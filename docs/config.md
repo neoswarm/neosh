@@ -1,0 +1,497 @@
+# Configuring neosh
+
+```sh
+neosh init
+```
+
+That writes a starter config, a `tsconfig.json`, and the API types — then tells you the path. Open
+`init.ts` and start editing.
+
+---
+
+## The one thing to understand
+
+**Your config is a plugin.** `init.ts` gets the entire public API, the same one every plugin uses,
+with nothing held back. There is no config-only API and nothing a plugin can do that your config
+cannot.
+
+This is why there is no list of "supported config options" anywhere in this document. Anything in
+[the API](../plugins/api/src/index.ts) is available to you — see [plugins.md](plugins.md).
+
+## Where things live
+
+```
+~/.config/neosh/            $XDG_CONFIG_HOME, or $NEOSH_CONFIG_DIR
+├── init.ts                 your config — this is the important file
+├── config.toml             values only; the non-code path
+├── tsconfig.json           generated, so your editor knows the API
+├── types/                  generated, the API types for this exact binary
+└── plugins/<name>/         drop a plugin here and it loads
+                            plugin.toml + its entry module
+
+~/.local/share/neosh/       installed plugins (a manager's business, not yours)
+~/.local/state/neosh/       trust.json — projects you allowed to run code
+
+<your project>/.neosh/      project config; see "Per-project" below
+├── config.toml
+└── init.ts
+```
+
+Same roots Neovim uses, for the same reason — `~/.config/neosh/init.ts` is to neosh what
+`~/.config/nvim/init.lua` is to Neovim, and symlinking the config directory into a dotfiles repo
+works exactly as you would expect.
+
+```sh
+neosh paths     # what those resolve to here, and which of them exist
+```
+
+Overridable with `NEOSH_CONFIG_DIR`, `NEOSH_DATA_DIR`, `NEOSH_STATE_DIR`, `NEOSH_CACHE_DIR`, or
+`--config-dir`. `neosh --clean` reads and writes nothing at all — use it when reporting a bug.
+
+## init.ts
+
+```ts
+import type { PluginContext } from "@neosh/api";
+
+export async function activate({ neosh }: PluginContext) {
+  await neosh.opt.set("agent.model", "claude-cli/sonnet");
+
+  await neosh.cmd.register("chat.clear", async () => { /* … */ }, {
+    desc: "Clear the conversation",
+  });
+  await neosh.keymap.set("chat", "<C-l>", "chat.clear");
+}
+```
+
+Keys bind to **command names**, never to callbacks. That indirection is what makes every binding
+listable, remappable, and callable by other plugins.
+
+Reload with **`<C-r>`** — no restart. It re-reads every layer from disk, unloads every plugin, and
+resets settings back to their defaults first, so deleting a line actually removes its effect. If the
+new config does not parse, the running one is left alone and you are told why.
+
+Type checking, and testing what you wrote — see **[testing.md](testing.md)**:
+
+```sh
+cd ~/.config/neosh && npx tsc --noEmit
+```
+
+The types in `types/` were written by the neosh binary you are running and are refreshed at startup
+if they drift, so they always describe the version you actually have.
+
+**If `init.ts` throws, neosh still starts.** The error is reported and startup continues — you need
+the editor to fix the editor.
+
+### Built-in commands
+
+The host registers its own commands through the same registry your plugins use, so they are
+listable with `neosh.cmd.list()` and rebindable like anything else:
+
+| command | default key | |
+|---|---|---|
+| `config.reload` | `<C-r>` | re-read config and reload plugins |
+| `quit` | `<C-q>` | close neosh |
+
+Both are shown in the status line at the bottom of the screen, which also reports the current mode
+and model.
+
+Binding the same key in your config replaces the default — these are ordinary bindings, not reserved
+keys.
+
+## The bundled plugins
+
+The sidebar, the model switcher and the git actions ship inside the binary. They are **plugins**, not
+features: same manifest, same API, same lifecycle, and nothing in their source that yours could not
+do. They exist partly to make that claim testable — `scripts/check.sh` type-checks them against the
+published `@neosh/api`, so the moment one reaches for something not public, the build fails.
+
+| Plugin | What it does | Keys |
+|---|---|---|
+| `sidebar` | Projects, conversations, changes, model, usage | `<C-b>` hide, `<C-t>` thread list, `<C-n>` new |
+| `model` | Model and reasoning-effort switchers, and the footer | `<C-p>`, `<C-e>` |
+| `git` | Status, branches, commits, diffs, worktrees | `<C-g>`, `<C-d>` |
+| `palette` | Everything by name, with its binding | `<C-k>`, `<F1>` |
+| `approvals` | Asks before the agent does something gated | — |
+
+Press `<F1>` for the complete list; it is read from the registry, so it is never out of date.
+
+Turn one off:
+
+```toml
+[options]
+"plugins.disabled" = ["sidebar"]
+```
+
+Or replace it: drop a plugin of your own in `~/.config/neosh/plugins/`. Yours loads *after* the
+bundled ones, so registering the same command or key wins.
+
+`neosh --clean` loads none of them, which is what makes it useful for answering "is this neosh or is
+it my setup".
+
+### Conversations and projects
+
+The sidebar groups conversations by the directory they were opened in. There is no project registry
+to maintain: opening a conversation somewhere else *is* how a second project appears, and
+`git.worktree.list` opens one in another worktree. `neosh.git` answers about whichever conversation
+is active, so switching conversation switches which tree you are looking at.
+
+Conversations are saved as you go — one file each under `~/.local/state/neosh/sessions/` — and
+restored at startup, in the one you were last in. `--clean` neither reads nor writes them.
+
+Pin the projects you live in with `f` and they move to a `FAVORITES` section at the top; `J`/`K`
+reorder within a section, and a pinned project stays listed after its last conversation is closed,
+so `Enter` on it starts a new one. The arrangement is saved under
+`~/.local/state/neosh/plugin-state/` — not in your config, because an editor that rewrites the file
+you hand-edited because you pressed a key is one you stop trusting with it.
+
+While a turn is running the row shows how long it has been running, next to the spinner. "Working"
+with no clock is indistinguishable from wedged.
+
+In the panel (`<C-t>`): `↑`/`↓`, `j`/`k` or `^N`/`^P` move, `Enter` opens or folds, `Space` folds,
+`f` pins, `J`/`K` reorder, `n` new conversation here, `x` close, `r` rename, `?` every binding,
+`Esc` leaves. The foot of the panel lists the keys for whatever the cursor is on; set
+`sidebar.hints = false` once they are in your fingers.
+
+```toml
+[options]
+"sidebar.open" = true        # show it at startup
+"sidebar.width" = 34
+"sidebar.hints" = true       # the contextual key strip at the foot of the panel
+"sidebar.refresh_ms" = 4000  # a workspace re-read per tick
+```
+
+### Keys are yours
+
+Every binding in neosh — including the ones that ship — is an ordinary entry in the same table your
+config writes to, bound to a *command name* rather than a callback. Setting the same key replaces
+what was there.
+
+```ts
+await neosh.opt.set("mapleader", ",");            // set it before you use it
+await neosh.keymap.set("chat", "<leader>pa", "project.open");
+await neosh.keymap.set("chat", "<leader>pp", "sidebar.focus");
+await neosh.keymap.del("chat", "<C-o>");           // and drop the default if you want
+```
+
+`<leader>` is substituted when the binding is made, not when the key is pressed — the same as
+Neovim, and for the same reason: a binding that silently moved when you changed `mapleader` halfway
+down your config would be impossible to reason about.
+
+Nothing ships bound to `<leader>`, which is deliberate: the default leader is `\`, and a leader with
+bindings on it is a character you can no longer type immediately. When you do bind a sequence, a
+prefix you start and do not finish is typed literally after `timeoutlen` milliseconds — so `,pa`
+does not cost you the comma key.
+
+```toml
+[options]
+mapleader = ","
+timeoutlen = 500   # how long to wait for the rest of a sequence
+```
+
+`^K` searches every command by name, and `F1` lists every binding — both read the live registry, so
+a plugin loaded five minutes ago is in them without anything having been written down.
+
+### Adding a project
+
+`^O` anywhere, `o` in the project panel, or `Enter` on the `+ Add project` row. It offers the
+worktrees of the repository you are in that are not open yet, and drops through to a path field for
+anything else. It is the `project.open` command, so `^K` finds it and `<leader>pa` can be it.
+
+The path field completes as you type: the list under it is the directories matching what you have
+so far. `<Tab>` takes the highlighted one into the field so you can keep descending, `<C-w>` goes
+back up a whole segment rather than a character, and `<CR>` accepts either the highlighted row or
+exactly what you typed — because the directory you want may not be one it offered. `~` expands, and
+a path with no `/` completes against the conversation's own directory.
+
+### Confirmations
+
+Anything that cannot be undone asks first: deleting a conversation removes its file from disk, and
+`git worktree remove` does not put a directory back. The cursor starts on the answer that changes
+nothing, because `<CR>` is reflex by the second time you have seen a dialog.
+
+It asks *conditionally*. A conversation you have not said anything in yet has nothing to lose, so
+`x` just closes it — a dialog for that is friction that teaches you to dismiss dialogs. Nothing that
+only changes what is on screen ever asks.
+
+```toml
+[options]
+"ui.confirm_destructive" = true
+```
+
+### Picker keys
+
+Every picker, prompt and completion list reads the same settings, and they take Neovim notation.
+More than one key can mean the same thing:
+
+```toml
+[options]
+"ui.keys.next" = "<Down> <C-n> <C-j>"
+"ui.keys.prev" = "<Up> <C-p> <C-k>"
+"ui.keys.page_down" = "<PageDown>"
+"ui.keys.page_up" = "<PageUp>"
+"ui.keys.first" = "<C-Home>"
+"ui.keys.last" = "<C-End>"
+"ui.keys.accept" = "<CR>"
+"ui.keys.dismiss" = "<Esc> <C-c>"
+"ui.keys.complete" = "<Tab> <Right>"
+"ui.keys.clear" = "<C-u>"
+"ui.keys.delete_word" = "<C-w>"
+```
+
+A widget claims these **window-scoped** while it is open, so they outrank global bindings and are
+released the moment it closes. That is what makes `^N` move in a picker even though `^N` is
+otherwise "new conversation" — without it, filtering a model list by typing `n` with control held
+would drop you into a new conversation with the picker gone.
+
+### Writing, selecting and copying
+
+The composer is a text field, not a line that gets appended to. `←`/`→` move by character and
+`^←`/`^→` by word; `Home`/`End` reach the ends of the line and `^Home`/`^End` the ends of the draft.
+Hold shift with any of them to select. `S-CR` breaks the line instead of sending, so a pasted
+snippet stays one message. `^W` deletes the word behind the cursor and `^U` clears back to the start
+of the line.
+
+`^C` copies when something is selected and clears the draft when nothing is — the two cases cannot
+both be true, which is what lets one key carry both jobs. `^X` cuts, `^A` selects everything. Your
+terminal's own paste works: it arrives as a bracketed paste and lands at the cursor.
+
+`^S` moves the keyboard into the transcript, which is where the text you actually want to keep
+lives. There the keys are vi's: `hjkl` and the arrows move, `w`/`b` by word, `0`/`$` to the ends of
+a line, `g`/`G` to the ends of the transcript, `v` starts a selection that motions extend, `a`
+selects all of it, `y` copies and leaves, `Esc` just leaves. The status line says `reading` while
+you are there.
+
+Copying uses OSC 52, which travels back through the terminal connection — so it reaches the
+clipboard on the machine you are sitting at, not the one neosh is running on. Terminals that do not
+implement it ignore it silently; there is no way to detect support.
+
+### Theme and motion
+
+```toml
+[options]
+"ui.theme" = "dark"       # or "light"
+"ui.motion" = true        # spinners and status pulses
+"ui.ascii_only" = false   # for terminals without a decent font
+```
+
+The theme is a set of semantic groups — `Status.Working`, `Git.Added`, `Meter.Fill` — that plugins
+link to rather than choosing colours. Override any of them from `init.ts` and a theme switch will
+leave yours alone:
+
+```ts
+await neosh.hl.define("Status.Working", { fg: "#ff00ff", bold: true });
+```
+
+Motion is one shared 100 ms clock and costs about 1% of a core and under 1 KiB/s, which is why it
+stays on over SSH. See [ADR 0019](adr/0019-motion-and-the-visual-language.md) for the measurements.
+
+### Approvals
+
+`permissions.mode = "ask"` prompts before the agent runs a command or reaches the network. Reading
+files inside the workspace is allowed in every mode but `deny` — the point of `ask` is the things
+that leave the project.
+
+An answer of "allow for this session" is held **in memory only**; making it permanent is a line in
+`config.toml`, not a keystroke. With the `approvals` plugin disabled, `ask` mode refuses anything it
+would have prompted about rather than allowing it.
+
+### Model and reasoning effort
+
+`<C-p>` picks the model; `<C-e>` picks its options — reasoning effort, and whatever else the driver
+exposes. Those are not a fixed list: they arrive as `ProviderOptionDescriptor`s attached to the
+model, so a provider plugin that invents a knob gets a working picker for it with no change to the
+switcher.
+
+Switching between two models that share an option keeps your setting; switching to one without it
+drops the setting rather than sending a value the driver would reject.
+
+### Git, and the prompts behind it
+
+`git.branch.new` asks what you are about to work on, has a model name the branch, and shows you the
+name **before** creating it. `git.commit` writes a message from the staged diff and shows you that
+before committing.
+
+Every prompt is a setting, in two layers:
+
+```toml
+[options]
+"git.branch.prefix" = "feature/"
+"git.branch.instructions" = "Start with the Jira key when the message mentions one."
+"git.commit.instructions" = "Follow Conventional Commits."
+```
+
+`*.instructions` is appended to the built-in prompt — the common case. `*.prompt` replaces it
+entirely, for when appending is not enough; it must still ask for JSON with the documented keys
+(`branch`, or `subject`/`body`). Instructions still apply on top of a replaced prompt, so a
+per-project rule in `.neosh/config.toml` layers onto your own prompt.
+
+```toml
+[options]
+"gen.model" = "anthropic/claude-haiku-4-5"   # what writes names and messages
+```
+
+`gen.model` is separate from `agent.model` on purpose: naming a branch does not need a frontier
+model. Empty uses the conversation's model.
+
+Repository *writes* — branch, checkout, stage, commit, worktree — need `permissions = ["vcs_write"]`
+in a plugin's `plugin.toml`. That is a plugin permission, not the agent's permission mode: those
+govern what the **model** may do, and the model does not reach git this way. It reaches it through a
+registered tool, gated like every tool.
+
+## config.toml
+
+For setting values without writing code. It can express a subset of what `init.ts` can; it exists so
+that "use this model" is one line, and so a settings UI has a file it can rewrite.
+
+```toml
+[agent]
+model = "anthropic/claude-opus-5"
+
+[permissions]
+mode = "ask"                 # ask | allow_listed | deny
+allow_commands = ["cargo"]
+
+[options]
+"chat.show_thinking" = true
+
+[[providers]]
+id = "local"
+driver = "openai-compat"
+display_name = "llama.cpp"
+base_url = "http://localhost:8080/v1"
+auth = { kind = "env", var = "MY_API_KEY" }
+
+plugin_dirs = ["~/src/neosh-plugins"]
+```
+
+Unknown keys are an **error**, not ignored. A typo that is silently skipped looks exactly like a
+setting that does not work.
+
+Credentials are read from the environment by name. Nothing writes a secret to this file.
+
+## Options
+
+Options are declared, typed, and owned. You cannot set one that does not exist, and you cannot set
+the wrong type — both are errors that name the problem.
+
+```ts
+await neosh.opt.set("chat.show_thinking", true);
+const n = await neosh.opt.get<boolean>("chat.show_thinking");
+await neosh.opt.all();                    // everything declared, with types and defaults
+neosh.opt.onChange((e) => { /* … */ });   // fires for every option, not just yours
+```
+
+Built in:
+
+| Option | Type | Default | Effect |
+|---|---|---|---|
+| `agent.model` | string | `""` | `instance/model`. Empty picks the first that works. |
+| `agent.system_prompt` | string | `""` | Replaces the built-in prompt when set. |
+| `chat.show_thinking` | bool | `false` | Stream reasoning into the chat buffer. |
+| `chat.show_tools` | bool | `true` | Show a line when a tool runs. Errors always show. |
+| `gen.model` | string | `""` | Model for branch names, commit messages and titles. Empty uses `agent.model`. |
+| `plugins.disabled` | list | `[]` | Bundled plugins not to load. |
+
+That list is short because every entry does something. Plugins declare their own, through the same
+call the built-ins use:
+
+```ts
+await neosh.opt.declare({
+  name: "myplugin.enabled",
+  type: { type: "bool" },
+  default: true,
+  description: "…",
+});
+```
+
+Once declared, it is settable from `config.toml` like any other — including by a user who set it
+*before* your plugin loaded. Held values are applied the moment the declaration arrives.
+
+## Plugins
+
+Anything in `~/.config/neosh/plugins/<name>/` with a `plugin.toml` loads automatically. To load from
+elsewhere, from `init.ts`:
+
+```ts
+await neosh.rtp.add("~/src/my-plugins");
+```
+
+This works because **your config runs before plugin discovery** — it is the thing that decides what
+else loads. `rtp.add` after discovery is an error rather than a silent no-op.
+
+## Per-project
+
+`<project>/.neosh/config.toml` is committable and applies to anyone who opens the repository.
+
+Because a config file in a repository you cloned is code someone else wrote, it is split by what it
+can do:
+
+**Applies immediately.** `model` — it can only name a provider instance *you* already configured, so
+the worst it achieves is picking a different one of your models. `[permissions]` — and only to make
+things **stricter**; a repository cannot grant itself `curl`.
+
+**Waits for `neosh trust`.** `.neosh/init.ts`, `plugin_dirs`, `providers`, `[options]`,
+`system_prompt`. Anything that runs code or widens what the agent may do.
+
+```sh
+neosh trust            # prints the files, then approves them
+neosh trust --list
+neosh trust --revoke
+```
+
+Trust is keyed on the **contents of every file under `.neosh/`**, not on the path. Editing any of
+them — including a module `init.ts` imports — revokes it automatically, so a `git pull` cannot
+quietly change what runs on your machine. You will be told, and you re-approve after reading the
+change.
+
+`neosh init --project` scaffolds `.neosh/` in the current directory.
+
+## Precedence
+
+Later wins:
+
+1. built-in defaults
+2. `~/.config/neosh/config.toml`
+3. `<project>/.neosh/config.toml`
+4. `~/.config/neosh/init.ts`
+5. `<project>/.neosh/init.ts`, if trusted
+6. command-line flags
+
+Flags last, so `--model` always takes effect.
+
+## Timers
+
+```ts
+const stop = neosh.timer.every(1000, () => { /* … */ });
+ctx.subscriptions.push(stop);          // cancelled when your plugin unloads
+
+const redraw = neosh.timer.debounce(150, () => render());
+neosh.agent.onToken(redraw);           // runs once, 150ms after the tokens stop
+```
+
+`setTimeout`, `setInterval`, `clearTimeout` and `clearInterval` exist as globals too, for ported
+code. Prefer `neosh.timer` — the globals cannot know who called them, so they are **not** cancelled
+when your plugin unloads, and an interval that outlives its plugin doubles up on every reload.
+
+Repeating timers have a 1 ms floor, so `setInterval(f, 0)` is `setInterval(f, 1)`. One-shots are
+not clamped.
+
+## What the runtime gives you
+
+The plugin runtime is a bare `deno_core` — a sandbox by construction, not by policy. You get the
+ECMAScript built-ins, `console`, `queueMicrotask`, `Deno.core`, and the timers above. You do **not**
+get `fetch`, `TextEncoder`, or any filesystem access. Anything with an effect goes through the neosh
+API, which is what makes hooks and permissions meaningful.
+
+## Not yet
+
+- **`:set` writing back to disk.** The machinery knows which options you changed; nothing persists
+  them.
+- **Buffer- and window-local options.** Global only for now.
+- **A plugin manager.** `rtp.add` and `plugins/` are the manual path; a manager is a plugin, and
+  nothing in the core needs to change for one to exist.
+- **A command line.** Commands are invoked by key, from the palette (`<C-k>`), or from code; there
+  is no `:` prompt yet.
+- **Reload closing what a plugin opened.** A float opened during `activate` opens again on reload,
+  and an in-flight turn keeps streaming. Use `ctx.subscriptions` for anything that should not
+  outlive your plugin.
