@@ -1,0 +1,188 @@
+//! Frontends.
+//!
+//! Two implementations of one trait. The terminal is what users run;
+//! [`StdioFrontend`] emits the identical event stream as JSON lines.
+//!
+//! The stdio frontend is not a debugging afterthought — it is what keeps the boundary honest. If
+//! the core ever reached past the protocol to touch ratatui, the JSON stream would immediately stop
+//! containing everything needed to render, and the end-to-end tests that assert on it would fail.
+//! It is also the shape a web or mobile frontend would connect over.
+
+use std::io::Write;
+
+use neosh_proto::{InputEvent, UiEvent};
+use neosh_tui::{Mirror, TerminalFrontend, to_input_event};
+use tokio::sync::mpsc;
+
+#[async_trait::async_trait]
+pub trait Frontend: Send {
+    /// Deliver one coalesced batch. The batch always ends with [`UiEvent::Flush`].
+    async fn send(&mut self, batch: Vec<UiEvent>) -> anyhow::Result<()>;
+    async fn shutdown(&mut self) -> anyhow::Result<()> {
+        Ok(())
+    }
+}
+
+/// Renders to the terminal.
+pub struct TerminalUi {
+    inner: TerminalFrontend,
+    mirror: Mirror,
+    /// Where input events go, so resolved geometry can be reported back as `ViewportChanged`.
+    input: mpsc::UnboundedSender<InputEvent>,
+    /// The last geometry we told the core about, per window.
+    ///
+    /// Only *changes* are sent. Emitting one per window per draw is a feedback loop: the event arms
+    /// the redraw deadline, which draws, which emits the event again, forever.
+    reported: std::collections::HashMap<neosh_proto::WindowId, (u16, u16, u32)>,
+}
+
+impl TerminalUi {
+    pub fn enter() -> anyhow::Result<(Self, mpsc::UnboundedReceiver<InputEvent>)> {
+        // Before taking the screen, arrange for a panic to be readable. Otherwise the message is
+        // printed into the alternate screen, `Drop` tears that screen down, and the user is left
+        // looking at their shell prompt with no indication anything happened at all.
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            neosh_tui::restore_terminal();
+            previous(info);
+        }));
+
+        let inner = TerminalFrontend::enter()?;
+        let (w, h) = inner.size()?;
+        let (tx, rx) = mpsc::unbounded_channel();
+        let _ = tx.send(InputEvent::Ready { width: w, height: h });
+        let tx_geometry = tx.clone();
+
+        tokio::spawn(async move {
+            use futures::StreamExt;
+            let mut events = crossterm::event::EventStream::new();
+            while let Some(Ok(ev)) = events.next().await {
+                if let Some(input) = to_input_event(ev)
+                    && tx.send(input).is_err()
+                {
+                    break;
+                }
+            }
+            let _ = tx.send(InputEvent::Disconnected);
+        });
+
+        Ok((
+            Self { inner, mirror: Mirror::new(), input: tx_geometry, reported: Default::default() },
+            rx,
+        ))
+    }
+}
+
+#[async_trait::async_trait]
+impl Frontend for TerminalUi {
+    async fn send(&mut self, batch: Vec<UiEvent>) -> anyhow::Result<()> {
+        let mut redraw = false;
+        for ev in batch {
+            redraw |= self.mirror.apply(ev);
+        }
+        // Before the draw: an escape written after ratatui has painted and moved the cursor is an
+        // escape the terminal sees in the middle of a frame it has already committed.
+        if let Some(text) = self.mirror.clipboard.take() {
+            // A terminal that does not do OSC 52 ignores it; a broken pipe on the way out is the
+            // shutdown path and not worth failing a redraw over.
+            let _ = self.inner.copy(&text);
+        }
+        if redraw && !self.mirror.shutdown {
+            let geometry = self.inner.draw(&self.mirror)?;
+            self.report_geometry(&geometry);
+        }
+        Ok(())
+    }
+
+    async fn shutdown(&mut self) -> anyhow::Result<()> {
+        self.inner.leave()?;
+        Ok(())
+    }
+}
+
+impl TerminalUi {
+    /// Tell the core where each window ended up, but only when it moved.
+    fn report_geometry(&mut self, geometry: &[(neosh_proto::WindowId, neosh_proto::Rect)]) {
+        for (win, rect) in geometry {
+            let top = self.mirror.windows.get(win).map(|w| w.top_line).unwrap_or(0);
+            let now = (rect.width, rect.height, top);
+            if self.reported.get(win) == Some(&now) {
+                continue;
+            }
+            self.reported.insert(*win, now);
+            let _ = self.input.send(InputEvent::ViewportChanged {
+                win: *win,
+                width: rect.width,
+                height: rect.height,
+                top_line: top,
+            });
+        }
+        // A window that closed should not keep a stale entry, or reopening it at the same size
+        // would report nothing and leave every plugin with the old geometry.
+        self.reported.retain(|win, _| geometry.iter().any(|(w, _)| w == win));
+    }
+}
+
+/// The frontend went away mid-write.
+///
+/// Not a failure: `neosh --ui-protocol=stdio | head` closing the pipe is the consumer's decision,
+/// and reporting it as an error would print a crash where a clean exit belongs.
+#[derive(Debug, thiserror::Error)]
+#[error("frontend disconnected")]
+pub struct Disconnected;
+
+/// Writes the protocol to stdout as JSON lines and reads input as JSON lines from stdin.
+pub struct StdioFrontend {
+    out: std::io::Stdout,
+}
+
+impl StdioFrontend {
+    pub fn new() -> (Self, mpsc::UnboundedReceiver<InputEvent>) {
+        let (tx, rx) = mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            use tokio::io::AsyncBufReadExt;
+            let mut lines = tokio::io::BufReader::new(tokio::io::stdin()).lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                if line.trim().is_empty() {
+                    continue;
+                }
+                match serde_json::from_str::<InputEvent>(&line) {
+                    Ok(ev) => {
+                        if tx.send(ev).is_err() {
+                            break;
+                        }
+                    }
+                    // A malformed line is reported and skipped rather than killing the session,
+                    // which matters when a human is driving this by hand.
+                    Err(e) => eprintln!("neosh: ignoring unparseable input: {e}"),
+                }
+            }
+            let _ = tx.send(InputEvent::Disconnected);
+        });
+        (Self { out: std::io::stdout() }, rx)
+    }
+}
+
+/// A closed pipe is a disconnect; anything else is a real I/O failure worth reporting.
+fn classify(e: std::io::Error) -> anyhow::Error {
+    match e.kind() {
+        std::io::ErrorKind::BrokenPipe => anyhow::Error::new(Disconnected),
+        _ => anyhow::Error::new(e),
+    }
+}
+
+#[async_trait::async_trait]
+impl Frontend for StdioFrontend {
+    async fn send(&mut self, batch: Vec<UiEvent>) -> anyhow::Result<()> {
+        // Serialized to a buffer first, so a write failure is an `io::Error` we can classify
+        // rather than a serde error that happens to wrap one.
+        let mut buf = Vec::new();
+        for ev in batch {
+            serde_json::to_writer(&mut buf, &ev)?;
+            buf.push(b'\n');
+        }
+        // Flushed per batch rather than per event: a consumer sees whole frames, and a streaming
+        // turn does not cost one syscall per token.
+        self.out.write_all(&buf).and_then(|()| self.out.flush()).map_err(classify)
+    }
+}
