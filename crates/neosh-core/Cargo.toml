@@ -1,0 +1,20 @@
+[package]
+name = "neosh-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+neosh-proto = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+smallvec = { workspace = true }
+slotmap = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+unicode-segmentation = { workspace = true }
+
+[dev-dependencies]
+insta = { workspace = true }
