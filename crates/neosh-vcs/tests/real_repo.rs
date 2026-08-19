@@ -1,0 +1,261 @@
+//! Exercises the parsers against the output of a real `git`, in a repository built for the test.
+//!
+//! The unit tests in `parse.rs` use captured fixtures, which stay correct only as long as git's
+//! output does. These are the ones that notice when it changes.
+
+use std::path::{Path, PathBuf};
+use std::process::Command;
+
+use neosh_proto::{DiffTarget, FileState};
+use neosh_vcs::Git;
+
+/// A throwaway repository. Removed on drop, including when a test panics.
+struct Repo {
+    dir: PathBuf,
+}
+
+impl Repo {
+    fn new(name: &str) -> Self {
+        let dir = std::env::temp_dir().join(format!("neosh-vcs-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let repo = Self { dir };
+        repo.git(&["init", "--initial-branch=main"]);
+        // Identity and signing are per-repo so the test cannot depend on, or disturb, the
+        // developer's global git config.
+        repo.git(&["config", "user.email", "test@neosh.invalid"]);
+        repo.git(&["config", "user.name", "neosh test"]);
+        repo.git(&["config", "commit.gpgsign", "false"]);
+        repo
+    }
+
+    fn git(&self, args: &[&str]) -> String {
+        let out = Command::new("git")
+            .current_dir(&self.dir)
+            .args(args)
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .output()
+            .expect("git runs");
+        assert!(
+            out.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    }
+
+    fn write(&self, path: &str, contents: &str) {
+        let p = self.dir.join(path);
+        if let Some(parent) = p.parent() {
+            std::fs::create_dir_all(parent).expect("parent dir");
+        }
+        std::fs::write(p, contents).expect("write");
+    }
+
+    fn path(&self) -> &Path {
+        &self.dir
+    }
+}
+
+impl Drop for Repo {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+fn have_git() -> bool {
+    Command::new("git").arg("--version").output().is_ok_and(|o| o.status.success())
+}
+
+#[tokio::test]
+async fn status_reports_what_git_actually_prints() {
+    if !have_git() {
+        return;
+    }
+    let repo = Repo::new("status");
+    repo.write("README.md", "hello\n");
+    repo.git(&["add", "."]);
+    repo.git(&["commit", "-m", "initial"]);
+
+    repo.write("staged.txt", "a\n");
+    repo.git(&["add", "staged.txt"]);
+    repo.write("dirty.txt", "b\n");
+    repo.write("README.md", "hello again\n");
+    // A path with a space is the case that breaks every non-`-z` parser.
+    repo.write("with space.txt", "c\n");
+
+    let git = Git::discover(repo.path()).await.expect("discovers the repo");
+    let status = git.status().await.expect("status");
+
+    assert_eq!(status.repo.branch.as_deref(), Some("main"));
+    assert!(!status.repo.detached);
+    assert!(status.repo.head.is_some(), "a repo with a commit has a HEAD");
+
+    let by = |p: &str| status.changes.iter().find(|c| c.path == p).unwrap_or_else(|| panic!("no entry for {p}, got {:?}", status.changes));
+    assert_eq!(by("staged.txt").staged, Some(FileState::Added));
+    assert_eq!(by("README.md").unstaged, Some(FileState::Modified));
+    assert_eq!(by("dirty.txt").unstaged, Some(FileState::Untracked));
+    assert_eq!(by("with space.txt").unstaged, Some(FileState::Untracked));
+    assert!(status.is_dirty());
+}
+
+#[tokio::test]
+async fn a_rename_keeps_both_paths() {
+    if !have_git() {
+        return;
+    }
+    let repo = Repo::new("rename");
+    repo.write("old.txt", "content that is long enough for git to score it as a rename\n");
+    repo.git(&["add", "."]);
+    repo.git(&["commit", "-m", "initial"]);
+    repo.git(&["mv", "old.txt", "new.txt"]);
+    repo.write("other.txt", "untracked\n");
+
+    let git = Git::discover(repo.path()).await.expect("repo");
+    let status = git.status().await.expect("status");
+
+    let rename = status
+        .changes
+        .iter()
+        .find(|c| c.path == "new.txt")
+        .expect("the renamed path is reported");
+    assert_eq!(rename.from.as_deref(), Some("old.txt"));
+    assert_eq!(rename.staged, Some(FileState::Renamed));
+    // The regression: the original path must not be mistaken for a separate untracked entry.
+    assert!(
+        status.changes.iter().any(|c| c.path == "other.txt"),
+        "the entry after a rename is still parsed"
+    );
+    assert_eq!(status.changes.len(), 2, "got {:?}", status.changes);
+}
+
+#[tokio::test]
+async fn branches_worktrees_and_log_round_trip() {
+    if !have_git() {
+        return;
+    }
+    let repo = Repo::new("branches");
+    repo.write("a.txt", "1\n");
+    repo.git(&["add", "."]);
+    repo.git(&["commit", "-m", "first commit\n\nWith a body."]);
+    repo.git(&["switch", "-c", "feature/thing"]);
+    repo.write("b.txt", "2\n");
+    repo.git(&["add", "."]);
+    repo.git(&["commit", "-m", "second"]);
+
+    let git = Git::discover(repo.path()).await.expect("repo");
+
+    let branches = git.branches(false).await.expect("branches");
+    let names: Vec<&str> = branches.iter().map(|b| b.name.as_str()).collect();
+    assert!(names.contains(&"main"), "got {names:?}");
+    assert!(names.contains(&"feature/thing"), "got {names:?}");
+    let head = branches.iter().find(|b| b.is_head).expect("one branch is HEAD");
+    assert_eq!(head.name, "feature/thing");
+    assert_eq!(head.subject.as_deref(), Some("second"));
+    assert!(head.committed_at > 0, "committer date parsed");
+    assert!(!head.is_remote);
+
+    let log = git.log(10).await.expect("log");
+    assert_eq!(log.len(), 2);
+    assert_eq!(log[0].subject, "second");
+    assert_eq!(log[1].subject, "first commit");
+    assert_eq!(log[1].body, "With a body.");
+    assert!(!log[0].short.is_empty());
+
+    let trees = git.worktrees().await.expect("worktrees");
+    assert_eq!(trees.len(), 1);
+    assert!(trees[0].is_main);
+    assert!(trees[0].is_current, "the tree we ran in is the current one");
+
+    assert_eq!(git.default_branch().await.as_deref(), Some("main"));
+}
+
+#[tokio::test]
+async fn diff_and_commit_go_through() {
+    if !have_git() {
+        return;
+    }
+    let repo = Repo::new("commit");
+    repo.write("a.txt", "1\n");
+    repo.git(&["add", "."]);
+    repo.git(&["commit", "-m", "initial"]);
+
+    repo.write("a.txt", "changed\n");
+    let git = Git::discover(repo.path()).await.expect("repo");
+
+    let unstaged = git.diff(&DiffTarget::Unstaged).await.expect("diff");
+    assert!(unstaged.contains("changed"), "got {unstaged:?}");
+    assert!(git.diff(&DiffTarget::Staged).await.expect("staged diff").is_empty());
+
+    git.stage(&[]).await.expect("stage");
+    let staged = git.diff(&DiffTarget::Staged).await.expect("staged diff");
+    assert!(staged.contains("changed"));
+    assert!(git.diff_stat(&DiffTarget::Staged).await.expect("stat").contains("a.txt"));
+
+    // A message with a quote, a newline and a shell metacharacter. If any of it reached a shell,
+    // this would not round-trip.
+    let message = "fix: don't $(break) \"quoting\"\n\nBody line.";
+    let commit = git.commit(message).await.expect("commit");
+    assert_eq!(commit.subject, "fix: don't $(break) \"quoting\"");
+    assert_eq!(commit.body, "Body line.");
+    assert!(!git.status().await.expect("status").is_dirty());
+}
+
+#[tokio::test]
+async fn a_repository_with_no_commits_is_not_an_error() {
+    if !have_git() {
+        return;
+    }
+    let repo = Repo::new("empty");
+    let git = Git::discover(repo.path()).await.expect("an empty repo is still a repo");
+    let status = git.status().await.expect("status works before the first commit");
+    assert_eq!(status.repo.head, None);
+    assert_eq!(status.repo.branch.as_deref(), Some("main"));
+    assert!(git.log(5).await.unwrap_or_default().is_empty());
+}
+
+#[tokio::test]
+async fn a_plain_directory_is_not_a_repository() {
+    if !have_git() {
+        return;
+    }
+    let dir = std::env::temp_dir().join(format!("neosh-vcs-plain-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("dir");
+    // Not an error to unwrap — "there is no repository here" is an ordinary answer.
+    assert!(Git::discover(&dir).await.is_none());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn worktrees_report_which_one_we_are_in() {
+    if !have_git() {
+        return;
+    }
+    let repo = Repo::new("worktree");
+    repo.write("a.txt", "1\n");
+    repo.git(&["add", "."]);
+    repo.git(&["commit", "-m", "initial"]);
+
+    let extra = repo.path().parent().unwrap().join(format!(
+        "neosh-vcs-worktree-extra-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&extra);
+
+    let git = Git::discover(repo.path()).await.expect("repo");
+    git.add_worktree(&extra, "side", true).await.expect("worktree add");
+
+    let from_main = git.worktrees().await.expect("worktrees");
+    assert_eq!(from_main.len(), 2, "got {from_main:?}");
+    assert!(from_main.iter().any(|t| t.is_main && t.is_current));
+
+    // Standing inside the second tree, `is_current` must move with us.
+    let inside = Git::discover(&extra).await.expect("the worktree is a repo too");
+    let from_side = inside.worktrees().await.expect("worktrees");
+    let current = from_side.iter().find(|t| t.is_current).expect("one is current");
+    assert_eq!(current.branch.as_deref(), Some("side"));
+    assert!(!current.is_main);
+
+    let _ = std::fs::remove_dir_all(&extra);
+}
