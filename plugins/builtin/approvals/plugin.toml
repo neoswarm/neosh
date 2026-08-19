@@ -1,0 +1,5 @@
+name = "approvals"
+version = "0.1.0"
+entry = "main.ts"
+description = "Asks before the agent does something the policy says to ask about."
+permissions = ["hooks_blocking"]

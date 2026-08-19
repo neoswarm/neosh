@@ -1,0 +1,8 @@
+name = "git"
+version = "0.1.0"
+entry = "main.ts"
+description = "Branch, commit and status, with model-written names and messages you can re-prompt."
+
+# Creates branches, stages and commits. Declared so `plugin.toml` answers "what can this
+# do to my repository" without reading the source.
+permissions = ["vcs_write"]
