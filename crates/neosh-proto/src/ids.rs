@@ -1,0 +1,166 @@
+//! Opaque handles.
+//!
+//! Every object the plugin API exposes is addressed by id rather than by a handle object. That is a
+//! deliberate constraint: an out-of-process plugin gets a byte-identical API, with no proxy objects
+//! that only work when the plugin happens to share an address space with the core.
+
+use serde::{Deserialize, Serialize};
+use ts_rs::TS;
+
+macro_rules! numeric_id {
+    ($(#[$m:meta])* $name:ident) => {
+        $(#[$m])*
+        #[derive(
+            TS, Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug, Default,
+        )]
+        #[serde(transparent)]
+        #[ts(export)]
+        pub struct $name(pub u32);
+
+        impl std::fmt::Display for $name {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(f, "{}", self.0)
+            }
+        }
+
+        impl From<u32> for $name {
+            fn from(v: u32) -> Self {
+                Self(v)
+            }
+        }
+    };
+}
+
+numeric_id!(
+    /// A text buffer. Buffers are the only place text lives.
+    BufferId
+);
+numeric_id!(
+    /// A viewport onto a buffer. Covers both docked windows and floats.
+    WindowId
+);
+numeric_id!(
+    /// An extmark namespace. Namespaces let a plugin clear only its own annotations.
+    NamespaceId
+);
+numeric_id!(
+    /// An annotation within a namespace.
+    ExtmarkId
+);
+numeric_id!(
+    /// A claimed raw-cell surface.
+    SurfaceId
+);
+
+/// Identifies a loaded plugin. Stable across reloads; derived from the manifest `name`.
+#[derive(TS, Serialize, Deserialize, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Debug)]
+#[serde(transparent)]
+#[ts(export)]
+pub struct PluginId(pub String);
+
+impl std::fmt::Display for PluginId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl From<&str> for PluginId {
+    fn from(v: &str) -> Self {
+        Self(v.to_string())
+    }
+}
+
+macro_rules! string_id {
+    ($(#[$m:meta])* $name:ident) => {
+        $(#[$m])*
+        #[derive(TS, Serialize, Deserialize, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Debug)]
+        #[serde(transparent)]
+        #[ts(export)]
+        pub struct $name(pub String);
+
+        impl $name {
+            pub fn new() -> Self {
+                Self(uuid_v4())
+            }
+        }
+
+        impl Default for $name {
+            fn default() -> Self {
+                Self::new()
+            }
+        }
+
+        impl std::fmt::Display for $name {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str(&self.0)
+            }
+        }
+
+        impl From<&str> for $name {
+            fn from(v: &str) -> Self {
+                Self(v.to_string())
+            }
+        }
+    };
+}
+
+string_id!(
+    /// One conversation, persistent across restarts.
+    SessionId
+);
+string_id!(
+    /// One user message plus everything the agent did in response, including tool calls.
+    TurnId
+);
+string_id!(
+    /// Correlates a `tool_use` block with its result.
+    ToolCallId
+);
+string_id!(
+    /// Correlates an in-flight provider stream with its cancellation.
+    StreamId
+);
+string_id!(
+    /// Correlates a request across the plugin boundary in either direction.
+    RequestId
+);
+
+/// A v4 UUID without pulling `uuid` into this crate's dependency tree.
+///
+/// `neosh-proto` is depended on by every other crate including the TS binding generator, so it is
+/// kept as close to zero-dependency as possible.
+fn uuid_v4() -> String {
+    use std::hash::{BuildHasher, Hasher, RandomState};
+    let mut bytes = [0u8; 16];
+    for chunk in bytes.chunks_mut(8) {
+        let mut h = RandomState::new().build_hasher();
+        h.write_u8(0);
+        chunk.copy_from_slice(&h.finish().to_ne_bytes()[..chunk.len()]);
+    }
+    bytes[6] = (bytes[6] & 0x0f) | 0x40; // version 4
+    bytes[8] = (bytes[8] & 0x3f) | 0x80; // variant 1
+    let h = |r: &[u8]| r.iter().map(|b| format!("{b:02x}")).collect::<String>();
+    format!(
+        "{}-{}-{}-{}-{}",
+        h(&bytes[0..4]),
+        h(&bytes[4..6]),
+        h(&bytes[6..8]),
+        h(&bytes[8..10]),
+        h(&bytes[10..16])
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn uuids_are_well_formed_and_distinct() {
+        let a = TurnId::new();
+        let b = TurnId::new();
+        assert_ne!(a, b, "ids must not collide");
+        assert_eq!(a.0.len(), 36);
+        assert_eq!(a.0.as_bytes()[14], b'4', "version nibble");
+        assert!(matches!(a.0.as_bytes()[19], b'8' | b'9' | b'a' | b'b'));
+    }
+}
