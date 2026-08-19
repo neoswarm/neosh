@@ -1,0 +1,120 @@
+# Everything `scripts/check.sh` runs, in the order that fails fastest.
+#
+# The steps are deliberately not folded into one `check.sh` call: a red X should
+# say *which* thing broke without anyone opening the log.
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # A failing build should print the error, not a backtrace of rustc.
+  RUST_BACKTRACE: 1
+
+jobs:
+  rust:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      # V8 dominates a clean build, so caching is the difference between a
+      # two-minute run and a twenty-minute one.
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Formatting
+        run: cargo fmt --all --check
+        continue-on-error: true
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets
+
+      # Git is a dependency of the version-control tests, and its default
+      # branch name and identity are not configured on a fresh runner.
+      - name: Configure git for the vcs tests
+        run: |
+          git config --global user.email "ci@neosh.invalid"
+          git config --global user.name "neosh ci"
+          git config --global init.defaultBranch main
+
+      - name: Tests
+        run: cargo test --workspace
+
+      # The plugin API's wire types are generated from Rust and committed. A
+      # Rust type that changed without its binding being regenerated means the
+      # ecosystem is compiling against a lie, so it is a build failure.
+      - name: TypeScript bindings are in sync with the Rust types
+        run: |
+          cargo test -p neosh-proto --quiet
+          if ! git diff --exit-code -- plugins/api/src/generated; then
+            echo "::error::generated TypeScript is out of date — run 'cargo test -p neosh-proto' and commit plugins/api/src/generated"
+            exit 1
+          fi
+
+  typescript:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: plugins/api/package-lock.json
+
+      - name: Install
+        working-directory: plugins/api
+        run: npm ci
+
+      # The generated types are the wire truth; the ergonomic layer sits on top.
+      - name: The plugin API type-checks against the generated types
+        working-directory: plugins/api
+        run: npx tsc --noEmit
+
+      - name: The example plugin type-checks against the published API
+        working-directory: examples/hello-plugin
+        run: ../../plugins/api/node_modules/.bin/tsc --noEmit
+
+      # The bundled plugins are the proof that the API is sufficient: they are
+      # written against exactly what a third party has. If one stops
+      # type-checking, either the API changed under it or it reached for
+      # something that is not public.
+      - name: The bundled plugins type-check against the published API
+        working-directory: plugins/builtin
+        run: ../api/node_modules/.bin/tsc --noEmit
+
+  scaffold:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: plugins/api/package-lock.json
+
+      - name: Install
+        working-directory: plugins/api
+        run: npm ci
+
+      # `neosh init` writes a starter config *and* the types it is checked
+      # against, both emitted from the binary. If the template drifts from the
+      # API, every new user's first experience is a type error.
+      - name: The scaffolded config type-checks against its own emitted types
+        run: |
+          scaffold="$(mktemp -d)"
+          cargo run --quiet -p neosh -- --config-dir "$scaffold" init
+          ./plugins/api/node_modules/.bin/tsc --noEmit --project "$scaffold/tsconfig.json"
