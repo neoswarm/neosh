@@ -1,0 +1,3 @@
+[env]
+# ts-rs writes every `#[ts(export)]` type here. Committed and drift-checked in CI.
+TS_RS_EXPORT_DIR = { value = "plugins/api/src/generated", relative = true }

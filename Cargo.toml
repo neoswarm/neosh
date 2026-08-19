@@ -1,0 +1,88 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/neosh-proto",
+    "crates/neosh-core",
+    "crates/neosh-provider",
+    "crates/neosh-vcs",
+    "crates/neosh-agent",
+    "crates/neosh-script",
+    "crates/neosh-tui",
+    "crates/neosh",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.90"
+license = "MIT"
+repository = "https://github.com/neosh-org/neosh"
+
+[workspace.dependencies]
+neosh-proto = { path = "crates/neosh-proto" }
+neosh-core = { path = "crates/neosh-core" }
+neosh-provider = { path = "crates/neosh-provider" }
+neosh-vcs = { path = "crates/neosh-vcs" }
+neosh-agent = { path = "crates/neosh-agent" }
+neosh-script = { path = "crates/neosh-script" }
+neosh-tui = { path = "crates/neosh-tui" }
+
+# async
+tokio = { version = "1.53", features = ["rt", "rt-multi-thread", "macros", "sync", "time", "process", "io-util", "fs", "signal"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+tokio-stream = "0.1"
+futures = "0.3"
+async-trait = "0.1"
+
+# serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.9"
+ts-rs = { version = "12", features = ["format", "serde-compat", "no-serde-warnings"] }
+
+# text
+unicode-width = "0.2"
+unicode-segmentation = "1.13"
+smallvec = { version = "1.15", features = ["union", "const_generics"] }
+
+# js runtime
+deno_core = "0.410"
+# Transpiles TypeScript plugins at load. This is the swc 17 line, which unlike the older one
+# pinned by rustyscript builds against current serde.
+deno_ast = { version = "0.53", features = ["transpiling"] }
+deno_error = "0.7"
+
+# tui
+ratatui = "0.30"
+crossterm = { version = "0.29", features = ["event-stream"] }
+
+# net
+reqwest = { version = "0.13", default-features = false, features = ["json", "stream", "rustls", "rustls-native-certs", "charset", "http2"] }
+eventsource-stream = "0.2"
+
+# util
+thiserror = "2"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+secrecy = { version = "0.10", features = ["serde"] }
+slotmap = "1.1"
+uuid = { version = "1", features = ["v4", "serde"] }
+clap = { version = "4", features = ["derive", "env"] }
+directories = "6"
+bytes = "1"
+pin-project-lite = "0.2"
+shellexpand = "3"
+# Content hashing for the project-config trust store.
+sha2 = "0.10"
+# Embeds the `@neosh/api` source tree so `neosh init` can emit types matching the running binary.
+include_dir = "0.7"
+
+# dev
+insta = { version = "1.48", features = ["json", "redactions"] }
+
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 2
