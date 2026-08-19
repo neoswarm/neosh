@@ -1,0 +1,740 @@
+//! Layout resolution and drawing.
+//!
+//! # Where display-width math lives
+//!
+//! Here, and nowhere else. The protocol carries UTF-8 *byte* offsets, so the core never touches
+//! `unicode-width` and cannot get column arithmetic wrong. Converting a byte offset to a screen
+//! column is a single function ([`display_col`]) that every caller goes through, which is what
+//! keeps CJK and emoji from corrupting layout the first time an agent emits them.
+//!
+//! # Where layout happens
+//!
+//! Also here. The core sends declarative geometry — a dock, or an anchor plus a preferred size —
+//! and [`resolve_layout`] turns that into rectangles against a real viewport. That is the split
+//! that lets a web frontend reuse the entire protocol.
+
+use neosh_proto::{
+    Anchor, Dock, Extent, LineRender, VirtTextPos, WindowId, WindowLayout,
+};
+use ratatui::layout::Rect;
+use ratatui::style::Style;
+use ratatui::text::{Line, Span};
+use ratatui::widgets::{Block, BorderType, Borders, Paragraph};
+use ratatui::Frame;
+use unicode_segmentation::UnicodeSegmentation;
+use unicode_width::UnicodeWidthStr;
+
+use crate::mirror::Mirror;
+use crate::theme::Theme;
+
+/// Screen columns occupied by `text`.
+pub fn width(text: &str) -> usize {
+    UnicodeWidthStr::width(text)
+}
+
+/// Convert a UTF-8 byte offset into a screen column.
+///
+/// Clamps to the nearest character boundary at or below `byte_col`, so a desynced or mid-codepoint
+/// offset degrades to a slightly-left position rather than panicking.
+pub fn display_col(text: &str, byte_col: usize) -> usize {
+    let mut b = byte_col.min(text.len());
+    while b > 0 && !text.is_char_boundary(b) {
+        b -= 1;
+    }
+    width(&text[..b])
+}
+
+/// Truncate to at most `max` screen columns without splitting a grapheme cluster.
+pub fn truncate_to_width(text: &str, max: usize) -> &str {
+    if width(text) <= max {
+        return text;
+    }
+    let mut used = 0;
+    let mut end = 0;
+    for (i, g) in text.grapheme_indices(true) {
+        let w = width(g);
+        if used + w > max {
+            end = i;
+            break;
+        }
+        used += w;
+        end = i + g.len();
+    }
+    &text[..end]
+}
+
+// ---------------------------------------------------------------------------
+// Lines
+// ---------------------------------------------------------------------------
+
+/// Break one rendered line into as many screen lines as it needs.
+///
+/// Not `Paragraph::wrap`: that reflows whitespace and rebuilds spans, which loses the correspondence
+/// between a span and the extmark that produced it — so a highlight ends up on the wrong columns the
+/// first time a line is long enough to matter. This splits at grapheme-cluster boundaries inside
+/// each span, carries the style across the break, and never splits a cluster.
+///
+/// Width is clamped to at least one column. A cluster too wide for that column — CJK at width 1,
+/// an emoji sequence in any narrow pane — still cannot fit, so it overflows onto a line of its
+/// own instead of being dropped. Every pass through the loop consumes at least one cluster, which
+/// is what stops a too-narrow pane from looping forever and exhausting memory.
+pub fn wrap_line(line: &Line<'static>, width_cols: usize) -> Vec<Line<'static>> {
+    let limit = width_cols.max(1);
+    let total: usize = line.spans.iter().map(|s| width(&s.content)).sum();
+    if total <= limit {
+        return vec![line.clone()];
+    }
+
+    let mut out: Vec<Line<'static>> = Vec::new();
+    let mut current: Vec<Span<'static>> = Vec::new();
+    let mut used = 0usize;
+
+    for span in &line.spans {
+        let style = span.style;
+        let mut text = span.content.as_ref();
+        while !text.is_empty() {
+            let room = limit - used;
+            if room == 0 {
+                out.push(Line::from(std::mem::take(&mut current)));
+                used = 0;
+                continue;
+            }
+            let head = truncate_to_width(text, room);
+            if head.is_empty() {
+                if used > 0 {
+                    // Something is on this line already — break, then retry the cluster against
+                    // a full-width line. `used` drops to 0, so the next pass has more room.
+                    out.push(Line::from(std::mem::take(&mut current)));
+                    used = 0;
+                    continue;
+                }
+                // The line is already empty and the cluster still does not fit, so it is wider
+                // than `limit` and no amount of breaking will ever make room for it. Give it a
+                // line of its own and advance past it: flushing again would leave `text`, `used`
+                // and `current` exactly as they are, and the loop would never terminate.
+                let cluster = text.graphemes(true).next().unwrap_or(text);
+                out.push(Line::from(Span::styled(cluster.to_string(), style)));
+                text = &text[cluster.len()..];
+                continue;
+            }
+            current.push(Span::styled(head.to_string(), style));
+            used += width(head);
+            text = &text[head.len()..];
+            if used >= limit && !text.is_empty() {
+                out.push(Line::from(std::mem::take(&mut current)));
+                used = 0;
+            }
+        }
+    }
+    if !current.is_empty() || out.is_empty() {
+        out.push(Line::from(current));
+    }
+    out
+}
+
+
+
+/// Render one buffer line, including any extra lines its annotations require.
+///
+/// `above` and `below` virtual text become their own screen lines, which is why this returns a
+/// vector: one buffer line is not always one screen line.
+pub fn render_line(line: &LineRender, theme: &Theme) -> Vec<Line<'static>> {
+    render_line_in(line, theme, None)
+}
+
+/// As [`render_line`], but knowing how wide the window is.
+///
+/// The width is only needed for [`VirtTextPos::Right`], which is the one annotation whose position
+/// depends on the pane rather than on the text. Passing `None` renders it as if it were `Eol`,
+/// which is what a caller with no viewport can honestly do.
+pub fn render_line_in(
+    line: &LineRender,
+    theme: &Theme,
+    window_width: Option<usize>,
+) -> Vec<Line<'static>> {
+    let mut out = Vec::new();
+    let visible: Vec<_> = line.marks.iter().collect();
+
+    let virt_lines = |pos: VirtTextPos| -> Vec<Line<'static>> {
+        visible
+            .iter()
+            .filter(|m| m.opts.virt_text_pos == pos && !m.opts.virt_text.is_empty())
+            .map(|m| {
+                Line::from(
+                    m.opts
+                        .virt_text
+                        .iter()
+                        .map(|c| {
+                            Span::styled(
+                                c.text.clone(),
+                                c.hl_group.as_deref().map(|g| theme.style(g)).unwrap_or_default(),
+                            )
+                        })
+                        .collect::<Vec<_>>(),
+                )
+            })
+            .collect()
+    };
+
+    out.extend(virt_lines(VirtTextPos::Above));
+
+    // Cut the line at every boundary an annotation introduces, then style each piece by the
+    // highest-priority range covering it.
+    let text = &line.text;
+    let mut cuts: Vec<usize> = vec![0, text.len()];
+    for m in &visible {
+        let col = (m.col as usize).min(text.len());
+        match m.opts.virt_text_pos {
+            VirtTextPos::Inline if !m.opts.virt_text.is_empty() => cuts.push(col),
+            _ => {}
+        }
+        if m.opts.hl_group.is_some() {
+            cuts.push(col);
+            if let Some(e) = m.opts.end_col {
+                cuts.push((e as usize).min(text.len()));
+            }
+        }
+    }
+    cuts.retain(|c| text.is_char_boundary(*c));
+    cuts.sort_unstable();
+    cuts.dedup();
+
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    for w in cuts.windows(2) {
+        let (a, b) = (w[0], w[1]);
+
+        // Inline virtual text is spliced in at its column, shifting real text right.
+        for m in visible.iter().filter(|m| {
+            m.opts.virt_text_pos == VirtTextPos::Inline
+                && !m.opts.virt_text.is_empty()
+                && (m.col as usize).min(text.len()) == a
+        }) {
+            for c in &m.opts.virt_text {
+                spans.push(Span::styled(
+                    c.text.clone(),
+                    c.hl_group.as_deref().map(|g| theme.style(g)).unwrap_or_default(),
+                ));
+            }
+        }
+
+        if a == b {
+            continue;
+        }
+        let style = visible
+            .iter()
+            .filter(|m| m.opts.hl_group.is_some())
+            .filter(|m| {
+                let s = (m.col as usize).min(text.len());
+                let e = m.opts.end_col.map(|e| (e as usize).min(text.len())).unwrap_or(s);
+                s <= a && b <= e && e > s
+            })
+            .max_by_key(|m| m.opts.priority)
+            .and_then(|m| m.opts.hl_group.as_deref())
+            .map(|g| theme.style(g))
+            .unwrap_or_else(Style::default);
+        spans.push(Span::styled(text[a..b].to_string(), style));
+    }
+
+    // Trailing annotations, then right-aligned ones.
+    //
+    // The order is the grammar: `Eol` means "after the text", `Right` means "at the edge". A row
+    // may carry both — a note beside what it says, and a status flush right — so the padding is
+    // computed after the trailing chunks are in, not before.
+    for m in visible.iter().filter(|m| m.opts.virt_text_pos == VirtTextPos::Eol) {
+        if m.opts.virt_text.is_empty() {
+            continue;
+        }
+        spans.push(Span::raw(" "));
+        for c in &m.opts.virt_text {
+            spans.push(Span::styled(
+                c.text.clone(),
+                c.hl_group.as_deref().map(|g| theme.style(g)).unwrap_or_default(),
+            ));
+        }
+    }
+
+    let right: Vec<Span<'static>> = visible
+        .iter()
+        .filter(|m| m.opts.virt_text_pos == VirtTextPos::Right)
+        .flat_map(|m| {
+            m.opts.virt_text.iter().map(|c| {
+                Span::styled(
+                    c.text.clone(),
+                    c.hl_group.as_deref().map(|g| theme.style(g)).unwrap_or_default(),
+                )
+            })
+        })
+        .collect();
+    if !right.is_empty() {
+        let used: usize = spans.iter().map(|s| width(&s.content)).sum();
+        let tail: usize = right.iter().map(|s| width(&s.content)).sum();
+        // Only pad when it actually fits. Padding past the edge would push the annotation onto the
+        // next row on a wrapping window, which is worse than simply following the text.
+        match window_width {
+            Some(w) if used + tail < w => spans.push(Span::raw(" ".repeat(w - used - tail))),
+            _ if used > 0 => spans.push(Span::raw(" ")),
+            _ => {}
+        }
+        spans.extend(right);
+    }
+
+    out.push(Line::from(spans));
+    out.extend(virt_lines(VirtTextPos::Below));
+    out
+}
+
+// ---------------------------------------------------------------------------
+// Layout
+// ---------------------------------------------------------------------------
+
+fn resolve_extent(e: Extent, content: u16, available: u16) -> u16 {
+    let v = match e {
+        Extent::Fixed { n } => n,
+        Extent::Auto => content,
+        Extent::Max { n } => content.min(n),
+        Extent::Fill => available,
+    };
+    v.clamp(1, available.max(1))
+}
+
+/// Turn declarative geometry into rectangles.
+///
+/// Docks are carved off the edges in a fixed order; whatever is left is `Main`. Floats are placed
+/// afterwards against their anchor, and clamped so a float can never be positioned off-screen —
+/// a plugin computing an offset from a stale viewport would otherwise render nothing at all.
+/// Columns of border drawn between a side dock and what is beside it.
+///
+/// One, and only for side docks. Text running straight from a panel into a transcript with no gap
+/// reads as one column of nonsense — the eye has nothing to stop at. A bottom dock needs no rule
+/// because a line break already separates it.
+const DOCK_RULE: u16 = 1;
+
+pub fn resolve_layout(mirror: &Mirror, area: Rect) -> Vec<(WindowId, Rect)> {
+    resolve_layout_with_rules(mirror, area).0
+}
+
+/// Layout, plus the columns where a separator should be drawn.
+pub fn resolve_layout_with_rules(
+    mirror: &Mirror,
+    area: Rect,
+) -> (Vec<(WindowId, Rect)>, Vec<Rect>) {
+    let mut out = Vec::new();
+    let mut rules: Vec<Rect> = Vec::new();
+    let mut main = area;
+
+    let dock_of = |w: &WindowId| match mirror.windows.get(w).map(|w| &w.layout) {
+        Some(WindowLayout::Docked { dock, size }) => Some((*dock, *size)),
+        _ => None,
+    };
+
+    for dock in [Dock::Left, Dock::Right, Dock::Bottom] {
+        // Every window on this edge, not just the first. Stacking them is what lets a status line
+        // sit under the composer, and what stops a plugin's panel from being silently invisible
+        // because something was already docked there.
+        let docked: Vec<WindowId> = mirror
+            .window_order
+            .iter()
+            .copied()
+            .filter(|w| dock_of(w).map(|d| d.0) == Some(dock))
+            .collect();
+
+        for win in docked {
+            let size = dock_of(&win).and_then(|d| d.1);
+            match dock {
+                Dock::Left | Dock::Right => {
+                    // At least one column has to survive for the main area, so a dock plus its rule
+                    // get at most `width - 1`. When even that is zero there is no room to split at
+                    // all, and the window is dropped rather than drawn over the only column there
+                    // is. The rule is the first thing given up when space runs short: a separator
+                    // that costs you the panel it separates is not a good trade.
+                    let avail = main.width.saturating_sub(1);
+                    if avail == 0 {
+                        continue;
+                    }
+                    let w = size.unwrap_or(main.width / 4).clamp(1, avail);
+                    let rule = if avail > w { DOCK_RULE } else { 0 };
+                    let (a, b) = if dock == Dock::Left {
+                        if rule > 0 {
+                            rules.push(Rect { x: main.x + w, width: 1, ..main });
+                        }
+                        (Rect { width: w, ..main }, Rect {
+                            x: main.x + w + rule,
+                            width: main.width - w - rule,
+                            ..main
+                        })
+                    } else {
+                        let edge = main.x + main.width - w;
+                        if rule > 0 {
+                            rules.push(Rect { x: edge - 1, width: 1, ..main });
+                        }
+                        (
+                            Rect { x: edge, width: w, ..main },
+                            Rect { width: main.width - w - rule, ..main },
+                        )
+                    };
+                    out.push((win, a));
+                    main = b;
+                }
+                Dock::Bottom => {
+                    let avail = main.height.saturating_sub(1);
+                    if avail == 0 {
+                        continue;
+                    }
+                    let h = size.unwrap_or(main.height / 4).clamp(1, avail);
+                    out.push((win, Rect { y: main.y + main.height - h, height: h, ..main }));
+                    main = Rect { height: main.height - h, ..main };
+                }
+                Dock::Main => {}
+            }
+        }
+    }
+
+    if let Some(win) = mirror.window_order.iter().find(|w| dock_of(w).map(|d| d.0) == Some(Dock::Main))
+    {
+        out.push((*win, main));
+    }
+
+    // Floats, in paint order so later entries draw on top.
+    for win in mirror.paint_order() {
+        let Some(w) = mirror.windows.get(&win) else { continue };
+        let WindowLayout::Float { config } = &w.layout else { continue };
+
+        let lines = mirror.buffers.get(&w.buf).map(|b| b.lines.len()).unwrap_or(0) as u16;
+        let longest = mirror
+            .buffers
+            .get(&w.buf)
+            .map(|b| b.lines.iter().map(|l| width(&l.text)).max().unwrap_or(0))
+            .unwrap_or(0) as u16;
+
+        let chrome = u16::from(config.border != neosh_proto::BorderStyle::None) * 2;
+        let cw = resolve_extent(config.width, longest.saturating_add(chrome), area.width);
+        let ch = resolve_extent(config.height, lines.saturating_add(chrome), area.height);
+
+        let (base_x, base_y) = match config.anchor {
+            Anchor::Screen => (
+                area.x + area.width.saturating_sub(cw) / 2,
+                area.y + area.height.saturating_sub(ch) / 2,
+            ),
+            Anchor::Cursor => {
+                // Anchored to the focused window's cursor, which is the only place the core needs
+                // realized geometry back from the frontend.
+                let anchor_win = mirror.focus.and_then(|f| mirror.windows.get(&f));
+                let (row, col) = anchor_win.map(|w| w.cursor).unwrap_or((0, 0));
+                let host = out
+                    .iter()
+                    .find(|(id, _)| Some(*id) == mirror.focus)
+                    .map(|(_, r)| *r)
+                    .unwrap_or(area);
+                (host.x + col.min(u16::MAX as u32) as u16, host.y + row.min(u16::MAX as u32) as u16 + 1)
+            }
+            Anchor::Window { win: target } => {
+                out.iter().find(|(id, _)| *id == target).map(|(_, r)| (r.x, r.y)).unwrap_or((area.x, area.y))
+            }
+        };
+
+        let x = (base_x as i64 + config.offset.col as i64)
+            .clamp(area.x as i64, (area.x + area.width).saturating_sub(cw) as i64) as u16;
+        let y = (base_y as i64 + config.offset.row as i64)
+            .clamp(area.y as i64, (area.y + area.height).saturating_sub(ch) as i64) as u16;
+
+        out.push((win, Rect { x, y, width: cw, height: ch }));
+    }
+
+    (out, rules)
+}
+
+// ---------------------------------------------------------------------------
+// Drawing
+// ---------------------------------------------------------------------------
+
+/// Draw one frame, and report where the caret belongs.
+///
+/// The caret is not decoration. Without one the composer gives no sign that typing goes anywhere,
+/// and a terminal program with no visible insertion point reads as frozen.
+pub fn draw(frame: &mut Frame, mirror: &Mirror, theme: &Theme) -> Option<(u16, u16)> {
+    let area = frame.area();
+    let (rects, rules) = resolve_layout_with_rules(mirror, area);
+
+    // Drawn before the windows so a float still covers it, and before content so nothing has to
+    // know the rule is there.
+    let rule_style = theme.style("Separator");
+    for r in &rules {
+        for y in r.y..r.y.saturating_add(r.height) {
+            if let Some(cell) = frame.buffer_mut().cell_mut((r.x, y)) {
+                cell.set_symbol("│");
+                cell.set_style(rule_style);
+            }
+        }
+    }
+    let order = mirror.paint_order();
+
+    for win in order {
+        let Some((_, rect)) = rects.iter().find(|(id, _)| *id == win) else { continue };
+        let Some(w) = mirror.windows.get(&win) else { continue };
+        let rect = *rect;
+        if rect.width == 0 || rect.height == 0 {
+            continue;
+        }
+
+        let (inner, block) = match &w.layout {
+            WindowLayout::Float { config } if config.border != neosh_proto::BorderStyle::None => {
+                let mut b = Block::default().borders(Borders::ALL).border_type(
+                    match config.border {
+                        neosh_proto::BorderStyle::Double => BorderType::Double,
+                        neosh_proto::BorderStyle::Thick => BorderType::Thick,
+                        neosh_proto::BorderStyle::Single => BorderType::Plain,
+                        _ => BorderType::Rounded,
+                    },
+                );
+                b = b.border_style(
+                    theme.style(config.border_hl.as_deref().unwrap_or("Float.Border")),
+                );
+                if let Some(t) = &config.title {
+                    b = b.title(Span::styled(t.clone(), theme.style("Float.Title")));
+                }
+                (b.inner(rect), Some(b))
+            }
+            _ => (rect, None),
+        };
+
+        // Floats are opaque: clear whatever is underneath, or the dock behind shows through.
+        if w.layout_is_float() {
+            frame.render_widget(ratatui::widgets::Clear, rect);
+        }
+        if let Some(b) = block {
+            frame.render_widget(b, rect);
+        }
+
+        // Wrapping is per window: the chat has to wrap or a long answer is silently cut off at the
+        // right edge, while the sidebar and the status line must clip or one long path would push
+        // everything below it off the screen.
+        let wraps = w.wraps();
+        let rendered: Vec<Line> = mirror
+            .buffers
+            .get(&w.buf)
+            .map(|b| {
+                b.lines
+                    .iter()
+                    .skip(w.top_line as usize)
+                    .flat_map(|l| render_line_in(l, theme, Some(inner.width as usize)))
+                    .flat_map(|l| {
+                        if wraps { wrap_line(&l, inner.width as usize) } else { vec![l] }
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        // Follow the tail. Taking the *first* n lines shows a long conversation's opening and
+        // never its answer, which is the wrong end of every transcript ever written. An explicit
+        // `top_line` still means "start here", so paging keeps working.
+        let height = inner.height as usize;
+        let lines: Vec<Line> = if w.follows_tail() && w.top_line == 0 && rendered.len() > height {
+            rendered[rendered.len() - height..].to_vec()
+        } else {
+            rendered.into_iter().take(height).collect()
+        };
+
+        frame.render_widget(Paragraph::new(lines).style(theme.style("Normal")), inner);
+    }
+
+    draw_notifications(frame, area, mirror, theme);
+
+    // Raw-cell surfaces blit last: a plugin claimed those cells and owns them outright.
+    let caret = caret_position(mirror, &rects, theme);
+
+    for surface in mirror.surfaces.values() {
+        let Some((_, host)) = rects.iter().find(|(id, _)| *id == surface.win) else { continue };
+        for cell in &surface.cells {
+            let x = host.x + surface.rect.col + cell.col;
+            let y = host.y + surface.rect.row + cell.row;
+            if x >= host.x + host.width || y >= host.y + host.height {
+                continue;
+            }
+            if let Some(target) = frame.buffer_mut().cell_mut((x, y)) {
+                target.set_symbol(&cell.grapheme);
+                if let Some(fg) = cell.fg {
+                    target.set_fg(theme.color(fg));
+                }
+                if let Some(bg) = cell.bg {
+                    target.set_bg(theme.color(bg));
+                }
+                target.set_style(Style::default().add_modifier(crate::theme::modifiers(&cell.attrs)));
+            }
+        }
+    }
+
+    caret
+}
+
+/// Where the caret goes, in screen cells.
+///
+/// The focused window if there is one, else the bottom-most docked window — which is the composer,
+/// and is where typing lands when nothing else has claimed the keyboard. Returns `None` when the
+/// target is off-screen, so the caller hides it rather than parking it in a corner.
+fn caret_position(
+    mirror: &Mirror,
+    rects: &[(WindowId, Rect)],
+    theme: &Theme,
+) -> Option<(u16, u16)> {
+    let target = mirror.focus.or_else(|| {
+        // The composer: the last docked-bottom window, matching how the host stacks them.
+        rects
+            .iter()
+            .filter(|(id, _)| {
+                mirror
+                    .windows
+                    .get(id)
+                    .is_some_and(|w| matches!(w.layout, WindowLayout::Docked { dock: Dock::Bottom, .. }))
+            })
+            .min_by_key(|(_, r)| r.y)
+            .map(|(id, _)| *id)
+    })?;
+
+    let (_, rect) = rects.iter().find(|(id, _)| *id == target)?;
+    let w = mirror.windows.get(&target)?;
+    let inner = if w.layout_is_float() {
+        // Inside the border, when there is one.
+        let has_border = matches!(&w.layout, WindowLayout::Float { config }
+            if !matches!(config.border, neosh_proto::BorderStyle::None));
+        if has_border {
+            Rect {
+                x: rect.x.saturating_add(1),
+                y: rect.y.saturating_add(1),
+                width: rect.width.saturating_sub(2),
+                height: rect.height.saturating_sub(2),
+            }
+        } else {
+            *rect
+        }
+    } else {
+        *rect
+    };
+    if inner.width == 0 || inner.height == 0 {
+        return None;
+    }
+
+    let (row, col) = w.cursor;
+    let buffer = mirror.buffers.get(&w.buf)?;
+    let text = buffer.lines.get(row as usize).map(|l| l.text.as_str()).unwrap_or("");
+    // Byte offset to screen column happens here, and only here — the same conversion every mark
+    // goes through, so a cursor after an emoji lands where the emoji ends.
+    let mut column = display_col(text, col as usize) as u16;
+
+    // Saturating throughout: a row far below `top_line` must clamp to "off-screen" rather than
+    // wrap around into a plausible-looking coordinate.
+    let mut line = u16::try_from(row.saturating_sub(w.top_line)).unwrap_or(u16::MAX);
+    if w.wraps() {
+        // On a wrapped line the caret moves down as well as along.
+        line = line.saturating_add(column / inner.width);
+        column %= inner.width;
+    }
+    let _ = theme;
+
+    if line >= inner.height || column >= inner.width {
+        return None;
+    }
+    Some((inner.x + column, inner.y + line))
+}
+
+/// How long a notification stays on screen.
+///
+/// There is no frame loop, so nothing repaints purely to expire one: a message outlives its welcome
+/// until the next real mutation. That is the honest trade for having no timer — and in a session
+/// where anything at all is happening, the next frame is milliseconds away.
+const NOTIFICATION_TTL: std::time::Duration = std::time::Duration::from_secs(6);
+
+/// The most recent notifications, above the bottom-most content.
+///
+/// Without this every `neosh.notify` — including the host's own "press ^C again to quit" — is
+/// collected, capped, and never shown. A program whose only feedback channel is invisible is a
+/// program that appears not to respond.
+fn draw_notifications(frame: &mut Frame, area: Rect, mirror: &Mirror, theme: &Theme) {
+    const MAX: usize = 3;
+
+    let live: Vec<_> = mirror
+        .messages
+        .iter()
+        .rev()
+        .filter(|(_, _, at)| at.elapsed() < NOTIFICATION_TTL)
+        .take(MAX)
+        .collect();
+    if live.is_empty() || area.height == 0 {
+        return;
+    }
+
+    // Right-aligned, hugging the bottom, so it overlays chrome rather than reflowing it: a message
+    // that pushed the composer down would move the thing the user is typing into.
+    let rows = (live.len() as u16).min(area.height);
+    let widest = live
+        .iter()
+        .map(|(_, text, _)| width(text) + 2)
+        .max()
+        .unwrap_or(0)
+        .min(area.width as usize) as u16;
+    if widest == 0 {
+        return;
+    }
+    let rect = Rect {
+        x: area.x + area.width.saturating_sub(widest),
+        y: area.y + area.height.saturating_sub(rows + 1),
+        width: widest,
+        height: rows,
+    };
+
+    frame.render_widget(ratatui::widgets::Clear, rect);
+    // Newest at the bottom, older above it and dimmed — the same ordering as the toast stack it
+    // replaces, without the choreography.
+    let lines: Vec<Line> = live
+        .iter()
+        .rev()
+        .enumerate()
+        .map(|(i, (level, text, _))| {
+            let group = match level {
+                neosh_proto::MessageLevel::Error => "Diagnostic.Error",
+                neosh_proto::MessageLevel::Warn => "Diagnostic.Warn",
+                neosh_proto::MessageLevel::Info => "Diagnostic.Info",
+            };
+            let mut style = theme.style(group);
+            if i + 1 < live.len() {
+                style = style.add_modifier(ratatui::style::Modifier::DIM);
+            }
+            Line::from(Span::styled(
+                format!(" {} ", truncate_to_width(text, widest.saturating_sub(2) as usize)),
+                style,
+            ))
+        })
+        .collect();
+    frame.render_widget(Paragraph::new(lines), rect);
+}
+
+trait LayoutExt {
+    fn layout_is_float(&self) -> bool;
+    /// Whether long lines wrap rather than clip.
+    fn wraps(&self) -> bool;
+    /// Whether an over-long buffer shows its end rather than its beginning.
+    fn follows_tail(&self) -> bool;
+}
+
+impl LayoutExt for crate::mirror::MirrorWindow {
+    fn layout_is_float(&self) -> bool {
+        matches!(self.layout, WindowLayout::Float { .. })
+    }
+
+    /// Prose wraps; everything else clips.
+    ///
+    /// Only the main dock. A side panel that wrapped a long path would reflow every row below it, a
+    /// status line that wrapped would eat the screen, and a picker that wrapped would push its own
+    /// last row off the bottom. A float that genuinely wants wrapped prose knows its own width —
+    /// it set it — and can wrap its text before writing it.
+    fn wraps(&self) -> bool {
+        matches!(self.layout, WindowLayout::Docked { dock: Dock::Main, .. })
+    }
+
+    /// Whether an over-long buffer shows its end rather than its beginning.
+    ///
+    /// A transcript does; a list does not. Tail-following a picker would hide its title and filter
+    /// line, which are the two rows it cannot do without.
+    fn follows_tail(&self) -> bool {
+        matches!(self.layout, WindowLayout::Docked { dock: Dock::Main, .. })
+    }
+}

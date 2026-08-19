@@ -1,0 +1,9 @@
+---
+source: crates/neosh-tui/tests/rendering.rs
+expression: "rendered.join(\"\\n\")"
+---
+background text here
+background text here
+backgro╭Pick──────────╮
+backgro│picker (1/3)  │
+backgro╰──────────────╯
