@@ -1,0 +1,8 @@
+name = "hello"
+version = "0.1.0"
+entry = "main.ts"
+description = "Exercises every part of the Phase 0 plugin boundary. Doubles as a regression test."
+
+# Declared up front. Phase 0 records and reports these; enforcement lands with sandboxing, and
+# declaring them now means the manifest format does not change when it does.
+permissions = ["tools", "hooks_blocking", "providers"]
