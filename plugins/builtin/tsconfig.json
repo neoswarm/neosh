@@ -1,0 +1,19 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "lib": ["ES2022"],
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "noEmit": true,
+    "skipLibCheck": true,
+    "verbatimModuleSyntax": true,
+    "allowImportingTsExtensions": true,
+    "paths": {
+      "@neosh/api": ["../api/src/index.ts"],
+      "@neosh/api/ui": ["../api/src/ui.ts"]
+    }
+  },
+  "include": ["*/main.ts", "../api/src/globals.d.ts"]
+}

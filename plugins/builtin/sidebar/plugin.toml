@@ -1,0 +1,4 @@
+name = "sidebar"
+version = "0.1.0"
+entry = "main.ts"
+description = "A docked panel: where you are, what changed, and what is answering."
