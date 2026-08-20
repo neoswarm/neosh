@@ -96,8 +96,17 @@ impl Session {
     }
 
     pub fn push_assistant(&mut self, msg: Message) {
-        // An assistant turn that produced nothing is not worth replaying, and some providers
-        // reject an empty content array outright.
+        self.push_message(msg);
+    }
+
+    /// Record a message a turn produced, whichever role it belongs to.
+    ///
+    /// A driver that runs its own loop produces both — assistant, then the tool results as a user
+    /// message, then assistant again — so "the assistant message" is not the shape of what comes
+    /// back any more.
+    pub fn push_message(&mut self, msg: Message) {
+        // A turn that produced nothing is not worth replaying, and some providers reject an empty
+        // content array outright.
         if !msg.content.is_empty() {
             self.messages.push(msg);
         }

@@ -302,7 +302,7 @@ impl Provider for ClaudeCliProvider {
                                     *session.lock().expect("session lock poisoned") =
                                         Some(id.to_string());
                                 }
-                                if let Some(ev) = sse::claude_cli_line(&v) {
+                                for ev in sse::claude_cli_line(&v) {
                                     saw_stop |= matches!(ev, ProviderEvent::MessageStop);
                                     if tx.send(ev).await.is_err() {
                                         // Receiver dropped: the turn was abandoned.

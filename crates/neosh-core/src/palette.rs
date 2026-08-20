@@ -198,6 +198,12 @@ pub fn groups(variant: Variant) -> Vec<(&'static str, HighlightDef)> {
         ("Agent.Tool", spec(fg(r.active))),
         ("Agent.ToolError", spec(bold(fg(r.danger)))),
         ("Agent.Usage", spec(dim(fg(r.muted)))),
+        // The dot beside a tool call, which is the only place in the transcript that says whether
+        // something is still happening. Pulsing while it runs and settling into a colour when it is
+        // over: a call that stopped moving is a call you can stop watching.
+        ("Agent.ToolRunning", spec(pulse(fg(r.attention), 2600))),
+        ("Agent.ToolDone", spec(fg(r.success))),
+        ("Agent.ToolFailed", spec(bold(fg(r.danger)))),
         // ---- markdown -----------------------------------------------------
         // An answer is prose with structure in it, and the structure should be visible without
         // being loud: the thing being read is the words. Hence one accent for headings and links,

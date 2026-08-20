@@ -2691,6 +2691,84 @@ export async function activate({ neosh }: PluginContext) {
 }
 "#;
 
+/// A provider that says something and then never finishes — the shape of a real turn that has
+/// written a sentence and gone off to run tools.
+const HALFWAY: &str = r#"
+import type { PluginContext } from "@neosh/api";
+
+export async function activate({ neosh }: PluginContext) {
+  await neosh.provider.register("half", [{
+    id: "half", driver: "half", display_name: "Half",
+    models: [{ id: "half", display_name: "Half" }],
+  }], async (_req, emit) => {
+    emit({ type: "message_start", model: "half", usage: {} });
+    emit({ type: "block_start", index: 0, block: { kind: "text" } });
+    emit({ type: "text_delta", index: 0, text: "Here is what I found so far." });
+    // And then nothing, ever. The turn stays in flight with an answer already on screen.
+  });
+  neosh.notify("half ready");
+}
+"#;
+
+/// A tool that succeeds with several lines, and a model that calls it once.
+///
+/// The built-in fixture's tools all fail, and a failure is the one case that ignores the limit —
+/// so proving the limit does anything needs a call that works.
+const CHATTY: &str = r#"
+import type { PluginContext } from "@neosh/api";
+
+export async function activate({ neosh }: PluginContext) {
+  await neosh.tool.register(
+    { name: "count", description: "Count", inputSchema: { type: "object" } },
+    async () => ({ content: "one\ntwo\nthree\nfour\nfive" }),
+  );
+  let asked = false;
+  await neosh.provider.register("chatty", [{
+    id: "chatty", driver: "chatty", display_name: "Chatty",
+    models: [{ id: "chatty", display_name: "Chatty" }],
+  }], async (_req, emit) => {
+    emit({ type: "message_start", model: "chatty", usage: {} });
+    if (!asked) {
+      asked = true;
+      emit({ type: "block_start", index: 0, block: { kind: "tool_use", id: "c1", name: "count" } });
+      emit({ type: "tool_input_delta", index: 0, partial_json: "{}" });
+      emit({ type: "block_stop", index: 0 });
+      emit({ type: "message_delta", stop_reason: { kind: "tool_use" }, usage: {} });
+      emit({ type: "message_stop" });
+      return;
+    }
+    emit({ type: "block_start", index: 0, block: { kind: "text" } });
+    emit({ type: "text_delta", index: 0, text: "Counted." });
+    emit({ type: "block_stop", index: 0 });
+    emit({ type: "message_delta", stop_reason: { kind: "end_turn" }, usage: {} });
+    emit({ type: "message_stop" });
+  });
+  neosh.notify("chatty ready");
+}
+"#;
+
+fn install_chatty(sb: &Sandbox) {
+    let dir = sb.root.join("config/plugins/chatty");
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    std::fs::write(
+        dir.join("plugin.toml"),
+        "name = \"chatty\"\nversion = \"0.1.0\"\nentry = \"main.ts\"\npermissions = [\"providers\", \"tools\"]\n",
+    )
+    .expect("manifest");
+    std::fs::write(dir.join("main.ts"), CHATTY).expect("plugin");
+}
+
+fn install_halfway(sb: &Sandbox) {
+    let dir = sb.root.join("config/plugins/half");
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    std::fs::write(
+        dir.join("plugin.toml"),
+        "name = \"half\"\nversion = \"0.1.0\"\nentry = \"main.ts\"\npermissions = [\"providers\"]\n",
+    )
+    .expect("manifest");
+    std::fs::write(dir.join("main.ts"), HALFWAY).expect("plugin");
+}
+
 fn install_stall(sb: &Sandbox) {
     let dir = sb.root.join("config/plugins/stall");
     std::fs::create_dir_all(&dir).expect("mkdir");
@@ -3291,7 +3369,16 @@ fn a_rendered_answer_looks_the_same_after_switching_away_and_back() {
     s.wait_for("PROJECTS");
     s.type_text("tell me");
     s.enter();
-    assert!(s.pump(|s| s.chat_now().iter().any(|l| l == "That is all.")), "the answer finished");
+    // Not just "the last words arrived" — the working line is still down there until the turn
+    // actually ends, and it is not part of the answer being compared.
+    assert!(
+        s.pump(|s| {
+            let rows = s.chat_now();
+            rows.iter().any(|l| l == "That is all.")
+                && !rows.iter().any(|l| l.contains("esc to interrupt"))
+        }),
+        "the turn finished"
+    );
     let live: Vec<String> = s.chat_now().into_iter().filter(|l| !l.trim().is_empty()).collect();
 
     s.send(&command("session.new"));
@@ -3577,6 +3664,96 @@ fn a_question_gets_a_gap_above_it_and_keeps_its_bar() {
 }
 
 #[test]
+fn a_tool_calls_dot_says_whether_it_is_still_going() {
+    // The only thing in the transcript that says whether something is still happening. Colour
+    // rather than shape, because a glyph that changes to mean "finished" makes the column
+    // impossible to scan — and a dot that never stops pulsing is a tool that looks hung.
+    let sb = Sandbox::new("tooldot");
+    let mut s = sb.start();
+    s.wait_for("PROJECTS");
+    s.key("h");
+    s.enter();
+    assert!(
+        s.pump(|s| {
+            let rows = s.chat_now();
+            let Some(at) = rows.iter().position(|l| l.contains("read_file(.env)")) else {
+                return false;
+            };
+            // Failed, because `.env` is not there — which is the point: the dot reports how it
+            // went, not merely that it is over.
+            s.chat_groups().get(at).is_some_and(|g| g.iter().any(|h| h == "Agent.ToolFailed"))
+        }),
+        "the dot beside a finished call says how it went\n{:?}\n{:?}",
+        s.chat_now(),
+        s.chat_groups()
+    );
+}
+
+#[test]
+fn a_turn_that_has_already_said_something_still_says_it_is_working() {
+    // The bug this fixes: the first token took the working line away and nothing put it back, so
+    // a turn that had written a sentence and then went off to run tools looked finished in the
+    // chat while the footer and the sidebar both said it was still going.
+    let sb = Sandbox::new("stillworking");
+    install_halfway(&sb);
+    sb.write_config("[options]\n\"agent.model\" = \"half/half\"\n");
+    let mut s = sb.start_letting_config_choose();
+    s.wait_for("half ready");
+
+    s.type_text("go");
+    s.enter();
+
+    assert!(
+        s.pump(|s| {
+            let rows = s.chat_now();
+            rows.iter().any(|l| l.contains("what I found so far"))
+                && rows.iter().any(|l| l.contains("esc to interrupt"))
+        }),
+        "the answer is on screen and so is the fact that it is not finished\n{:?}",
+        s.chat_now()
+    );
+    // And in that order: a spinner above the sentence it is producing says the wrong thing about
+    // which of them is still happening.
+    let rows = s.chat_now();
+    let said = rows.iter().position(|l| l.contains("what I found so far")).expect("the answer");
+    let spinner = rows.iter().position(|l| l.contains("esc to interrupt")).expect("the line");
+    assert!(spinner > said, "the working line is under the answer\n{rows:?}");
+}
+
+#[test]
+fn how_much_of_a_tool_result_to_show_is_a_setting() {
+    // Three lines is a default, not a law. `0` is the other end of it: how much came back, and
+    // nothing else.
+    let sb = Sandbox::new("toollines");
+    install_chatty(&sb);
+    sb.write_config(
+        "[options]\n\"agent.model\" = \"chatty/chatty\"\n\"chat.tool_output_lines\" = 2\n",
+    );
+    let mut s = sb.start_letting_config_choose();
+    s.wait_for("chatty ready");
+    s.type_text("go");
+    s.enter();
+
+    assert!(
+        s.pump(|s| s.chat_now().iter().any(|l| l.contains("Counted."))),
+        "the turn finished\n{:?}",
+        s.chat_now()
+    );
+    let rows = s.chat_now();
+    assert!(rows.iter().any(|l| l.contains("one")), "the first line is there\n{rows:?}");
+    assert!(rows.iter().any(|l| l.contains("two")), "and the second\n{rows:?}");
+    assert!(
+        !rows.iter().any(|l| l.contains("three")),
+        "and the setting stopped it there\n{rows:?}"
+    );
+    assert!(
+        rows.iter().any(|l| l.contains("+3 more lines")),
+        "saying how much was left out, because a result that is silently cut is a result you \
+         would believe\n{rows:?}"
+    );
+}
+
+#[test]
 fn a_tool_call_says_what_came_back_not_only_that_it_ran() {
     // A card that names the tool and nothing else is a card you have to take on trust, and "it
     // ran" is not the thing you wanted to know.
@@ -3586,12 +3763,12 @@ fn a_tool_call_says_what_came_back_not_only_that_it_ran() {
     s.type_text("go");
     s.enter();
     assert!(
-        s.pump(|s| s.chat_now().iter().any(|l| l.contains("read_file  .env"))),
+        s.pump(|s| s.chat_now().iter().any(|l| l.contains("read_file(.env)"))),
         "the call is shown with its subject\n{:?}",
         s.chat_now()
     );
     assert!(
-        s.pump(|s| s.chat_now().iter().any(|l| l.trim_start().starts_with('\u{2717}')
+        s.pump(|s| s.chat_now().iter().any(|l| l.contains('\u{23bf}')
             && l.contains("could not read"))),
         "and what it came back with, under it\n{:?}",
         s.chat_now()

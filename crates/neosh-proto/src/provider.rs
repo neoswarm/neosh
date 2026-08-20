@@ -641,6 +641,18 @@ pub enum ProviderEvent {
         usage: Usage,
     },
     MessageStop,
+    /// A tool call came back.
+    ///
+    /// No model API sends this: the model *asks* for a tool and the client answers. An agent
+    /// driver is both ends at once — the CLI runs its own loop — so it is the only thing that can
+    /// report a call finishing. Without it a delegating driver's transcript shows every call and
+    /// not one result, which reads as a tool that hung.
+    ToolResult {
+        id: ToolCallId,
+        content: String,
+        #[serde(default)]
+        is_error: bool,
+    },
     /// Transport or provider error. Terminal for the stream.
     Error {
         message: String,

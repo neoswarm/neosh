@@ -154,21 +154,64 @@ fn str_at(v: &Value, key: &str) -> Option<String> {
 ///
 /// The CLI multiplexes several event families on one stream; only `stream_event` carries model
 /// output, and its `event` field is the raw Anthropic SSE payload.
-pub fn claude_cli_line(v: &Value) -> Option<ProviderEvent> {
-    match v.get("type")?.as_str()? {
-        "stream_event" => anthropic(v.get("event")?),
+pub fn claude_cli_line(v: &Value) -> Vec<ProviderEvent> {
+    let Some(kind) = v.get("type").and_then(Value::as_str) else { return Vec::new() };
+    match kind {
+        "stream_event" => v.get("event").and_then(anthropic).into_iter().collect(),
+        // The CLI runs its own tools, and reports each result as a user message carrying
+        // `tool_result` blocks. Dropping these leaves a transcript full of calls and no answers,
+        // which reads as a tool that hung — so they are the other half of the stream, not chatter.
+        "user" => tool_results(v.get("message").unwrap_or(&Value::Null)),
         // A `result` with is_error signals the CLI itself failed (auth, spawn, quota).
         "result" if v.get("is_error").and_then(Value::as_bool) == Some(true) => {
-            Some(ProviderEvent::Error {
+            vec![ProviderEvent::Error {
                 message: v
                     .get("result")
                     .and_then(Value::as_str)
                     .unwrap_or("claude CLI reported an error")
                     .to_string(),
                 retryable: false,
-            })
+            }]
         }
-        _ => None,
+        _ => Vec::new(),
+    }
+}
+
+/// The `tool_result` blocks of a message, if it has any.
+///
+/// `content` is a string for most tools and a block array for the ones that return images, so both
+/// are read; a result nobody can render as text still counts as a result that arrived.
+fn tool_results(message: &Value) -> Vec<ProviderEvent> {
+    let Some(blocks) = message.get("content").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    blocks
+        .iter()
+        .filter(|b| b.get("type").and_then(Value::as_str) == Some("tool_result"))
+        .filter_map(|b| {
+            let id = b.get("tool_use_id").and_then(Value::as_str)?;
+            Some(ProviderEvent::ToolResult {
+                id: ToolCallId(id.to_string()),
+                content: result_text(b.get("content")),
+                is_error: b.get("is_error").and_then(Value::as_bool).unwrap_or(false),
+            })
+        })
+        .collect()
+}
+
+fn result_text(content: Option<&Value>) -> String {
+    match content {
+        Some(Value::String(s)) => s.clone(),
+        Some(Value::Array(blocks)) => blocks
+            .iter()
+            .filter_map(|b| match b.get("type").and_then(Value::as_str) {
+                Some("text") => b.get("text").and_then(Value::as_str).map(str::to_string),
+                Some(other) => Some(format!("[{other}]")),
+                None => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n"),
+        _ => String::new(),
     }
 }
 
@@ -452,7 +495,7 @@ mod tests {
     fn parses_real_claude_cli_output() {
         let events: Vec<ProviderEvent> = REAL_CLI_LINES
             .iter()
-            .filter_map(|l| claude_cli_line(&serde_json::from_str(l).unwrap()))
+            .flat_map(|l| claude_cli_line(&serde_json::from_str(l).unwrap()))
             .collect();
 
         assert!(matches!(events[0], ProviderEvent::MessageStart { .. }));
@@ -474,7 +517,7 @@ mod tests {
     #[test]
     fn message_start_carries_cache_usage() {
         let v: Value = serde_json::from_str(REAL_CLI_LINES[0]).unwrap();
-        let ProviderEvent::MessageStart { usage, model } = claude_cli_line(&v).unwrap() else {
+        let [ProviderEvent::MessageStart { usage, model }] = &claude_cli_line(&v)[..] else {
             panic!("expected MessageStart");
         };
         assert_eq!(usage.cache_read_tokens, 12078);
