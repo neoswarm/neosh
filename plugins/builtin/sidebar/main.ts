@@ -20,6 +20,7 @@
  * off, and a sidebar of your own loads after this one and wins.
  */
 
+import { byteLength } from "@neosh/api";
 import type { Disposable, Neosh, PluginContext, SessionInfo, WindowId, WorktreeInfo } from "@neosh/api";
 import {
   confirmDestructive,
@@ -952,12 +953,14 @@ function projectRow(
       : { text: "" };
 
   // The heart sits before the fold arrow rather than after the name: it is what you scan the
-  // column for, and a marker at the ragged right edge is not a column.
+  // column for, and a marker at the ragged right edge is not a column. It gets its own highlight
+  // because a heart is red — a grey one reads as a heart that has stopped.
   const heart = p.favorite ? (opts.ascii ? "*" : "♥") : " ";
 
   return {
     text: ` ${heart} ${arrow} ${clip(p.name, opts.width - 8)}`,
     hl: here ? "Directory" : "Sidebar.Dim",
+    spans: p.favorite ? [{ from: 1, to: 1 + byteLength(heart), hl: "Sidebar.Favorite" }] : undefined,
     right,
     value: { kind: "project", cwd: p.cwd },
   };

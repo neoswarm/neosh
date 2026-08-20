@@ -17,4 +17,12 @@ export type WindowLayout = {
    * Which end content settles against when there is not enough of it to fill the window.
    */
   gravity: Gravity;
+  /**
+   * Whether long lines wrap rather than clip. The main dock always wraps; every other dock
+   * clips unless it says otherwise, because a text field is the only chrome whose content
+   * is prose. A bottom dock that wraps also grows to fit what wrapped, `size` becoming its
+   * floor — a field that wraps a long line and then hides the wrapped rows has clipped it
+   * with extra steps.
+   */
+  wrap?: boolean | null;
 } | { "kind": "float"; config: FloatConfig };

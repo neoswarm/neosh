@@ -164,6 +164,13 @@ pub enum WindowLayout {
         /// Which end content settles against when there is not enough of it to fill the window.
         #[serde(default)]
         gravity: Gravity,
+        /// Whether long lines wrap rather than clip. The main dock always wraps; every other dock
+        /// clips unless it says otherwise, because a text field is the only chrome whose content
+        /// is prose. A bottom dock that wraps also grows to fit what wrapped, `size` becoming its
+        /// floor — a field that wraps a long line and then hides the wrapped rows has clipped it
+        /// with extra steps.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        wrap: Option<bool>,
     },
     Float {
         config: FloatConfig,

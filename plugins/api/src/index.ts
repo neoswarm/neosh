@@ -353,11 +353,16 @@ export interface WindowApi {
    * `gravity` is which end short content settles against: `"start"` (the default) pins it to the
    * top, `"end"` to the bottom, which is what makes a transcript read as a conversation rather
    * than as a document that happens to be in a window.
+   *
+   * `wrap` makes long lines fold rather than clip. Docks clip by default — a side panel that
+   * wrapped a long path would reflow every row below it — but a text field is prose and wants
+   * this on. A bottom dock that wraps also grows to show the folded rows, `size` acting as its
+   * floor.
    */
   open(
     buf: BufferId,
     dock: Dock,
-    opts?: { size?: number; gravity?: Gravity },
+    opts?: { size?: number; gravity?: Gravity; wrap?: boolean },
   ): Promise<WindowId>;
   close(win: WindowId): Promise<void>;
   setBuf(win: WindowId, buf: BufferId): Promise<void>;
@@ -1081,6 +1086,7 @@ export function __createContext(plugin: string, config: unknown, version: number
           dock,
           size: opts?.size ?? null,
           gravity: opts?.gravity ?? "start",
+          wrap: opts?.wrap ?? null,
         };
         return expect(await c({ call: "win_open", buf, layout }), "win").win;
       },

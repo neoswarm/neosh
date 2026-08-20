@@ -400,7 +400,29 @@ pub fn resolve_layout_with_rules(
                     if avail == 0 {
                         continue;
                     }
-                    let h = size.unwrap_or(main.height / 4).clamp(1, avail);
+                    let base = size.unwrap_or(main.height / 4);
+                    // A wrapping bottom dock grows to fit what wrapped, its declared size becoming
+                    // a floor: folding a long prompt and then hiding the folded rows would be
+                    // clipping with extra steps. Capped at half of what is left, because the
+                    // transcript above is the thing the prompt is answering.
+                    //
+                    // Counted with a bare theme rather than the live one, so layout does not need
+                    // the styling pipeline threaded through it: colours cannot change how many
+                    // rows a line folds into — only the text and the window's width can.
+                    let h = match mirror.windows.get(&win) {
+                        Some(w) if w.wraps() => {
+                            let rows = rendered_lines(
+                                mirror,
+                                w,
+                                &Theme::new(crate::theme::ColorDepth::Ansi16),
+                                main.width,
+                            )
+                            .len() as u16;
+                            rows.clamp(base, (avail / 2).max(base))
+                        }
+                        _ => base,
+                    };
+                    let h = h.clamp(1, avail);
                     out.push((win, Rect { y: main.y + main.height - h, height: h, ..main }));
                     main = Rect { height: main.height - h, ..main };
                 }
@@ -827,12 +849,17 @@ impl LayoutExt for crate::mirror::MirrorWindow {
 
     /// Prose wraps; everything else clips.
     ///
-    /// Only the main dock. A side panel that wrapped a long path would reflow every row below it, a
-    /// status line that wrapped would eat the screen, and a picker that wrapped would push its own
-    /// last row off the bottom. A float that genuinely wants wrapped prose knows its own width —
-    /// it set it — and can wrap its text before writing it.
+    /// The main dock always, and any dock that asked. By default a side panel clips because a long
+    /// path would reflow every row below it, and a status line clips because wrapping would eat the
+    /// screen — but a text field like the composer is prose, and it opts in with `wrap`. A float
+    /// that genuinely wants wrapped prose knows its own width — it set it — and can wrap its text
+    /// before writing it.
     fn wraps(&self) -> bool {
-        matches!(self.layout, WindowLayout::Docked { dock: Dock::Main, .. })
+        matches!(
+            self.layout,
+            WindowLayout::Docked { dock: Dock::Main, .. }
+                | WindowLayout::Docked { wrap: Some(true), .. }
+        )
     }
 
     /// Whether an over-long buffer shows its end rather than its beginning.

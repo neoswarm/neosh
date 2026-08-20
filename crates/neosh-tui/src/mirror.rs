@@ -299,7 +299,7 @@ mod tests {
         m.apply(UiEvent::WindowOpened {
             win: WindowId(1),
             buf: BufferId(1),
-            layout: WindowLayout::Docked { dock: Dock::Main, size: None, gravity: Gravity::Start },
+            layout: WindowLayout::Docked { dock: Dock::Main, size: None, gravity: Gravity::Start, wrap: None },
         });
         let float = |z: i32| WindowLayout::Float {
             config: FloatConfig {
@@ -321,7 +321,7 @@ mod tests {
         m.apply(UiEvent::WindowOpened {
             win: WindowId(1),
             buf: BufferId(1),
-            layout: WindowLayout::Docked { dock: Dock::Main, size: None, gravity: Gravity::Start },
+            layout: WindowLayout::Docked { dock: Dock::Main, size: None, gravity: Gravity::Start, wrap: None },
         });
         m.apply(UiEvent::SurfaceClaimed {
             surface: SurfaceId(1),
