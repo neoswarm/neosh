@@ -139,6 +139,16 @@ pub struct Host {
     composer_win: WindowId,
     status: BufferId,
     status_ns: neosh_proto::NamespaceId,
+    /// Where the transcript's own highlights live.
+    ///
+    /// Separate from the status line's so that redrawing the working line — which happens several
+    /// times a second — cannot clear a mark on a message from ten turns ago.
+    chat_ns: neosh_proto::NamespaceId,
+    /// The row the working line is on while a turn is in flight, and what it says.
+    ///
+    /// Held rather than searched for: the transcript grows underneath it as tools report in, and
+    /// scanning for "the line that looks like a spinner" is how you end up rewriting a message.
+    working: Option<Working>,
     /// What plugins put in the status line, by key.
     ///
     /// A `BTreeMap` so iteration order is deterministic; the render sorts by priority anyway, but a
@@ -207,6 +217,61 @@ pub struct Host {
     secret: Option<SecretPrompt>,
 }
 
+/// What a tool call is about, in a few words, for the row that announces it.
+///
+/// Best-effort by design: tool inputs are whatever schema the tool declared, and guessing wrongly
+/// costs nothing because the name is already there. The keys tried are the ones every file and
+/// shell tool in practice uses.
+fn tool_subject(call: &neosh_proto::ToolCall) -> String {
+    const KEYS: &[&str] = &["path", "file_path", "file", "pattern", "query", "command", "url"];
+    let Some(map) = call.input.as_object() else { return String::new() };
+    for key in KEYS {
+        if let Some(v) = map.get(*key).and_then(|v| v.as_str()) {
+            let one = v.lines().next().unwrap_or(v).trim();
+            if one.is_empty() {
+                continue;
+            }
+            // By character, not byte: slicing a multi-byte boundary panics, and the frontend
+            // measures display width anyway.
+            let clipped: String = one.chars().take(48).collect();
+            let ellipsis = if one.chars().count() > 48 { "\u{2026}" } else { "" };
+            return format!("  {clipped}{ellipsis}");
+        }
+    }
+    String::new()
+}
+
+/// The line that says a turn is in flight.
+///
+/// It exists because the gap between pressing Enter and the first token is the longest silence in
+/// the program, and a still screen and a wedged process look identical. It carries an elapsed
+/// clock for the same reason: "working" with no number is indistinguishable from "stuck".
+struct Working {
+    /// The word this turn is using. Chosen once per turn — a verb that changes every tick is a
+    /// slot machine, and you end up watching it instead of thinking.
+    verb: &'static str,
+    started: std::time::Instant,
+    /// What it is waiting on, when that is something other than the model.
+    note: Option<String>,
+}
+
+// Deliberately no row index. The working line is *always the last line of the transcript* and
+// everything else inserts above it, which makes "where is it" a question with one answer instead of
+// a number to keep in step with four different append paths. The first version tracked a row and
+// went wrong under load, in the one way that is hard to see: a stale index deletes the wrong line.
+
+// A token counter belongs here too, and is deliberately absent: usage is only reported at the end
+// of a turn, and a count derived from characters would be a number that looks measured and is not.
+
+/// Words a turn can be doing.
+///
+/// Deliberately a small list of ordinary present participles. The point is a word that reads as
+/// activity without claiming anything about what the model is actually doing, which nobody knows.
+const VERBS: &[&str] = &[
+    "Thinking", "Working", "Pondering", "Considering", "Reasoning", "Puzzling", "Weighing",
+    "Mulling", "Deliberating", "Reckoning", "Chewing", "Turning it over",
+];
+
 /// A key being typed in, and who is waiting to hear how it went.
 struct SecretPrompt {
     instance: neosh_proto::InstanceId,
@@ -250,12 +315,14 @@ impl Host {
             editor.open_window(composer, WindowLayout::Docked { dock: Dock::Bottom, size: Some(3) });
         editor.set_mode(Mode::Chat);
 
-        let status_ns = match editor
-            .apply(&PluginId::from(BUILTIN), ApiCall::NsCreate { name: "neosh.status".into() })
-        {
-            Ok(ApiOk::Ns { ns }) => ns,
-            _ => neosh_proto::NamespaceId(0),
+        let mut namespace = |name: &str| {
+            match editor.apply(&PluginId::from(BUILTIN), ApiCall::NsCreate { name: name.into() }) {
+                Ok(ApiOk::Ns { ns }) => ns,
+                _ => neosh_proto::NamespaceId(0),
+            }
         };
+        let status_ns = namespace("neosh.status");
+        let chat_ns = namespace("neosh.chat");
 
         Self {
             editor,
@@ -269,6 +336,8 @@ impl Host {
             composer_win,
             status,
             status_ns,
+            chat_ns,
+            working: None,
             status_segments: Default::default(),
             active_turn: None,
             keys_pending: false,
@@ -369,19 +438,9 @@ impl Host {
     }
 
     fn chat_line(&mut self, text: impl Into<String>) {
-        let plugin = PluginId::from(BUILTIN);
-        let n = self
-            .editor
-            .buffer(self.chat)
-            .map(|b| b.line_count() as i64)
-            .unwrap_or(0);
-        let _ = self.editor.apply(&plugin, ApiCall::BufSetLines {
-            buf: self.chat,
-            start: n,
-            end: n,
-            lines: vec![text.into()],
-        });
-        self.streaming = None;
+        // Through the same insertion point as everything else, so a line written mid-turn lands
+        // above the working line rather than under it.
+        self.chat_push(vec![text.into()]);
     }
 
     fn composer_text(&self) -> String {
@@ -716,7 +775,8 @@ impl Host {
         // Asking a question means you want to see the answer: scrolled-back state does not survive
         // sending, or the reply arrives somewhere off screen.
         self.scroll_chat(0);
-        self.chat_line(format!("› {text}"));
+        self.chat_question(&text);
+        self.begin_working();
 
         let agent = self.agent.clone();
         let bridge = self.bridge.clone();
@@ -1402,9 +1462,161 @@ impl Host {
     }
 
     /// Append streamed output, starting a new line when the kind of output changes.
+    // ---- the transcript --------------------------------------------------
+
+    /// Add lines to the end of the transcript, returning the row the first one landed on.
+    ///
+    /// "The end" means above the working line when there is one. It says what is happening *now*,
+    /// so anything that has already happened belongs above it — a tool card appended underneath
+    /// would leave the spinner stranded in the middle of the turn it is reporting on.
+    fn chat_push(&mut self, lines: Vec<String>) -> u32 {
+        let plugin = PluginId::from(BUILTIN);
+        let at = self.chat_end();
+        let _ = self.editor.apply(&plugin, ApiCall::BufSetLines {
+            buf: self.chat,
+            start: at,
+            end: at,
+            lines,
+        });
+        self.streaming = None;
+        at.max(0) as u32
+    }
+
+    /// Where new content goes: the end, or the line above the working line when there is one.
+    fn chat_end(&self) -> i64 {
+        let n = self.editor.buffer(self.chat).map(|b| b.line_count() as i64).unwrap_or(0);
+        if self.working.is_some() { (n - 1).max(0) } else { n }
+    }
+
+    /// Highlight a span of one transcript row.
+    fn chat_mark(&mut self, row: u32, from: usize, to: usize, hl: &str) {
+        let _ = self.editor.apply(&PluginId::from(BUILTIN), ApiCall::MarkSet {
+            ns: self.chat_ns,
+            buf: self.chat,
+            row,
+            col: from as u32,
+            opts: neosh_proto::ExtmarkOpts {
+                end_col: Some(to as u32),
+                hl_group: Some(hl.to_string()),
+                virt_text: vec![],
+                virt_text_pos: neosh_proto::VirtTextPos::Eol,
+                on_delete: neosh_proto::OnDelete::Clamp,
+                priority: 0,
+            },
+        });
+    }
+
+    /// Draw a question the way a transcript should: framed, so the eye can find where a turn began.
+    ///
+    /// A bar down the left rather than a `>` prefix, because a multi-line question wrapped by the
+    /// frontend loses a prefix on every line but the first, and the thing you scan for when
+    /// scrolling back is *where the turns start*.
+    fn chat_question(&mut self, text: &str) {
+        let glyph = if self.option_bool("ui.ascii_only") { "|" } else { "\u{258c}" };
+        let mut rows = Vec::new();
+        for line in text.lines() {
+            rows.push(format!("{glyph} {line}"));
+        }
+        if rows.is_empty() {
+            rows.push(glyph.to_string());
+        }
+        rows.push(String::new());
+        let at = self.chat_push(rows);
+        let lines = text.lines().count().max(1) as u32;
+        for i in 0..lines {
+            self.chat_mark(at + i, 0, glyph.len(), "Agent.User");
+        }
+    }
+
+    /// Begin the working line, and pick this turn's word for it.
+    fn begin_working(&mut self) {
+        // Not random: the turn id would be ideal but is not known yet, and a clock read is the one
+        // varying thing already to hand. Per turn, so it does not change under you mid-answer.
+        let verb = VERBS
+            .get(now_secs().unsigned_abs() as usize % VERBS.len())
+            .copied()
+            .unwrap_or("Working");
+        self.chat_push(vec![String::new()]);
+        self.working = Some(Working { verb, started: std::time::Instant::now(), note: None });
+        self.draw_working();
+    }
+
+    /// Redraw the working line in place.
+    ///
+    /// Cheap enough to call on every token: it is one `set_lines` over a single row, which the
+    /// core coalesces with everything else in the same 16 ms frame. The *movement* costs nothing
+    /// here at all — the shimmer is the frontend's, running at its own rate over whatever this
+    /// last wrote.
+    fn draw_working(&mut self) {
+        let Some(w) = self.working.as_ref() else { return };
+        let (verb, note) = (w.verb, w.note.clone());
+        let secs = w.started.elapsed().as_secs();
+        let row = self.working_row();
+
+        let ascii = self.option_bool("ui.ascii_only");
+        let glyph = if ascii { "*" } else { "\u{2733}" };
+        let elapsed =
+            if secs >= 60 { format!("{}m {}s", secs / 60, secs % 60) } else { format!("{secs}s") };
+
+        let label = note.as_deref().unwrap_or(verb);
+        let mut text = format!("{glyph} {label}\u{2026}  {elapsed}");
+        text.push_str("  \u{b7}  esc to interrupt");
+
+        let plugin = PluginId::from(BUILTIN);
+        let _ = self.editor.apply(&plugin, ApiCall::BufSetLines {
+            buf: self.chat,
+            start: row as i64,
+            end: row as i64 + 1,
+            lines: vec![text.clone()],
+        });
+        // Only the label moves. A clock and a hint sweeping along with it would turn a status line
+        // into a light show, and the thing you actually want to read is the number.
+        let label_end = glyph.len() + 1 + label.len() + "\u{2026}".len();
+        let hl = if note.is_some() { "Status.Pending" } else { "Status.Streaming" };
+        self.chat_mark(row, 0, label_end, hl);
+        self.chat_mark(row, label_end, text.len(), "Agent.Usage");
+    }
+
+    /// Take the working line away.
+    ///
+    /// Removed rather than blanked: it was never content, and a transcript that accumulates one
+    /// empty row per turn is a transcript with a growing hole in it.
+    fn end_working(&mut self) {
+        if self.working.is_none() {
+            return;
+        }
+        let row = self.working_row();
+        self.working = None;
+        let plugin = PluginId::from(BUILTIN);
+        let _ = self.editor.apply(&plugin, ApiCall::MarkClear {
+            ns: self.chat_ns,
+            buf: self.chat,
+            start: Some(row),
+            end: Some(row + 1),
+        });
+        let _ = self.editor.apply(&plugin, ApiCall::BufSetLines {
+            buf: self.chat,
+            start: row as i64,
+            end: row as i64 + 1,
+            lines: vec![],
+        });
+        self.streaming = None;
+    }
+
+    /// The last line of the transcript, which is where the working line lives while there is one.
+    fn working_row(&self) -> u32 {
+        self.editor
+            .buffer(self.chat)
+            .map(|b| b.line_count().saturating_sub(1))
+            .unwrap_or(0)
+    }
+
     fn stream_into_chat(&mut self, kind: Stream, text: &str) {
         let plugin = PluginId::from(BUILTIN);
         if self.streaming != Some(kind) {
+            // Text is appended to the buffer's *last* line, so the working line has to stop being
+            // it before anything streams. This is the one rule that keeps the invariant true.
+            self.end_working();
             let n = self.editor.buffer(self.chat).map(|b| b.line_count() as i64).unwrap_or(0);
             let _ = self.editor.apply(&plugin, ApiCall::BufSetLines {
                 buf: self.chat,
@@ -1427,7 +1639,14 @@ impl Host {
             }
             AgentEvent::Token { turn, text } => {
                 let plugin = PluginId::from(BUILTIN);
+                // The first token is the answer arriving, so the "still working" line goes. It is
+                // the *first* one specifically: leaving it above the answer would say a turn is in
+                // flight while you are reading its result.
                 if self.streaming != Some(Stream::Text) {
+                    // The first token is the answer arriving, so the working line goes. It has to
+                    // go *before* the append, because appending targets the last line and the
+                    // working line is it.
+                    self.end_working();
                     let n = self
                         .editor
                         .buffer(self.chat)
@@ -1455,18 +1674,44 @@ impl Host {
             }
             AgentEvent::ToolStarted { turn, call } => {
                 if self.option_bool("chat.show_tools") {
-                    self.chat_line(format!("  ⚙ {}", call.name));
+                    let ascii = self.option_bool("ui.ascii_only");
+                    let glyph = if ascii { ">" } else { "\u{23f5}" };
+                    let text = format!("  {glyph} {}{}", call.name, tool_subject(&call));
+                    let row = self.chat_push(vec![text.clone()]);
+                    self.chat_mark(row, 0, 2 + glyph.len() + 1 + call.name.len(), "Agent.Tool");
+                    self.chat_mark(
+                        row,
+                        2 + glyph.len() + 1 + call.name.len(),
+                        text.len(),
+                        "Agent.Usage",
+                    );
+                    // The tool is what the turn is doing now, so the working line should say so
+                    // rather than keep claiming the model is thinking.
+                    if let Some(w) = self.working.as_mut() {
+                        w.note = Some(format!("Running {}", call.name));
+                    }
+                    self.draw_working();
                 }
                 self.bridge.broadcast(PluginEvent::ToolStarted { turn, call });
             }
             AgentEvent::ToolFinished { turn, call, result } => {
                 // Errors show regardless: a tool that failed silently is a debugging session.
                 if result.is_error {
-                    self.chat_line(format!("  ✗ {}: {}", call.name, result.content));
+                    let ascii = self.option_bool("ui.ascii_only");
+                    let glyph = if ascii { "x" } else { "\u{2717}" };
+                    let first = result.content.lines().next().unwrap_or("").trim();
+                    let text = format!("  {glyph} {}: {first}", call.name);
+                    let row = self.chat_push(vec![text.clone()]);
+                    self.chat_mark(row, 0, text.len(), "Agent.ToolError");
                 }
+                if let Some(w) = self.working.as_mut() {
+                    w.note = None;
+                }
+                self.draw_working();
                 self.bridge.broadcast(PluginEvent::ToolFinished { turn, call, result });
             }
             AgentEvent::TurnEnded { turn, stop_reason, usage } => {
+                self.end_working();
                 self.active_turn = None;
                 {
                     let mut s = self.agent.session();
@@ -1648,6 +1893,14 @@ impl Host {
         tokio::pin!(keys);
         let mut waiting = false;
 
+        // The elapsed clock on the working line. A third deadline rather than a share of the redraw
+        // window, because it answers a different question: the redraw window asks "how long may a
+        // burst of edits be batched", this asks "how often does a number that nobody edited change".
+        // Armed only while a turn is in flight, so an idle workspace has no timer at all.
+        let clock = tokio::time::sleep(Duration::from_secs(86_400));
+        tokio::pin!(clock);
+        let mut ticking = false;
+
         loop {
             tokio::select! {
                 Some(out) = script_rx.recv() => self.handle_script_out(out).await,
@@ -1669,6 +1922,10 @@ impl Host {
                     armed = false;
                     self.flush().await?;
                 }
+                () = &mut clock, if ticking => {
+                    ticking = false;
+                    self.draw_working();
+                }
                 () = &mut keys, if waiting => {
                     waiting = false;
                     self.keys_pending = false;
@@ -1688,6 +1945,10 @@ impl Host {
                     let ms = self.editor.options().int("timeoutlen").unwrap_or(500).max(0) as u64;
                     keys.as_mut().reset(Instant::now() + Duration::from_millis(ms));
                 }
+            }
+            if self.working.is_some() && !ticking {
+                clock.as_mut().reset(Instant::now() + Duration::from_secs(1));
+                ticking = true;
             }
             if self.editor.has_pending_ui() && !armed {
                 idle.as_mut().reset(Instant::now() + COALESCE);

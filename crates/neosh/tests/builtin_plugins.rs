@@ -2205,3 +2205,112 @@ fn while_a_key_is_being_typed_no_binding_fires() {
         s.sidebar_now()
     );
 }
+
+// ---------------------------------------------------------------------------
+// The transcript
+// ---------------------------------------------------------------------------
+
+/// A driver that starts a turn and never finishes it, so the working line is reliably on screen.
+const STALLS: &str = r#"
+import type { PluginContext } from "@neosh/api";
+
+export async function activate({ neosh }: PluginContext) {
+  await neosh.provider.register("stall", [{
+    id: "stall", driver: "stall", display_name: "Stall",
+    models: [{ id: "stall", display_name: "Stall" }],
+  }], async (_req, emit) => {
+    emit({ type: "message_start", model: "stall", usage: {} });
+    // Nothing else, ever. The turn stays in flight.
+  });
+  neosh.notify("stall ready");
+}
+"#;
+
+fn install_stall(sb: &Sandbox) {
+    let dir = sb.root.join("config/plugins/stall");
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    std::fs::write(
+        dir.join("plugin.toml"),
+        "name = \"stall\"\nversion = \"0.1.0\"\nentry = \"main.ts\"\npermissions = [\"providers\"]\n",
+    )
+    .expect("manifest");
+    std::fs::write(dir.join("main.ts"), STALLS).expect("plugin");
+}
+
+#[test]
+fn a_question_is_framed_so_you_can_find_where_a_turn_began() {
+    // A bar down the left rather than a `>` prefix: the frontend wraps long lines, a prefix
+    // survives only on the first of them, and what you scan for when scrolling back is exactly
+    // where the turns start.
+    let sb = Sandbox::new("framing");
+    let mut s = sb.start();
+    s.wait_for("PROJECTS");
+    for c in ["h", "i"] {
+        s.key(c);
+    }
+    s.enter();
+    assert!(
+        s.pump(|s| s.chat_now().iter().any(|l| l == "\u{258c} hi")),
+        "the question is framed\n{:?}",
+        s.chat_now()
+    );
+}
+
+#[test]
+fn a_tool_call_says_what_it_is_about_not_only_its_name() {
+    // `read_file` tells you nothing you did not already know. `read_file  .env` is the line you
+    // actually wanted, and it costs one lookup in the input the tool was given.
+    let sb = Sandbox::new("toolrow");
+    let mut s = sb.start();
+    s.wait_for("PROJECTS");
+    s.key("h");
+    s.enter();
+    assert!(
+        s.pump(|s| s.chat_now().iter().any(|l| l.contains("read_file") && l.contains(".env"))),
+        "the subject is beside the name\n{:?}",
+        s.chat_now()
+    );
+}
+
+#[test]
+fn a_turn_in_flight_says_so_and_says_for_how_long() {
+    // The gap between pressing Enter and the first token is the longest silence in the program,
+    // and a still screen and a wedged process look identical. The clock is the difference.
+    let sb = Sandbox::new("working");
+    install_stall(&sb);
+    sb.write_config("[options]\n\"agent.model\" = \"stall/stall\"\n");
+    let mut s = sb.start_letting_config_choose();
+    s.wait_for("stall ready");
+
+    for c in ["h", "a", "n", "g"] {
+        s.key(c);
+    }
+    s.enter();
+    assert!(
+        s.pump(|s| s.chat_now().iter().any(|l| l.contains('\u{2026}') && l.contains("esc to interrupt"))),
+        "the working line is up\n{:?}",
+        s.chat_now()
+    );
+    // And it is the last line: it says what is happening *now*, so anything already reported
+    // belongs above it.
+    let rows = s.chat_now();
+    let last = rows.iter().rposition(|l| !l.trim().is_empty()).unwrap_or(0);
+    assert!(rows[last].contains("esc to interrupt"), "pinned to the bottom\n{rows:?}");
+}
+
+#[test]
+fn the_working_line_is_gone_the_moment_there_is_an_answer() {
+    // Leaving it above the reply would say a turn is in flight while you are reading its result.
+    let sb = Sandbox::new("workingends");
+    let mut s = sb.start();
+    s.wait_for("PROJECTS");
+    s.key("h");
+    s.enter();
+    s.wait_for("All done.");
+    s.drain_for(Duration::from_millis(300));
+    assert!(
+        !s.chat_now().iter().any(|l| l.contains("esc to interrupt")),
+        "no working line survives the turn\n{:?}",
+        s.chat_now()
+    );
+}
