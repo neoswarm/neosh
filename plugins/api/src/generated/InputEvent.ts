@@ -15,4 +15,5 @@ export type InputEvent =
     top_line: number;
   }
   | { "type": "command"; name: string; args: Array<string> }
+  | { "type": "repaint" }
   | { "type": "disconnected" };

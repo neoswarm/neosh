@@ -126,6 +126,16 @@ fn italic(mut s: HighlightSpec) -> HighlightSpec {
     s
 }
 
+fn shimmer(mut s: HighlightSpec, period_ms: u32) -> HighlightSpec {
+    s.animate = Some(neosh_proto::Animation::Shimmer { period_ms });
+    s
+}
+
+fn pulse(mut s: HighlightSpec, period_ms: u32) -> HighlightSpec {
+    s.animate = Some(neosh_proto::Animation::Pulse { period_ms });
+    s
+}
+
 /// Every group a plugin may link to, with a concrete spec.
 ///
 /// Kept as one list rather than scattered across the crates that use each group, because the whole
@@ -182,6 +192,16 @@ pub fn groups(variant: Variant) -> Vec<(&'static str, HighlightDef)> {
         ("Status.Failed", spec(bold(fg(r.danger)))),
         ("Status.Done", spec(fg(r.success))),
         ("Status.Idle", spec(dim(fg(r.muted)))),
+        // The two groups that move. Motion is reserved for "something is happening and you cannot
+        // see it yet" — the one state where a still screen and a wedged program look identical.
+        //
+        // A sweep rather than a blink: a blink asks to be looked at every time it changes, and you
+        // pay that attention whether or not there is news. A band travelling along a word reads as
+        // aliveness at the edge of vision and costs nothing to ignore.
+        ("Status.Streaming", spec(shimmer(fg(r.active), 2000))),
+        // Slower and uniform, for waiting on something outside the program: a tool, a subprocess,
+        // a person. Different shape, because it is a different kind of waiting.
+        ("Status.Pending", spec(pulse(fg(r.attention), 2600))),
         // ---- version control ----------------------------------------------
         ("Git.Added", spec(fg(r.success))),
         ("Git.Modified", spec(fg(r.attention))),

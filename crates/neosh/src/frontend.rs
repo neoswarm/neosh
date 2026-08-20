@@ -9,6 +9,9 @@
 //! It is also the shape a web or mobile frontend would connect over.
 
 use std::io::Write;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
 use neosh_proto::{InputEvent, UiEvent};
 use neosh_tui::{Mirror, TerminalFrontend, to_input_event};
@@ -29,6 +32,8 @@ pub struct TerminalUi {
     mirror: Mirror,
     /// Where input events go, so resolved geometry can be reported back as `ViewportChanged`.
     input: mpsc::UnboundedSender<InputEvent>,
+    /// Whether a repaint ticker is running, and the switch that stops it.
+    animating: Arc<AtomicBool>,
     /// The last geometry we told the core about, per window.
     ///
     /// Only *changes* are sent. Emitting one per window per draw is a feedback loop: the event arms
@@ -67,7 +72,13 @@ impl TerminalUi {
         });
 
         Ok((
-            Self { inner, mirror: Mirror::new(), input: tx_geometry, reported: Default::default() },
+            Self {
+                inner,
+                mirror: Mirror::new(),
+                input: tx_geometry,
+                reported: Default::default(),
+                animating: Arc::new(AtomicBool::new(false)),
+            },
             rx,
         ))
     }
@@ -90,6 +101,7 @@ impl Frontend for TerminalUi {
         if redraw && !self.mirror.shutdown {
             let geometry = self.inner.draw(&self.mirror)?;
             self.report_geometry(&geometry);
+            self.follow_motion(neosh_tui::shimmer::take_drew_animation());
         }
         Ok(())
     }
@@ -100,7 +112,42 @@ impl Frontend for TerminalUi {
     }
 }
 
+/// How often to redraw while something on screen is moving.
+///
+/// 20 fps. Fast enough that a sweep reads as continuous, slow enough that it is a rounding error
+/// next to what streaming a response already costs — and it only runs while there is motion, so an
+/// idle workspace is still a process asleep on a `select!`.
+const MOTION_FRAME: Duration = Duration::from_millis(50);
+
 impl TerminalUi {
+    /// Start or stop asking for frames.
+    ///
+    /// The frontend drives this, not the core, because the frontend is the only thing that knows
+    /// whether the animated row is on screen or has been scrolled past. The ticker exists for
+    /// exactly as long as motion is visible: it is armed by a frame that had some, and the first
+    /// frame without any takes it down.
+    fn follow_motion(&mut self, moving: bool) {
+        if moving == self.animating.load(Ordering::Relaxed) {
+            return;
+        }
+        self.animating.store(moving, Ordering::Relaxed);
+        if !moving {
+            return;
+        }
+        let flag = self.animating.clone();
+        let tx = self.input.clone();
+        tokio::spawn(async move {
+            // Re-checked each tick rather than held for the lifetime of the task, so the ticker
+            // stops itself the moment a frame comes back still.
+            while flag.load(Ordering::Relaxed) {
+                tokio::time::sleep(MOTION_FRAME).await;
+                if tx.send(InputEvent::Repaint).is_err() {
+                    return;
+                }
+            }
+        });
+    }
+
     /// Tell the core where each window ended up, but only when it moved.
     fn report_geometry(&mut self, geometry: &[(neosh_proto::WindowId, neosh_proto::Rect)]) {
         for (win, rect) in geometry {

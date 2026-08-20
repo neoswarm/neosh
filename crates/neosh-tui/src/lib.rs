@@ -4,6 +4,7 @@
 //! It holds no authority over anything: the core owns all state, and this crate owns only the
 //! question of how that state looks on a character grid.
 
+pub mod shimmer;
 pub mod mirror;
 pub mod render;
 pub mod terminal;

@@ -189,12 +189,24 @@ impl Editor {
         if !self.highlights.set_variant(variant) {
             return false;
         }
-        let defs: Vec<_> =
-            self.highlights.iter().map(|(n, d)| (n.clone(), d.clone())).collect();
+        self.republish_highlights();
+        true
+    }
+
+    /// Turn motion on or off. Returns whether anything changed.
+    pub fn set_motion(&mut self, on: bool) -> bool {
+        if !self.highlights.set_motion(on) {
+            return false;
+        }
+        self.republish_highlights();
+        true
+    }
+
+    fn republish_highlights(&mut self) {
+        let defs: Vec<_> = self.highlights.iter().map(|(n, d)| (n.clone(), d.clone())).collect();
         for (name, def) in defs {
             self.push_ui(UiEvent::HighlightDefined { name, def });
         }
-        true
     }
 
     /// Queue a UI event, coalescing consecutive edits to the same buffer region.

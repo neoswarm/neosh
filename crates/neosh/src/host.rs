@@ -819,6 +819,14 @@ impl Host {
                     self.refresh_status();
                 }
             }
+            "ui.motion" => {
+                // Applied by stripping the animation from the groups that have one, so a frontend
+                // needs no concept of the setting: it animates what carries an animation, and with
+                // motion off nothing does.
+                if self.editor.set_motion(value.as_bool().unwrap_or(true)) {
+                    self.refresh_status();
+                }
+            }
             "agent.system_prompt" => {
                 let text = value.as_str().unwrap_or_default();
                 self.agent.session().system =
@@ -1602,6 +1610,8 @@ impl Host {
                 self.editor.exec_command(&name, args);
                 self.drain_effects();
             }
+            // Answered in the run loop, which is the only place with a frontend to draw to.
+            InputEvent::Repaint => {}
             InputEvent::Disconnected => return false,
         }
         true
@@ -1643,6 +1653,14 @@ impl Host {
                 Some(out) = script_rx.recv() => self.handle_script_out(out).await,
                 Some(ev) = agent_rx.recv() => self.handle_agent_event(ev),
                 Some(input) = input_rx.recv() => {
+                    // A repaint changes nothing, so it must not go through the input path: the
+                    // frontend is asking to draw the same state again while something on it moves.
+                    // Answering with an empty batch is what makes an animation unable to
+                    // desynchronise from the text it is drawn over.
+                    if matches!(input, InputEvent::Repaint) {
+                        self.frontend.send(vec![UiEvent::Flush]).await?;
+                        continue;
+                    }
                     if !self.handle_input(input) {
                         break;
                     }

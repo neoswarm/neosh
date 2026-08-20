@@ -220,7 +220,7 @@ pub fn render_line_in(
         if a == b {
             continue;
         }
-        let style = visible
+        let group = visible
             .iter()
             .filter(|m| m.opts.hl_group.is_some())
             .filter(|m| {
@@ -229,10 +229,20 @@ pub fn render_line_in(
                 s <= a && b <= e && e > s
             })
             .max_by_key(|m| m.opts.priority)
-            .and_then(|m| m.opts.hl_group.as_deref())
-            .map(|g| theme.style(g))
-            .unwrap_or_else(Style::default);
-        spans.push(Span::styled(text[a..b].to_string(), style));
+            .and_then(|m| m.opts.hl_group.as_deref());
+        let style = group.map(|g| theme.style(g)).unwrap_or_else(Style::default);
+        // A group that moves becomes one span per grapheme; everything else stays one span, because
+        // splitting text that does not need splitting multiplies the span count of every line for
+        // no visible difference.
+        match group.and_then(|g| theme.animation(g)).filter(|_| theme.motion()) {
+            Some(anim) => spans.extend(crate::shimmer::animate(
+                &text[a..b],
+                style,
+                anim,
+                theme.truecolor(),
+            )),
+            None => spans.push(Span::styled(text[a..b].to_string(), style)),
+        }
     }
 
     // Trailing annotations, then right-aligned ones.

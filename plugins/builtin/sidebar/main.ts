@@ -981,7 +981,9 @@ async function installFooter(neosh: Neosh, subscriptions: PluginContext["subscri
     if (current.active_turn) {
       await neosh.status.set("turn", {
         text: `${spinnerFrame()} ${turnFor(current, Date.now())}`,
-        hl: "Status.Working",
+        // The group that sweeps. Nothing here drives the animation — the frontend does, at its own
+        // rate, which is why this can be set once per second and still look continuous.
+        hl: "Status.Streaming",
         align: "right",
         priority: 5,
       });

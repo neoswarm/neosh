@@ -201,6 +201,45 @@ pub struct Attrs {
     pub strikethrough: bool,
 }
 
+/// Text that moves on its own.
+///
+/// Declared on a highlight group rather than driven by whoever wrote the text, for two reasons.
+/// A plugin animating text itself would have to re-set an extmark per character per tick — forty
+/// API calls at 20 Hz, across a runtime boundary, to move a highlight two columns. And motion is a
+/// *display* decision: how bright a band can get depends on what the terminal can render, which is
+/// the one thing only the frontend knows.
+///
+/// So the core stores this and forwards it; the frontend animates whatever carries it, at whatever
+/// rate it likes, and stops when nothing animated is on screen. Nothing wakes the core.
+#[derive(TS, Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+#[ts(export)]
+pub enum Animation {
+    /// A band of brightness sweeping along the run, left to right.
+    ///
+    /// What "it is working" looks like when there is nothing yet to show. Reads as motion at a
+    /// glance without asking to be read, which is the whole trick: a spinner you have to look at
+    /// costs attention every time it moves.
+    Shimmer {
+        /// One full sweep, in milliseconds.
+        #[ts(type = "number")]
+        period_ms: u32,
+    },
+    /// The whole run brightening and dimming together.
+    Pulse {
+        #[ts(type = "number")]
+        period_ms: u32,
+    },
+}
+
+impl Animation {
+    pub fn period_ms(self) -> u32 {
+        match self {
+            Self::Shimmer { period_ms } | Self::Pulse { period_ms } => period_ms.max(50),
+        }
+    }
+}
+
 #[derive(TS, Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug, Default)]
 #[ts(export)]
 pub struct HighlightSpec {
@@ -210,6 +249,10 @@ pub struct HighlightSpec {
     pub bg: Option<Color>,
     #[serde(flatten)]
     pub attrs: Attrs,
+    /// Motion. Ignored when `ui.motion` is off, which is why it is a hint on the group rather than
+    /// a promise to the plugin that set it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub animate: Option<Animation>,
 }
 
 /// Plugins declare semantic names, never colors directly.
@@ -602,6 +645,16 @@ pub enum InputEvent {
         #[serde(default)]
         args: Vec<String>,
     },
+    /// Draw the same state again.
+    ///
+    /// The frontend asks for this while something on screen is animating, and stops asking the
+    /// moment nothing is. It carries no state and mutates nothing — the core answers by flushing
+    /// what it already had, which is why an animation cannot desynchronise from the buffer it is
+    /// drawn over.
+    ///
+    /// This is the *only* thing that draws a frame nobody asked for, and it exists on the frontend's
+    /// terms: there is still no frame loop, and an idle workspace still sends nothing at all.
+    Repaint,
     /// The frontend is going away (terminal closed, socket dropped).
     Disconnected,
 }
