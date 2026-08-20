@@ -35,3 +35,4 @@ implementation — and in two cases (0005, 0008) it did not, which is itself rec
 | [0027](0027-one-driver-for-every-agent-that-speaks-acp.md) | One driver for every agent that speaks ACP | Accepted |
 | [0028](0028-the-transcript-is-a-place-you-go.md) | The transcript is a place you go, not a pane you focus | Accepted |
 | [0029](0029-a-conversation-carries-its-directory.md) | A conversation carries its directory, and everything follows it | Accepted |
+| [0030](0030-a-turn-belongs-to-a-conversation.md) | A turn belongs to a conversation, not to the program | Accepted |

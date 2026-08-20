@@ -345,3 +345,74 @@ async fn usage_accumulates_across_turns() {
     assert_eq!(usage.input_tokens, 200, "two turns, summed");
     assert_eq!(usage.output_tokens, 20);
 }
+
+// ---------------------------------------------------------------------------
+// A turn belongs to a conversation
+// ---------------------------------------------------------------------------
+
+/// One scripted turn that says `text` and stops.
+fn text_script(text: &str) -> Vec<neosh_proto::ProviderEvent> {
+    MockProvider::text_turn(&[text])
+}
+
+#[tokio::test]
+async fn a_turn_runs_in_the_conversation_it_names_not_in_whichever_is_on_screen() {
+    // The whole point of addressing a turn by id: you can switch away from it, and it keeps
+    // writing where it started rather than into whatever you are now reading.
+    let (agent, mut rx) = agent_with_script(vec![text_script("answered")]);
+    let on_screen = agent.sessions().active_id().clone();
+
+    let mut other = Session::new(std::env::temp_dir());
+    other.selection = agent.selection();
+    let elsewhere = other.id.clone();
+    agent.sessions().insert(other);
+
+    agent
+        .run_turn_in(
+            &TestBridge::default(),
+            elsewhere.clone(),
+            "ask the other one".into(),
+            tokio_util::sync::CancellationToken::new(),
+        )
+        .await;
+
+    let store = agent.sessions();
+    assert_eq!(store.active_id(), &on_screen, "running a turn does not switch conversations");
+    assert!(
+        store.get(&on_screen).expect("still there").messages.is_empty(),
+        "the conversation on screen was not part of this and must be untouched"
+    );
+    let ran_in = store.get(&elsewhere).expect("still there");
+    assert_eq!(ran_in.messages.len(), 2, "the question and the answer landed where they belong");
+    drop(store);
+
+    assert!(
+        drain(&mut rx).iter().all(|e| e.session() == &elsewhere),
+        "every event says which conversation it came from, and it is not the one on screen"
+    );
+}
+
+#[tokio::test]
+async fn steering_is_taken_by_the_conversation_it_was_typed_in() {
+    // A single queue would hand what you typed here to whichever turn reached a gap first.
+    let (agent, _rx) = agent_with_script(vec![]);
+    let here = agent.sessions().active_id().clone();
+    let there = {
+        let s = Session::new(std::env::temp_dir());
+        let id = s.id.clone();
+        agent.sessions().insert(s);
+        id
+    };
+
+    agent.steer(&here, "wait, not that file".into());
+    agent.steer(&there, "and rename it too".into());
+
+    assert_eq!(agent.steering_count(&here), 1);
+    assert_eq!(agent.steering_count(&there), 1);
+    assert_eq!(agent.take_steering(&here), vec!["wait, not that file".to_string()]);
+    assert_eq!(
+        agent.steering_texts(&there),
+        vec!["and rename it too".to_string()],
+        "taking one conversation's queue must not empty another's"
+    );
+}

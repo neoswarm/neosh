@@ -82,7 +82,7 @@ registry — this table is what ships.
 | `^E` | Reasoning effort and the other per-model options |
 | `⌥↑` `⌥↓` | One rung up or down the capability ladder, same provider |
 | `⇧⇥` | Permission mode — ask, allow-listed, full access, deny |
-| `^T` | Projects and conversations |
+| `^T` | Projects and conversations. Switching is never refused — turns keep running where they are |
 | `^N` | New conversation. In a repository it asks where: here, a new worktree, an existing one, elsewhere |
 | `^O` | Add a project |
 | `^B` | Toggle the sidebar |
@@ -96,7 +96,7 @@ registry — this table is what ships.
 | `^R` | Reload configuration |
 | `^Q` | Quit |
 | `F1` | Every binding, live |
-| `Esc` | Interrupt what is running |
+| `Esc` | Interrupt the turn in this conversation |
 
 Composer editing is a text field: `←`/`→` by character and `^←`/`^→` by word, `Home`/`End` and
 `^Home`/`^End` for the ends, shift with any of them to select, `^W` and `^U` to delete a word or

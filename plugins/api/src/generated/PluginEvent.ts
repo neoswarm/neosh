@@ -28,18 +28,20 @@ export type PluginEvent =
     old_end: number;
     new_end: number;
   }
-  | { "type": "turn_started"; turn: TurnId }
-  | { "type": "token"; turn: TurnId; text: string }
-  | { "type": "thinking_token"; turn: TurnId; text: string }
-  | { "type": "tool_started"; turn: TurnId; call: ToolCall }
+  | { "type": "turn_started"; session: SessionId; turn: TurnId }
+  | { "type": "token"; session: SessionId; turn: TurnId; text: string }
+  | { "type": "thinking_token"; session: SessionId; turn: TurnId; text: string }
+  | { "type": "tool_started"; session: SessionId; turn: TurnId; call: ToolCall }
   | {
     "type": "tool_finished";
+    session: SessionId;
     turn: TurnId;
     call: ToolCall;
     result: ToolResult;
   }
   | {
     "type": "turn_ended";
+    session: SessionId;
     turn: TurnId;
     stop_reason: StopReason;
     usage: Usage;

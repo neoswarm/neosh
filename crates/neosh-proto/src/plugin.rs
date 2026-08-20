@@ -104,16 +104,25 @@ pub enum PluginEvent {
         old_end: u32,
         new_end: u32,
     },
+    /// A turn has begun.
+    ///
+    /// Every turn event says which conversation it belongs to. A workspace runs several at once,
+    /// so a plugin that assumed "the one on screen" would attribute one conversation's answer to
+    /// another — and by the time a turn ends, the conversation it ran in may not be on screen at
+    /// all.
     TurnStarted {
+        session: SessionId,
         turn: TurnId,
     },
     /// One streamed chunk of assistant text. Chunks are provider-sized, not character-sized.
     Token {
+        session: SessionId,
         turn: TurnId,
         text: String,
     },
     /// One streamed chunk of reasoning, where the provider exposes it.
     ThinkingToken {
+        session: SessionId,
         turn: TurnId,
         text: String,
     },
@@ -121,15 +130,18 @@ pub enum PluginEvent {
     /// call may proceed and can veto it, this one is told that it is happening. A transcript wants
     /// the telling, not the asking.
     ToolStarted {
+        session: SessionId,
         turn: TurnId,
         call: ToolCall,
     },
     ToolFinished {
+        session: SessionId,
         turn: TurnId,
         call: ToolCall,
         result: ToolResult,
     },
     TurnEnded {
+        session: SessionId,
         turn: TurnId,
         stop_reason: StopReason,
         usage: Usage,

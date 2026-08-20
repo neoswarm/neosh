@@ -19,6 +19,12 @@ pub struct Session {
     /// The prompt size of the most recent request: how full the window actually is.
     pub context_tokens: u64,
     pub active_turn: Option<TurnId>,
+    /// Things said to *this* conversation while its turn was running, waiting for a gap to be
+    /// taken in.
+    ///
+    /// Per conversation rather than per process: several turns can be in flight at once, and a
+    /// single queue would hand what you typed here to whichever one reached a gap first.
+    pub steering: Vec<String>,
     /// When the running turn started, in seconds since the epoch. Stamped by whoever starts the
     /// turn, for the same reason `created_at` is: this type does not read a clock.
     pub turn_started_at: Option<i64>,
@@ -48,6 +54,7 @@ impl Session {
             usage: Usage::default(),
             context_tokens: 0,
             active_turn: None,
+            steering: Vec::new(),
             turn_started_at: None,
             title: None,
             created_at: 0,

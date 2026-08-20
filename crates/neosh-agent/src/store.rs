@@ -143,7 +143,9 @@ impl SessionStore {
         &self.active.id == id || self.idle.contains_key(id)
     }
 
-    fn get_mut(&mut self, id: &SessionId) -> Option<&mut Session> {
+    /// Public because a turn reaches its own conversation by id: it may not be the active one, and
+    /// by the time the turn ends it may not even be the one on screen.
+    pub fn get_mut(&mut self, id: &SessionId) -> Option<&mut Session> {
         if &self.active.id == id { Some(&mut self.active) } else { self.idle.get_mut(id) }
     }
 

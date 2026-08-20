@@ -516,11 +516,20 @@ export interface AgentApi {
    * its window — wants this one.
    */
   onSelectionChange(cb: (e: { selection: ModelSelection }) => void): Disposable;
-  onTurnStart(cb: (e: { turn: string }) => void): Disposable;
+  /**
+   * A turn has begun.
+   *
+   * Every turn event says which conversation it belongs to. A workspace runs several at once, so
+   * anything that draws a turn has to check: by the time one ends, the conversation it ran in may
+   * not be the one on screen. `neosh.session.list()` flags the active one.
+   */
+  onTurnStart(cb: (e: { session: string; turn: string }) => void): Disposable;
   /** One streamed chunk of assistant text. Chunks are provider-sized, not characters. */
-  onToken(cb: (e: { turn: string; text: string }) => void): Disposable;
-  onThinking(cb: (e: { turn: string; text: string }) => void): Disposable;
-  onTurnEnd(cb: (e: { turn: string; stopReason: StopReason; usage: Usage }) => void): Disposable;
+  onToken(cb: (e: { session: string; turn: string; text: string }) => void): Disposable;
+  onThinking(cb: (e: { session: string; turn: string; text: string }) => void): Disposable;
+  onTurnEnd(
+    cb: (e: { session: string; turn: string; stopReason: StopReason; usage: Usage }) => void,
+  ): Disposable;
   /**
    * A tool is about to run.
    *
@@ -528,8 +537,10 @@ export interface AgentApi {
    * veto it. This is told that it is happening, cannot influence it, and is therefore what a
    * transcript wants.
    */
-  onToolStart(cb: (e: { turn: string; call: ToolCall }) => void): Disposable;
-  onToolEnd(cb: (e: { turn: string; call: ToolCall; result: ToolResult }) => void): Disposable;
+  onToolStart(cb: (e: { session: string; turn: string; call: ToolCall }) => void): Disposable;
+  onToolEnd(
+    cb: (e: { session: string; turn: string; call: ToolCall; result: ToolResult }) => void,
+  ): Disposable;
 }
 
 export interface ToolApi {
@@ -651,11 +662,19 @@ export interface SessionApi {
    * `cwd` opens it against another checkout, which is how a second project becomes visible.
    */
   create(opts?: { cwd?: string; title?: string; activate?: boolean }): Promise<SessionInfo>;
-  /** Rejects with `busy` while a turn is streaming: its output would land in the wrong transcript. */
+  /**
+   * Look at another conversation.
+   *
+   * Never refused, including while a turn is running. A turn belongs to its conversation and keeps
+   * streaming into it; what you see is rebuilt from whichever one you switched to, and switching
+   * back puts you in the middle of the answer where you left it.
+   */
   switch(session: SessionId): Promise<void>;
   /**
    * Close one. Closing the active conversation moves to the most recently used other; closing the
    * last one is an error, because there is always somewhere for the next thing you type.
+   *
+   * A turn running in it is cancelled: there is about to be nowhere to put its answer.
    */
   close(session: SessionId): Promise<void>;
   /** Pass `null` to clear a title and go back to the first-message label. */
@@ -1237,15 +1256,31 @@ export function __createContext(plugin: string, config: unknown, version: number
         await c({ call: "provider_forget_credential", instance });
       },
       onSelectionChange: (cb) => listener(r.selectionListeners, cb),
-      onTurnStart: (cb) => listener(r.agentListeners.turnStart as Array<(e: { turn: string }) => void>, cb),
-      onToken: (cb) => listener(r.agentListeners.token as Array<(e: { turn: string; text: string }) => void>, cb),
-      onThinking: (cb) => listener(r.agentListeners.thinking as Array<(e: { turn: string; text: string }) => void>, cb),
+      onTurnStart: (cb) =>
+        listener(r.agentListeners.turnStart as Array<(e: { session: string; turn: string }) => void>, cb),
+      onToken: (cb) =>
+        listener(r.agentListeners.token as Array<(e: { session: string; turn: string; text: string }) => void>, cb),
+      onThinking: (cb) =>
+        listener(r.agentListeners.thinking as Array<(e: { session: string; turn: string; text: string }) => void>, cb),
       onTurnEnd: (cb) =>
-        listener(r.agentListeners.turnEnd as Array<(e: { turn: string; stopReason: StopReason; usage: Usage }) => void>, cb),
+        listener(
+          r.agentListeners.turnEnd as Array<
+            (e: { session: string; turn: string; stopReason: StopReason; usage: Usage }) => void
+          >,
+          cb,
+        ),
       onToolStart: (cb) =>
-        listener(r.agentListeners.toolStart as Array<(e: { turn: string; call: ToolCall }) => void>, cb),
+        listener(
+          r.agentListeners.toolStart as Array<(e: { session: string; turn: string; call: ToolCall }) => void>,
+          cb,
+        ),
       onToolEnd: (cb) =>
-        listener(r.agentListeners.toolEnd as Array<(e: { turn: string; call: ToolCall; result: ToolResult }) => void>, cb),
+        listener(
+          r.agentListeners.toolEnd as Array<
+            (e: { session: string; turn: string; call: ToolCall; result: ToolResult }) => void
+          >,
+          cb,
+        ),
     },
     tool: {
       async register(def, handler) {
@@ -1512,25 +1547,38 @@ export async function __dispatch(plugin: string, msg: Record<string, unknown>): 
         break;
       }
       case "turn_started":
-        for (const cb of r.agentListeners.turnStart) (cb as (e: unknown) => void)({ turn: ev.turn });
+        for (const cb of r.agentListeners.turnStart)
+          (cb as (e: unknown) => void)({ session: ev.session, turn: ev.turn });
         break;
       case "token":
-        for (const cb of r.agentListeners.token) (cb as (e: unknown) => void)({ turn: ev.turn, text: ev.text });
+        for (const cb of r.agentListeners.token)
+          (cb as (e: unknown) => void)({ session: ev.session, turn: ev.turn, text: ev.text });
         break;
       case "thinking_token":
-        for (const cb of r.agentListeners.thinking) (cb as (e: unknown) => void)({ turn: ev.turn, text: ev.text });
+        for (const cb of r.agentListeners.thinking)
+          (cb as (e: unknown) => void)({ session: ev.session, turn: ev.turn, text: ev.text });
         break;
       case "turn_ended":
         for (const cb of r.agentListeners.turnEnd)
-          (cb as (e: unknown) => void)({ turn: ev.turn, stopReason: ev.stop_reason, usage: ev.usage });
+          (cb as (e: unknown) => void)({
+            session: ev.session,
+            turn: ev.turn,
+            stopReason: ev.stop_reason,
+            usage: ev.usage,
+          });
         break;
       case "tool_started":
         for (const cb of r.agentListeners.toolStart)
-          (cb as (e: unknown) => void)({ turn: ev.turn, call: ev.call });
+          (cb as (e: unknown) => void)({ session: ev.session, turn: ev.turn, call: ev.call });
         break;
       case "tool_finished":
         for (const cb of r.agentListeners.toolEnd)
-          (cb as (e: unknown) => void)({ turn: ev.turn, call: ev.call, result: ev.result });
+          (cb as (e: unknown) => void)({
+            session: ev.session,
+            turn: ev.turn,
+            call: ev.call,
+            result: ev.result,
+          });
         break;
       case "hook_observed": {
         const h = r.hooks.get(ev.hook);
