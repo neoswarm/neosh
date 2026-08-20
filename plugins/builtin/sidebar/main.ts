@@ -20,7 +20,7 @@
  * off, and a sidebar of your own loads after this one and wins.
  */
 
-import type { Disposable, Neosh, PluginContext, SessionInfo, WindowId } from "@neosh/api";
+import type { Disposable, Neosh, PluginContext, SessionInfo, WindowId, WorktreeInfo } from "@neosh/api";
 import {
   confirmDestructive,
   configureMotion,
@@ -518,9 +518,14 @@ async function registerCommands(w: Wiring): Promise<void> {
     await neosh.cmd.register("sidebar.refresh", w.draw, { desc: "Redraw the sidebar now" }),
   );
   w.subscriptions.push(
-    await neosh.cmd.register("session.new", async () => {
+    await neosh.cmd.register("session.new", () => newConversation(neosh), {
+      desc: "Start a new conversation — here, or in a worktree of its own",
+    }),
+  );
+  w.subscriptions.push(
+    await neosh.cmd.register("session.new.here", async () => {
       await neosh.session.create();
-    }, { desc: "Start a new conversation" }),
+    }, { desc: "Start a new conversation in this project, without asking where" }),
   );
   w.subscriptions.push(
     await neosh.cmd.register("session.close", async (args) => {
@@ -569,6 +574,87 @@ async function registerCommands(w: Wiring): Promise<void> {
 
   await neosh.hint.set("sessions", { keys: "^T", label: "conversations", priority: 20 });
   await neosh.hint.set("new", { keys: "^N", label: "new", priority: 21 });
+}
+
+/**
+ * Start a conversation, asking where when there is something to ask.
+ *
+ * A conversation belongs to a directory — that is what makes the sidebar a list of projects rather
+ * than a list of threads — and in a git repository "where" has a real answer that is not always
+ * "here". A branch you want to work on without disturbing what is checked out is a *worktree*, and
+ * having to create one, find it, and then open a conversation in it is three steps for one
+ * intention.
+ *
+ * Outside a repository the question has one answer, so it is not asked: `^N` stays a single key
+ * everywhere the choice would be theatre. Inside one, `Here` is selected, so `^N ⏎` is what `^N`
+ * always did.
+ */
+async function newConversation(neosh: Neosh): Promise<void> {
+  const current = await neosh.session.current().catch(() => null);
+  const here = current?.cwd;
+  // Empty outside a repository, which is also how this knows there is nothing to ask about: a
+  // worktree is a git idea, and a directory that is not a checkout has exactly one answer to
+  // "where does this conversation go".
+  const trees = await neosh.git.worktrees().catch(() => [] as WorktreeInfo[]);
+  // The git plugin may also be switched off, in which case the rows that lead into it would lead
+  // nowhere. Offering an action that cannot happen is worse than not offering it.
+  const commands = new Set((await neosh.cmd.list().catch(() => [])).map((c) => c.name));
+  const canBranch = trees.length > 0 && commands.has("git.worktree.new");
+  const others = trees.filter((t) => t.path !== here);
+
+  if (!canBranch && others.length === 0) {
+    await neosh.session.create();
+    return;
+  }
+
+  type Where =
+    | { kind: "here" }
+    | { kind: "new" }
+    | { kind: "elsewhere" }
+    | { kind: "tree"; path: string; label: string };
+  const rows: Array<{ label: string; detail?: string; keywords?: string; value: Where }> = [
+    { label: "Here", detail: here ?? "this project", value: { kind: "here" } },
+  ];
+  if (canBranch) {
+    rows.push({
+      label: "In a new worktree…",
+      detail: "a branch of its own, checked out somewhere else",
+      keywords: "branch worktree",
+      value: { kind: "new" },
+    });
+  }
+  for (const t of others) {
+    const label = t.branch ?? t.head ?? t.path;
+    rows.push({
+      label,
+      detail: `worktree  ·  ${t.path}`,
+      keywords: `${t.path} worktree`,
+      value: { kind: "tree", path: t.path, label },
+    });
+  }
+  rows.push({
+    label: "Another directory…",
+    detail: "somewhere else entirely",
+    keywords: "project folder",
+    value: { kind: "elsewhere" },
+  });
+
+  const chosen = await picker(neosh, rows, { title: "New conversation", width: 76 });
+  if (chosen === null) return;
+  switch (chosen.kind) {
+    case "here":
+      await neosh.session.create();
+      return;
+    case "new":
+      await neosh.cmd.exec("git.worktree.new").catch((e: unknown) => neosh.notify(String(e), "warn"));
+      return;
+    case "tree":
+      await neosh.session.create({ cwd: chosen.path });
+      neosh.notify(`new conversation in ${chosen.label}`);
+      return;
+    case "elsewhere":
+      await neosh.cmd.exec("project.open").catch(() => {});
+  }
 }
 
 async function activateTarget(

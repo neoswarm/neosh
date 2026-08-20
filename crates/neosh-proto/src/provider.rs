@@ -569,6 +569,19 @@ fn auth_none() -> AuthRef {
 #[ts(export)]
 pub struct TurnRequest {
     pub selection: ModelSelection,
+    /// The directory this turn happens in.
+    ///
+    /// The conversation's, not the process's. A vendor CLI is an agent that reads files, runs
+    /// commands and looks at git — all of it relative to where it was started — so a driver that
+    /// spawns it in whatever directory neosh happened to be launched from is asking about the
+    /// wrong repository. Every conversation carries a project; this is how a driver finds out
+    /// which one.
+    ///
+    /// Empty means "wherever the host process is", which is what a driver with no opinion did
+    /// before this field existed.
+    #[serde(default)]
+    #[ts(type = "string")]
+    pub cwd: std::path::PathBuf,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub system: Option<String>,
     pub messages: Vec<Message>,

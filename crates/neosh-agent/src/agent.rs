@@ -234,6 +234,7 @@ impl Agent {
 
         let request = TurnRequest {
             selection,
+            cwd: self.session().cwd.clone(),
             system,
             messages: vec![Message {
                 role: Role::User,
@@ -408,12 +409,13 @@ impl Agent {
 
             // One guard, not two: temporaries in a struct literal live to the end of the
             // statement, so taking the session lock twice here would deadlock against itself.
-            let (system, messages) = {
+            let (cwd, system, messages) = {
                 let sess = self.session();
-                (sess.system.clone(), sess.messages.clone())
+                (sess.cwd.clone(), sess.system.clone(), sess.messages.clone())
             };
             let request = TurnRequest {
                 selection: selection.clone(),
+                cwd,
                 system,
                 messages,
                 // An agent driver brings its own tools; advertising ours would list tools it

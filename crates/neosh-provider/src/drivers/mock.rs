@@ -128,6 +128,7 @@ mod tests {
 
     fn req() -> TurnRequest {
         TurnRequest {
+            cwd: std::path::PathBuf::new(),
             selection: ModelSelection {
                 instance: InstanceId::from("mock"),
                 model: "mock".into(),

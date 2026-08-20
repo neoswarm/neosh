@@ -222,6 +222,11 @@ impl Provider for ClaudeCliProvider {
 
         tokio::spawn(async move {
             let mut cmd = Command::new(&program);
+            // Where the conversation is, not where neosh was launched. The CLI is an agent: it
+            // reads files, runs commands and looks at git, all of it relative to here.
+            if !request.cwd.as_os_str().is_empty() {
+                cmd.current_dir(&request.cwd);
+            }
             cmd.arg("-p")
                 .arg(Self::prompt_from(&request.messages))
                 .args(["--output-format", "stream-json"])
@@ -360,6 +365,7 @@ mod tests {
 
     fn req(model: &str) -> TurnRequest {
         TurnRequest {
+            cwd: std::path::PathBuf::new(),
             selection: ModelSelection {
                 instance: InstanceId::from("claude-cli"),
                 model: model.into(),
@@ -457,6 +463,49 @@ mod tests {
             Some(r#"{"alwaysThinkingEnabled":false}"#),
             "thinking off is a real instruction — the CLI's own default is not necessarily off"
         );
+    }
+
+    /// The child is spawned in the conversation's directory.
+    ///
+    /// Worth a real process rather than a mock: the whole failure this fixes was a `Command` that
+    /// looked complete and inherited a directory nobody had chosen, and nothing short of asking a
+    /// child where it woke up would have caught it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_child_is_started_in_the_conversations_directory() {
+        use futures::StreamExt;
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join(format!("neosh-cwd-{}", std::process::id()));
+        let work = dir.join("work");
+        std::fs::create_dir_all(&work).expect("dirs");
+        let script = dir.join("fake-claude");
+        std::fs::write(&script, "#!/bin/sh\npwd > \"$(dirname \"$0\")/where\"\n").expect("script");
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+
+        let p = ClaudeCliProvider::new(script.display().to_string());
+        let mut req = req("claude-opus-5");
+        req.cwd = work.clone();
+        let _: Vec<_> = p.stream(&inst(), req, CancellationToken::new()).collect().await;
+
+        let saw = std::fs::read_to_string(dir.join("where")).expect("the child ran");
+        // Compared canonically: the temp directory is a symlink on some systems, and `pwd` in a
+        // shell reports the logical path.
+        assert_eq!(
+            std::fs::canonicalize(saw.trim()).ok(),
+            std::fs::canonicalize(&work).ok(),
+            "spawned in {saw:?}, wanted {}",
+            work.display()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An empty directory means "wherever the host is", which is what a driver with no opinion did
+    /// before the field existed — so a provider plugin written against the old shape still works.
+    #[test]
+    fn an_empty_directory_is_left_to_the_process() {
+        let r = req("claude-opus-5");
+        assert!(r.cwd.as_os_str().is_empty());
     }
 
     /// A missing binary must surface as a provider error on the stream, not a panic or a hang.

@@ -360,6 +360,7 @@ mod tests {
     #[test]
     fn usage_reporting_is_requested_explicitly() {
         let r = TurnRequest {
+            cwd: std::path::PathBuf::new(),
             selection: ModelSelection {
                 instance: InstanceId::from("openai"),
                 model: neosh_proto::ModelId::from("some-model"),
