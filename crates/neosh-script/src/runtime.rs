@@ -277,6 +277,52 @@ fn op_neosh_timer_clear(state: &mut OpState, id: f64) {
     }
 }
 
+/// How many terminal columns a string occupies.
+///
+/// Synchronous, because it is called per row of a list being laid out and a round trip to the host
+/// per string would make a picker feel like a network service.
+///
+/// It exists because a plugin composing a two-column layout has to align the column, and the only
+/// tools JavaScript gives it are `String.length` (UTF-16 units) and `Array.from().length` (code
+/// points). Both are wrong for the text agents actually produce: `"日本"` is 2 code points and 4
+/// columns, `"👋🏽"` is 2 code points and 2 columns, `"é"` may be 2 code points and 1 column. Every
+/// plugin that padded with a character count drew a ragged rule the first time a CJK model name
+/// appeared in the list.
+///
+/// The same `unicode-width` + `unicode-segmentation` pair the frontend measures with, so a plugin
+/// and the renderer agree by construction rather than by coincidence.
+#[op2(fast)]
+fn op_neosh_width(#[string] text: &str) -> u32 {
+    use unicode_segmentation::UnicodeSegmentation;
+    use unicode_width::UnicodeWidthStr;
+    // By grapheme cluster: a combining mark belongs to the character it sits on, and measuring the
+    // pieces separately would count the accent as its own column.
+    text.graphemes(true).map(|g| g.width() as u32).sum()
+}
+
+/// Truncate to at most `columns` terminal columns, on a grapheme boundary.
+///
+/// Paired with [`op_neosh_width`] because clipping is the other half of laying a column out, and a
+/// plugin doing it by hand would either cut a character in half or walk the string twice through
+/// the op boundary.
+#[op2]
+#[string]
+fn op_neosh_clip(#[string] text: &str, columns: u32) -> String {
+    use unicode_segmentation::UnicodeSegmentation;
+    use unicode_width::UnicodeWidthStr;
+    let mut used = 0u32;
+    let mut out = String::with_capacity(text.len());
+    for g in text.graphemes(true) {
+        let w = g.width() as u32;
+        if used + w > columns {
+            break;
+        }
+        used += w;
+        out.push_str(g);
+    }
+    out
+}
+
 /// Send one message to the host.
 #[op2]
 fn op_neosh_send(state: &mut OpState, #[serde] msg: ScriptOutbound) {
@@ -292,8 +338,14 @@ fn extension(
     timers: TimerState,
     outbox: mpsc::UnboundedSender<ScriptOutbound>,
 ) -> Extension {
-    const OPS: &[OpDecl] =
-        &[op_neosh_next(), op_neosh_send(), op_neosh_timer_start(), op_neosh_timer_clear()];
+    const OPS: &[OpDecl] = &[
+        op_neosh_next(),
+        op_neosh_send(),
+        op_neosh_timer_start(),
+        op_neosh_timer_clear(),
+        op_neosh_width(),
+        op_neosh_clip(),
+    ];
     Extension {
         name: "neosh",
         ops: std::borrow::Cow::Borrowed(OPS),

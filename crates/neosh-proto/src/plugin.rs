@@ -17,7 +17,7 @@ use crate::agent::{HookName, HookOutcome, HookPayload, StopReason, ToolCall, Too
 use crate::api::{ApiCall, ApiResponse, KeyContext};
 use crate::ids::{BufferId, RequestId, SessionId, StreamId, TurnId, WindowId};
 use crate::options::OptionValue;
-use crate::provider::TurnRequest;
+use crate::provider::{ModelSelection, TurnRequest};
 
 // ---------------------------------------------------------------------------
 // plugin -> host
@@ -155,6 +155,17 @@ pub enum PluginEvent {
     /// of them is the one that caused it.
     SessionChanged {
         session: SessionId,
+    },
+    /// The model this conversation will use changed, whoever changed it.
+    ///
+    /// Broadcast for the same reason [`Self::SessionChanged`] is, and it was missing for exactly
+    /// as long as only one plugin cared. It is not the same thing as `agent.model` changing:
+    /// that option is a *preference*, and the selection also moves when a conversation is restored,
+    /// when a stored model turns out not to authenticate, and when a provider registers late and
+    /// the model somebody asked for finally becomes reachable. Every one of those leaves a footer
+    /// naming the wrong model and a context meter measuring against the wrong window.
+    SelectionChanged {
+        selection: ModelSelection,
     },
     /// Stop producing events for this stream and release its resources.
     ProviderCancel {

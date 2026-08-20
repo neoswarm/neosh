@@ -42,11 +42,30 @@ const MAX_LINK_DEPTH: usize = 16;
 pub struct Theme {
     groups: BTreeMap<String, HighlightDef>,
     depth: ColorDepth,
+    /// Whether animated groups actually animate. Follows `ui.motion`.
+    ///
+    /// Held here rather than checked at each call site so that turning motion off is one decision
+    /// in one place — and so a group that animates still renders its colours when it is off, rather
+    /// than disappearing along with the movement.
+    motion: bool,
 }
 
 impl Theme {
     pub fn new(depth: ColorDepth) -> Self {
-        Self { groups: BTreeMap::new(), depth }
+        Self { groups: BTreeMap::new(), depth, motion: true }
+    }
+
+    pub fn set_motion(&mut self, on: bool) {
+        self.motion = on;
+    }
+
+    pub fn motion(&self) -> bool {
+        self.motion
+    }
+
+    /// Whether a blend between two colours will survive the trip to the terminal.
+    pub fn truecolor(&self) -> bool {
+        self.depth == ColorDepth::TrueColor
     }
 
     pub fn set(&mut self, name: impl Into<String>, def: HighlightDef) {
@@ -68,6 +87,11 @@ impl Theme {
     pub fn style(&self, name: &str) -> Style {
         let Some(spec) = self.resolve(name) else { return Style::default() };
         self.to_style(&spec)
+    }
+
+    /// The animation a group carries, if any. Follows links, like the colours do.
+    pub fn animation(&self, name: &str) -> Option<neosh_proto::Animation> {
+        self.resolve(name).and_then(|s| s.animate)
     }
 
     fn resolve(&self, name: &str) -> Option<HighlightSpec> {
@@ -212,6 +236,7 @@ mod tests {
                 fg: Some(Color::Rgb { r: 200, g: 30, b: 30 }),
                 bg: None,
                 attrs: Attrs { bold: true, ..Default::default() },
+                animate: None,
             },
         });
         t

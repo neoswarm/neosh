@@ -101,18 +101,71 @@ impl SessionStore {
             self.order.retain(|x| x != id);
             return Ok(());
         }
-        // Closing what you are looking at has to land you somewhere, and the most recently used
-        // other session is the least surprising place.
+        self.step_away()?;
+        self.idle.remove(id);
+        self.order.retain(|x| x != id);
+        Ok(())
+    }
+
+    /// Put a conversation away, or bring it back.
+    ///
+    /// Archiving is *not* closing: the session stays in the store, keeps its messages and comes
+    /// back the moment you unarchive it. Only its place in [`list`](Self::list) changes.
+    ///
+    /// The active session cannot be left archived — you would be typing into something the list no
+    /// longer shows — so archiving it moves you somewhere else first. `at` is the clock the caller
+    /// read; this type does not read one.
+    pub fn archive(
+        &mut self,
+        id: &SessionId,
+        archived: bool,
+        at: i64,
+    ) -> Result<(), StoreError> {
+        if !self.contains(id) {
+            return Err(StoreError::NoSuchSession(id.clone()));
+        }
+        if archived && &self.active.id == id {
+            self.step_away()?;
+        }
+        let s = self.get_mut(id).ok_or_else(|| StoreError::NoSuchSession(id.clone()))?;
+        s.archived = archived;
+        s.archived_at = archived.then_some(at);
+        if !archived {
+            // Coming back puts it at the top of the list, because you unarchived it in order to
+            // look at it.
+            self.order.retain(|x| x != id);
+            self.order.insert(0, id.clone());
+        }
+        Ok(())
+    }
+
+    fn contains(&self, id: &SessionId) -> bool {
+        &self.active.id == id || self.idle.contains_key(id)
+    }
+
+    fn get_mut(&mut self, id: &SessionId) -> Option<&mut Session> {
+        if &self.active.id == id { Some(&mut self.active) } else { self.idle.get_mut(id) }
+    }
+
+    /// Make some other conversation active, parking the current one in `idle`.
+    ///
+    /// Leaving what you are looking at has to land you somewhere, and the most recently used other
+    /// session is the least surprising place. Archived ones are skipped: landing in a conversation
+    /// you deliberately put away is the one destination that is definitely wrong.
+    fn step_away(&mut self) -> Result<(), StoreError> {
+        let leaving = self.active.id.clone();
         let next = self
             .order
             .iter()
-            .find(|candidate| *candidate != id && self.idle.contains_key(*candidate))
+            .find(|c| **c != leaving && self.idle.get(*c).is_some_and(|s| !s.archived))
             .cloned()
-            .or_else(|| self.idle.keys().next().cloned())
+            .or_else(|| {
+                self.idle.iter().find(|(_, s)| !s.archived).map(|(id, _)| id.clone())
+            })
             .ok_or(StoreError::LastSession)?;
         let replacement = self.idle.remove(&next).ok_or(StoreError::LastSession)?;
-        self.active = replacement;
-        self.order.retain(|x| x != id);
+        let previous = std::mem::replace(&mut self.active, replacement);
+        self.idle.insert(previous.id.clone(), previous);
         self.order.retain(|x| x != &next);
         self.order.insert(0, next);
         Ok(())
@@ -128,8 +181,16 @@ impl SessionStore {
         Ok(())
     }
 
-    /// Every session, most recently active first, with the active one flagged.
+    /// The conversations you work in, most recently active first, with the active one flagged.
+    ///
+    /// Archived ones are left out. That is the whole point of archiving, and making every caller
+    /// remember to filter would mean the one that forgot is the one that ships.
     pub fn list(&self) -> Vec<SessionInfo> {
+        self.list_with(false)
+    }
+
+    /// Every session, most recently active first, with the active one flagged.
+    pub fn list_with(&self, include_archived: bool) -> Vec<SessionInfo> {
         let mut seen: Vec<SessionInfo> = Vec::with_capacity(self.len());
         for id in &self.order {
             if let Some(s) = self.get(id) {
@@ -145,6 +206,9 @@ impl SessionStore {
         }
         if !self.order.contains(&self.active.id) {
             seen.insert(0, self.info(&self.active));
+        }
+        if !include_archived {
+            seen.retain(|s| !s.archived);
         }
         seen
     }
@@ -183,6 +247,65 @@ mod tests {
         s.insert(b);
         s.insert(c);
         (s, ia, ib, ic)
+    }
+
+    #[test]
+    fn archiving_hides_a_conversation_without_losing_it() {
+        let (mut s, _a, b, _c) = store();
+        s.archive(&b, true, 1234).expect("archives");
+        assert!(!s.list().iter().any(|i| i.id == b), "still in the everyday list");
+        assert!(s.list_with(true).iter().any(|i| i.id == b), "gone from the store entirely");
+        let kept = s.get(&b).expect("the session itself survives");
+        assert!(kept.archived);
+        assert_eq!(kept.archived_at, Some(1234));
+    }
+
+    #[test]
+    fn archiving_the_active_conversation_moves_you_somewhere_else_first() {
+        // You cannot be left typing into something the list no longer shows.
+        let (mut s, a, _b, _c) = store();
+        assert_eq!(s.active_id(), &a);
+        s.archive(&a, true, 1).expect("archives");
+        assert_ne!(s.active_id(), &a);
+        assert!(!s.active().archived);
+        assert!(s.list().iter().all(|i| i.id != a));
+    }
+
+    #[test]
+    fn stepping_away_never_lands_in_something_already_archived() {
+        // The one destination that is definitely wrong is the conversation you put away.
+        let (mut s, a, b, c) = store();
+        s.archive(&b, true, 1).expect("archives b");
+        s.archive(&a, true, 2).expect("archives a");
+        assert_eq!(s.active_id(), &c, "landed in the only open conversation");
+    }
+
+    #[test]
+    fn archiving_the_last_open_conversation_is_refused_rather_than_leaving_nowhere_to_type() {
+        // The host answers this by starting an empty conversation first; the store's job is to
+        // refuse rather than to invent one, because it cannot read a clock or a working directory.
+        let mut s = SessionStore::new(Session::new("/x"));
+        let only = s.active_id().clone();
+        assert_eq!(s.archive(&only, true, 1), Err(StoreError::LastSession));
+        assert!(!s.active().archived);
+    }
+
+    #[test]
+    fn unarchiving_puts_it_back_at_the_top_because_that_is_why_you_did_it() {
+        let (mut s, _a, _b, c) = store();
+        s.archive(&c, true, 1).expect("archives");
+        s.archive(&c, false, 0).expect("unarchives");
+        assert_eq!(s.list().first().map(|i| i.id.clone()), Some(c));
+        assert!(s.get(&s.list()[0].id.clone()).expect("there").archived_at.is_none());
+    }
+
+    #[test]
+    fn archiving_something_that_is_not_there_is_an_error_not_a_silent_success() {
+        let (mut s, ..) = store();
+        assert!(matches!(
+            s.archive(&SessionId::from("nope"), true, 1),
+            Err(StoreError::NoSuchSession(_))
+        ));
     }
 
     #[test]

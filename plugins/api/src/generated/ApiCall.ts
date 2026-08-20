@@ -8,6 +8,7 @@ import type { ExtmarkId } from "./ExtmarkId";
 import type { ExtmarkOpts } from "./ExtmarkOpts";
 import type { FloatConfig } from "./FloatConfig";
 import type { HighlightDef } from "./HighlightDef";
+import type { Hint } from "./Hint";
 import type { HookName } from "./HookName";
 import type { InstanceConfig } from "./InstanceConfig";
 import type { InstanceId } from "./InstanceId";
@@ -18,6 +19,7 @@ import type { ModelSelection } from "./ModelSelection";
 import type { NamespaceId } from "./NamespaceId";
 import type { OptionSpec } from "./OptionSpec";
 import type { OptionValue } from "./OptionValue";
+import type { PermissionMode } from "./PermissionMode";
 import type { ProviderEvent } from "./ProviderEvent";
 import type { Rect } from "./Rect";
 import type { SessionId } from "./SessionId";
@@ -149,7 +151,24 @@ export type ApiCall =
     refresh: boolean;
   }
   | { "call": "agent_list_instances" }
-  | { "call": "session_list" }
+  | { "call": "provider_credentials" }
+  | {
+    "call": "provider_set_credential";
+    instance: InstanceId;
+    /**
+     * Overwrite a key that is already there without asking. Off by default.
+     */
+    replace: boolean;
+  }
+  | { "call": "provider_forget_credential"; instance: InstanceId }
+  | {
+    "call": "session_list";
+    /**
+     * Include conversations that have been put away. Off by default, so every existing caller
+     * keeps showing the list the user actually works in.
+     */
+    include_archived: boolean;
+  }
   | { "call": "session_current" }
   | {
     "call": "session_new";
@@ -163,6 +182,7 @@ export type ApiCall =
   | { "call": "session_switch"; session: SessionId }
   | { "call": "session_close"; session: SessionId }
   | { "call": "session_rename"; session: SessionId; title?: string | null }
+  | { "call": "session_archive"; session: SessionId; archived: boolean }
   | { "call": "session_messages"; session?: SessionId | null }
   | { "call": "tool_register"; def: ToolDef }
   | { "call": "tool_unregister"; name: string }
@@ -185,6 +205,8 @@ export type ApiCall =
     instances: Array<InstanceConfig>;
   }
   | { "call": "provider_emit"; stream: StreamId; event: ProviderEvent }
+  | { "call": "permission_get_mode" }
+  | { "call": "permission_set_mode"; mode: PermissionMode }
   | { "call": "permission_check"; capability: Capability }
   | { "call": "opt_declare"; spec: OptionSpec }
   | { "call": "opt_set"; name: string; value: OptionValue }
@@ -237,5 +259,7 @@ export type ApiCall =
   }
   | { "call": "status_set"; key: string; segment: StatusSegment }
   | { "call": "status_clear"; key: string }
+  | { "call": "hint_set"; key: string; hint: Hint }
+  | { "call": "hint_clear"; key: string }
   | { "call": "log"; level: MessageLevel; message: string }
   | { "call": "notify"; level: MessageLevel; message: string };

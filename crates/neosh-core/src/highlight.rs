@@ -14,7 +14,7 @@ use neosh_proto::{HighlightDef, HighlightSpec};
 
 use crate::palette::{self, Variant};
 
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Clone)]
 pub struct HighlightRegistry {
     defs: HashMap<String, HighlightDef>,
     /// Which theme the defaults came from, so switching can replace exactly those and leave a
@@ -23,10 +23,18 @@ pub struct HighlightRegistry {
     /// Groups defined by someone other than the theme. A theme switch must not silently discard a
     /// plugin's colours, and it must not resurrect a default the plugin deliberately overrode.
     overridden: HashSet<String>,
+    /// Whether groups that animate keep their animation. Follows `ui.motion`.
+    motion: bool,
 }
 
 /// How deep a link chain may go before we call it a cycle.
 const MAX_LINK_DEPTH: usize = 16;
+
+impl Default for HighlightRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl HighlightRegistry {
     pub fn new() -> Self {
@@ -34,7 +42,8 @@ impl HighlightRegistry {
     }
 
     pub fn with_variant(variant: Variant) -> Self {
-        let mut r = Self { defs: HashMap::new(), variant, overridden: HashSet::new() };
+        let mut r =
+            Self { defs: HashMap::new(), variant, overridden: HashSet::new(), motion: true };
         r.install_theme(variant);
         r
     }
@@ -64,6 +73,46 @@ impl HighlightRegistry {
         }
         self.install_theme(variant);
         true
+    }
+
+    /// Turn motion on or off across every group that has any.
+    ///
+    /// Done by *removing* the animation from the definitions rather than by telling the frontend
+    /// to ignore it. That keeps `ui.motion` a single decision made in one place, and it means a
+    /// frontend needs no concept of the setting at all — it animates what carries an animation,
+    /// and with motion off nothing does. A group keeps its colours either way: turning movement off
+    /// must not turn text invisible.
+    ///
+    /// Returns whether anything changed.
+    pub fn set_motion(&mut self, on: bool) -> bool {
+        if self.motion == on {
+            return false;
+        }
+        self.motion = on;
+        let names: Vec<String> = self.defs.keys().cloned().collect();
+        let mut changed = false;
+        for name in names {
+            let base = palette::groups(self.variant)
+                .into_iter()
+                .find(|(n, _)| *n == name)
+                .map(|(_, d)| d);
+            let Some(HighlightDef::Spec { spec: base }) = base else { continue };
+            if base.animate.is_none() {
+                continue;
+            }
+            // A plugin that redefined the group owns it; restoring the catalogue's version here
+            // would undo their choice as a side effect of a setting they did not touch.
+            if self.overridden.contains(name.as_str()) {
+                continue;
+            }
+            let mut spec = base;
+            if !on {
+                spec.animate = None;
+            }
+            self.defs.insert(name, HighlightDef::Spec { spec });
+            changed = true;
+        }
+        changed
     }
 
     pub fn define(&mut self, name: impl Into<String>, def: HighlightDef) {

@@ -128,6 +128,9 @@ impl PermissionLayer {
                 let writing = matches!(cap, Capability::WriteFile { .. });
                 match self.mode {
                     PermissionMode::Deny => deny("permission mode is deny".into()),
+                    // Still inside the workspace: the check above already refused anything outside
+                    // it, in every mode. "Full access" means not being asked, not reaching further.
+                    PermissionMode::Allow => PermissionDecision::Allow,
                     // Reads inside the workspace are the agent's basic job; prompting for each one
                     // trains users to approve reflexively, which is worse than not asking.
                     PermissionMode::AllowListed if !writing => PermissionDecision::Allow,
@@ -140,6 +143,7 @@ impl PermissionLayer {
                 let program = command.split_whitespace().next().unwrap_or_default();
                 match self.mode {
                     PermissionMode::Deny => deny("permission mode is deny".into()),
+                    PermissionMode::Allow => PermissionDecision::Allow,
                     _ if self.allowed_commands.iter().any(|c| c == program) => {
                         PermissionDecision::Allow
                     }
@@ -151,6 +155,7 @@ impl PermissionLayer {
             }
             Capability::Network { host } => match self.mode {
                 PermissionMode::Deny => deny("permission mode is deny".into()),
+                PermissionMode::Allow => PermissionDecision::Allow,
                 _ if self.allowed_hosts.iter().any(|h| h == host) => PermissionDecision::Allow,
                 PermissionMode::AllowListed => deny(format!("{host} is not in the allow-list")),
                 PermissionMode::Ask => PermissionDecision::Prompt,

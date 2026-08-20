@@ -60,15 +60,26 @@ pub enum Anchor {
 }
 
 /// A size request along one axis. Resolved by the frontend against the real viewport.
+///
+/// # An extent measures content, not the box drawn around it
+///
+/// Every variant here answers the same question — *how much room does what I am putting in it
+/// need* — and the border is chrome the frontend adds afterwards. `Auto` could not mean anything
+/// else, since the content is all it has to measure; the others follow it so that swapping one for
+/// another does not silently resize what you can see.
+///
+/// The alternative, where `Fixed` names the outer box, means every caller subtracts two from every
+/// number it computes, and the day one of them forgets, the last line of a list is simply not
+/// drawn — with no error, because a rectangle that small is perfectly valid.
 #[derive(TS, Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 #[ts(export)]
 pub enum Extent {
-    /// Exactly `n` cells.
+    /// Room for exactly `n` cells of content.
     Fixed { n: u16 },
     /// Fit the content.
     Auto,
-    /// Fit the content, but never exceed `n` cells.
+    /// Fit the content, but never more than `n` cells of it.
     Max { n: u16 },
     /// Fill the available space.
     Fill,
@@ -150,10 +161,28 @@ pub enum WindowLayout {
         /// Preferred extent along the dock's variable axis.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         size: Option<u16>,
+        /// Which end content settles against when there is not enough of it to fill the window.
+        #[serde(default)]
+        gravity: Gravity,
     },
     Float {
         config: FloatConfig,
     },
+}
+
+/// Which end of a window short content settles against.
+///
+/// A layout property rather than a rendering trick, so it survives the trip through the protocol and
+/// a different frontend resolves it the same way. `End` is what makes a transcript read as a
+/// conversation: three exchanges should sit just above the field you are typing into, not stranded
+/// at the top of an empty screen with the composer a long way below them.
+#[derive(TS, Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug, Default)]
+#[serde(rename_all = "snake_case")]
+#[ts(export)]
+pub enum Gravity {
+    #[default]
+    Start,
+    End,
 }
 
 /// A resolved rectangle in frontend cell space. Only ever travels frontend -> core (as viewport
@@ -201,6 +230,45 @@ pub struct Attrs {
     pub strikethrough: bool,
 }
 
+/// Text that moves on its own.
+///
+/// Declared on a highlight group rather than driven by whoever wrote the text, for two reasons.
+/// A plugin animating text itself would have to re-set an extmark per character per tick — forty
+/// API calls at 20 Hz, across a runtime boundary, to move a highlight two columns. And motion is a
+/// *display* decision: how bright a band can get depends on what the terminal can render, which is
+/// the one thing only the frontend knows.
+///
+/// So the core stores this and forwards it; the frontend animates whatever carries it, at whatever
+/// rate it likes, and stops when nothing animated is on screen. Nothing wakes the core.
+#[derive(TS, Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+#[ts(export)]
+pub enum Animation {
+    /// A band of brightness sweeping along the run, left to right.
+    ///
+    /// What "it is working" looks like when there is nothing yet to show. Reads as motion at a
+    /// glance without asking to be read, which is the whole trick: a spinner you have to look at
+    /// costs attention every time it moves.
+    Shimmer {
+        /// One full sweep, in milliseconds.
+        #[ts(type = "number")]
+        period_ms: u32,
+    },
+    /// The whole run brightening and dimming together.
+    Pulse {
+        #[ts(type = "number")]
+        period_ms: u32,
+    },
+}
+
+impl Animation {
+    pub fn period_ms(self) -> u32 {
+        match self {
+            Self::Shimmer { period_ms } | Self::Pulse { period_ms } => period_ms.max(50),
+        }
+    }
+}
+
 #[derive(TS, Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug, Default)]
 #[ts(export)]
 pub struct HighlightSpec {
@@ -210,6 +278,10 @@ pub struct HighlightSpec {
     pub bg: Option<Color>,
     #[serde(flatten)]
     pub attrs: Attrs,
+    /// Motion. Ignored when `ui.motion` is off, which is why it is a hint on the group rather than
+    /// a promise to the plugin that set it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub animate: Option<Animation>,
 }
 
 /// Plugins declare semantic names, never colors directly.
@@ -602,6 +674,16 @@ pub enum InputEvent {
         #[serde(default)]
         args: Vec<String>,
     },
+    /// Draw the same state again.
+    ///
+    /// The frontend asks for this while something on screen is animating, and stops asking the
+    /// moment nothing is. It carries no state and mutates nothing — the core answers by flushing
+    /// what it already had, which is why an animation cannot desynchronise from the buffer it is
+    /// drawn over.
+    ///
+    /// This is the *only* thing that draws a frame nobody asked for, and it exists on the frontend's
+    /// terms: there is still no frame loop, and an idle workspace still sends nothing at all.
+    Repaint,
     /// The frontend is going away (terminal closed, socket dropped).
     Disconnected,
 }

@@ -6,6 +6,14 @@ import type { StatusAlign } from "./StatusAlign";
  */
 export type StatusSegment = {
   text: string;
+  /**
+   * The key that changes this, written the way the user would press it — `^P`, `F1`.
+   *
+   * Beside what it acts on rather than in a list of its own, because a key is only memorable
+   * once you have seen it next to the thing it does. A separate legend is a second place to
+   * look, and the thing being looked up is right there.
+   */
+  keys?: string | null;
   hl?: string | null;
   align: StatusAlign;
   /**

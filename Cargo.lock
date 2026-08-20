@@ -2216,6 +2216,8 @@ dependencies = [
  "toml",
  "tracing",
  "tracing-subscriber",
+ "unicode-segmentation",
+ "unicode-width",
  "url",
 ]
 
@@ -2302,6 +2304,8 @@ dependencies = [
  "tokio",
  "toml",
  "tracing",
+ "unicode-segmentation",
+ "unicode-width",
  "url",
 ]
 

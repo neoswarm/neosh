@@ -3,6 +3,7 @@ import type { BranchInfo } from "./BranchInfo";
 import type { BufferId } from "./BufferId";
 import type { CommandEntry } from "./CommandEntry";
 import type { CommitInfo } from "./CommitInfo";
+import type { CredentialInfo } from "./CredentialInfo";
 import type { ExtmarkId } from "./ExtmarkId";
 import type { ExtmarkInfo } from "./ExtmarkInfo";
 import type { InstanceConfig } from "./InstanceConfig";
@@ -13,6 +14,7 @@ import type { ModelSelection } from "./ModelSelection";
 import type { NamespaceId } from "./NamespaceId";
 import type { OptionEntry } from "./OptionEntry";
 import type { PermissionDecision } from "./PermissionDecision";
+import type { PermissionMode } from "./PermissionMode";
 import type { RepoStatus } from "./RepoStatus";
 import type { SessionInfo } from "./SessionInfo";
 import type { SurfaceId } from "./SurfaceId";
@@ -27,6 +29,7 @@ import type { WorktreeInfo } from "./WorktreeInfo";
  */
 export type ApiOk =
   | { "ok": "unit" }
+  | { "ok": "bool"; value: boolean }
   | { "ok": "buf"; buf: BufferId }
   | { "ok": "win"; win: WindowId }
   | { "ok": "ns"; ns: NamespaceId }
@@ -45,12 +48,14 @@ export type ApiOk =
   | { "ok": "commands"; commands: Array<CommandEntry> }
   | { "ok": "keymaps"; keymaps: Array<KeymapEntry> }
   | { "ok": "permission"; decision: PermissionDecision }
+  | { "ok": "permission_mode"; mode: PermissionMode }
   | { "ok": "focused_win"; win: WindowId | null }
   | { "ok": "option"; entry: OptionEntry | null }
   | { "ok": "options"; options: Array<OptionEntry> }
   | { "ok": "paths"; paths: Array<string> }
   | { "ok": "viewport"; viewport: Viewport | null }
   | { "ok": "sessions"; sessions: Array<SessionInfo> }
+  | { "ok": "credentials"; credentials: Array<CredentialInfo> }
   | { "ok": "session"; session: SessionInfo }
   | { "ok": "messages"; messages: Array<Message> }
   | { "ok": "status"; status: RepoStatus }

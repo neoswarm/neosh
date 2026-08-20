@@ -126,6 +126,26 @@ fn italic(mut s: HighlightSpec) -> HighlightSpec {
     s
 }
 
+fn underline(mut s: HighlightSpec) -> HighlightSpec {
+    s.attrs.underline = true;
+    s
+}
+
+fn struck(mut s: HighlightSpec) -> HighlightSpec {
+    s.attrs.strikethrough = true;
+    s
+}
+
+fn shimmer(mut s: HighlightSpec, period_ms: u32) -> HighlightSpec {
+    s.animate = Some(neosh_proto::Animation::Shimmer { period_ms });
+    s
+}
+
+fn pulse(mut s: HighlightSpec, period_ms: u32) -> HighlightSpec {
+    s.animate = Some(neosh_proto::Animation::Pulse { period_ms });
+    s
+}
+
 /// Every group a plugin may link to, with a concrete spec.
 ///
 /// Kept as one list rather than scattered across the crates that use each group, because the whole
@@ -172,6 +192,23 @@ pub fn groups(variant: Variant) -> Vec<(&'static str, HighlightDef)> {
         ("Agent.Tool", spec(fg(r.active))),
         ("Agent.ToolError", spec(bold(fg(r.danger)))),
         ("Agent.Usage", spec(dim(fg(r.muted)))),
+        // ---- markdown -----------------------------------------------------
+        // An answer is prose with structure in it, and the structure should be visible without
+        // being loud: the thing being read is the words. Hence one accent for headings and links,
+        // one quiet colour for code, and attributes rather than colour for emphasis — a paragraph
+        // where three words are a different hue is harder to read than one where they are bold.
+        ("Markdown.Heading", spec(bold(fg(r.accent)))),
+        ("Markdown.Bold", spec(bold(fg(r.fg)))),
+        ("Markdown.Italic", spec(italic(fg(r.fg)))),
+        // Struck-through text is text the answer has told you to disregard, so it reads at the
+        // weight of something disregarded: the line through it *and* a step back on the ramp.
+        ("Markdown.Strike", spec(struck(dim(fg(r.muted))))),
+        ("Markdown.Code", spec(fg(r.active))),
+        ("Markdown.Fence", spec(dim(fg(r.muted)))),
+        ("Markdown.Bullet", spec(fg(r.accent))),
+        ("Markdown.Quote", spec(dim(fg(r.faint)))),
+        ("Markdown.Rule", link("Separator")),
+        ("Markdown.Link", spec(underline(fg(r.accent)))),
         // ---- conversation state -------------------------------------------
         // One hue per meaning: in motion, act now, broken, done.
         ("Status.Working", spec(fg(r.active))),
@@ -182,6 +219,16 @@ pub fn groups(variant: Variant) -> Vec<(&'static str, HighlightDef)> {
         ("Status.Failed", spec(bold(fg(r.danger)))),
         ("Status.Done", spec(fg(r.success))),
         ("Status.Idle", spec(dim(fg(r.muted)))),
+        // The two groups that move. Motion is reserved for "something is happening and you cannot
+        // see it yet" — the one state where a still screen and a wedged program look identical.
+        //
+        // A sweep rather than a blink: a blink asks to be looked at every time it changes, and you
+        // pay that attention whether or not there is news. A band travelling along a word reads as
+        // aliveness at the edge of vision and costs nothing to ignore.
+        ("Status.Streaming", spec(shimmer(fg(r.active), 2000))),
+        // Slower and uniform, for waiting on something outside the program: a tool, a subprocess,
+        // a person. Different shape, because it is a different kind of waiting.
+        ("Status.Pending", spec(pulse(fg(r.attention), 2600))),
         // ---- version control ----------------------------------------------
         ("Git.Added", spec(fg(r.success))),
         ("Git.Modified", spec(fg(r.attention))),
@@ -214,6 +261,44 @@ pub fn groups(variant: Variant) -> Vec<(&'static str, HighlightDef)> {
         ("Sidebar.Dim", link("Comment")),
         ("Sidebar.Selected", link("CursorLine")),
         ("Status.Line", link("Comment")),
+        // ---- the composer -------------------------------------------------
+        // The field you type into is chrome, not content: it should read as furniture at the
+        // bottom of the screen and never compete with what the model just said. Hence a rule at
+        // the faintest step on the ramp, and a prompt that is the one accented thing down there.
+        ("Composer.Rule", link("Separator")),
+        ("Composer.Prompt", spec(bold(fg(r.accent)))),
+        ("Composer.Placeholder", link("NonText")),
+        ("Composer.Hint", link("Comment")),
+        ("Composer.HintKey", spec(fg(r.muted))),
+        // ---- provider marks -----------------------------------------------
+        // One group per vendor, so a provider rail is legible at a glance and a theme can restyle
+        // the lot. These are the *only* groups tied to something outside neosh, which is why they
+        // are named after the company rather than after a role: there is no role to name, the
+        // whole job is "looks like that vendor".
+        //
+        // Approximations of brand hues, pulled toward the palette so a rail of eleven marks still
+        // looks like one program. A provider plugin adds its own group and nothing here changes.
+        ("Brand.Anthropic", spec(fg(rgb(0xd9, 0x7a, 0x57)))),
+        ("Brand.OpenAI", spec(fg(rgb(0x74, 0xaa, 0x9c)))),
+        ("Brand.Google", spec(fg(rgb(0x66, 0x9d, 0xf6)))),
+        ("Brand.OpenRouter", spec(fg(rgb(0x8b, 0x8b, 0xa7)))),
+        ("Brand.Groq", spec(fg(rgb(0xf5, 0x5c, 0x36)))),
+        ("Brand.DeepSeek", spec(fg(rgb(0x4d, 0x6b, 0xfe)))),
+        ("Brand.XAI", spec(fg(r.fg))),
+        ("Brand.Cursor", spec(fg(rgb(0x7c, 0x8b, 0xa1)))),
+        ("Brand.Mistral", spec(fg(rgb(0xff, 0x8a, 0x00)))),
+        ("Brand.Together", spec(fg(rgb(0x0f, 0x6f, 0xff)))),
+        ("Brand.Fireworks", spec(fg(rgb(0xff, 0x5a, 0x8a)))),
+        ("Brand.Cerebras", spec(fg(rgb(0xf2, 0x54, 0x54)))),
+        // Anything on this machine. One group, because "local" is the distinction that matters.
+        ("Brand.Local", spec(fg(r.success))),
+        // ---- accounts ------------------------------------------------------
+        // A plan and a key cost different things. Saying so in colour means the picker does not
+        // have to say it in words on every row.
+        ("Account.Plan", spec(fg(r.success))),
+        ("Account.Key", spec(fg(r.accent))),
+        ("Account.Local", spec(dim(fg(r.muted)))),
+        ("Account.Missing", link("Diagnostic.Warn")),
     ]
 }
 

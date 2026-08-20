@@ -9,6 +9,7 @@ use neosh_proto::{InputEvent, ModelId};
 use neosh_provider::ProviderRegistry;
 use neosh_script::ScriptRuntime;
 
+mod markdown;
 mod bridge;
 mod config;
 mod frontend;
@@ -213,10 +214,11 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
     let (script, script_rx) = ScriptRuntime::spawn();
     let bridge = Arc::new(ScriptBridge::new(script));
 
+    let mut acp_drivers = Vec::new();
     match &cli.mock_script {
         Some(path) => install_mock_provider(&agent, path)?,
         None => {
-            host::install_builtin_providers(&agent);
+            acp_drivers = host::install_builtin_providers(&agent);
             for i in resolved.providers.clone() {
                 agent.providers_mut().add_instance(i);
             }
@@ -250,6 +252,7 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
     let input_rx = with_signals(input_rx);
 
     let mut host = Host::new(agent.clone(), bridge.clone(), frontend);
+    host.adopt_acp_drivers(acp_drivers);
     host.discover_repo(&cwd).await;
     // `--clean` reads and writes nothing, which has to include conversations.
     host.restore_sessions((!paths.clean).then(|| paths.state.clone())).await;
@@ -462,37 +465,40 @@ fn install_mock_provider(agent: &Agent, path: &std::path::Path) -> anyhow::Resul
         display_name: "Mock".into(),
         base_url: None,
         auth: neosh_proto::AuthRef::None,
-        models: vec![neosh_proto::ModelInfo {
-            id: ModelId::from("mock"),
-            display_name: "Mock".into(),
-            context_window: None,
-            max_output_tokens: None,
-            capabilities: Default::default(),
-            pricing: None,
-        }],
+        brand: None,
+        models: vec![neosh_proto::ModelInfo::undescribed(ModelId::from("mock"), "Mock")],
         extra_headers: vec![],
     });
     Ok(())
 }
 
 async fn list_models(agent: &Agent) -> anyhow::Result<()> {
-    let instances: Vec<_> = agent.providers().usable_instances().cloned().collect();
+    let instances: Vec<_> = agent.providers().instances().cloned().collect();
     for inst in instances {
         let driver = agent.providers().driver(&inst.driver);
         let models = match &driver {
             Some(d) => d.list_models(&inst).await.unwrap_or_else(|_| inst.models.clone()),
             None => inst.models.clone(),
         };
-        let note = match &inst.auth {
-            neosh_proto::AuthRef::Env { var } if std::env::var_os(var).is_none() => {
-                format!("  ({var} not set)")
-            }
-            neosh_proto::AuthRef::Inherited => "  (uses an existing CLI login)".to_string(),
-            _ => String::new(),
+        // What the credential store says, not what the config file says: a key typed in last week
+        // and put in the keychain is why an instance whose environment variable is unset works
+        // anyway, and a listing that reported otherwise would send people looking for a bug.
+        let source = neosh_provider::credentials::credentials().source(&inst);
+        let note = match source {
+            neosh_proto::CredentialSource::NotNeeded => String::new(),
+            other => format!("  ({})", other.summary(&inst.auth)),
         };
         say!("{} — {}{}", inst.id, inst.display_name, note);
         if models.is_empty() {
-            say!("    (no models listed; discovery needs credentials)");
+            // Why there is nothing, not just that there is nothing. The two causes need opposite
+            // fixes: one is a key, the other is starting the server.
+            match &inst.auth {
+                neosh_proto::AuthRef::None => say!(
+                    "    (nothing reachable at {})",
+                    inst.base_url.as_deref().unwrap_or("the configured address")
+                ),
+                _ => say!("    (no models listed \u{2014} discovery needs a key)"),
+            }
         }
         for m in models {
             say!("    {}/{}", inst.id, m.id);

@@ -11,15 +11,16 @@ use serde::{Deserialize, Serialize};
 use ts_rs::TS;
 
 use crate::agent::{
-    Capability, HookName, HookPayload, Message, PermissionDecision, SessionInfo, ToolDef,
-    ToolResult,
+    Capability, HookName, HookPayload, Message, PermissionDecision, PermissionMode, SessionInfo,
+    ToolDef, ToolResult,
 };
 use crate::ids::{
     BufferId, ExtmarkId, NamespaceId, RequestId, SessionId, StreamId, SurfaceId, WindowId,
 };
 use crate::options::{OptionEntry, OptionSpec, OptionValue};
 use crate::provider::{
-    DriverKind, InstanceConfig, InstanceId, ModelEntry, ModelSelection, ProviderEvent,
+    CredentialInfo, DriverKind, InstanceConfig, InstanceId, ModelEntry, ModelSelection,
+    ProviderEvent,
 };
 use crate::ui::{
     CursorMotion, ExtmarkInfo, ExtmarkOpts, FloatConfig, HighlightDef, KeyPress, MessageLevel,
@@ -332,10 +333,37 @@ pub enum ApiCall {
     },
     AgentListInstances,
 
+    // ---- credentials ---------------------------------------------------
+    // Three verbs, and *none of them carries a key*. Listing reports where a key comes from, never
+    // what it is; setting one hands the job to the host, which reads the keystrokes itself and puts
+    // the value straight into a secret store. Nothing a plugin can call returns a secret, so no
+    // plugin can leak one — which is a property of the protocol rather than of plugin authors
+    // being careful.
+    ProviderCredentials,
+    /// Ask the host to collect a key for `instance` from the keyboard.
+    ///
+    /// The host owns this prompt because a plugin one would put the key in a buffer, and a buffer
+    /// is drawn — the value would cross the frontend boundary in a `UiEvent` and land in whatever
+    /// the frontend logs. Answered when the prompt closes: `true` if a key was stored.
+    ProviderSetCredential {
+        instance: InstanceId,
+        /// Overwrite a key that is already there without asking. Off by default.
+        #[serde(default)]
+        replace: bool,
+    },
+    ProviderForgetCredential {
+        instance: InstanceId,
+    },
+
     // ---- sessions ------------------------------------------------------
     // A workspace is not one conversation. These are the verbs a thread list needs; what it looks
     // like is a plugin's business.
-    SessionList,
+    SessionList {
+        /// Include conversations that have been put away. Off by default, so every existing caller
+        /// keeps showing the list the user actually works in.
+        #[serde(default)]
+        include_archived: bool,
+    },
     SessionCurrent,
     /// Start a conversation. `cwd` defaults to the one neosh was started in, so opening a session
     /// in another checkout is one argument rather than another process.
@@ -360,6 +388,16 @@ pub enum ApiCall {
         session: SessionId,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         title: Option<String>,
+    },
+    /// Put a conversation away, or bring it back.
+    ///
+    /// Distinct from [`SessionClose`](Self::SessionClose), which deletes the file. Archiving the
+    /// active conversation moves you to the most recently used other one, exactly as closing does,
+    /// because there is always somewhere for the next thing you type.
+    SessionArchive {
+        session: SessionId,
+        #[serde(default = "yes")]
+        archived: bool,
     },
     /// The conversation itself, for a transcript view that wants to render it rather than replay
     /// the UI events that built it.
@@ -413,6 +451,13 @@ pub enum ApiCall {
     // ---- permissions ---------------------------------------------------
     /// Ask the host whether a capability is allowed. Plugins performing side effects must call this
     /// rather than assume.
+    /// What the permission mode is right now.
+    PermissionGetMode,
+    /// Change it for this session. Not written to configuration: a mode you turned on to get
+    /// through one task should not still be on next week.
+    PermissionSetMode {
+        mode: PermissionMode,
+    },
     PermissionCheck {
         capability: Capability,
     },
@@ -569,6 +614,14 @@ pub enum ApiCall {
     StatusClear {
         key: String,
     },
+    /// Put one shortcut on the row under the composer, or replace what is there under this key.
+    HintSet {
+        key: String,
+        hint: Hint,
+    },
+    HintClear {
+        key: String,
+    },
 
     // ---- misc ----------------------------------------------------------
     Log {
@@ -589,6 +642,7 @@ pub enum ApiCall {
 #[ts(export)]
 pub enum ApiOk {
     Unit,
+    Bool { value: bool },
     Buf { buf: BufferId },
     Win { win: WindowId },
     Ns { ns: NamespaceId },
@@ -607,6 +661,7 @@ pub enum ApiOk {
     Commands { commands: Vec<CommandEntry> },
     Keymaps { keymaps: Vec<KeymapEntry> },
     Permission { decision: PermissionDecision },
+    PermissionMode { mode: PermissionMode },
     FocusedWin { win: Option<WindowId> },
     Option { entry: Option<OptionEntry> },
     Options { options: Vec<OptionEntry> },
@@ -614,6 +669,7 @@ pub enum ApiOk {
     /// `None` until the frontend has drawn the window at least once.
     Viewport { viewport: Option<Viewport> },
     Sessions { sessions: Vec<SessionInfo> },
+    Credentials { credentials: Vec<CredentialInfo> },
     Session { session: SessionInfo },
     Messages { messages: Vec<Message> },
     // ---- version control ----
@@ -637,12 +693,35 @@ pub enum ApiOk {
 #[ts(export)]
 pub struct StatusSegment {
     pub text: String,
+    /// The key that changes this, written the way the user would press it — `^P`, `F1`.
+    ///
+    /// Beside what it acts on rather than in a list of its own, because a key is only memorable
+    /// once you have seen it next to the thing it does. A separate legend is a second place to
+    /// look, and the thing being looked up is right there.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keys: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hl: Option<String>,
     #[serde(default)]
     pub align: StatusAlign,
     /// Lower sorts first within its side. Ties break by key, so the order is stable across redraws
     /// rather than depending on which plugin happened to load first.
+    #[serde(default)]
+    pub priority: i32,
+}
+
+/// One shortcut, as it reads on the row under the composer.
+///
+/// Split into the key and what it does rather than one pre-formatted string, because the row has to
+/// survive a narrow terminal: labels are dropped before keys are, and that decision cannot be made
+/// once the two have been glued together. The key is written the way the user would press it —
+/// `^P`, `⏎`, `esc` — which is the frontend's spelling of a binding, not the core's `<C-p>`.
+#[derive(TS, Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
+#[ts(export)]
+pub struct Hint {
+    pub keys: String,
+    pub label: String,
+    /// Lower sorts first. Ties break by key, so the row does not reshuffle when a plugin reloads.
     #[serde(default)]
     pub priority: i32,
 }

@@ -52,6 +52,7 @@ fn mock_instance() -> InstanceConfig {
         driver: DriverKind::from("mock"),
         display_name: "Mock".into(),
         base_url: None,
+        brand: None,
         auth: AuthRef::None,
         models: vec![],
         extra_headers: vec![],

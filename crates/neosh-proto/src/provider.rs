@@ -174,6 +174,55 @@ pub struct Pricing {
     pub cache_write_per_mtok: f64,
 }
 
+/// Where a model sits on the capability ladder.
+///
+/// Three rungs, because every lineup worth switching between has three: Opus/Sonnet/Haiku,
+/// gpt-5/mini/nano, Pro/Flash/Flash-Lite. This is what makes "give me the next one down" a question
+/// with an answer, across catalogues that share no naming convention at all.
+///
+/// It is a *statement about the model*, supplied by whoever describes it — a catalogue entry, a
+/// discovery response, a provider plugin. Nothing infers it from an id, because id conventions are
+/// exactly the thing that differs.
+#[derive(TS, Serialize, Deserialize, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug, Hash)]
+#[serde(rename_all = "snake_case")]
+#[ts(export)]
+pub enum ModelTier {
+    /// Cheapest and quickest. For things you would not think hard about yourself.
+    Fast,
+    /// The everyday one.
+    Balanced,
+    /// The most capable thing this provider sells.
+    Frontier,
+}
+
+impl ModelTier {
+    /// Low to high, so a ladder can be walked.
+    pub const LADDER: [ModelTier; 3] = [Self::Fast, Self::Balanced, Self::Frontier];
+
+    pub fn rank(self) -> u8 {
+        match self {
+            Self::Fast => 0,
+            Self::Balanced => 1,
+            Self::Frontier => 2,
+        }
+    }
+
+    /// One rung along, or `None` at the end. No wrapping: a "downgrade" that lands on the most
+    /// expensive model in the catalogue is a keystroke you learn not to press.
+    pub fn step(self, delta: i8) -> Option<Self> {
+        let at = self.rank() as i8 + delta;
+        (0..3).contains(&at).then(|| Self::LADDER[at as usize])
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Fast => "Fast",
+            Self::Balanced => "Balanced",
+            Self::Frontier => "Frontier",
+        }
+    }
+}
+
 #[derive(TS, Serialize, Deserialize, Clone, PartialEq, Debug)]
 #[ts(export)]
 pub struct ModelInfo {
@@ -189,6 +238,43 @@ pub struct ModelInfo {
     pub capabilities: ModelCapabilities,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pricing: Option<Pricing>,
+    /// The lineup: `"opus"`, `"sonnet"`, `"gpt-5"`. Models sharing a family are the same product at
+    /// different versions, which is what "the best one in that line" means.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub family: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tier: Option<ModelTier>,
+    /// Superseded, but still reachable. Folded away in a picker rather than removed, because the
+    /// reason you go looking for last year's model is usually that you need to reproduce something.
+    #[serde(default)]
+    pub legacy: bool,
+    /// One line on what it is for. `"Most capable for complex work"`, not `"128k context"` — the
+    /// numbers are already columns.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tagline: Option<String>,
+}
+
+impl ModelInfo {
+    /// The blanks an endpoint that told us only a name leaves behind.
+    ///
+    /// Deliberately not `Default`: a `ModelInfo` with no id is not a thing, and the family, tier
+    /// and tagline are exactly the fields a discovery response cannot supply — they are editorial,
+    /// and inferring them from an id would be guessing in the one place a wrong guess sends a turn
+    /// to a model you did not ask for.
+    pub fn undescribed(id: impl Into<ModelId>, display_name: impl Into<String>) -> Self {
+        Self {
+            id: id.into(),
+            display_name: display_name.into(),
+            context_window: None,
+            max_output_tokens: None,
+            capabilities: ModelCapabilities::default(),
+            pricing: None,
+            family: None,
+            tier: None,
+            legacy: false,
+            tagline: None,
+        }
+    }
 }
 
 /// A model together with the instance that serves it.
@@ -242,10 +328,102 @@ impl ModelSelection {
 pub enum AuthRef {
     /// Read the key from this environment variable.
     Env { var: String },
-    /// The driver is a subprocess that carries its own credentials (e.g. an already-logged-in CLI).
+    /// Run a program and read the key from its standard output.
+    ///
+    /// The git-credential-helper pattern, and the reason neosh needs no opinion about your password
+    /// manager: `["pass", "show", "anthropic/key"]`, `["op", "read", "op://…"]`, `["secret-tool",
+    /// "lookup", …]` all work, and none of them puts a key in a file neosh wrote.
+    Command { argv: Vec<String> },
+    /// A **plan**: a vendor CLI you are already signed in to, which carries its own credentials.
+    ///
+    /// `program` is what must be on `$PATH`; `login` is the command that signs you in, quoted back
+    /// at you when it is missing. neosh never holds a token for these — that is the point. An
+    /// account subscription and an API key are different things to buy, bill and revoke, and a
+    /// picker that lists them as one flat set cannot tell you which one you are about to spend.
+    Cli {
+        program: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        login: Option<String>,
+    },
+    /// The driver authenticates itself and will not say how.
+    ///
+    /// The door for a plan that is not a CLI — a plugin that runs its own OAuth flow registers a
+    /// driver with this and neither the core nor the picker needs to learn anything new.
     Inherited,
     /// No auth, e.g. a local llama.cpp or Ollama endpoint.
     None,
+}
+
+/// What you are spending when you use an instance.
+///
+/// The one distinction the old flat list could not make. Everything else in a picker — ordering,
+/// grouping, which sign-in verb to offer, whether to show a price — follows from this.
+#[derive(TS, Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug, Hash)]
+#[serde(rename_all = "snake_case")]
+#[ts(export)]
+pub enum AccountKind {
+    /// A subscription you already pay for. No key, nothing for neosh to store.
+    Plan,
+    /// Billed per token against a key you supply.
+    ApiKey,
+    /// Something on this machine. Costs nothing and needs nothing.
+    Local,
+}
+
+impl AccountKind {
+    /// The heading a picker files this under.
+    pub fn heading(self) -> &'static str {
+        match self {
+            Self::Plan => "PLANS",
+            Self::ApiKey => "API KEYS",
+            Self::Local => "LOCAL",
+        }
+    }
+}
+
+impl AuthRef {
+    /// Which of the three kinds of account this is.
+    pub fn account_kind(&self) -> AccountKind {
+        match self {
+            Self::Cli { .. } | Self::Inherited => AccountKind::Plan,
+            Self::Env { .. } | Self::Command { .. } => AccountKind::ApiKey,
+            Self::None => AccountKind::Local,
+        }
+    }
+}
+
+/// How a provider is drawn: a mark, and a highlight group carrying its colour.
+///
+/// Three marks rather than one because a terminal is not one thing. A Nerd Font has a real brand
+/// glyph; a bare Unicode terminal has geometry; `ui.ascii_only` has a letter. Choosing between them
+/// is the frontend's job, like every other display decision — this type only says what the choices
+/// are.
+///
+/// The colour is a **highlight group name**, never a colour value, so a theme can restyle every
+/// provider mark without anything here changing and a 16-colour terminal still gets something.
+#[derive(TS, Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
+#[ts(export)]
+pub struct Brand {
+    /// Nerd Font glyph, used when `ui.nerd_font` is on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nerd: Option<String>,
+    /// Plain Unicode mark. Works in any terminal with a modern font.
+    pub mark: String,
+    /// One or two ASCII characters, for `ui.ascii_only`.
+    pub ascii: String,
+    /// Highlight group carrying the brand colour, e.g. `Brand.Anthropic`.
+    pub hl: String,
+}
+
+impl Brand {
+    pub fn new(nerd: Option<&str>, mark: &str, ascii: &str, hl: &str) -> Self {
+        Self {
+            nerd: nerd.map(str::to_string),
+            mark: mark.into(),
+            ascii: ascii.into(),
+            hl: hl.into(),
+        }
+    }
 }
 
 impl AuthRef {
@@ -257,9 +435,105 @@ impl AuthRef {
     pub fn is_available(&self) -> bool {
         match self {
             Self::Env { var } => std::env::var_os(var).is_some_and(|v| !v.is_empty()),
-            Self::Inherited | Self::None => true,
+            // A helper is assumed to work for the same reason `Inherited` is: finding out costs a
+            // subprocess, and doing that for every instance every time a picker opens would make
+            // opening a picker slow in proportion to how well configured you are.
+            Self::Command { argv } => !argv.is_empty(),
+            Self::Cli { .. } | Self::Inherited | Self::None => true,
         }
     }
+}
+
+/// Where the key for an instance is coming from.
+///
+/// Reported so a settings list can say *why* something works, which is the difference between "it
+/// is signed in" and "it is signed in and will still be tomorrow".
+#[derive(TS, Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+#[ts(export)]
+pub enum CredentialSource {
+    /// A vendor CLI carries the login. `via` is the program.
+    ///
+    /// Whether you are *signed in* to it is deliberately not claimed: finding out means running it,
+    /// and a picker that lied either way would be worse than one that says where to look.
+    Plan { via: String },
+    /// A plan whose CLI is not installed. `hint` is the command that would fix it.
+    PlanMissing {
+        program: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        hint: Option<String>,
+    },
+    /// This environment variable, which is set.
+    Env { var: String },
+    /// The OS keychain, via its command-line helper. Survives a restart.
+    Keychain,
+    /// Typed in this session and held in memory only. Gone when neosh exits.
+    Session,
+    /// A helper program named in configuration.
+    Command,
+    /// The driver brings its own login and will not say how.
+    Inherited,
+    /// The endpoint needs no key at all.
+    NotNeeded,
+    /// Nothing to authenticate with.
+    Missing,
+}
+
+impl CredentialSource {
+    /// How this reads in one short phrase, next to a provider's name.
+    ///
+    /// Lives here rather than in each caller because the same sentence has to appear in the model
+    /// picker, the welcome block and `--list-models`, and three copies of it is three chances for
+    /// one of them to still say "no API key" about an account that is on a plan — which is the
+    /// exact confusion the account split exists to remove.
+    pub fn summary(&self, auth: &AuthRef) -> String {
+        match self {
+            Self::Plan { via } => format!("your {via} login"),
+            Self::PlanMissing { program, hint } => match hint {
+                Some(cmd) => format!("{program} is not installed — then `{cmd}`"),
+                None => format!("{program} is not installed"),
+            },
+            Self::Env { var } => format!("${var}"),
+            Self::Keychain => "key in the keychain".into(),
+            Self::Session => "key entered this run".into(),
+            Self::Command => "credential helper".into(),
+            Self::Inherited => "uses an existing login".into(),
+            Self::NotNeeded => "no key needed".into(),
+            Self::Missing => match auth {
+                AuthRef::Env { var } => format!("no key — ${var} is not set"),
+                _ => "no key".into(),
+            },
+        }
+    }
+
+    /// Whether a turn sent to this instance can authenticate.
+    pub fn is_usable(&self) -> bool {
+        !matches!(self, Self::Missing | Self::PlanMissing { .. })
+    }
+
+    /// Whether it will still be there after a restart.
+    pub fn is_durable(&self) -> bool {
+        !matches!(self, Self::Session | Self::Missing | Self::PlanMissing { .. })
+    }
+}
+
+/// An instance and the state of its credential. **Never carries the secret itself.**
+#[derive(TS, Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
+#[ts(export)]
+pub struct CredentialInfo {
+    pub instance: InstanceId,
+    pub display_name: String,
+    pub driver: DriverKind,
+    pub source: CredentialSource,
+    /// A plan, a key, or something local. What a picker groups by.
+    pub account: AccountKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub brand: Option<Brand>,
+    /// Whether this instance's driver is registered, so the entry is worth offering at all.
+    pub driver_available: bool,
+    /// Whether a key can be typed in for it. False for a CLI login or a local endpoint, where
+    /// asking for one would be asking for something that does nothing.
+    pub accepts_key: bool,
 }
 
 /// A configured driver.
@@ -273,6 +547,9 @@ pub struct InstanceConfig {
     pub base_url: Option<String>,
     #[serde(default = "auth_none")]
     pub auth: AuthRef,
+    /// How to draw it. `None` falls back to a generic mark.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub brand: Option<Brand>,
     /// Models this instance serves. Empty means "ask the endpoint at runtime".
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub models: Vec<ModelInfo>,
@@ -377,4 +654,40 @@ pub enum BlockStartKind {
 pub struct ProviderEmit {
     pub stream: StreamId,
     pub event: ProviderEvent,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_ladder_does_not_wrap() {
+        // A "downgrade" that teleports you to the most expensive model in the catalogue is a
+        // keystroke you learn not to press.
+        assert_eq!(ModelTier::Fast.step(-1), None);
+        assert_eq!(ModelTier::Frontier.step(1), None);
+        assert_eq!(ModelTier::Balanced.step(-1), Some(ModelTier::Fast));
+        assert_eq!(ModelTier::Balanced.step(1), Some(ModelTier::Frontier));
+    }
+
+    #[test]
+    fn a_plan_is_not_a_key_and_a_key_is_not_a_plan() {
+        assert_eq!(
+            AuthRef::Cli { program: "claude".into(), login: None }.account_kind(),
+            AccountKind::Plan
+        );
+        assert_eq!(AuthRef::Inherited.account_kind(), AccountKind::Plan);
+        assert_eq!(AuthRef::Env { var: "K".into() }.account_kind(), AccountKind::ApiKey);
+        assert_eq!(AuthRef::Command { argv: vec![] }.account_kind(), AccountKind::ApiKey);
+        assert_eq!(AuthRef::None.account_kind(), AccountKind::Local);
+    }
+
+    #[test]
+    fn a_plan_source_never_claims_a_key() {
+        // Nothing that describes a plan may serialise a value: there is none, and a field that
+        // could hold one is a field someone will fill in.
+        let json = serde_json::to_string(&CredentialSource::Plan { via: "claude".into() })
+            .expect("serialises");
+        assert_eq!(json, r#"{"kind":"plan","via":"claude"}"#);
+    }
 }

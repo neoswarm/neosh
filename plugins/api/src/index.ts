@@ -19,9 +19,15 @@ import type { BufferId } from "./generated/BufferId";
 import type { Capability } from "./generated/Capability";
 import type { CommitInfo } from "./generated/CommitInfo";
 import type { CommandEntry } from "./generated/CommandEntry";
+import type { AccountKind } from "./generated/AccountKind";
+import type { Brand } from "./generated/Brand";
+import type { CredentialInfo } from "./generated/CredentialInfo";
+import type { CredentialSource } from "./generated/CredentialSource";
 import type { CursorMotion } from "./generated/CursorMotion";
 import type { DiffTarget } from "./generated/DiffTarget";
 import type { Dock } from "./generated/Dock";
+import type { Gravity } from "./generated/Gravity";
+import type { Hint } from "./generated/Hint";
 import type { ExtmarkId } from "./generated/ExtmarkId";
 import type { FileChange } from "./generated/FileChange";
 import type { FileState } from "./generated/FileState";
@@ -42,6 +48,7 @@ import type { Mode } from "./generated/Mode";
 import type { ModelEntry } from "./generated/ModelEntry";
 import type { ModelInfo } from "./generated/ModelInfo";
 import type { ModelSelection } from "./generated/ModelSelection";
+import type { ModelTier } from "./generated/ModelTier";
 import type { NamespaceId } from "./generated/NamespaceId";
 import type { OptionChoice } from "./generated/OptionChoice";
 import type { OptionEntry } from "./generated/OptionEntry";
@@ -50,6 +57,7 @@ import type { OptionSpec } from "./generated/OptionSpec";
 import type { OptionType } from "./generated/OptionType";
 import type { OptionValue } from "./generated/OptionValue";
 import type { PermissionDecision } from "./generated/PermissionDecision";
+import type { PermissionMode } from "./generated/PermissionMode";
 import type { PluginEvent } from "./generated/PluginEvent";
 import type { Pricing } from "./generated/Pricing";
 import type { ProviderEvent } from "./generated/ProviderEvent";
@@ -77,12 +85,12 @@ import type { WindowLayout } from "./generated/WindowLayout";
 import type { WorktreeInfo } from "./generated/WorktreeInfo";
 
 export type {
-  ApiError, BranchInfo, BufferId, Capability, CommandEntry, CommitInfo, DiffTarget, Dock,
-  CursorMotion, ExtmarkId, ExtmarkInfo, ExtmarkOpts, FileChange, FileState, FloatConfig,
-  HighlightDef, HighlightSpec, HookName, HookOutcome, HookPayload, InstanceConfig, KeyContext,
-  KeymapEntry, KeymapScope, MessageLevel, Mode, ModelEntry, ModelInfo, ModelSelection, NamespaceId,
+  AccountKind, ApiError, BranchInfo, Brand, BufferId, Capability, CommandEntry, CommitInfo,
+  CredentialInfo, CredentialSource, DiffTarget, Dock, CursorMotion, ExtmarkId, ExtmarkInfo, ExtmarkOpts, FileChange, FileState, FloatConfig,
+  Gravity, HighlightDef, HighlightSpec, Hint, HookName, HookOutcome, HookPayload, InstanceConfig, KeyContext,
+  KeymapEntry, KeymapScope, MessageLevel, Mode, ModelEntry, ModelInfo, ModelSelection, ModelTier, NamespaceId,
   OptionChoice, OptionEntry, OptionSelection, OptionSpec, OptionType, OptionValue,
-  Message, PermissionDecision, PluginEvent, Pricing, ProviderEvent, ProviderOptionDescriptor,
+  Message, PermissionDecision, PermissionMode, PluginEvent, Pricing, ProviderEvent, ProviderOptionDescriptor,
   Rect, RepoInfo, RepoStatus, SessionId, SessionInfo, StatusAlign, StatusSegment, StopReason,
   SurfaceCell, SurfaceId, TextEdit, ToolCall, ToolDef, ToolResult, TurnRequest, Usage, Viewport,
   WindowId, WindowLayout,
@@ -132,12 +140,40 @@ export function byteOffsets(s: string): number[] {
 // Transport
 // ---------------------------------------------------------------------------
 
-/** The two ops the host installs. Everything else is built on these. */
+/** The ops the host installs. Everything else is built on these. */
 interface CoreOps {
   op_neosh_send(msg: unknown): void;
   op_neosh_next(): Promise<unknown>;
+  op_neosh_width(text: string): number;
+  op_neosh_clip(text: string, columns: number): string;
 }
 declare const Deno: { core: { ops: CoreOps } };
+
+/**
+ * How many terminal columns a string occupies.
+ *
+ * Use this for any layout with a column in it. JavaScript offers `String.length` (UTF-16 units) and
+ * `Array.from(s).length` (code points), and both are wrong for the text a model produces: `"日本"`
+ * is 2 code points and **4** columns, `"👋🏽"` is 2 code points and **2**, `"é"` may be 2 code points
+ * and **1**. Padding with either draws a ragged rule the first time a CJK model name appears.
+ *
+ * Synchronous — it is an op, not a host call, so calling it per row costs nothing. It uses the same
+ * measurement the renderer does, so a plugin and the frontend agree by construction.
+ */
+export function width(text: string): number {
+  return Deno.core.ops.op_neosh_width(text);
+}
+
+/** Truncate to at most `columns` columns, cutting on a grapheme boundary rather than mid-character. */
+export function clipToWidth(text: string, columns: number): string {
+  return Deno.core.ops.op_neosh_clip(text, Math.max(0, Math.floor(columns)));
+}
+
+/** Pad on the right to exactly `columns`, clipping if it is already wider. */
+export function padToWidth(text: string, columns: number): string {
+  const clipped = clipToWidth(text, columns);
+  return clipped + " ".repeat(Math.max(0, columns - width(clipped)));
+}
 
 /** Thrown when the host refuses a call. Carries the structured reason. */
 export class NeoshError extends Error {
@@ -266,6 +302,7 @@ export interface Neosh {
   readonly gen: GenApi;
   readonly session: SessionApi;
   readonly status: StatusApi;
+  readonly hint: HintApi;
   readonly opt: OptionApi;
   readonly state: StateApi;
   readonly rtp: RuntimePathApi;
@@ -276,6 +313,14 @@ export interface Neosh {
   notify(message: string, level?: MessageLevel): void;
   /** Ask the host whether a side effect is allowed. */
   permit(capability: Capability): Promise<PermissionDecision>;
+  /**
+   * What the agent is allowed to do without asking, and how to change it.
+   *
+   * `setMode` lasts for this session only. A mode switched on to get through one task should not
+   * still be on next week, and writing it to a file is exactly how that happens — so it is not
+   * written to one.
+   */
+  readonly permission: PermissionApi;
 }
 
 export interface BufferApi {
@@ -304,7 +349,16 @@ export interface BufferApi {
 }
 
 export interface WindowApi {
-  open(buf: BufferId, dock: Dock, opts?: { size?: number }): Promise<WindowId>;
+  /**
+   * `gravity` is which end short content settles against: `"start"` (the default) pins it to the
+   * top, `"end"` to the bottom, which is what makes a transcript read as a conversation rather
+   * than as a document that happens to be in a window.
+   */
+  open(
+    buf: BufferId,
+    dock: Dock,
+    opts?: { size?: number; gravity?: Gravity },
+  ): Promise<WindowId>;
   close(win: WindowId): Promise<void>;
   setBuf(win: WindowId, buf: BufferId): Promise<void>;
   /** `col` is a UTF-8 byte offset, not a character or display column. */
@@ -431,6 +485,37 @@ export interface AgentApi {
    */
   listModels(instance?: string, opts?: { refresh?: boolean }): Promise<ModelEntry[]>;
   listInstances(): Promise<InstanceConfig[]>;
+  /**
+   * Where each configured provider's key comes from — and never what it is.
+   *
+   * There is deliberately no call that returns a secret. A plugin can find out that `anthropic` is
+   * authenticated from the keychain, and can ask the host to collect a new key; it cannot read one,
+   * so it cannot leak one.
+   */
+  credentials(): Promise<CredentialInfo[]>;
+  /**
+   * Ask the host to collect an API key for `instance` from the keyboard.
+   *
+   * The host runs this prompt itself: a plugin one would have to put the key in a buffer, and a
+   * buffer is drawn — the value would cross the frontend boundary and land in whatever it logs.
+   * What comes back is whether a key was stored, never the key.
+   *
+   * Rejects when the instance signs in on its own (a CLI login) or needs no key at all, and when it
+   * already has one unless you pass `replace`.
+   */
+  setCredential(instance: string, opts?: { replace?: boolean }): Promise<boolean>;
+  /** Drop a stored key from memory and from the keychain. The environment is not ours to clear. */
+  forgetCredential(instance: string): Promise<void>;
+  /**
+   * The model this conversation will use changed, whoever changed it.
+   *
+   * Not the same as `opt.onChange` for `agent.model`: that option is a preference, and the
+   * selection also moves when a conversation is restored, when a stored model turns out not to
+   * authenticate, and when a provider registers late and the model somebody asked for finally
+   * becomes reachable. Anything that names the model — a footer, a context meter measuring against
+   * its window — wants this one.
+   */
+  onSelectionChange(cb: (e: { selection: ModelSelection }) => void): Disposable;
   onTurnStart(cb: (e: { turn: string }) => void): Disposable;
   /** One streamed chunk of assistant text. Chunks are provider-sized, not characters. */
   onToken(cb: (e: { turn: string; text: string }) => void): Disposable;
@@ -551,8 +636,13 @@ export interface GenApi {
  * away from one is not a way to lose it.
  */
 export interface SessionApi {
-  /** Most recently active first, with exactly one flagged `is_active`. */
-  list(): Promise<SessionInfo[]>;
+  /**
+   * Most recently active first, with exactly one flagged `is_active`.
+   *
+   * Archived conversations are left out unless you ask for them. That is what archiving is for, and
+   * a list that included them by default would make every caller responsible for remembering.
+   */
+  list(opts?: { includeArchived?: boolean }): Promise<SessionInfo[]>;
   current(): Promise<SessionInfo>;
   /**
    * Start one. It inherits the model and system prompt you are using — starting a conversation
@@ -570,6 +660,14 @@ export interface SessionApi {
   close(session: SessionId): Promise<void>;
   /** Pass `null` to clear a title and go back to the first-message label. */
   rename(session: SessionId, title: string | null): Promise<void>;
+  /**
+   * Put a conversation away, or bring it back.
+   *
+   * Not `close`: nothing is deleted, every message survives, and `list({ includeArchived: true })`
+   * still finds it. Archiving the active conversation moves you to the most recently used other
+   * one — or to a fresh empty one if there is no other.
+   */
+  archive(session: SessionId, archived?: boolean): Promise<void>;
   /** The conversation itself, for a transcript view that renders rather than replays. */
   messages(session?: SessionId): Promise<Message[]>;
   /** Fires whenever the active conversation changes — switched, created, or closed. */
@@ -587,8 +685,43 @@ export interface SessionApi {
  * clear first and cannot leave two. Segments are namespaced per plugin, so two plugins choosing
  * `"model"` cannot collide, and unloading a plugin takes its segments with it.
  */
+/**
+ * The shortcut row under the composer.
+ *
+ * Whoever owns a feature owns its hint, which is the only arrangement that stays true: the row is
+ * built from what is actually registered right now, so a plugin that is switched off takes its
+ * shortcut with it rather than leaving a key advertised that no longer does anything.
+ *
+ * Write the key the way the user would press it — `^P`, `⇧⏎`, `F1` — not the way a keymap spells
+ * it. Hints are dropped from the end when the terminal is too narrow, so put the one you would
+ * most want seen at the lowest priority.
+ */
+export interface HintApi {
+  set(key: string, hint: { keys: string; label: string; priority?: number }): Promise<void>;
+  clear(key: string): Promise<void>;
+}
+
+export interface PermissionApi {
+  mode(): Promise<PermissionMode>;
+  setMode(mode: PermissionMode): Promise<PermissionMode>;
+}
+
 export interface StatusApi {
-  set(key: string, segment: { text: string; hl?: string; align?: StatusAlign; priority?: number }): Promise<void>;
+  /**
+   * `keys` is drawn immediately after `text`, dimmed — the key that changes this thing, beside the
+   * thing it changes. Write it the way the user would press it (`^P`, `F1`), not the way a keymap
+   * spells it.
+   */
+  set(
+    key: string,
+    segment: {
+      text: string;
+      keys?: string;
+      hl?: string;
+      align?: StatusAlign;
+      priority?: number;
+    },
+  ): Promise<void>;
   clear(key: string): Promise<void>;
 }
 
@@ -705,6 +838,7 @@ interface Registered {
   bufferListeners: Map<number, Array<(e: { buf: BufferId; start: number; oldEnd: number; newEnd: number }) => void>>;
   optionListeners: Array<(e: { name: string; value: OptionValue }) => void>;
   sessionListeners: Array<(e: { session: SessionId }) => void>;
+  selectionListeners: Array<(e: { selection: ModelSelection }) => void>;
   options: Set<string>;
   /// Timer handles this plugin armed, cleared on unload.
   timers: Set<number>;
@@ -726,6 +860,7 @@ function reg(plugin: string): Registered {
       bufferListeners: new Map(),
       optionListeners: [],
       sessionListeners: [],
+      selectionListeners: [],
       options: new Set(),
       timers: new Set(),
       agentListeners: { turnStart: [], token: [], thinking: [], turnEnd: [], toolStart: [], toolEnd: [] },
@@ -941,7 +1076,12 @@ export function __createContext(plugin: string, config: unknown, version: number
     },
     win: {
       async open(buf, dock, opts) {
-        const layout: WindowLayout = { kind: "docked", dock, size: opts?.size ?? null };
+        const layout: WindowLayout = {
+          kind: "docked",
+          dock,
+          size: opts?.size ?? null,
+          gravity: opts?.gravity ?? "start",
+        };
         return expect(await c({ call: "win_open", buf, layout }), "win").win;
       },
       async close(win) {
@@ -1081,6 +1221,22 @@ export function __createContext(plugin: string, config: unknown, version: number
       async listInstances() {
         return expect(await c({ call: "agent_list_instances" }), "instances").instances;
       },
+      async credentials() {
+        return expect(await c({ call: "provider_credentials" }), "credentials").credentials;
+      },
+      async setCredential(instance, opts) {
+        // Does not settle until the prompt closes — the answer is what the user did.
+        const v = await c({
+          call: "provider_set_credential",
+          instance,
+          replace: opts?.replace ?? false,
+        });
+        return expect(v, "bool").value;
+      },
+      async forgetCredential(instance) {
+        await c({ call: "provider_forget_credential", instance });
+      },
+      onSelectionChange: (cb) => listener(r.selectionListeners, cb),
       onTurnStart: (cb) => listener(r.agentListeners.turnStart as Array<(e: { turn: string }) => void>, cb),
       onToken: (cb) => listener(r.agentListeners.token as Array<(e: { turn: string; text: string }) => void>, cb),
       onThinking: (cb) => listener(r.agentListeners.thinking as Array<(e: { turn: string; text: string }) => void>, cb),
@@ -1197,8 +1353,12 @@ export function __createContext(plugin: string, config: unknown, version: number
       },
     },
     session: {
-      async list() {
-        return expect(await c({ call: "session_list" }), "sessions").sessions;
+      async list(opts) {
+        const v = await c({
+          call: "session_list",
+          include_archived: opts?.includeArchived ?? false,
+        });
+        return expect(v, "sessions").sessions;
       },
       async current() {
         return expect(await c({ call: "session_current" }), "session").session;
@@ -1221,11 +1381,34 @@ export function __createContext(plugin: string, config: unknown, version: number
       async rename(session, title) {
         await c({ call: "session_rename", session, title });
       },
+      async archive(session, archived) {
+        await c({ call: "session_archive", session, archived: archived ?? true });
+      },
       async messages(session) {
         const v = await c({ call: "session_messages", session: session ?? null });
         return expect(v, "messages").messages;
       },
       onChange: (cb) => listener(r.sessionListeners, cb),
+    },
+    permission: {
+      async mode() {
+        return expect(await c({ call: "permission_get_mode" }), "permission_mode").mode;
+      },
+      async setMode(mode) {
+        return expect(await c({ call: "permission_set_mode", mode }), "permission_mode").mode;
+      },
+    },
+    hint: {
+      async set(key, hint) {
+        await c({
+          call: "hint_set",
+          key,
+          hint: { keys: hint.keys, label: hint.label, priority: hint.priority ?? 0 },
+        });
+      },
+      async clear(key) {
+        await c({ call: "hint_clear", key });
+      },
     },
     status: {
       async set(key, segment) {
@@ -1234,6 +1417,7 @@ export function __createContext(plugin: string, config: unknown, version: number
           key,
           segment: {
             text: segment.text,
+            keys: segment.keys ?? null,
             hl: segment.hl ?? null,
             align: segment.align ?? "left",
             priority: segment.priority ?? 0,
@@ -1363,6 +1547,9 @@ export async function __dispatch(plugin: string, msg: Record<string, unknown>): 
         break;
       case "session_changed":
         for (const cb of r.sessionListeners) cb({ session: ev.session });
+        break;
+      case "selection_changed":
+        for (const cb of r.selectionListeners) cb({ selection: ev.selection });
         break;
       case "focus_changed":
       case "shutdown":

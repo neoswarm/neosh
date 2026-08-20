@@ -12,7 +12,7 @@
  * ```
  */
 
-import { byteLength, byteOffsets } from "@neosh/api";
+import { byteLength, byteOffsets, clipToWidth, padToWidth, width } from "@neosh/api";
 import type { BufferId, Disposable, FileChange, FileState, KeyContext, Neosh, WindowId } from "@neosh/api";
 
 // ---------------------------------------------------------------------------
@@ -93,11 +93,15 @@ export type WidgetAction =
   | "dismiss"
   | "complete"
   | "clear"
-  | "delete_word";
+  | "delete_word"
+  /** Move to the next pane of a two-pane widget — the provider rail and the list beside it. */
+  | "pane_next"
+  | "pane_prev";
 
 const ACTIONS: WidgetAction[] = [
   "next", "prev", "page_down", "page_up", "first", "last",
   "accept", "dismiss", "complete", "clear", "delete_word",
+  "pane_next", "pane_prev",
 ];
 
 /** One parsed key: a code kind, the character if it is one, and the modifiers that must match. */
@@ -147,6 +151,12 @@ function parseKey(spec: string): KeySpec | null {
     out.kind = named[lower]!;
     if (lower === "space") out.c = " ";
     if (lower === "lt") out.c = "<";
+    // `<S-Tab>` is not tab with a modifier — a terminal sends a wholly different sequence, which
+    // arrives as its own code. Written the way everyone writes it, matched the way it arrives.
+    if (out.kind === "tab" && out.shift) {
+      out.kind = "back_tab";
+      out.shift = false;
+    }
     return out;
   }
   if (inner.length === 1) {
@@ -214,15 +224,54 @@ function watchKeys(neosh: Neosh): void {
   });
 }
 
-/** Which action a key press means, or `null` if it is ordinary input. */
-function actionFor(keys: Map<WidgetAction, KeySpec[]>, key: KeyContext["key"]): WidgetAction | null {
-  for (const action of ACTIONS) {
+/**
+ * How to write the key bound to an action, the way a person would press it.
+ *
+ * Read from the setting rather than hard-coded, so a rebinding shows up in the affordance too —
+ * the whole point of putting the key on screen is that it is the key that works.
+ */
+function keyLabel(keys: Map<WidgetAction, KeySpec[]>, action: WidgetAction): string {
+  const spec = keys.get(action)?.[0];
+  if (!spec) return "";
+  const pretty: Record<string, string> = {
+    "<Tab>": "⇥",
+    "<S-Tab>": "⇧⇥",
+    "<Left>": "←",
+    "<Right>": "→",
+    "<CR>": "↵",
+    "<Esc>": "esc",
+  };
+  return pretty[spec.lhs] ?? spec.lhs.replace(/^<C-(.)>$/, "^$1").replace(/^<|>$/g, "");
+}
+
+/**
+ * Which action a key press means, or `null` if it is ordinary input.
+ *
+ * `only` is the set of actions the asking widget can actually carry out, and it is not an
+ * optimisation. Two actions share `<Tab>` on purpose — `complete` in a field with suggestions
+ * under it, `pane_next` in a widget with two panes — on the reasoning that no widget has both. It
+ * does not have both, but it does *resolve* both: without this filter the first one in `ACTIONS`
+ * wins for everybody, and `<Tab>` in the model picker resolved to a completion the picker has no
+ * case for, so it silently did nothing at all and the second pane had no way in.
+ */
+function actionFor(
+  keys: Map<WidgetAction, KeySpec[]>,
+  key: KeyContext["key"],
+  only?: readonly WidgetAction[],
+): WidgetAction | null {
+  for (const action of only ?? ACTIONS) {
     for (const spec of keys.get(action) ?? []) {
       if (matches(spec, key)) return action;
     }
   }
   return null;
 }
+
+/** What a two-pane widget answers to. Notably not `complete`, whose key it shares. */
+const RAIL_ACTIONS: readonly WidgetAction[] = [
+  "dismiss", "accept", "pane_next", "pane_prev", "next", "prev",
+  "page_down", "page_up", "first", "last", "clear", "delete_word",
+];
 
 export interface PickerItem<T> {
   /** What the user reads and what the filter matches against. */
@@ -756,8 +805,9 @@ async function bindWidgetKeys(
   win: WindowId,
   command: string,
   keys: Map<WidgetAction, KeySpec[]>,
+  extra: readonly string[] = [],
 ): Promise<void> {
-  const lhs = new Set<string>();
+  const lhs = new Set<string>(extra);
   for (const specs of keys.values()) {
     for (const spec of specs) lhs.add(spec.lhs);
   }
@@ -1158,4 +1208,560 @@ export class CursoredList<T = unknown> {
       }
     }
   }
+}
+
+// ---------------------------------------------------------------------------
+// Two-pane picker
+// ---------------------------------------------------------------------------
+
+/**
+ * One entry in the left rail: a provider, an account, a category.
+ *
+ * The mark is drawn in its own highlight group, which is how a rail of eleven providers stays
+ * legible — you find the one you want by shape and colour before you have read a word.
+ */
+export interface RailItem<G> {
+  /** A brand mark, one or two columns. Drawn in `mark.hl`. */
+  mark?: { text: string; hl?: string };
+  label: string;
+  /** A state marker at the right edge — signed in, needs a key, unavailable. */
+  badge?: { text: string; hl?: string };
+  /** Heading this sits under. Groups appear in the order their first member does. */
+  group?: string;
+  /** Listed, dimmed, and skipped by the cursor. For a provider whose driver is missing. */
+  disabled?: boolean;
+  value: G;
+}
+
+/** One row of the right-hand list. */
+export interface PaneItem<T> extends PickerItem<T> {
+  /** A middle column, aligned across rows: a tier, a size, a state. */
+  badge?: { text: string; hl?: string };
+  /**
+   * A collapsible section this row belongs to.
+   *
+   * Rows in a section are hidden behind a header that says how many there are. What it is for:
+   * last year's models, which you want reachable and do not want in the way.
+   */
+  section?: string;
+  disabled?: boolean;
+}
+
+export interface RailPickerOptions<G, T> {
+  title?: string;
+  /** Columns for the rail. The list takes the rest. */
+  railWidth?: number;
+  /** Total inner width. */
+  width?: number;
+  /** Rows of body. */
+  height?: number;
+  rail: RailItem<G>[];
+  /** Which rail entry to open on. */
+  railAt?: number;
+  /** The rows for a rail entry. Called on open and on every rail move. */
+  items(group: G): Promise<PaneItem<T>[]>;
+  /** Which row to start on, given the rows. */
+  itemAt?(items: PaneItem<T>[]): number;
+  /** The key strip at the foot. Keep it to one line. */
+  hints?: string;
+  /**
+   * What the two panes are called, for the affordance in the title row.
+   *
+   * `"providers"` and `"models"` rather than `"panes"` and `"list"`, wherever the caller knows —
+   * a key labelled with what it reaches is a key somebody presses.
+   */
+  railLabel?: string;
+  paneLabel?: string;
+  /**
+   * Shown in place of the list when there is nothing in it.
+   *
+   * Not decoration: an empty pane beside a populated rail reads as a broken widget, and the two
+   * reasons it can be empty — your filter matched nothing, or this provider serves nothing until
+   * it can authenticate — need different things done about them.
+   */
+  placeholder?: string;
+  /**
+   * Keys `onKey` wants that a *binding elsewhere* would otherwise take.
+   *
+   * The raw capture only receives what no keymap claimed, so a caller reaching for `<C-s>` gets
+   * nothing — that key belongs to the transcript reader. Listing it here binds it to this widget
+   * for as long as the widget is open, the same way its own movement keys are bound.
+   *
+   * Bare letters do not need this and should not use it: they reach `onKey` already, and taking
+   * one means it can never be typed into the filter — which is how a model picker ends up unable
+   * to search for "sonnet".
+   */
+  ownKeys?: readonly string[];
+  /**
+   * A key the caller wants for itself, checked before the widget's own.
+   *
+   * Return `"close"` to dismiss, `"reload"` to re-fetch the current list, `"handled"` to redraw,
+   * and nothing at all to let the widget have the key. This is what lets a model picker put "sign
+   * in" and "set effort" on keys without a second modal.
+   */
+  onKey?(
+    key: KeyContext,
+    ctx: { rail: G | undefined; item: T | undefined },
+  ): Promise<"handled" | "reload" | "close" | undefined> | "handled" | "reload" | "close" | undefined;
+}
+
+const RAIL_NS = "neosh.ui.rail";
+
+/**
+ * A picker in two panes: a rail of categories, and the rows belonging to the selected one.
+ *
+ * The shape exists because one flat list cannot answer two questions at once. "Which provider" and
+ * "which model" are different choices with different cardinalities — a dozen providers, hundreds of
+ * models — and flattening them produces a list where the thing you want is thirty rows below a
+ * provider you do not use.
+ *
+ * Both panes are one buffer with a rule down the middle rather than two floats, because two floats
+ * cannot be kept adjacent without each of them knowing the other's width, and neither of them may
+ * measure anything. One buffer makes the rule a character, which is a thing a plugin can place.
+ *
+ * Typing filters the list. `pane_next`/`pane_prev` — `<Tab>`/`<S-Tab>` and `←`/`→` by default —
+ * move between the panes, and the rail's own entries are reachable with the same movement keys as
+ * the list, so nothing here needs a mouse or a chord you have to be told about.
+ */
+export async function railPicker<G, T>(
+  neosh: Neosh,
+  opts: RailPickerOptions<G, T>,
+): Promise<T | null> {
+  const height = Math.max(3, opts.height ?? 14);
+  const total = Math.max(40, opts.width ?? 84);
+  const railWidth = Math.min(Math.max(12, opts.railWidth ?? 22), total - 24);
+  const paneWidth = total - railWidth - 1; // the rule takes a column
+
+  const buf = await neosh.buf.create({ name: `[${opts.title ?? "select"}]`, scratch: true });
+  const ns = await neosh.ns.create(RAIL_NS);
+  const win = await neosh.float.open(buf, {
+    anchor: { kind: "screen" },
+    width: { kind: "fixed", n: total },
+    // title, filter, rule, body, rule, hints
+    height: { kind: "fixed", n: height + 5 },
+    border: "rounded",
+    focusable: true,
+    closeOnBlur: true,
+    z: 200,
+  });
+
+  watchKeys(neosh);
+  const keys = await widgetKeys(neosh);
+  const railLabel = opts.railLabel ?? "panes";
+  const paneLabel = opts.paneLabel ?? "list";
+
+  // ---- rail rows, headings interleaved ------------------------------------
+  type RailRow =
+    | { kind: "heading"; text: string }
+    | { kind: "entry"; item: RailItem<G>; index: number };
+
+  const railRows: RailRow[] = [];
+  {
+    let group: string | undefined;
+    opts.rail.forEach((item, index) => {
+      if (item.group !== undefined && item.group !== group) {
+        group = item.group;
+        railRows.push({ kind: "heading", text: item.group });
+      }
+      railRows.push({ kind: "entry", item, index });
+    });
+  }
+  const selectableRail = railRows
+    .map((r, at) => (r.kind === "entry" && !r.item.disabled ? at : -1))
+    .filter((at) => at >= 0);
+
+  let railAt =
+    selectableRail.find(
+      (at) => (railRows[at] as { index: number }).index === (opts.railAt ?? 0),
+    ) ?? selectableRail[0] ?? 0;
+  let railTop = 0;
+
+  // ---- pane state ----------------------------------------------------------
+  let all: PaneItem<T>[] = [];
+  let open = new Set<string>();
+  let query = "";
+  let cursor = 0;
+  let paneTop = 0;
+  /** In the rail, or in the list. */
+  let focus: "rail" | "pane" = "pane";
+
+  type PaneRow =
+    | { kind: "section"; name: string; count: number }
+    | { kind: "item"; item: PaneItem<T>; positions: number[] };
+
+  let rows: PaneRow[] = [];
+
+  const rebuild = () => {
+    const ranked = query === ""
+      ? all.map((item) => ({ item, positions: [] as number[], score: 0 }))
+      : all
+          .map((item) => {
+            const hay = item.keywords ? `${item.label} ${item.keywords}` : item.label;
+            const m = fuzzy(hay, query);
+            return m ? { item, positions: m.positions, score: m.score } : null;
+          })
+          .filter((x): x is NonNullable<typeof x> => x !== null)
+          .sort((a, b) => b.score - a.score);
+
+    const out: PaneRow[] = [];
+    const sections = new Map<string, number>();
+    for (const r of ranked) {
+      const section = r.item.section;
+      if (section === undefined) {
+        out.push({ kind: "item", item: r.item, positions: r.positions });
+        continue;
+      }
+      sections.set(section, (sections.get(section) ?? 0) + 1);
+    }
+    // Filtering opens every section: a row you cannot see is a row your query did not find, and
+    // "no matches" while the match sits folded away is the worst possible answer.
+    for (const [name, count] of sections) {
+      const expanded = open.has(name) || query !== "";
+      out.push({ kind: "section", name, count });
+      if (!expanded) continue;
+      for (const r of ranked) {
+        if (r.item.section === name) out.push({ kind: "item", item: r.item, positions: r.positions });
+      }
+    }
+    rows = out;
+    cursor = Math.min(cursor, Math.max(0, rows.length - 1));
+  };
+
+  // Bumped on every rail move, so a slow load cannot land after a faster one that came later.
+  let generation = 0;
+
+  const load = async () => {
+    const mine = ++generation;
+    const entry = railRows[railAt];
+    const got = entry?.kind === "entry" ? await opts.items(entry.item.value).catch(() => []) : [];
+    // Holding a movement key starts one load per row, and they finish in whatever order the
+    // network allows — so the last *answer* is routinely not the last *question*. Without this,
+    // pressing down eight times lands you on a provider showing the empty list of a provider you
+    // passed through on the way, which reads as "this one has no models".
+    if (mine !== generation) return;
+    all = got;
+    rebuild();
+    cursor = Math.max(0, Math.min(opts.itemAt?.(all) ?? 0, Math.max(0, rows.length - 1)));
+    // Land on something selectable rather than on a section header.
+    if (rows[cursor]?.kind !== "item") cursor = rows.findIndex((r) => r.kind === "item");
+    if (cursor < 0) cursor = 0;
+    paneTop = 0;
+  };
+
+  // ---- drawing -------------------------------------------------------------
+  const RULE_V = "│";
+  const railCell = (row: RailRow | undefined, on: boolean): { text: string; marks: Mark[] } => {
+    const marks: Mark[] = [];
+    if (!row) return { text: padToWidth("", railWidth), marks };
+    if (row.kind === "heading") {
+      const text = padToWidth(` ${row.text}`, railWidth);
+      marks.push({ from: 0, to: byteLength(text), hl: "Sidebar.Heading" });
+      return { text, marks };
+    }
+    const { item } = row;
+    const mark = item.mark?.text ?? " ";
+    const badge = item.badge?.text ?? "";
+    const room = railWidth - 3 - width(mark) - width(badge) - 1;
+    const label = clipToWidth(item.label, Math.max(1, room));
+    const head = `${on ? "❯" : " "} ${mark} `;
+    const body = `${head}${label}`;
+    const text = padToWidth(body, railWidth - width(badge) - 1) + badge + " ";
+    if (item.mark) {
+      const at = byteLength(`${on ? "❯" : " "} `);
+      marks.push({ from: at, to: at + byteLength(mark), hl: item.mark.hl ?? "Normal" });
+    }
+    if (item.badge) {
+      const at = byteLength(padToWidth(body, railWidth - width(badge) - 1));
+      marks.push({ from: at, to: at + byteLength(badge), hl: item.badge.hl ?? "Comment" });
+    }
+    if (on) {
+      marks.push({ from: 0, to: byteLength(text), hl: "Picker.Selected", priority: 1 });
+    } else if (item.disabled) {
+      marks.push({ from: 0, to: byteLength(text), hl: "Comment" });
+    }
+    return { text, marks };
+  };
+
+  const paneCell = (row: PaneRow | undefined, on: boolean): { text: string; marks: Mark[] } => {
+    const marks: Mark[] = [];
+    if (!row) return { text: "", marks };
+    if (row.kind === "section") {
+      const text = `   ${open.has(row.name) || query !== "" ? "▾" : "▸"} ${row.count} ${row.name}`;
+      marks.push({ from: 0, to: byteLength(text), hl: on ? "Picker.Selected" : "Comment" });
+      return { text, marks };
+    }
+    const { item } = row;
+    const badge = item.badge?.text ?? "";
+    const detail = item.detail ?? "";
+    // Three columns: label, badge, detail. The badge column is fixed so the rungs of the ladder
+    // line up — reading down it is how you see the shape of what a provider offers.
+    const badgeWidth = badge === "" ? 0 : 10;
+    const labelWidth = Math.max(10, Math.floor((paneWidth - 3 - badgeWidth) * 0.45));
+    const head = on ? " ❯ " : "   ";
+    const label = padToWidth(clipToWidth(item.label, labelWidth), labelWidth);
+    const badgeCell = badgeWidth === 0 ? "" : padToWidth(clipToWidth(badge, badgeWidth), badgeWidth);
+    const room = paneWidth - width(head) - labelWidth - badgeWidth;
+    const text = `${head}${label}${badgeCell}${clipToWidth(detail, Math.max(0, room))}`;
+
+    const labelAt = byteLength(head);
+    const offsets = byteOffsets(item.label);
+    for (const at of row.positions) {
+      const from = offsets[at];
+      const to = offsets[at + 1];
+      if (from === undefined || to === undefined) continue;
+      marks.push({ from: labelAt + from, to: labelAt + to, hl: "Picker.Match", priority: 200 });
+    }
+    if (badgeWidth > 0) {
+      const at = labelAt + byteLength(label);
+      marks.push({ from: at, to: at + byteLength(badgeCell), hl: item.badge?.hl ?? "Comment" });
+    }
+    if (detail !== "") {
+      const at = labelAt + byteLength(label) + byteLength(badgeCell);
+      marks.push({ from: at, to: byteLength(text), hl: "Picker.Detail" });
+    }
+    if (item.disabled) marks.push({ from: 0, to: byteLength(text), hl: "Comment" });
+    if (on) marks.push({ from: 0, to: byteLength(text), hl: "Picker.Selected", priority: 1 });
+    return { text, marks };
+  };
+
+  interface Mark {
+    from: number;
+    to: number;
+    hl: string;
+    priority?: number;
+  }
+
+  const render = async () => {
+    // Each pane scrolls on its own: moving down a long model list must not scroll the rail out
+    // from under the provider you are looking at.
+    if (railAt < railTop) railTop = railAt;
+    if (railAt >= railTop + height) railTop = railAt - height + 1;
+    if (cursor < paneTop) paneTop = cursor;
+    if (cursor >= paneTop + height) paneTop = cursor - height + 1;
+
+    const lines: string[] = [];
+    const marks: { line: number; mark: Mark }[] = [];
+
+    // The title row, and at its right edge the key for *the pane you are not in*. Live rather
+    // than a legend: the shortcut row below can only say the key exists, and a two-pane widget
+    // whose second pane has no visible way in is a pane nobody finds.
+    const title = opts.title ?? "";
+    const cross = focus === "pane" ? `${keyLabel(keys, "pane_prev")} ${railLabel}` : `${keyLabel(keys, "pane_next")} ${paneLabel}`;
+    const gap = Math.max(1, total - width(title) - width(cross));
+    lines.push(`${title}${" ".repeat(gap)}${cross}`);
+    marks.push({ line: 0, mark: { from: 0, to: byteLength(title), hl: "Float.Title" } });
+    marks.push({
+      line: 0,
+      mark: {
+        from: byteLength(title) + gap,
+        to: byteLength(lines[0]!),
+        hl: "Composer.HintKey",
+      },
+    });
+    lines.push(`> ${query}`);
+    lines.push("─".repeat(railWidth) + "┬" + "─".repeat(paneWidth));
+    marks.push({ line: 2, mark: { from: 0, to: byteLength(lines[2]!), hl: "Separator" } });
+
+    const empty = rows.length === 0
+      ? `   ${query === "" ? (opts.placeholder ?? "nothing here") : "no matches"}`
+      : null;
+    for (let i = 0; i < height; i++) {
+      const left = railCell(railRows[railTop + i], focus === "rail" && railTop + i === railAt);
+      const right = empty !== null && i === 0
+        ? { text: empty, marks: [{ from: 0, to: byteLength(empty), hl: "Comment" }] }
+        : paneCell(rows[paneTop + i], focus === "pane" && paneTop + i === cursor);
+      const line = lines.length;
+      lines.push(`${left.text}${RULE_V}${right.text}`);
+      for (const m of left.marks) marks.push({ line, mark: m });
+      const shift = byteLength(left.text) + byteLength(RULE_V);
+      marks.push({ line, mark: { from: byteLength(left.text), to: shift, hl: "Separator" } });
+      for (const m of right.marks) {
+        marks.push({ line, mark: { from: m.from + shift, to: m.to + shift, hl: m.hl, priority: m.priority } });
+      }
+    }
+
+    lines.push("─".repeat(railWidth) + "┴" + "─".repeat(paneWidth));
+    marks.push({
+      line: lines.length - 1,
+      mark: { from: 0, to: byteLength(lines[lines.length - 1]!), hl: "Separator" },
+    });
+    const hints = opts.hints ?? "↵ use   ⇥ panes   ^N/^P move   esc close";
+    lines.push(` ${hints}`);
+    marks.push({
+      line: lines.length - 1,
+      mark: { from: 0, to: byteLength(lines[lines.length - 1]!), hl: "Sidebar.Dim" },
+    });
+
+    await neosh.buf.setLines(buf, 0, -1, lines);
+    await neosh.ns.clear(ns, buf);
+    for (const { line, mark } of marks) {
+      await neosh.ns.mark(ns, buf, line, mark.from, {
+        hlGroup: mark.hl,
+        endCol: mark.to,
+        priority: mark.priority ?? 0,
+      });
+    }
+    // The caret belongs where the typing goes. Parked at the origin, the filter reads as inert.
+    await neosh.win.setCursor(win, 1, byteLength(`> ${query}`));
+  };
+
+  // ---- keys ----------------------------------------------------------------
+  let settle: (v: T | null) => void = () => {};
+  const done = new Promise<T | null>((resolve) => {
+    settle = resolve;
+  });
+
+  const command = `${RAIL_NS}.key.${++pickerSeq}`;
+  const disposers: Disposable[] = [];
+  let closed = false;
+  const close = async (value: T | null) => {
+    if (closed) return;
+    closed = true;
+    for (const d of disposers) d.dispose();
+    await neosh.win.close(win).catch(() => {});
+    settle(value);
+  };
+
+  const moveRail = async (delta: number) => {
+    const at = selectableRail.indexOf(railAt);
+    const next = selectableRail[Math.min(selectableRail.length - 1, Math.max(0, at + delta))];
+    if (next === undefined || next === railAt) return;
+    railAt = next;
+    // The filter belongs to the list that was showing. Carrying it to a different provider hides
+    // most of what you just switched to, for a reason that has scrolled off the screen.
+    query = "";
+    await load();
+  };
+
+  /**
+   * Move the list cursor, stepping over rows that cannot be landed on.
+   *
+   * Section headers *are* landable — `↵` on one folds it — so the only thing skipped is a row the
+   * caller marked unusable. Skipping in the direction of travel, and giving up at the end rather
+   * than reversing, so holding a movement key never bounces.
+   */
+  const movePane = (delta: number) => {
+    const step = delta > 0 ? 1 : -1;
+    let at = cursor;
+    for (let n = 0; n < Math.abs(delta); n++) {
+      let candidate = at + step;
+      while (candidate >= 0 && candidate < rows.length) {
+        const row = rows[candidate];
+        if (row && !(row.kind === "item" && row.item.disabled)) break;
+        candidate += step;
+      }
+      if (candidate < 0 || candidate >= rows.length) break;
+      at = candidate;
+    }
+    cursor = Math.max(0, Math.min(Math.max(0, rows.length - 1), at));
+  };
+
+  const currentItem = (): PaneItem<T> | undefined => {
+    const row = rows[cursor];
+    return row?.kind === "item" ? row.item : undefined;
+  };
+
+  disposers.push(
+    await neosh.cmd.register(command, async (_args, key) => {
+      if (!key) return;
+      const railEntry = railRows[railAt];
+      const outcome = await opts.onKey?.(key, {
+        rail: railEntry?.kind === "entry" ? railEntry.item.value : undefined,
+        item: currentItem()?.value,
+      });
+      if (outcome === "close") {
+        await close(null);
+        return;
+      }
+      if (outcome === "reload") {
+        await load();
+        await render();
+        return;
+      }
+      if (outcome === "handled") {
+        await render();
+        return;
+      }
+
+      switch (actionFor(keys, key.key, RAIL_ACTIONS)) {
+        case "dismiss":
+          await close(null);
+          return;
+        case "accept": {
+          const row = rows[cursor];
+          if (focus === "rail") {
+            focus = "pane";
+            break;
+          }
+          if (row?.kind === "section") {
+            if (open.has(row.name)) open.delete(row.name);
+            else open.add(row.name);
+            rebuild();
+            break;
+          }
+          const item = row?.kind === "item" ? row.item : undefined;
+          if (!item || item.disabled) return;
+          await close(item.value);
+          return;
+        }
+        case "pane_next":
+          focus = "pane";
+          break;
+        case "pane_prev":
+          focus = "rail";
+          break;
+        case "next":
+          if (focus === "rail") await moveRail(1);
+          else movePane(1);
+          break;
+        case "prev":
+          if (focus === "rail") await moveRail(-1);
+          else movePane(-1);
+          break;
+        case "page_down":
+          if (focus === "pane") movePane(height);
+          break;
+        case "page_up":
+          if (focus === "pane") movePane(-height);
+          break;
+        case "first":
+          if (focus === "pane") cursor = Math.max(0, rows.findIndex((r) => r.kind === "item"));
+          break;
+        case "last":
+          if (focus === "pane") cursor = rows.length - 1;
+          break;
+        case "clear":
+          query = "";
+          rebuild();
+          break;
+        case "delete_word":
+          query = dropSegment(query);
+          rebuild();
+          break;
+        default: {
+          if (key.key.code.kind === "backspace") {
+            query = query.slice(0, -1);
+            rebuild();
+            break;
+          }
+          if (key.key.code.kind !== "char" || key.key.mods.ctrl || key.key.mods.alt) return;
+          // Typing is about the list, wherever the focus is: nobody switches panes first.
+          focus = "pane";
+          query += key.key.code.c;
+          cursor = 0;
+          rebuild();
+          if (rows[cursor]?.kind !== "item") movePane(1);
+          break;
+        }
+      }
+      await render();
+    }, { desc: "rail picker key" }),
+  );
+
+  await neosh.focus.push(win);
+  disposers.push(await neosh.keymap.capture(win, command));
+  await bindWidgetKeys(neosh, win, command, keys, opts.ownKeys ?? []);
+  await load();
+  await render();
+  return done;
 }

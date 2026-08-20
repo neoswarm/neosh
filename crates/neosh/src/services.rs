@@ -232,9 +232,12 @@ impl Services {
     /// providers waits for the sum of five network round trips before anything appears; the slowest
     /// one should be the only cost.
     pub async fn list_models(&self, only: Option<InstanceId>, refresh: bool) -> ApiResult {
+        // Every configured instance, not only the ones with a driver loaded. A plan whose CLI is
+        // not installed still has a catalogue, and the list of what it offers is exactly how
+        // somebody decides whether installing it is worth their afternoon.
         let targets: Vec<_> = {
             let reg = self.agent.providers();
-            reg.usable_instances()
+            reg.instances()
                 .filter(|i| only.as_ref().is_none_or(|want| &i.id == want))
                 .cloned()
                 .collect()
@@ -260,10 +263,15 @@ impl Services {
                     return (inst.id.clone(), models);
                 }
                 let models = match driver {
+                    // The endpoint decides what exists; the catalogue decides how it reads. Neither
+                    // alone is enough — a discovered id with no name or rung is unpickable, and a
+                    // written-down list is out of date the week after it is written.
                     Some(d) => match d.list_models(&inst).await {
-                        Ok(m) => m,
+                        Ok(m) => neosh_provider::catalog::merge(m, &inst.models),
                         Err(e) => {
-                            // Falling back to what was configured keeps an offline machine usable.
+                            // Falling back to what was configured keeps an offline machine usable —
+                            // and, more often, keeps a provider you have not signed into yet
+                            // showing what it offers, which is how you decide whether to.
                             tracing::debug!(instance = %inst.id, "model discovery failed: {e}");
                             inst.models.clone()
                         }

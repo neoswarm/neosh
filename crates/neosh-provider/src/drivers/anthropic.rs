@@ -140,7 +140,7 @@ impl Provider for AnthropicProvider {
     }
 
     async fn list_models(&self, instance: &InstanceConfig) -> Result<Vec<ModelInfo>, ProviderError> {
-        let Some(key) = resolve_auth(&instance.auth)? else {
+        let Some(key) = resolve_auth(instance)? else {
             return Ok(instance.models.clone());
         };
         let resp = http::client()
@@ -162,17 +162,14 @@ impl Provider for AnthropicProvider {
         let mut out = Vec::new();
         for m in v.get("data").and_then(Value::as_array).unwrap_or(&vec![]) {
             let Some(id) = m.get("id").and_then(Value::as_str) else { continue };
-            let mut info = known.iter().find(|k| k.id.0 == id).cloned().unwrap_or(ModelInfo {
-                id: ModelId::from(id),
-                display_name: m
-                    .get("display_name")
-                    .and_then(Value::as_str)
-                    .unwrap_or(id)
-                    .to_string(),
-                context_window: None,
-                max_output_tokens: None,
-                capabilities: Default::default(),
-                pricing: None,
+            let mut info = known.iter().find(|k| k.id.0 == id).cloned().unwrap_or_else(|| {
+                // Not in the catalogue: a model that shipped after this build. It gets a name and
+                // nothing editorial, which is honest — the alternative is guessing its tier from
+                // its id and putting it on the wrong rung of the ladder.
+                ModelInfo::undescribed(
+                    id,
+                    m.get("display_name").and_then(Value::as_str).unwrap_or(id),
+                )
             });
             if let Some(ctx) = m.get("max_input_tokens").and_then(Value::as_u64) {
                 info.context_window = Some(ctx);
@@ -193,13 +190,13 @@ impl Provider for AnthropicProvider {
     ) -> ProviderStream {
         let (tx, rx) = mpsc::channel::<ProviderEvent>(256);
         let base = Self::base(instance);
-        let auth = instance.auth.clone();
+        let config = instance.clone();
         let extra = instance.extra_headers.clone();
         let thinking = Self::thinking_supported(instance, &request.selection.model);
         let fast = request.selection.option_flag("fast_mode") == Some(true);
 
         tokio::spawn(async move {
-            let key = match resolve_auth(&auth) {
+            let key = match resolve_auth(&config) {
                 Ok(Some(k)) => k,
                 Ok(None) => {
                     let _ = tx

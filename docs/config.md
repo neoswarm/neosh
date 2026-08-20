@@ -138,8 +138,8 @@ is active, so switching conversation switches which tree you are looking at.
 Conversations are saved as you go — one file each under `~/.local/state/neosh/sessions/` — and
 restored at startup, in the one you were last in. `--clean` neither reads nor writes them.
 
-Pin the projects you live in with `f` and they move to a `FAVORITES` section at the top; `J`/`K`
-reorder within a section, and a pinned project stays listed after its last conversation is closed,
+Pin the projects you live in with `f` and they move to the top of the list, marked with a heart;
+`J`/`K` reorder within a group, and a pinned project stays listed after its last conversation is gone,
 so `Enter` on it starts a new one. The arrangement is saved under
 `~/.local/state/neosh/plugin-state/` — not in your config, because an editor that rewrites the file
 you hand-edited because you pressed a key is one you stop trusting with it.
@@ -148,9 +148,27 @@ While a turn is running the row shows how long it has been running, next to the 
 with no clock is indistinguishable from wedged.
 
 In the panel (`<C-t>`): `↑`/`↓`, `j`/`k` or `^N`/`^P` move, `Enter` opens or folds, `Space` folds,
-`f` pins, `J`/`K` reorder, `n` new conversation here, `x` close, `r` rename, `?` every binding,
-`Esc` leaves. The foot of the panel lists the keys for whatever the cursor is on; set
-`sidebar.hints = false` once they are in your fingers.
+`f` pins, `J`/`K` reorder, `n` new conversation here, `x` archive, `u` unarchive, `X` delete,
+`r` rename, `?` every binding, `Esc` leaves. `J`/`K` work from a conversation row too — they move
+the project it is in, because you are looking at the project when you are looking at what is inside
+it. The foot of the panel lists the keys for whatever the cursor is on; set `sidebar.hints = false`
+once they are in your fingers.
+
+### Archiving, and the one verb that deletes
+
+`x` archives. Everything is kept — every message, the file on disk — it simply leaves the list you
+work in and appears under `ARCHIVED` at the foot of the panel, which only exists while there is
+something in it and starts shut. `u`, or opening it, brings it back to the top.
+
+It asks nothing, because it takes nothing away. Charging a confirmation for a reversible action is
+what teaches you to dismiss confirmations, which is how the one that matters stops working.
+
+`X` deletes: the file goes and there is no undo, so it asks — unless the conversation has nothing in
+it to lose, or you have set `ui.confirm_destructive = false`. Archiving the conversation you are in
+moves you to the most recently used other one, or starts a fresh one if there is no other.
+
+For plugins: `session.archive(id)`, `session.archive(id, false)`, and
+`session.list({ includeArchived: true })`. Plain `list()` leaves them out.
 
 ```toml
 [options]
@@ -255,24 +273,215 @@ of the line.
 both be true, which is what lets one key carry both jobs. `^X` cuts, `^A` selects everything. Your
 terminal's own paste works: it arrives as a bracketed paste and lands at the cursor.
 
+### Reading the transcript
+
 `^S` moves the keyboard into the transcript, which is where the text you actually want to keep
-lives. There the keys are vi's: `hjkl` and the arrows move, `w`/`b` by word, `0`/`$` to the ends of
-a line, `g`/`G` to the ends of the transcript, `v` starts a selection that motions extend, `a`
-selects all of it, `y` copies and leaves, `Esc` just leaves. The status line says `reading` while
-you are there.
+lives. It is a mode, not a focus change, because the keys mean different things there. The status
+line says `reading` while you are in it, and the row under the composer says what the keys do —
+including, once an operator is down, what can follow it.
+
+The keys are vi's, chosen rather than invented:
+
+| | |
+|---|---|
+| `hjkl`, arrows | move |
+| `w` `b` | by word |
+| `0` `$` | ends of the line |
+| `gg` `G` | ends of the transcript |
+| `^D` `^U` | half a screen |
+| `^F` `^B`, `PgUp`/`PgDn` | a screen |
+| `zz` `zt` `zb` | put the cursor's line in the middle, at the top, at the bottom |
+| `[` `]` | previous / next **turn** |
+| `{` `}` | previous / next **block** |
+| `/` `?` | search forward / backward |
+| `n` `N` | next / previous match |
+| `v` | start a selection that motions extend |
+| `V` | select this whole line |
+| `y` | copy the selection, and leave |
+| `yy` `Y` | copy the line |
+| `yc` | copy the **code block** the cursor is in |
+| `ym` | copy the whole **turn** — the question and everything it produced |
+| `ya` | copy the entire transcript |
+| `i` `a` `o` `⏎` | back to the composer |
+| `Esc` | drop the search highlight, then leave |
+
+Two of those are not in any editor, because a transcript has two things a file does not. `[`/`]`
+step between turns, found from the bar drawn down the left of a question rather than from a
+remembered list — a remembered one would be wrong in exactly the case you need it, which is
+scrolling back through a long conversation. And `yc` takes the code block the cursor is in, without
+the indent the renderer added or the language line above it. That one is the reason the mode
+exists: an answer with a command in it is worth very little if getting the command means selecting
+it by hand across a wrapped line.
+
+Searching is incremental — hits light up as you type — and case-insensitive unless the query has a
+capital in it. The composer is borrowed to type into, and your draft comes back when the search
+closes, however it closes.
 
 Copying uses OSC 52, which travels back through the terminal connection — so it reaches the
 clipboard on the machine you are sitting at, not the one neosh is running on. Terminals that do not
 implement it ignore it silently; there is no way to detect support.
+
+### The strip along the bottom
+
+```
+ chat  ask ⇧⇥  main  ███░░░░░ 38% of 200k  ↑12k ↓4k          claude-opus-5 ^P  High ^E
+```
+
+Left is what the conversation is *spending* — the permission mode, the branch, how full the context
+window is, tokens in and out. Right is what it is spending it *on*. They are separated because they
+change at different rates, and interleaving two things that move at different speeds makes both
+harder to read.
+
+The context meter is drawn from the moment a conversation opens, empty, rather than appearing once
+a turn has been spent. The one time you most want to know how much room a model has is *before*
+deciding what to do with it, and a 200k window and a 1M one are different tools. The bar is for the
+shape of the answer — plenty of room, getting full, nearly out — and the number beside it for the
+rest; the colour changes past 70% and again past 90%.
+
+When the strip is too narrow for everything in it, whole segments are dropped, least important
+first. Nothing is truncated: half a token count is a wrong token count, and a bar cut short reads
+as a level nothing is at.
+
+Every entry carries the key that changes it, immediately after it. That is the whole rule: a key is
+memorable once it has been seen beside the thing it does, and a legend somewhere else is a second
+place to look for something that is already on screen. It also means those keys are *not* repeated
+on the shortcut row below — saying it twice costs a row and teaches nothing the first place did not.
+
+There is no shortcut row below by default, for the same reason. It carried `^T`, `^N` and `^K`,
+which are in the sidebar's own footer two rows away, and `F1`, which is on the row it points at.
+What the duplication actually bought was one fewer line of transcript and a composer pressed
+against the status strip. `ui.hints = true` brings it back if you want it; the exception is reading
+mode, which draws its own row whatever the setting says, because those keys are live, different,
+and written down nowhere else.
+
+Plugins own the strip's contents:
+
+```ts
+await neosh.status.set("model", { text: "opus", keys: "^P", align: "right", priority: 10 });
+```
+
+### The row under the composer
+
+Under the field you type into is a row of shortcuts: `⏎ send`, `^P model`, `^T conversations`, and
+so on. It is not a hard-coded list. Every entry is registered by whoever owns the feature:
+
+```ts
+await neosh.hint.set("model", { keys: "^P", label: "model", priority: 10 });
+```
+
+Which means the row is always true. A plugin in `plugins.disabled` takes its shortcut with it,
+rather than leaving a key advertised that no longer does anything — and a plugin you install adds
+its own without neosh knowing it exists.
+
+Entries sort by `priority` and are dropped from the end when the terminal is too narrow, so the
+lowest priority is the one you would most want kept. Nothing is ever cut in half: half a shortcut
+reads as a key that exists and does something else. `ui.hints` is off by default, so the row is
+there for a plugin that has something worth putting on it rather than by default; the full list is
+on the help key either way.
+
+### Saying something while it is working
+
+Typing while a turn is running does not start a second turn and is not refused. It is **steering**:
+the message is held, shown under the composer, and taken into the running turn at the next gap —
+between one round of tool calls and the next, or in place of the turn ending. The model sees it
+while it is still working, and can change what it does next.
+
+```
+  ⏵ read_file  src/main.rs
+✳ Working…  8s  ·  1 queued  ·  esc to interrupt
+```
+
+It is not injected into the provider stream, because a stream in flight cannot be interrupted
+without discarding what has already been generated. The gap between rounds is the earliest honest
+moment.
+
+It does not appear in the transcript until it has actually been said — a transcript that shows a
+question nobody has been asked is a transcript that is lying. And if the turn ends before there is
+a gap, the message becomes the next turn rather than being quietly dropped.
+
+Drivers that run their own loop (`claude-cli`, `codex-cli`) have exactly one round trip per turn,
+so steering them means the message lands as the next turn. That is a property of those CLIs, not a
+setting.
+
+### What the agent may do
+
+The footer says what the agent is allowed to do without asking, and `⇧⇥` changes it:
+
+| | |
+|---|---|
+| `ask` | prompt before writing, running or connecting. The default |
+| `allow-listed` | only what `config.toml` already permits |
+| `full access` | no prompts |
+| `deny` | refuse everything; read-only |
+
+**Workspace containment applies in every mode, including full access.** A path outside the
+workspace is refused whatever the setting says: "full access" means not being asked, not reaching
+the rest of the disk.
+
+`⇧⇥` opens a list rather than cycling, because full access is one keystroke from `ask` in any cycle
+and arriving there by holding a key down is exactly the accident worth designing against.
+`permission.cycle` is bound to nothing by default, for people who want it.
+
+The mode is for this session only and is never written to a file. A mode you switched on to get
+through one task should not still be on next week — the way to make it permanent is
+`[permissions] mode = "…"`, which is a thing you did on purpose.
+
+### How an answer is drawn
+
+Answers are rendered as markdown as they arrive: headings lose their hashes, `- ` becomes a bullet,
+fenced code is indented under its language, and `**bold**` / `*italic*` / `` `code` `` /
+`[text](url)` have their markers **removed** rather than shown. A terminal can draw bold; drawing
+the asterisks as well is showing the same thing twice.
+
+The rendering is incremental, and the rule is that a block is settled once it cannot change — a
+paragraph followed by a blank line, a heading with its newline, a fence with its closing
+back-ticks. Settled blocks are drawn once and never touched again; only the trailing partial block
+is redrawn per tick. Re-parsing the whole answer on every token is quadratic in its length, and the
+place that would show is the tail of the long answer you actually care about.
+
+Tables are laid out in columns, with alignment honoured and a rule under the labels rather than a
+box around everything — the job is separating the labels from the data, and a full grid spends four
+times the ink saying it. A table too wide to line up becomes one block per row instead:
+
+```
+  Provider  Kind                 Key
+  ──────────────────────────────────
+  Claude    plan                none
+  OpenAI    api key  $OPENAI_API_KEY
+```
+
+Columns running off the right edge would mean guessing which value belongs to which label, which is
+worse than not having a table.
+
+One thing is deliberately not done: **no syntax highlighting inside fences**. Doing it properly is a
+grammar per language; doing it with a regex over keywords colours the wrong words in exactly the
+code you are reading closely. A fence gets one colour and its language in the corner.
+
+`chat.markdown = false` shows exactly what the model sent, which is what you want when the question
+is "what did it actually say".
 
 ### Theme and motion
 
 ```toml
 [options]
 "ui.theme" = "dark"       # or "light"
-"ui.motion" = true        # spinners and status pulses
+"ui.motion" = true        # text that moves while something is happening
+"ui.hints" = false        # a shortcut row under the composer; off, the sidebar says the same keys
 "ui.ascii_only" = false   # for terminals without a decent font
+"ui.nerd_font" = false    # brand glyphs for providers, where the font has them
 ```
+
+Motion is reserved for one thing: *something is happening and you cannot see it yet*. While a turn
+is in flight the working line sweeps — a band of brightness travelling along the word — because a
+still screen and a wedged process look identical, and a sweep reads as aliveness at the edge of
+vision without asking to be looked at. `Status.Streaming` sweeps; `Status.Pending` pulses, for
+waiting on something outside the program.
+
+The **frontend** does this, on its own clock, over whatever the core last wrote — so a shimmer costs
+nothing above the terminal boundary and stops the moment the animated row scrolls out of sight.
+Without truecolor the same band renders as bold rather than as nothing. `ui.motion = false` removes
+the movement and keeps the colour; it never makes text disappear. See
+[ADR 0025](adr/0025-motion-belongs-to-the-frontend.md).
 
 The theme is a set of semantic groups — `Status.Working`, `Git.Added`, `Meter.Fill` — that plugins
 link to rather than choosing colours. Override any of them from `init.ts` and a theme switch will
@@ -295,15 +504,209 @@ An answer of "allow for this session" is held **in memory only**; making it perm
 `config.toml`, not a keystroke. With the `approvals` plugin disabled, `ask` mode refuses anything it
 would have prompted about rather than allowing it.
 
-### Model and reasoning effort
+### Choosing a model
 
-`<C-p>` picks the model; `<C-e>` picks its options — reasoning effort, and whatever else the driver
-exposes. Those are not a fixed list: they arrive as `ProviderOptionDescriptor`s attached to the
-model, so a provider plugin that invents a knob gets a working picker for it with no change to the
-switcher.
+`<C-p>` opens a picker in two panes: your providers on the left, the models each one serves on the
+right.
+
+```
+Model                                                              ⇧⇥ providers
+> 
+ PLANS                  │ ❯ Claude Opus 5         Frontier  Most capable for complex work
+  ✳ Claude            ✓ │   Claude Fable 5        Frontier  Long-form writing and voice
+  ⬢ Codex             ✓ │   Claude Sonnet 5       Balanced  Best for everyday tasks
+ API KEYS               │   Claude Haiku 4.5      Fast      Fastest, for quick answers
+  ✳ Anthropic         ! │   ▸ 5 superseded
+ LOCAL                  │
+  ▲ Ollama              │
+────────────────────────┴──────────────────────────────────────────────────────────
+ ↵ use   ^S sign in   ^R refresh   ^A add   ^D remove   esc close
+```
+
+The rail is grouped by **what a turn costs you**, which is the distinction one flat list could not
+make:
+
+| | | |
+|---|---|---|
+| **PLANS** | a subscription you already pay for | no key, nothing stored |
+| **API KEYS** | billed per token | see [API keys](#api-keys) |
+| **LOCAL** | on this machine | costs nothing, needs nothing |
+
+The marker at the right edge of each rail entry: `✓` it will work, `!` it needs a key or its CLI is
+missing, `⨯` no driver provides it. Superseded models fold behind a count — reachable, out of the
+way, and opened automatically while you are filtering.
+
+Typing filters the model list. `⇧⇥` and `←` reach the provider rail, `⇥` and `→` come back, and the
+title row says which of the two the key would take you to right now — a legend can only tell you a
+key exists, and a second pane with no visible way into it is a pane nobody finds.
+
+The picker's own actions are **chords**, not letters:
+
+| | |
+|---|---|
+| `^S` | sign in to whatever the rail is on |
+| `^R` | ask that endpoint again — after adding a key, gaining access, or starting a local server |
+| `^A` | add a model by id, for something the catalogue has never heard of |
+| `^D` | remove one you added |
+
+Chords because every bare letter the picker takes is a letter the filter can never contain. These
+used to be `s`, `r`, `n` and `d`, which between them made it impossible to search for "sonnet".
+
+`^A` asks twice — the id, which goes on the wire and has to be exact, and the name, which is what
+you will read in the list forever afterwards. Nothing validates the id, because nothing here can:
+whether an endpoint serves it is a question only the endpoint can answer, and it answers on the
+first turn. What you add is kept per provider in plugin state rather than in configuration — it is
+a note about *this machine's* access, not a decision worth committing to a repository. `^D` takes
+it back out, and refuses on a model the provider serves, which is not yours to delete.
+
+`ui.nerd_font = true` swaps the geometric provider marks for real brand glyphs. Off by default and
+deliberately not detected: a terminal cannot be asked what its font contains, and guessing wrong
+draws a row of boxes, which reads as a broken program rather than as a missing font.
+`ui.ascii_only = true` reduces them to letters.
+
+#### What you see before you sign in
+
+Every provider lists models whether or not you have a key for it, because the list is *how you
+decide whether to sign in*. Those entries come from a written-down catalogue: enough to pick from,
+and never claimed to be complete.
+
+The moment a key is present the endpoint's own `/v1/models` decides what exists, and the catalogue
+keeps only the part it is authoritative about — the display name, the rung and the one-line
+description, none of which appear in any `/v1/models` response. A model the endpoint does not
+return is dropped, even if the catalogue lists it: offering one whose first turn is a 404 is worse
+than offering nothing.
+
+Providers that serve other people's models — Groq, Cerebras, Together, Fireworks — have no written
+catalogue on purpose. Their lineups change weekly, so a list here would be wrong faster than it was
+useful, and the picker says "discovery needs a key" rather than showing an empty pane.
+
+#### When the model you used last has stopped working
+
+Reopening a conversation restores the model it was using. If that model can no longer authenticate
+— an API-key provider, on a machine that does not have the key — neosh moves to one that can, keeps
+the product line where it can (`anthropic/claude-opus-5` becomes the Opus on your plan, not
+whatever sorts first), and says so in one line.
+
+A stored selection is a *record of what was used*, not an instruction. What you put in
+`agent.model` is an instruction, and is left alone even when it cannot authenticate: quietly using
+a different model would be worse than the error you get when you send.
+
+### Moving along the ladder
+
+Every model in the catalogue sits on one of three rungs — **Frontier**, **Balanced**, **Fast** —
+because every lineup worth switching between has three: Opus/Sonnet/Haiku, gpt-5/mini/nano,
+Pro/Flash/Flash-Lite.
+
+```
+<A-Up>      model.upgrade      one rung up, same provider
+<A-Down>    model.downgrade    one rung down
+            model.line opus    the current model in a line, wherever it is reachable
+```
+
+`upgrade`/`downgrade` hold the provider fixed on purpose: "give me something cheaper" is a question
+about the model, and answering it by also changing your billing would answer a question nobody
+asked. Neither wraps — at the top, `upgrade` says so rather than dropping you to the cheapest thing
+in the catalogue.
+
+`model.line` resolves a *product line* to the one in it that has not been superseded, which is what
+people mean by "use Opus": not a pinned id that goes stale.
+
+These are ordinary commands. Rebind them like anything else:
+
+```toml
+# in init.ts
+await neosh.keymap.set("chat", "<C-A-k>", "model.upgrade");
+```
+
+### Reasoning effort
+
+`<C-e>` picks reasoning effort and whatever else the driver exposes. Those are not a fixed list:
+they arrive as `ProviderOptionDescriptor`s attached to the model, so a provider plugin that invents
+a knob gets a working picker for it with no change to the switcher.
 
 Switching between two models that share an option keeps your setting; switching to one without it
 drops the setting rather than sending a value the driver would reject.
+
+### Plans
+
+Two plans ship: `claude-cli` and `codex-cli`. Both are the vendor's own CLI, driven as a provider.
+Neither needs an API key, neither stores a token, and neither is offered unless the program is
+actually on your `$PATH` — a provider whose every turn would fail with "no such file" is worse than
+one that is not listed.
+
+They are **agent drivers**: `claude -p` and `codex exec` run their own loop, with their own tools,
+their own sandbox and their own approval policy. So neosh's tool registry is not in play on those
+turns and `tool.pre` hooks observe rather than gate. Two consequences worth knowing before you pick
+one:
+
+- Neither driver overrides the CLI's sandbox. If a turn stops to ask for approval it wants, the
+  place to change that is `codex`'s or `claude`'s configuration, not neosh's. Loosening somebody
+  else's security policy to make turns run more smoothly is not a decision a wrapper should make.
+- `codex exec --json` has no token deltas — the protocol reports an assistant message when it is
+  complete. So a Codex turn shows its tool activity live and then its answer all at once. That is
+  the CLI's shape, not a shortcut.
+
+Three more come from one driver, because Cursor's `cursor-agent`, xAI's `grok` and Google's
+`gemini --experimental-acp` all speak the **Agent Client Protocol** — JSON-RPC over stdio. A fourth
+ACP agent is a line in the catalogue rather than a file of code.
+
+ACP has one limitation worth knowing before you pick one. An ACP agent asks its *client* for
+permission, which means neosh has to answer, and it currently answers from the permission mode
+alone: under **full access** it takes the agent's allow-once option, and under anything else it
+refuses and says so. Routing those prompts into the same approval you get for a built-in tool call
+is the next step and needs the request to travel out of the driver and an answer to travel back.
+Until then the behaviour is conservative and stated rather than quietly permissive.
+
+Adding a plan behind a CLI that speaks neither is a driver plus a line in the catalogue.
+`AuthRef::Cli { program, login }` is the whole contract: name the program, name the command that
+logs in, and the account split, the rail grouping and the "not installed — run this" message all
+follow.
+
+A provider whose CLI is not installed still lists what it offers, greyed out, with the command that
+would fix it at the top. What a provider serves is how you decide whether installing it is worth
+your afternoon, and an empty pane answers that with silence.
+
+### API keys
+
+Only for the **API KEYS** group. A plan signs itself in — if the Claude entries are missing, the
+`claude` CLI is not on your `$PATH`, and `provider.auth` says so rather than hiding the provider.
+
+`provider.auth` lists every configured provider and the state of its account; `provider.key` (built
+in, so it works with `--clean`) takes a key for the provider you are on. Picking a model that has no key
+offers the same prompt rather than failing later, when the failure is between you and the question
+you were asking.
+
+**The prompt is the host's, not a plugin's.** Nothing is echoed — you get one bullet per character —
+and no plugin ever sees what you typed. There is no API call that returns a key, only ones that
+report where it came from, so a plugin cannot leak what it cannot read. See
+[ADR 0022](adr/0022-credentials-never-cross-the-plugin-boundary.md).
+
+Where it goes:
+
+| | Survives a restart | |
+|---|---|---|
+| OS keychain | yes | used automatically when `secret-tool` or `security` is installed |
+| this session | no | the fallback when neither is — say, over SSH with no session bus |
+
+neosh tells you which happened. It never writes a key to a file it controls.
+
+Four places a key is looked for, in order — one you typed this session, the keychain, a helper
+program, then the environment. Typed wins, because you typed it after seeing what the environment
+gave you.
+
+A helper is the answer if you already keep secrets somewhere:
+
+```toml
+[[providers]]
+id = "anthropic"
+driver = "anthropic"
+display_name = "Anthropic"
+base_url = "https://api.anthropic.com"
+auth = { kind = "command", argv = ["pass", "show", "anthropic/api-key"] }
+```
+
+Anything on `$PATH` works — `pass`, `op read`, `bw get`, `gopass`, your own script. Only the first
+line of its output is used, so tools that print metadata after the secret are fine.
 
 ### Git, and the prompts behind it
 
@@ -367,7 +770,10 @@ plugin_dirs = ["~/src/neosh-plugins"]
 Unknown keys are an **error**, not ignored. A typo that is silently skipped looks exactly like a
 setting that does not work.
 
-Credentials are read from the environment by name. Nothing writes a secret to this file.
+`auth` names *where a key is*, never a key: `{ kind = "env", var = "…" }`,
+`{ kind = "command", argv = [...] }`, `{ kind = "cli", program = "codex", login = "codex login" }`
+for a plan behind a vendor CLI, or `{ kind = "none" }` for a local endpoint that wants none.
+Nothing writes a secret to this file, and nothing reads one from it.
 
 ## Options
 

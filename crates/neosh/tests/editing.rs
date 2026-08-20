@@ -443,6 +443,7 @@ fn you_can_move_into_the_transcript_and_copy_a_line_out_of_it() {
 
     // Top of the transcript, down onto the greeting, select to the end of it, yank.
     s.ch("g");
+    s.ch("g");
     s.ch("j");
     s.ch("v");
     s.ch("$");
@@ -463,8 +464,8 @@ fn select_all_while_reading_takes_the_whole_transcript() {
     assert!(s.pump(|s| s.chat().iter().any(|l| l.contains("neosh"))));
 
     s.press(json!({"kind": "char", "c": "s"}), &["ctrl"]);
-    s.ch("a");
     s.ch("y");
+    s.ch("a");
     assert!(
         s.pump(|s| s.copied().iter().any(|t| t.contains("neosh"))),
         "everything, not just the line under the cursor: {:?}",
@@ -535,7 +536,9 @@ export async function activate({ neosh }: PluginContext) {
         "the sequence ran the command: {:?}",
         s.messages()
     );
-    assert_eq!(s.composer(), Vec::<String>::new().as_slice(), "and typed nothing");
+    // Concatenated rather than compared to a literal: an empty composer is one empty line, and
+    // whether the frontend has been told about that line yet is not what this test is about.
+    assert_eq!(s.composer().concat(), "", "and typed nothing");
 }
 
 #[test]

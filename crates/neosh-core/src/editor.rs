@@ -66,6 +66,10 @@ pub struct Editor {
     attached: HashMap<BufferId, HashSet<PluginId>>,
     /// Windows that want the keys nothing else claimed, and the command to send them to.
     captures: HashMap<WindowId, String>,
+    /// Plugins that ship with neosh. Their keymaps are *defaults*, and a default that overwrites a
+    /// choice is not a default — `init.ts` runs before plugin discovery, so without this every
+    /// bundled plugin would silently take a key the user's configuration had just bound.
+    bundled: HashSet<String>,
     /// Where the selection highlight is drawn.
     ///
     /// Reserved at construction rather than exposed, so a selection is an ordinary extmark from the
@@ -108,6 +112,11 @@ impl Editor {
         e
     }
 
+    /// Say that a plugin ships with neosh, so its keymaps behave as defaults.
+    pub fn mark_bundled(&mut self, plugin: &PluginId) {
+        self.bundled.insert(plugin.0.clone());
+    }
+
     /// Whether this call is UI-domain and belongs to the core.
     ///
     /// The host uses this to split synchronous UI work from asynchronous agent work without the
@@ -129,6 +138,8 @@ impl Editor {
                 | ApiCall::ProviderRegisterDriver { .. }
                 | ApiCall::ProviderEmit { .. }
                 | ApiCall::PermissionCheck { .. }
+                | ApiCall::PermissionGetMode
+                | ApiCall::PermissionSetMode { .. }
                 | ApiCall::RtpAdd { .. }
                 | ApiCall::RtpList
                 | ApiCall::PathComplete { .. }
@@ -146,15 +157,21 @@ impl Editor {
                 | ApiCall::GitAddWorktree { .. }
                 | ApiCall::GitRemoveWorktree { .. }
                 | ApiCall::GenComplete { .. }
-                | ApiCall::SessionList
+                | ApiCall::SessionList { .. }
                 | ApiCall::SessionCurrent
                 | ApiCall::SessionNew { .. }
                 | ApiCall::SessionSwitch { .. }
                 | ApiCall::SessionClose { .. }
                 | ApiCall::SessionRename { .. }
+                | ApiCall::SessionArchive { .. }
+                | ApiCall::ProviderCredentials
+                | ApiCall::ProviderSetCredential { .. }
+                | ApiCall::ProviderForgetCredential { .. }
                 | ApiCall::SessionMessages { .. }
                 | ApiCall::StatusSet { .. }
                 | ApiCall::StatusClear { .. }
+                | ApiCall::HintSet { .. }
+                | ApiCall::HintClear { .. }
                 | ApiCall::StateGet { .. }
                 | ApiCall::StateSet { .. }
                 | ApiCall::StateDelete { .. }
@@ -185,12 +202,24 @@ impl Editor {
         if !self.highlights.set_variant(variant) {
             return false;
         }
-        let defs: Vec<_> =
-            self.highlights.iter().map(|(n, d)| (n.clone(), d.clone())).collect();
+        self.republish_highlights();
+        true
+    }
+
+    /// Turn motion on or off. Returns whether anything changed.
+    pub fn set_motion(&mut self, on: bool) -> bool {
+        if !self.highlights.set_motion(on) {
+            return false;
+        }
+        self.republish_highlights();
+        true
+    }
+
+    fn republish_highlights(&mut self) {
+        let defs: Vec<_> = self.highlights.iter().map(|(n, d)| (n.clone(), d.clone())).collect();
         for (name, def) in defs {
             self.push_ui(UiEvent::HighlightDefined { name, def });
         }
-        true
     }
 
     /// Queue a UI event, coalescing consecutive edits to the same buffer region.
@@ -254,6 +283,11 @@ impl Editor {
 
     pub fn window(&self, id: WindowId) -> Option<&Window> {
         self.windows.get(&id)
+    }
+
+    /// Every open window, for the rare caller that needs to find one by what it shows.
+    pub fn windows(&self) -> impl Iterator<Item = &Window> {
+        self.windows.values()
     }
 
     pub fn mode(&self) -> Mode {
@@ -712,12 +746,19 @@ impl Editor {
             }
             ApiCall::KeymapSet { mode, lhs, command, scope, desc } => {
                 let lhs = self.with_leader(&lhs);
-                self.keymaps.set(
+                let took = self.keymaps.set(
                     mode,
                     scope.unwrap_or(KeymapScope::Global),
                     &lhs,
-                    Binding { command, desc, owner: Some(plugin.0.clone()) },
+                    Binding { command: command.clone(), desc, owner: Some(plugin.0.clone()) },
+                    &self.bundled,
                 )?;
+                if !took {
+                    // Not an error: a bundled plugin offering a default for a key somebody has
+                    // already taken is the ordinary case, and failing the call would make every
+                    // such plugin log a warning on a perfectly good configuration.
+                    tracing::debug!(%plugin, lhs, command, "key already bound; default not applied");
+                }
                 Ok(ApiOk::Unit)
             }
             ApiCall::KeymapDel { mode, lhs, scope } => {
@@ -974,14 +1015,22 @@ fn call_name(call: &ApiCall) -> &'static str {
         ApiCall::GitAddWorktree { .. } => "git.addWorktree",
         ApiCall::GitRemoveWorktree { .. } => "git.removeWorktree",
         ApiCall::GenComplete { .. } => "gen.complete",
+        ApiCall::PermissionGetMode => "permission.mode",
+        ApiCall::PermissionSetMode { .. } => "permission.setMode",
         ApiCall::StatusSet { .. } => "status.set",
+        ApiCall::HintSet { .. } => "hint.set",
+        ApiCall::HintClear { .. } => "hint.clear",
         ApiCall::StatusClear { .. } => "status.clear",
-        ApiCall::SessionList => "session.list",
+        ApiCall::SessionList { .. } => "session.list",
         ApiCall::SessionCurrent => "session.current",
         ApiCall::SessionNew { .. } => "session.new",
         ApiCall::SessionSwitch { .. } => "session.switch",
         ApiCall::SessionClose { .. } => "session.close",
         ApiCall::SessionRename { .. } => "session.rename",
+        ApiCall::SessionArchive { .. } => "session.archive",
+        ApiCall::ProviderCredentials => "provider.credentials",
+        ApiCall::ProviderSetCredential { .. } => "provider.set_credential",
+        ApiCall::ProviderForgetCredential { .. } => "provider.forget_credential",
         ApiCall::SessionMessages { .. } => "session.messages",
         _ => "call",
     }

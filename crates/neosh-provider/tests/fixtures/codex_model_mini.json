@@ -1,0 +1,46 @@
+{
+  "id": "gpt-5.4-mini",
+  "model": "gpt-5.4-mini",
+  "upgrade": "gpt-5.6-luna",
+  "upgradeInfo": {
+    "model": "gpt-5.6-luna",
+    "upgradeCopy": null,
+    "modelLink": null,
+    "migrationMarkdown": "GPT-5.4 Mini is no longer available\n\nCodex now uses GPT-5.6 Luna in place of GPT-5.4 Mini. Switch to GPT-5.6 Luna to continue.\n",
+    "retirementAt": null
+  },
+  "availabilityNux": null,
+  "displayName": "GPT-5.4-Mini",
+  "description": "Small, fast, and cost-efficient model for simpler coding tasks.",
+  "modelSpecialty": null,
+  "hidden": true,
+  "supportedReasoningEfforts": [
+    {
+      "reasoningEffort": "low",
+      "description": "Fast responses with lighter reasoning"
+    },
+    {
+      "reasoningEffort": "medium",
+      "description": "Balances speed and reasoning depth for everyday tasks"
+    },
+    {
+      "reasoningEffort": "high",
+      "description": "Greater reasoning depth for complex problems"
+    },
+    {
+      "reasoningEffort": "xhigh",
+      "description": "Extra high reasoning depth for complex problems"
+    }
+  ],
+  "defaultReasoningEffort": "medium",
+  "inputModalities": [
+    "text",
+    "image"
+  ],
+  "supportsPersonality": true,
+  "multiAgentVersion": null,
+  "additionalSpeedTiers": [],
+  "serviceTiers": [],
+  "defaultServiceTier": null,
+  "isDefault": false
+}

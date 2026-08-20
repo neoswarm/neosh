@@ -75,3 +75,38 @@ fn edits_to_two_buffers_never_merge_into_each_other() {
     assert_eq!(appends(&ui, chat).len(), 1);
     assert_eq!(appends(&ui, composer).len(), 1);
 }
+
+/// Turning motion off strips the movement and keeps the colour.
+///
+/// Both halves matter. A setting that made the working indicator *disappear* rather than hold
+/// still would be a setting nobody uses twice; and a frontend that had to know about `ui.motion`
+/// would need one more concept for every future frontend to reimplement.
+#[test]
+fn motion_can_be_switched_off_without_the_text_going_with_it() {
+    use neosh_proto::{HighlightDef, UiEvent};
+
+    let mut editor = Editor::new();
+    let animated = |editor: &mut Editor| -> (bool, bool) {
+        let mut moves = false;
+        let mut coloured = false;
+        for ev in editor.drain_ui() {
+            if let UiEvent::HighlightDefined { name, def } = ev
+                && name == "Status.Streaming"
+                && let HighlightDef::Spec { spec } = def
+            {
+                moves = spec.animate.is_some();
+                coloured = spec.fg.is_some();
+            }
+        }
+        (moves, coloured)
+    };
+
+    assert_eq!(animated(&mut editor), (true, true), "it moves by default");
+
+    assert!(editor.set_motion(false), "the change is reported, so the caller can skip a redraw");
+    assert_eq!(animated(&mut editor), (false, true), "still says something, just holds still");
+    assert!(!editor.set_motion(false), "setting it twice changes nothing");
+
+    assert!(editor.set_motion(true));
+    assert_eq!(animated(&mut editor), (true, true), "and back");
+}

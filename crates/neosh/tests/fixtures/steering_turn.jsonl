@@ -1,0 +1,20 @@
+{"type": "message_start", "model": "mock", "usage": {}}
+{"type": "block_start", "index": 0, "block": {"kind": "tool_use", "id": "c1", "name": "read_file"}}
+{"type": "tool_input_delta", "index": 0, "partial_json": "{\"path\":\"README.md\"}"}
+{"type": "block_stop", "index": 0}
+{"type": "message_delta", "stop_reason": {"kind": "tool_use"}, "usage": {}}
+{"type": "message_stop"}
+
+{"type": "message_start", "model": "mock", "usage": {}}
+{"type": "block_start", "index": 0, "block": {"kind": "text"}}
+{"type": "text_delta", "index": 0, "text": "Done, and I saw your follow-up."}
+{"type": "block_stop", "index": 0}
+{"type": "message_delta", "stop_reason": {"kind": "end_turn"}, "usage": {"input_tokens": 1200, "output_tokens": 40}}
+{"type": "message_stop"}
+
+{"type": "message_start", "model": "mock", "usage": {}}
+{"type": "block_start", "index": 0, "block": {"kind": "text"}}
+{"type": "text_delta", "index": 0, "text": "And again."}
+{"type": "block_stop", "index": 0}
+{"type": "message_delta", "stop_reason": {"kind": "end_turn"}, "usage": {"input_tokens": 1500, "output_tokens": 10}}
+{"type": "message_stop"}

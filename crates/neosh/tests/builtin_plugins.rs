@@ -244,6 +244,15 @@ impl Session {
             .collect()
     }
 
+    /// Every event this frontend has been sent, verbatim.
+    ///
+    /// The only way to assert a *negative* about the wire: that something the host knows never
+    /// appears in what it sends. Rendered text is not enough — a value could be in a field nothing
+    /// draws and still be in the JSON a frontend logs.
+    fn wire(&self) -> String {
+        self.events.iter().map(|e| e.to_string()).collect::<Vec<_>>().join("\n")
+    }
+
     fn transcript(&self) -> String {
         let mut s = String::from("--- text seen ---\n");
         for l in self.texts() {
@@ -353,9 +362,195 @@ fn the_model_picker_opens_and_lists_what_is_reachable() {
     let mut s = sb.start();
     s.wait_for("PROJECTS");
     s.ctrl("p");
-    // The instance is shown beside the model, because a model id is unique per instance and not
-    // globally. A picker that dropped it would have to guess which endpoint a row means.
-    s.wait_for("Mock  mock");
+    s.wait_for("Model");
+    let rows = s.picker_now();
+    // Two panes: providers on the left under the heading for what they cost, their models on the
+    // right. The heading is the whole point — a plan and a key are different things to spend, and
+    // one flat list could not say which a row was.
+    assert!(rows.iter().any(|l| l.contains("LOCAL")), "grouped by account\n{rows:?}");
+    assert!(
+        rows.iter().any(|l| l.contains("Mock") && l.contains('\u{2502}')),
+        "a rail entry and a model row on the same line\n{rows:?}"
+    );
+    // The model id is still there: it is unique per instance and not globally, so a picker that
+    // dropped it would have to guess which endpoint a row means.
+    assert!(rows.iter().any(|l| l.contains("mock")), "{rows:?}");
+}
+
+/// A second provider with two models, so the rail has somewhere to move to and the pane has
+/// somewhere to move *within* — which is how "did the focus actually change panes" is answerable.
+const OTHER: &str = r#"
+import type { PluginContext } from "@neosh/api";
+
+export async function activate({ neosh }: PluginContext) {
+  await neosh.provider.register("other", [{
+    id: "other", driver: "other", display_name: "Other",
+    models: [
+      { id: "other-1", display_name: "Other One" },
+      { id: "other-2", display_name: "Other Two" },
+    ],
+  }], async (_req, emit) => { emit({ type: "message_stop" }); });
+  neosh.notify("other ready");
+}
+"#;
+
+fn install_other(sb: &Sandbox) {
+    let dir = sb.root.join("config/plugins/other");
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    std::fs::write(
+        dir.join("plugin.toml"),
+        "name = \"other\"\nversion = \"0.1.0\"\nentry = \"main.ts\"\npermissions = [\"providers\"]\n",
+    )
+    .expect("manifest");
+    std::fs::write(dir.join("main.ts"), OTHER).expect("plugin");
+}
+
+/// Moving into the rail and down it changes which provider's models are on the right.
+///
+/// Regression, and a nasty one: `<Tab>` is deliberately shared between `complete` and `pane_next`
+/// on the reasoning that no widget has both. But the key was resolved against every action in a
+/// fixed order regardless of which widget was asking, so `<Tab>` in the model picker came back as
+/// `complete` — an action a rail picker has no case for — and did nothing at all. The second pane
+/// was on screen, named in the shortcut row, and unreachable.
+#[test]
+fn the_rail_is_reachable_and_choosing_a_provider_lists_its_models() {
+    let sb = Sandbox::new("railmove");
+    install_other(&sb);
+    let mut s = sb.start();
+    s.wait_for("other ready");
+    s.wait_for("PROJECTS");
+    s.ctrl("p");
+    s.wait_for("Model");
+
+    // The shortcut row says how to get there, so it had better be true.
+    assert!(
+        s.picker_now().iter().any(|l| l.contains("providers")),
+        "the picker says the rail is reachable\n{:?}",
+        s.picker_now()
+    );
+
+    // Back a pane, into the rail; down it, onto the other provider; then *forward* a pane with
+    // `<Tab>` and down again. If `<Tab>` reached the pane, that last press moved the model cursor.
+    // If it did not, it moved the rail instead — off the end, leaving the cursor on the first
+    // model of a provider whose list nobody asked to change.
+    s.special("back_tab");
+    s.special("down");
+    assert!(
+        s.pump(|s| s.picker_now().iter().any(|l| l.contains("Other One"))),
+        "moving down the rail listed the other provider\n{:?}",
+        s.picker_now()
+    );
+    s.special("tab");
+    s.special("down");
+    assert!(
+        s.pump(|s| s
+            .picker_now()
+            .iter()
+            .any(|l| l.contains("Other Two") && l.contains('\u{276f}'))),
+        "and the cursor is on the second model, so <Tab> reached the pane\n{:?}",
+        s.picker_now()
+    );
+}
+
+/// A model you named yourself can be taken back out.
+///
+/// `n` existed and `d` did not, which meant a mistyped id was a row you had to read past forever —
+/// and the most likely thing to be in a hand-typed list of model ids is a typo.
+#[test]
+fn a_model_you_added_yourself_can_be_removed_again() {
+    let sb = Sandbox::new("customdel");
+    let mut s = sb.start();
+    s.wait_for("PROJECTS");
+    s.ctrl("p");
+    s.wait_for("Model");
+
+    // `^A`, then the id, then the name it shows as.
+    s.ctrl("a");
+    assert!(s.pump(|s| !s.prompt_now().is_empty()), "the id prompt opened");
+    s.type_text("acme-1");
+    s.enter();
+    assert!(
+        s.pump(|s| s.prompt_now().iter().any(|l| l.contains("Show it as"))),
+        "then it asks what to call it\n{:?}",
+        s.prompt_now()
+    );
+    s.type_text("!");
+    s.enter();
+    assert!(
+        s.pump(|s| s.picker_now().iter().any(|l| l.contains("acme-1") && l.contains("yours"))),
+        "and it is in the list, marked as yours\n{:?}",
+        s.picker_now()
+    );
+
+    // Onto it — it sorts above the provider's own models — and out.
+    s.special("up");
+    s.ctrl("d");
+    assert!(
+        s.pump(|s| !s.picker_now().iter().any(|l| l.contains("acme-1"))),
+        "and out again\n{:?}",
+        s.picker_now()
+    );
+    assert!(
+        s.saw("removed"),
+        "and it says so"
+    );
+}
+
+/// The filter can contain any letter, including the ones the picker's own actions used to take.
+///
+/// Regression: sign-in, refresh, add and remove were on bare `s`, `r`, `n` and `d`, checked before
+/// the filter ever saw the key. So typing "sonnet" opened a sign-in prompt on the `s`, and there
+/// was no way to search a long model list for anything whose name contained one of four very
+/// common letters.
+#[test]
+fn typing_a_model_name_filters_rather_than_firing_a_command() {
+    let sb = Sandbox::new("filterletters");
+    install_other(&sb);
+    let mut s = sb.start();
+    s.wait_for("other ready");
+    s.wait_for("PROJECTS");
+    s.ctrl("p");
+    s.wait_for("Model");
+    // Onto the provider with two models to tell apart.
+    s.special("back_tab");
+    s.special("down");
+    assert!(s.pump(|s| s.picker_now().iter().any(|l| l.contains("Other Two"))));
+    s.special("tab");
+
+    // Every letter here is one that used to be a command.
+    s.type_text("nd");
+    assert!(
+        s.pump(|s| {
+            let rows = s.picker_now();
+            rows.iter().any(|l| l.contains("> nd"))
+        }),
+        "the letters went into the filter\n{:?}",
+        s.picker_now()
+    );
+    assert!(
+        s.prompt_now().is_empty() && !s.saw("asking again"),
+        "and fired nothing: {:?}",
+        s.prompt_now()
+    );
+}
+
+/// `d` on a model the provider serves is not a deletion. It is not ours to delete, and saying
+/// which of the two a row is beats doing nothing at all.
+#[test]
+fn d_on_a_model_the_provider_serves_explains_rather_than_deleting() {
+    let sb = Sandbox::new("customdel2");
+    let mut s = sb.start();
+    s.wait_for("PROJECTS");
+    s.ctrl("p");
+    s.wait_for("Model");
+    let before = s.picker_now();
+
+    s.ctrl("d");
+    assert!(
+        s.pump(|s| s.saw("nothing of yours to remove")),
+        "it says which kind of row this is"
+    );
+    assert_eq!(s.picker_now(), before, "and nothing moved");
 }
 
 #[test]
@@ -371,7 +566,7 @@ fn a_picker_owns_its_navigation_keys_while_it_is_open() {
     let before = s.sidebar_now().iter().filter(|l| l.contains("New conversation")).count();
     let windows = s.open_windows().len();
     s.ctrl("p");
-    s.wait_for("Mock  mock");
+    s.wait_for("Model");
     s.ctrl("n");
     s.drain_for(Duration::from_secs(1));
     assert_eq!(
@@ -405,7 +600,7 @@ fn the_navigation_keys_can_be_rebound() {
     s.wait_for("PROJECTS");
 
     s.ctrl("p");
-    s.wait_for("Mock  mock");
+    s.wait_for("Model");
     // `<C-f>` now moves. There is one model in the mock catalogue, so what this proves is that the
     // key reaches the picker at all rather than falling through to the composer.
     s.ctrl("f");
@@ -632,6 +827,10 @@ fn command(name: &str) -> String {
     format!(r#"{{"type":"command","name":"{name}"}}"#)
 }
 
+fn command_with(name: &str, arg: &str) -> String {
+    format!(r#"{{"type":"command","name":"{name}","args":["{arg}"]}}"#)
+}
+
 #[test]
 fn a_plugin_that_did_not_declare_vcs_write_is_refused() {
     if !have_git() {
@@ -746,6 +945,141 @@ export async function activate({ neosh }: PluginContext) {
   neosh.notify("lab ready");
 }
 "#;
+
+/// A driver with a full ladder in it: three rungs, plus one superseded model.
+const LADDER: &str = r#"
+import type { PluginContext } from "@neosh/api";
+
+const model = (id: string, name: string, tier: string, legacy: boolean) => ({
+  id,
+  display_name: name,
+  family: "rung",
+  tier,
+  legacy,
+  tagline: `the ${tier} one`,
+  capabilities: {
+    tools: false, vision: false, streaming: true, thinking: false, prompt_caching: false,
+    option_descriptors: [],
+  },
+});
+
+export async function activate({ neosh }: PluginContext) {
+  await neosh.provider.register("ladder", [{
+    id: "lab",
+    driver: "ladder",
+    display_name: "Lab",
+    models: [
+      model("big", "Big", "frontier", false),
+      model("mid", "Mid", "balanced", false),
+      model("small", "Small", "fast", false),
+      model("old", "Old", "balanced", true),
+    ],
+  }], async (_req, emit) => {
+    emit({ type: "message_start", model: "mid", usage: {} });
+    emit({ type: "message_stop" });
+  });
+
+  await neosh.cmd.register("lab.report", async () => {
+    const sel = await neosh.agent.selection();
+    neosh.notify(`selection: ${sel?.instance}/${sel?.model}`);
+  });
+  neosh.notify("ladder ready");
+}
+"#;
+
+fn install_ladder(sb: &Sandbox) {
+    let dir = sb.root.join("config/plugins/lab");
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    std::fs::write(
+        dir.join("plugin.toml"),
+        "name = \"lab\"\nversion = \"0.1.0\"\nentry = \"main.ts\"\npermissions = [\"providers\"]\n",
+    )
+    .expect("write manifest");
+    std::fs::write(dir.join("main.ts"), LADDER).expect("write plugin");
+}
+
+#[test]
+fn one_step_down_is_a_rung_not_a_list() {
+    // The whole reason models carry a tier. "Give me something cheaper" should be a keystroke, and
+    // it should stay on the provider you are already paying for.
+    let sb = Sandbox::new("ladder");
+    install_ladder(&sb);
+    sb.write_config("[options]\n\"agent.model\" = \"lab/big\"\n");
+    let mut s = sb.start_letting_config_choose();
+    s.wait_for("ladder ready");
+
+    s.send(&command("model.downgrade"));
+    s.wait_for("model: lab/Mid");
+    s.send(&command("model.downgrade"));
+    s.wait_for("model: lab/Small");
+
+    // No wrapping. A downgrade that teleports you to the most expensive thing in the catalogue is
+    // a keystroke you learn not to press.
+    s.send(&command("model.downgrade"));
+    s.wait_for("already the quickest one here");
+    s.send(&command("lab.report"));
+    s.wait_for("selection: lab/small");
+
+    s.send(&command("model.upgrade"));
+    s.wait_for("model: lab/Mid");
+}
+
+#[test]
+fn a_line_resolves_to_the_one_that_has_not_been_superseded() {
+    // "Use Opus" is a statement about a product line, not about a pinned id that goes stale. The
+    // superseded entry sits on the same rung as the current one, so picking wrongly is possible
+    // and would be silent.
+    let sb = Sandbox::new("line");
+    install_ladder(&sb);
+    sb.write_config("[options]\n\"agent.model\" = \"lab/small\"\n");
+    let mut s = sb.start_letting_config_choose();
+    s.wait_for("ladder ready");
+
+    s.send(&command_with("model.line", "rung"));
+    s.wait_for("model: lab/Big");
+    s.send(&command_with("model.line", "nonesuch"));
+    s.wait_for(r#"nothing reachable is in the "nonesuch" line"#);
+}
+
+#[test]
+fn superseded_models_are_folded_behind_a_count() {
+    // Reachable and out of the way. You go looking for last year's model to reproduce something,
+    // which is exactly when hiding it outright would be worst.
+    let sb = Sandbox::new("legacy");
+    install_ladder(&sb);
+    sb.write_config("[options]\n\"agent.model\" = \"lab/big\"\n");
+    let mut s = sb.start_letting_config_choose();
+    s.wait_for("ladder ready");
+
+    s.ctrl("p");
+    s.wait_for("Model");
+    let rows = s.picker_now();
+    assert!(rows.iter().any(|l| l.contains("Big")), "the current models are listed\n{rows:?}");
+    assert!(
+        rows.iter().any(|l| l.contains("1 superseded")),
+        "and the old one is behind a count\n{rows:?}"
+    );
+    assert!(
+        !rows.iter().any(|l| l.contains("Old")),
+        "which means it is not in the way\n{rows:?}"
+    );
+}
+
+#[test]
+fn the_rail_says_what_a_provider_costs_before_you_pick_from_it() {
+    // A plan you already pay for and a key billed per token are different decisions. The old flat
+    // list could not say which a row was, which is why "it says I have no API key" was reasonable.
+    let sb = Sandbox::new("accounts");
+    sb.write_config(NEEDS_A_KEY);
+    let mut s = sb.start();
+    s.wait_for("PROJECTS");
+    s.ctrl("p");
+    s.wait_for("Model");
+    let rows = s.picker_now();
+    assert!(rows.iter().any(|l| l.contains("API KEYS")), "grouped by account\n{rows:?}");
+    assert!(rows.iter().any(|l| l.contains("LOCAL")), "grouped by account\n{rows:?}");
+    assert!(rows.iter().any(|l| l.contains("Acme")), "the configured instance is on the rail\n{rows:?}");
+}
 
 #[test]
 fn a_driver_can_invent_an_option_and_the_switcher_renders_it() {
@@ -933,11 +1267,94 @@ impl Session {
     }
 
     /// The sidebar buffer's current contents, folded the way a frontend folds splices.
+    /// The lines of the model picker, whatever pane they belong to.
+    fn picker_now(&self) -> Vec<String> {
+        self.picker_named("[Model]")
+    }
+
+    /// The newest buffer with a name, for widgets that open one per use.
+    ///
+    /// A prompt asks two questions by opening two buffers both called `[prompt]`, so matching the
+    /// first one means reading the answer to a question that has already been answered.
+    fn latest_named(&self, name: &str) -> Option<u64> {
+        self.events.iter().rev().find_map(|e| {
+            (e["type"] == "buffer_opened" && e["name"] == name).then(|| e["buf"].as_u64())?
+        })
+    }
+
+    fn prompt_now(&self) -> Vec<String> {
+        match self.latest_named("[prompt]") {
+            Some(b) => self.lines_of(b),
+            None => Vec::new(),
+        }
+    }
+
+    /// The contents of a picker window, by the title it was opened with.
+    fn picker_named(&self, name: &str) -> Vec<String> {
+        match self.buffer_named(name) {
+            Some(buf) => self.lines_of(buf),
+            None => Vec::new(),
+        }
+    }
+
+    /// The highlight groups on each row of the transcript.
+    fn chat_groups(&self) -> Vec<Vec<String>> {
+        let name = self.events.iter().find_map(|e| {
+            let n = e["name"].as_str()?;
+            (e["type"] == "buffer_opened" && n.starts_with("[chat]")).then(|| n.to_string())
+        });
+        match name.and_then(|n| self.buffer_named(&n)) {
+            Some(b) => self.groups_of(b),
+            None => Vec::new(),
+        }
+    }
+
     fn sidebar_now(&self) -> Vec<String> {
-        let buf = match self.buffer_named("[sidebar]") {
-            Some(b) => b,
-            None => return Vec::new(),
-        };
+        match self.buffer_named("[sidebar]") {
+            Some(b) => self.lines_of(b),
+            None => Vec::new(),
+        }
+    }
+
+    /// Replay every edit to one buffer, so what comes back is what is on screen now rather than
+    /// everything that was ever drawn there.
+    /// The highlight groups on each row of a buffer, folded the same way its text is.
+    ///
+    /// Needed because a mark is not text: inserting a row above a marked one moves the mark with
+    /// it, and an off-by-one there is invisible in the transcript's contents and glaring on screen.
+    fn groups_of(&self, buf: u64) -> Vec<Vec<String>> {
+        let mut rows: Vec<Vec<String>> = Vec::new();
+        for e in &self.events {
+            if e["type"] != "buffer_lines" || e["buf"].as_u64() != Some(buf) {
+                continue;
+            }
+            let start = e["start"].as_i64().unwrap_or(0);
+            let old_end = e["old_end"].as_i64().unwrap_or(start);
+            let new: Vec<Vec<String>> = e["lines"]
+                .as_array()
+                .map(|a| {
+                    a.iter()
+                        .map(|l| {
+                            l["marks"]
+                                .as_array()
+                                .map(|ms| {
+                                    ms.iter()
+                                        .filter_map(|m| m["hl_group"].as_str().map(str::to_string))
+                                        .collect()
+                                })
+                                .unwrap_or_default()
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            let s = start.clamp(0, rows.len() as i64) as usize;
+            let en = if old_end < 0 { rows.len() } else { (old_end as usize).clamp(s, rows.len()) };
+            rows.splice(s..en, new);
+        }
+        rows
+    }
+
+    fn lines_of(&self, buf: u64) -> Vec<String> {
         let mut lines: Vec<String> = Vec::new();
         for e in &self.events {
             if e["type"] != "buffer_lines" || e["buf"].as_u64() != Some(buf) {
@@ -1310,7 +1727,7 @@ fn the_key_hints_follow_what_the_cursor_is_on() {
 
     s.enter_panel();
     assert!(
-        s.pump(|s| s.sidebar_now().iter().any(|l| l.contains("x close"))),
+        s.pump(|s| s.sidebar_now().iter().any(|l| l.contains("x archive"))),
         "on a conversation, it offers the conversation verbs\n{:?}",
         s.sidebar_now()
     );
@@ -1387,9 +1804,81 @@ impl Session {
 }
 
 #[test]
+fn archiving_takes_a_conversation_out_of_the_list_and_u_brings_it_back() {
+    // The everyday verb. It asks nothing, because there is nothing to lose — which is the whole
+    // reason it exists beside the one that does ask.
+    let sb = Sandbox::new("archive");
+    let mut s = sb.start();
+    s.wait_for("PROJECTS");
+
+    for c in ["k", "e", "e", "p"] {
+        s.key(c);
+    }
+    s.enter();
+    s.wait_for("keep");
+    s.ctrl("n"); // a second conversation, so the first is not the only one left
+
+    s.enter_panel();
+    assert!(s.pump(|s| s.sidebar_now().iter().any(|l| l.contains("keep"))));
+    s.down();
+    assert!(
+        s.pump(|s| s.sidebar_now().iter().any(|l| l.contains("x archive"))),
+        "the cursor is on a conversation\n{:?}",
+        s.sidebar_now()
+    );
+    let panel_only = s.open_windows().len();
+    s.key("x");
+    assert!(
+        s.pump(|s| s.sidebar_now().iter().any(|l| l.contains("ARCHIVED"))),
+        "an archived section appeared\n{:?}",
+        s.sidebar_now()
+    );
+    assert_eq!(s.open_windows().len(), panel_only, "and nothing asked");
+
+    assert!(
+        s.pump(|s| !s.sidebar_now().iter().any(|l| l.contains("keep"))),
+        "and it left the everyday list\n{:?}",
+        s.sidebar_now()
+    );
+
+    // Down to the archive heading. Where the cursor landed when the row under it was archived is
+    // not something this test should assert, so it steps until the hints say it has arrived — the
+    // hints being contextual is exactly what makes that legible.
+    let on_heading =
+        |s: &Session| s.sidebar_now().iter().any(|l| l.contains("show what is put away"));
+    let mut found = on_heading(&s);
+    for _ in 0..6 {
+        if found {
+            break;
+        }
+        // Stepping first and waiting after: waiting on a predicate that is not yet true costs the
+        // whole budget, and a test that spends thirty seconds arriving is a test people delete.
+        s.key("j");
+        found = s.pump(on_heading);
+    }
+    assert!(found, "never reached the archive heading\n{:?}", s.sidebar_now());
+    s.enter();
+    assert!(
+        s.pump(|s| s.sidebar_now().iter().any(|l| l.contains("keep"))),
+        "unfolding the archive shows what is in it\n{:?}",
+        s.sidebar_now()
+    );
+
+    // And `u` on it puts it back where it was.
+    s.key("j");
+    assert!(s.pump(|s| s.sidebar_now().iter().any(|l| l.contains("u unarchive"))));
+    s.key("u");
+    assert!(
+        s.pump(|s| !s.sidebar_now().iter().any(|l| l.contains("ARCHIVED"))),
+        "the section goes away with the last thing in it\n{:?}",
+        s.sidebar_now()
+    );
+}
+
+#[test]
 fn deleting_a_conversation_with_something_in_it_asks_first() {
-    // Closing removes the file from disk. There is no undo, so this is the one verb in the panel
-    // that stops and asks.
+    // Deleting removes the file from disk. There is no undo, so this is the one verb in the panel
+    // that stops and asks — and it is shifted, so it is not the one your fingers reach for.
     let sb = Sandbox::new("confirmdel");
     let mut s = sb.start();
     s.wait_for("PROJECTS");
@@ -1399,18 +1888,18 @@ fn deleting_a_conversation_with_something_in_it_asks_first() {
     }
     s.enter();
     s.wait_for("keep");
-    s.ctrl("n"); // a second conversation, so closing the first is even allowed
+    s.ctrl("n"); // a second conversation, so deleting the first is even allowed
 
     s.enter_panel();
     assert!(s.pump(|s| s.sidebar_now().iter().any(|l| l.contains("keep"))));
     s.down();
     assert!(
-        s.pump(|s| s.sidebar_now().iter().any(|l| l.contains("x close"))),
+        s.pump(|s| s.sidebar_now().iter().any(|l| l.contains("X delete"))),
         "the cursor is on a conversation\n{:?}",
         s.sidebar_now()
     );
     let panel_only = s.open_windows().len();
-    s.key("x");
+    s.key("X");
     assert!(s.pump(|s| s.open_windows().len() > panel_only), "the dialog opened");
 
     // The cursor starts on the answer that changes nothing: `<CR>` is reflex by the second time you
@@ -1424,7 +1913,7 @@ fn deleting_a_conversation_with_something_in_it_asks_first() {
     );
 
     // And saying yes really does delete it, so the dialog is a question rather than a speed bump.
-    s.key("x");
+    s.key("X");
     assert!(s.pump(|s| s.open_windows().len() > panel_only), "asked a second time");
     s.special("up");
     s.enter();
@@ -1436,7 +1925,7 @@ fn deleting_a_conversation_with_something_in_it_asks_first() {
 }
 
 #[test]
-fn an_empty_conversation_is_closed_without_being_asked_about() {
+fn an_empty_conversation_is_deleted_without_being_asked_about() {
     // A dialog for something with nothing to lose is friction that teaches you to dismiss dialogs.
     let sb = Sandbox::new("nodialog");
     let mut s = sb.start();
@@ -1447,7 +1936,7 @@ fn an_empty_conversation_is_closed_without_being_asked_about() {
     }));
 
     s.enter_panel();
-    s.key("x");
+    s.key("X");
     assert!(
         s.pump(|s| {
             s.sidebar_now().iter().filter(|l| l.contains("New conversation")).count() == 1
@@ -1455,7 +1944,7 @@ fn an_empty_conversation_is_closed_without_being_asked_about() {
         "gone, with nothing asked\n{:?}",
         s.sidebar_now()
     );
-    assert!(!s.saw("Delete"), "and no dialog appeared\n{}", s.transcript());
+    assert!(!s.saw("Delete \""), "and no dialog appeared\n{}", s.transcript());
 }
 
 #[test]
@@ -1475,8 +1964,8 @@ fn confirmation_can_be_switched_off() {
     s.enter_panel();
     assert!(s.pump(|s| s.sidebar_now().iter().any(|l| l.contains("gone"))));
     s.down();
-    assert!(s.pump(|s| s.sidebar_now().iter().any(|l| l.contains("x close"))));
-    s.key("x");
+    assert!(s.pump(|s| s.sidebar_now().iter().any(|l| l.contains("X delete"))));
+    s.key("X");
     assert!(
         s.pump(|s| !s.sidebar_now().iter().any(|l| l.contains("gone"))),
         "deleted without asking\n{:?}",
@@ -1493,7 +1982,7 @@ fn the_caret_follows_what_you_type_into_a_picker() {
     s.wait_for("PROJECTS");
 
     s.ctrl("p");
-    s.wait_for("Mock  mock");
+    s.wait_for("Model");
     let win = s.window_showing("[Model]").expect("the picker window");
     for c in ["m", "o"] {
         s.key(c);
@@ -1853,4 +2342,971 @@ fn an_untracked_file_says_so_rather_than_showing_an_empty_diff() {
     s.wait_for("Changed files");
     s.enter();
     s.wait_for("is untracked");
+}
+
+// ---------------------------------------------------------------------------
+// Entering an API key
+// ---------------------------------------------------------------------------
+
+/// The literal a test types in. Distinctive so a search for it means something.
+const FAKE_KEY: &str = "sk-neosh-test-DO-NOT-LOG-8f3a";
+
+/// A configured instance that wants a key.
+///
+/// The mock provider needs none, which is exactly right for every other test here and no use at
+/// all for this one. The variable is never set, so this instance starts out with nothing.
+const NEEDS_A_KEY: &str = r#"
+[[providers]]
+id = "acme"
+driver = "openai-compat"
+display_name = "Acme"
+base_url = "https://acme.invalid/v1"
+auth = { kind = "env", var = "NEOSH_TEST_ACME_KEY_NEVER_SET" }
+"#;
+
+#[test]
+fn a_key_typed_in_never_reaches_the_frontend() {
+    // The load-bearing test for the whole credential path. The host reads these keystrokes itself
+    // precisely so the value never enters a buffer — because a buffer is drawn, and drawing it
+    // would put the key in a `UiEvent`, across a process boundary, into whatever the frontend logs.
+    let sb = Sandbox::new("secretwire");
+    sb.write_config(NEEDS_A_KEY);
+    let mut s = sb.start();
+    s.wait_for("PROJECTS");
+
+    s.send(&command_with("provider.key", "acme"));
+    s.wait_for("Paste or type the key");
+
+    for c in FAKE_KEY.chars() {
+        s.key(&c.to_string());
+    }
+    assert!(
+        s.pump(|s| s.saw("\u{2022}\u{2022}\u{2022}")),
+        "the field shows bullets, so a paste that did not arrive is visible\n{}",
+        s.transcript()
+    );
+    s.enter();
+    // Something happened — either it was stored, or the keychain was unavailable and it is held for
+    // the run. Both are fine here; what is not fine is the value being anywhere in the JSON.
+    assert!(s.pump(|s| s.saw("key saved") || s.saw("kept for this run")), "{}", s.transcript());
+
+    assert!(
+        !s.wire().contains(FAKE_KEY),
+        "the key reached the frontend, which is the one thing this design exists to prevent"
+    );
+    assert!(!s.wire().contains("sk-neosh-test"), "not even a prefix of it");
+}
+
+#[test]
+fn the_key_prompt_gives_the_composer_back_with_the_draft_still_in_it() {
+    // It borrows the composer. Borrowing is only acceptable if it gives it back — losing an unsent
+    // question because you stopped to paste a key would be its own reason never to stop.
+    let sb = Sandbox::new("secretdraft");
+    sb.write_config(NEEDS_A_KEY);
+    let mut s = sb.start();
+    s.wait_for("PROJECTS");
+
+    for c in ["h", "a", "l", "f"] {
+        s.key(c);
+    }
+    assert!(s.pump(|s| s.saw("half")), "{}", s.transcript());
+
+    s.send(&command_with("provider.key", "acme"));
+    s.wait_for("Paste or type the key");
+    for c in ["a", "b", "c"] {
+        s.key(c);
+    }
+    s.send(r#"{"type":"key","key":{"code":{"kind":"esc"},"mods":{}}}"#);
+
+    assert!(
+        s.pump(|s| s.texts().iter().rev().take(4).any(|l| l == "half")),
+        "the draft came back\n{}",
+        s.transcript()
+    );
+    assert!(!s.wire().contains("abc"), "and what was typed into the prompt went nowhere");
+}
+
+#[test]
+fn while_a_key_is_being_typed_no_binding_fires() {
+    // Every base64 key contains an `n`, and `<C-n>` is a new conversation. Routing these keys
+    // through the keymaps would mean pasting a key sometimes started a conversation halfway
+    // through — which is also how half a key ends up stored.
+    let sb = Sandbox::new("secretkeys");
+    sb.write_config(NEEDS_A_KEY);
+    let mut s = sb.start();
+    s.wait_for("PROJECTS");
+    let before = s.sidebar_now().iter().filter(|l| l.contains("New conversation")).count();
+
+    s.send(&command_with("provider.key", "acme"));
+    s.wait_for("Paste or type the key");
+    s.ctrl("n");
+    s.ctrl("t");
+    s.key("n");
+    assert!(s.pump(|s| s.saw("\u{2022}")), "the `n` went into the key\n{}", s.transcript());
+
+    s.send(r#"{"type":"key","key":{"code":{"kind":"esc"},"mods":{}}}"#);
+    s.drain_for(Duration::from_millis(200));
+    assert_eq!(
+        s.sidebar_now().iter().filter(|l| l.contains("New conversation")).count(),
+        before,
+        "no conversation was created\n{:?}",
+        s.sidebar_now()
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The transcript
+// ---------------------------------------------------------------------------
+
+/// A driver that starts a turn and never finishes it, so the working line is reliably on screen.
+const STALLS: &str = r#"
+import type { PluginContext } from "@neosh/api";
+
+export async function activate({ neosh }: PluginContext) {
+  await neosh.provider.register("stall", [{
+    id: "stall", driver: "stall", display_name: "Stall",
+    models: [{ id: "stall", display_name: "Stall" }],
+  }], async (_req, emit) => {
+    emit({ type: "message_start", model: "stall", usage: {} });
+    // Nothing else, ever. The turn stays in flight.
+  });
+  neosh.notify("stall ready");
+}
+"#;
+
+fn install_stall(sb: &Sandbox) {
+    let dir = sb.root.join("config/plugins/stall");
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    std::fs::write(
+        dir.join("plugin.toml"),
+        "name = \"stall\"\nversion = \"0.1.0\"\nentry = \"main.ts\"\npermissions = [\"providers\"]\n",
+    )
+    .expect("manifest");
+    std::fs::write(dir.join("main.ts"), STALLS).expect("plugin");
+}
+
+#[test]
+fn a_question_is_framed_so_you_can_find_where_a_turn_began() {
+    // A bar down the left rather than a `>` prefix: the frontend wraps long lines, a prefix
+    // survives only on the first of them, and what you scan for when scrolling back is exactly
+    // where the turns start.
+    let sb = Sandbox::new("framing");
+    let mut s = sb.start();
+    s.wait_for("PROJECTS");
+    for c in ["h", "i"] {
+        s.key(c);
+    }
+    s.enter();
+    assert!(
+        s.pump(|s| s.chat_now().iter().any(|l| l == "\u{258c} hi")),
+        "the question is framed\n{:?}",
+        s.chat_now()
+    );
+}
+
+#[test]
+fn a_tool_call_says_what_it_is_about_not_only_its_name() {
+    // `read_file` tells you nothing you did not already know. `read_file  .env` is the line you
+    // actually wanted, and it costs one lookup in the input the tool was given.
+    let sb = Sandbox::new("toolrow");
+    let mut s = sb.start();
+    s.wait_for("PROJECTS");
+    s.key("h");
+    s.enter();
+    assert!(
+        s.pump(|s| s.chat_now().iter().any(|l| l.contains("read_file") && l.contains(".env"))),
+        "the subject is beside the name\n{:?}",
+        s.chat_now()
+    );
+}
+
+#[test]
+fn a_turn_in_flight_says_so_and_says_for_how_long() {
+    // The gap between pressing Enter and the first token is the longest silence in the program,
+    // and a still screen and a wedged process look identical. The clock is the difference.
+    let sb = Sandbox::new("working");
+    install_stall(&sb);
+    sb.write_config("[options]\n\"agent.model\" = \"stall/stall\"\n");
+    let mut s = sb.start_letting_config_choose();
+    s.wait_for("stall ready");
+
+    for c in ["h", "a", "n", "g"] {
+        s.key(c);
+    }
+    s.enter();
+    assert!(
+        s.pump(|s| s.chat_now().iter().any(|l| l.contains('\u{2026}') && l.contains("esc to interrupt"))),
+        "the working line is up\n{:?}",
+        s.chat_now()
+    );
+    // And it is the last line: it says what is happening *now*, so anything already reported
+    // belongs above it.
+    let rows = s.chat_now();
+    let last = rows.iter().rposition(|l| !l.trim().is_empty()).unwrap_or(0);
+    assert!(rows[last].contains("esc to interrupt"), "pinned to the bottom\n{rows:?}");
+}
+
+#[test]
+fn the_working_line_is_gone_the_moment_there_is_an_answer() {
+    // Leaving it above the reply would say a turn is in flight while you are reading its result.
+    let sb = Sandbox::new("workingends");
+    let mut s = sb.start();
+    s.wait_for("PROJECTS");
+    s.key("h");
+    s.enter();
+    s.wait_for("All done.");
+    s.drain_for(Duration::from_millis(300));
+    assert!(
+        !s.chat_now().iter().any(|l| l.contains("esc to interrupt")),
+        "no working line survives the turn\n{:?}",
+        s.chat_now()
+    );
+}
+
+
+// ---------------------------------------------------------------------------
+// The composer: what it says, and what the keys under it do
+// ---------------------------------------------------------------------------
+
+impl Session {
+    /// Everything drawn *around* the composer that is not in the composer: the prompt, the
+    /// placeholder, the rule, the shortcut row. All of it is virtual text, so none of it can be
+    /// read back out of the buffer — which is the point, since the buffer's contents get sent.
+    fn composer_chrome(&self) -> Vec<String> {
+        let buf = self
+            .events
+            .iter()
+            .find_map(|e| {
+                (e["type"] == "buffer_opened" && e["name"] == "[composer]")
+                    .then(|| e["buf"].as_u64())?
+            })
+            .unwrap_or(u64::MAX);
+        let mut latest: Vec<String> = Vec::new();
+        for e in &self.events {
+            if e["type"] != "buffer_lines" || e["buf"].as_u64() != Some(buf) {
+                continue;
+            }
+            let mut found = Vec::new();
+            for line in e["lines"].as_array().into_iter().flatten() {
+                for m in line["marks"].as_array().into_iter().flatten() {
+                    let text: String = m["virt_text"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .filter_map(|c| c["text"].as_str())
+                        .collect();
+                    if !text.trim().is_empty() {
+                        found.push(text);
+                    }
+                }
+            }
+            if !found.is_empty() {
+                latest = found;
+            }
+        }
+        latest
+    }
+}
+
+#[test]
+fn the_shortcut_row_is_off_because_the_sidebar_already_says_all_of_it() {
+    // It read as a good idea and was not. `^T`, `^N` and `^K` are in the sidebar's own footer two
+    // rows below, `F1` is on the row it points at, and what the duplication actually bought was
+    // one fewer line of transcript and a composer pressed against the status strip.
+    let sb = Sandbox::new("nohints");
+    let mut s = sb.start();
+    s.wait_for("PROJECTS");
+    assert!(
+        s.pump(|s| s.sidebar_now().iter().any(|l| l.contains("^K palette"))),
+        "the sidebar carries the keys\n{:?}",
+        s.sidebar_now()
+    );
+    assert!(
+        !s.composer_chrome().join(" ").contains("palette"),
+        "and the composer does not say them again\n{:?}",
+        s.composer_chrome()
+    );
+}
+
+#[test]
+fn the_shortcut_row_comes_back_if_you_ask_for_it() {
+    let sb = Sandbox::new("hints");
+    sb.write_config("[options]\n\"ui.hints\" = true\n");
+    let mut s = sb.start_letting_config_choose();
+    // Waiting on a plugin's entry, not the host's: the host seeds `⏎ send` before any plugin has
+    // loaded, so asserting on that alone would pass before the row was finished.
+    assert!(
+        s.pump(|s| s.composer_chrome().iter().any(|t| t.contains("F1 keys"))),
+        "the way to the keys that did not fit\n{:?}",
+        s.composer_chrome()
+    );
+    let chrome = s.composer_chrome().join(" ");
+    assert!(chrome.contains("send"), "and the one key everybody needs: {chrome}");
+}
+
+/// A provider whose model says how big its window is, and which reports having filled a third of
+/// it. Enough for the meter to be a real number rather than a shape.
+const WIDE: &str = r#"
+import type { PluginContext } from "@neosh/api";
+
+export async function activate({ neosh }: PluginContext) {
+  await neosh.provider.register("wide", [{
+    id: "wide", driver: "wide", display_name: "Wide",
+    models: [{ id: "wide-1", display_name: "Wide One", context_window: 300000 }],
+  }], async (_req, emit) => {
+    emit({ type: "message_start", model: "wide-1", usage: { input_tokens: 100000 } });
+    emit({ type: "text_delta", index: 0, text: "ok" });
+    emit({
+      type: "message_delta",
+      stop_reason: { kind: "end_turn" },
+      usage: { input_tokens: 100000, output_tokens: 20 },
+    });
+    emit({ type: "message_stop" });
+  });
+  neosh.notify("wide ready");
+}
+"#;
+
+fn install_wide(sb: &Sandbox) {
+    let dir = sb.root.join("config/plugins/wide");
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    std::fs::write(
+        dir.join("plugin.toml"),
+        "name = \"wide\"\nversion = \"0.1.0\"\nentry = \"main.ts\"\npermissions = [\"providers\"]\n",
+    )
+    .expect("manifest");
+    std::fs::write(dir.join("main.ts"), WIDE).expect("plugin");
+}
+
+/// How full the window is, drawn as a bar and said as a percentage — and drawn *before* anything
+/// has been spent.
+///
+/// It used to appear only once a turn had gone through, so the one moment you could not see how
+/// much room a model has was before deciding what to do with it. A 200k window and a 1M window are
+/// different tools and the difference matters most at the start.
+#[test]
+fn the_context_meter_is_there_before_the_first_turn() {
+    let sb = Sandbox::new("ctxmeter");
+    install_wide(&sb);
+    sb.write_config("[options]\n\"agent.model\" = \"wide/wide-1\"\n");
+    let mut s = sb.start_letting_config_choose();
+    s.wait_for("wide ready");
+
+    assert!(
+        s.pump(|s| s.status_now().iter().any(|l| l.contains("of 300k"))),
+        "the window is on the strip before a single token has been spent\n{:?}",
+        s.status_now()
+    );
+    assert!(
+        s.status_now().iter().any(|l| l.contains("0% of 300k")),
+        "and it reads empty rather than being absent\n{:?}",
+        s.status_now()
+    );
+    assert!(
+        s.status_now().iter().any(|l| l.contains('\u{2591}')),
+        "as a bar, not only as a number\n{:?}",
+        s.status_now()
+    );
+
+    s.type_text("go");
+    s.enter();
+    assert!(
+        s.pump(|s| s.status_now().iter().any(|l| l.contains("33% of 300k"))),
+        "and it fills\n{:?}",
+        s.status_now()
+    );
+    assert!(
+        s.status_now().iter().any(|l| l.contains('\u{2588}')),
+        "with filled cells\n{:?}",
+        s.status_now()
+    );
+}
+
+/// One gauge, not two. The sidebar drew a context meter and so did the usage plugin; for as long
+/// as no model in the catalogue reported a window, only one of them ever appeared. The moment one
+/// did, the footer had two bars in it that disagreed about what "used" meant.
+#[test]
+fn there_is_exactly_one_context_meter() {
+    let sb = Sandbox::new("onemeter");
+    install_wide(&sb);
+    sb.write_config("[options]\n\"agent.model\" = \"wide/wide-1\"\n");
+    let mut s = sb.start_letting_config_choose();
+    s.wait_for("wide ready");
+    s.type_text("go");
+    s.enter();
+    assert!(s.pump(|s| s.status_now().iter().any(|l| l.contains("33% of 300k"))));
+
+    let line = s.status_now().join(" ");
+    let bars = line.match_indices('\u{2588}').count();
+    assert!(bars > 0 && bars <= 8, "one bar of at most eight cells, not two: {line:?}");
+}
+
+/// A strip too narrow for everything drops whole segments, least important first, rather than
+/// writing the right half over the end of the left one.
+#[test]
+fn a_narrow_status_strip_drops_segments_rather_than_overlapping_them() {
+    let sb = Sandbox::new("narrowstatus");
+    install_wide(&sb);
+    sb.write_config("[options]\n\"agent.model\" = \"wide/wide-1\"\n");
+    let mut s = sb.start_letting_config_choose();
+    s.wait_for("wide ready");
+    assert!(s.pump(|s| s.status_now().iter().any(|l| l.contains("of 300k"))));
+
+    s.viewport("[status]", 40, 1);
+    assert!(
+        s.pump(|s| {
+            let line = s.status_now().join("");
+            !line.contains("of 300k") && line.contains("chat")
+        }),
+        "the meter went and the mode stayed\n{:?}",
+        s.status_now()
+    );
+    let line = s.status_now().join("");
+    assert!(
+        line.chars().count() <= 41,
+        "and the line still fits the window: {} chars of 40\n{line:?}",
+        line.chars().count()
+    );
+}
+
+#[test]
+fn a_key_shown_beside_what_it_changes_is_not_repeated_on_the_shortcut_row() {
+    // The rule the footer exists for. Saying it twice costs a row and teaches nothing the first
+    // place did not — and the first place is better, because the thing being changed is right
+    // there being read.
+    let sb = Sandbox::new("nodupekeys");
+    let mut s = sb.start();
+    assert!(
+        s.pump(|s| s.status_now().iter().any(|l| l.contains("^P"))),
+        "the model carries its key\n{:?}",
+        s.status_now()
+    );
+    assert!(
+        !s.composer_chrome().join(" ").contains("^P"),
+        "and the shortcut row does not say it again\n{:?}",
+        s.composer_chrome()
+    );
+}
+
+#[test]
+fn an_empty_composer_says_what_to_do_with_it() {
+    let sb = Sandbox::new("placeholder");
+    let mut s = sb.start();
+    assert!(
+        s.pump(|s| s.composer_chrome().iter().any(|t| t.contains("Ask anything"))),
+        "a prompt for the one field there is\n{:?}",
+        s.composer_chrome()
+    );
+    // And it goes away once there is something to send, or it would look like part of the message.
+    s.type_text("hi");
+    assert!(
+        s.pump(|s| !s.composer_chrome().iter().any(|t| t.contains("Ask anything"))),
+        "the placeholder steps aside\n{:?}",
+        s.composer_chrome()
+    );
+}
+
+#[test]
+fn the_welcome_says_which_account_answers() {
+    // The whole complaint the account split exists to answer: a fresh screen that says "no API
+    // key" tells you nothing about the plan you are actually on. This says which it is, before you
+    // have typed anything.
+    let sb = Sandbox::new("welcome");
+    let mut s = sb.start();
+    assert!(
+        s.pump(|s| s.chat_now().iter().any(|l| l.contains("model      mock/mock"))),
+        "the welcome names the model\n{:?}",
+        s.chat_now()
+    );
+}
+
+#[test]
+fn the_welcome_does_not_land_on_top_of_a_conversation() {
+    // Regression: the greeting was appended at startup unconditionally, so restoring a session
+    // printed "type a message and press Enter" *underneath* the last thing that was said.
+    let sb = Sandbox::new("welcomeconv");
+    let mut s = sb.start();
+    s.pump(|s| s.chat_now().iter().any(|l| l.contains("neosh")));
+    s.type_text("a question");
+    s.enter();
+    assert!(s.pump(|s| s.chat_now().iter().any(|l| l.contains("a question"))), "it was asked");
+    // It may stay at the top — that is where a header belongs. What it must never do is appear
+    // *below* the exchange, which is what happened when it was appended at startup regardless of
+    // what had already been restored into the buffer.
+    let chat = s.chat_now();
+    let welcome = chat.iter().position(|l| l.contains("agent workspace"));
+    let question = chat.iter().position(|l| l.contains("a question")).expect("the question is there");
+    if let Some(w) = welcome {
+        assert!(w < question, "the welcome stays above the conversation\n{chat:?}");
+    }
+}
+
+
+// ---------------------------------------------------------------------------
+// A model that has stopped working
+// ---------------------------------------------------------------------------
+
+impl Sandbox {
+    /// Put a conversation on disk that remembers a model needing an API key nobody has.
+    ///
+    /// Written as a file rather than produced by driving the UI, because the situation being tested
+    /// is specifically "this was chosen a long time ago, on a machine that had the key".
+    fn remember_a_conversation_using(&self, instance: &str, model: &str) {
+        let dir = self.root.join("state/sessions");
+        std::fs::create_dir_all(&dir).expect("session dir");
+        let cwd = self.work().display().to_string();
+        std::fs::write(
+            dir.join("aaaaaaaa-1111-2222-3333-444444444444.json"),
+            format!(
+                r#"{{"id":"aaaaaaaa-1111-2222-3333-444444444444","cwd":"{cwd}",
+                    "created_at":1,"updated_at":2,"messages":[],
+                    "selection":{{"instance":"{instance}","model":"{model}","options":[]}},
+                    "archived":false}}"#
+            ),
+        )
+        .expect("write session");
+    }
+}
+
+#[test]
+fn a_remembered_model_that_cannot_authenticate_gives_way_to_one_that_can() {
+    // The complaint this exists for: a conversation started against an API-key provider, reopened
+    // on a machine with no key, greeting you with "no key" over a model you did not choose today.
+    // A stored selection is a record of what was used, not an instruction.
+    let sb = Sandbox::new("staleselection");
+    sb.remember_a_conversation_using("anthropic", "claude-opus-5");
+    let mut s = sb.start_letting_config_choose();
+    assert!(
+        s.pump(|s| s.texts().iter().any(|t| t.contains("instead"))),
+        "it said what it swapped and what for\n{}",
+        s.transcript()
+    );
+    assert!(
+        s.texts().iter().any(|t| t.contains("anthropic/claude-opus-5 cannot authenticate")),
+        "and named the one that stopped working\n{}",
+        s.transcript()
+    );
+}
+
+#[test]
+fn a_model_you_asked_for_is_not_swapped_out_from_under_you() {
+    // The other half of the rule. `agent.model` is somebody saying which model to use; answering
+    // that with a different one would be worse than the error they get when they send.
+    let sb = Sandbox::new("pinnedselection");
+    let dir = sb.root.join("config/plugins/locked");
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    std::fs::write(
+        dir.join("plugin.toml"),
+        "name = \"locked\"\nversion = \"0.1.0\"\nentry = \"main.ts\"\npermissions = [\"providers\"]\n",
+    )
+    .expect("write manifest");
+    std::fs::write(dir.join("main.ts"), WANTS_A_KEY).expect("write plugin");
+    sb.write_config("[options]\n\"agent.model\" = \"vault/sealed\"\n");
+
+    let mut s = sb.start_letting_config_choose();
+    s.wait_for("vault ready");
+    assert!(
+        s.pump(|s| s.chat_now().iter().any(|l| l.contains("vault/sealed"))),
+        "the welcome still names the model that was asked for\n{:?}",
+        s.chat_now()
+    );
+    // The welcome still warns that it cannot authenticate — that is the honest thing to say. What
+    // must not happen is a substitution, which is the "instead" this looks for.
+    assert!(
+        !s.texts().iter().any(|t| t.contains("instead")),
+        "the choice stood\n{}",
+        s.transcript()
+    );
+}
+
+/// A driver whose instance wants a key from a variable that is never set.
+///
+/// Registered by a plugin rather than written in `config.toml`, because the point is an instance
+/// that *resolves* — there is a driver behind it — and still cannot authenticate. A configured
+/// instance with no driver loaded fails a different way, one step earlier.
+const WANTS_A_KEY: &str = r#"
+import type { PluginContext } from "@neosh/api";
+
+export async function activate({ neosh }: PluginContext) {
+  await neosh.provider.register("vault", [{
+    id: "vault",
+    driver: "vault",
+    display_name: "Vault",
+    auth: { kind: "env", var: "NEOSH_TEST_VAULT_KEY_NEVER_SET" },
+    models: [{
+      id: "sealed",
+      display_name: "Sealed",
+      capabilities: {
+        tools: false, vision: false, streaming: true, thinking: false, prompt_caching: false,
+        option_descriptors: [],
+      },
+    }],
+  }], async (_req, emit) => {
+    emit({ type: "message_start", model: "sealed", usage: {} });
+    emit({ type: "message_stop" });
+  });
+  neosh.notify("vault ready");
+}
+"#;
+
+
+/// A two-pane picker with a slow provider between two quick ones.
+///
+/// The shape of the bug this reproduces: holding a movement key starts one lookup per row it passes
+/// through, and they finish in whatever order the network allows.
+const SLOW_RAIL: &str = r#"
+import type { PluginContext } from "@neosh/api";
+import { railPicker } from "@neosh/api/ui";
+
+const after = (neosh: any, ms: number) =>
+  new Promise<void>((done) => neosh.timer.after(ms, () => done()));
+
+export async function activate({ neosh }: PluginContext) {
+  await neosh.cmd.register("slow.pick", async () => {
+    await railPicker<string, string>(neosh, {
+      title: "Slow",
+      rail: [
+        { label: "First", value: "first" },
+        { label: "Dawdler", value: "dawdler" },
+        { label: "Last", value: "last" },
+      ],
+      async items(which) {
+        if (which === "dawdler") {
+          await after(neosh, 600);
+          return [];
+        }
+        return [{ label: `${which} arrived`, value: which }];
+      },
+    });
+  });
+  neosh.notify("slow ready");
+}
+"#;
+
+#[test]
+fn a_slow_provider_cannot_clobber_the_one_you_moved_on_to() {
+    let sb = Sandbox::new("railrace");
+    let dir = sb.root.join("config/plugins/slowrail");
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    std::fs::write(
+        dir.join("plugin.toml"),
+        "name = \"slowrail\"\nversion = \"0.1.0\"\nentry = \"main.ts\"\n",
+    )
+    .expect("write manifest");
+    std::fs::write(dir.join("main.ts"), SLOW_RAIL).expect("write plugin");
+
+    let mut s = sb.start();
+    s.wait_for("slow ready");
+    s.send(&command("slow.pick"));
+    s.wait_for("first arrived");
+
+    // Two moves in a row, without waiting: straight through the slow one and out the other side,
+    // which is what holding a movement key does.
+    s.special("left");
+    s.special("down");
+    s.special("down");
+    assert!(
+        s.pump(|s| s.picker_named("[Slow]").iter().any(|l| l.contains("last arrived"))),
+        "the provider you ended on decides what is listed\n{:?}",
+        s.picker_named("[Slow]")
+    );
+
+    // And it stays that way once the one you passed through finally replies. Pumping keeps events
+    // flowing while that happens, which is what gives the late answer its chance to land.
+    let until = Instant::now() + Duration::from_millis(1200);
+    while Instant::now() < until {
+        s.pump(|_| false);
+    }
+    assert!(
+        s.picker_named("[Slow]").iter().any(|l| l.contains("last arrived")),
+        "a late answer to a question you have moved on from is dropped\n{:?}",
+        s.picker_named("[Slow]")
+    );
+}
+
+
+// ---------------------------------------------------------------------------
+// Markdown in the transcript
+// ---------------------------------------------------------------------------
+
+fn markdown_fixture() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/markdown_turn.jsonl")
+}
+
+#[test]
+fn an_answer_is_rendered_as_markdown_while_it_streams() {
+    // The fixture arrives three characters at a time, so what this checks is the incremental path:
+    // headings, lists and fences all have to survive being cut in half by a token boundary.
+    let sb = Sandbox::new("mdstream");
+    let mut s = sb.spawn(&markdown_fixture(), Some("mock/mock"));
+    s.wait_for("PROJECTS");
+    s.type_text("tell me");
+    s.enter();
+    assert!(
+        s.pump(|s| s.chat_now().iter().any(|l| l == "That is all.")),
+        "the answer finished\n{:?}",
+        s.chat_now()
+    );
+
+    let chat = s.chat_now();
+    let has = |needle: &str| chat.iter().any(|l| l == needle);
+    assert!(has("What I found"), "the heading lost its hashes\n{chat:?}");
+    assert!(has("  \u{2022} the rule is drawn above the composer"), "bullets and bold\n{chat:?}");
+    assert!(has("  \u{2022} ui.hints turns the row off"), "inline code\n{chat:?}");
+    assert!(has("  \u{2022} links like the docs keep their words"), "link labels\n{chat:?}");
+    assert!(has("  rust"), "the fence says what language it is\n{chat:?}");
+    assert!(has("  fn main() {"), "and its contents are indented\n{chat:?}");
+    assert!(
+        has("      // ## not a heading"),
+        "nothing inside a fence is markup\n{chat:?}"
+    );
+    assert!(
+        !chat.iter().any(|l| l.contains("```") || l.contains("**")),
+        "no markers survive into the transcript\n{chat:?}"
+    );
+}
+
+#[test]
+fn a_rendered_answer_looks_the_same_after_switching_away_and_back() {
+    // Two renderers is how a reopened conversation stops looking like the one you were just in.
+    let sb = Sandbox::new("mdreplay");
+    let mut s = sb.spawn(&markdown_fixture(), Some("mock/mock"));
+    s.wait_for("PROJECTS");
+    s.type_text("tell me");
+    s.enter();
+    assert!(s.pump(|s| s.chat_now().iter().any(|l| l == "That is all.")), "the answer finished");
+    let live: Vec<String> = s.chat_now().into_iter().filter(|l| !l.trim().is_empty()).collect();
+
+    s.send(&command("session.new"));
+    assert!(s.pump(|s| !s.chat_now().iter().any(|l| l == "That is all.")), "somewhere else now");
+    // Closing the empty one lands back in the conversation it was opened from.
+    s.send(&command("session.close"));
+    assert!(
+        s.pump(|s| s.chat_now().iter().any(|l| l == "That is all.")),
+        "and back\n{:?}",
+        s.chat_now()
+    );
+    let replayed: Vec<String> = s.chat_now().into_iter().filter(|l| !l.trim().is_empty()).collect();
+    assert!(
+        replayed.ends_with(&live[live.len().saturating_sub(6)..]),
+        "the replay ends the way the live stream did\nlive: {live:?}\nback: {replayed:?}"
+    );
+}
+
+#[test]
+fn markdown_can_be_turned_off_for_when_you_want_what_was_actually_sent() {
+    let sb = Sandbox::new("mdoff");
+    sb.write_config("[options]\n\"chat.markdown\" = false\n");
+    let mut s = sb.spawn(&markdown_fixture(), Some("mock/mock"));
+    s.wait_for("PROJECTS");
+    s.type_text("tell me");
+    s.enter();
+    assert!(
+        s.pump(|s| s.chat_now().iter().any(|l| l.contains("## What I found"))),
+        "the hashes are still there\n{:?}",
+        s.chat_now()
+    );
+}
+
+
+// ---------------------------------------------------------------------------
+// Steering: saying something to a turn that is already running
+// ---------------------------------------------------------------------------
+
+#[test]
+fn typing_while_it_works_is_steering_rather_than_an_error() {
+    // It used to say "a turn is already running" and throw the sentence away. That is the one
+    // moment in the program where you know exactly what you want to say and cannot say it.
+    let sb = Sandbox::new("steer");
+    install_stall(&sb);
+    sb.write_config("[options]\n\"agent.model\" = \"stall/stall\"\n");
+    let mut s = sb.start_letting_config_choose();
+    s.wait_for("stall ready");
+
+    s.type_text("first");
+    s.enter();
+    assert!(s.pump(|s| s.chat_now().iter().any(|l| l.contains("first"))), "the turn started");
+
+    s.type_text("actually, do it differently");
+    s.enter();
+    assert!(
+        s.pump(|s| s.composer_chrome().iter().any(|t| t.contains("queued"))),
+        "it is held, and says so\n{:?}",
+        s.composer_chrome()
+    );
+    assert!(
+        s.composer_chrome().iter().any(|t| t.contains("do it differently")),
+        "and says what is waiting\n{:?}",
+        s.composer_chrome()
+    );
+    assert!(
+        !s.texts().iter().any(|t| t.contains("already running")),
+        "and does not refuse it\n{}",
+        s.transcript()
+    );
+    // Not in the transcript yet: the model has not been told, and a transcript showing a question
+    // nobody has been asked is a transcript that is lying.
+    assert!(
+        !s.chat_now().iter().any(|l| l.contains("do it differently")),
+        "not shown as asked until it has been\n{:?}",
+        s.chat_now()
+    );
+}
+
+#[test]
+fn a_message_queued_past_the_last_gap_becomes_the_next_turn() {
+    // Steering is taken into the running turn at the next gap. If the turn ends before there is
+    // one — interrupted, or simply finished — the question was still asked, and dropping it
+    // silently would be the worst possible reading of "queued".
+    let sb = Sandbox::new("steerleftover");
+    install_stall(&sb);
+    sb.write_config("[options]\n\"agent.model\" = \"stall/stall\"\n");
+    let mut s = sb.start_letting_config_choose();
+    s.wait_for("stall ready");
+
+    s.type_text("first");
+    s.enter();
+    assert!(s.pump(|s| s.chat_now().iter().any(|l| l.contains("esc to interrupt"))), "working");
+    s.type_text("second");
+    s.enter();
+    assert!(s.pump(|s| s.composer_chrome().iter().any(|t| t.contains("queued"))), "held");
+
+    s.special("esc");
+    assert!(
+        s.pump(|s| s.chat_now().iter().any(|l| l.contains("second"))),
+        "it was asked once there was room to ask it\n{:?}",
+        s.chat_now()
+    );
+}
+
+#[test]
+fn the_working_line_says_how_much_is_waiting() {
+    let sb = Sandbox::new("steercount");
+    install_stall(&sb);
+    sb.write_config("[options]\n\"agent.model\" = \"stall/stall\"\n");
+    let mut s = sb.start_letting_config_choose();
+    s.wait_for("stall ready");
+    s.type_text("go");
+    s.enter();
+    assert!(s.pump(|s| s.chat_now().iter().any(|l| l.contains("esc to interrupt"))), "working");
+
+    s.type_text("one");
+    s.enter();
+    s.type_text("two");
+    s.enter();
+    assert!(
+        s.pump(|s| s.chat_now().iter().any(|l| l.contains("2 queued"))),
+        "the line that says a turn is in flight also says what is behind it\n{:?}",
+        s.chat_now()
+    );
+}
+
+/// A question butted against whatever came before it reads as another line of that answer.
+///
+/// The case this exists for is a tool card, which has no trailing blank of its own: the previous
+/// turn ends with `└ 3 files`, and the next thing you said starts on the very next row.
+#[test]
+fn a_question_gets_a_gap_above_it_and_keeps_its_bar() {
+    let sb = Sandbox::new("questiongap");
+    let mut s = sb.start();
+    s.wait_for("PROJECTS");
+    s.type_text("go");
+    s.enter();
+    assert!(
+        s.pump(|s| s.chat_now().iter().any(|l| l.contains("read_file"))),
+        "the turn ran\n{:?}",
+        s.chat_now()
+    );
+    s.type_text("again");
+    s.enter();
+
+    assert!(
+        s.pump(|s| {
+            let rows = s.chat_now();
+            rows.iter().position(|l| l.contains("again")).is_some_and(|at| {
+                at > 0 && rows[at - 1].trim().is_empty()
+            })
+        }),
+        "there is a blank row above it\n{:?}",
+        s.chat_now()
+    );
+    // And the bar is *coloured* on the question rather than on the blank row above it. The gap
+    // shifts every row after it, which is exactly the sort of off-by-one that leaves the text
+    // looking perfectly correct and the colour one row out.
+    let rows = s.chat_now();
+    let at = rows.iter().position(|l| l.contains("again")).expect("found above");
+    let groups = s.chat_groups();
+    assert!(
+        groups.get(at).is_some_and(|g| g.iter().any(|h| h == "Agent.User")),
+        "the bar is coloured on the question, not on the gap: {:?}",
+        &groups[at.saturating_sub(1)..(at + 1).min(groups.len())]
+    );
+}
+
+#[test]
+fn a_tool_call_says_what_came_back_not_only_that_it_ran() {
+    // A card that names the tool and nothing else is a card you have to take on trust, and "it
+    // ran" is not the thing you wanted to know.
+    let sb = Sandbox::new("toolresult");
+    let mut s = sb.start();
+    s.wait_for("PROJECTS");
+    s.type_text("go");
+    s.enter();
+    assert!(
+        s.pump(|s| s.chat_now().iter().any(|l| l.contains("read_file  .env"))),
+        "the call is shown with its subject\n{:?}",
+        s.chat_now()
+    );
+    assert!(
+        s.pump(|s| s.chat_now().iter().any(|l| l.trim_start().starts_with('\u{2717}')
+            && l.contains("could not read"))),
+        "and what it came back with, under it\n{:?}",
+        s.chat_now()
+    );
+}
+
+#[test]
+fn the_footer_says_what_the_agent_may_do_and_which_key_changes_it() {
+    let sb = Sandbox::new("permmode");
+    let mut s = sb.start();
+    assert!(
+        s.pump(|s| s.status_now().iter().any(|l| l.contains("ask"))),
+        "the mode, and the key beside it\n{:?}",
+        s.status_now()
+    );
+    s.send(&command("permission.cycle"));
+    assert!(
+        s.pump(|s| s.status_now().iter().any(|l| l.contains("allow-listed"))),
+        "and it changes\n{:?}",
+        s.status_now()
+    );
+}
+
+impl Session {
+    /// The window showing a named buffer, if the frontend was told about one.
+    fn window_of(&self, name: &str) -> Option<u64> {
+        let buf = self.buffer_named(name)?;
+        self.events.iter().find_map(|e| {
+            (e["type"] == "window_opened" && e["buf"].as_u64() == Some(buf))
+                .then(|| e["win"].as_u64())?
+        })
+    }
+
+    /// Tell the core how big a window really is.
+    ///
+    /// A stdio frontend has no geometry of its own, so nothing reports this unless a test does —
+    /// which means anything that depends on real width is untested until it is said out loud here.
+    fn viewport(&mut self, name: &str, width: u16, height: u16) {
+        let Some(win) = self.window_of(name) else { return };
+        self.send(&format!(
+            r#"{{"type":"viewport_changed","win":{win},"width":{width},"height":{height},"top_line":0}}"#
+        ));
+    }
+
+    fn status_now(&self) -> Vec<String> {
+        match self.buffer_named("[status]") {
+            Some(b) => self.lines_of(b),
+            None => Vec::new(),
+        }
+    }
 }

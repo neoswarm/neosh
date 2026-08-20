@@ -321,9 +321,10 @@ fn narrow_list(
 /// it is a widening even though it sounds restrictive.
 fn strictness(m: PermissionMode) -> u8 {
     match m {
-        PermissionMode::AllowListed => 0,
-        PermissionMode::Ask => 1,
-        PermissionMode::Deny => 2,
+        PermissionMode::Allow => 0,
+        PermissionMode::AllowListed => 1,
+        PermissionMode::Ask => 2,
+        PermissionMode::Deny => 3,
     }
 }
 
