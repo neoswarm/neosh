@@ -283,6 +283,28 @@ Copying uses OSC 52, which travels back through the terminal connection — so i
 clipboard on the machine you are sitting at, not the one neosh is running on. Terminals that do not
 implement it ignore it silently; there is no way to detect support.
 
+### The strip along the bottom
+
+```
+ chat  ask ⇧⇥  38% of 200k  ↑12k ↓4k                              claude-opus-5 ^P  high ^E
+```
+
+Left is what the conversation is *spending* — the permission mode, how full the context window is,
+tokens in and out. Right is what it is spending it *on*. They are separated because they change at
+different rates, and interleaving two things that move at different speeds makes both harder to
+read.
+
+Every entry carries the key that changes it, immediately after it. That is the whole rule: a key is
+memorable once it has been seen beside the thing it does, and a legend somewhere else is a second
+place to look for something that is already on screen. It also means those keys are *not* repeated
+on the shortcut row below — saying it twice costs a row and teaches nothing the first place did not.
+
+Plugins own the strip's contents:
+
+```ts
+await neosh.status.set("model", { text: "opus", keys: "^P", align: "right", priority: 10 });
+```
+
 ### The row under the composer
 
 Under the field you type into is a row of shortcuts: `⏎ send`, `^P model`, `^T conversations`, and

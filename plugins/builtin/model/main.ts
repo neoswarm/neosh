@@ -62,10 +62,9 @@ export async function activate({ neosh, subscriptions }: PluginContext) {
   await neosh.keymap.set("chat", "<A-Up>", "model.upgrade", { desc: "A more capable model" });
   await neosh.keymap.set("chat", "<A-Down>", "model.downgrade", { desc: "A cheaper model" });
 
-  // On the row under the composer, because which model answers is the thing people change most
-  // often and the thing they are least likely to guess a key for.
-  await neosh.hint.set("model", { keys: "^P", label: "model", priority: 10 });
-  await neosh.hint.set("effort", { keys: "^E", label: "effort", priority: 11 });
+  // Deliberately *not* on the shortcut row. The key lives beside the model name in the footer,
+  // where the thing it changes is already being read — saying it twice costs a row and teaches
+  // nothing the first place did not.
 
   // The footer. The model and its options belong beside the composer rather than on a settings
   // page: they are the two things you change mid-conversation — and each carries its own key,
@@ -77,6 +76,7 @@ export async function activate({ neosh, subscriptions }: PluginContext) {
         text: "no model",
         keys: "^P",
         hl: "Diagnostic.Warn",
+        align: "right",
         priority: 10,
       });
       await neosh.status.clear("effort");
@@ -88,10 +88,14 @@ export async function activate({ neosh, subscriptions }: PluginContext) {
     const cred = (await neosh.agent.credentials().catch(() => []))
       .find((c) => c.instance === selection.instance);
     const unusable = cred?.source.kind === "missing";
+    // Right-hand end, where pi puts it: the left of the strip is what the conversation is
+    // spending, which changes constantly, and the right is what it is spending it on, which does
+    // not. Two things that move at different rates should not be interleaved.
     await neosh.status.set("model", {
       text: `${selection.model}${unusable ? "  no key" : ""}`,
       keys: "^P",
       hl: unusable ? "Diagnostic.Warn" : "Accent",
+      align: "right",
       priority: 10,
     });
 
@@ -99,7 +103,12 @@ export async function activate({ neosh, subscriptions }: PluginContext) {
     // one you want to change is whichever you are not looking at.
     const options = (selection.options ?? []).map((o) => String(o.value)).join(" ");
     if (options) {
-      await neosh.status.set("effort", { text: options, keys: "^E", priority: 11 });
+      await neosh.status.set("effort", {
+        text: options,
+        keys: "^E",
+        align: "right",
+        priority: 11,
+      });
     } else {
       await neosh.status.clear("effort");
     }

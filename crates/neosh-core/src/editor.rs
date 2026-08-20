@@ -66,6 +66,10 @@ pub struct Editor {
     attached: HashMap<BufferId, HashSet<PluginId>>,
     /// Windows that want the keys nothing else claimed, and the command to send them to.
     captures: HashMap<WindowId, String>,
+    /// Plugins that ship with neosh. Their keymaps are *defaults*, and a default that overwrites a
+    /// choice is not a default — `init.ts` runs before plugin discovery, so without this every
+    /// bundled plugin would silently take a key the user's configuration had just bound.
+    bundled: HashSet<String>,
     /// Where the selection highlight is drawn.
     ///
     /// Reserved at construction rather than exposed, so a selection is an ordinary extmark from the
@@ -106,6 +110,11 @@ impl Editor {
             e.ui.push(UiEvent::HighlightDefined { name: name.clone(), def: def.clone() });
         }
         e
+    }
+
+    /// Say that a plugin ships with neosh, so its keymaps behave as defaults.
+    pub fn mark_bundled(&mut self, plugin: &PluginId) {
+        self.bundled.insert(plugin.0.clone());
     }
 
     /// Whether this call is UI-domain and belongs to the core.
@@ -274,6 +283,11 @@ impl Editor {
 
     pub fn window(&self, id: WindowId) -> Option<&Window> {
         self.windows.get(&id)
+    }
+
+    /// Every open window, for the rare caller that needs to find one by what it shows.
+    pub fn windows(&self) -> impl Iterator<Item = &Window> {
+        self.windows.values()
     }
 
     pub fn mode(&self) -> Mode {
@@ -732,12 +746,19 @@ impl Editor {
             }
             ApiCall::KeymapSet { mode, lhs, command, scope, desc } => {
                 let lhs = self.with_leader(&lhs);
-                self.keymaps.set(
+                let took = self.keymaps.set(
                     mode,
                     scope.unwrap_or(KeymapScope::Global),
                     &lhs,
-                    Binding { command, desc, owner: Some(plugin.0.clone()) },
+                    Binding { command: command.clone(), desc, owner: Some(plugin.0.clone()) },
+                    &self.bundled,
                 )?;
+                if !took {
+                    // Not an error: a bundled plugin offering a default for a key somebody has
+                    // already taken is the ordinary case, and failing the call would make every
+                    // such plugin log a warning on a perfectly good configuration.
+                    tracing::debug!(%plugin, lhs, command, "key already bound; default not applied");
+                }
                 Ok(ApiOk::Unit)
             }
             ApiCall::KeymapDel { mode, lhs, scope } => {

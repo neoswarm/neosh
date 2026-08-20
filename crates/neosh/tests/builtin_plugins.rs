@@ -2371,16 +2371,33 @@ impl Session {
 fn the_row_under_the_composer_says_what_the_keys_do() {
     let sb = Sandbox::new("hints");
     let mut s = sb.start();
+    // Waiting on a plugin's entry, not the host's: the host seeds `⏎ send` before any plugin has
+    // loaded, so asserting on that alone would pass before the row was finished.
     assert!(
-        s.pump(|s| s.composer_chrome().iter().any(|t| t.contains("^P"))),
-        "the model key is advertised where you would look for it\n{:?}",
+        s.pump(|s| s.composer_chrome().iter().any(|t| t.contains("F1 keys"))),
+        "the way to the keys that did not fit\n{:?}",
         s.composer_chrome()
     );
     let chrome = s.composer_chrome().join(" ");
-    assert!(chrome.contains("send"), "and so is the one key everybody needs: {chrome}");
+    assert!(chrome.contains("send"), "and the one key everybody needs: {chrome}");
+}
+
+#[test]
+fn a_key_shown_beside_what_it_changes_is_not_repeated_on_the_shortcut_row() {
+    // The rule the footer exists for. Saying it twice costs a row and teaches nothing the first
+    // place did not — and the first place is better, because the thing being changed is right
+    // there being read.
+    let sb = Sandbox::new("nodupekeys");
+    let mut s = sb.start();
     assert!(
-        chrome.contains("F1 keys"),
-        "and the way to the ones that did not fit: {chrome}"
+        s.pump(|s| s.status_now().iter().any(|l| l.contains("^P"))),
+        "the model carries its key\n{:?}",
+        s.status_now()
+    );
+    assert!(
+        !s.composer_chrome().join(" ").contains("^P"),
+        "and the shortcut row does not say it again\n{:?}",
+        s.composer_chrome()
     );
 }
 

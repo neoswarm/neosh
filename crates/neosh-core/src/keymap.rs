@@ -213,16 +213,34 @@ impl KeymapTable {
         Self::default()
     }
 
+    /// Bind a key, unless a bundled plugin is trying to take one somebody else already claimed.
+    ///
+    /// `bundled` is the set of plugins that ship with neosh. Their bindings are *defaults*, and a
+    /// default that overwrites a choice is not a default. This matters because `init.ts` runs
+    /// **before** plugin discovery — it decides what else loads — so without this rule every
+    /// bundled plugin silently steals whichever key the user's configuration had just bound.
+    ///
+    /// Returns whether the binding was made, so the caller can say so rather than leaving a
+    /// keystroke that quietly does something else.
     pub fn set(
         &mut self,
         mode: Mode,
         scope: KeymapScope,
         lhs: &str,
         binding: Binding,
-    ) -> Result<(), ApiError> {
+        bundled: &std::collections::HashSet<String>,
+    ) -> Result<bool, ApiError> {
         let seq = parse_keys(lhs)?;
-        self.maps.insert((mode, scope, seq), binding);
-        Ok(())
+        let key = (mode, scope, seq);
+        let new_is_bundled = binding.owner.as_ref().is_some_and(|o| bundled.contains(o));
+        if new_is_bundled
+            && let Some(existing) = self.maps.get(&key)
+            && existing.owner.as_ref().is_some_and(|o| !bundled.contains(o))
+        {
+            return Ok(false);
+        }
+        self.maps.insert(key, binding);
+        Ok(true)
     }
 
     pub fn del(&mut self, mode: Mode, scope: KeymapScope, lhs: &str) -> Result<(), ApiError> {
@@ -277,6 +295,13 @@ impl KeymapTable {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// No plugin is bundled, so every binding simply takes the key. The rule that bundled defaults
+    /// defer to somebody else's choice is tested in `neosh` end to end, where there is a real
+    /// `init.ts` and real bundled plugins to be in the wrong order about.
+    fn none() -> std::collections::HashSet<String> {
+        std::collections::HashSet::new()
+    }
 
     #[test]
     fn leader_is_substituted_wherever_it_appears() {
@@ -369,8 +394,10 @@ mod tests {
     fn table() -> KeymapTable {
         let mut t = KeymapTable::new();
         let b = |c: &str| Binding { command: c.into(), desc: None, owner: Some("p".into()) };
-        t.set(Mode::Normal, KeymapScope::Global, "gd", b("goto.def")).unwrap();
-        t.set(Mode::Normal, KeymapScope::Global, "<C-p>", b("picker.open")).unwrap();
+        t.set(Mode::Normal, KeymapScope::Global, "gd", b("goto.def"), &none())
+        .unwrap();
+        t.set(Mode::Normal, KeymapScope::Global, "<C-p>", b("picker.open"), &none())
+        .unwrap();
         t
     }
 
@@ -405,7 +432,7 @@ mod tests {
             command: "float.close".into(),
             desc: None,
             owner: None,
-        })
+        }, &none())
         .unwrap();
 
         let scopes = [win, KeymapScope::Global];

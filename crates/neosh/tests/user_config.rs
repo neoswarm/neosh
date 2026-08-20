@@ -1180,3 +1180,27 @@ fn a_termination_signal_leaves_through_the_ordinary_quit_path() {
 fn libc_sigterm() -> i32 {
     15
 }
+
+
+#[test]
+fn a_bundled_default_does_not_take_a_key_your_config_already_bound() {
+    // `init.ts` runs *before* plugin discovery — it decides what else loads — so without a rule
+    // saying otherwise, every bundled plugin silently takes whichever key the configuration had
+    // just bound. `<C-p>` is the model picker's; here it is the user's.
+    let s = Sandbox::new("keydefault");
+    s.write(
+        "config/init.ts",
+        &init_ts(
+            r#"  await neosh.cmd.register("mine.pick", () => neosh.notify("mine ran"));
+  await neosh.keymap.set("chat", "<C-p>", "mine.pick");
+  neosh.notify("config ready");"#,
+        ),
+    );
+
+    let mut sess = s.start();
+    sess.wait_for("config ready");
+    // Wait for the plugin that would have taken it, so this is not merely a race won by luck.
+    sess.wait_for("agent workspace");
+    sess.key_ctrl('p');
+    sess.wait_for("mine ran");
+}

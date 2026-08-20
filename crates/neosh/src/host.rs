@@ -1058,20 +1058,50 @@ impl Host {
             marks.push((from, text.len(), hl.to_string()));
         };
 
+        let mut segment =
+            |text: &mut String, marks: &mut Vec<(usize, usize, String)>, seg: &neosh_proto::StatusSegment| {
+                text.push_str("  ");
+                push(text, marks, &seg.text, seg.hl.as_deref().unwrap_or("Status.Line"));
+                // The key that changes it, right after it. A key is only memorable once it has
+                // been seen next to the thing it does; a legend somewhere else is a second place
+                // to look.
+                if let Some(keys) = seg.keys.as_deref().filter(|k| !k.is_empty()) {
+                    text.push(' ');
+                    push(text, marks, keys, "Composer.HintKey");
+                }
+            };
+
         push(&mut text, &mut marks, mode, "Status.Line");
-        for (_, _, seg) in left.iter().chain(right.iter()) {
-            text.push_str("  ");
-            push(&mut text, &mut marks, &seg.text, seg.hl.as_deref().unwrap_or("Status.Line"));
-            // The key that changes it, right after it. A key is only memorable once it has been
-            // seen next to the thing it does; a legend somewhere else is a second place to look.
-            if let Some(keys) = seg.keys.as_deref().filter(|k| !k.is_empty()) {
-                text.push(' ');
-                push(&mut text, &mut marks, keys, "Composer.HintKey");
-            }
+        for (_, _, seg) in left.iter() {
+            segment(&mut text, &mut marks, seg);
         }
         if self.status_segments.is_empty() {
             // Before any plugin has contributed — and under `--clean`, where none will.
             push(&mut text, &mut marks, "  ^C quit", "Status.Line");
+        }
+
+        // Right-aligned segments actually go to the right edge. They used to be appended after the
+        // left ones and were therefore right-aligned in name only — which is the sort of thing that
+        // looks fine until a second plugin uses it and both end up in the middle.
+        if !right.is_empty() {
+            let mut tail = String::new();
+            let mut tail_marks: Vec<(usize, usize, String)> = Vec::new();
+            for (_, _, seg) in right.iter() {
+                segment(&mut tail, &mut tail_marks, seg);
+            }
+            let width = self
+                .editor
+                .windows()
+                .find(|w| w.buf == self.status)
+                .and_then(|w| w.viewport.map(|v| v.width as usize))
+                .unwrap_or(0);
+            let used = display_width(&text) + display_width(&tail) + 1;
+            if width > used {
+                text.push_str(&" ".repeat(width - used));
+            }
+            let base = text.len();
+            text.push_str(&tail);
+            marks.extend(tail_marks.into_iter().map(|(a, b, hl)| (base + a, base + b, hl)));
         }
         text.push(' ');
 
@@ -3372,6 +3402,9 @@ impl Host {
                 continue;
             }
             let id = PluginId(builtin.name.clone());
+            // Its keymaps are defaults from here on: they will not take a key something else has
+            // already bound, which is the only way `init.ts` running first can also mean it wins.
+            self.editor.mark_bundled(&id);
             match toml::from_str::<neosh_proto::PluginManifest>(&builtin.manifest) {
                 Ok(m) => {
                     self.plugin_permissions.insert(id.clone(), m.permissions);
