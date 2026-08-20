@@ -269,6 +269,38 @@ export async function activate({ neosh }: PluginContext) {
       neosh.notify(`close failed: ${e}`);
     }
   });
+  await neosh.cmd.register("t.listAll", async () => {
+    const all = await neosh.session.list({ includeArchived: true });
+    neosh.notify(
+      `all: ${all.map((s) => `${s.archived ? "~" : ""}${s.is_active ? "*" : ""}${s.label}`).join(" | ")}`,
+    );
+  });
+  await neosh.cmd.register("t.archiveOldest", async () => {
+    const all = await neosh.session.list();
+    const oldest = all[all.length - 1];
+    if (!oldest) return;
+    try {
+      await neosh.session.archive(oldest.id);
+      neosh.notify("archived");
+    } catch (e) {
+      neosh.notify(`archive failed: ${e}`);
+    }
+  });
+  await neosh.cmd.register("t.unarchiveAll", async () => {
+    for (const s of await neosh.session.list({ includeArchived: true })) {
+      if (s.archived) await neosh.session.archive(s.id, false);
+    }
+    neosh.notify("unarchived");
+  });
+  await neosh.cmd.register("t.archiveActive", async () => {
+    const cur = await neosh.session.current();
+    try {
+      await neosh.session.archive(cur.id);
+      neosh.notify("archived the active one");
+    } catch (e) {
+      neosh.notify(`archive failed: ${e}`);
+    }
+  });
   await neosh.cmd.register("t.rename", async () => {
     const cur = await neosh.session.current();
     await neosh.session.rename(cur.id, "Renamed thread");
@@ -415,6 +447,85 @@ fn closing_the_active_conversation_lands_on_another_one() {
         "landed back in the surviving conversation\n{:?}",
         s.chat_now()
     );
+}
+
+#[test]
+fn an_archived_conversation_leaves_the_list_without_leaving_the_store() {
+    let sb = Sandbox::new("archived");
+    install_driver(&sb);
+    let mut s = sb.start();
+    s.wait_for("driver ready");
+
+    s.type_text("put me away");
+    s.enter();
+    s.wait_for("put me away");
+    s.command("t.new");
+    s.wait_for("created");
+
+    s.command("t.archiveOldest");
+    s.wait_for("archived");
+    s.command("t.list");
+    s.wait_for("sessions: *New conversation");
+    s.command("t.listAll");
+    s.wait_for("~put me away");
+
+    s.command("t.unarchiveAll");
+    s.wait_for("unarchived");
+    s.command("t.list");
+    // Back, and at the top: you unarchived it in order to look at it.
+    s.wait_for("sessions: put me away | *New conversation");
+}
+
+#[test]
+fn archiving_the_only_conversation_lands_you_in_a_fresh_one_rather_than_nowhere() {
+    // The store refuses to leave you with nothing; the host answers by starting something empty,
+    // because "there is nowhere to go" is a bad answer to "I am done with this".
+    let sb = Sandbox::new("archivelast");
+    install_driver(&sb);
+    let mut s = sb.start();
+    s.wait_for("driver ready");
+
+    s.type_text("the only one");
+    s.enter();
+    s.wait_for("the only one");
+
+    s.command("t.archiveActive");
+    s.wait_for("archived the active one");
+    s.command("t.list");
+    s.wait_for("sessions: *New conversation");
+    s.command("t.listAll");
+    s.wait_for("~the only one");
+}
+
+#[test]
+fn archiving_survives_a_restart() {
+    let sb = Sandbox::new("archiverestart");
+    install_driver(&sb);
+    {
+        let mut s = sb.start();
+        s.wait_for("driver ready");
+        s.type_text("shelved");
+        s.enter();
+        s.wait_for("shelved");
+        s.command("t.new");
+        s.wait_for("created");
+        s.command("t.archiveOldest");
+        s.wait_for("archived");
+        s.command("quit");
+        assert!(s.exits_within(Duration::from_secs(10)), "clean exit");
+    }
+
+    let mut s = sb.start();
+    s.wait_for("driver ready");
+    // Not restored *into*: landing in the conversation you deliberately put away would make
+    // archiving feel like it had not worked.
+    assert!(
+        s.pump(|s| !s.chat_now().iter().any(|l| l.contains("shelved"))),
+        "started somewhere else\n{:?}",
+        s.chat_now()
+    );
+    s.command("t.listAll");
+    s.wait_for("~shelved");
 }
 
 #[test]

@@ -483,12 +483,22 @@ async fn list_models(agent: &Agent) -> anyhow::Result<()> {
             Some(d) => d.list_models(&inst).await.unwrap_or_else(|_| inst.models.clone()),
             None => inst.models.clone(),
         };
-        let note = match &inst.auth {
-            neosh_proto::AuthRef::Env { var } if std::env::var_os(var).is_none() => {
-                format!("  ({var} not set)")
+        // What the credential store says, not what the config file says: a key typed in last week
+        // and put in the keychain is why an instance whose environment variable is unset works
+        // anyway, and a listing that reported otherwise would send people looking for a bug.
+        let note = match neosh_provider::credentials::credentials().source(&inst) {
+            neosh_proto::CredentialSource::Env { var } => format!("  (${var})"),
+            neosh_proto::CredentialSource::Keychain => "  (key in the keychain)".to_string(),
+            neosh_proto::CredentialSource::Session => "  (key entered this run)".to_string(),
+            neosh_proto::CredentialSource::Command => "  (credential helper)".to_string(),
+            neosh_proto::CredentialSource::Inherited => {
+                "  (uses an existing CLI login)".to_string()
             }
-            neosh_proto::AuthRef::Inherited => "  (uses an existing CLI login)".to_string(),
-            _ => String::new(),
+            neosh_proto::CredentialSource::NotNeeded => String::new(),
+            neosh_proto::CredentialSource::Missing => match &inst.auth {
+                neosh_proto::AuthRef::Env { var } => format!("  (no key — ${var} is not set)"),
+                _ => "  (no key)".to_string(),
+            },
         };
         say!("{} — {}{}", inst.id, inst.display_name, note);
         if models.is_empty() {

@@ -753,7 +753,7 @@ impl Host {
                     // so they are listable and rebindable like any other. It just answers them
                     // itself rather than sending them to a JS plugin that does not exist.
                     if plugin.0 == BUILTIN {
-                        self.run_builtin(&name);
+                        self.run_builtin(&name, args);
                     } else {
                         self.bridge.notify(&plugin, PluginEvent::CommandInvoked { name, args, key });
                     }
@@ -1856,7 +1856,10 @@ impl Host {
             // Built in rather than left to the model plugin: with `--clean`, or with plugins
             // disabled, this is the only way to authenticate, and "install a plugin first" is a
             // poor answer to "it says I have no API key".
-            ("provider.key", "Enter an API key for the provider this model belongs to"),
+            (
+                "provider.key",
+                "Enter an API key — for the named instance, or the one this model belongs to",
+            ),
         ];
         for (name, desc) in commands {
             let _ = self.editor.apply(&plugin, ApiCall::CmdRegister {
@@ -2021,7 +2024,7 @@ impl Host {
         let _ = self.editor.apply(&plugin, ApiCall::WinScrollTo { win, top_line: top });
     }
 
-    fn run_builtin(&mut self, name: &str) {
+    fn run_builtin(&mut self, name: &str, args: Vec<String>) {
         match name {
             "config.reload" => self.reload_config(),
             "quit" => self.quitting = true,
@@ -2046,11 +2049,15 @@ impl Host {
             }
             "edit.newline" => self.compose(TextEdit::Insert { text: "\n".into() }),
             "provider.key" => {
-                // The instance serving the model you are on: the one you would be asked about, and
-                // the only one this command could mean without a picker to choose from.
-                match self.agent.selection() {
-                    Some(sel) => {
-                        if let Err(e) = self.begin_secret(sel.instance, true, None) {
+                // Named, or else the instance serving the model you are on — the one you would be
+                // asked about, and the only one this could mean without a picker to choose from.
+                let target = args
+                    .first()
+                    .map(|a| neosh_proto::InstanceId::from(a.as_str()))
+                    .or_else(|| self.agent.selection().map(|s| s.instance));
+                match target {
+                    Some(instance) => {
+                        if let Err(e) = self.begin_secret(instance, true, None) {
                             self.editor_message(MessageLevel::Warn, e.to_string());
                         }
                     }

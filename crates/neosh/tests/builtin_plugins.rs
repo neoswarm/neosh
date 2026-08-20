@@ -244,6 +244,15 @@ impl Session {
             .collect()
     }
 
+    /// Every event this frontend has been sent, verbatim.
+    ///
+    /// The only way to assert a *negative* about the wire: that something the host knows never
+    /// appears in what it sends. Rendered text is not enough — a value could be in a field nothing
+    /// draws and still be in the JSON a frontend logs.
+    fn wire(&self) -> String {
+        self.events.iter().map(|e| e.to_string()).collect::<Vec<_>>().join("\n")
+    }
+
     fn transcript(&self) -> String {
         let mut s = String::from("--- text seen ---\n");
         for l in self.texts() {
@@ -630,6 +639,10 @@ fn dismissing_the_description_creates_nothing() {
 /// that does would break the moment a user rebound it.
 fn command(name: &str) -> String {
     format!(r#"{{"type":"command","name":"{name}"}}"#)
+}
+
+fn command_with(name: &str, arg: &str) -> String {
+    format!(r#"{{"type":"command","name":"{name}","args":["{arg}"]}}"#)
 }
 
 #[test]
@@ -1925,4 +1938,114 @@ fn an_untracked_file_says_so_rather_than_showing_an_empty_diff() {
     s.wait_for("Changed files");
     s.enter();
     s.wait_for("is untracked");
+}
+
+// ---------------------------------------------------------------------------
+// Entering an API key
+// ---------------------------------------------------------------------------
+
+/// The literal a test types in. Distinctive so a search for it means something.
+const FAKE_KEY: &str = "sk-neosh-test-DO-NOT-LOG-8f3a";
+
+/// A configured instance that wants a key.
+///
+/// The mock provider needs none, which is exactly right for every other test here and no use at
+/// all for this one. The variable is never set, so this instance starts out with nothing.
+const NEEDS_A_KEY: &str = r#"
+[[providers]]
+id = "acme"
+driver = "openai-compat"
+display_name = "Acme"
+base_url = "https://acme.invalid/v1"
+auth = { kind = "env", var = "NEOSH_TEST_ACME_KEY_NEVER_SET" }
+"#;
+
+#[test]
+fn a_key_typed_in_never_reaches_the_frontend() {
+    // The load-bearing test for the whole credential path. The host reads these keystrokes itself
+    // precisely so the value never enters a buffer — because a buffer is drawn, and drawing it
+    // would put the key in a `UiEvent`, across a process boundary, into whatever the frontend logs.
+    let sb = Sandbox::new("secretwire");
+    sb.write_config(NEEDS_A_KEY);
+    let mut s = sb.start();
+    s.wait_for("PROJECTS");
+
+    s.send(&command_with("provider.key", "acme"));
+    s.wait_for("Paste or type the key");
+
+    for c in FAKE_KEY.chars() {
+        s.key(&c.to_string());
+    }
+    assert!(
+        s.pump(|s| s.saw("\u{2022}\u{2022}\u{2022}")),
+        "the field shows bullets, so a paste that did not arrive is visible\n{}",
+        s.transcript()
+    );
+    s.enter();
+    // Something happened — either it was stored, or the keychain was unavailable and it is held for
+    // the run. Both are fine here; what is not fine is the value being anywhere in the JSON.
+    assert!(s.pump(|s| s.saw("key saved") || s.saw("kept for this run")), "{}", s.transcript());
+
+    assert!(
+        !s.wire().contains(FAKE_KEY),
+        "the key reached the frontend, which is the one thing this design exists to prevent"
+    );
+    assert!(!s.wire().contains("sk-neosh-test"), "not even a prefix of it");
+}
+
+#[test]
+fn the_key_prompt_gives_the_composer_back_with_the_draft_still_in_it() {
+    // It borrows the composer. Borrowing is only acceptable if it gives it back — losing an unsent
+    // question because you stopped to paste a key would be its own reason never to stop.
+    let sb = Sandbox::new("secretdraft");
+    sb.write_config(NEEDS_A_KEY);
+    let mut s = sb.start();
+    s.wait_for("PROJECTS");
+
+    for c in ["h", "a", "l", "f"] {
+        s.key(c);
+    }
+    assert!(s.pump(|s| s.saw("half")), "{}", s.transcript());
+
+    s.send(&command_with("provider.key", "acme"));
+    s.wait_for("Paste or type the key");
+    for c in ["a", "b", "c"] {
+        s.key(c);
+    }
+    s.send(r#"{"type":"key","key":{"code":{"kind":"esc"},"mods":{}}}"#);
+
+    assert!(
+        s.pump(|s| s.texts().iter().rev().take(4).any(|l| l == "half")),
+        "the draft came back\n{}",
+        s.transcript()
+    );
+    assert!(!s.wire().contains("abc"), "and what was typed into the prompt went nowhere");
+}
+
+#[test]
+fn while_a_key_is_being_typed_no_binding_fires() {
+    // Every base64 key contains an `n`, and `<C-n>` is a new conversation. Routing these keys
+    // through the keymaps would mean pasting a key sometimes started a conversation halfway
+    // through — which is also how half a key ends up stored.
+    let sb = Sandbox::new("secretkeys");
+    sb.write_config(NEEDS_A_KEY);
+    let mut s = sb.start();
+    s.wait_for("PROJECTS");
+    let before = s.sidebar_now().iter().filter(|l| l.contains("New conversation")).count();
+
+    s.send(&command_with("provider.key", "acme"));
+    s.wait_for("Paste or type the key");
+    s.ctrl("n");
+    s.ctrl("t");
+    s.key("n");
+    assert!(s.pump(|s| s.saw("\u{2022}")), "the `n` went into the key\n{}", s.transcript());
+
+    s.send(r#"{"type":"key","key":{"code":{"kind":"esc"},"mods":{}}}"#);
+    s.drain_for(Duration::from_millis(200));
+    assert_eq!(
+        s.sidebar_now().iter().filter(|l| l.contains("New conversation")).count(),
+        before,
+        "no conversation was created\n{:?}",
+        s.sidebar_now()
+    );
 }
