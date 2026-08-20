@@ -822,7 +822,11 @@ function group(sessions: SessionInfo[], arrangement: Arrangement): Project[][] {
 
   const projects: Project[] = [...by.entries()].map(([cwd, list]) => ({
     cwd,
-    name: basename(cwd),
+    // What the host decided to call it. For a worktree that is the repository and the branch,
+    // rather than whatever the directory happens to be named — a row reading `wt-fe3c0d93`
+    // tells you nothing about which checkout it is, and reads as somebody else's directory having
+    // wandered into your workspace.
+    name: list[0]?.project || basename(cwd),
     favorite: arrangement.isFavorite(cwd),
     sessions: list,
   }));
@@ -995,7 +999,7 @@ function sessionRow(s: SessionInfo, now: number, opts: DrawOptions): ListRow<Tar
  * its own does not say which checkout it belongs to.
  */
 function archivedRow(s: SessionInfo, opts: DrawOptions): ListRow<Target> {
-  const project = basename(s.cwd);
+  const project = s.project || basename(s.cwd);
   const width = Math.max(8, opts.width - 10 - project.length);
   return {
     text: `     ${opts.ascii ? "-" : "┈"} ${clip(s.label, width)}`,

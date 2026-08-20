@@ -250,6 +250,8 @@ pub struct Host {
     repos: std::collections::HashMap<std::path::PathBuf, Option<neosh_vcs::Git>>,
     /// Where neosh was started, and the fallback for a session that names nowhere.
     cwd: std::path::PathBuf,
+    /// What to call each directory a conversation lives in, worked out once when it is first seen.
+    projects: std::collections::HashMap<std::path::PathBuf, String>,
     /// A key being typed in, if one is.
     ///
     /// The host collects this itself rather than lending a plugin a text field, because a plugin
@@ -463,6 +465,7 @@ impl Host {
             pstate: crate::pstate::PluginState::new(None),
             repos: Default::default(),
             cwd: std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
+            projects: Default::default(),
             secret: None,
         }
     }
@@ -639,9 +642,12 @@ impl Host {
                 Ok(ApiOk::Unit)
             }
             // ---- sessions ----------------------------------------------
-            ApiCall::SessionList { include_archived } => Ok(ApiOk::Sessions {
-                sessions: self.agent.sessions().list_with(include_archived),
-            }),
+            ApiCall::SessionList { include_archived } => {
+                let list = self.agent.sessions().list_with(include_archived);
+                Ok(ApiOk::Sessions {
+                    sessions: list.into_iter().map(|s| self.named(s)).collect(),
+                })
+            }
             ApiCall::SessionCurrent => {
                 let info = {
                     let store = self.agent.sessions();
@@ -649,7 +655,7 @@ impl Host {
                     i.is_active = true;
                     i
                 };
-                Ok(ApiOk::Session { session: info })
+                Ok(ApiOk::Session { session: self.named(info) })
             }
             ApiCall::SessionNew { cwd, title, activate } => {
                 let cwd = cwd.map(std::path::PathBuf::from).unwrap_or_else(|| self.cwd.clone());
@@ -684,6 +690,7 @@ impl Host {
                     i.is_active = store.active_id() == &id;
                     i
                 };
+                let info = self.named(info);
                 if activate {
                     // Before the redraw: the banner names the directory, and the file tools have
                     // to be pointed at it before the first turn rather than after it.
@@ -3426,8 +3433,24 @@ impl Host {
         let found = neosh_vcs::Git::discover(&dir).await;
         if let Some(g) = &found {
             tracing::info!(dir = %dir.display(), root = %g.root().display(), "git repository");
+            // Asked once, when the directory is first seen, and remembered. A label is read on
+            // every redraw of the panel and is not worth a `rev-parse` each time.
+            let (branch, main) = g.identity().await;
+            self.projects.insert(dir.clone(), project_name(&dir, branch, main));
         }
         self.repos.insert(dir, found);
+    }
+
+    /// Stamp the display name onto a conversation's info.
+    ///
+    /// Done here rather than in the session store because naming a checkout means having looked at
+    /// the repository, which is the host's job — the store holds conversations and knows nothing
+    /// about git.
+    fn named(&self, mut info: neosh_proto::SessionInfo) -> neosh_proto::SessionInfo {
+        if let Some(name) = self.projects.get(std::path::Path::new(&info.cwd)) {
+            info.project = name.clone();
+        }
+        info
     }
 
     pub fn begin_startup(&mut self, boot: Bootstrap) {
@@ -4528,6 +4551,51 @@ fn chunk(text: impl Into<String>, hl: &str) -> neosh_proto::VirtChunk {
 fn display_width(s: &str) -> usize {
     use unicode_width::UnicodeWidthStr;
     s.width()
+}
+
+/// What to call a checkout.
+///
+/// The last segment of the path is what everything used to use, and it is wrong for exactly the
+/// case a project list exists to make sense of: a worktree is named by whoever created it, so a
+/// panel reading `wt-fe3c0d93` says nothing about which repository or branch that is — and
+/// somebody looking at it reasonably wonders what an unrelated tool's directory is doing in their
+/// workspace.
+///
+/// So: a checkout is named after the repository it belongs to, and a *linked* worktree adds its
+/// branch. `neosh` for the original, `neosh · fix/thing` for a worktree of it. Anything that is not
+/// a repository keeps its directory name, which is all there is to go on.
+fn project_name(
+    dir: &std::path::Path,
+    branch: Option<String>,
+    main: Option<std::path::PathBuf>,
+) -> String {
+    let leaf = |p: &std::path::Path| {
+        p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| p.display().to_string())
+    };
+    let Some(main) = main else { return leaf(dir) };
+    let repo = leaf(&main);
+    // The original checkout is just the repository. Adding its branch would put a word that
+    // changes on every `git switch` next to a name that never does.
+    if same_dir(dir, &main) {
+        return repo;
+    }
+    match branch {
+        Some(b) => format!("{repo} \u{b7} {b}"),
+        // A detached head has no name of its own; the directory somebody chose is the next best
+        // thing, and better than showing a bare hash.
+        None => format!("{repo} \u{b7} {}", leaf(dir)),
+    }
+}
+
+/// Whether two paths are the same directory, following symlinks where they resolve.
+fn same_dir(a: &std::path::Path, b: &std::path::Path) -> bool {
+    if a == b {
+        return true;
+    }
+    match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => false,
+    }
 }
 
 /// The other direction: `~/x` back into an absolute path.

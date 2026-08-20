@@ -133,6 +133,13 @@ impl Session {
         SessionInfo {
             id: self.id.clone(),
             cwd: self.cwd.display().to_string(),
+            // Filled in by the host, which is the only thing that has looked at the repository.
+            // The leaf directory is the honest fallback, and what every caller used before.
+            project: self
+                .cwd
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| self.cwd.display().to_string()),
             message_count: self.messages.len() as u32,
             active_turn: self.active_turn.clone(),
             turn_started_at: self.turn_started_at,

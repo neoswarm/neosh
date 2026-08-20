@@ -238,6 +238,8 @@ function keyLabel(keys: Map<WidgetAction, KeySpec[]>, action: WidgetAction): str
     "<S-Tab>": "⇧⇥",
     "<Left>": "←",
     "<Right>": "→",
+    "<Up>": "↑",
+    "<Down>": "↓",
     "<CR>": "↵",
     "<Esc>": "esc",
   };
@@ -265,6 +267,23 @@ function actionFor(
     }
   }
   return null;
+}
+
+/**
+ * The key strip a single-pane picker gets unless the caller writes its own.
+ *
+ * Built from the bindings rather than written out, because the point of putting a key on screen is
+ * that it is the key that works — a legend that goes stale the moment somebody rebinds `ui.keys.*`
+ * is worse than no legend, since it is believed.
+ */
+function defaultHints(keys: Map<WidgetAction, KeySpec[]>, filtering: boolean): string {
+  const parts = [
+    `${keyLabel(keys, "accept")} choose`,
+    `${keyLabel(keys, "prev")}/${keyLabel(keys, "next")} move`,
+  ];
+  if (filtering) parts.push("type to filter");
+  parts.push(`${keyLabel(keys, "dismiss")} close`);
+  return parts.join("   ");
 }
 
 /** What a two-pane widget answers to. Notably not `complete`, whose key it shares. */
@@ -324,6 +343,14 @@ export interface PickerOptions<T> {
    * you typed in full, which is not one of them.
    */
   freeform?(query: string): T | null;
+  /**
+   * The key strip at the foot. One line.
+   *
+   * Written out by default, from the keys actually bound, so a rebinding shows up here rather than
+   * making the row a lie. Pass `""` for a picker with nothing worth saying — a two-row yes/no
+   * question is not helped by being told that `↵` chooses.
+   */
+  hints?: string;
 }
 
 const NS = "neosh.ui.picker";
@@ -360,20 +387,27 @@ export async function picker<T>(
 
   const buf = await neosh.buf.create({ name: `[${opts.title ?? "picker"}]`, scratch: true });
   const ns = await neosh.ns.create(NS);
+
+  watchKeys(neosh);
+  const keys = await widgetKeys(neosh);
+  // A picker with no keys on it is a modal you have to guess your way out of. Every one of these
+  // is a list you arrived at by pressing something, and none of them said what to press next.
+  const hints = opts.hints ?? defaultHints(keys, filtering);
+
   const win = await neosh.float.open(buf, {
     anchor: { kind: "screen" },
     width: { kind: "fixed", n: width },
-    // +1 for the separator, +1 more for the filter line when there is one; the title, when
-    // present, adds another.
-    height: { kind: "fixed", n: height + 1 + (filtering ? 1 : 0) + (opts.title ? 1 : 0) },
+    // Exactly the rows that get drawn: the list, plus a filter line when there is one, a title
+    // when there is one, and the key strip unless it was waived.
+    height: {
+      kind: "fixed",
+      n: height + (filtering ? 1 : 0) + (opts.title ? 1 : 0) + (hints === "" ? 0 : 1),
+    },
     border: "rounded",
     focusable: true,
     closeOnBlur: true,
     z: 200,
   });
-
-  watchKeys(neosh);
-  const keys = await widgetKeys(neosh);
 
   let query = opts.query ?? "";
   let cursor = Math.min(Math.max(0, opts.selected ?? 0), Math.max(0, items.length - 1));
@@ -442,11 +476,24 @@ export async function picker<T>(
       const detail = row.item.detail ? `  ${row.item.detail}` : "";
       lines.push(`${mark}${row.item.label}${detail}`);
     }
+    // Pushed onto the last row rather than floated: the float is sized for it, and a strip that
+    // moved up as the list shortened would be a strip you have to look for.
+    const hintLine = hints === "" ? -1 : lines.length + Math.max(0, height - window.length);
+    if (hintLine >= 0) {
+      while (lines.length < hintLine) lines.push("");
+      lines.push(` ${hints}`);
+    }
     await neosh.buf.setLines(buf, 0, -1, lines);
 
     // Marks are reapplied rather than moved: the buffer was just replaced, so there is nothing to
     // move, and clearing first keeps a stale highlight from surviving a filter that shortened it.
     await neosh.ns.clear(ns, buf);
+    if (hintLine >= 0) {
+      await neosh.ns.mark(ns, buf, hintLine, 0, {
+        hlGroup: "Sidebar.Dim",
+        endCol: byteLength(lines[hintLine] ?? ""),
+      });
+    }
     const listTop = (opts.title ? 1 : 0) + (filtering ? 1 : 0);
     for (let i = 0; i < window.length; i++) {
       const row = window[i]!;

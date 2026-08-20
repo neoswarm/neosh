@@ -5,9 +5,10 @@
 ## Context
 
 The brief: treat MCP as "a well-known case of the JSON-RPC door, do not invent a competing tool
-protocol". While surveying prior art we found `packages/effect-acp` in t3code — Zed's **Agent Client
-Protocol**, a JSON-RPC-over-stdio standard for the editor↔agent boundary — alongside a Codex
-app-server integration. The same "don't invent a competitor" logic plausibly extends to it.
+protocol". Surveying prior art turned up a second standard already occupying the neighbouring
+boundary — Zed's **Agent Client Protocol**, JSON-RPC over stdio for the editor↔agent seam — and,
+separately, Codex's app-server speaking its own JSON-RPC on the same seam. The "don't invent a
+competitor" logic plausibly extends to both.
 
 ## Decision
 

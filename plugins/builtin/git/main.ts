@@ -100,14 +100,18 @@ export async function activate({ neosh, subscriptions }: PluginContext) {
       "Largest patch sent to the model when writing a commit message. A large refactor is truncated rather than rejected.",
   });
 
-  const cmds: Array<[string, () => Promise<void>, string]> = [
+  const cmds: Array<[string, (args: string[]) => Promise<void>, string]> = [
     ["git.status", () => showStatus(neosh), "Show working tree status"],
     ["git.branch.switch", () => switchBranch(neosh), "Switch to another branch"],
     ["git.branch.new", () => newBranch(neosh), "Start a branch named after what you describe"],
     ["git.commit", () => commit(neosh), "Stage everything and commit with a written message"],
     ["git.diff", () => showDiff(neosh), "Show what changed"],
     ["git.worktree.list", () => pickWorktree(neosh), "Open a conversation in another worktree"],
-    ["git.worktree.new", () => newWorktree(neosh), "Create a worktree and start working in it"],
+    [
+      "git.worktree.new",
+      (args: string[]) => newWorktree(neosh, args),
+      "Create a worktree and start working in it — `git.worktree.new <branch> [path]`",
+    ],
     ["git.worktree.remove", () => removeWorktree(neosh), "Remove a worktree"],
   ];
   for (const [name, fn, desc] of cmds) {
@@ -555,32 +559,40 @@ async function pickWorktree(neosh: Neosh): Promise<void> {
   neosh.notify(`new conversation in ${chosen.branch ?? chosen.path}`);
 }
 
-async function newWorktree(neosh: Neosh): Promise<void> {
+/**
+ * Make a worktree and start working in it.
+ *
+ * **One question.** It used to ask twice — the branch, then the path, prefilled with the answer it
+ * had already worked out. That second prompt was the whole point of `worktree.root` being a
+ * setting, asked again: somebody who has configured where their worktrees go has said where their
+ * worktrees go. The path is still reachable — `git.worktree.new <branch> <path>` takes it — but
+ * from the palette or a key, the location follows from the configuration and the message says
+ * where it landed.
+ *
+ * Landing in it is the point. Creating a directory you then have to go and find is not a feature,
+ * it is a chore with extra steps.
+ */
+async function newWorktree(neosh: Neosh, args: string[] = []): Promise<void> {
   const status = await repoStatus(neosh);
   if (!status) return;
 
-  const branch = await prompt(neosh, "Branch for the new worktree", { width: 70 });
-  if (!branch || !branch.trim()) return;
-  const name = slug(branch);
-
-  const path = await worktreePath(neosh, status.repo.root, name);
+  const asked = args[0] ?? (await prompt(neosh, "Branch for the new worktree", { width: 70 }));
+  if (!asked || !asked.trim()) return;
+  const name = slug(asked);
+  const where = (args[1] ?? (await worktreePath(neosh, status.repo.root, name))).trim();
+  if (where === "") return;
 
   const taken = new Set((await neosh.git.branches({ includeRemote: true })).map((b) => b.name));
   const create = !taken.has(name);
 
-  const where = await prompt(neosh, "Create worktree at", { initial: path, width: 78 });
-  if (!where || !where.trim()) return;
-
   try {
-    await neosh.git.addWorktree(where.trim(), name, { create });
+    await neosh.git.addWorktree(where, name, { create });
   } catch (e) {
     neosh.notify(String(e), "error");
     return;
   }
-  // Landing in it is the point. Creating a directory you then have to find yourself is not a
-  // feature, it is a chore with extra steps.
-  await neosh.session.create({ cwd: where.trim() });
-  neosh.notify(`working in ${name}`);
+  await neosh.session.create({ cwd: where });
+  neosh.notify(`${create ? "branched" : "checked out"} ${name} in ${where}`);
 }
 
 /**

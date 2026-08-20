@@ -70,6 +70,35 @@ impl Git {
         &self.cwd
     }
 
+    /// What to call this checkout, and what it is a checkout *of*.
+    ///
+    /// Returns `(branch, main worktree)`. Both are needed to name a directory usefully, and
+    /// neither is [`Self::root`]: in a linked worktree `--show-toplevel` is the worktree itself,
+    /// so the repository's own name has to come from `--git-common-dir`, whose parent is the
+    /// original checkout.
+    ///
+    /// One `rev-parse` for both, and deliberately not [`Self::info`] — that runs a full
+    /// `git status`, which is the wrong price to pay for a label in a list.
+    pub async fn identity(&self) -> (Option<String>, Option<PathBuf>) {
+        let Ok(out) = self
+            .git(["rev-parse", "--path-format=absolute", "--git-common-dir", "--abbrev-ref", "HEAD"])
+            .await
+        else {
+            return (None, None);
+        };
+        let mut lines = out.stdout.lines().map(str::trim).filter(|l| !l.is_empty());
+        // `--git-common-dir` is the `.git` of the original checkout; its parent is that checkout.
+        // A bare repository has no parent worth naming, which `None` says.
+        let main = lines
+            .next()
+            .map(PathBuf::from)
+            .and_then(|g| g.parent().map(Path::to_path_buf))
+            .filter(|p| p.is_dir());
+        // `HEAD` on a detached head, which is not a branch name and should not be shown as one.
+        let branch = lines.next().filter(|b| *b != "HEAD").map(str::to_string);
+        (branch, main)
+    }
+
     async fn git<I, S>(&self, args: I) -> Result<Output, VcsError>
     where
         I: IntoIterator<Item = S>,

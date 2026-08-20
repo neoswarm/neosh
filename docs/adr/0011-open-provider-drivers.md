@@ -4,9 +4,9 @@
 
 ## Context
 
-The requirement was "support every model", explicitly modelled on t3code. Reading t3code's contracts
-showed the load-bearing idea: `ProviderDriverKind` is an **open branded slug**, not a closed enum,
-and drivers advertise per-model option descriptors that the UI renders generically.
+The requirement was "support every model". Surveying how existing multi-provider clients manage it
+turned up one load-bearing idea worth copying: the driver kind is an **open branded slug**, not a
+closed enum, and drivers advertise per-model option descriptors that the UI renders generically.
 
 ## Decision
 
