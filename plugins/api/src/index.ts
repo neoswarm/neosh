@@ -19,6 +19,8 @@ import type { BufferId } from "./generated/BufferId";
 import type { Capability } from "./generated/Capability";
 import type { CommitInfo } from "./generated/CommitInfo";
 import type { CommandEntry } from "./generated/CommandEntry";
+import type { AccountKind } from "./generated/AccountKind";
+import type { Brand } from "./generated/Brand";
 import type { CredentialInfo } from "./generated/CredentialInfo";
 import type { CredentialSource } from "./generated/CredentialSource";
 import type { CursorMotion } from "./generated/CursorMotion";
@@ -44,6 +46,7 @@ import type { Mode } from "./generated/Mode";
 import type { ModelEntry } from "./generated/ModelEntry";
 import type { ModelInfo } from "./generated/ModelInfo";
 import type { ModelSelection } from "./generated/ModelSelection";
+import type { ModelTier } from "./generated/ModelTier";
 import type { NamespaceId } from "./generated/NamespaceId";
 import type { OptionChoice } from "./generated/OptionChoice";
 import type { OptionEntry } from "./generated/OptionEntry";
@@ -79,10 +82,10 @@ import type { WindowLayout } from "./generated/WindowLayout";
 import type { WorktreeInfo } from "./generated/WorktreeInfo";
 
 export type {
-  ApiError, BranchInfo, BufferId, Capability, CommandEntry, CommitInfo, CredentialInfo,
-  CredentialSource, DiffTarget, Dock, CursorMotion, ExtmarkId, ExtmarkInfo, ExtmarkOpts, FileChange, FileState, FloatConfig,
+  AccountKind, ApiError, BranchInfo, Brand, BufferId, Capability, CommandEntry, CommitInfo,
+  CredentialInfo, CredentialSource, DiffTarget, Dock, CursorMotion, ExtmarkId, ExtmarkInfo, ExtmarkOpts, FileChange, FileState, FloatConfig,
   HighlightDef, HighlightSpec, HookName, HookOutcome, HookPayload, InstanceConfig, KeyContext,
-  KeymapEntry, KeymapScope, MessageLevel, Mode, ModelEntry, ModelInfo, ModelSelection, NamespaceId,
+  KeymapEntry, KeymapScope, MessageLevel, Mode, ModelEntry, ModelInfo, ModelSelection, ModelTier, NamespaceId,
   OptionChoice, OptionEntry, OptionSelection, OptionSpec, OptionType, OptionValue,
   Message, PermissionDecision, PluginEvent, Pricing, ProviderEvent, ProviderOptionDescriptor,
   Rect, RepoInfo, RepoStatus, SessionId, SessionInfo, StatusAlign, StatusSegment, StopReason,

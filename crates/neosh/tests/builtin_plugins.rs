@@ -362,9 +362,19 @@ fn the_model_picker_opens_and_lists_what_is_reachable() {
     let mut s = sb.start();
     s.wait_for("PROJECTS");
     s.ctrl("p");
-    // The instance is shown beside the model, because a model id is unique per instance and not
-    // globally. A picker that dropped it would have to guess which endpoint a row means.
-    s.wait_for("Mock  mock");
+    s.wait_for("Model");
+    let rows = s.picker_now();
+    // Two panes: providers on the left under the heading for what they cost, their models on the
+    // right. The heading is the whole point — a plan and a key are different things to spend, and
+    // one flat list could not say which a row was.
+    assert!(rows.iter().any(|l| l.contains("LOCAL")), "grouped by account\n{rows:?}");
+    assert!(
+        rows.iter().any(|l| l.contains("Mock") && l.contains('\u{2502}')),
+        "a rail entry and a model row on the same line\n{rows:?}"
+    );
+    // The model id is still there: it is unique per instance and not globally, so a picker that
+    // dropped it would have to guess which endpoint a row means.
+    assert!(rows.iter().any(|l| l.contains("mock")), "{rows:?}");
 }
 
 #[test]
@@ -380,7 +390,7 @@ fn a_picker_owns_its_navigation_keys_while_it_is_open() {
     let before = s.sidebar_now().iter().filter(|l| l.contains("New conversation")).count();
     let windows = s.open_windows().len();
     s.ctrl("p");
-    s.wait_for("Mock  mock");
+    s.wait_for("Model");
     s.ctrl("n");
     s.drain_for(Duration::from_secs(1));
     assert_eq!(
@@ -414,7 +424,7 @@ fn the_navigation_keys_can_be_rebound() {
     s.wait_for("PROJECTS");
 
     s.ctrl("p");
-    s.wait_for("Mock  mock");
+    s.wait_for("Model");
     // `<C-f>` now moves. There is one model in the mock catalogue, so what this proves is that the
     // key reaches the picker at all rather than falling through to the composer.
     s.ctrl("f");
@@ -760,6 +770,141 @@ export async function activate({ neosh }: PluginContext) {
 }
 "#;
 
+/// A driver with a full ladder in it: three rungs, plus one superseded model.
+const LADDER: &str = r#"
+import type { PluginContext } from "@neosh/api";
+
+const model = (id: string, name: string, tier: string, legacy: boolean) => ({
+  id,
+  display_name: name,
+  family: "rung",
+  tier,
+  legacy,
+  tagline: `the ${tier} one`,
+  capabilities: {
+    tools: false, vision: false, streaming: true, thinking: false, prompt_caching: false,
+    option_descriptors: [],
+  },
+});
+
+export async function activate({ neosh }: PluginContext) {
+  await neosh.provider.register("ladder", [{
+    id: "lab",
+    driver: "ladder",
+    display_name: "Lab",
+    models: [
+      model("big", "Big", "frontier", false),
+      model("mid", "Mid", "balanced", false),
+      model("small", "Small", "fast", false),
+      model("old", "Old", "balanced", true),
+    ],
+  }], async (_req, emit) => {
+    emit({ type: "message_start", model: "mid", usage: {} });
+    emit({ type: "message_stop" });
+  });
+
+  await neosh.cmd.register("lab.report", async () => {
+    const sel = await neosh.agent.selection();
+    neosh.notify(`selection: ${sel?.instance}/${sel?.model}`);
+  });
+  neosh.notify("ladder ready");
+}
+"#;
+
+fn install_ladder(sb: &Sandbox) {
+    let dir = sb.root.join("config/plugins/lab");
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    std::fs::write(
+        dir.join("plugin.toml"),
+        "name = \"lab\"\nversion = \"0.1.0\"\nentry = \"main.ts\"\npermissions = [\"providers\"]\n",
+    )
+    .expect("write manifest");
+    std::fs::write(dir.join("main.ts"), LADDER).expect("write plugin");
+}
+
+#[test]
+fn one_step_down_is_a_rung_not_a_list() {
+    // The whole reason models carry a tier. "Give me something cheaper" should be a keystroke, and
+    // it should stay on the provider you are already paying for.
+    let sb = Sandbox::new("ladder");
+    install_ladder(&sb);
+    sb.write_config("[options]\n\"agent.model\" = \"lab/big\"\n");
+    let mut s = sb.start_letting_config_choose();
+    s.wait_for("ladder ready");
+
+    s.send(&command("model.downgrade"));
+    s.wait_for("model: lab/Mid");
+    s.send(&command("model.downgrade"));
+    s.wait_for("model: lab/Small");
+
+    // No wrapping. A downgrade that teleports you to the most expensive thing in the catalogue is
+    // a keystroke you learn not to press.
+    s.send(&command("model.downgrade"));
+    s.wait_for("already the quickest one here");
+    s.send(&command("lab.report"));
+    s.wait_for("selection: lab/small");
+
+    s.send(&command("model.upgrade"));
+    s.wait_for("model: lab/Mid");
+}
+
+#[test]
+fn a_line_resolves_to_the_one_that_has_not_been_superseded() {
+    // "Use Opus" is a statement about a product line, not about a pinned id that goes stale. The
+    // superseded entry sits on the same rung as the current one, so picking wrongly is possible
+    // and would be silent.
+    let sb = Sandbox::new("line");
+    install_ladder(&sb);
+    sb.write_config("[options]\n\"agent.model\" = \"lab/small\"\n");
+    let mut s = sb.start_letting_config_choose();
+    s.wait_for("ladder ready");
+
+    s.send(&command_with("model.line", "rung"));
+    s.wait_for("model: lab/Big");
+    s.send(&command_with("model.line", "nonesuch"));
+    s.wait_for(r#"nothing reachable is in the "nonesuch" line"#);
+}
+
+#[test]
+fn superseded_models_are_folded_behind_a_count() {
+    // Reachable and out of the way. You go looking for last year's model to reproduce something,
+    // which is exactly when hiding it outright would be worst.
+    let sb = Sandbox::new("legacy");
+    install_ladder(&sb);
+    sb.write_config("[options]\n\"agent.model\" = \"lab/big\"\n");
+    let mut s = sb.start_letting_config_choose();
+    s.wait_for("ladder ready");
+
+    s.ctrl("p");
+    s.wait_for("Model");
+    let rows = s.picker_now();
+    assert!(rows.iter().any(|l| l.contains("Big")), "the current models are listed\n{rows:?}");
+    assert!(
+        rows.iter().any(|l| l.contains("1 superseded")),
+        "and the old one is behind a count\n{rows:?}"
+    );
+    assert!(
+        !rows.iter().any(|l| l.contains("Old")),
+        "which means it is not in the way\n{rows:?}"
+    );
+}
+
+#[test]
+fn the_rail_says_what_a_provider_costs_before_you_pick_from_it() {
+    // A plan you already pay for and a key billed per token are different decisions. The old flat
+    // list could not say which a row was, which is why "it says I have no API key" was reasonable.
+    let sb = Sandbox::new("accounts");
+    sb.write_config(NEEDS_A_KEY);
+    let mut s = sb.start();
+    s.wait_for("PROJECTS");
+    s.ctrl("p");
+    s.wait_for("Model");
+    let rows = s.picker_now();
+    assert!(rows.iter().any(|l| l.contains("API KEYS")), "grouped by account\n{rows:?}");
+    assert!(rows.iter().any(|l| l.contains("LOCAL")), "grouped by account\n{rows:?}");
+    assert!(rows.iter().any(|l| l.contains("Acme")), "the configured instance is on the rail\n{rows:?}");
+}
+
 #[test]
 fn a_driver_can_invent_an_option_and_the_switcher_renders_it() {
     let sb = Sandbox::new("invented");
@@ -946,11 +1091,22 @@ impl Session {
     }
 
     /// The sidebar buffer's current contents, folded the way a frontend folds splices.
+    /// The lines of the model picker, whatever pane they belong to.
+    fn picker_now(&self) -> Vec<String> {
+        let Some(buf) = self.buffer_named("[Model]") else { return Vec::new() };
+        self.lines_of(buf)
+    }
+
     fn sidebar_now(&self) -> Vec<String> {
-        let buf = match self.buffer_named("[sidebar]") {
-            Some(b) => b,
-            None => return Vec::new(),
-        };
+        match self.buffer_named("[sidebar]") {
+            Some(b) => self.lines_of(b),
+            None => Vec::new(),
+        }
+    }
+
+    /// Replay every edit to one buffer, so what comes back is what is on screen now rather than
+    /// everything that was ever drawn there.
+    fn lines_of(&self, buf: u64) -> Vec<String> {
         let mut lines: Vec<String> = Vec::new();
         for e in &self.events {
             if e["type"] != "buffer_lines" || e["buf"].as_u64() != Some(buf) {
@@ -1578,7 +1734,7 @@ fn the_caret_follows_what_you_type_into_a_picker() {
     s.wait_for("PROJECTS");
 
     s.ctrl("p");
-    s.wait_for("Mock  mock");
+    s.wait_for("Model");
     let win = s.window_showing("[Model]").expect("the picker window");
     for c in ["m", "o"] {
         s.key(c);

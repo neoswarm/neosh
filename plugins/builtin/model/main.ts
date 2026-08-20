@@ -8,16 +8,19 @@
  */
 
 import type {
+  AccountKind,
   CredentialInfo,
   CredentialSource,
   ModelEntry,
   ModelSelection,
+  ModelTier,
   Neosh,
   OptionSelection,
   PluginContext,
   ProviderOptionDescriptor,
 } from "@neosh/api";
-import { confirmDestructive, defineHighlights, picker } from "@neosh/api/ui";
+import type { RailItem } from "@neosh/api/ui";
+import { confirmDestructive, defineHighlights, picker, railPicker } from "@neosh/api/ui";
 
 type SelectDescriptor = Extract<ProviderOptionDescriptor, { type: "select" }>;
 
@@ -40,9 +43,23 @@ export async function activate({ neosh, subscriptions }: PluginContext) {
   await neosh.cmd.register("provider.auth", () => pickProvider(neosh), {
     desc: "Sign in to a provider, or forget a key",
   });
+  await neosh.cmd.register("model.upgrade", () => step(neosh, 1), {
+    desc: "Move up one rung — to the more capable model this provider serves",
+  });
+  await neosh.cmd.register("model.downgrade", () => step(neosh, -1), {
+    desc: "Move down one rung — cheaper and quicker",
+  });
+  await neosh.cmd.register("model.line", (args) => useLine(neosh, args[0]), {
+    desc: "Switch to the current model in a line — `model.line opus`",
+  });
 
   await neosh.keymap.set("chat", "<C-p>", "model.pick", { desc: "Pick a model" });
   await neosh.keymap.set("chat", "<C-e>", "model.options", { desc: "Pick reasoning effort" });
+  // Alt-arrows because they are unclaimed in every mode and mean "along an axis" in most editors.
+  // Rebind like anything else: every one of these is an ordinary command in the same table your
+  // own bindings live in.
+  await neosh.keymap.set("chat", "<A-Up>", "model.upgrade", { desc: "A more capable model" });
+  await neosh.keymap.set("chat", "<A-Down>", "model.downgrade", { desc: "A cheaper model" });
 
   // The footer. The model and its options belong beside the composer rather than on a settings
   // page: they are the two things you change mid-conversation.
@@ -89,6 +106,16 @@ let refreshFooter: () => Promise<void> = async () => {};
  */
 function describe(source: CredentialSource): string {
   switch (source.kind) {
+    // A plan. There is no key, which is the answer to "why does it say I have no API key".
+    case "plan":
+      return `your ${source.via} login`;
+    case "plan_missing":
+      return source.hint
+        ? `${source.program} is not installed — then \`${source.hint}\``
+        : `${source.program} is not installed`;
+    case "inherited":
+      return "signs in on its own";
+    // A key, and which of the four places it is coming from.
     case "env":
       return `$${source.var}`;
     case "keychain":
@@ -97,116 +124,196 @@ function describe(source: CredentialSource): string {
       return "this session only";
     case "command":
       return "credential helper";
-    case "inherited":
-      // The whole reason this instance is first in the catalogue, and the answer to "why does it
-      // say I have no API key" — you do not need one.
-      return "your CLI login — no key needed";
     case "not_needed":
-      return "local — no key needed";
+      return "no key needed";
     case "missing":
       return "needs a key";
   }
 }
 
-/** Instances by id, so a model row can say what will happen when you pick it. */
-async function credentialMap(neosh: Neosh): Promise<Map<string, CredentialInfo>> {
-  const rows = await neosh.agent.credentials().catch(() => [] as CredentialInfo[]);
-  return new Map(rows.map((r) => [r.instance, r]));
-}
-
-/** A model row, or the row that offers to sign you in to a provider with no key. */
-type Pick =
-  | { kind: "model"; instance: string; model: ModelEntry["model"] }
-  | { kind: "signin"; instance: string };
-
 async function pickModel(neosh: Neosh): Promise<void> {
-  // The host pairs each model with the instance that serves it. Guessing that here would be wrong
-  // whenever two instances offer the same model id — and wrong quietly, by sending the next turn to
-  // a different endpoint.
-  const [entries, current, creds] = await Promise.all([
-    neosh.agent.listModels(),
-    neosh.agent.selection(),
-    credentialMap(neosh),
+  const [creds, current, ascii, nerd] = await Promise.all([
+    neosh.agent.credentials().catch(() => [] as CredentialInfo[]),
+    neosh.agent.selection().catch(() => null),
+    // Defensively: a display setting that cannot be read must not stop the picker opening. It is
+    // decoration, and failing closed here would mean no way to change models at all.
+    neosh.opt.get<boolean>("ui.ascii_only").catch(() => false),
+    neosh.opt.get<boolean>("ui.nerd_font").catch(() => false),
   ]);
-
-  const showPricing = await neosh.opt.get<boolean>("model.picker.show_pricing");
-  const ready = (instance: string) => creds.get(instance)?.source.kind !== "missing";
-
-  const models = entries.map(({ instance, model }) => {
-    const cred = creds.get(instance);
-    const bits: string[] = [instance];
-    if (cred) bits.push(describe(cred.source));
-    if (model.capabilities?.thinking) bits.push("thinking");
-    if (showPricing && model.pricing) {
-      bits.push(`$${model.pricing.input_per_mtok}/$${model.pricing.output_per_mtok} per Mtok`);
-    }
-    return {
-      label: model.display_name,
-      detail: bits.join("  ·  "),
-      keywords: `${model.id} ${instance}`,
-      value: { kind: "model", instance, model } as Pick,
-      // Everything you can actually talk to, first. A list that opens on a model which will fail
-      // on send is a list that taught you the wrong thing about your own setup.
-      rank: ready(instance) ? 0 : 1,
-    };
-  });
-
-  // An endpoint with no key discovers no models, so without these rows OpenAI is not merely
-  // unusable — it is invisible, and there is nowhere to go to fix that.
-  const signin = [...creds.values()]
-    .filter((c) => c.driver_available && c.accepts_key && c.source.kind === "missing")
-    .filter((c) => !entries.some((e) => e.instance === c.instance))
-    .map((c) => ({
-      label: `Sign in to ${c.display_name}…`,
-      detail: "enter an API key",
-      keywords: c.instance,
-      value: { kind: "signin", instance: c.instance } as Pick,
-      rank: 2,
-    }));
-
-  const items = [...models, ...signin].sort((a, b) => a.rank - b.rank);
-  if (items.length === 0) {
-    neosh.notify("no models are reachable — try `neosh --list-models`", "warn");
+  if (creds.length === 0) {
+    neosh.notify("no providers are configured", "warn");
     return;
   }
+  const showPricing =
+    (await neosh.opt.get<boolean>("model.picker.show_pricing").catch(() => true)) ?? true;
+  const glyphs = { ascii: ascii ?? false, nerd: nerd ?? false };
 
-  const at = current
-    ? items.findIndex(
-        (i) =>
-          i.value.kind === "model" &&
-          i.value.model.id === current.model &&
-          i.value.instance === current.instance,
-      )
-    : 0;
+  // Grouped by what a turn spends. A plan you already pay for and a key billed per token are
+  // different decisions, and a flat list makes you read every row to tell which is which.
+  const order: AccountKind[] = ["plan", "api_key", "local"];
+  const rail: RailItem<CredentialInfo>[] = [];
+  for (const account of order) {
+    for (const c of creds.filter((x) => x.account === account)) {
+      rail.push({
+        mark: { text: markFor(c, glyphs), hl: c.brand?.hl ?? "Comment" },
+        label: c.display_name,
+        badge: badgeFor(c, glyphs),
+        group: headingFor(account),
+        // Listed, not hidden: a provider that vanished because its CLI is missing is a question
+        // with nowhere to ask it.
+        disabled: !c.driver_available,
+        value: c,
+      });
+    }
+  }
 
-  const chosen = await picker(neosh, items, {
+  const startAt = Math.max(0, rail.findIndex((r) => r.value.instance === current?.instance));
+
+  const chosen = await railPicker<CredentialInfo, ModelEntry>(neosh, {
     title: "Model",
-    selected: Math.max(0, at),
-    width: 76,
+    width: 88,
+    railWidth: 24,
+    height: 14,
+    rail,
+    railAt: startAt,
+    hints: "↵ use   ⇥ providers   s sign in   e effort   ^N/^P move   esc close",
+    placeholder: "nothing here yet — `s` to sign in",
+    async items(c) {
+      if (!c.driver_available) return [];
+      const entries = await neosh.agent.listModels(c.instance).catch(() => [] as ModelEntry[]);
+      return entries.map((e) => ({
+        label: e.model.display_name,
+        badge: e.model.tier ? { text: tierLabel(e.model.tier), hl: tierHl(e.model.tier) } : undefined,
+        detail: describeModel(e, showPricing),
+        keywords: `${e.model.id} ${e.model.family ?? ""}`,
+        // Last year's models are reachable and out of the way. You go looking for one to
+        // reproduce something, which is exactly when hiding it outright would be worst.
+        section: e.model.legacy ? "superseded" : undefined,
+        value: e,
+      }));
+    },
+    itemAt: (items) => Math.max(0, items.findIndex((i) => i.value.model.id === current?.model)),
+    async onKey(key, ctx) {
+      if (key.key.code.kind !== "char" || key.key.mods.ctrl || key.key.mods.alt) return;
+      if (key.key.code.c === "s") {
+        const c = ctx.rail;
+        if (!c) return "handled";
+        if (!c.accepts_key) {
+          neosh.notify(`${c.display_name}: ${describe(c.source)}`, "info");
+          return "handled";
+        }
+        return (await signIn(neosh, c.instance, c)) ? "reload" : "handled";
+      }
+      return undefined;
+    },
   });
   if (!chosen) return;
 
-  if (chosen.kind === "signin") {
-    if (!(await signIn(neosh, chosen.instance, creds.get(chosen.instance)))) return;
-    // Straight back to the list, which now has the models that endpoint serves in it. Making you
-    // press the key again would be making you ask twice for one thing.
-    await pickModel(neosh);
+  if (!creds.find((c) => c.instance === chosen.instance)?.source.kind.startsWith("plan")) {
+    const cred = creds.find((c) => c.instance === chosen.instance);
+    if (cred && cred.source.kind === "missing" && cred.accepts_key) {
+      if (!(await signIn(neosh, chosen.instance, cred))) return;
+    }
+  }
+  await use(neosh, chosen, current);
+}
+
+/**
+ * Move one rung along the capability ladder, within the provider you are already using.
+ *
+ * The provider is held fixed on purpose. "Give me something cheaper" is a question about the model;
+ * answering it by also moving you to a different endpoint — with different billing, possibly a
+ * different key — would be answering a question nobody asked.
+ *
+ * No wrapping. At the top, `upgrade` says so rather than dropping you to the cheapest thing in the
+ * catalogue, which is the kind of surprise that stops people using a key at all.
+ */
+async function step(neosh: Neosh, delta: number): Promise<void> {
+  const current = await neosh.agent.selection().catch(() => null);
+  if (!current) {
+    neosh.notify("no model is selected", "warn");
     return;
   }
-
-  // Picked something that cannot authenticate: offer the key now rather than at send time, when
-  // the failure is a wall of red between you and the question you were asking.
-  if (!ready(chosen.instance)) {
-    const cred = creds.get(chosen.instance);
-    if (cred?.accepts_key && !(await signIn(neosh, chosen.instance, cred))) return;
+  const entries = await neosh.agent.listModels(current.instance).catch(() => [] as ModelEntry[]);
+  const here = entries.find((e) => e.model.id === current.model);
+  const from = here?.model.tier;
+  if (!from) {
+    neosh.notify(`${current.model} is not on the ladder — nothing to step to`, "warn");
+    return;
   }
+  const rungs: ModelTier[] = ["fast", "balanced", "frontier"];
+  const at = rungs.indexOf(from) + delta;
+  const want = rungs[at];
+  if (!want) {
+    neosh.notify(delta > 0 ? "already the most capable one here" : "already the quickest one here");
+    return;
+  }
+  const next = best(entries.filter((e) => e.model.tier === want));
+  if (!next) {
+    neosh.notify(`${current.instance} has nothing on the ${tierLabel(want)} rung`, "warn");
+    return;
+  }
+  await use(neosh, next, current);
+}
 
-  // Carry over option values that still exist on the new model. Switching between two thinking
-  // models should keep your effort level; switching to one without the knob must drop it rather
-  // than send a value the driver will reject.
+/**
+ * Switch to the current model in a named line — `model.line opus`.
+ *
+ * A *line* is a product across versions; the best one in it is the newest that has not been
+ * superseded. That is the thing people mean by "use Opus": not a pinned id that goes stale, and not
+ * a picker they have to read.
+ *
+ * Looks in the provider you are on first, then anywhere reachable, so this works whether your Opus
+ * comes from a plan or a key.
+ */
+async function useLine(neosh: Neosh, line: string | undefined): Promise<void> {
+  if (!line) {
+    neosh.notify("model.line needs a line — try `model.line opus`", "warn");
+    return;
+  }
+  const current = await neosh.agent.selection().catch(() => null);
+  const wanted = line.trim().toLowerCase();
+  const matching = (entries: ModelEntry[]) =>
+    entries.filter((e) => (e.model.family ?? "").toLowerCase() === wanted);
+
+  let found = current
+    ? best(matching(await neosh.agent.listModels(current.instance).catch(() => [])))
+    : undefined;
+  if (!found) found = best(matching(await neosh.agent.listModels().catch(() => [])));
+  if (!found) {
+    neosh.notify(`nothing reachable is in the "${line}" line`, "warn");
+    return;
+  }
+  await use(neosh, found, current);
+}
+
+/**
+ * The one to use out of a set: current before superseded, then the most capable.
+ *
+ * Order within a rung is the catalogue's, which lists newest first — so "current" needs no version
+ * parsing, which is the thing that goes wrong the moment a vendor renames something.
+ */
+function best(entries: ModelEntry[]): ModelEntry | undefined {
+  const live = entries.filter((e) => !e.model.legacy);
+  const pool = live.length > 0 ? live : entries;
+  const rank = (e: ModelEntry) =>
+    e.model.tier === "frontier" ? 2 : e.model.tier === "balanced" ? 1 : 0;
+  return pool.reduce<ModelEntry | undefined>(
+    (win, e) => (win === undefined || rank(e) > rank(win) ? e : win),
+    undefined,
+  );
+}
+
+/** Put a selection into effect, carrying over the option values the new model also has. */
+async function use(
+  neosh: Neosh,
+  chosen: ModelEntry,
+  current: ModelSelection | null,
+): Promise<void> {
+  // Switching between two thinking models should keep your effort level; switching to one without
+  // the knob must drop it rather than send a value the driver will reject.
   const descriptors = chosen.model.capabilities?.option_descriptors ?? [];
   const keep = (current?.options ?? []).filter((o) => descriptors.some((d) => d.id === o.id));
-
   await neosh.agent.setSelection({
     instance: chosen.instance,
     model: chosen.model.id,
@@ -214,6 +321,66 @@ async function pickModel(neosh: Neosh): Promise<void> {
   });
   await refreshFooter();
   neosh.notify(`model: ${chosen.instance}/${chosen.model.display_name}`);
+}
+
+function headingFor(account: AccountKind): string {
+  if (account === "plan") return "PLANS";
+  return account === "api_key" ? "API KEYS" : "LOCAL";
+}
+
+/**
+ * The mark for a provider, at whatever fidelity this terminal has.
+ *
+ * Three levels rather than one, because a terminal is not one thing: a Nerd Font has a real brand
+ * glyph, a bare Unicode terminal has geometry, `ui.ascii_only` has a letter. Choosing badly is
+ * worse than choosing plainly — a box glyph where a logo should be reads as a broken program.
+ */
+function markFor(c: CredentialInfo, glyphs: { ascii: boolean; nerd: boolean }): string {
+  const b = c.brand;
+  if (!b) return glyphs.ascii ? "?" : "·";
+  if (glyphs.ascii) return b.ascii;
+  return (glyphs.nerd && b.nerd) || b.mark;
+}
+
+/** The state marker at the right edge of the rail. One column, four meanings. */
+function badgeFor(
+  c: CredentialInfo,
+  glyphs: { ascii: boolean },
+): { text: string; hl: string } | undefined {
+  if (!c.driver_available) return { text: glyphs.ascii ? "-" : "⨯", hl: "Comment" };
+  switch (c.source.kind) {
+    case "missing":
+    case "plan_missing":
+      return { text: "!", hl: "Account.Missing" };
+    case "not_needed":
+      return undefined;
+    case "plan":
+      return { text: glyphs.ascii ? "*" : "✓", hl: "Account.Plan" };
+    default:
+      return { text: glyphs.ascii ? "+" : "✓", hl: "Account.Key" };
+  }
+}
+
+/** The rung, as a word. Read down this column and you see the shape of what a provider offers. */
+function tierLabel(tier: ModelTier): string {
+  if (tier === "frontier") return "Frontier";
+  return tier === "balanced" ? "Balanced" : "Fast";
+}
+
+function tierHl(tier: ModelTier): string {
+  if (tier === "frontier") return "Accent";
+  return tier === "balanced" ? "Status.Working" : "Status.Done";
+}
+
+/** What a model row says about itself, beyond its name and rung. */
+function describeModel(e: ModelEntry, showPricing: boolean): string {
+  const bits: string[] = [];
+  if (e.model.tagline) bits.push(e.model.tagline);
+  if (showPricing && e.model.pricing) {
+    bits.push(`$${e.model.pricing.input_per_mtok}/$${e.model.pricing.output_per_mtok}`);
+  }
+  if (bits.length === 0) bits.push(String(e.model.id));
+  return bits.join("  ·  ");
 }
 
 /**
@@ -244,11 +411,11 @@ async function signIn(
 }
 
 /**
- * Every configured provider and the state of its key.
+ * Every configured provider and the state of its account.
  *
- * A settings page for the one setting people get stuck on. It lists instances that serve no models
- * yet, which is exactly the state you are in when you have not signed in — and therefore the state
- * the model picker cannot help you out of on its own.
+ * The same information the model picker's rail carries, as a page you can go to directly — for
+ * replacing a key, forgetting one, or finding out why a provider you expected is not offering
+ * anything.
  */
 async function pickProvider(neosh: Neosh): Promise<void> {
   const rows = await neosh.agent.credentials();
@@ -256,21 +423,25 @@ async function pickProvider(neosh: Neosh): Promise<void> {
     neosh.notify("no providers are configured", "warn");
     return;
   }
-  // Instances whose driver is missing are listed rather than hidden. The `claude` CLI not being
-  // installed is the single most likely reason someone's subscription is not showing up, and a
-  // provider that has silently vanished from the list is a question with nowhere to ask it.
+  // Unavailable drivers are listed rather than hidden. The `claude` CLI not being installed is the
+  // single most likely reason a subscription does not show up, and a provider that has silently
+  // vanished from the list is a question with nowhere to ask it.
+  const order = ["plan", "api_key", "local"] as const;
+  const sorted = order.flatMap((account) =>
+    rows
+      .filter((c) => c.account === account)
+      .sort((a, b) => Number(b.driver_available) - Number(a.driver_available)),
+  );
   const chosen = await picker(
     neosh,
-    [...rows]
-      .sort((a, b) => Number(b.driver_available) - Number(a.driver_available))
-      .map((c) => ({
-        label: c.display_name,
-        detail: c.driver_available
-          ? `${c.instance}  ·  ${describe(c.source)}`
-          : `${c.instance}  ·  its driver is not available here`,
-        keywords: c.instance,
-        value: c,
-      })),
+    sorted.map((c) => ({
+      label: c.display_name,
+      detail: c.driver_available
+        ? `${headingFor(c.account).toLowerCase()}  ·  ${describe(c.source)}`
+        : `${c.instance}  ·  its driver is not available here`,
+      keywords: c.instance,
+      value: c,
+    })),
     { title: "Providers", width: 76 },
   );
   if (!chosen) return;
@@ -280,6 +451,16 @@ async function pickProvider(neosh: Neosh): Promise<void> {
       chosen.driver === "claude-cli"
         ? "the `claude` CLI is not on your PATH — install it to use your Claude subscription"
         : `${chosen.display_name}: no plugin provides the "${chosen.driver}" driver`,
+      "warn",
+    );
+    return;
+  }
+  if (chosen.source.kind === "plan_missing") {
+    const { program, hint } = chosen.source;
+    neosh.notify(
+      hint
+        ? `${program} is not installed. Install it, then run \`${hint}\`.`
+        : `${program} is not installed.`,
       "warn",
     );
     return;
@@ -307,11 +488,10 @@ async function pickProvider(neosh: Neosh): Promise<void> {
     await signIn(neosh, chosen.instance, chosen);
     return;
   }
-  const ok = await confirmDestructive(
-    neosh,
-    `Forget the key for ${chosen.display_name}?`,
-    { yes: "Forget", no: "Keep" },
-  );
+  const ok = await confirmDestructive(neosh, `Forget the key for ${chosen.display_name}?`, {
+    yes: "Forget",
+    no: "Keep",
+  });
   if (!ok) return;
   await neosh.agent.forgetCredential(chosen.instance);
   await refreshFooter();

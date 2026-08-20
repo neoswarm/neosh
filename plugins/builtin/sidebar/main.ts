@@ -248,19 +248,6 @@ async function declareOptions(neosh: Neosh): Promise<void> {
     default: 4000,
     description: "How often to re-read the workspace when nothing has told us it changed.",
   });
-  await neosh.opt.declare({
-    name: "ui.motion",
-    type: { type: "bool" },
-    default: true,
-    description:
-      "Animate spinners and status pulses. Measured at ~1% of one core and under 1 KiB/s, so this is on even over SSH; turn it off if you prefer a still screen.",
-  });
-  await neosh.opt.declare({
-    name: "ui.ascii_only",
-    type: { type: "bool" },
-    default: false,
-    description: "Use ASCII for glyphs and spinners, for terminals without a decent font.",
-  });
 }
 
 // ---------------------------------------------------------------------------

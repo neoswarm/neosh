@@ -2268,6 +2268,60 @@ impl Host {
                 ),
             },
             OptionSpec {
+                name: "ui.keys.pane_next".into(),
+                ty: OptionType::Str,
+                default: OptionValue::Str("<Tab> <Right>".into()),
+                description: Some(
+                    "Move to the next pane of a two-pane widget — from the provider rail to the \
+                     models beside it. Shares `<Tab>` with `complete`, which is safe because no \
+                     widget has both: a rail has nothing to complete and a path field has no rail."
+                        .into(),
+                ),
+            },
+            OptionSpec {
+                name: "ui.keys.pane_prev".into(),
+                ty: OptionType::Str,
+                default: OptionValue::Str("<S-Tab> <Left>".into()),
+                description: Some("Move back a pane in a two-pane widget.".into()),
+            },
+            // Display settings every widget reads. Declared here rather than by whichever plugin
+            // happens to load first: two plugins declaring one name is an error, and a plugin that
+            // is switched off must not take the setting away from everything else — which is
+            // exactly what happened when the sidebar owned these and `plugins.disabled` was used.
+            OptionSpec {
+                name: "ui.ascii_only".into(),
+                ty: OptionType::Bool,
+                default: OptionValue::Bool(false),
+                description: Some(
+                    "Use ASCII for glyphs, spinners and provider marks, for terminals without a \
+                     decent font."
+                        .into(),
+                ),
+            },
+            OptionSpec {
+                name: "ui.motion".into(),
+                ty: OptionType::Bool,
+                default: OptionValue::Bool(true),
+                description: Some(
+                    "Animate spinners and status pulses. Measured at ~1% of one core and under \
+                     1 KiB/s, so this is on even over SSH; turn it off if you prefer a still \
+                     screen."
+                        .into(),
+                ),
+            },
+            OptionSpec {
+                name: "ui.nerd_font".into(),
+                ty: OptionType::Bool,
+                default: OptionValue::Bool(false),
+                description: Some(
+                    "Use Nerd Font glyphs where there is one — provider logos, chiefly. Off by \
+                     default and not detected: a terminal cannot be asked what its font contains, \
+                     and guessing wrong draws a row of boxes, which reads as a broken program \
+                     rather than as a missing font."
+                        .into(),
+                ),
+            },
+            OptionSpec {
                 name: "ui.confirm_destructive".into(),
                 ty: OptionType::Bool,
                 default: OptionValue::Bool(true),
