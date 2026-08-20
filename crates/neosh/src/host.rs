@@ -171,11 +171,12 @@ pub struct Host {
     /// Separate from the status line's so that redrawing the working line — which happens several
     /// times a second — cannot clear a mark on a message from ten turns ago.
     chat_ns: neosh_proto::NamespaceId,
-    /// The row the working line is on while a turn is in flight, and what it says.
+    /// Whether the working line is currently the last row of the chat buffer.
     ///
-    /// Held rather than searched for: the transcript grows underneath it as tools report in, and
-    /// scanning for "the line that looks like a spinner" is how you end up rewriting a message.
-    working: Option<Working>,
+    /// A fact about the buffer on screen, not about a turn: what the line *says* lives on the
+    /// [`Round`], because the turn it reports on may be running in a conversation you are not
+    /// looking at.
+    working: bool,
     /// What plugins put in the status line, by key.
     ///
     /// A `BTreeMap` so iteration order is deterministic; the render sorts by priority anyway, but a
@@ -183,7 +184,19 @@ pub struct Host {
     /// redraws.
     status_segments: std::collections::BTreeMap<String, neosh_proto::StatusSegment>,
 
-    active_turn: Option<CancellationToken>,
+    /// One cancellation token per conversation with a turn in flight.
+    ///
+    /// A map rather than an `Option`, because a turn belongs to a conversation and not to the
+    /// program. Switching used to be refused while one ran; now switching is just switching, and
+    /// `<Esc>` cancels the turn of the conversation you are looking at.
+    turns: std::collections::HashMap<neosh_proto::SessionId, CancellationToken>,
+    /// What each conversation with a turn in flight is doing, and what it has said so far in the
+    /// round it is in the middle of.
+    ///
+    /// Kept for every running conversation, on screen or not: a round's text only reaches
+    /// `session.messages` when its stream closes, so a transcript rebuilt from messages alone would
+    /// show a conversation that is visibly working and has said nothing.
+    rounds: std::collections::HashMap<neosh_proto::SessionId, Round>,
     /// Set while a multi-key sequence is half typed, so the loop knows to arm the timeout that
     /// eventually gives up on it.
     keys_pending: bool,
@@ -313,18 +326,27 @@ fn subject_of(_name: &str, input: &serde_json::Value) -> String {
     String::new()
 }
 
-/// The line that says a turn is in flight.
+/// A turn in flight, in whichever conversation it belongs to.
 ///
-/// It exists because the gap between pressing Enter and the first token is the longest silence in
-/// the program, and a still screen and a wedged process look identical. It carries an elapsed
-/// clock for the same reason: "working" with no number is indistinguishable from "stuck".
-struct Working {
+/// The working line exists because the gap between pressing Enter and the first token is the
+/// longest silence in the program, and a still screen and a wedged process look identical. It
+/// carries an elapsed clock for the same reason: "working" with no number is indistinguishable
+/// from "stuck".
+///
+/// This is per conversation rather than per screen, so that switching away from a turn and back
+/// shows the same clock it would have shown had you never left.
+struct Round {
     /// The word this turn is using. Chosen once per turn — a verb that changes every tick is a
     /// slot machine, and you end up watching it instead of thinking.
     verb: &'static str,
     started: std::time::Instant,
     /// What it is waiting on, when that is something other than the model.
     note: Option<String>,
+    /// Text streamed in the round now in progress.
+    ///
+    /// Cleared the moment that round's assistant message lands in the conversation, because from
+    /// then on the messages are the truth and this would be a second copy of them.
+    text: String,
 }
 
 // Deliberately no row index. The working line is *always the last line of the transcript* and
@@ -439,13 +461,14 @@ impl Host {
             status_ns,
             chat_ns,
             composer_ns,
-            working: None,
+            working: false,
             status_segments: Default::default(),
             hints: Default::default(),
             welcome_rows: 0,
             selection_pinned: false,
             acp_drivers: Vec::new(),
-            active_turn: None,
+            turns: std::collections::HashMap::new(),
+            rounds: std::collections::HashMap::new(),
             keys_pending: false,
             keys_touched: false,
             reading: false,
@@ -606,9 +629,7 @@ impl Host {
                 Ok(ApiOk::Unit)
             }
             ApiCall::AgentCancel => {
-                if let Some(t) = self.active_turn.take() {
-                    t.cancel();
-                }
+                self.cancel_turn_here();
                 Ok(ApiOk::Unit)
             }
             ApiCall::AgentGetSelection => {
@@ -701,14 +722,11 @@ impl Host {
                 self.persist_sessions();
                 Ok(ApiOk::Session { session: info })
             }
+            // Switching is never refused, including while a turn is running. A turn belongs to its
+            // conversation: it keeps streaming into that one's transcript, and what you see is
+            // rebuilt from the conversation you switched to. Waiting for a model to finish before
+            // you may look at something else is the workspace refusing to be a workspace.
             ApiCall::SessionSwitch { session } => {
-                if self.active_turn.is_some() {
-                    // The turn writes into the chat buffer as it streams; switching underneath it
-                    // would interleave one conversation's output into another's transcript.
-                    return Err(ApiError::Busy {
-                        message: "a turn is running — interrupt it first".into(),
-                    });
-                }
                 self.agent
                     .sessions()
                     .switch(&session)
@@ -720,11 +738,13 @@ impl Host {
             }
             ApiCall::SessionClose { session } => {
                 let closing_active = self.agent.sessions().active_id() == &session;
-                if closing_active && self.active_turn.is_some() {
-                    return Err(ApiError::Busy {
-                        message: "a turn is running — interrupt it first".into(),
-                    });
+                // Closing is the one case that does stop a turn: there is about to be nowhere to
+                // put its answer, and a stream writing into a conversation that no longer exists is
+                // a subprocess nobody can reach.
+                if let Some(t) = self.turns.remove(&session) {
+                    t.cancel();
                 }
+                self.rounds.remove(&session);
                 self.agent.sessions().remove(&session).map_err(|e| match e {
                     neosh_agent::store::StoreError::LastSession => {
                         ApiError::InvalidArgument { message: e.to_string() }
@@ -740,13 +760,11 @@ impl Host {
                 self.persist_sessions();
                 Ok(ApiOk::Unit)
             }
+            // Archiving does not stop a turn. Putting a conversation away is about the list you
+            // read, not about the work: it keeps its messages, and it keeps whatever it was in the
+            // middle of saying.
             ApiCall::SessionArchive { session, archived } => {
                 let leaving = archived && self.agent.sessions().active_id() == &session;
-                if leaving && self.active_turn.is_some() {
-                    return Err(ApiError::Busy {
-                        message: "a turn is running — interrupt it first".into(),
-                    });
-                }
                 // Archiving the only conversation you have is a reasonable thing to want, and
                 // "there is nowhere to go" is a bad answer to it. Somewhere to go is one line.
                 if leaving && self.agent.sessions().list().len() <= 1 {
@@ -907,33 +925,80 @@ impl Host {
         }
     }
 
+    /// The conversation on screen. Cloned rather than borrowed: everything that asks this goes on
+    /// to touch the store again, and holding the lock across that is how a deadlock is written.
+    fn active_session(&self) -> neosh_proto::SessionId {
+        self.agent.sessions().active_id().clone()
+    }
+
     fn start_turn(&mut self, text: String) {
+        let here = self.active_session();
+        self.start_turn_in(here, text);
+    }
+
+    /// Start a turn in a named conversation, drawing it only if it is the one on screen.
+    ///
+    /// Named rather than implied, because the caller is not always the keyboard: a turn that ends
+    /// with something still queued starts the next one, and by then you may be reading something
+    /// else entirely.
+    fn start_turn_in(&mut self, session: neosh_proto::SessionId, text: String) {
+        let on_screen = self.active_session() == session;
         // Typing while it works is steering, not an error. The old behaviour — refuse, and make you
         // wait with the sentence already written — is the one moment in the program where you know
         // exactly what you want to say and cannot say it.
-        if self.active_turn.is_some() {
-            self.agent.steer(text);
-            self.draw_working();
-            self.refresh_composer();
+        if self.turns.contains_key(&session) {
+            self.agent.steer(&session, text);
+            if on_screen {
+                self.draw_working();
+                self.refresh_composer();
+            }
             return;
         }
         let token = CancellationToken::new();
-        self.active_turn = Some(token.clone());
+        self.turns.insert(session.clone(), token.clone());
+        // Not random: the turn id would be ideal but is not known yet, and a clock read is the one
+        // varying thing already to hand. Per turn, so it does not change under you mid-answer.
+        let verb = VERBS
+            .get(now_secs().unsigned_abs() as usize % VERBS.len())
+            .copied()
+            .unwrap_or("Working");
+        self.rounds.insert(session.clone(), Round {
+            verb,
+            started: std::time::Instant::now(),
+            note: None,
+            text: String::new(),
+        });
         // Stamped here rather than inside the agent so `Session` stays clock-free and testable.
         // The turn id itself is set by the agent a moment later; a list only reads this while the
         // turn id is present, so the ordering is not observable.
-        self.agent.session().turn_started_at = Some(now_secs());
-        // Asking a question means you want to see the answer: scrolled-back state does not survive
-        // sending, or the reply arrives somewhere off screen.
-        self.scroll_chat(0);
-        self.chat_question(&text);
-        self.begin_working();
+        if let Some(s) = self.agent.sessions().get_mut(&session) {
+            s.turn_started_at = Some(now_secs());
+        }
+        if on_screen {
+            // Asking a question means you want to see the answer: scrolled-back state does not
+            // survive sending, or the reply arrives somewhere off screen.
+            self.scroll_chat(0);
+            self.chat_question(&text);
+            self.begin_working();
+        }
 
         let agent = self.agent.clone();
         let bridge = self.bridge.clone();
         tokio::spawn(async move {
-            agent.run_turn_with(&*bridge, text, token).await;
+            agent.run_turn_in(&*bridge, session, text, token).await;
         });
+    }
+
+    /// Stop the turn in the conversation on screen, if there is one.
+    fn cancel_turn_here(&mut self) -> bool {
+        let here = self.active_session();
+        match self.turns.remove(&here) {
+            Some(t) => {
+                t.cancel();
+                true
+            }
+            None => false,
+        }
     }
 
     /// Start an empty conversation without switching to it.
@@ -1317,7 +1382,7 @@ impl Host {
 
         // What you typed while it was working, waiting for a gap to be said in. This outranks the
         // shortcut row: an unsent sentence of yours is more urgent than a list of keys.
-        let queued = self.agent.steering_texts();
+        let queued = self.agent.steering_texts(&self.active_session());
         for (i, text) in queued.iter().take(2).enumerate() {
             let more = queued.len().saturating_sub(2);
             let tail = if i == 1 && more > 0 { format!("  (+{more} more)") } else { String::new() };
@@ -1662,8 +1727,7 @@ impl Host {
             return;
         }
         if key.code == KeyCode::Esc {
-            if let Some(t) = self.active_turn.take() {
-                t.cancel();
+            if self.cancel_turn_here() {
                 self.editor_message(MessageLevel::Info, "interrupted");
             }
             return;
@@ -2633,6 +2697,7 @@ impl Host {
         // that are on their way out would write into the conversation being left behind.
         self.answer = None;
         self.streaming = None;
+        self.working = false;
         self.chat_top = 0;
         let ascii = self.option_bool("ui.ascii_only");
         let (lines, marks, label) = {
@@ -2666,11 +2731,34 @@ impl Host {
         self.welcome_rows = 0;
         self.ensure_usable_selection();
         self.draw_welcome();
+        self.replay_round();
         self.set_composer("");
         self.refresh_status();
         self.bridge.broadcast(PluginEvent::SessionChanged {
             session: self.agent.sessions().active_id().clone(),
         });
+    }
+
+    /// Put back what a turn already said, for a conversation that is still mid-turn.
+    ///
+    /// The transcript is rebuilt from messages, and the round in progress is not in them yet — its
+    /// assistant message only lands when the stream closes. Without this, switching into a
+    /// conversation that is halfway through an answer shows the answer's first half missing and
+    /// the second half arriving out of nowhere.
+    ///
+    /// Text or the working line, never both, because that is what the live path does: the first
+    /// token takes the working line away.
+    fn replay_round(&mut self) {
+        let here = self.active_session();
+        if !self.turns.contains_key(&here) {
+            return;
+        }
+        let said = self.rounds.get(&here).map(|r| r.text.clone()).unwrap_or_default();
+        if said.is_empty() {
+            self.begin_working();
+        } else {
+            self.answer_text(&said);
+        }
     }
 
     /// Append streamed output, starting a new line when the kind of output changes.
@@ -2700,7 +2788,7 @@ impl Host {
     /// Where new content goes: the end, or the line above the working line when there is one.
     fn chat_end(&self) -> i64 {
         let n = self.editor.buffer(self.chat).map(|b| b.line_count() as i64).unwrap_or(0);
-        if self.working.is_some() { (n - 1).max(0) } else { n }
+        if self.working { (n - 1).max(0) } else { n }
     }
 
     /// Highlight a span of one transcript row.
@@ -2862,15 +2950,16 @@ impl Host {
     }
 
     /// Begin the working line, and pick this turn's word for it.
+    /// Put the working line at the end of the transcript, for the conversation on screen.
+    ///
+    /// Says nothing about starting a turn: the turn's own state is the [`Round`], which exists
+    /// whether or not you are looking at it. This is only the line.
     fn begin_working(&mut self) {
-        // Not random: the turn id would be ideal but is not known yet, and a clock read is the one
-        // varying thing already to hand. Per turn, so it does not change under you mid-answer.
-        let verb = VERBS
-            .get(now_secs().unsigned_abs() as usize % VERBS.len())
-            .copied()
-            .unwrap_or("Working");
+        if self.working {
+            return;
+        }
         self.chat_push(vec![String::new()]);
-        self.working = Some(Working { verb, started: std::time::Instant::now(), note: None });
+        self.working = true;
         self.draw_working();
     }
 
@@ -2881,7 +2970,11 @@ impl Host {
     /// here at all — the shimmer is the frontend's, running at its own rate over whatever this
     /// last wrote.
     fn draw_working(&mut self) {
-        let Some(w) = self.working.as_ref() else { return };
+        if !self.working {
+            return;
+        }
+        let here = self.active_session();
+        let Some(w) = self.rounds.get(&here) else { return };
         let (verb, note) = (w.verb, w.note.clone());
         let secs = w.started.elapsed().as_secs();
         let row = self.working_row();
@@ -2894,7 +2987,7 @@ impl Host {
         let label = note.as_deref().unwrap_or(verb);
         let mut text = format!("{glyph} {label}\u{2026}  {elapsed}");
         // What you typed while it was working, and the fact that it has not been said yet.
-        match self.agent.steering_count() {
+        match self.agent.steering_count(&here) {
             0 => {}
             1 => text.push_str("  \u{b7}  1 queued"),
             n => text.push_str(&format!("  \u{b7}  {n} queued")),
@@ -2921,11 +3014,11 @@ impl Host {
     /// Removed rather than blanked: it was never content, and a transcript that accumulates one
     /// empty row per turn is a transcript with a growing hole in it.
     fn end_working(&mut self) {
-        if self.working.is_none() {
+        if !self.working {
             return;
         }
         let row = self.working_row();
-        self.working = None;
+        self.working = false;
         let plugin = PluginId::from(BUILTIN);
         let _ = self.editor.apply(&plugin, ApiCall::MarkClear {
             ns: self.chat_ns,
@@ -2972,23 +3065,45 @@ impl Host {
         });
     }
 
+    /// Route one thing a turn did.
+    ///
+    /// Two jobs, and they are deliberately separate. *Bookkeeping* — what a conversation has said
+    /// so far, whether its turn is still running, what to persist — happens for every event
+    /// whatever is on screen. *Drawing* happens only when the event came from the conversation you
+    /// are looking at. That split is what lets several turns run at once without one of them
+    /// writing into another's transcript.
     fn handle_agent_event(&mut self, ev: AgentEvent) {
+        let on_screen = &self.active_session() == ev.session();
         match ev {
-            AgentEvent::TurnStarted { turn } => {
-                self.bridge.broadcast(PluginEvent::TurnStarted { turn });
+            AgentEvent::TurnStarted { session, turn } => {
+                self.bridge.broadcast(PluginEvent::TurnStarted { session, turn });
             }
-            AgentEvent::Token { turn, text } => {
-                self.answer_text(&text);
-                self.bridge.broadcast(PluginEvent::Token { turn, text });
+            AgentEvent::Token { session, turn, text } => {
+                if let Some(r) = self.rounds.get_mut(&session) {
+                    r.text.push_str(&text);
+                }
+                if on_screen {
+                    self.answer_text(&text);
+                }
+                self.bridge.broadcast(PluginEvent::Token { session, turn, text });
             }
-            AgentEvent::Thinking { turn, text } => {
-                if self.option_bool("chat.show_thinking") {
+            AgentEvent::Thinking { session, turn, text } => {
+                // Not accumulated, for the same reason `transcript` does not replay it: reasoning
+                // is shown live and reprinting it on a switch would bury the answer under the
+                // working out.
+                if on_screen && self.option_bool("chat.show_thinking") {
                     self.stream_into_chat(Stream::Thinking, &text);
                 }
-                self.bridge.broadcast(PluginEvent::ThinkingToken { turn, text });
+                self.bridge.broadcast(PluginEvent::ThinkingToken { session, turn, text });
             }
-            AgentEvent::ToolStarted { turn, call } => {
-                if self.option_bool("chat.show_tools") {
+            AgentEvent::ToolStarted { session, turn, call } => {
+                // The round's assistant message has landed in the conversation by now, so what was
+                // streamed is on record and this copy of it would only go stale.
+                if let Some(r) = self.rounds.get_mut(&session) {
+                    r.text.clear();
+                    r.note = Some(format!("Running {}", call.name));
+                }
+                if on_screen && self.option_bool("chat.show_tools") {
                     let glyph = self.glyphs().tool;
                     let text = format!("  {glyph} {}{}", call.name, tool_subject(&call));
                     let row = self.chat_push(vec![text.clone()]);
@@ -3001,21 +3116,21 @@ impl Host {
                     );
                     // The tool is what the turn is doing now, so the working line should say so
                     // rather than keep claiming the model is thinking.
-                    if let Some(w) = self.working.as_mut() {
-                        w.note = Some(format!("Running {}", call.name));
-                    }
                     self.draw_working();
                 }
-                self.bridge.broadcast(PluginEvent::ToolStarted { turn, call });
+                self.bridge.broadcast(PluginEvent::ToolStarted { session, turn, call });
             }
-            AgentEvent::ToolFinished { turn, call, result } => {
+            AgentEvent::ToolFinished { session, turn, call, result } => {
                 // Every call gets an answer under it, not just the failures. A card that says what
                 // ran and nothing about what came back is a card you have to take on trust, and
                 // "it ran" is not the thing you wanted to know.
                 //
                 // Errors show even with tool cards off: a tool that failed silently is a debugging
                 // session, and the setting is about noise, not about hiding failures.
-                if result.is_error || self.option_bool("chat.show_tools") {
+                if let Some(r) = self.rounds.get_mut(&session) {
+                    r.note = None;
+                }
+                if on_screen && (result.is_error || self.option_bool("chat.show_tools")) {
                     let g = self.glyphs();
                     let glyph = if result.is_error { g.fail } else { g.result };
                     let summary = tool_summary(&result);
@@ -3024,39 +3139,48 @@ impl Host {
                     let hl = if result.is_error { "Agent.ToolError" } else { "Agent.Usage" };
                     self.chat_mark(row, 0, text.len(), hl);
                 }
-                if let Some(w) = self.working.as_mut() {
-                    w.note = None;
+                if on_screen {
+                    self.draw_working();
                 }
-                self.draw_working();
-                self.bridge.broadcast(PluginEvent::ToolFinished { turn, call, result });
+                self.bridge.broadcast(PluginEvent::ToolFinished { session, turn, call, result });
             }
-            AgentEvent::TurnEnded { turn, stop_reason, usage } => {
-                self.close_answer();
-                self.end_working();
+            AgentEvent::TurnEnded { session, turn, stop_reason, usage } => {
+                if on_screen {
+                    self.close_answer();
+                    self.end_working();
+                    self.streaming = None;
+                }
                 // Queued after the last gap this turn had. It is a question that was asked and not
                 // yet answered, so it becomes the next turn rather than being quietly dropped.
-                let leftover = self.agent.take_steering();
-                self.active_turn = None;
-                {
-                    let mut s = self.agent.session();
+                let leftover = self.agent.take_steering(&session);
+                self.turns.remove(&session);
+                self.rounds.remove(&session);
+                if let Some(s) = self.agent.sessions().get_mut(&session) {
                     s.updated_at = now_secs();
                 }
                 self.persist_sessions();
-                self.streaming = None;
-                self.bridge.broadcast(PluginEvent::TurnEnded { turn, stop_reason, usage });
+                self.bridge.broadcast(PluginEvent::TurnEnded {
+                    session: session.clone(),
+                    turn,
+                    stop_reason,
+                    usage,
+                });
                 if !leftover.is_empty() {
-                    self.start_turn(leftover.join("\n"));
+                    self.start_turn_in(session, leftover.join("\n"));
                 }
             }
             AgentEvent::Steered { text, .. } => {
                 // Drawn now rather than when it was typed: until the model has been told, a
                 // transcript showing the question is a transcript that is lying about what was
-                // asked.
-                self.chat_question(&text);
-                self.draw_working();
-                self.refresh_composer();
+                // asked. Off screen it needs no drawing at all — it is in the conversation's
+                // messages, which is what a switch back rebuilds from.
+                if on_screen {
+                    self.chat_question(&text);
+                    self.draw_working();
+                    self.refresh_composer();
+                }
             }
-            AgentEvent::Notice { level, text } => self.editor_message(level, text),
+            AgentEvent::Notice { level, text, .. } => self.editor_message(level, text),
         }
     }
 
@@ -3306,7 +3430,7 @@ impl Host {
                     keys.as_mut().reset(Instant::now() + Duration::from_millis(ms));
                 }
             }
-            if self.working.is_some() && !ticking {
+            if self.working && !ticking {
                 clock.as_mut().reset(Instant::now() + Duration::from_secs(1));
                 ticking = true;
             }
@@ -3656,8 +3780,7 @@ impl Host {
             self.quit_armed = None;
             return;
         }
-        if let Some(t) = self.active_turn.take() {
-            t.cancel();
+        if self.cancel_turn_here() {
             self.quit_armed = None;
             self.editor_message(MessageLevel::Info, "interrupted");
             return;

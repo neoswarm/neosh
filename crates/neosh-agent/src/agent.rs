@@ -12,12 +12,13 @@
 //! * **A driver that runs its own loop gets no tool list.** Sending ours to an agent driver would
 //!   advertise tools it cannot call.
 
+use std::path::Path;
 use std::sync::Arc;
 
 use futures::StreamExt;
 use neosh_proto::{
     ContentBlock, HookName, HookOutcome, HookPayload, Message, MessageLevel, ModelSelection, Role,
-    StopReason, ToolCall, ToolCallId, ToolResult, TurnId, TurnRequest, Usage,
+    SessionId, StopReason, ToolCall, ToolCallId, ToolResult, TurnId, TurnRequest, Usage,
 };
 use neosh_provider::ProviderRegistry;
 use tokio::sync::mpsc;
@@ -38,21 +39,42 @@ use crate::PluginBridge;
 const MAX_TOOL_ROUNDS: usize = 32;
 
 /// Everything the host needs to render or forward.
+///
+/// Every variant says which conversation it came from. Turns run per conversation and several can
+/// be in flight at once, so a receiver that assumed "the current one" would write one
+/// conversation's answer into another's transcript — which is exactly the bug switching used to be
+/// refused in order to avoid.
 #[derive(Debug, Clone, PartialEq)]
 pub enum AgentEvent {
-    TurnStarted { turn: TurnId },
-    Token { turn: TurnId, text: String },
-    Thinking { turn: TurnId, text: String },
-    ToolStarted { turn: TurnId, call: ToolCall },
-    ToolFinished { turn: TurnId, call: ToolCall, result: ToolResult },
-    TurnEnded { turn: TurnId, stop_reason: StopReason, usage: Usage },
+    TurnStarted { session: SessionId, turn: TurnId },
+    Token { session: SessionId, turn: TurnId, text: String },
+    Thinking { session: SessionId, turn: TurnId, text: String },
+    ToolStarted { session: SessionId, turn: TurnId, call: ToolCall },
+    ToolFinished { session: SessionId, turn: TurnId, call: ToolCall, result: ToolResult },
+    TurnEnded { session: SessionId, turn: TurnId, stop_reason: StopReason, usage: Usage },
     /// A message typed while the turn was running has been taken into it.
     ///
     /// Emitted at the moment it enters the conversation rather than when it was typed, because
     /// until then it is a draft the user can still change their mind about — and a transcript that
     /// shows a question the model has not been told about is a transcript that is lying.
-    Steered { turn: TurnId, text: String },
-    Notice { level: MessageLevel, text: String },
+    Steered { session: SessionId, turn: TurnId, text: String },
+    Notice { session: SessionId, level: MessageLevel, text: String },
+}
+
+impl AgentEvent {
+    /// Which conversation this belongs to, for a receiver deciding whether to draw it.
+    pub fn session(&self) -> &SessionId {
+        match self {
+            Self::TurnStarted { session, .. }
+            | Self::Token { session, .. }
+            | Self::Thinking { session, .. }
+            | Self::ToolStarted { session, .. }
+            | Self::ToolFinished { session, .. }
+            | Self::TurnEnded { session, .. }
+            | Self::Steered { session, .. }
+            | Self::Notice { session, .. } => session,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -76,11 +98,6 @@ pub struct Agent {
     /// Swappable, because a config reload can tighten permissions and a layer fixed at launch
     /// would report success while changing nothing.
     permissions: Arc<std::sync::RwLock<Arc<PermissionLayer>>>,
-    /// Things typed while a turn was running, waiting for a gap to be said in.
-    ///
-    /// Its own lock, and never held across an await: the turn loop drains it between rounds, and
-    /// the keyboard adds to it from a completely different task.
-    steering: Arc<std::sync::Mutex<Vec<String>>>,
     events: mpsc::UnboundedSender<AgentEvent>,
 }
 
@@ -98,7 +115,6 @@ impl Agent {
                 hooks: Arc::new(std::sync::RwLock::new(HookRegistry::new())),
                 providers: Arc::new(std::sync::RwLock::new(providers)),
                 permissions: Arc::new(std::sync::RwLock::new(permissions)),
-                steering: Arc::default(),
                 events: tx,
             },
             rx,
@@ -169,6 +185,15 @@ impl Agent {
         let _ = self.events.send(ev);
     }
 
+    /// Reach one conversation by id, whether or not it is the one on screen.
+    ///
+    /// `None` means it has been closed. That can happen while its own turn is still running, and
+    /// it is a reason for the turn to stop rather than a reason to panic.
+    fn with<T>(&self, id: &SessionId, f: impl FnOnce(&mut Session) -> T) -> Option<T> {
+        let mut store = self.sessions();
+        store.get_mut(id).map(f)
+    }
+
     /// Say something to a turn that is already running.
     ///
     /// It is taken into the conversation at the next gap — between one round of tool calls and the
@@ -178,23 +203,39 @@ impl Agent {
     /// Not injected into the provider stream, because a stream in flight cannot be interrupted
     /// without discarding what has already been generated. The gap between rounds is the earliest
     /// honest moment.
-    pub fn steer(&self, text: String) {
-        self.steering.lock().expect("steering lock poisoned").push(text);
+    ///
+    /// Addressed to a conversation, because what you type belongs to the one you typed it in — not
+    /// to whichever turn happens to reach a gap first.
+    pub fn steer(&self, session: &SessionId, text: String) {
+        self.with(session, |s| s.steering.push(text));
     }
 
     /// Whether anything is waiting to be said.
-    pub fn steering_count(&self) -> usize {
-        self.steering.lock().expect("steering lock poisoned").len()
+    pub fn steering_count(&self, session: &SessionId) -> usize {
+        self.with(session, |s| s.steering.len()).unwrap_or(0)
     }
 
     /// What is waiting, without taking it. For drawing it.
-    pub fn steering_texts(&self) -> Vec<String> {
-        self.steering.lock().expect("steering lock poisoned").clone()
+    pub fn steering_texts(&self, session: &SessionId) -> Vec<String> {
+        self.with(session, |s| s.steering.clone()).unwrap_or_default()
     }
 
     /// Take what is waiting, leaving the queue empty.
-    pub fn take_steering(&self) -> Vec<String> {
-        std::mem::take(&mut *self.steering.lock().expect("steering lock poisoned"))
+    pub fn take_steering(&self, session: &SessionId) -> Vec<String> {
+        self.with(session, |s| std::mem::take(&mut s.steering)).unwrap_or_default()
+    }
+
+    /// The policy, rooted at the directory a turn is running in.
+    ///
+    /// The shared layer's root follows the conversation on screen, which is right for a plugin
+    /// asking a question and wrong for a turn: the turn may not be the one on screen, and by the
+    /// time it finishes it may not be the one on screen either.
+    fn permissions_in(&self, cwd: &Path) -> Arc<PermissionLayer> {
+        let base = self.permissions();
+        if cwd.as_os_str().is_empty() || base.workspace() == cwd {
+            return base;
+        }
+        Arc::new(base.rooted_at(cwd))
     }
 
     pub fn selection(&self) -> Option<ModelSelection> {
@@ -319,25 +360,44 @@ impl Agent {
         }
     }
 
-    /// Run one user turn to completion, with a caller-supplied cancellation token.
-    ///
-    /// The host owns the token so it can interrupt a turn without taking the lock the turn itself
-    /// holds — otherwise `<Esc>` would have to wait for the thing it is trying to stop.
+    /// Run one user turn to completion in the conversation on screen.
     pub async fn run_turn(&self, bridge: &dyn PluginBridge, text: String) -> TurnOutcome {
         self.run_turn_with(bridge, text, CancellationToken::new()).await
     }
 
+    /// The same, with a caller-supplied cancellation token.
+    ///
+    /// The host owns the token so it can interrupt a turn without taking the lock the turn itself
+    /// holds — otherwise `<Esc>` would have to wait for the thing it is trying to stop.
     pub async fn run_turn_with(
         &self,
         bridge: &dyn PluginBridge,
         text: String,
         cancel: CancellationToken,
     ) -> TurnOutcome {
+        let session = self.sessions().active_id().clone();
+        self.run_turn_in(bridge, session, text, cancel).await
+    }
+
+    /// Run one user turn to completion **in a named conversation**.
+    ///
+    /// Every read and write goes through the id rather than through "the active session", so the
+    /// turn is unaffected by switching, and several turns can be in flight in different
+    /// conversations at once. The conversation may even be closed underneath it; that reads as a
+    /// cancellation, because there is nowhere left to put the answer.
+    pub async fn run_turn_in(
+        &self,
+        bridge: &dyn PluginBridge,
+        session: SessionId,
+        text: String,
+        cancel: CancellationToken,
+    ) -> TurnOutcome {
         let turn = TurnId::new();
-        self.session().active_turn = Some(turn.clone());
+        self.with(&session, |s| s.active_turn = Some(turn.clone()));
 
         let end = |me: &Self, stop: StopReason, usage: Usage| {
             me.emit(AgentEvent::TurnEnded {
+                session: session.clone(),
                 turn: turn.clone(),
                 stop_reason: stop.clone(),
                 usage,
@@ -355,8 +415,9 @@ impl Agent {
         )
         .await;
         if let HookOutcome::Veto { reason } = outcome {
-            self.session().active_turn = None;
+            self.with(&session, |s| s.active_turn = None);
             self.emit(AgentEvent::Notice {
+                session: session.clone(),
                 level: MessageLevel::Warn,
                 text: format!("turn blocked: {reason}"),
             });
@@ -371,11 +432,12 @@ impl Agent {
             text: text.clone(),
         });
 
-        self.emit(AgentEvent::TurnStarted { turn: turn.clone() });
-        self.session().push_user_text(text);
+        self.emit(AgentEvent::TurnStarted { session: session.clone(), turn: turn.clone() });
+        self.with(&session, |s| s.push_user_text(text));
 
-        let Some(selection) = self.selection() else {
-            self.session().active_turn = None;
+        let selection = self.with(&session, |s| s.selection.clone()).flatten();
+        let Some(selection) = selection else {
+            self.with(&session, |s| s.active_turn = None);
             return end(
                 self,
                 StopReason::Error { message: "no model selected".into() },
@@ -409,13 +471,18 @@ impl Agent {
 
             // One guard, not two: temporaries in a struct literal live to the end of the
             // statement, so taking the session lock twice here would deadlock against itself.
-            let (cwd, system, messages) = {
-                let sess = self.session();
-                (sess.cwd.clone(), sess.system.clone(), sess.messages.clone())
+            let Some((cwd, system, messages)) =
+                self.with(&session, |s| (s.cwd.clone(), s.system.clone(), s.messages.clone()))
+            else {
+                // Closed while its own turn was running. There is nowhere to put the answer, so
+                // this is a cancellation rather than an error to report into a transcript that no
+                // longer exists.
+                stop = StopReason::Cancelled;
+                break;
             };
             let request = TurnRequest {
                 selection: selection.clone(),
-                cwd,
+                cwd: cwd.clone(),
                 system,
                 messages,
                 // An agent driver brings its own tools; advertising ours would list tools it
@@ -440,13 +507,18 @@ impl Agent {
                 let Some(ev) = next else { break };
                 for update in assembler.push(ev) {
                     match update {
-                        TurnUpdate::Text { text } => {
-                            self.emit(AgentEvent::Token { turn: turn.clone(), text })
-                        }
-                        TurnUpdate::Thinking { text } => {
-                            self.emit(AgentEvent::Thinking { turn: turn.clone(), text })
-                        }
+                        TurnUpdate::Text { text } => self.emit(AgentEvent::Token {
+                            session: session.clone(),
+                            turn: turn.clone(),
+                            text,
+                        }),
+                        TurnUpdate::Thinking { text } => self.emit(AgentEvent::Thinking {
+                            session: session.clone(),
+                            turn: turn.clone(),
+                            text,
+                        }),
                         TurnUpdate::Error { message, .. } => self.emit(AgentEvent::Notice {
+                            session: session.clone(),
                             level: MessageLevel::Error,
                             text: message,
                         }),
@@ -462,11 +534,10 @@ impl Agent {
             let calls = assembler.tool_calls();
             let (message, this_stop, usage) = assembler.finish();
             total.merge(&usage);
-            {
-                let mut sess = self.session();
-                sess.add_usage(&usage);
-                sess.push_assistant(message);
-            }
+            self.with(&session, |s| {
+                s.add_usage(&usage);
+                s.push_assistant(message);
+            });
 
             if cancelled {
                 stop = StopReason::Cancelled;
@@ -477,7 +548,7 @@ impl Agent {
                 // Nothing left to do — unless somebody typed while it was working. Carrying on
                 // rather than ending is the whole point: a follow-up that starts a new turn has
                 // lost the chance to change what this one does.
-                if cancel.is_cancelled() || !self.take_steering_into(&turn) {
+                if cancel.is_cancelled() || !self.take_steering_into(&session, &turn) {
                     break;
                 }
                 continue;
@@ -489,12 +560,12 @@ impl Agent {
                     break;
                 }
                 let call = ToolCall { id: id.clone(), turn: turn.clone(), name, input };
-                results.push((id, self.run_tool(bridge, call, &cancel).await));
+                results.push((id, self.run_tool(bridge, &session, &cwd, call, &cancel).await));
             }
-            self.session().push_tool_results(results);
+            self.with(&session, |s| s.push_tool_results(results));
             // The gap between rounds: the model is about to be asked again anyway, so anything
             // typed since the last one rides along with the tool results.
-            self.take_steering_into(&turn);
+            self.take_steering_into(&session, &turn);
 
             if round + 1 == MAX_TOOL_ROUNDS {
                 stop = StopReason::Error {
@@ -503,7 +574,7 @@ impl Agent {
             }
         }
 
-        self.session().active_turn = None;
+        self.with(&session, |s| s.active_turn = None);
         self.observe(bridge, HookName::TurnPost, HookPayload::TurnPost {
             turn: turn.clone(),
             stop_reason: stop.clone(),
@@ -513,14 +584,18 @@ impl Agent {
     }
 
     /// Move anything queued into the conversation. Returns whether there was anything.
-    fn take_steering_into(&self, turn: &TurnId) -> bool {
-        let queued = self.take_steering();
+    fn take_steering_into(&self, session: &SessionId, turn: &TurnId) -> bool {
+        let queued = self.take_steering(session);
         if queued.is_empty() {
             return false;
         }
         for text in queued {
-            self.session().push_user_text(text.clone());
-            self.emit(AgentEvent::Steered { turn: turn.clone(), text });
+            self.with(session, |s| s.push_user_text(text.clone()));
+            self.emit(AgentEvent::Steered {
+                session: session.clone(),
+                turn: turn.clone(),
+                text,
+            });
         }
         true
     }
@@ -529,6 +604,8 @@ impl Agent {
     async fn run_tool(
         &self,
         bridge: &dyn PluginBridge,
+        session: &SessionId,
+        cwd: &Path,
         call: ToolCall,
         cancel: &CancellationToken,
     ) -> ToolResult {
@@ -552,6 +629,7 @@ impl Agent {
             // The model is told, so it can explain or route around the refusal rather than
             // silently losing the call.
             self.emit(AgentEvent::ToolFinished {
+                session: session.clone(),
                 turn: call.turn.clone(),
                 call: call.clone(),
                 result: result.clone(),
@@ -569,7 +647,11 @@ impl Agent {
             _ => call,
         };
 
-        self.emit(AgentEvent::ToolStarted { turn: call.turn.clone(), call: call.clone() });
+        self.emit(AgentEvent::ToolStarted {
+            session: session.clone(),
+            turn: call.turn.clone(),
+            call: call.clone(),
+        });
 
         // Resolve the handler and release the registry lock before running it: a tool that
         // calls back into the API must not find the registry it came from locked.
@@ -584,7 +666,10 @@ impl Agent {
                         turn: Some(call.turn.clone()),
                     };
                     let ctx = ToolCtx {
-                        permissions: self.permissions(),
+                        // Rooted at the conversation this turn belongs to, not at whichever one is
+                        // on screen: `src/main.rs` has to mean the same file for the whole turn,
+                        // however much switching happens while it runs.
+                        permissions: self.permissions_in(cwd),
                         // Only offer to ask if something is actually listening; otherwise `permit`
                         // would wait on a hook nobody registered.
                         approve: (!approver.hooks.is_empty()).then_some(&approver as &dyn crate::tools::Approver),
@@ -604,6 +689,7 @@ impl Agent {
         };
 
         self.emit(AgentEvent::ToolFinished {
+            session: session.clone(),
             turn: call.turn.clone(),
             call: call.clone(),
             result: result.clone(),

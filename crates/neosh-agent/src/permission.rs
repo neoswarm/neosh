@@ -81,6 +81,17 @@ impl PermissionLayer {
         self.workspace = workspace.into();
     }
 
+    /// The same policy, resolving relative paths against a different root.
+    ///
+    /// [`set_workspace`](Self::set_workspace) moves the one shared layer, which is the right answer
+    /// for a plugin asking a question outside any turn. It is the wrong answer for a turn: several
+    /// conversations can be running at once, in different projects, and a root set by whichever
+    /// switch happened last would let one turn's `src/main.rs` resolve into another turn's tree.
+    /// A turn takes a view rooted at its own conversation instead.
+    pub fn rooted_at(&self, workspace: impl Into<PathBuf>) -> Self {
+        Self { workspace: workspace.into(), ..self.clone() }
+    }
+
     /// Resolve a possibly-relative path and confirm it stays inside an allowed root.
     ///
     /// Returns the resolved path on success. `None` means the path escapes every root, by any

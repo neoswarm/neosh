@@ -460,6 +460,35 @@ Drivers that run their own loop (`claude-cli`, `codex-cli`) have exactly one rou
 so steering them means the message lands as the next turn. That is a property of those CLIs, not a
 setting.
 
+What is queued belongs to the conversation you typed it in. Switch away and it stays there, waiting
+for that turn's next gap.
+
+### Working on more than one thing at once
+
+A turn belongs to its conversation, not to the program. Several run at once, and switching between
+them is never refused — `^T` to move, or `↵` on any row of the project panel, with a model still
+answering behind you.
+
+A conversation that is working says so wherever it appears. In the panel it carries `◍` and the time
+its turn has been running; the one you are in gets the spinner:
+
+```
+ ♥ ▾ neosh                        3
+     ▸ the flaky test in ci     1m 4s
+       ◍ rename the extmark api    22s
+       a question from yesterday   3h
+```
+
+Switching back puts you in the middle of the answer rather than before it: what the turn has already
+said is redrawn, with the elapsed clock still counting from when it started. `Esc` and `^C` interrupt
+the turn of the conversation you are looking at — the only one you could have meant.
+
+Closing a conversation cancels its turn, because there is about to be nowhere to put the answer.
+Archiving does not: putting a conversation away is about the list you read, not about the work.
+
+Sending twice in *one* conversation is still steering rather than a second turn. That is a different
+question, and the answer to it is above.
+
 ### What the agent may do
 
 The footer says what the agent is allowed to do without asking, and `⇧⇥` changes it:

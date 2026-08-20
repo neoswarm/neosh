@@ -256,6 +256,17 @@ export async function activate({ neosh }: PluginContext) {
       neosh.notify(`switch failed: ${e}`);
     }
   });
+  await neosh.cmd.register("t.other", async () => {
+    const all = await neosh.session.list();
+    const other = all.find((s) => !s.is_active);
+    if (!other) { neosh.notify("nowhere else to go"); return; }
+    try {
+      await neosh.session.switch(other.id);
+      neosh.notify(`switched to ${other.label}`);
+    } catch (e) {
+      neosh.notify(`switch failed: ${e}`);
+    }
+  });
   await neosh.cmd.register("t.list", async () => {
     const all = await neosh.session.list();
     neosh.notify(`sessions: ${all.map((s) => `${s.is_active ? "*" : ""}${s.label}`).join(" | ")}`);
@@ -595,12 +606,9 @@ fn clean_neither_reads_nor_writes_conversations() {
     );
 }
 
-#[test]
-fn switching_while_a_turn_is_running_is_refused_rather_than_interleaved() {
-    // The turn streams into the chat buffer; switching underneath it would put one conversation's
-    // output into another's transcript.
-    let sb = Sandbox::new("busy");
-    install_driver(&sb);
+/// A conversation with a model that says one word and then never finishes, and a second one that
+/// answers straight away. Between them they can prove a turn is a property of a conversation.
+fn install_slow(sb: &Sandbox) {
     let dir = sb.root.join("config/plugins/slow");
     std::fs::create_dir_all(&dir).expect("mkdir");
     std::fs::write(
@@ -613,24 +621,45 @@ fn switching_while_a_turn_is_running_is_refused_rather_than_interleaved() {
         r#"
 import type { PluginContext } from "@neosh/api";
 export async function activate({ neosh }: PluginContext) {
-  // Starts a turn and never finishes it, so the turn is reliably still in flight.
   await neosh.provider.register("slow", [{
     id: "slow", driver: "slow", display_name: "Slow",
-    models: [{ id: "slow", display_name: "Slow" }],
-  }], async (_req, emit) => {
-    emit({ type: "message_start", model: "slow", usage: {} });
+    models: [{ id: "slow", display_name: "Slow" }, { id: "quick", display_name: "Quick" }],
+  }], async (req, emit) => {
+    emit({ type: "message_start", model: req.selection.model, usage: {} });
     emit({ type: "block_start", index: 0, block: { kind: "text" } });
+    if (req.selection.model === "quick") {
+      emit({ type: "text_delta", index: 0, text: "answered right away" });
+      emit({ type: "block_stop", index: 0 });
+      emit({ type: "message_delta", stop_reason: { kind: "end_turn" }, usage: {} });
+      emit({ type: "message_stop" });
+      return;
+    }
+    // Says one word and then never finishes, so the turn is reliably still in flight.
     emit({ type: "text_delta", index: 0, text: "thinking" });
   });
   await neosh.cmd.register("t.useSlow", async () => {
     await neosh.agent.setSelection({ instance: "slow", model: "slow", options: [] });
     neosh.notify("using slow");
   });
+  await neosh.cmd.register("t.useQuick", async () => {
+    await neosh.agent.setSelection({ instance: "slow", model: "quick", options: [] });
+    neosh.notify("using quick");
+  });
   neosh.notify("slow ready");
 }
 "#,
     )
     .expect("plugin");
+}
+
+#[test]
+fn switching_away_from_a_running_turn_leaves_it_running_where_it_belongs() {
+    // Switching used to be refused while a turn ran, to stop one conversation's output landing in
+    // another's transcript. The refusal was the wrong half of the fix: route the output, and
+    // switching is just switching.
+    let sb = Sandbox::new("switch-busy");
+    install_driver(&sb);
+    install_slow(&sb);
 
     let mut s = sb.start();
     s.wait_for("driver ready");
@@ -644,8 +673,74 @@ export async function activate({ neosh }: PluginContext) {
     s.enter();
     s.wait_for("thinking");
 
-    s.command("t.oldest");
-    s.wait_for("a turn is running");
+    s.command("t.other");
+    s.wait_for("switched to");
+    assert!(
+        s.pump(|s| !s.chat_now().iter().any(|l| l.contains("hang please"))),
+        "the other conversation is not asked the question\n{:?}",
+        s.chat_now()
+    );
+    assert!(
+        !s.chat_now().iter().any(|l| l.contains("thinking")),
+        "and does not receive its answer either\n{:?}",
+        s.chat_now()
+    );
+
+    s.command("t.other");
+    assert!(
+        s.pump(|s| s.chat_now().iter().any(|l| l.contains("thinking"))),
+        "coming back puts you in the middle of the answer, not before it\n{:?}",
+        s.chat_now()
+    );
+    assert!(
+        s.chat_now().iter().any(|l| l.contains("hang please")),
+        "with the question that started it\n{:?}",
+        s.chat_now()
+    );
+}
+
+#[test]
+fn a_second_conversation_answers_while_the_first_is_still_working() {
+    // The point of the whole change: a model that never finishes stops one conversation, not the
+    // workspace.
+    let sb = Sandbox::new("concurrent");
+    install_driver(&sb);
+    install_slow(&sb);
+
+    let mut s = sb.start();
+    s.wait_for("driver ready");
+    s.wait_for("slow ready");
+    s.command("t.new");
+    s.wait_for("created");
+    s.command("t.useSlow");
+    s.wait_for("using slow");
+    s.type_text("hang please");
+    s.enter();
+    s.wait_for("thinking");
+
+    s.command("t.other");
+    s.wait_for("switched to");
+    s.command("t.useQuick");
+    s.wait_for("using quick");
+    s.type_text("and this one?");
+    s.enter();
+    assert!(
+        s.pump(|s| s.chat_now().iter().any(|l| l.contains("answered right away"))),
+        "the second conversation got its answer with the first still in flight\n{:?}",
+        s.chat_now()
+    );
+
+    s.command("t.other");
+    assert!(
+        s.pump(|s| s.chat_now().iter().any(|l| l.contains("thinking"))),
+        "and the first is where it was left\n{:?}",
+        s.chat_now()
+    );
+    assert!(
+        !s.chat_now().iter().any(|l| l.contains("answered right away")),
+        "with none of the other one's answer in it\n{:?}",
+        s.chat_now()
+    );
 }
 
 // ---------------------------------------------------------------------------
