@@ -111,6 +111,38 @@ if (!(await confirmDestructive(neosh, `Delete ${name}?`, { yes: "Delete", no: "K
 The bar is *irreversible*, not merely significant. Closing a panel or switching a model asks
 nothing, because you can put those back.
 
+### `railPicker`
+
+Two panes: a rail of categories, and the rows belonging to whichever one is selected. What the model
+switcher is built from.
+
+```ts
+const chosen = await railPicker<Provider, Model>(neosh, {
+  title: "Model",
+  rail: providers.map((p) => ({
+    mark: { text: "✳", hl: "Brand.Anthropic" },   // drawn in its own colour
+    badge: { text: "✓", hl: "Account.Plan" },     // one column, at the right edge
+    group: "PLANS",                                    // headings, in first-seen order
+    label: p.name,
+    value: p,
+  })),
+  items: async (p) => rowsFor(p),        // called on open and on every rail move
+  hints: "↵ use   ⇥ panes   esc close",
+  placeholder: "nothing here yet",
+  onKey: (key, ctx) => (key.key.code.c === "s" ? signIn(ctx.rail) : undefined),
+});
+```
+
+Reach for it when one list would be answering two questions at once. "Which provider" and "which
+model" have different cardinalities — a dozen against hundreds — and flattening them puts the thing
+you want thirty rows under something you do not use.
+
+A `PaneItem` may name a `section`, which folds its rows behind a count and opens automatically while
+a filter is active: "no matches" with the match folded away is the worst possible answer.
+
+Both panes are one buffer with a rule down the middle, not two floats. Two floats cannot be kept
+adjacent without each of them knowing the other's width, and neither of them may measure anything.
+
 ### Helpers
 
 `fuzzy`, `stateLetter`, `statusPrefix`, `shortenPath`, and `defineHighlights` (which links
@@ -122,6 +154,42 @@ nothing, because you can put those back.
 
 Every column in this API is a byte offset, matching Neovim and for the same reason: it keeps
 display-width math in one place, the frontend.
+
+### Measuring, when you are laying one out
+
+```ts
+import { width, clipToWidth, padToWidth } from "@neosh/api";
+
+width("日本")            // 4 columns, 2 code points
+padToWidth(name, 20) + "│"  // a rule that lines up
+```
+
+Use these for anything with a column in it. JavaScript offers `String.length` (UTF-16 units) and
+`Array.from(s).length` (code points), and **both are wrong** for the text a model produces: two CJK
+characters are 2 code points and 4 columns, a waving hand is 1 and 2, a combining accent adds a code
+point and no column. Padding with either draws a ragged rule the first time a non-ASCII name appears
+in your list.
+
+They are synchronous — ops, not host calls — so calling one per row costs nothing, and they use the
+same measurement the renderer does, so your layout and the frame agree by construction.
+
+## Text that moves
+
+A highlight group may carry an animation, and the frontend animates whatever does:
+
+```ts
+await neosh.hl.define("MyPlugin.Working", { link: "Status.Streaming" });  // sweeps
+await neosh.hl.define("MyPlugin.Waiting", { link: "Status.Pending" });    // pulses
+```
+
+Set the group once and stop thinking about it: nothing in your plugin drives the movement, there is
+no timer to own, and it costs you no API calls at all. Animating text yourself would mean re-setting
+an extmark per character per tick — hundreds of calls a second across the runtime boundary to move a
+highlight two columns.
+
+Motion is reserved, by convention, for *something is happening and you cannot see it yet*. A screen
+where several things move is a screen where none of them means anything. `ui.motion = false` removes
+the movement and keeps the colour, and your plugin needs no code for that case.
 
 JavaScript's `.length` is UTF-16 code units. It agrees with bytes only for ASCII, so using it to
 place a highlight on a line containing an emoji or any CJK puts the mark in the wrong column — or

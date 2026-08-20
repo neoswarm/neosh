@@ -288,9 +288,22 @@ implement it ignore it silently; there is no way to detect support.
 ```toml
 [options]
 "ui.theme" = "dark"       # or "light"
-"ui.motion" = true        # spinners and status pulses
+"ui.motion" = true        # text that moves while something is happening
 "ui.ascii_only" = false   # for terminals without a decent font
+"ui.nerd_font" = false    # brand glyphs for providers, where the font has them
 ```
+
+Motion is reserved for one thing: *something is happening and you cannot see it yet*. While a turn
+is in flight the working line sweeps — a band of brightness travelling along the word — because a
+still screen and a wedged process look identical, and a sweep reads as aliveness at the edge of
+vision without asking to be looked at. `Status.Streaming` sweeps; `Status.Pending` pulses, for
+waiting on something outside the program.
+
+The **frontend** does this, on its own clock, over whatever the core last wrote — so a shimmer costs
+nothing above the terminal boundary and stops the moment the animated row scrolls out of sight.
+Without truecolor the same band renders as bold rather than as nothing. `ui.motion = false` removes
+the movement and keeps the colour; it never makes text disappear. See
+[ADR 0025](adr/0025-motion-belongs-to-the-frontend.md).
 
 The theme is a set of semantic groups — `Status.Working`, `Git.Added`, `Meter.Fill` — that plugins
 link to rather than choosing colours. Override any of them from `init.ts` and a theme switch will
@@ -313,26 +326,85 @@ An answer of "allow for this session" is held **in memory only**; making it perm
 `config.toml`, not a keystroke. With the `approvals` plugin disabled, `ask` mode refuses anything it
 would have prompted about rather than allowing it.
 
-### Model and reasoning effort
+### Choosing a model
 
-`<C-p>` picks the model; `<C-e>` picks its options — reasoning effort, and whatever else the driver
-exposes. Those are not a fixed list: they arrive as `ProviderOptionDescriptor`s attached to the
-model, so a provider plugin that invents a knob gets a working picker for it with no change to the
-switcher.
+`<C-p>` opens a picker in two panes: your providers on the left, the models each one serves on the
+right.
+
+```
+ PLANS                  │ ❯ Claude Opus           Frontier  Most capable for complex work
+  ✳ Claude            ✓ │   Claude Sonnet         Balanced  Best for everyday tasks
+ API KEYS               │   Claude Haiku          Fast      Fastest, for quick answers
+  ✳ Anthropic         ! │
+  ⬢ OpenAI            ! │   ▸ 4 superseded
+ LOCAL                  │
+  ▲ Ollama              │
+────────────────────────┴──────────────────────────────────────────────────────────
+ ↵ use   ⇥ providers   s sign in   e effort   ^N/^P move   esc close
+```
+
+The rail is grouped by **what a turn costs you**, which is the distinction one flat list could not
+make:
+
+| | | |
+|---|---|---|
+| **PLANS** | a subscription you already pay for | no key, nothing stored |
+| **API KEYS** | billed per token | see [API keys](#api-keys) |
+| **LOCAL** | on this machine | costs nothing, needs nothing |
+
+The marker at the right edge of each rail entry: `✓` it will work, `!` it needs a key or its CLI is
+missing, `⨯` no driver provides it. Typing filters the model list; `⇥` and `←`/`→` move between the
+panes; `s` signs in to whatever the rail is on. Superseded models fold behind a count — reachable,
+out of the way, and opened automatically while you are filtering.
+
+`ui.nerd_font = true` swaps the geometric provider marks for real brand glyphs. Off by default and
+deliberately not detected: a terminal cannot be asked what its font contains, and guessing wrong
+draws a row of boxes, which reads as a broken program rather than as a missing font.
+`ui.ascii_only = true` reduces them to letters.
+
+### Moving along the ladder
+
+Every model in the catalogue sits on one of three rungs — **Frontier**, **Balanced**, **Fast** —
+because every lineup worth switching between has three: Opus/Sonnet/Haiku, gpt-5/mini/nano,
+Pro/Flash/Flash-Lite.
+
+```
+<A-Up>      model.upgrade      one rung up, same provider
+<A-Down>    model.downgrade    one rung down
+            model.line opus    the current model in a line, wherever it is reachable
+```
+
+`upgrade`/`downgrade` hold the provider fixed on purpose: "give me something cheaper" is a question
+about the model, and answering it by also changing your billing would answer a question nobody
+asked. Neither wraps — at the top, `upgrade` says so rather than dropping you to the cheapest thing
+in the catalogue.
+
+`model.line` resolves a *product line* to the one in it that has not been superseded, which is what
+people mean by "use Opus": not a pinned id that goes stale.
+
+These are ordinary commands. Rebind them like anything else:
+
+```toml
+# in init.ts
+await neosh.keymap.set("chat", "<C-A-k>", "model.upgrade");
+```
+
+### Reasoning effort
+
+`<C-e>` picks reasoning effort and whatever else the driver exposes. Those are not a fixed list:
+they arrive as `ProviderOptionDescriptor`s attached to the model, so a provider plugin that invents
+a knob gets a working picker for it with no change to the switcher.
 
 Switching between two models that share an option keeps your setting; switching to one without it
 drops the setting rather than sending a value the driver would reject.
 
-Every row says where its key comes from — `$ANTHROPIC_API_KEY`, `keychain`, `credential helper`, or
-**your CLI login — no key needed**, which is why the Claude entries work with nothing configured.
-Rows that cannot authenticate sort last, and an endpoint with no key at all gets a `Sign in to …`
-row: it serves no models until it can authenticate, so without that row it would be invisible rather
-than merely unusable.
-
 ### API keys
 
-`provider.auth` lists every configured provider and the state of its key; `provider.key` (built in,
-so it works with `--clean`) takes one for the provider you are on. Picking a model that has no key
+Only for the **API KEYS** group. A plan signs itself in — if the Claude entries are missing, the
+`claude` CLI is not on your `$PATH`, and `provider.auth` says so rather than hiding the provider.
+
+`provider.auth` lists every configured provider and the state of its account; `provider.key` (built
+in, so it works with `--clean`) takes a key for the provider you are on. Picking a model that has no key
 offers the same prompt rather than failing later, when the failure is between you and the question
 you were asking.
 
