@@ -2566,7 +2566,15 @@ pub fn install_builtin_providers(agent: &Agent) {
         reg.register_driver(Arc::new(neosh_provider::drivers::AnthropicProvider));
         reg.register_driver(Arc::new(neosh_provider::drivers::OpenAiCompatProvider));
         reg.register_driver(Arc::new(neosh_provider::drivers::GoogleProvider));
-        reg.register_driver(Arc::new(neosh_provider::drivers::ClaudeCliProvider::default()));
+        // Only when the CLI is actually there. It needs no key, so it is first in the catalogue
+        // and would otherwise be what a fresh install defaults to — and every turn would fail with
+        // "no such file", on the one path that is supposed to work with no setup at all. The
+        // instance stays configured either way, so a settings list can say the driver is missing
+        // rather than the provider simply not existing.
+        let cli = neosh_provider::drivers::ClaudeCliProvider::default();
+        if cli.available() {
+            reg.register_driver(Arc::new(cli));
+        }
         for i in catalog::builtin_instances() {
             reg.add_instance(i);
         }

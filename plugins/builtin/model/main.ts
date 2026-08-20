@@ -251,23 +251,39 @@ async function signIn(
  * the model picker cannot help you out of on its own.
  */
 async function pickProvider(neosh: Neosh): Promise<void> {
-  const rows = (await neosh.agent.credentials()).filter((c) => c.driver_available);
+  const rows = await neosh.agent.credentials();
   if (rows.length === 0) {
     neosh.notify("no providers are configured", "warn");
     return;
   }
+  // Instances whose driver is missing are listed rather than hidden. The `claude` CLI not being
+  // installed is the single most likely reason someone's subscription is not showing up, and a
+  // provider that has silently vanished from the list is a question with nowhere to ask it.
   const chosen = await picker(
     neosh,
-    rows.map((c) => ({
-      label: c.display_name,
-      detail: `${c.instance}  ·  ${describe(c.source)}`,
-      keywords: c.instance,
-      value: c,
-    })),
+    [...rows]
+      .sort((a, b) => Number(b.driver_available) - Number(a.driver_available))
+      .map((c) => ({
+        label: c.display_name,
+        detail: c.driver_available
+          ? `${c.instance}  ·  ${describe(c.source)}`
+          : `${c.instance}  ·  its driver is not available here`,
+        keywords: c.instance,
+        value: c,
+      })),
     { title: "Providers", width: 76 },
   );
   if (!chosen) return;
 
+  if (!chosen.driver_available) {
+    neosh.notify(
+      chosen.driver === "claude-cli"
+        ? "the `claude` CLI is not on your PATH — install it to use your Claude subscription"
+        : `${chosen.display_name}: no plugin provides the "${chosen.driver}" driver`,
+      "warn",
+    );
+    return;
+  }
   if (!chosen.accepts_key) {
     neosh.notify(`${chosen.display_name}: ${describe(chosen.source)}`, "info");
     return;
