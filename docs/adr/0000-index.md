@@ -27,3 +27,5 @@ implementation — and in two cases (0005, 0008) it did not, which is itself rec
 | [0019](0019-motion-and-the-visual-language.md) | Motion, colour, and what a terminal is actually for | Accepted |
 | [0020](0020-plugin-state-is-not-configuration.md) | Plugin state is a separate store, not configuration | Accepted |
 | [0021](0021-motions-are-verbs-the-core-resolves.md) | Motions and edits are verbs resolved by the core | Accepted |
+| [0022](0022-credentials-never-cross-the-plugin-boundary.md) | A key is typed into the host, and never crosses a boundary | Accepted |
+| [0023](0023-archive-not-delete.md) | Archiving is the everyday verb; deleting is the exception | Accepted |
