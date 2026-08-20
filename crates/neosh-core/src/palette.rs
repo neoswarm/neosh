@@ -73,6 +73,10 @@ struct Roles {
     plan: Color,
     /// The one hue used for emphasis that is not a state.
     accent: Color,
+    /// The favourite marker. Not a fourth state hue: the heart glyph carries the whole meaning,
+    /// and the world has already decided what colour a heart is — painting it anything else reads
+    /// as a decision the user has to decode.
+    favorite: Color,
 }
 
 const DARK: Roles = Roles {
@@ -87,6 +91,7 @@ const DARK: Roles = Roles {
     success: rgb(0x6e, 0xe7, 0xb7),
     plan: rgb(0xc4, 0xb5, 0xfd),
     accent: rgb(0xa5, 0xb4, 0xfc),
+    favorite: rgb(0xfb, 0x64, 0x7b),
 };
 
 const LIGHT: Roles = Roles {
@@ -101,6 +106,7 @@ const LIGHT: Roles = Roles {
     success: rgb(0x05, 0x96, 0x69),
     plan: rgb(0x7c, 0x3a, 0xed),
     accent: rgb(0x4f, 0x46, 0xe5),
+    favorite: rgb(0xe1, 0x1d, 0x48),
 };
 
 fn fg(c: Color) -> HighlightSpec {
@@ -260,6 +266,7 @@ pub fn groups(variant: Variant) -> Vec<(&'static str, HighlightDef)> {
         ("Sidebar.Heading", link("Title")),
         ("Sidebar.Dim", link("Comment")),
         ("Sidebar.Selected", link("CursorLine")),
+        ("Sidebar.Favorite", spec(fg(r.favorite))),
         ("Status.Line", link("Comment")),
         // ---- the composer -------------------------------------------------
         // The field you type into is chrome, not content: it should read as furniture at the

@@ -1108,6 +1108,12 @@ export interface ListRow<T = unknown> {
   text: string;
   /** Highlight group for the whole row. Link to one the theme defines. */
   hl?: string;
+  /**
+   * Highlights for pieces of the row, over the top of `hl`: a favourite marker, a state glyph, a
+   * matched substring. `from`/`to` are UTF-8 byte offsets into `text` — the same unit every column
+   * on the wire uses — so build them with {@link byteLength} rather than `.length`.
+   */
+  spans?: Array<{ from: number; to: number; hl: string }>;
   /** Flush-right status: a timestamp, a count, a state word. */
   right?: { text: string; hl?: string };
   /** Rows that cannot be landed on: headings, separators, blanks. */
@@ -1234,6 +1240,16 @@ export class CursoredList<T = unknown> {
       }
       if (row.hl && eol > 0) {
         await this.neosh.ns.mark(this.ns, this.buf, i, 0, { hlGroup: row.hl, endCol: eol });
+      }
+      // Above the row's own highlight, below the cursor's 200: a marker keeps its colour on an
+      // ordinary row and yields to the selection, which is the row the eye is already on.
+      for (const s of row.spans ?? []) {
+        if (s.to <= s.from || s.from >= eol) continue;
+        await this.neosh.ns.mark(this.ns, this.buf, i, s.from, {
+          hlGroup: s.hl,
+          endCol: Math.min(s.to, eol),
+          priority: 100,
+        });
       }
       if (row.right) {
         await this.neosh.ns.mark(this.ns, this.buf, i, 0, {

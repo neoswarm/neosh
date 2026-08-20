@@ -420,20 +420,22 @@ impl Host {
                 // the eye has to travel the whole window between what was said and where you say
                 // the next thing.
                 gravity: Gravity::End,
+                wrap: None,
             });
 
         // Docked before the composer, so it takes the bottom-most row and the composer sits above
         // it. Without a status line the startup screen renders literally nothing — two empty
         // buffers — and "it opened an empty terminal" is indistinguishable from "it crashed".
         let status = editor.create_buffer("[status]");
-        editor.open_window(status, WindowLayout::Docked { dock: Dock::Bottom, size: Some(1), gravity: Gravity::Start });
+        editor.open_window(status, WindowLayout::Docked { dock: Dock::Bottom, size: Some(1), gravity: Gravity::Start, wrap: None });
 
         let composer = editor.create_buffer("[composer]");
-        // Four rows: a rule, up to three lines of what you are writing, and the shortcut row that
-        // lives on the last of them as a virtual line. The rule is what makes the composer read as
-        // a field rather than as the last paragraph of the transcript.
+        // Four rows at rest: a rule, up to three lines of what you are writing, and the shortcut
+        // row that lives on the last of them as a virtual line. The rule is what makes the composer
+        // read as a field rather than as the last paragraph of the transcript. `wrap` is what makes
+        // a long prompt fold and the window grow to show it, instead of running off the right edge.
         let composer_win =
-            editor.open_window(composer, WindowLayout::Docked { dock: Dock::Bottom, size: Some(4), gravity: Gravity::Start });
+            editor.open_window(composer, WindowLayout::Docked { dock: Dock::Bottom, size: Some(4), gravity: Gravity::Start, wrap: Some(true) });
         editor.set_mode(Mode::Chat);
 
         let mut namespace = |name: &str| {
