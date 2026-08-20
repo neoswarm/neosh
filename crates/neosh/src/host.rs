@@ -279,36 +279,132 @@ pub struct Host {
 /// Best-effort by design: tool inputs are whatever schema the tool declared, and guessing wrongly
 /// costs nothing because the name is already there. The keys tried are the ones every file and
 /// shell tool in practice uses.
-fn tool_subject(call: &neosh_proto::ToolCall) -> String {
-    subject_of(&call.name, &call.input)
+/// How a tool call is going, which is the only thing the dot beside it says.
+#[derive(Clone, Copy, PartialEq)]
+enum ToolState {
+    Running,
+    Done,
+    Failed,
 }
 
-/// One line saying what a tool call came back with.
+impl ToolState {
+    fn hl(self) -> &'static str {
+        match self {
+            Self::Running => "Agent.ToolRunning",
+            Self::Done => "Agent.ToolDone",
+            Self::Failed => "Agent.ToolFailed",
+        }
+    }
+}
+
+/// The header line of a tool card: a state dot, the tool's name, and what it is about.
 ///
-/// The *shape* of the result, not the result: a card that inlined four hundred lines of file would
-/// bury the answer it was gathered for. What is useful at a glance is "it worked, and roughly how
-/// much came back", with the exception of an error — where the first line is the whole point.
-fn tool_summary(result: &neosh_proto::ToolResult) -> String {
-    let text = result.content.trim();
-    if text.is_empty() {
-        return if result.is_error { "failed".into() } else { "done".into() };
-    }
-    let first = text.lines().next().unwrap_or("").trim();
-    let lines = text.lines().count();
-    // Errors say what went wrong; successes say how much there is, once there is more than a line
-    // of it. By character, not byte: slicing a multi-byte boundary panics.
-    let clipped: String = first.chars().take(96).collect();
-    let ellipsis = if first.chars().count() > 96 { "\u{2026}" } else { "" };
-    if result.is_error || lines <= 1 {
-        format!("{clipped}{ellipsis}")
+/// `⏺ Read(src/main.rs)`. One line however large the arguments are — a card that grows with its
+/// input buries the answer it was gathered for, and the arguments are in the conversation anyway.
+///
+/// The name is whatever the tool calls itself. Mapping `Read` to something friendlier would be
+/// inventing a second vocabulary for the one the model is already using, and the moment they
+/// disagree the transcript is describing a tool that does not exist.
+fn tool_card(
+    g: &Glyphs,
+    name: &str,
+    input: &serde_json::Value,
+    root: &std::path::Path,
+    state: ToolState,
+    width: usize,
+) -> (String, Vec<(usize, usize, &'static str)>) {
+    // What is left for the subject once the dot, the name and the brackets have had their share.
+    let room = width.saturating_sub(g.dot.chars().count() + 1 + name.chars().count() + 2).max(8);
+    let subject = subject_of(name, input, root, room);
+    let text = if subject.is_empty() {
+        format!("{} {name}", g.dot)
     } else {
-        format!("{clipped}{ellipsis}  ({lines} lines)")
+        format!("{} {name}({subject})", g.dot)
+    };
+    let after_dot = g.dot.len();
+    let name_end = after_dot + 1 + name.len();
+    let mut marks = vec![(0, after_dot, state.hl()), (after_dot, name_end, "Agent.Tool")];
+    if name_end < text.len() {
+        marks.push((name_end, text.len(), "Agent.Usage"));
     }
+    (text, marks)
+}
+
+/// What a tool came back with, under a gutter.
+///
+/// ```text
+///   ⎿  1  hello
+///      2  world
+///      … +2 lines
+/// ```
+///
+/// `limit` lines of it, because the point is to see that something happened and roughly what —
+/// not to reprint a file into the middle of the conversation that asked about it. An error ignores
+/// the limit being zero: a failure nobody can see is a debugging session, and the setting is about
+/// noise rather than about hiding failures.
+fn tool_result_lines(
+    g: &Glyphs,
+    result: &neosh_proto::ToolResult,
+    limit: usize,
+    width: usize,
+) -> Vec<(String, &'static str)> {
+    let hl = if result.is_error { "Agent.ToolError" } else { "Agent.Usage" };
+    let indent = " ".repeat(2 + g.gutter.len() + 2);
+    let head = format!("  {}  ", g.gutter);
+
+    let body = result.content.trim_end();
+    if body.trim().is_empty() {
+        let word = if result.is_error { "failed" } else { "done" };
+        return vec![(format!("{head}{word}"), hl)];
+    }
+
+    let limit = if result.is_error { limit.max(1) } else { limit };
+    if limit == 0 {
+        let n = body.lines().count();
+        let word = if n == 1 { "line" } else { "lines" };
+        return vec![(format!("{head}{n} {word}"), hl)];
+    }
+
+    let mut out = Vec::new();
+    let mut left = limit;
+    for line in body.lines() {
+        if left == 0 {
+            break;
+        }
+        // By character, not byte: slicing a multi-byte boundary panics, and the frontend measures
+        // display width anyway.
+        let prefix = if out.is_empty() { head.as_str() } else { indent.as_str() };
+        let room = width.saturating_sub(prefix.chars().count()).max(8);
+        let text = if line.chars().count() <= room {
+            line.to_string()
+        } else {
+            let clipped: String = line.chars().take(room.saturating_sub(1)).collect();
+            format!("{clipped}\u{2026}")
+        };
+        out.push((format!("{prefix}{text}"), hl));
+        left -= 1;
+    }
+    let rest = body.lines().count().saturating_sub(limit);
+    if rest > 0 {
+        let word = if rest == 1 { "line" } else { "lines" };
+        out.push((format!("{indent}\u{2026} +{rest} more {word}"), "Agent.Usage"));
+    }
+    out
 }
 
 /// What a tool call is *about*, from whichever of its arguments says so.
-fn subject_of(_name: &str, input: &serde_json::Value) -> String {
-    const KEYS: &[&str] = &["path", "file_path", "file", "pattern", "query", "command", "url"];
+///
+/// A path is shown relative to the conversation's directory. An absolute path is mostly the part
+/// you already know, and once it is clipped to fit, the part you already know is *all* you can
+/// see — which is how a card ends up saying `/home/you/projects/thing/crates/neosh/src/…`.
+fn subject_of(
+    _name: &str,
+    input: &serde_json::Value,
+    root: &std::path::Path,
+    room: usize,
+) -> String {
+    const KEYS: &[&str] =
+        &["path", "file_path", "file", "pattern", "query", "command", "url", "prompt"];
     let Some(map) = input.as_object() else { return String::new() };
     for key in KEYS {
         if let Some(v) = map.get(*key).and_then(|v| v.as_str()) {
@@ -316,14 +412,30 @@ fn subject_of(_name: &str, input: &serde_json::Value) -> String {
             if one.is_empty() {
                 continue;
             }
+            let shown = relative_to(one, root);
+            if shown.chars().count() <= room {
+                return shown;
+            }
             // By character, not byte: slicing a multi-byte boundary panics, and the frontend
             // measures display width anyway.
-            let clipped: String = one.chars().take(48).collect();
-            let ellipsis = if one.chars().count() > 48 { "\u{2026}" } else { "" };
-            return format!("  {clipped}{ellipsis}");
+            let clipped: String = shown.chars().take(room.saturating_sub(1)).collect();
+            return format!("{clipped}\u{2026}");
         }
     }
     String::new()
+}
+
+/// A path inside the conversation's directory, said the short way.
+fn relative_to(value: &str, root: &std::path::Path) -> String {
+    if root.as_os_str().is_empty() {
+        return value.to_string();
+    }
+    std::path::Path::new(value)
+        .strip_prefix(root)
+        .ok()
+        .filter(|r| !r.as_os_str().is_empty())
+        .map(|r| r.display().to_string())
+        .unwrap_or_else(|| value.to_string())
 }
 
 /// A turn in flight, in whichever conversation it belongs to.
@@ -347,6 +459,13 @@ struct Round {
     /// Cleared the moment that round's assistant message lands in the conversation, because from
     /// then on the messages are the truth and this would be a second copy of them.
     text: String,
+    /// Which row each unfinished tool call's card is on, so the dot beside it can change when the
+    /// call comes back.
+    ///
+    /// Rows only ever grow downwards from here — everything appends at the end — so a row recorded
+    /// once stays the row it was. Dropped on a switch, because the transcript is rebuilt from
+    /// scratch and every row moves.
+    cards: std::collections::HashMap<neosh_proto::ToolCallId, u32>,
 }
 
 // Deliberately no row index. The working line is *always the last line of the transcript* and
@@ -969,6 +1088,7 @@ impl Host {
             started: std::time::Instant::now(),
             note: None,
             text: String::new(),
+            cards: std::collections::HashMap::new(),
         });
         // Stamped here rather than inside the agent so `Session` stays clock-free and testable.
         // The turn id itself is set by the agent a moment later; a list only reads this while the
@@ -1717,6 +1837,10 @@ impl Host {
         self.editor.options().bool(name).unwrap_or(false)
     }
 
+    fn option_usize(&self, name: &str) -> usize {
+        self.editor.options().int(name).unwrap_or(0).max(0) as usize
+    }
+
     /// Keys nothing claimed.
     ///
     /// In chat mode this is the composer, which is a real text field rather than a string things
@@ -2203,6 +2327,19 @@ impl Host {
     }
 
     /// How many rows of transcript are on screen.
+    /// How wide the transcript is, for the one thing that has to fit on a single row.
+    ///
+    /// Everything else in the transcript is prose and the frontend wraps it. A tool card is not
+    /// prose — it is one line whose job is to be scannable, and a card that wraps puts `n .cla…)`
+    /// on a row of its own, which is worse than saying less.
+    fn chat_width(&self) -> usize {
+        self.editor
+            .window(self.chat_win)
+            .and_then(|w| w.viewport.map(|v| v.width as usize))
+            .unwrap_or(80)
+            .max(24)
+    }
+
     fn chat_height(&self) -> u32 {
         self.editor
             .window(self.chat_win)
@@ -2702,10 +2839,12 @@ impl Host {
         self.working = false;
         self.chat_top = 0;
         let ascii = self.option_bool("ui.ascii_only");
+        let limit = self.option_usize("chat.tool_output_lines");
+        let width = self.chat_width();
         let (lines, marks, label) = {
             let store = self.agent.sessions();
             let s = store.active();
-            let (lines, marks) = transcript(s, ascii);
+            let (lines, marks) = transcript(s, ascii, limit, width);
             (lines, marks, s.label())
         };
         let plugin = PluginId::from(BUILTIN);
@@ -2748,19 +2887,18 @@ impl Host {
     /// conversation that is halfway through an answer shows the answer's first half missing and
     /// the second half arriving out of nowhere.
     ///
-    /// Text or the working line, never both, because that is what the live path does: the first
-    /// token takes the working line away.
+    /// The working line goes back too, because a turn that is still running should look like one
+    /// wherever you are reading it.
     fn replay_round(&mut self) {
         let here = self.active_session();
         if !self.turns.contains_key(&here) {
             return;
         }
         let said = self.rounds.get(&here).map(|r| r.text.clone()).unwrap_or_default();
-        if said.is_empty() {
-            self.begin_working();
-        } else {
+        if !said.is_empty() {
             self.answer_text(&said);
         }
+        self.begin_working();
     }
 
     /// Append streamed output, starting a new line when the kind of output changes.
@@ -2823,13 +2961,17 @@ impl Host {
     fn answer_text(&mut self, text: &str) {
         let plugin = PluginId::from(BUILTIN);
         if !self.option_bool("chat.markdown") {
-            if self.streaming != Some(Stream::Text) {
-                self.open_answer_row();
-                self.streaming = Some(Stream::Text);
-            }
-            let _ = self
-                .editor
-                .apply(&plugin, ApiCall::BufAppendText { buf: self.chat, text: text.into() });
+            // Raw mode appends to the buffer's *last* line, so the working line has to stop being
+            // it. It goes back underneath as soon as the chunk has landed.
+            self.below_working(|me| {
+                if me.streaming != Some(Stream::Text) {
+                    me.open_answer_row();
+                    me.streaming = Some(Stream::Text);
+                }
+                let _ = me
+                    .editor
+                    .apply(&plugin, ApiCall::BufAppendText { buf: me.chat, text: text.into() });
+            });
             return;
         }
 
@@ -2851,13 +2993,29 @@ impl Host {
         self.streaming = None;
     }
 
+    /// Do something that appends to the last line of the transcript, with the working line taken
+    /// out of the way and put back afterwards.
+    ///
+    /// `BufAppendText` means "the last line" by definition, so anything using it has to own that
+    /// line for the duration. Everything else writes at [`Self::chat_end`] and needs none of this.
+    fn below_working(&mut self, f: impl FnOnce(&mut Self)) {
+        let had = self.working;
+        if had {
+            self.end_working();
+        }
+        f(self);
+        if had {
+            self.begin_working();
+        }
+    }
+
     /// Open the row an answer starts on, after a blank line separating it from what came before.
     ///
-    /// The working line goes first, and it has to: it is the last line of the transcript, and this
-    /// writes at the end.
+    /// Above the working line, not at the end of the buffer: the turn is still running, and a
+    /// spinner stranded above the answer it is producing says the wrong thing about which of them
+    /// is still happening.
     fn open_answer_row(&mut self) -> u32 {
-        self.end_working();
-        let n = self.editor.buffer(self.chat).map(|b| b.line_count() as i64).unwrap_or(0);
+        let n = self.chat_end();
         // A blank line between the last thing and the answer — unless there already is one. A tool
         // card butted straight up against the sentence that follows it reads as one paragraph, and
         // two blank lines reads as a gap somebody forgot to fill.
@@ -2928,11 +3086,19 @@ impl Host {
         // answer — often a tool card, which has no trailing blank of its own — and a new question
         // butted straight against it reads as another line of that answer rather than the start of
         // something you said.
-        let gap = self
-            .editor
-            .buffer(self.chat)
-            .and_then(|b| b.lines().last().map(|l| !l.text.trim().is_empty()))
-            .unwrap_or(false);
+        // The line above where this is about to land, which is not the last line of the buffer
+        // while a turn is working: the spinner is down there and is not what came before.
+        let end = self.chat_end();
+        let gap = end > 0
+            && self
+                .editor
+                .buffer(self.chat)
+                .map(|b| {
+                    b.get_lines((end - 1) as u32, end as u32)
+                        .iter()
+                        .any(|l| !l.trim().is_empty())
+                })
+                .unwrap_or(false);
         if gap {
             rows.push(String::new());
         }
@@ -2951,16 +3117,26 @@ impl Host {
         }
     }
 
-    /// Begin the working line, and pick this turn's word for it.
     /// Put the working line at the end of the transcript, for the conversation on screen.
     ///
     /// Says nothing about starting a turn: the turn's own state is the [`Round`], which exists
     /// whether or not you are looking at it. This is only the line.
+    ///
+    /// Written directly rather than through [`Self::chat_push`], which settles the answer above
+    /// it. The working line is not content — it sits *after* an answer that is still being
+    /// written, and closing that answer in order to say it is still going would be a strange thing
+    /// to do.
     fn begin_working(&mut self) {
         if self.working {
             return;
         }
-        self.chat_push(vec![String::new()]);
+        let at = self.chat_end();
+        let _ = self.editor.apply(&PluginId::from(BUILTIN), ApiCall::BufSetLines {
+            buf: self.chat,
+            start: at,
+            end: at,
+            lines: vec![String::new()],
+        });
         self.working = true;
         self.draw_working();
     }
@@ -3034,7 +3210,6 @@ impl Host {
             end: row as i64 + 1,
             lines: vec![],
         });
-        self.streaming = None;
     }
 
     /// The last line of the transcript, which is where the working line lives while there is one.
@@ -3046,6 +3221,10 @@ impl Host {
     }
 
     fn stream_into_chat(&mut self, kind: Stream, text: &str) {
+        self.below_working(|me| me.stream_into_chat_now(kind, text));
+    }
+
+    fn stream_into_chat_now(&mut self, kind: Stream, text: &str) {
         let plugin = PluginId::from(BUILTIN);
         if self.streaming != Some(kind) {
             self.close_answer();
@@ -3106,16 +3285,18 @@ impl Host {
                     r.note = Some(format!("Running {}", call.name));
                 }
                 if on_screen && self.option_bool("chat.show_tools") {
-                    let glyph = self.glyphs().tool;
-                    let text = format!("  {glyph} {}{}", call.name, tool_subject(&call));
-                    let row = self.chat_push(vec![text.clone()]);
-                    self.chat_mark(row, 0, 2 + glyph.len() + 1 + call.name.len(), "Agent.Tool");
-                    self.chat_mark(
-                        row,
-                        2 + glyph.len() + 1 + call.name.len(),
-                        text.len(),
-                        "Agent.Usage",
-                    );
+                    let g = self.glyphs();
+                    let root = self.cwd.clone();
+                    let width = self.chat_width();
+                    let (text, marks) =
+                        tool_card(&g, &call.name, &call.input, &root, ToolState::Running, width);
+                    let row = self.chat_push(vec![text]);
+                    for (from, to, hl) in marks {
+                        self.chat_mark(row, from, to, hl);
+                    }
+                    if let Some(r) = self.rounds.get_mut(&session) {
+                        r.cards.insert(call.id.clone(), row);
+                    }
                     // The tool is what the turn is doing now, so the working line should say so
                     // rather than keep claiming the model is thinking.
                     self.draw_working();
@@ -3134,12 +3315,20 @@ impl Host {
                 }
                 if on_screen && (result.is_error || self.option_bool("chat.show_tools")) {
                     let g = self.glyphs();
-                    let glyph = if result.is_error { g.fail } else { g.result };
-                    let summary = tool_summary(&result);
-                    let text = format!("    {glyph} {summary}");
-                    let row = self.chat_push(vec![text.clone()]);
-                    let hl = if result.is_error { "Agent.ToolError" } else { "Agent.Usage" };
-                    self.chat_mark(row, 0, text.len(), hl);
+                    // The dot beside the call it answers stops pulsing and says how it went. The
+                    // card may be off the top of the buffer by now; the row is still the row.
+                    let card = self.rounds.get_mut(&session).and_then(|r| r.cards.remove(&call.id));
+                    if let Some(row) = card {
+                        let state =
+                            if result.is_error { ToolState::Failed } else { ToolState::Done };
+                        self.chat_mark(row, 0, g.dot.len(), state.hl());
+                    }
+                    let limit = self.option_usize("chat.tool_output_lines");
+                    let width = self.chat_width();
+                    for (text, hl) in tool_result_lines(&g, &result, limit, width) {
+                        let row = self.chat_push(vec![text.clone()]);
+                        self.chat_mark(row, 0, text.len(), hl);
+                    }
                 }
                 if on_screen {
                     self.draw_working();
@@ -3982,6 +4171,16 @@ impl Host {
                 description: Some("Show a line in chat when a tool runs. Errors always show.".into()),
             },
             OptionSpec {
+                name: "chat.tool_output_lines".into(),
+                ty: OptionType::Int { min: Some(0), max: Some(200) },
+                default: OptionValue::Int(3),
+                description: Some(
+                    "How much of what a tool came back with to show under it. `0` shows only how \
+                     many lines there were. An error always shows at least its first line."
+                        .into(),
+                ),
+            },
+            OptionSpec {
                 name: "mapleader".into(),
                 ty: OptionType::Str,
                 default: OptionValue::Str("\\".into()),
@@ -4574,10 +4773,30 @@ pub fn now_secs() -> i64 {
 ///
 /// Deliberately the *same* shape the live stream produces, so switching away and back does not
 /// change what a turn looks like.
-fn transcript(session: &neosh_agent::Session, ascii: bool) -> (Vec<String>, Vec<Mark>) {
+fn transcript(
+    session: &neosh_agent::Session,
+    ascii: bool,
+    limit: usize,
+    width: usize,
+) -> (Vec<String>, Vec<Mark>) {
     use neosh_proto::{ContentBlock, Role};
 
     let g = Glyphs::new(ascii);
+    let root = session.cwd.as_path();
+    // Which calls have an answer, and whether it was a failure. Gathered first because a result
+    // always comes *after* the call it answers, and a dot that only turns green on the second pass
+    // over the buffer is a dot that flickers on every switch.
+    let answered: std::collections::HashMap<&neosh_proto::ToolCallId, bool> = session
+        .messages
+        .iter()
+        .flat_map(|m| &m.content)
+        .filter_map(|b| match b {
+            ContentBlock::ToolResult { tool_use_id, is_error, .. } => {
+                Some((tool_use_id, *is_error))
+            }
+            _ => None,
+        })
+        .collect();
     let mut lines: Vec<String> = Vec::new();
     let mut marks: Vec<Mark> = Vec::new();
     for message in &session.messages {
@@ -4599,24 +4818,29 @@ fn transcript(session: &neosh_agent::Session, ascii: bool) -> (Vec<String>, Vec<
                     lines.extend(rendered);
                     lines.push(String::new());
                 }
-                ContentBlock::ToolUse { name, input, .. } => {
-                    let subject = subject_of(name, input);
-                    let text = format!("  {} {name}{subject}", g.tool);
-                    let split = 2 + g.tool.len() + 1 + name.len();
-                    marks.push((lines.len() as u32, 0, split, "Agent.Tool"));
-                    marks.push((lines.len() as u32, split, text.len(), "Agent.Usage"));
+                ContentBlock::ToolUse { id, name, input } => {
+                    // The dot says how it went, which the conversation already records: a call
+                    // with a result somewhere after it is finished, and one without is still
+                    // running. Nothing here has to remember anything.
+                    let state = match answered.get(id) {
+                        Some(true) => ToolState::Failed,
+                        Some(false) => ToolState::Done,
+                        None => ToolState::Running,
+                    };
+                    let (text, spans) = tool_card(&g, name, input, root, state, width);
+                    let at = lines.len() as u32;
+                    marks.extend(spans.into_iter().map(|(a, b, h)| (at, a, b, h)));
                     lines.push(text);
                 }
                 ContentBlock::ToolResult { is_error, content, .. } => {
-                    let glyph = if *is_error { g.fail } else { g.result };
-                    let summary = tool_summary(&neosh_proto::ToolResult {
+                    let result = neosh_proto::ToolResult {
                         content: content.clone(),
                         is_error: *is_error,
-                    });
-                    let text = format!("    {glyph} {summary}");
-                    let hl = if *is_error { "Agent.ToolError" } else { "Agent.Usage" };
-                    marks.push((lines.len() as u32, 0, text.len(), hl));
-                    lines.push(text);
+                    };
+                    for (text, hl) in tool_result_lines(&g, &result, limit, width) {
+                        marks.push((lines.len() as u32, 0, text.len(), hl));
+                        lines.push(text);
+                    }
                 }
                 // Reasoning is not replayed: it is shown live when `chat.show_thinking` is on, and
                 // reprinting it on every switch would bury the answer under the working out.
@@ -4637,12 +4861,12 @@ type Mark = (u32, usize, usize, &'static str);
 struct Glyphs {
     /// The bar down the left of a question.
     bar: &'static str,
-    /// A tool being called.
-    tool: &'static str,
-    /// A tool that failed.
-    fail: &'static str,
-    /// What a tool came back with.
-    result: &'static str,
+    /// The state of a tool call: one dot, which changes colour rather than shape. Shape says
+    /// *what*, colour says *how it went* — a glyph that changes to mean "finished" makes the
+    /// column impossible to scan.
+    dot: &'static str,
+    /// The elbow that introduces what a tool came back with.
+    gutter: &'static str,
     /// The working line's mark.
     work: &'static str,
 }
@@ -4650,13 +4874,12 @@ struct Glyphs {
 impl Glyphs {
     fn new(ascii: bool) -> Self {
         if ascii {
-            Self { bar: "|", tool: ">", fail: "x", result: "`-", work: "*" }
+            Self { bar: "|", dot: "*", gutter: "`-", work: "*" }
         } else {
             Self {
                 bar: "\u{258c}",
-                tool: "\u{23f5}",
-                fail: "\u{2717}",
-                result: "\u{2514}",
+                dot: "\u{23fa}",
+                gutter: "\u{23bf}",
                 work: "\u{2733}",
             }
         }

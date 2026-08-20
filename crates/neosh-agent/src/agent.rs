@@ -309,10 +309,10 @@ impl Agent {
             return Err("cancelled".to_string());
         }
 
-        let (message, stop, _usage) = assembler.finish();
-        let text: String = message
-            .content
+        let (messages, stop, _usage) = assembler.finish();
+        let text: String = messages
             .iter()
+            .flat_map(|m| &m.content)
             .filter_map(|b| match b {
                 ContentBlock::Text { text } => Some(text.as_str()),
                 _ => None,
@@ -498,6 +498,14 @@ impl Agent {
             let mut assembler = TurnAssembler::new();
             let mut stream = provider.stream(&instance, request, cancel.clone());
 
+            // Only for a driver that runs its own loop. It calls tools we never see, so its stream
+            // is the only place the calls exist — and reporting them as they happen is the
+            // difference between a transcript that says what is going on and one that catches up
+            // at the end. Kept so a result can be matched back to the call it answers.
+            let reporting = provider.delegates_agent_loop();
+            let mut announced: std::collections::HashMap<ToolCallId, ToolCall> =
+                std::collections::HashMap::new();
+
             loop {
                 let next = tokio::select! {
                     biased;
@@ -522,8 +530,33 @@ impl Agent {
                             level: MessageLevel::Error,
                             text: message,
                         }),
-                        // Handled after the stream closes, so tools run in the order the model
-                        // produced them rather than the order their JSON happened to finish.
+                        // A call we are going to run ourselves is handled after the stream
+                        // closes, so tools run in the order the model produced them rather than
+                        // the order their JSON happened to finish. A call somebody else is
+                        // running has already started, and saying so later would be a lie about
+                        // when it happened.
+                        TurnUpdate::ToolReady { id, name, input } if reporting => {
+                            let call =
+                                ToolCall { id: id.clone(), turn: turn.clone(), name, input };
+                            announced.insert(id, call.clone());
+                            self.emit(AgentEvent::ToolStarted {
+                                session: session.clone(),
+                                turn: turn.clone(),
+                                call,
+                            });
+                        }
+                        TurnUpdate::ToolResult { id, content, is_error } => {
+                            // Only a delegating driver sends these; our own tools report through
+                            // `run_tool`, which knows a great deal more about the call.
+                            if let Some(call) = announced.remove(&id) {
+                                self.emit(AgentEvent::ToolFinished {
+                                    session: session.clone(),
+                                    turn: turn.clone(),
+                                    call,
+                                    result: ToolResult { content, is_error },
+                                });
+                            }
+                        }
                         TurnUpdate::ToolReady { .. } | TurnUpdate::ToolMalformed { .. } => {}
                     }
                 }
@@ -532,11 +565,13 @@ impl Agent {
 
             let cancelled = cancel.is_cancelled();
             let calls = assembler.tool_calls();
-            let (message, this_stop, usage) = assembler.finish();
+            let (produced, this_stop, usage) = assembler.finish();
             total.merge(&usage);
             self.with(&session, |s| {
                 s.add_usage(&usage);
-                s.push_assistant(message);
+                for m in produced {
+                    s.push_message(m);
+                }
             });
 
             if cancelled {
@@ -544,7 +579,9 @@ impl Agent {
                 break;
             }
             stop = this_stop;
-            if !matches!(stop, StopReason::ToolUse) || calls.is_empty() {
+            // A driver that runs its own loop has already run these. Executing them again because
+            // its last message happened to stop on `tool_use` would call every tool twice.
+            if reporting || !matches!(stop, StopReason::ToolUse) || calls.is_empty() {
                 // Nothing left to do — unless somebody typed while it was working. Carrying on
                 // rather than ending is the whole point: a follow-up that starts a new turn has
                 // lost the chance to change what this one does.

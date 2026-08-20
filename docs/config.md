@@ -436,6 +436,44 @@ reads as a key that exists and does something else. `ui.hints` is off by default
 there for a plugin that has something worth putting on it rather than by default; the full list is
 on the help key either way.
 
+### What a turn is doing
+
+A tool call is one line: a dot, the tool's name, and what it is about. What came back goes under it.
+
+```
+⏺ Bash(wc -l AGENTS.md)
+  ⎿  168 AGENTS.md
+
+⏺ Read(crates/neosh/src/host.rs)
+  ⎿  //! The chat host.
+     //!
+     //! Owns the conversation, the transcript buffer and every key that is not a plugin's.
+     … +4482 more lines
+```
+
+The **dot** is the only thing in the transcript that says whether something is still happening: it
+pulses while the call runs, and settles green or red when it comes back. Colour rather than shape,
+because a glyph that changes to mean "finished" makes the column impossible to scan.
+
+The **name** is whatever the tool calls itself. Mapping `Read` onto something friendlier would
+invent a second vocabulary for the one the model is already using, and the moment they disagree the
+transcript is describing a tool that does not exist. A path is shown relative to the conversation's
+directory, because the absolute part is the part you already know — and once the line is clipped to
+fit, the part you already know is all that is left.
+
+`chat.tool_output_lines` says how much of a result to show; `0` gives the line count and nothing
+else, and an error always shows at least its first line whatever the setting says. `chat.show_tools
+= false` hides the cards entirely, again except for errors: the setting is about noise, not about
+hiding failures.
+
+**The working line stays under the answer** for as long as the turn is running. A turn that has
+written a sentence and gone off to run three more tools is still working, and a chat that looks
+finished while the footer says otherwise is a chat you stop believing.
+
+Drivers that run their own loop — `claude-cli`, `codex-cli` — report their tool calls the same way.
+They are running the tools themselves, and neosh is telling you about it as it happens rather than
+catching up when the turn is over.
+
 ### Saying something while it is working
 
 Typing while a turn is running does not start a second turn and is not refused. It is **steering**:
@@ -444,7 +482,8 @@ between one round of tool calls and the next, or in place of the turn ending. Th
 while it is still working, and can change what it does next.
 
 ```
-  ⏵ read_file  src/main.rs
+⏺ Read(src/main.rs)
+  ⎿  //! The agent loop.
 ✳ Working…  8s  ·  1 queued  ·  esc to interrupt
 ```
 
@@ -881,6 +920,7 @@ Built in:
 | `agent.system_prompt` | string | `""` | Replaces the built-in prompt when set. |
 | `chat.show_thinking` | bool | `false` | Stream reasoning into the chat buffer. |
 | `chat.show_tools` | bool | `true` | Show a line when a tool runs. Errors always show. |
+| `chat.tool_output_lines` | int | `3` | How much of what a tool returned to show under it. `0` counts it instead. |
 | `gen.model` | string | `""` | Model for branch names, commit messages and titles. Empty uses `agent.model`. |
 | `plugins.disabled` | list | `[]` | Bundled plugins not to load. |
 
