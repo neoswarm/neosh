@@ -273,11 +273,49 @@ of the line.
 both be true, which is what lets one key carry both jobs. `^X` cuts, `^A` selects everything. Your
 terminal's own paste works: it arrives as a bracketed paste and lands at the cursor.
 
+### Reading the transcript
+
 `^S` moves the keyboard into the transcript, which is where the text you actually want to keep
-lives. There the keys are vi's: `hjkl` and the arrows move, `w`/`b` by word, `0`/`$` to the ends of
-a line, `g`/`G` to the ends of the transcript, `v` starts a selection that motions extend, `a`
-selects all of it, `y` copies and leaves, `Esc` just leaves. The status line says `reading` while
-you are there.
+lives. It is a mode, not a focus change, because the keys mean different things there. The status
+line says `reading` while you are in it, and the row under the composer says what the keys do —
+including, once an operator is down, what can follow it.
+
+The keys are vi's, chosen rather than invented:
+
+| | |
+|---|---|
+| `hjkl`, arrows | move |
+| `w` `b` | by word |
+| `0` `$` | ends of the line |
+| `gg` `G` | ends of the transcript |
+| `^D` `^U` | half a screen |
+| `^F` `^B`, `PgUp`/`PgDn` | a screen |
+| `zz` `zt` `zb` | put the cursor's line in the middle, at the top, at the bottom |
+| `[` `]` | previous / next **turn** |
+| `{` `}` | previous / next **block** |
+| `/` `?` | search forward / backward |
+| `n` `N` | next / previous match |
+| `v` | start a selection that motions extend |
+| `V` | select this whole line |
+| `y` | copy the selection, and leave |
+| `yy` `Y` | copy the line |
+| `yc` | copy the **code block** the cursor is in |
+| `ym` | copy the whole **turn** — the question and everything it produced |
+| `ya` | copy the entire transcript |
+| `i` `a` `o` `⏎` | back to the composer |
+| `Esc` | drop the search highlight, then leave |
+
+Two of those are not in any editor, because a transcript has two things a file does not. `[`/`]`
+step between turns, found from the bar drawn down the left of a question rather than from a
+remembered list — a remembered one would be wrong in exactly the case you need it, which is
+scrolling back through a long conversation. And `yc` takes the code block the cursor is in, without
+the indent the renderer added or the language line above it. That one is the reason the mode
+exists: an answer with a command in it is worth very little if getting the command means selecting
+it by hand across a wrapped line.
+
+Searching is incremental — hits light up as you type — and case-insensitive unless the query has a
+capital in it. The composer is borrowed to type into, and your draft comes back when the search
+closes, however it closes.
 
 Copying uses OSC 52, which travels back through the terminal connection — so it reaches the
 clipboard on the machine you are sitting at, not the one neosh is running on. Terminals that do not
@@ -298,6 +336,13 @@ Every entry carries the key that changes it, immediately after it. That is the w
 memorable once it has been seen beside the thing it does, and a legend somewhere else is a second
 place to look for something that is already on screen. It also means those keys are *not* repeated
 on the shortcut row below — saying it twice costs a row and teaches nothing the first place did not.
+
+There is no shortcut row below by default, for the same reason. It carried `^T`, `^N` and `^K`,
+which are in the sidebar's own footer two rows away, and `F1`, which is on the row it points at.
+What the duplication actually bought was one fewer line of transcript and a composer pressed
+against the status strip. `ui.hints = true` brings it back if you want it; the exception is reading
+mode, which draws its own row whatever the setting says, because those keys are live, different,
+and written down nowhere else.
 
 Plugins own the strip's contents:
 
@@ -320,8 +365,9 @@ its own without neosh knowing it exists.
 
 Entries sort by `priority` and are dropped from the end when the terminal is too narrow, so the
 lowest priority is the one you would most want kept. Nothing is ever cut in half: half a shortcut
-reads as a key that exists and does something else. `ui.hints = false` gives the row back to the
-transcript; the full list is on the help key either way.
+reads as a key that exists and does something else. `ui.hints` is off by default, so the row is
+there for a plugin that has something worth putting on it rather than by default; the full list is
+on the help key either way.
 
 ### Saying something while it is working
 
@@ -410,7 +456,7 @@ is "what did it actually say".
 [options]
 "ui.theme" = "dark"       # or "light"
 "ui.motion" = true        # text that moves while something is happening
-"ui.hints" = true         # the shortcut row under the composer
+"ui.hints" = false        # a shortcut row under the composer; off, the sidebar says the same keys
 "ui.ascii_only" = false   # for terminals without a decent font
 "ui.nerd_font" = false    # brand glyphs for providers, where the font has them
 ```

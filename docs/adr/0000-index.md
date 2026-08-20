@@ -33,3 +33,4 @@ implementation — and in two cases (0005, 0008) it did not, which is itself rec
 | [0025](0025-motion-belongs-to-the-frontend.md) | Text that moves is a property of a highlight group | Accepted |
 | [0026](0026-a-block-is-settled-once-it-cannot-change.md) | A markdown block is settled once it cannot change | Accepted |
 | [0027](0027-one-driver-for-every-agent-that-speaks-acp.md) | One driver for every agent that speaks ACP | Accepted |
+| [0028](0028-the-transcript-is-a-place-you-go.md) | The transcript is a place you go, not a pane you focus | Accepted |

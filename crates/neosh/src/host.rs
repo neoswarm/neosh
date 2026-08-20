@@ -198,6 +198,19 @@ pub struct Host {
     /// A place, not a focus: `j` moves there and types here, and one flag is a great deal easier to
     /// reason about than inferring intent from which window happens to be focused.
     reading: bool,
+    /// The first key of a two-key sequence in the transcript — `y` waiting to hear what to yank,
+    /// `g` waiting for the second `g`, `z` waiting for where to put the line.
+    ///
+    /// Cleared by the key that follows, whatever it is, so a mistyped second key ends the sequence
+    /// instead of leaving the next unrelated press to be swallowed by it.
+    reading_pending: Option<char>,
+    /// The search being typed in the transcript, if one is.
+    search: Option<SearchPrompt>,
+    /// The last thing searched for, so `n` still works after the prompt has closed.
+    searched: String,
+    /// Highlights for search hits. Its own namespace so clearing them cannot take the transcript's
+    /// own colour with it.
+    search_ns: neosh_proto::NamespaceId,
     /// Set while output is streaming, so chunks append rather than starting a new line.
     streaming: Option<Stream>,
     /// The answer currently being written, and where it sits in the transcript.
@@ -330,6 +343,22 @@ const VERBS: &[&str] = &[
 ];
 
 /// A key being typed in, and who is waiting to hear how it went.
+/// A search being typed in the transcript.
+///
+/// It borrows the composer to be typed into, the same way entering a key does, because the
+/// alternative is a float over the thing you are searching — which hides the answer at the moment
+/// it appears.
+struct SearchPrompt {
+    query: String,
+    /// Opened with `?` rather than `/`, so `n` goes backwards.
+    back: bool,
+    /// Where the cursor was when it opened. Esc puts it back, because an abandoned search should
+    /// leave you where you were rather than wherever the incremental match wandered to.
+    from: (u32, u32),
+    /// The draft that was in the composer, put back afterwards.
+    draft: String,
+}
+
 struct SecretPrompt {
     instance: neosh_proto::InstanceId,
     label: String,
@@ -392,6 +421,7 @@ impl Host {
         let status_ns = namespace("neosh.status");
         let chat_ns = namespace("neosh.chat");
         let composer_ns = namespace("neosh.composer");
+        let search_ns = namespace("neosh.search");
 
         Self {
             editor,
@@ -417,6 +447,10 @@ impl Host {
             keys_pending: false,
             keys_touched: false,
             reading: false,
+            reading_pending: None,
+            search: None,
+            searched: String::new(),
+            search_ns,
             streaming: None,
             answer: None,
             startup: Startup::default(),
@@ -1150,13 +1184,6 @@ impl Host {
             start: None,
             end: None,
         });
-        if self.secret.is_some() {
-            // While a key is being typed the composer is borrowed and says so itself. Shortcuts
-            // that no longer work, advertised under a field where every keystroke is captured, is
-            // exactly the wrong thing to be reading.
-            return;
-        }
-
         let ascii = self.option_bool("ui.ascii_only");
         let text = self.composer_text();
         let lines = self.editor.buffer(self.composer).map(|b| b.line_count()).unwrap_or(1).max(1);
@@ -1166,14 +1193,32 @@ impl Host {
             .and_then(|w| w.viewport.map(|v| v.width as usize))
             .unwrap_or(80);
 
-        // The rule. Drawn above the first line, so it moves with the field rather than being a row
-        // the transcript has to remember not to write on.
+        // A blank row, then the rule. Both drawn above the first line, so they move with the field
+        // rather than being rows the transcript has to remember not to write on.
+        //
+        // The blank is not decoration. Without it the last line of an answer sits directly on the
+        // rule, and the eye reads the two as one block — the end of what was said and the edge of
+        // where you say things run together, which is the single worst place in this layout to
+        // save a row.
+        self.composer_mark(0, VirtTextPos::Above, vec![chunk("", "Composer.Rule")]);
         let rule = if ascii { "-" } else { "\u{2500}" };
         self.composer_mark(0, VirtTextPos::Above, vec![chunk(rule.repeat(width), "Composer.Rule")]);
 
         // The prompt, spliced in at column zero. The caret is pushed past it by the frontend, which
         // is the only place that knows how wide it drew.
         let caret = if ascii { "> " } else { "\u{203a} " };
+
+        // While a key or a search is being typed the composer is borrowed and says so itself, so
+        // it gets the rule above it and nothing else: a prompt glyph in front of `/Haiku` would
+        // read as part of the search, and shortcuts that no longer work, advertised under a field
+        // where every keystroke is captured, are exactly the wrong thing to be reading.
+        //
+        // The rule stays because it is the layout. Dropping it moves every row of the transcript
+        // by one the moment you press `/`, which is the moment you least want the screen to jump.
+        if self.secret.is_some() || self.search.is_some() {
+            return;
+        }
+
         self.composer_mark(0, VirtTextPos::Inline, vec![chunk(caret, "Composer.Prompt")]);
 
         if text.is_empty() {
@@ -1203,6 +1248,17 @@ impl Host {
             ]);
         }
 
+        // Reading is the one place a shortcut row earns its line, whatever `ui.hints` says. The
+        // keys mean something different here, they are not written down anywhere else, and the
+        // composer is not being typed into — so the row is free and the question it answers is
+        // live.
+        if self.reading {
+            let mut v = vec![chunk(pad, "Composer.Hint")];
+            v.extend(self.reading_hints(width.saturating_sub(indent)));
+            self.composer_mark(row, VirtTextPos::Below, v);
+            return;
+        }
+
         // The shortcut row goes under the last line you have written — and steps aside once you are
         // writing enough, or have enough queued, that it would cost you a line to look at.
         if lines <= 2 && queued.is_empty()
@@ -1212,6 +1268,58 @@ impl Host {
             v.extend(chunks);
             self.composer_mark(row, VirtTextPos::Below, v);
         }
+    }
+
+    /// What the keys do while reading, as many as fit.
+    ///
+    /// A pending operator takes the row over entirely: once `y` is down, the only useful thing to
+    /// know is what the second key can be, and leaving the general list up would be answering a
+    /// question nobody is asking any more.
+    fn reading_hints(&self, width: usize) -> Vec<neosh_proto::VirtChunk> {
+        let pairs: &[(&str, &str)] = match self.reading_pending {
+            Some('y') => &[
+                ("y", "line"),
+                ("c", "code block"),
+                ("m", "this turn"),
+                ("a", "everything"),
+            ],
+            Some('g') => &[("g", "top")],
+            Some('z') => &[("z", "centre"), ("t", "top"), ("b", "bottom")],
+            Some(_) => &[],
+            None if self.chat_anchored() => {
+                &[("y", "copy"), ("v", "drop"), ("hjkl", "extend"), ("esc", "leave")]
+            }
+            None => &[
+                ("y", "copy"),
+                ("v", "select"),
+                ("[ ]", "turn"),
+                ("{ }", "block"),
+                ("/", "find"),
+                ("i", "write"),
+                ("esc", "leave"),
+            ],
+        };
+        let mut out: Vec<neosh_proto::VirtChunk> = Vec::new();
+        let mut used = 0usize;
+        if self.reading_pending.is_some() {
+            let head = "waiting…  ";
+            used += display_width(head);
+            out.push(chunk(head, "Status.Pending"));
+        }
+        for (keys, label) in pairs {
+            let gap = if out.len() > usize::from(self.reading_pending.is_some()) { 2 } else { 0 };
+            let cost = gap + display_width(keys) + 1 + display_width(label);
+            if used + cost > width {
+                break;
+            }
+            if gap > 0 {
+                out.push(chunk("  ", "Composer.Hint"));
+            }
+            out.push(chunk((*keys).to_string(), "Composer.HintKey"));
+            out.push(chunk(format!(" {label}"), "Composer.Hint"));
+            used += cost;
+        }
+        out
     }
 
     /// One virtual-text mark on the composer.
@@ -1239,7 +1347,7 @@ impl Host {
     /// Nothing is ever dropped silently to nothing — a row too narrow for even one hint simply
     /// does not appear, and the full list is still a keypress away.
     fn hint_row(&self, width: usize) -> Option<Vec<neosh_proto::VirtChunk>> {
-        if !self.editor.options().bool("ui.hints").unwrap_or(true) {
+        if !self.editor.options().bool("ui.hints").unwrap_or(false) {
             return None;
         }
         let mut hints: Vec<(&String, &neosh_proto::Hint)> = self.hints.iter().collect();
@@ -1748,6 +1856,12 @@ impl Host {
         }
         // `p` drops here, which zeroes whatever is left of the value.
     }
+    // ---- reading the transcript ------------------------------------------
+    //
+    // A modal reader over the chat buffer. The keys are vi's, chosen rather than invented: `j` and
+    // `y` mean here what they mean everywhere else, and the two things this transcript has that a
+    // file does not — turns and code blocks — get keys of their own rather than being approximated
+    // with line numbers.
 
     /// Move into the transcript to read, navigate and select it.
     ///
@@ -1760,14 +1874,16 @@ impl Host {
             return;
         }
         self.reading = true;
+        self.reading_pending = None;
         let plugin = PluginId::from(BUILTIN);
         let _ = self.editor.apply(&plugin, ApiCall::FocusPush { win: self.chat_win });
         let _ = self.editor.apply(&plugin, ApiCall::WinSelect { win: self.chat_win, on: false });
+        // Start at the newest thing said rather than at line one: you came here to take something
+        // out of the answer you are looking at.
+        let last = self.chat_lines().len().saturating_sub(1) as u32;
+        self.reading_jump((last, 0), false);
         self.refresh_status();
-        self.editor_message(
-            MessageLevel::Info,
-            "reading — hjkl/arrows move, v selects, y copies, Esc leaves",
-        );
+        self.refresh_composer();
     }
 
     fn leave_reading(&mut self) {
@@ -1775,21 +1891,42 @@ impl Host {
             return;
         }
         self.reading = false;
+        self.reading_pending = None;
+        self.clear_matches();
         let plugin = PluginId::from(BUILTIN);
         let _ = self.editor.apply(&plugin, ApiCall::WinSelect { win: self.chat_win, on: false });
         let _ = self.editor.apply(&plugin, ApiCall::FocusPop);
         self.refresh_status();
+        self.refresh_composer();
     }
 
-    /// Keys while reading the transcript. Deliberately the vi set, plus the arrows.
+    /// Keys while reading the transcript.
     ///
     /// Motion extends the selection whenever one is running, so `v` then `j j j` selects three
     /// lines — the modal behaviour, rather than requiring shift to be held for the whole journey.
     fn reading_key(&mut self, key: neosh_proto::KeyPress) {
+        if self.search.is_some() {
+            self.search_key(key);
+            return;
+        }
         let ch = match &key.code {
             KeyCode::Char { c } => c.as_str(),
             _ => "",
         };
+        // A pending first key consumes exactly one more press, whatever it is. Anything else and a
+        // mistyped `y` would sit there waiting to eat an unrelated keystroke later.
+        if let Some(first) = self.reading_pending.take() {
+            self.refresh_composer();
+            self.reading_pair(first, &key, ch);
+            return;
+        }
+        if matches!(ch, "y" | "g" | "z") && !self.chat_anchored() {
+            self.reading_pending = ch.chars().next();
+            self.refresh_composer();
+            return;
+        }
+
+        let select = self.chat_anchored() || key.mods.shift;
         let motion = match (&key.code, ch) {
             (KeyCode::Left, _) | (_, "h") => Some(CursorMotion::Left),
             (KeyCode::Right, _) | (_, "l") => Some(CursorMotion::Right),
@@ -1797,14 +1934,12 @@ impl Host {
             (KeyCode::Down, _) | (_, "j") => Some(CursorMotion::Down),
             (_, "b") | (_, "B") => Some(CursorMotion::WordLeft),
             (_, "w") | (_, "W") => Some(CursorMotion::WordRight),
-            (KeyCode::Home, _) | (_, "0") => Some(CursorMotion::LineStart),
+            (KeyCode::Home, _) | (_, "0") | (_, "^") => Some(CursorMotion::LineStart),
             (KeyCode::End, _) | (_, "$") => Some(CursorMotion::LineEnd),
-            (_, "g") => Some(CursorMotion::BufStart),
             (_, "G") => Some(CursorMotion::BufEnd),
             _ => None,
         };
         if let Some(motion) = motion {
-            let select = self.chat_anchored() || key.mods.shift;
             let _ = self.editor.apply(&PluginId::from(BUILTIN), ApiCall::WinMotion {
                 win: self.chat_win,
                 motion,
@@ -1814,21 +1949,536 @@ impl Host {
             return;
         }
 
+        // Whole-screen movement. `<C-d>`/`<C-u>` are half a screen because that is what they are
+        // everywhere; a full screen with no overlap loses the line you were reading.
+        let page = self.chat_height().max(2);
+        if key.mods.ctrl {
+            match ch {
+                "d" => return self.reading_by(page as i64 / 2, select),
+                "u" => return self.reading_by(-(page as i64 / 2), select),
+                "f" => return self.reading_by(page as i64, select),
+                "b" => return self.reading_by(-(page as i64), select),
+                "e" => return self.reading_by(1, select),
+                "y" => return self.reading_by(-1, select),
+                _ => {}
+            }
+        }
         match (&key.code, ch) {
-            (KeyCode::Esc, _) | (_, "q") => self.leave_reading(),
-            (_, "v") | (_, "V") => {
+            (KeyCode::PageDown, _) => self.reading_by(page as i64, select),
+            (KeyCode::PageUp, _) => self.reading_by(-(page as i64), select),
+
+            // The two things a transcript has that a file does not.
+            (_, "]") => self.reading_to_turn(1, select),
+            (_, "[") => self.reading_to_turn(-1, select),
+            (_, "}") => self.reading_to_block(1, select),
+            (_, "{") => self.reading_to_block(-1, select),
+
+            (_, "v") => {
                 let on = !self.chat_anchored();
                 let _ = self.editor.apply(&PluginId::from(BUILTIN), ApiCall::WinSelect {
                     win: self.chat_win,
                     on,
                 });
+                self.refresh_composer();
             }
-            (_, "a") => self.select_all(self.chat_win),
-            // Leaving on a successful yank: you came here to take something, and staying would mean
-            // pressing Esc every single time.
+            // Not a linewise mode — there is no such thing here — but the thing people press `V`
+            // for, which is "this whole line, and then let me extend it".
+            (_, "V") => self.select_line(),
+
+            (_, "/") => self.begin_search(false),
+            (_, "?") => self.begin_search(true),
+            (_, "n") => self.search_step(true),
+            (_, "N") => self.search_step(false),
+
+            // Yank with a selection running takes the selection, and leaves — you came here to
+            // take something, and staying would mean pressing Esc every single time. Without one,
+            // `y` has already been held as a pending operator above.
             (_, "y") if self.copy_selection(false) => self.leave_reading(),
+            (_, "Y") => self.yank_line(),
+
+            // Back to typing, at the key every editor uses for it, because the usual reason to
+            // stop reading is that you have thought of what to say.
+            (KeyCode::Enter, _) | (_, "i") | (_, "a") | (_, "o") => self.leave_reading(),
+            // Esc gives up the search highlight first and the mode second: one press per thing you
+            // want to be rid of, in the order you stopped wanting them.
+            (KeyCode::Esc, _) if !self.searched.is_empty() => {
+                self.searched.clear();
+                self.clear_matches();
+                self.refresh_composer();
+            }
+            (KeyCode::Esc, _) | (_, "q") => self.leave_reading(),
             _ => {}
         }
+    }
+
+    /// The second key of a pair: `gg`, `zz`/`zt`/`zb`, and the `y` operator.
+    fn reading_pair(&mut self, first: char, key: &neosh_proto::KeyPress, ch: &str) {
+        match (first, ch) {
+            ('g', "g") => {
+                let _ = self.editor.apply(&PluginId::from(BUILTIN), ApiCall::WinMotion {
+                    win: self.chat_win,
+                    motion: CursorMotion::BufStart,
+                    select: key.mods.shift,
+                });
+                self.follow_cursor();
+            }
+            // Where the cursor's line sits on screen. `zz` is the one worth having: it is how you
+            // read an answer that ends at the bottom edge.
+            ('z', "z") => self.place_cursor_line(self.chat_height() / 2),
+            ('z', "t") => self.place_cursor_line(0),
+            ('z', "b") => self.place_cursor_line(self.chat_height().saturating_sub(1)),
+
+            ('y', "y") => self.yank_line(),
+            ('y', "c") => self.yank_code(),
+            ('y', "m") | ('y', "t") => self.yank_turn(),
+            ('y', "a") => {
+                self.select_all(self.chat_win);
+                if self.copy_selection(false) {
+                    self.leave_reading();
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// How many rows of transcript are on screen.
+    fn chat_height(&self) -> u32 {
+        self.editor
+            .window(self.chat_win)
+            .and_then(|w| w.viewport.map(|v| v.height as u32))
+            .unwrap_or(20)
+            .max(1)
+    }
+
+    /// The transcript, as plain rows.
+    fn chat_lines(&self) -> Vec<String> {
+        self.editor
+            .buffer(self.chat)
+            .map(|b| b.lines().iter().map(|l| l.text.clone()).collect())
+            .unwrap_or_default()
+    }
+
+    /// Put the cursor somewhere, extending a selection if one is anchored.
+    ///
+    /// `WinSetCursor` leaves the anchor alone, which is exactly right: a jump with a selection
+    /// running should take the text it jumped over, and one without should not start a selection.
+    fn reading_jump(&mut self, at: (u32, u32), select: bool) {
+        if select && !self.chat_anchored() {
+            let _ = self
+                .editor
+                .apply(&PluginId::from(BUILTIN), ApiCall::WinSelect { win: self.chat_win, on: true });
+        }
+        if !select && self.chat_anchored() {
+            let _ = self.editor.apply(&PluginId::from(BUILTIN), ApiCall::WinSelect {
+                win: self.chat_win,
+                on: false,
+            });
+        }
+        let _ = self.editor.apply(&PluginId::from(BUILTIN), ApiCall::WinSetCursor {
+            win: self.chat_win,
+            row: at.0,
+            col: at.1,
+        });
+        self.follow_cursor();
+    }
+
+    /// Move `delta` rows, clamped to the transcript.
+    fn reading_by(&mut self, delta: i64, select: bool) {
+        let last = self.chat_lines().len().saturating_sub(1) as i64;
+        let row = (self.chat_cursor().0 as i64 + delta).clamp(0, last.max(0)) as u32;
+        self.reading_jump((row, 0), select);
+    }
+
+    fn chat_cursor(&self) -> (u32, u32) {
+        self.editor.window(self.chat_win).map(|w| w.cursor).unwrap_or((0, 0))
+    }
+
+    /// Rows where a turn begins: the first line of a question, marked by the bar down its left.
+    ///
+    /// Read off the buffer rather than remembered alongside it. A remembered list is one more
+    /// thing to keep true across a session switch, an answer being rewritten as it settles, and a
+    /// transcript rebuilt from stored messages — and it would be wrong in exactly the cases where
+    /// somebody is scrolling back through a long conversation looking for something.
+    fn turn_rows(&self) -> Vec<u32> {
+        let bar = self.glyphs().bar;
+        let lines = self.chat_lines();
+        let mut out = Vec::new();
+        let mut inside = false;
+        for (i, line) in lines.iter().enumerate() {
+            let is_bar = line.starts_with(bar);
+            if is_bar && !inside {
+                out.push(i as u32);
+            }
+            inside = is_bar;
+        }
+        out
+    }
+
+    fn reading_to_turn(&mut self, dir: i32, select: bool) {
+        let here = self.chat_cursor().0;
+        let rows = self.turn_rows();
+        let next = if dir > 0 {
+            rows.into_iter().find(|r| *r > here)
+        } else {
+            rows.into_iter().rev().find(|r| *r < here)
+        };
+        match next {
+            Some(row) => self.reading_jump((row, 0), select),
+            None => self.editor_message(
+                MessageLevel::Info,
+                if dir > 0 { "no later turn" } else { "no earlier turn" },
+            ),
+        }
+    }
+
+    /// The next or previous blank-line boundary.
+    ///
+    /// Which in this buffer is a paragraph, a list, a table and a code block all at once, because
+    /// the markdown renderer separates every block with one — so `}` steps through an answer the
+    /// way its author wrote it rather than by a fixed number of rows.
+    fn reading_to_block(&mut self, dir: i32, select: bool) {
+        let lines = self.chat_lines();
+        let last = lines.len().saturating_sub(1) as i64;
+        let blank = |i: i64| lines.get(i as usize).is_none_or(|l| l.trim().is_empty());
+        let mut at = self.chat_cursor().0 as i64;
+        let step = dir as i64;
+        // Off whatever run of blanks we are standing in first, then on to the next one, so holding
+        // the key walks block by block instead of stalling in the gap between two.
+        while at + step >= 0 && at + step <= last && blank(at + step) == blank(at) {
+            at += step;
+        }
+        at = (at + step).clamp(0, last.max(0));
+        while at + step >= 0 && at + step <= last && blank(at) {
+            at += step;
+        }
+        self.reading_jump((at.clamp(0, last.max(0)) as u32, 0), select);
+    }
+
+    /// Scroll so the cursor's line lands `at` rows down the window.
+    fn place_cursor_line(&mut self, at: u32) {
+        let row = self.chat_cursor().0;
+        let top = row.saturating_sub(at);
+        self.chat_top = top.max(1);
+        let _ = self
+            .editor
+            .apply(&PluginId::from(BUILTIN), ApiCall::WinScrollTo { win: self.chat_win, top_line: top });
+    }
+
+    /// Select the line the cursor is on, end to end.
+    fn select_line(&mut self) {
+        let plugin = PluginId::from(BUILTIN);
+        let _ = self.editor.apply(&plugin, ApiCall::WinSelect { win: self.chat_win, on: false });
+        let _ = self.editor.apply(&plugin, ApiCall::WinMotion {
+            win: self.chat_win,
+            motion: CursorMotion::LineStart,
+            select: false,
+        });
+        let _ = self.editor.apply(&plugin, ApiCall::WinSelect { win: self.chat_win, on: true });
+        let _ = self.editor.apply(&plugin, ApiCall::WinMotion {
+            win: self.chat_win,
+            motion: CursorMotion::LineEnd,
+            select: true,
+        });
+        self.refresh_composer();
+    }
+
+    /// Copy some rows of the transcript, and say how many.
+    fn yank_rows(&mut self, rows: std::ops::Range<u32>, what: &str, strip: bool) {
+        let lines = self.chat_lines();
+        let taken: Vec<String> = lines
+            .iter()
+            .skip(rows.start as usize)
+            .take(rows.len())
+            .map(|l| if strip { l.strip_prefix("  ").unwrap_or(l).to_string() } else { l.clone() })
+            .collect();
+        let text = taken.join("\n");
+        if text.trim().is_empty() {
+            self.editor_message(MessageLevel::Warn, format!("nothing to copy — no {what} here"));
+            return;
+        }
+        let n = taken.len();
+        let _ = self
+            .editor
+            .apply(&PluginId::from(BUILTIN), ApiCall::ClipboardWrite { text });
+        self.editor_message(
+            MessageLevel::Info,
+            format!("copied {what} — {n} line{}", if n == 1 { "" } else { "s" }),
+        );
+    }
+
+    fn yank_line(&mut self) {
+        let row = self.chat_cursor().0;
+        self.yank_rows(row..row + 1, "the line", false);
+    }
+
+    /// Copy the code block the cursor is in, without its indent.
+    ///
+    /// Found from the marks rather than from the text: a fenced block's rows are the ones the
+    /// renderer coloured as code across their whole width, which is a fact it already recorded and
+    /// which no amount of looking at the characters could recover — the back-ticks are gone by
+    /// the time this buffer exists, because they were punctuation for the parser.
+    fn yank_code(&mut self) {
+        let Some(rows) = self.code_block_at(self.chat_cursor().0) else {
+            self.editor_message(MessageLevel::Warn, "the cursor is not in a code block");
+            return;
+        };
+        self.yank_rows(rows, "the code block", true);
+    }
+
+    /// Whether a row is the language line the renderer draws above a fenced block.
+    fn is_fence_header_row(buf: &neosh_core::buffer::Buffer, row: u32) -> bool {
+        buf.render_range(row, row + 1).first().is_some_and(|r| {
+            r.marks.iter().any(|m| m.opts.hl_group.as_deref() == Some("Markdown.Fence"))
+        })
+    }
+
+    fn code_block_at(&self, row: u32) -> Option<std::ops::Range<u32>> {
+        let buf = self.editor.buffer(self.chat)?;
+        let count = buf.line_count();
+        if row >= count {
+            return None;
+        }
+        // A row is code when a mark covers the whole of it with the code group. Sub-ranges are
+        // inline back-ticks, which are part of a sentence and not a block to take away.
+        let is_code = |i: u32| -> bool {
+            buf.render_range(i, i + 1).first().is_some_and(|r| {
+                !r.text.is_empty()
+                    && r.marks.iter().any(|m| {
+                        m.opts.hl_group.as_deref() == Some("Markdown.Code")
+                            && m.col == 0
+                            && m.opts.end_col == Some(r.text.len() as u32)
+                    })
+            })
+        };
+        // Standing on the language header is standing on the block: it is drawn as part of it, it
+        // is the first row of it you can see, and it is where the cursor lands coming down from
+        // above. Refusing there would be pedantry about a distinction only the parser cares about.
+        let row = if is_code(row) {
+            row
+        } else if Self::is_fence_header_row(buf, row) && row + 1 < count && is_code(row + 1) {
+            row + 1
+        } else {
+            return None;
+        };
+        let mut from = row;
+        while from > 0 && is_code(from - 1) {
+            from -= 1;
+        }
+        let mut to = row + 1;
+        while to < count && is_code(to) {
+            to += 1;
+        }
+        Some(from..to)
+    }
+
+    /// Copy the whole exchange the cursor is in — the question and everything it produced.
+
+    fn yank_turn(&mut self) {
+        let here = self.chat_cursor().0;
+        let rows = self.turn_rows();
+        let from = rows.iter().rev().find(|r| **r <= here).copied().unwrap_or(0);
+        let to = rows
+            .iter()
+            .find(|r| **r > here)
+            .copied()
+            .unwrap_or_else(|| self.chat_lines().len() as u32);
+        self.yank_rows(from..to, "the turn", false);
+    }
+
+    // ---- searching -------------------------------------------------------
+
+    /// Start typing a search, borrowing the composer for it.
+    fn begin_search(&mut self, back: bool) {
+        if self.search.is_some() {
+            return;
+        }
+        self.search = Some(SearchPrompt {
+            query: String::new(),
+            back,
+            from: self.chat_cursor(),
+            draft: self.composer_text(),
+        });
+        self.render_search();
+        self.refresh_status();
+    }
+
+    fn render_search(&mut self) {
+        let Some(p) = self.search.as_ref() else { return };
+        let line = format!("{}{}", if p.back { "?" } else { "/" }, p.query);
+        self.set_composer(&line);
+    }
+
+    fn search_key(&mut self, key: neosh_proto::KeyPress) {
+        let Some(p) = self.search.as_mut() else { return };
+        match key.code {
+            KeyCode::Esc => return self.finish_search(false),
+            KeyCode::Enter => return self.finish_search(true),
+            KeyCode::Backspace => {
+                if p.query.is_empty() {
+                    return self.finish_search(false);
+                }
+                let keep = p.query.graphemes(true).count().saturating_sub(1);
+                p.query = p.query.graphemes(true).take(keep).collect();
+            }
+            KeyCode::Char { ref c } if key.mods.ctrl => match c.as_str() {
+                "u" => p.query.clear(),
+                "c" => return self.finish_search(false),
+                _ => return,
+            },
+            KeyCode::Char { ref c } if !key.mods.alt => p.query.push_str(c),
+            _ => return,
+        }
+        self.render_search();
+        // Incremental: the hits light up as you type, so a search that was going to find nothing
+        // says so before you have finished typing it.
+        let (query, back, from) = {
+            let p = self.search.as_ref().expect("checked above");
+            (p.query.clone(), p.back, p.from)
+        };
+        self.highlight_matches(&query);
+        if !query.is_empty() && let Some(at) = self.find_from(&query, from, !back, true) {
+            self.reading_jump(at, false);
+        }
+    }
+
+    fn finish_search(&mut self, submit: bool) {
+        let Some(p) = self.search.take() else { return };
+        self.set_composer(&p.draft);
+        if submit && !p.query.is_empty() {
+            self.searched = p.query.clone();
+            self.highlight_matches(&p.query);
+            match self.find_from(&p.query, p.from, !p.back, true) {
+                Some(at) => self.reading_jump(at, false),
+                None => self.editor_message(MessageLevel::Warn, format!("no match for {:?}", p.query)),
+            }
+        } else {
+            self.clear_matches();
+            self.reading_jump(p.from, false);
+        }
+        self.refresh_status();
+        self.refresh_composer();
+    }
+
+    /// `n` and `N`: on to the next hit for whatever was last searched for.
+    fn search_step(&mut self, same_direction: bool) {
+        if self.searched.is_empty() {
+            self.editor_message(MessageLevel::Info, "nothing to search for yet — `/` starts one");
+            return;
+        }
+        let query = self.searched.clone();
+        let forward = same_direction;
+        match self.find_from(&query, self.chat_cursor(), forward, false) {
+            Some(at) => self.reading_jump(at, false),
+            None => self.editor_message(MessageLevel::Warn, format!("no more matches for {query:?}")),
+        }
+    }
+
+    /// The next match, wrapping round the end.
+    ///
+    /// `include_here` is the difference between typing a search — which should land on the match
+    /// under the cursor if there is one — and pressing `n`, which must move.
+    fn find_from(
+        &self,
+        query: &str,
+        from: (u32, u32),
+        forward: bool,
+        include_here: bool,
+    ) -> Option<(u32, u32)> {
+        let lines = self.chat_lines();
+        if lines.is_empty() || query.is_empty() {
+            return None;
+        }
+        let needle = query.to_lowercase();
+        let n = lines.len();
+        // Case-insensitive unless the query has a capital in it, which is `smartcase` and is what
+        // everybody has turned on anyway.
+        let cased = query.chars().any(char::is_uppercase);
+        let hits = |row: usize| -> Vec<u32> {
+            let hay = if cased { lines[row].clone() } else { lines[row].to_lowercase() };
+            let pat = if cased { query } else { needle.as_str() };
+            let mut out = Vec::new();
+            let mut at = 0;
+            while let Some(i) = hay[at..].find(pat) {
+                out.push((at + i) as u32);
+                at += i + pat.len().max(1);
+            }
+            out
+        };
+        for step in 0..=n {
+            let row = if forward {
+                (from.0 as usize + step) % n
+            } else {
+                (from.0 as usize + n - (step % n)) % n
+            };
+            let cols = hits(row);
+            let found = if step == 0 {
+                let here = from.1;
+                if forward {
+                    cols.into_iter().find(|c| if include_here { *c >= here } else { *c > here })
+                } else {
+                    cols.into_iter().rev().find(|c| if include_here { *c <= here } else { *c < here })
+                }
+            } else if forward {
+                cols.into_iter().next()
+            } else {
+                cols.into_iter().next_back()
+            };
+            if let Some(col) = found {
+                return Some((row as u32, col));
+            }
+        }
+        None
+    }
+
+    /// Colour every hit, so the shape of where a word appears is visible without walking to each.
+    fn highlight_matches(&mut self, query: &str) {
+        self.clear_matches();
+        if query.is_empty() {
+            return;
+        }
+        let lines = self.chat_lines();
+        let cased = query.chars().any(char::is_uppercase);
+        let needle = query.to_lowercase();
+        let plugin = PluginId::from(BUILTIN);
+        // Bounded, because a one-letter query against a long transcript is thousands of marks and
+        // every one of them travels to the frontend. The cursor still walks to every hit.
+        let mut left = 500usize;
+        for (row, line) in lines.iter().enumerate() {
+            let hay = if cased { line.clone() } else { line.to_lowercase() };
+            let pat = if cased { query } else { needle.as_str() };
+            let mut at = 0usize;
+            while let Some(i) = hay[at..].find(pat) {
+                let from = at + i;
+                let _ = self.editor.apply(&plugin, ApiCall::MarkSet {
+                    ns: self.search_ns,
+                    buf: self.chat,
+                    row: row as u32,
+                    col: from as u32,
+                    opts: neosh_proto::ExtmarkOpts {
+                        end_col: Some((from + pat.len()) as u32),
+                        hl_group: Some("Search".into()),
+                        virt_text: Vec::new(),
+                        virt_text_pos: VirtTextPos::Eol,
+                        on_delete: neosh_proto::OnDelete::Invalidate,
+                        priority: 50,
+                    },
+                });
+                left -= 1;
+                if left == 0 {
+                    return;
+                }
+                at = from + pat.len().max(1);
+            }
+        }
+    }
+
+    fn clear_matches(&mut self) {
+        let _ = self.editor.apply(&PluginId::from(BUILTIN), ApiCall::MarkClear {
+            ns: self.search_ns,
+            buf: self.chat,
+            start: None,
+            end: None,
+        });
     }
 
     fn chat_anchored(&self) -> bool {
@@ -2396,6 +3046,29 @@ impl Host {
             }
             return true;
         }
+        // A search being typed takes the keyboard the same way, and for a milder version of the
+        // same reason: `n` is a letter in most words and it is also the key for "next match".
+        if self.search.is_some() {
+            match input {
+                InputEvent::Key { key } => self.search_key(key),
+                InputEvent::Paste { text } => {
+                    if let Some(p) = self.search.as_mut() {
+                        p.query.push_str(text.trim());
+                    }
+                    self.render_search();
+                    let (query, back, from) = {
+                        let p = self.search.as_ref().expect("checked above");
+                        (p.query.clone(), p.back, p.from)
+                    };
+                    self.highlight_matches(&query);
+                    if let Some(at) = self.find_from(&query, from, !back, true) {
+                        self.reading_jump(at, false);
+                    }
+                }
+                other => return self.handle_input_uncaptured(other),
+            }
+            return true;
+        }
         let handled = self.handle_input_uncaptured(input);
         self.refresh_composer();
         handled
@@ -2708,7 +3381,10 @@ impl Host {
             ("chat.scroll_up", "Scroll the transcript up a screen"),
             ("chat.scroll_down", "Scroll the transcript down a screen"),
             ("chat.scroll_end", "Jump to the end of the transcript"),
-            ("chat.read", "Move into the transcript to navigate, select and copy it"),
+            (
+                "chat.read",
+                "Read the transcript: hjkl move, [ ] turns, { } blocks, / finds, yc takes the code",
+            ),
             ("edit.copy", "Copy what is selected"),
             ("edit.cut", "Cut what is selected"),
             ("edit.select_all", "Select everything here"),
@@ -3161,13 +3837,18 @@ impl Host {
             // happens to load first: two plugins declaring one name is an error, and a plugin that
             // is switched off must not take the setting away from everything else — which is
             // exactly what happened when the sidebar owned these and `plugins.disabled` was used.
+            // Off by default. It read as a good idea and was not: nearly every key on it is
+            // already in the sidebar's own footer, two rows below, and the ones that are not are
+            // on the help key. What it actually did was take a row off the transcript and press
+            // the composer against the status strip.
             OptionSpec {
                 name: "ui.hints".into(),
                 ty: OptionType::Bool,
-                default: OptionValue::Bool(true),
+                default: OptionValue::Bool(false),
                 description: Some(
-                    "Show the shortcut row under the composer. Off gives the transcript the row \
-                     back; the full list is still on the help key."
+                    "Show a shortcut row under the composer. Off by default: the sidebar's footer \
+                     carries the same keys and `F1` carries all of them, so the row mostly cost \
+                     the transcript a line."
                         .into(),
                 ),
             },

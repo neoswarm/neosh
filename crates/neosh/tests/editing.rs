@@ -443,6 +443,7 @@ fn you_can_move_into_the_transcript_and_copy_a_line_out_of_it() {
 
     // Top of the transcript, down onto the greeting, select to the end of it, yank.
     s.ch("g");
+    s.ch("g");
     s.ch("j");
     s.ch("v");
     s.ch("$");
@@ -463,8 +464,8 @@ fn select_all_while_reading_takes_the_whole_transcript() {
     assert!(s.pump(|s| s.chat().iter().any(|l| l.contains("neosh"))));
 
     s.press(json!({"kind": "char", "c": "s"}), &["ctrl"]);
-    s.ch("a");
     s.ch("y");
+    s.ch("a");
     assert!(
         s.pump(|s| s.copied().iter().any(|t| t.contains("neosh"))),
         "everything, not just the line under the cursor: {:?}",

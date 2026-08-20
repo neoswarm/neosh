@@ -2443,9 +2443,30 @@ impl Session {
 }
 
 #[test]
-fn the_row_under_the_composer_says_what_the_keys_do() {
-    let sb = Sandbox::new("hints");
+fn the_shortcut_row_is_off_because_the_sidebar_already_says_all_of_it() {
+    // It read as a good idea and was not. `^T`, `^N` and `^K` are in the sidebar's own footer two
+    // rows below, `F1` is on the row it points at, and what the duplication actually bought was
+    // one fewer line of transcript and a composer pressed against the status strip.
+    let sb = Sandbox::new("nohints");
     let mut s = sb.start();
+    s.wait_for("PROJECTS");
+    assert!(
+        s.pump(|s| s.sidebar_now().iter().any(|l| l.contains("^K palette"))),
+        "the sidebar carries the keys\n{:?}",
+        s.sidebar_now()
+    );
+    assert!(
+        !s.composer_chrome().join(" ").contains("palette"),
+        "and the composer does not say them again\n{:?}",
+        s.composer_chrome()
+    );
+}
+
+#[test]
+fn the_shortcut_row_comes_back_if_you_ask_for_it() {
+    let sb = Sandbox::new("hints");
+    sb.write_config("[options]\n\"ui.hints\" = true\n");
+    let mut s = sb.start_letting_config_choose();
     // Waiting on a plugin's entry, not the host's: the host seeds `⏎ send` before any plugin has
     // loaded, so asserting on that alone would pass before the row was finished.
     assert!(
