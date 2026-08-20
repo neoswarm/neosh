@@ -44,8 +44,9 @@ fn boolean(id: &str, label: &str, desc: &str) -> ProviderOptionDescriptor {
         current_value: false,
     }
 }
+/// `low` -> `Low`. Shared so a discovered effort level reads like a written-down one.
 
-fn title_case(s: &str) -> String {
+pub fn title_case(s: &str) -> String {
     let mut c = s.chars();
     match c.next() {
         Some(f) => f.to_uppercase().collect::<String>() + c.as_str(),
@@ -152,37 +153,124 @@ pub fn anthropic_models() -> Vec<ModelInfo> {
     ]
 }
 
+/// A select over how much context to buy: the 1M window is opt-in and billed differently.
+///
+/// Written as an option rather than as two catalogue rows, because it is the same model — a row
+/// each would double the list and put the decision in the wrong place, which is beside the
+/// reasoning effort, not among the products.
+fn context_window(long_by_default: bool) -> ProviderOptionDescriptor {
+    ProviderOptionDescriptor::Select {
+        id: "context".into(),
+        label: "Context".into(),
+        description: Some("How much of the conversation the model can see at once.".into()),
+        options: vec![
+            OptionChoice {
+                id: "200k".into(),
+                label: "200k".into(),
+                description: None,
+                is_default: !long_by_default,
+            },
+            OptionChoice {
+                id: "1m".into(),
+                label: "1M".into(),
+                description: Some("Premium pricing past 200k.".into()),
+                is_default: long_by_default,
+            },
+        ],
+        current_value: Some(if long_by_default { "1m".into() } else { "200k".into() }),
+        prompt_injected_values: Vec::new(),
+    }
+}
+
+/// What each `claude` model needs from the CLI, beyond its name.
+///
+/// `(id, name, family, tier, tagline, context, efforts, fast_mode, long_context, legacy)`.
+type ClaudeCliEntry = (
+    &'static str,
+    &'static str,
+    &'static str,
+    ModelTier,
+    &'static str,
+    u64,
+    Option<&'static [&'static str]>,
+    bool,
+    Option<bool>,
+    bool,
+);
+
 /// Models reachable through the `claude` CLI.
 ///
-/// The CLI accepts aliases and resolves them itself, so this is a short list of aliases rather than
-/// pinned ids — it stays correct as the CLI updates.
+/// # Why this is written down rather than discovered
+///
+/// The CLI has no "list models" call — `--model` takes a slug or an alias and resolves it itself,
+/// and there is no way to ask what it would accept. So this is the catalogue, and
+/// [`crate::drivers::claude_cli`] filters it against the version that is actually installed: an
+/// older CLI rejects a model it has never heard of, and offering it anyway turns a switch into a
+/// failed turn.
+///
+/// # Slugs, not aliases
+///
+/// This used to be three aliases — `opus`, `sonnet`, `haiku` — on the reasoning that an alias
+/// never goes stale. It does not, but it also cannot say what it resolves to, cannot carry a
+/// version's own option set, and hides every model that is not the newest in its line. Pinning
+/// slugs and letting `model.line opus` do the resolving separates the two jobs: the catalogue says
+/// what exists, and the ladder says which one is current.
 pub fn claude_cli_models() -> Vec<ModelInfo> {
     use ModelTier::{Balanced, Fast, Frontier};
-    [
-        ("opus", Frontier, "Most capable for complex work"),
-        ("sonnet", Balanced, "Best for everyday tasks"),
-        ("haiku", Fast, "Fastest, for quick answers"),
-    ]
-    .into_iter()
-    .map(|(alias, tier, tagline)| {
-        let mut m = ModelInfo::undescribed(alias, format!("Claude {}", title_case(alias)));
-        m.capabilities = ModelCapabilities {
-            tools: true,
-            vision: true,
-            streaming: true,
-            thinking: true,
-            prompt_caching: true,
-            option_descriptors: vec![effort(EFFORT_5, "high")],
-        };
-        // The alias *is* the family: the CLI resolves it to whatever is current, which is the whole
-        // reason to pin an alias rather than an id. There is nothing older to fold away, so no
-        // entry here is ever legacy.
-        m.family = Some(alias.to_string());
-        m.tier = Some(tier);
-        m.tagline = Some(tagline.into());
-        m
-    })
-    .collect()
+    const OPUS: &str = "Most capable for complex work";
+    const SONNET: &str = "Best for everyday tasks";
+    const ENTRIES: &[ClaudeCliEntry] = &[
+        ("claude-opus-5", "Claude Opus 5", "opus", Frontier, OPUS, 1_000_000, Some(EFFORT_5), true, Some(true), false),
+        ("claude-fable-5", "Claude Fable 5", "fable", Frontier, "Long-form writing and voice", 1_000_000, Some(EFFORT_5), false, Some(true), false),
+        ("claude-sonnet-5", "Claude Sonnet 5", "sonnet", Balanced, SONNET, 1_000_000, Some(EFFORT_5), false, Some(false), false),
+        ("claude-haiku-4-5", "Claude Haiku 4.5", "haiku", Fast, "Fastest, for quick answers", 200_000, None, false, None, false),
+        ("claude-opus-4-8", "Claude Opus 4.8", "opus", Frontier, OPUS, 1_000_000, Some(EFFORT_5), true, None, true),
+        ("claude-opus-4-7", "Claude Opus 4.7", "opus", Frontier, OPUS, 1_000_000, Some(EFFORT_5), false, None, true),
+        ("claude-opus-4-6", "Claude Opus 4.6", "opus", Frontier, OPUS, 1_000_000, Some(EFFORT_46), false, None, true),
+        ("claude-opus-4-5", "Claude Opus 4.5", "opus", Frontier, OPUS, 200_000, Some(EFFORT_46), false, None, true),
+        ("claude-sonnet-4-6", "Claude Sonnet 4.6", "sonnet", Balanced, SONNET, 1_000_000, Some(EFFORT_46), false, Some(false), true),
+    ];
+
+    ENTRIES
+        .iter()
+        .map(|(id, name, family, tier, tagline, ctx, efforts, fast, long, legacy)| {
+            let mut descriptors = Vec::new();
+            if let Some(levels) = efforts {
+                descriptors.push(effort(levels, "high"));
+            } else {
+                descriptors.push(boolean(
+                    "thinking",
+                    "Thinking",
+                    "Let it reason before answering.",
+                ));
+            }
+            if *fast {
+                descriptors.push(boolean(
+                    "fast_mode",
+                    "Fast mode",
+                    "Same model, higher output rate, premium pricing.",
+                ));
+            }
+            if let Some(long_by_default) = *long {
+                descriptors.push(context_window(long_by_default));
+            }
+            let mut m = ModelInfo::undescribed(*id, *name);
+            m.context_window = Some(*ctx);
+            m.capabilities = ModelCapabilities {
+                tools: true,
+                vision: true,
+                streaming: true,
+                thinking: efforts.is_some(),
+                prompt_caching: true,
+                option_descriptors: descriptors,
+            };
+            m.family = Some((*family).to_string());
+            m.tier = Some(*tier);
+            m.tagline = Some((*tagline).to_string());
+            m.legacy = *legacy;
+            m
+        })
+        .collect()
 }
 
 /// A model in a seed list: enough to pick one, not enough to pretend it is a full description.

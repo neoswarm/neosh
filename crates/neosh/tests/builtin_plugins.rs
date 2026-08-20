@@ -377,6 +377,81 @@ fn the_model_picker_opens_and_lists_what_is_reachable() {
     assert!(rows.iter().any(|l| l.contains("mock")), "{rows:?}");
 }
 
+/// A second provider with two models, so the rail has somewhere to move to and the pane has
+/// somewhere to move *within* — which is how "did the focus actually change panes" is answerable.
+const OTHER: &str = r#"
+import type { PluginContext } from "@neosh/api";
+
+export async function activate({ neosh }: PluginContext) {
+  await neosh.provider.register("other", [{
+    id: "other", driver: "other", display_name: "Other",
+    models: [
+      { id: "other-1", display_name: "Other One" },
+      { id: "other-2", display_name: "Other Two" },
+    ],
+  }], async (_req, emit) => { emit({ type: "message_stop" }); });
+  neosh.notify("other ready");
+}
+"#;
+
+fn install_other(sb: &Sandbox) {
+    let dir = sb.root.join("config/plugins/other");
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    std::fs::write(
+        dir.join("plugin.toml"),
+        "name = \"other\"\nversion = \"0.1.0\"\nentry = \"main.ts\"\npermissions = [\"providers\"]\n",
+    )
+    .expect("manifest");
+    std::fs::write(dir.join("main.ts"), OTHER).expect("plugin");
+}
+
+/// Moving into the rail and down it changes which provider's models are on the right.
+///
+/// Regression, and a nasty one: `<Tab>` is deliberately shared between `complete` and `pane_next`
+/// on the reasoning that no widget has both. But the key was resolved against every action in a
+/// fixed order regardless of which widget was asking, so `<Tab>` in the model picker came back as
+/// `complete` — an action a rail picker has no case for — and did nothing at all. The second pane
+/// was on screen, named in the shortcut row, and unreachable.
+#[test]
+fn the_rail_is_reachable_and_choosing_a_provider_lists_its_models() {
+    let sb = Sandbox::new("railmove");
+    install_other(&sb);
+    let mut s = sb.start();
+    s.wait_for("other ready");
+    s.wait_for("PROJECTS");
+    s.ctrl("p");
+    s.wait_for("Model");
+
+    // The shortcut row says how to get there, so it had better be true.
+    assert!(
+        s.picker_now().iter().any(|l| l.contains("providers")),
+        "the picker says the rail is reachable\n{:?}",
+        s.picker_now()
+    );
+
+    // Back a pane, into the rail; down it, onto the other provider; then *forward* a pane with
+    // `<Tab>` and down again. If `<Tab>` reached the pane, that last press moved the model cursor.
+    // If it did not, it moved the rail instead — off the end, leaving the cursor on the first
+    // model of a provider whose list nobody asked to change.
+    s.special("back_tab");
+    s.special("down");
+    assert!(
+        s.pump(|s| s.picker_now().iter().any(|l| l.contains("Other One"))),
+        "moving down the rail listed the other provider\n{:?}",
+        s.picker_now()
+    );
+    s.special("tab");
+    s.special("down");
+    assert!(
+        s.pump(|s| s
+            .picker_now()
+            .iter()
+            .any(|l| l.contains("Other Two") && l.contains('\u{276f}'))),
+        "and the cursor is on the second model, so <Tab> reached the pane\n{:?}",
+        s.picker_now()
+    );
+}
+
 #[test]
 fn a_picker_owns_its_navigation_keys_while_it_is_open() {
     // `<C-n>` is bound globally to "new conversation". A raw capture only receives keys that no
@@ -2829,8 +2904,8 @@ fn a_tool_call_says_what_came_back_not_only_that_it_ran() {
         s.chat_now()
     );
     assert!(
-        s.chat_now().iter().any(|l| l.trim_start().starts_with('\u{2717}')
-            && l.contains("could not read")),
+        s.pump(|s| s.chat_now().iter().any(|l| l.trim_start().starts_with('\u{2717}')
+            && l.contains("could not read"))),
         "and what it came back with, under it\n{:?}",
         s.chat_now()
     );

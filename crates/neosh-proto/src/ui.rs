@@ -60,15 +60,26 @@ pub enum Anchor {
 }
 
 /// A size request along one axis. Resolved by the frontend against the real viewport.
+///
+/// # An extent measures content, not the box drawn around it
+///
+/// Every variant here answers the same question — *how much room does what I am putting in it
+/// need* — and the border is chrome the frontend adds afterwards. `Auto` could not mean anything
+/// else, since the content is all it has to measure; the others follow it so that swapping one for
+/// another does not silently resize what you can see.
+///
+/// The alternative, where `Fixed` names the outer box, means every caller subtracts two from every
+/// number it computes, and the day one of them forgets, the last line of a list is simply not
+/// drawn — with no error, because a rectangle that small is perfectly valid.
 #[derive(TS, Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 #[ts(export)]
 pub enum Extent {
-    /// Exactly `n` cells.
+    /// Room for exactly `n` cells of content.
     Fixed { n: u16 },
     /// Fit the content.
     Auto,
-    /// Fit the content, but never exceed `n` cells.
+    /// Fit the content, but never more than `n` cells of it.
     Max { n: u16 },
     /// Fill the available space.
     Fill,

@@ -12,6 +12,7 @@ NAMED = {
     "cr": "\r", "esc": "\x1b", "tab": "\t", "bs": "\x7f", "space": " ",
     "up": "\x1b[A", "down": "\x1b[B", "right": "\x1b[C", "left": "\x1b[D",
     "s-tab": "\x1b[Z",
+    "f1": "\x1bOP", "f2": "\x1bOQ", "f3": "\x1bOR", "f4": "\x1bOS",
 }
 
 def encode(tok: str) -> str:

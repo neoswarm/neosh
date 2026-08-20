@@ -151,6 +151,12 @@ function parseKey(spec: string): KeySpec | null {
     out.kind = named[lower]!;
     if (lower === "space") out.c = " ";
     if (lower === "lt") out.c = "<";
+    // `<S-Tab>` is not tab with a modifier — a terminal sends a wholly different sequence, which
+    // arrives as its own code. Written the way everyone writes it, matched the way it arrives.
+    if (out.kind === "tab" && out.shift) {
+      out.kind = "back_tab";
+      out.shift = false;
+    }
     return out;
   }
   if (inner.length === 1) {
@@ -218,15 +224,34 @@ function watchKeys(neosh: Neosh): void {
   });
 }
 
-/** Which action a key press means, or `null` if it is ordinary input. */
-function actionFor(keys: Map<WidgetAction, KeySpec[]>, key: KeyContext["key"]): WidgetAction | null {
-  for (const action of ACTIONS) {
+/**
+ * Which action a key press means, or `null` if it is ordinary input.
+ *
+ * `only` is the set of actions the asking widget can actually carry out, and it is not an
+ * optimisation. Two actions share `<Tab>` on purpose — `complete` in a field with suggestions
+ * under it, `pane_next` in a widget with two panes — on the reasoning that no widget has both. It
+ * does not have both, but it does *resolve* both: without this filter the first one in `ACTIONS`
+ * wins for everybody, and `<Tab>` in the model picker resolved to a completion the picker has no
+ * case for, so it silently did nothing at all and the second pane had no way in.
+ */
+function actionFor(
+  keys: Map<WidgetAction, KeySpec[]>,
+  key: KeyContext["key"],
+  only?: readonly WidgetAction[],
+): WidgetAction | null {
+  for (const action of only ?? ACTIONS) {
     for (const spec of keys.get(action) ?? []) {
       if (matches(spec, key)) return action;
     }
   }
   return null;
 }
+
+/** What a two-pane widget answers to. Notably not `complete`, whose key it shares. */
+const RAIL_ACTIONS: readonly WidgetAction[] = [
+  "dismiss", "accept", "pane_next", "pane_prev", "next", "prev",
+  "page_down", "page_up", "first", "last", "clear", "delete_word",
+];
 
 export interface PickerItem<T> {
   /** What the user reads and what the filter matches against. */
@@ -1601,7 +1626,7 @@ export async function railPicker<G, T>(
         return;
       }
 
-      switch (actionFor(keys, key.key)) {
+      switch (actionFor(keys, key.key, RAIL_ACTIONS)) {
         case "dismiss":
           await close(null);
           return;

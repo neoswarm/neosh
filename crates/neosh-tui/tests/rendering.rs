@@ -333,6 +333,91 @@ fn an_auto_sized_float_fits_its_widest_line() {
     assert_eq!(f.height, 2);
 }
 
+/// A bordered float asking for `n` rows gets `n` rows of *content*, not `n - 2`.
+///
+/// Regression: the border used to be taken out of the number the caller asked for, so a picker
+/// laid out as "title, filter, rule, fourteen rows, rule, shortcuts" lost its last two lines —
+/// silently, because a rectangle two rows short is a perfectly legal rectangle. The shortcut row
+/// is where a picker says how to reach its second pane, so the affordance vanished with it.
+#[test]
+fn a_border_does_not_eat_the_rows_a_float_asked_for() {
+    let mut m = Mirror::new();
+    m.apply(UiEvent::BufferOpened { buf: BufferId(4), name: "f".into() });
+    m.apply(UiEvent::WindowOpened {
+        win: WindowId(11),
+        buf: BufferId(4),
+        layout: WindowLayout::Float {
+            config: FloatConfig {
+                anchor: Anchor::Screen,
+                width: Extent::Fixed { n: 40 },
+                height: Extent::Fixed { n: 19 },
+                border: BorderStyle::Rounded,
+                ..Default::default()
+            },
+        },
+    });
+    let f = resolve_layout(&m, Rect::new(0, 0, 100, 40))
+        .into_iter()
+        .find(|(w, _)| *w == WindowId(11))
+        .unwrap()
+        .1;
+    assert_eq!((f.width, f.height), (42, 21), "outer rect should be the content plus its border");
+}
+
+/// The same request without a border gets exactly what it asked for, so the two agree about what
+/// the number means and only differ in what is drawn around it.
+#[test]
+fn without_a_border_a_fixed_extent_is_the_rectangle() {
+    let mut m = Mirror::new();
+    m.apply(UiEvent::BufferOpened { buf: BufferId(5), name: "f".into() });
+    m.apply(UiEvent::WindowOpened {
+        win: WindowId(12),
+        buf: BufferId(5),
+        layout: WindowLayout::Float {
+            config: FloatConfig {
+                anchor: Anchor::Screen,
+                width: Extent::Fixed { n: 40 },
+                height: Extent::Fixed { n: 19 },
+                border: BorderStyle::None,
+                ..Default::default()
+            },
+        },
+    });
+    let f = resolve_layout(&m, Rect::new(0, 0, 100, 40))
+        .into_iter()
+        .find(|(w, _)| *w == WindowId(12))
+        .unwrap()
+        .1;
+    assert_eq!((f.width, f.height), (40, 19));
+}
+
+/// Asking for more than there is loses content, never the bottom edge of the box.
+#[test]
+fn a_float_too_tall_for_the_screen_is_clamped_to_it() {
+    let mut m = Mirror::new();
+    m.apply(UiEvent::BufferOpened { buf: BufferId(6), name: "f".into() });
+    m.apply(UiEvent::WindowOpened {
+        win: WindowId(13),
+        buf: BufferId(6),
+        layout: WindowLayout::Float {
+            config: FloatConfig {
+                anchor: Anchor::Screen,
+                width: Extent::Fixed { n: 200 },
+                height: Extent::Fixed { n: 200 },
+                border: BorderStyle::Rounded,
+                ..Default::default()
+            },
+        },
+    });
+    let area = Rect::new(0, 0, 60, 20);
+    let f = resolve_layout(&m, area)
+        .into_iter()
+        .find(|(w, _)| *w == WindowId(13))
+        .unwrap()
+        .1;
+    assert_eq!((f.width, f.height), (60, 20));
+}
+
 // ---------------------------------------------------------------------------
 // Snapshot
 // ---------------------------------------------------------------------------

@@ -101,7 +101,11 @@ export async function activate({ neosh, subscriptions }: PluginContext) {
 
     // Its own segment, with its own key. Glued onto the model name they read as one word, and the
     // one you want to change is whichever you are not looking at.
-    const options = (selection.options ?? []).map((o) => String(o.value)).join(" ");
+    const entries = await neosh.agent.listModels(selection.instance).catch(() => [] as ModelEntry[]);
+    const descriptors =
+      entries.find((e) => e.model.id === selection.model)?.model.capabilities?.option_descriptors ??
+      [];
+    const options = summarise(selection.options ?? [], descriptors);
     if (options) {
       await neosh.status.set("effort", {
         text: options,
@@ -127,6 +131,30 @@ export async function activate({ neosh, subscriptions }: PluginContext) {
 
 /** Set by `activate`, so the pickers can update the footer the moment a choice lands. */
 let refreshFooter: () => Promise<void> = async () => {};
+
+/**
+ * The option values, as a line short enough to sit in a footer.
+ *
+ * A boolean that is off is not shown at all — `fast_mode false` says nothing you did not already
+ * assume, and putting the word "false" in a status strip beside a model name reads as an error.
+ * One that is on is shown by name, because that *is* the news. Selects show their value, since a
+ * select always has one and which one it is always matters.
+ */
+function summarise(
+  chosen: readonly OptionSelection[],
+  descriptors: readonly ProviderOptionDescriptor[],
+): string {
+  const out: string[] = [];
+  for (const d of descriptors) {
+    const value = chosen.find((o) => o.id === d.id)?.value;
+    if (d.type === "boolean") {
+      if (value === true) out.push(d.label.toLowerCase());
+    } else if (typeof value === "string") {
+      out.push(d.options.find((o) => o.id === value)?.label ?? value);
+    }
+  }
+  return out.join(" ");
+}
 
 /**
  * How an instance's key situation reads in a list.

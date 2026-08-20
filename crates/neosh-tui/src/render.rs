@@ -299,11 +299,19 @@ pub fn render_line_in(
 // Layout
 // ---------------------------------------------------------------------------
 
-fn resolve_extent(e: Extent, content: u16, available: u16) -> u16 {
+/// Turn a size request into cells, border included.
+///
+/// `content` is what the buffer needs, `chrome` the columns or rows the border will eat, and
+/// `available` the whole axis. Every variant sizes *content* — see [`Extent`] — so the chrome is
+/// added on afterwards and the sum is clamped to what there is.
+///
+/// The clamp is why the border has to be part of this function rather than added by the caller: a
+/// float asking for more than fits must lose content rows, not draw its bottom edge off-screen.
+fn resolve_extent(e: Extent, content: u16, chrome: u16, available: u16) -> u16 {
     let v = match e {
-        Extent::Fixed { n } => n,
-        Extent::Auto => content,
-        Extent::Max { n } => content.min(n),
+        Extent::Fixed { n } => n.saturating_add(chrome),
+        Extent::Auto => content.saturating_add(chrome),
+        Extent::Max { n } => content.min(n).saturating_add(chrome),
         Extent::Fill => available,
     };
     v.clamp(1, available.max(1))
@@ -419,8 +427,8 @@ pub fn resolve_layout_with_rules(
             .unwrap_or(0) as u16;
 
         let chrome = u16::from(config.border != neosh_proto::BorderStyle::None) * 2;
-        let cw = resolve_extent(config.width, longest.saturating_add(chrome), area.width);
-        let ch = resolve_extent(config.height, lines.saturating_add(chrome), area.height);
+        let cw = resolve_extent(config.width, longest, chrome, area.width);
+        let ch = resolve_extent(config.height, lines, chrome, area.height);
 
         let (base_x, base_y) = match config.anchor {
             Anchor::Screen => (

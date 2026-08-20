@@ -52,9 +52,12 @@ pub fn to_input_event(ev: Event) -> Option<InputEvent> {
                 _ => return None,
             };
             // Terminals already fold shift into the character, so reporting it as well would make
-            // `<S-a>` and `A` two different bindings for the same keystroke.
+            // `<S-a>` and `A` two different bindings for the same keystroke. `BackTab` is the same
+            // situation spelled differently: it *is* shift-tab, arriving as its own sequence, and
+            // crossterm reports the modifier as well. Keeping both means the key that arrives is
+            // shift-back-tab, which is not a key anybody can write down or press.
             let shift = modifiers.contains(KeyModifiers::SHIFT)
-                && !matches!(code, KeyCode::Char { .. });
+                && !matches!(code, KeyCode::Char { .. } | KeyCode::BackTab);
             Some(InputEvent::Key {
                 key: KeyPress {
                     code,
@@ -263,6 +266,22 @@ mod tests {
         // For non-character keys, shift is meaningful.
         let ev = to_input_event(key(CtCode::Tab, KeyModifiers::SHIFT, KeyEventKind::Press));
         assert!(matches!(ev, Some(InputEvent::Key { key }) if key.mods.shift));
+    }
+
+    /// Regression: crossterm reports shift-tab as `BackTab` *and* sets the shift modifier, so a
+    /// binding written `<S-Tab>` — which is one key press, not two things at once — never matched
+    /// what arrived. It stayed listed in the key sheet the whole time, which is the worst way for
+    /// a binding to be broken.
+    #[test]
+    fn back_tab_does_not_also_report_the_shift_that_produced_it() {
+        let ev = to_input_event(key(CtCode::BackTab, KeyModifiers::SHIFT, KeyEventKind::Press));
+        match ev {
+            Some(InputEvent::Key { key }) => {
+                assert_eq!(key.code, KeyCode::BackTab);
+                assert!(!key.mods.shift);
+            }
+            other => panic!("unexpected {other:?}"),
+        }
     }
 
     #[test]

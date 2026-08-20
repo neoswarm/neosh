@@ -97,7 +97,16 @@ fn parse_bracketed(inner: &str, whole: &str) -> Result<KeyPress, ApiError> {
     let code = match rest.to_ascii_lowercase().as_str() {
         "esc" => KeyCode::Esc,
         "cr" | "enter" | "return" => KeyCode::Enter,
+        // A terminal has no such thing as tab-with-shift held: it sends a different sequence
+        // entirely, which arrives as `BackTab` with no modifier. Everyone writes the binding as
+        // `<S-Tab>`, so that notation has to land on the key the terminal will actually deliver —
+        // otherwise the binding is accepted, listed, shown in the footer, and never fires.
+        "tab" if mods.shift => {
+            mods.shift = false;
+            KeyCode::BackTab
+        }
         "tab" => KeyCode::Tab,
+        "backtab" => KeyCode::BackTab,
         "bs" | "backspace" => KeyCode::Backspace,
         "del" | "delete" => KeyCode::Delete,
         "insert" => KeyCode::Insert,
@@ -460,5 +469,26 @@ mod tests {
         let mut t = table();
         t.remove_owner("p");
         assert!(t.list(None).is_empty());
+    }
+
+    /// `<S-Tab>` is one key press, and a terminal delivers it as its own code with no modifier.
+    ///
+    /// Regression: it parsed to tab-with-shift, which is a key press no terminal produces. The
+    /// binding was accepted, listed in the key sheet and shown in the footer, and never once fired.
+    #[test]
+    fn shift_tab_is_the_key_a_terminal_actually_sends() {
+        let parsed = parse_keys("<S-Tab>").expect("parses");
+        assert_eq!(parsed, vec![KeyPress { code: KeyCode::BackTab, mods: KeyMods::default() }]);
+        assert_eq!(parse_keys("<BackTab>").expect("parses"), parsed);
+        // And it round-trips, so the sheet says what you would have to type to bind it again.
+        assert_eq!(format_keys(&parsed), "<S-Tab>");
+    }
+
+    #[test]
+    fn a_plain_tab_is_still_a_plain_tab() {
+        assert_eq!(
+            parse_keys("<Tab>").expect("parses"),
+            vec![KeyPress { code: KeyCode::Tab, mods: KeyMods::default() }]
+        );
     }
 }

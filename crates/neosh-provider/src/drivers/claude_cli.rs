@@ -25,18 +25,41 @@ use std::process::Stdio;
 use std::sync::{Arc, Mutex};
 
 use neosh_proto::{
-    ContentBlock, DriverKind, InstanceConfig, Message, ProviderEvent, Role, TurnRequest,
+    ContentBlock, DriverKind, InstanceConfig, Message, ModelInfo, ProviderEvent, Role, TurnRequest,
 };
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-use crate::{Provider, ProviderStream, sse};
+use crate::{Provider, ProviderError, ProviderStream, catalog, sse};
+
+/// The oldest `claude` that will accept a given model.
+///
+/// A CLI that has not heard of a model does not degrade — it exits with "unknown model" after you
+/// have typed your question. So the picker is filtered rather than the failure explained, and
+/// anything not listed here has been around long enough that no installed version lacks it.
+///
+/// Sourced from the release each model shipped in. Wrong in the safe direction if it drifts: a
+/// too-high floor hides a model until the next upgrade, a too-low one is the behaviour we have
+/// today.
+const MIN_VERSION: &[(&str, (u32, u32, u32))] = &[
+    ("claude-opus-5", (2, 1, 219)),
+    ("claude-fable-5", (2, 1, 169)),
+    ("claude-sonnet-5", (2, 1, 219)),
+    ("claude-opus-4-8", (2, 1, 154)),
+    ("claude-opus-4-7", (2, 1, 111)),
+];
 
 #[derive(Debug)]
 pub struct ClaudeCliProvider {
     program: String,
+    /// What `claude --version` said, asked once.
+    ///
+    /// `Some(None)` means we asked and could not tell — a CLI that will not report its version is
+    /// treated as new enough, because hiding every recent model from somebody whose install works
+    /// fine is the worse of the two mistakes.
+    version: Arc<Mutex<Option<Option<(u32, u32, u32)>>>>,
     /// The CLI owns conversation history; we hold its session id and resume into it.
     ///
     /// One conversation per instance, which matches one neosh session. Multiple concurrent
@@ -52,7 +75,7 @@ impl Default for ClaudeCliProvider {
 
 impl ClaudeCliProvider {
     pub fn new(program: impl Into<String>) -> Self {
-        Self { program: program.into(), session: Arc::default() }
+        Self { program: program.into(), version: Arc::default(), session: Arc::default() }
     }
 
     /// Whether the CLI is on `PATH`. Used to decide if this instance is offerable at all.
@@ -63,6 +86,19 @@ impl ClaudeCliProvider {
     /// Forget the CLI-side conversation, so the next turn starts fresh.
     pub fn reset_session(&self) {
         *self.session.lock().expect("session lock poisoned") = None;
+    }
+
+    /// The installed version, asked once and remembered.
+    ///
+    /// Blocking, deliberately: this is one `--version` on a program already on `PATH`, and the
+    /// alternative is an async lock held across a spawn in a function whose only caller is itself
+    /// async and already awaiting a list.
+    fn version(&self) -> Option<(u32, u32, u32)> {
+        let mut slot = self.version.lock().expect("version lock poisoned");
+        *slot.get_or_insert_with(|| {
+            let out = std::process::Command::new(&self.program).arg("--version").output().ok()?;
+            parse_version(&String::from_utf8_lossy(&out.stdout))
+        })
     }
 
     /// The CLI takes a single prompt, not a message array, so we send only the newest user turn
@@ -100,10 +136,74 @@ pub(crate) fn which(program: &str) -> Option<std::path::PathBuf> {
     })
 }
 
+/// Pull `2.1.237` out of `2.1.237 (Claude Code)`.
+///
+/// Leading-number-triple rather than a semver parse: the string is a version *followed by* a
+/// product name, which no semver crate will accept, and the part we compare is the triple.
+fn parse_version(out: &str) -> Option<(u32, u32, u32)> {
+    let field = out.split_whitespace().next()?;
+    let mut parts = field.split('.').map(|p| p.trim_end_matches(|c: char| !c.is_ascii_digit()));
+    let major = parts.next()?.parse().ok()?;
+    let minor = parts.next()?.parse().ok()?;
+    let patch = parts.next().unwrap_or("0").parse().unwrap_or(0);
+    Some((major, minor, patch))
+}
+
+/// Whether an installed version can serve a model.
+///
+/// Unknown version means yes: see [`ClaudeCliProvider::version`].
+fn serves(model: &str, installed: Option<(u32, u32, u32)>) -> bool {
+    let Some(need) = MIN_VERSION.iter().find(|(id, _)| *id == model).map(|(_, v)| *v) else {
+        return true;
+    };
+    installed.is_none_or(|have| have >= need)
+}
+
+/// The model string `--model` should be given.
+///
+/// The long context window is a suffix on the id rather than a flag, which is how the CLI spells
+/// it: `claude-opus-5[1m]`. Only ever appended for a model whose catalogue entry offers the
+/// choice, so a selection carried over from a model that had the knob cannot smuggle it onto one
+/// that does not.
+fn model_arg(selection: &neosh_proto::ModelSelection) -> String {
+    match selection.option_str("context") {
+        Some("1m") => format!("{}[1m]", selection.model),
+        _ => selection.model.to_string(),
+    }
+}
+
+/// The `--settings` payload for the switches that are settings rather than flags.
+///
+/// Fast mode and always-on thinking have no command-line flag; the CLI reads them from its
+/// settings, which `--settings` will take as a JSON string. Returns nothing when neither is on, so
+/// the usual case adds no argument at all.
+fn settings_arg(selection: &neosh_proto::ModelSelection) -> Option<String> {
+    let mut map = serde_json::Map::new();
+    if selection.option_flag("fast_mode") == Some(true) {
+        map.insert("fastMode".into(), true.into());
+    }
+    if let Some(on) = selection.option_flag("thinking") {
+        map.insert("alwaysThinkingEnabled".into(), on.into());
+    }
+    (!map.is_empty()).then(|| serde_json::Value::Object(map).to_string())
+}
+
 #[async_trait::async_trait]
 impl Provider for ClaudeCliProvider {
     fn driver(&self) -> DriverKind {
         DriverKind::from("claude-cli")
+    }
+
+    /// The catalogue, minus anything this install is too old to accept.
+    ///
+    /// Not a network call and not cached upstream by accident: `--version` is asked once per
+    /// process, and the filtering is a comparison over nine entries.
+    async fn list_models(&self, _instance: &InstanceConfig) -> Result<Vec<ModelInfo>, ProviderError> {
+        let installed = self.version();
+        Ok(catalog::claude_cli_models()
+            .into_iter()
+            .filter(|m| serves(m.id.as_ref(), installed))
+            .collect())
     }
 
     fn delegates_agent_loop(&self) -> bool {
@@ -128,10 +228,13 @@ impl Provider for ClaudeCliProvider {
                 .arg("--include-partial-messages")
                 // The CLI requires --verbose to emit stream-json on stdout.
                 .arg("--verbose")
-                .args(["--model", request.selection.model.as_ref()]);
+                .args(["--model", &model_arg(&request.selection)]);
 
             if let Some(effort) = request.selection.option_str("effort") {
                 cmd.args(["--effort", effort]);
+            }
+            if let Some(settings) = settings_arg(&request.selection) {
+                cmd.args(["--settings", &settings]);
             }
             if let Some(prev) = session.lock().expect("session lock poisoned").clone() {
                 cmd.args(["--resume", &prev]);
@@ -288,6 +391,72 @@ mod tests {
     #[test]
     fn it_declares_that_it_owns_the_agent_loop() {
         assert!(ClaudeCliProvider::default().delegates_agent_loop());
+    }
+
+    fn sel(model: &str, options: &[(&str, neosh_proto::ProviderOptionValue)]) -> ModelSelection {
+        ModelSelection {
+            instance: InstanceId::from("claude-cli"),
+            model: model.into(),
+            options: options
+                .iter()
+                .map(|(id, v)| neosh_proto::OptionSelection { id: (*id).into(), value: v.clone() })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn the_version_is_the_number_in_front_of_the_product_name() {
+        assert_eq!(parse_version("2.1.237 (Claude Code)\n"), Some((2, 1, 237)));
+        assert_eq!(parse_version("2.1 (Claude Code)"), Some((2, 1, 0)));
+        assert_eq!(parse_version("who knows"), None);
+    }
+
+    /// The ordering that matters is patch-level: the releases these models shipped in differ only
+    /// there, so a comparison that stopped at minor would offer every one of them to every install.
+    #[test]
+    fn an_older_cli_is_not_offered_a_model_it_will_reject() {
+        assert!(!serves("claude-opus-5", Some((2, 1, 218))));
+        assert!(serves("claude-opus-5", Some((2, 1, 219))));
+        assert!(serves("claude-opus-5", Some((2, 2, 0))));
+        // Nothing recorded means it has always been there.
+        assert!(serves("claude-haiku-4-5", Some((1, 0, 0))));
+    }
+
+    /// A CLI that will not say what it is gets the benefit of the doubt: hiding everything recent
+    /// from somebody whose install works is worse than offering one model too many.
+    #[test]
+    fn an_unknown_version_is_offered_everything() {
+        assert!(serves("claude-opus-5", None));
+    }
+
+    #[test]
+    fn the_long_context_window_is_a_suffix_on_the_model_not_a_flag() {
+        use neosh_proto::ProviderOptionValue::Text;
+        assert_eq!(model_arg(&sel("claude-opus-5", &[("context", Text("1m".into()))])), "claude-opus-5[1m]");
+        assert_eq!(model_arg(&sel("claude-opus-5", &[("context", Text("200k".into()))])), "claude-opus-5");
+        assert_eq!(model_arg(&sel("claude-opus-5", &[])), "claude-opus-5");
+    }
+
+    /// Fast mode and always-on thinking have no flag; they are settings, and `--settings` takes
+    /// JSON. Neither on means no argument at all, so the ordinary turn is unchanged.
+    #[test]
+    fn the_switches_without_flags_travel_as_settings_json() {
+        use neosh_proto::ProviderOptionValue::Flag;
+        assert_eq!(settings_arg(&sel("claude-opus-5", &[])), None);
+        assert_eq!(
+            settings_arg(&sel("claude-opus-5", &[("fast_mode", Flag(false))])),
+            None,
+            "off is the default, and saying so would be a setting written for no reason"
+        );
+        assert_eq!(
+            settings_arg(&sel("claude-opus-5", &[("fast_mode", Flag(true))])).as_deref(),
+            Some(r#"{"fastMode":true}"#)
+        );
+        assert_eq!(
+            settings_arg(&sel("claude-haiku-4-5", &[("thinking", Flag(false))])).as_deref(),
+            Some(r#"{"alwaysThinkingEnabled":false}"#),
+            "thinking off is a real instruction — the CLI's own default is not necessarily off"
+        );
     }
 
     /// A missing binary must surface as a provider error on the stream, not a panic or a hang.

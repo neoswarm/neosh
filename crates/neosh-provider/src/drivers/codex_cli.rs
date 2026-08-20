@@ -33,15 +33,16 @@ use std::process::Stdio;
 use std::sync::{Arc, Mutex};
 
 use neosh_proto::{
-    BlockStartKind, ContentBlock, DriverKind, InstanceConfig, Message, ProviderEvent, Role,
-    StopReason, ToolCallId, TurnRequest, Usage,
+    BlockStartKind, ContentBlock, DriverKind, InstanceConfig, Message, ModelCapabilities, ModelInfo,
+    ModelTier, OptionChoice, ProviderEvent, ProviderOptionDescriptor, Role, StopReason, ToolCallId,
+    TurnRequest, Usage,
 };
-use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-use crate::{Provider, ProviderStream};
+use crate::{Provider, ProviderError, ProviderStream, catalog};
 
 #[derive(Debug)]
 pub struct CodexCliProvider {
@@ -256,10 +257,182 @@ fn reindex(ev: ProviderEvent, index: u32) -> ProviderEvent {
     }
 }
 
+/// Ask a running `codex app-server` what models it serves.
+///
+/// # Why a second process rather than a flag
+///
+/// `codex exec` has no way to list anything — it takes a prompt and runs a turn. `codex
+/// app-server` is the same binary speaking JSON-RPC on stdio, and `model/list` is a documented
+/// method on it that answers from the account's own catalogue. So the list is *the account's*: a
+/// model somebody has early access to appears without neosh knowing it exists, and one they have
+/// lost access to stops being offered.
+///
+/// # What comes back that a written list cannot have
+///
+/// Each entry carries its own reasoning-effort ladder and its own default — which differ per
+/// model, and gained a level (`ultra`) that no list written by hand would have. Those become the
+/// option descriptors, so the effort picker offers exactly what this model accepts.
+///
+/// Hidden models are asked for too. `hidden` is the CLI's own "not in the default picker" flag,
+/// which is very nearly what `legacy` means here: reachable, out of the way, and the reason you
+/// went looking is usually that you are reproducing something.
+async fn discover(program: &str) -> Result<Vec<ModelInfo>, ProviderError> {
+    let mut child = Command::new(program)
+        .arg("app-server")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .map_err(|e| ProviderError::Transport(format!("could not run {program} app-server: {e}")))?;
+
+    let mut stdin = child.stdin.take().expect("stdin was piped");
+    let stdout = child.stdout.take().expect("stdout was piped");
+    let mut lines = BufReader::new(stdout).lines();
+
+    let hello = serde_json::json!({
+        "jsonrpc": "2.0", "id": 1, "method": "initialize",
+        "params": { "clientInfo": { "name": "neosh", "title": "neosh", "version": env!("CARGO_PKG_VERSION") } },
+    });
+    let ready = serde_json::json!({ "jsonrpc": "2.0", "method": "initialized", "params": {} });
+    let ask = serde_json::json!({
+        "jsonrpc": "2.0", "id": 2, "method": "model/list",
+        "params": { "includeHidden": true },
+    });
+    for msg in [hello, ready, ask] {
+        let line = format!("{msg}\n");
+        stdin
+            .write_all(line.as_bytes())
+            .await
+            .map_err(|e| ProviderError::Transport(format!("writing to {program}: {e}")))?;
+    }
+    stdin.flush().await.ok();
+
+    // Notifications are interleaved with replies — a remote-control status arrives unprompted
+    // between the two — so this reads until the id it asked about rather than taking line two.
+    let mut out = Vec::new();
+    while let Ok(Some(line)) = lines.next_line().await {
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) else { continue };
+        if v.get("id").and_then(serde_json::Value::as_u64) != Some(2) {
+            continue;
+        }
+        if let Some(e) = v.get("error") {
+            return Err(ProviderError::BadResponse(format!("{program} model/list: {e}")));
+        }
+        let Some(data) = v.pointer("/result/data").and_then(|d| d.as_array()) else { break };
+        out.extend(data.iter().filter_map(codex_model));
+        break;
+    }
+    // Dropping the child kills it (`kill_on_drop`), but only once it is polled; this makes the
+    // reaping happen here rather than whenever the runtime next gets round to it.
+    let _ = child.kill().await;
+
+    if out.is_empty() {
+        return Err(ProviderError::BadResponse(format!("{program} listed no models")));
+    }
+    Ok(out)
+}
+
+/// One entry of a `model/list` reply.
+///
+/// `pub` because the shape is worth testing against a recorded reply without a `codex` on `PATH`,
+/// which is the only way this parser gets exercised in CI.
+pub fn codex_model(v: &serde_json::Value) -> Option<ModelInfo> {
+    let id = v.get("model").or_else(|| v.get("id"))?.as_str()?;
+    let name = v.get("displayName").and_then(|d| d.as_str()).unwrap_or(id);
+    let levels: Vec<&str> = v
+        .get("supportedReasoningEfforts")
+        .and_then(|e| e.as_array())
+        .map(|a| a.iter().filter_map(|o| o.get("reasoningEffort")?.as_str()).collect())
+        .unwrap_or_default();
+    let default = v.get("defaultReasoningEffort").and_then(|d| d.as_str()).unwrap_or("medium");
+
+    let mut descriptors = Vec::new();
+    if !levels.is_empty() {
+        descriptors.push(ProviderOptionDescriptor::Select {
+            id: "effort".into(),
+            label: "Effort".into(),
+            description: Some("How much reasoning the model spends before answering.".into()),
+            options: levels
+                .iter()
+                .map(|l| OptionChoice {
+                    id: (*l).into(),
+                    label: catalog::title_case(l),
+                    // The CLI writes a sentence for each level. It is better than anything we
+                    // would invent, and it is per model rather than per ladder.
+                    description: v
+                        .get("supportedReasoningEfforts")
+                        .and_then(|e| e.as_array())
+                        .and_then(|a| {
+                            a.iter().find(|o| o.get("reasoningEffort").and_then(|r| r.as_str()) == Some(*l))
+                        })
+                        .and_then(|o| o.get("description")?.as_str())
+                        .map(str::to_string),
+                    is_default: *l == default,
+                })
+                .collect(),
+            current_value: Some(default.into()),
+            prompt_injected_values: Vec::new(),
+        });
+    }
+
+    let hidden = v.get("hidden").and_then(serde_json::Value::as_bool).unwrap_or(false);
+    let mut m = ModelInfo::undescribed(id, name);
+    m.capabilities = ModelCapabilities {
+        tools: true,
+        vision: v
+            .get("inputModalities")
+            .and_then(|i| i.as_array())
+            .is_some_and(|a| a.iter().any(|m| m.as_str() == Some("image"))),
+        streaming: true,
+        thinking: !levels.is_empty(),
+        prompt_caching: true,
+        option_descriptors: descriptors,
+    };
+    // The family is the generation, so `model.line gpt-5.6` means "whichever Sol/Terra/Luna is
+    // current" — the same trick the Claude aliases play, from a naming scheme rather than a table.
+    m.family = Some(id.rsplit_once('-').map(|(head, _)| head).unwrap_or(id).to_string());
+    m.tier = Some(codex_tier(id));
+    m.tagline = v.get("description").and_then(|d| d.as_str()).map(str::to_string);
+    m.legacy = hidden;
+    Some(m)
+}
+
+/// Which rung a codex model sits on.
+///
+/// The ladder is in the name — Sol, Terra, Luna, in that order, and a `-mini` is always the small
+/// one. Everything else is called balanced, which is where an unknown model is least wrong: it
+/// will not be offered as "the most capable thing here" by an upgrade, nor as the cheap one.
+fn codex_tier(id: &str) -> ModelTier {
+    if id.ends_with("-sol") {
+        ModelTier::Frontier
+    } else if id.ends_with("-luna") || id.ends_with("-mini") {
+        ModelTier::Fast
+    } else {
+        ModelTier::Balanced
+    }
+}
+
 #[async_trait::async_trait]
 impl Provider for CodexCliProvider {
     fn driver(&self) -> DriverKind {
         DriverKind::from("codex-cli")
+    }
+
+    /// What this account can reach, asked of the CLI; the written catalogue if it cannot say.
+    ///
+    /// The fallback is not a formality. `codex app-server` needs the same login `codex exec` does,
+    /// so on a machine that has the binary but has not signed in, discovery fails — and that is
+    /// exactly the machine whose owner is deciding whether signing in is worth it. An empty pane
+    /// answers that with silence.
+    async fn list_models(&self, instance: &InstanceConfig) -> Result<Vec<ModelInfo>, ProviderError> {
+        match discover(&self.program).await {
+            Ok(models) => Ok(models),
+            Err(e) => {
+                tracing::debug!(program = %self.program, "codex model discovery failed: {e}");
+                Ok(instance.models.clone())
+            }
+        }
     }
 
     fn delegates_agent_loop(&self) -> bool {
@@ -564,5 +737,65 @@ mod tests {
         let got: Vec<_> = p.stream(&inst, req, CancellationToken::new()).collect().await;
         assert_eq!(got.len(), 1);
         assert!(matches!(got[0], ProviderEvent::Error { retryable: false, .. }));
+    }
+
+    /// A real `model/list` entry, copied verbatim from `codex app-server` on a signed-in machine.
+    ///
+    /// Recorded rather than hand-written because the point of discovery is that it answers
+    /// questions no catalogue of ours could — the `ultra` effort level here is one nobody wrote
+    /// down, and a fixture I invented would not have it.
+    const SOL: &str = include_str!("../../tests/fixtures/codex_model_sol.json");
+    const MINI: &str = include_str!("../../tests/fixtures/codex_model_mini.json");
+
+    fn parse(raw: &str) -> ModelInfo {
+        codex_model(&serde_json::from_str(raw).expect("fixture is JSON")).expect("a model")
+    }
+
+    #[test]
+    fn a_discovered_model_keeps_the_name_and_blurb_the_cli_gave_it() {
+        let m = parse(SOL);
+        assert_eq!(m.id.as_ref(), "gpt-5.6-sol");
+        assert_eq!(m.display_name, "GPT-5.6-Sol");
+        assert_eq!(m.tagline.as_deref(), Some("Latest frontier agentic coding model."));
+        assert!(!m.legacy);
+    }
+
+    /// The whole reason to ask rather than to write a list down: this ladder has a level our own
+    /// `EFFORT_CODEX` never had, and it arrives with the CLI's own description of each rung.
+    #[test]
+    fn the_effort_ladder_is_the_one_this_model_actually_accepts() {
+        let m = parse(SOL);
+        let ProviderOptionDescriptor::Select { options, current_value, .. } =
+            &m.capabilities.option_descriptors[0]
+        else {
+            panic!("effort should be a select");
+        };
+        let ids: Vec<&str> = options.iter().map(|o| o.id.as_str()).collect();
+        assert_eq!(ids, ["low", "medium", "high", "xhigh", "max", "ultra"]);
+        assert_eq!(current_value.as_deref(), Some("low"));
+        assert!(options.iter().find(|o| o.id == "low").expect("low").is_default);
+        assert_eq!(
+            options[0].description.as_deref(),
+            Some("Fast responses with lighter reasoning")
+        );
+    }
+
+    /// `hidden` is the CLI's "not in the default picker" flag, which is what `legacy` means here:
+    /// reachable, folded away, and the reason you went looking is that you are reproducing
+    /// something.
+    #[test]
+    fn a_model_the_cli_hides_is_offered_as_superseded_rather_than_dropped() {
+        let m = parse(MINI);
+        assert!(m.legacy);
+        assert_eq!(m.tier, Some(ModelTier::Fast));
+    }
+
+    #[test]
+    fn the_rung_comes_from_the_name_and_an_unknown_one_lands_in_the_middle() {
+        assert_eq!(codex_tier("gpt-5.6-sol"), ModelTier::Frontier);
+        assert_eq!(codex_tier("gpt-5.6-luna"), ModelTier::Fast);
+        assert_eq!(codex_tier("gpt-5.4-mini"), ModelTier::Fast);
+        assert_eq!(codex_tier("gpt-5.6-terra"), ModelTier::Balanced);
+        assert_eq!(codex_tier("something-new"), ModelTier::Balanced);
     }
 }

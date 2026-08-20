@@ -1058,7 +1058,7 @@ impl Host {
             marks.push((from, text.len(), hl.to_string()));
         };
 
-        let mut segment =
+        let segment =
             |text: &mut String, marks: &mut Vec<(usize, usize, String)>, seg: &neosh_proto::StatusSegment| {
                 text.push_str("  ");
                 push(text, marks, &seg.text, seg.hl.as_deref().unwrap_or("Status.Line"));
