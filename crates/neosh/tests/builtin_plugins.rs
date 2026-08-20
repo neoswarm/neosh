@@ -1310,7 +1310,7 @@ fn the_key_hints_follow_what_the_cursor_is_on() {
 
     s.enter_panel();
     assert!(
-        s.pump(|s| s.sidebar_now().iter().any(|l| l.contains("x close"))),
+        s.pump(|s| s.sidebar_now().iter().any(|l| l.contains("x archive"))),
         "on a conversation, it offers the conversation verbs\n{:?}",
         s.sidebar_now()
     );
@@ -1387,9 +1387,81 @@ impl Session {
 }
 
 #[test]
+fn archiving_takes_a_conversation_out_of_the_list_and_u_brings_it_back() {
+    // The everyday verb. It asks nothing, because there is nothing to lose — which is the whole
+    // reason it exists beside the one that does ask.
+    let sb = Sandbox::new("archive");
+    let mut s = sb.start();
+    s.wait_for("PROJECTS");
+
+    for c in ["k", "e", "e", "p"] {
+        s.key(c);
+    }
+    s.enter();
+    s.wait_for("keep");
+    s.ctrl("n"); // a second conversation, so the first is not the only one left
+
+    s.enter_panel();
+    assert!(s.pump(|s| s.sidebar_now().iter().any(|l| l.contains("keep"))));
+    s.down();
+    assert!(
+        s.pump(|s| s.sidebar_now().iter().any(|l| l.contains("x archive"))),
+        "the cursor is on a conversation\n{:?}",
+        s.sidebar_now()
+    );
+    let panel_only = s.open_windows().len();
+    s.key("x");
+    assert!(
+        s.pump(|s| s.sidebar_now().iter().any(|l| l.contains("ARCHIVED"))),
+        "an archived section appeared\n{:?}",
+        s.sidebar_now()
+    );
+    assert_eq!(s.open_windows().len(), panel_only, "and nothing asked");
+
+    assert!(
+        s.pump(|s| !s.sidebar_now().iter().any(|l| l.contains("keep"))),
+        "and it left the everyday list\n{:?}",
+        s.sidebar_now()
+    );
+
+    // Down to the archive heading. Where the cursor landed when the row under it was archived is
+    // not something this test should assert, so it steps until the hints say it has arrived — the
+    // hints being contextual is exactly what makes that legible.
+    let on_heading =
+        |s: &Session| s.sidebar_now().iter().any(|l| l.contains("show what is put away"));
+    let mut found = on_heading(&s);
+    for _ in 0..6 {
+        if found {
+            break;
+        }
+        // Stepping first and waiting after: waiting on a predicate that is not yet true costs the
+        // whole budget, and a test that spends thirty seconds arriving is a test people delete.
+        s.key("j");
+        found = s.pump(on_heading);
+    }
+    assert!(found, "never reached the archive heading\n{:?}", s.sidebar_now());
+    s.enter();
+    assert!(
+        s.pump(|s| s.sidebar_now().iter().any(|l| l.contains("keep"))),
+        "unfolding the archive shows what is in it\n{:?}",
+        s.sidebar_now()
+    );
+
+    // And `u` on it puts it back where it was.
+    s.key("j");
+    assert!(s.pump(|s| s.sidebar_now().iter().any(|l| l.contains("u unarchive"))));
+    s.key("u");
+    assert!(
+        s.pump(|s| !s.sidebar_now().iter().any(|l| l.contains("ARCHIVED"))),
+        "the section goes away with the last thing in it\n{:?}",
+        s.sidebar_now()
+    );
+}
+
+#[test]
 fn deleting_a_conversation_with_something_in_it_asks_first() {
-    // Closing removes the file from disk. There is no undo, so this is the one verb in the panel
-    // that stops and asks.
+    // Deleting removes the file from disk. There is no undo, so this is the one verb in the panel
+    // that stops and asks — and it is shifted, so it is not the one your fingers reach for.
     let sb = Sandbox::new("confirmdel");
     let mut s = sb.start();
     s.wait_for("PROJECTS");
@@ -1399,18 +1471,18 @@ fn deleting_a_conversation_with_something_in_it_asks_first() {
     }
     s.enter();
     s.wait_for("keep");
-    s.ctrl("n"); // a second conversation, so closing the first is even allowed
+    s.ctrl("n"); // a second conversation, so deleting the first is even allowed
 
     s.enter_panel();
     assert!(s.pump(|s| s.sidebar_now().iter().any(|l| l.contains("keep"))));
     s.down();
     assert!(
-        s.pump(|s| s.sidebar_now().iter().any(|l| l.contains("x close"))),
+        s.pump(|s| s.sidebar_now().iter().any(|l| l.contains("X delete"))),
         "the cursor is on a conversation\n{:?}",
         s.sidebar_now()
     );
     let panel_only = s.open_windows().len();
-    s.key("x");
+    s.key("X");
     assert!(s.pump(|s| s.open_windows().len() > panel_only), "the dialog opened");
 
     // The cursor starts on the answer that changes nothing: `<CR>` is reflex by the second time you
@@ -1424,7 +1496,7 @@ fn deleting_a_conversation_with_something_in_it_asks_first() {
     );
 
     // And saying yes really does delete it, so the dialog is a question rather than a speed bump.
-    s.key("x");
+    s.key("X");
     assert!(s.pump(|s| s.open_windows().len() > panel_only), "asked a second time");
     s.special("up");
     s.enter();
@@ -1436,7 +1508,7 @@ fn deleting_a_conversation_with_something_in_it_asks_first() {
 }
 
 #[test]
-fn an_empty_conversation_is_closed_without_being_asked_about() {
+fn an_empty_conversation_is_deleted_without_being_asked_about() {
     // A dialog for something with nothing to lose is friction that teaches you to dismiss dialogs.
     let sb = Sandbox::new("nodialog");
     let mut s = sb.start();
@@ -1447,7 +1519,7 @@ fn an_empty_conversation_is_closed_without_being_asked_about() {
     }));
 
     s.enter_panel();
-    s.key("x");
+    s.key("X");
     assert!(
         s.pump(|s| {
             s.sidebar_now().iter().filter(|l| l.contains("New conversation")).count() == 1
@@ -1455,7 +1527,7 @@ fn an_empty_conversation_is_closed_without_being_asked_about() {
         "gone, with nothing asked\n{:?}",
         s.sidebar_now()
     );
-    assert!(!s.saw("Delete"), "and no dialog appeared\n{}", s.transcript());
+    assert!(!s.saw("Delete \""), "and no dialog appeared\n{}", s.transcript());
 }
 
 #[test]
@@ -1475,8 +1547,8 @@ fn confirmation_can_be_switched_off() {
     s.enter_panel();
     assert!(s.pump(|s| s.sidebar_now().iter().any(|l| l.contains("gone"))));
     s.down();
-    assert!(s.pump(|s| s.sidebar_now().iter().any(|l| l.contains("x close"))));
-    s.key("x");
+    assert!(s.pump(|s| s.sidebar_now().iter().any(|l| l.contains("X delete"))));
+    s.key("X");
     assert!(
         s.pump(|s| !s.sidebar_now().iter().any(|l| l.contains("gone"))),
         "deleted without asking\n{:?}",

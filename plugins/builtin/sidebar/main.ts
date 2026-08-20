@@ -41,10 +41,12 @@ import {
 /** What a row points at, so the cursor survives the list being rebuilt underneath it. */
 type Target =
   | { kind: "project"; cwd: string }
-  | { kind: "session"; id: string; cwd: string }
+  | { kind: "session"; id: string; cwd: string; archived: boolean }
   /** The row that opens another directory. A row rather than only a key, because a verb nobody
    * can see is a verb nobody uses. */
-  | { kind: "add" };
+  | { kind: "add" }
+  /** The heading of the archived section, which folds. Only present when there is one. */
+  | { kind: "archive" };
 
 /** A project as the panel thinks of it: a directory, and what is going on in it. */
 interface Project {
@@ -60,6 +62,7 @@ const NS = "neosh.sidebar";
 const KEY_FAVORITES = "favorites";
 const KEY_ORDER = "order";
 const KEY_FOLDED = "folded";
+const KEY_ARCHIVE_OPEN = "archiveOpen";
 
 export async function activate({ neosh, subscriptions }: PluginContext) {
   await declareOptions(neosh);
@@ -216,7 +219,7 @@ export async function activate({ neosh, subscriptions }: PluginContext) {
 function same(a: Target, b: Target): boolean {
   if (a.kind === "session") return b.kind === "session" && a.id === b.id;
   if (a.kind === "project") return b.kind === "project" && a.cwd === b.cwd;
-  return b.kind === "add";
+  return a.kind === b.kind;
 }
 
 async function declareOptions(neosh: Neosh): Promise<void> {
@@ -275,18 +278,38 @@ class Arrangement {
   private favorites: string[] = [];
   private order: string[] = [];
   private folded = new Set<string>();
+  /** The archive starts shut. It is where things go to stop being in your way. */
+  private archiveOpen = false;
 
   constructor(private readonly neosh: Neosh) {}
 
   async load(): Promise<void> {
-    const [favorites, order, folded] = await Promise.all([
+    const [favorites, order, folded, archiveOpen] = await Promise.all([
       this.neosh.state.get<string[]>(KEY_FAVORITES),
       this.neosh.state.get<string[]>(KEY_ORDER),
       this.neosh.state.get<string[]>(KEY_FOLDED),
+      this.neosh.state.get<boolean>(KEY_ARCHIVE_OPEN),
     ]);
     this.favorites = strings(favorites);
     this.order = strings(order);
     this.folded = new Set(strings(folded));
+    this.archiveOpen = archiveOpen === true;
+  }
+
+  isArchiveOpen(): boolean {
+    return this.archiveOpen;
+  }
+
+  async toggleArchive(): Promise<void> {
+    this.archiveOpen = !this.archiveOpen;
+    await this.neosh.state.set(KEY_ARCHIVE_OPEN, this.archiveOpen);
+  }
+
+  /** Open the archive without a keystroke, so unarchiving from elsewhere is visible. */
+  openArchive(): void {
+    if (this.archiveOpen) return;
+    this.archiveOpen = true;
+    void this.neosh.state.set(KEY_ARCHIVE_OPEN, true);
   }
 
   /** Pinned directories, in the order they should appear. Also the seed for projects with no conversations. */
@@ -414,6 +437,10 @@ async function registerCommands(w: Wiring): Promise<void> {
           }
           switch (c) {
             case " ":
+              if (target?.kind === "archive") {
+                await arrangement.toggleArchive();
+                break;
+              }
               if (target?.kind !== "project") return;
               await arrangement.toggleFold(target.cwd);
               break;
@@ -425,16 +452,19 @@ async function registerCommands(w: Wiring): Promise<void> {
               break;
             // Shift moves the thing rather than the cursor — the one convention every list that
             // can be rearranged already shares.
+            //
+            // From a conversation row it moves the project that conversation is in. Requiring the
+            // cursor to be on the heading first made the feature invisible: you are looking at the
+            // project when you are looking at what is inside it.
             case "J":
-              if (target?.kind !== "project") return;
-              if (!(await arrangement.move(await groups(), target.cwd, 1))) return;
+            case "K": {
+              const cwd = owningProject(target);
+              if (cwd === null) return;
+              if (!(await arrangement.move(await groups(), cwd, c === "J" ? 1 : -1))) return;
               break;
-            case "K":
-              if (target?.kind !== "project") return;
-              if (!(await arrangement.move(await groups(), target.cwd, -1))) return;
-              break;
+            }
             case "f": {
-              if (!target || target.kind === "add") return;
+              if (!target || target.kind === "add" || target.kind === "archive") return;
               const cwd = target.cwd;
               const now = await arrangement.toggleFavorite(cwd);
               neosh.notify(now ? `favourited ${short(cwd)}` : `unfavourited ${short(cwd)}`, "info");
@@ -445,14 +475,25 @@ async function registerCommands(w: Wiring): Promise<void> {
               return;
             case "n": {
               // In the project you are looking at, which is the whole reason the cursor is there.
-              const cwd = target && target.kind !== "add" ? target.cwd : undefined;
+              const cwd = owningProject(target) ?? undefined;
               await neosh.session.create(cwd ? { cwd } : undefined);
               await w.leave();
               return;
             }
-            case "x": {
+            // The everyday verb, and it is reversible. Archiving takes a conversation out of the
+            // list without taking anything away, which is what people were reaching for `x` to do
+            // before `x` deleted things.
+            case "x":
+            case "u": {
               if (target?.kind !== "session") return;
-              await closeSession(neosh, target.id);
+              if (target.archived) arrangement.openArchive();
+              await setArchived(neosh, target.id, !target.archived);
+              break;
+            }
+            // Shifted, because this is the one that cannot be undone.
+            case "X": {
+              if (target?.kind !== "session") return;
+              await deleteSession(neosh, target.id);
               break;
             }
             case "r":
@@ -500,8 +541,25 @@ async function registerCommands(w: Wiring): Promise<void> {
     await neosh.cmd.register("session.close", async (args) => {
       // Through the same gate as the key, so the palette cannot become a way around the question.
       const id = args[0] ?? (await neosh.session.current().catch(() => null))?.id;
-      if (id) await closeSession(neosh, id);
-    }, { desc: "Delete a conversation" }),
+      if (id) await deleteSession(neosh, id);
+    }, { desc: "Delete a conversation permanently" }),
+  );
+  w.subscriptions.push(
+    await neosh.cmd.register("session.archive", async (args) => {
+      const id = args[0] ?? (await neosh.session.current().catch(() => null))?.id;
+      if (id) await setArchived(neosh, id, true);
+    }, { desc: "Archive a conversation — it keeps everything and can come back" }),
+  );
+  w.subscriptions.push(
+    await neosh.cmd.register("session.unarchive", async (args) => {
+      const id = args[0];
+      if (!id) {
+        neosh.notify("session.unarchive needs a conversation id", "warn");
+        return;
+      }
+      arrangement.openArchive();
+      await setArchived(neosh, id, false);
+    }, { desc: "Bring an archived conversation back" }),
   );
   w.subscriptions.push(
     await neosh.cmd.register("project.open", async (args) => {
@@ -537,6 +595,11 @@ async function activateTarget(
     await neosh.cmd.exec("project.open").catch(() => {});
     return;
   }
+  if (target.kind === "archive") {
+    await arrangement.toggleArchive();
+    await w.draw();
+    return;
+  }
   if (target.kind === "project") {
     // A pinned project with nothing in it yet: `↵` should start something, not fold an empty list.
     const sessions = await neosh.session.list().catch(() => [] as SessionInfo[]);
@@ -550,12 +613,22 @@ async function activateTarget(
     return;
   }
   try {
+    // Opening something you put away is a statement that you want it back. Leaving it archived
+    // while you work in it would mean the list you are looking at does not contain the
+    // conversation you are in.
+    if (target.archived) await neosh.session.archive(target.id, false);
     await neosh.session.switch(target.id);
   } catch (e) {
     neosh.notify(String(e), "warn");
     return;
   }
   await w.leave();
+}
+
+/** The project a row belongs to — its own, or the one its conversation is in. */
+function owningProject(target: Target | undefined): string | null {
+  if (!target) return null;
+  return target.kind === "project" || target.kind === "session" ? target.cwd : null;
 }
 
 /**
@@ -594,20 +667,36 @@ async function chooseDirectory(neosh: Neosh): Promise<string | null> {
 }
 
 /**
- * Close a conversation, asking first when there is something to lose.
+ * Put a conversation away, or bring it back.
  *
- * Closing deletes it — the file goes from disk and there is no undo — so this is the one verb in
- * the panel that asks. It asks *conditionally*: a conversation you have not said anything in yet
- * has nothing to lose, and a dialog for it is friction that teaches you to dismiss dialogs.
+ * Asks nothing, on purpose. A confirmation is the price of an irreversible action, and this one is
+ * reversible by pressing the same key again — charging for it would teach you to dismiss dialogs,
+ * which is exactly the habit that makes the delete dialog useless.
  */
-async function closeSession(neosh: Neosh, session: string): Promise<void> {
-  const info = (await neosh.session.list().catch(() => [] as SessionInfo[]))
+async function setArchived(neosh: Neosh, session: string, archived: boolean): Promise<void> {
+  try {
+    await neosh.session.archive(session, archived);
+    neosh.notify(archived ? "archived — `u` brings it back" : "unarchived");
+  } catch (e) {
+    neosh.notify(String(e), "warn");
+  }
+}
+
+/**
+ * Delete a conversation, asking first when there is something to lose.
+ *
+ * The file goes from disk and there is no undo, so this is the one verb in the panel that asks. It
+ * asks *conditionally*: a conversation you have not said anything in yet has nothing to lose, and
+ * a dialog for it is friction that teaches you to dismiss dialogs.
+ */
+async function deleteSession(neosh: Neosh, session: string): Promise<void> {
+  const info = (await neosh.session.list({ includeArchived: true }).catch(() => [] as SessionInfo[]))
     .find((s) => s.id === session);
   if (info && info.message_count > 0) {
     const what = info.message_count === 1 ? "message" : "messages";
     const ok = await confirmDestructive(
       neosh,
-      `Delete "${clip(info.label, 40)}" and its ${info.message_count} ${what}?`,
+      `Delete "${clip(info.label, 40)}" and its ${info.message_count} ${what}? Archiving keeps it.`,
       { yes: "Delete", no: "Keep" },
     );
     if (!ok) return;
@@ -696,7 +785,11 @@ async function collect(
 
   // Failures absorbed: a panel that renders an exception instead of your conversations is worse
   // than one showing less.
-  const sessions = await neosh.session.list().catch(() => [] as SessionInfo[]);
+  const all = await neosh.session
+    .list({ includeArchived: true })
+    .catch(() => [] as SessionInfo[]);
+  const sessions = all.filter((s) => !s.archived);
+  const archived = all.filter((s) => s.archived);
   const running = sessions.some((s) => s.active_turn);
   const now = Date.now();
   // One list, favourites first. A separate `FAVORITES` section splits a short list in half and
@@ -720,6 +813,23 @@ async function collect(
     hl: "Accent",
     value: { kind: "add" },
   });
+
+  // Only when there is one. An empty section is a permanent reminder of a feature you are not
+  // using, which is the cost of putting every feature on screen forever.
+  if (archived.length > 0) {
+    const open = arrangement.isArchiveOpen();
+    const arrow = opts.ascii ? (open ? "v" : ">") : open ? "▾" : "▸";
+    rows.push(blank());
+    rows.push({
+      text: ` ${arrow} ARCHIVED`,
+      hl: "Sidebar.Heading",
+      right: { text: `${archived.length} `, hl: "Sidebar.Dim" },
+      value: { kind: "archive" },
+    });
+    if (open) {
+      for (const s of archived) rows.push(archivedRow(s, opts));
+    }
+  }
 
   if (opts.hints) rows.push(...hints(opts));
 
@@ -800,7 +910,24 @@ function sessionRow(s: SessionInfo, now: number, opts: DrawOptions): ListRow<Tar
       text: right === "" ? "" : `${right} `,
       hl: working ? "Status.Working" : "Sidebar.Dim",
     },
-    value: { kind: "session", id: s.id, cwd: s.cwd },
+    value: { kind: "session", id: s.id, cwd: s.cwd, archived: false },
+  };
+}
+
+/**
+ * An archived conversation: dim, with the project it came from instead of a clock.
+ *
+ * The project is what you need here and nowhere else — the archive is one flat list, so a name on
+ * its own does not say which checkout it belongs to.
+ */
+function archivedRow(s: SessionInfo, opts: DrawOptions): ListRow<Target> {
+  const project = basename(s.cwd);
+  const width = Math.max(8, opts.width - 10 - project.length);
+  return {
+    text: `     ${opts.ascii ? "-" : "┈"} ${clip(s.label, width)}`,
+    hl: "Sidebar.Dim",
+    right: { text: `${project} `, hl: "Comment" },
+    value: { kind: "session", id: s.id, cwd: s.cwd, archived: true },
   };
 }
 
@@ -826,14 +953,20 @@ function turnFor(s: SessionInfo, now: number): string {
  * here is also reachable from `?`, which is the escape hatch when the panel is too narrow.
  */
 function hints(opts: DrawOptions): ListRow<Target>[] {
-  const kind = opts.selected?.kind;
+  const target = opts.selected;
+  const kind = target?.kind;
+  const archived = target?.kind === "session" && target.archived;
   const lines = !opts.focused
     ? ["^T projects  ^N new   ^O add", "^K palette   ^B hide  F1 keys"]
     : kind === "project"
       ? ["↵ fold   f ♥      JK move", "n new    o add    ? keys"]
-      : kind === "session"
-        ? ["↵ open   r rename  x close", "n new    f ♥       ? keys"]
-        : ["↵ add project    ? keys", "esc back"];
+      : archived
+        ? ["↵ open    u unarchive", "X delete  ? keys"]
+        : kind === "session"
+          ? ["↵ open   r rename   x archive", "JK move  X delete   ? keys"]
+          : kind === "archive"
+            ? ["↵ show what is put away", "? keys"]
+            : ["↵ add project    ? keys", "esc back"];
 
   return [
     blank(),
