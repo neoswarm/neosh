@@ -1199,34 +1199,24 @@ impl Host {
                 self.editor_message(MessageLevel::Warn, "nothing entered");
             } else {
                 let secret = secrecy::SecretString::from(trimmed);
-                match neosh_provider::credentials::credentials().set(&p.instance, secret) {
-                    Ok(neosh_provider::credentials::Stored::Keychain) => {
-                        stored = true;
-                        let label = p.label.clone();
-                        self.editor_message(
-                            MessageLevel::Info,
-                            format!("{label}: key saved to the keychain"),
-                        );
-                    }
-                    Ok(neosh_provider::credentials::Stored::Session) => {
-                        stored = true;
-                        let label = p.label.clone();
-                        self.editor_message(
-                            MessageLevel::Warn,
-                            format!(
-                                "{label}: key kept for this run only — no keychain helper found. \
-                                 Install `secret-tool`, or point `auth` at a command in config.toml."
-                            ),
-                        );
-                    }
-                    // The helper's own message is not repeated: it can quote what it was given.
-                    Err(e) => {
-                        let label = p.label.clone();
-                        self.editor_message(
-                            MessageLevel::Error,
-                            format!("{label}: could not save the key ({e})"),
-                        );
-                    }
+                let where_it_went =
+                    neosh_provider::credentials::credentials().set(&p.instance, secret);
+                stored = true;
+                let label = p.label.clone();
+                match where_it_went {
+                    neosh_provider::credentials::Stored::Keychain => self.editor_message(
+                        MessageLevel::Info,
+                        format!("{label}: key saved to the keychain"),
+                    ),
+                    // Still usable, just not tomorrow — which is worth saying plainly rather than
+                    // letting it be a surprise at the next start.
+                    neosh_provider::credentials::Stored::Session => self.editor_message(
+                        MessageLevel::Warn,
+                        format!(
+                            "{label}: key kept for this run only — no keychain available. \
+                             Install `secret-tool`, or point `auth` at a command in config.toml."
+                        ),
+                    ),
                 }
             }
         }

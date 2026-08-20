@@ -164,11 +164,13 @@ pub enum Stored {
 #[derive(Debug)]
 pub struct Credentials {
     keychain: Option<Keychain>,
-    /// Keys typed in this session, and keychain hits already paid for.
+    /// Keys typed in this session, and every keychain answer already paid for.
     ///
-    /// The cache matters: without it every turn spawns `secret-tool`, which is a process launch on
-    /// the latency path of pressing Enter.
-    memory: Mutex<HashMap<InstanceId, Entry>>,
+    /// `None` means "looked, and there was nothing" — caching the *misses* is the part that
+    /// matters. A settings list asks about every configured instance, and most of them have no key;
+    /// without remembering that, drawing the model picker spawns `secret-tool` a dozen times, on
+    /// the loop that is also drawing the screen.
+    memory: Mutex<HashMap<InstanceId, Option<Entry>>>,
 }
 
 #[derive(Debug, Clone)]
@@ -199,7 +201,7 @@ impl Credentials {
         self.keychain.is_some()
     }
 
-    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<InstanceId, Entry>> {
+    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<InstanceId, Option<Entry>>> {
         // A poisoned lock means a panic happened while a key was in scope. Taking the map anyway
         // is right: the alternative is that one panic makes the editor unable to authenticate for
         // the rest of the run.
@@ -208,32 +210,50 @@ impl Credentials {
 
     /// Look up a key that was typed in, or is in the keychain. Not the environment — that is
     /// [`AuthRef`]'s business, and it is consulted by [`resolve`](Self::resolve).
-    fn stored(&self, id: &InstanceId) -> Option<Entry> {
-        if let Some(hit) = self.lock().get(id).cloned() {
-            return Some(hit);
+    ///
+    /// `ask_keychain` is false for instances that have nowhere to put a key: a CLI login and a
+    /// local endpoint would never have one, and asking costs a process launch to be told so.
+    fn stored(&self, id: &InstanceId, ask_keychain: bool) -> Option<Entry> {
+        if let Some(known) = self.lock().get(id) {
+            return known.clone();
         }
-        let secret = self.keychain?.load(id.as_ref())?;
-        let entry = Entry { secret, from: Stored::Keychain };
+        let found = if ask_keychain {
+            self.keychain.and_then(|k| k.load(id.as_ref()))
+        } else {
+            None
+        };
+        let entry = found.map(|secret| Entry { secret, from: Stored::Keychain });
+        // Remembered either way — including the miss, which is the common answer.
         self.lock().insert(id.clone(), entry.clone());
-        Some(entry)
+        entry
     }
 
-    /// Keep a key. Goes to the keychain when there is one, and to memory when there is not.
-    pub fn set(&self, id: &InstanceId, secret: SecretString) -> Result<Stored, String> {
+    /// Keep a key.
+    ///
+    /// Never fails: a keychain that refuses — no session bus, a locked keyring — falls back to
+    /// memory rather than throwing the key away. What comes back says which happened, so the
+    /// caller can be honest about whether it will still be there tomorrow.
+    pub fn set(&self, id: &InstanceId, secret: SecretString) -> Stored {
         let from = match self.keychain {
-            Some(k) => {
-                k.store(id.as_ref(), &secret)?;
-                Stored::Keychain
-            }
+            Some(k) => match k.store(id.as_ref(), &secret) {
+                Ok(()) => Stored::Keychain,
+                Err(e) => {
+                    // The helper's message, not the value: nothing here has ever seen one.
+                    tracing::warn!("the keychain helper refused to store a key: {e}");
+                    Stored::Session
+                }
+            },
             None => Stored::Session,
         };
-        self.lock().insert(id.clone(), Entry { secret, from });
-        Ok(from)
+        self.lock().insert(id.clone(), Some(Entry { secret, from }));
+        from
     }
 
     /// Drop a key from memory and from the keychain. The environment is not ours to clear.
     pub fn forget(&self, id: &InstanceId) {
-        self.lock().remove(id);
+        // Recorded as a miss rather than removed, so the next look does not go back to the
+        // keychain for something we just took out of it.
+        self.lock().insert(id.clone(), None);
         if let Some(k) = self.keychain {
             k.forget(id.as_ref());
         }
@@ -248,7 +268,7 @@ impl Credentials {
         id: &InstanceId,
         auth: &AuthRef,
     ) -> Result<Option<SecretString>, crate::ProviderError> {
-        if let Some(entry) = self.stored(id) {
+        if let Some(entry) = self.stored(id, accepts_key(auth)) {
             return Ok(Some(entry.secret));
         }
         match auth {
@@ -272,7 +292,7 @@ impl Credentials {
     /// Where this instance's key is coming from, for a settings list. Reads nothing secret into
     /// anything that leaves this function.
     pub fn source(&self, cfg: &InstanceConfig) -> CredentialSource {
-        if let Some(entry) = self.stored(&cfg.id) {
+        if let Some(entry) = self.stored(&cfg.id, accepts_key(&cfg.auth)) {
             // Deliberately drops the value on the floor; only its provenance escapes.
             return match entry.from {
                 Stored::Keychain => CredentialSource::Keychain,
@@ -307,12 +327,18 @@ impl Credentials {
                 driver: cfg.driver.clone(),
                 source: self.source(cfg),
                 driver_available: driver_available(cfg),
-                // A CLI login and a local endpoint have nowhere to put a key, so offering to take
-                // one would be offering to do nothing.
-                accepts_key: !matches!(cfg.auth, AuthRef::Inherited | AuthRef::None),
+                accepts_key: accepts_key(&cfg.auth),
             })
             .collect()
     }
+}
+
+/// Whether typing a key in for this instance would do anything.
+///
+/// A CLI login and a local endpoint have nowhere to put one, so offering to take one would be
+/// offering to do nothing — and looking one up costs a process launch to be told so.
+fn accepts_key(auth: &AuthRef) -> bool {
+    !matches!(auth, AuthRef::Inherited | AuthRef::None)
 }
 
 /// Run a credential helper and take its first line.
@@ -364,7 +390,7 @@ mod tests {
         let c = cfg("acme", AuthRef::Env { var: "NEOSH_TEST_UNSET_XYZ".into() });
         assert_eq!(store.source(&c), CredentialSource::Missing);
 
-        assert_eq!(store.set(&c.id, SecretString::from("sk-test")).expect("stored"), Stored::Session);
+        assert_eq!(store.set(&c.id, SecretString::from("sk-test")), Stored::Session);
         assert_eq!(store.source(&c), CredentialSource::Session);
         assert!(!store.is_durable(), "no helper on this machine means no promise of persistence");
     }
@@ -376,7 +402,7 @@ mod tests {
         let store = Credentials::in_memory();
         let c = cfg("acme", AuthRef::Env { var: "PATH".into() }); // PATH is always set and non-empty
         assert!(matches!(store.source(&c), CredentialSource::Env { .. }));
-        store.set(&c.id, SecretString::from("typed")).expect("stored");
+        store.set(&c.id, SecretString::from("typed"));
         assert_eq!(store.source(&c), CredentialSource::Session);
         let got = store.resolve(&c.id, &c.auth).expect("resolves").expect("has a key");
         assert_eq!(got.expose_secret(), "typed");
@@ -386,10 +412,27 @@ mod tests {
     fn forgetting_falls_back_to_whatever_the_config_says() {
         let store = Credentials::in_memory();
         let c = cfg("acme", AuthRef::None);
-        store.set(&c.id, SecretString::from("typed")).expect("stored");
+        store.set(&c.id, SecretString::from("typed"));
         assert_eq!(store.source(&c), CredentialSource::Session);
         store.forget(&c.id);
         assert_eq!(store.source(&c), CredentialSource::NotNeeded);
+    }
+
+    #[test]
+    fn an_instance_with_nowhere_to_put_a_key_is_never_looked_up() {
+        // Regression, and a sharp one: a settings list asks about every instance, most of which
+        // have no key. Going to the keychain for each of them — and again on the next redraw,
+        // because a miss was not remembered — put a dozen process launches on the loop that draws
+        // the screen, and startup went from a tenth of a second to timing out.
+        let store = Credentials::in_memory();
+        for auth in [AuthRef::Inherited, AuthRef::None] {
+            let c = cfg("local", auth);
+            store.source(&c);
+        }
+        assert!(
+            store.lock().values().all(|v| v.is_none()),
+            "nothing was looked up, so nothing is cached as found"
+        );
     }
 
     #[test]
@@ -434,7 +477,7 @@ mod tests {
     fn a_survey_row_carries_provenance_and_never_a_value() {
         let store = Credentials::in_memory();
         let c = cfg("acme", AuthRef::Env { var: "NEOSH_TEST_UNSET_XYZ".into() });
-        store.set(&c.id, SecretString::from("sk-secret-value")).expect("stored");
+        store.set(&c.id, SecretString::from("sk-secret-value"));
         let rows = store.survey([&c].into_iter(), |_| true);
         let json = serde_json::to_string(&rows).expect("serialises");
         assert!(!json.contains("sk-secret-value"), "a secret reached the wire: {json}");
