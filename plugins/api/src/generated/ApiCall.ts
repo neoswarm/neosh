@@ -149,7 +149,24 @@ export type ApiCall =
     refresh: boolean;
   }
   | { "call": "agent_list_instances" }
-  | { "call": "session_list" }
+  | { "call": "provider_credentials" }
+  | {
+    "call": "provider_set_credential";
+    instance: InstanceId;
+    /**
+     * Overwrite a key that is already there without asking. Off by default.
+     */
+    replace: boolean;
+  }
+  | { "call": "provider_forget_credential"; instance: InstanceId }
+  | {
+    "call": "session_list";
+    /**
+     * Include conversations that have been put away. Off by default, so every existing caller
+     * keeps showing the list the user actually works in.
+     */
+    include_archived: boolean;
+  }
   | { "call": "session_current" }
   | {
     "call": "session_new";
@@ -163,6 +180,7 @@ export type ApiCall =
   | { "call": "session_switch"; session: SessionId }
   | { "call": "session_close"; session: SessionId }
   | { "call": "session_rename"; session: SessionId; title?: string | null }
+  | { "call": "session_archive"; session: SessionId; archived: boolean }
   | { "call": "session_messages"; session?: SessionId | null }
   | { "call": "tool_register"; def: ToolDef }
   | { "call": "tool_unregister"; name: string }

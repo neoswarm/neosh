@@ -146,12 +146,16 @@ impl Editor {
                 | ApiCall::GitAddWorktree { .. }
                 | ApiCall::GitRemoveWorktree { .. }
                 | ApiCall::GenComplete { .. }
-                | ApiCall::SessionList
+                | ApiCall::SessionList { .. }
                 | ApiCall::SessionCurrent
                 | ApiCall::SessionNew { .. }
                 | ApiCall::SessionSwitch { .. }
                 | ApiCall::SessionClose { .. }
                 | ApiCall::SessionRename { .. }
+                | ApiCall::SessionArchive { .. }
+                | ApiCall::ProviderCredentials
+                | ApiCall::ProviderSetCredential { .. }
+                | ApiCall::ProviderForgetCredential { .. }
                 | ApiCall::SessionMessages { .. }
                 | ApiCall::StatusSet { .. }
                 | ApiCall::StatusClear { .. }
@@ -976,12 +980,16 @@ fn call_name(call: &ApiCall) -> &'static str {
         ApiCall::GenComplete { .. } => "gen.complete",
         ApiCall::StatusSet { .. } => "status.set",
         ApiCall::StatusClear { .. } => "status.clear",
-        ApiCall::SessionList => "session.list",
+        ApiCall::SessionList { .. } => "session.list",
         ApiCall::SessionCurrent => "session.current",
         ApiCall::SessionNew { .. } => "session.new",
         ApiCall::SessionSwitch { .. } => "session.switch",
         ApiCall::SessionClose { .. } => "session.close",
         ApiCall::SessionRename { .. } => "session.rename",
+        ApiCall::SessionArchive { .. } => "session.archive",
+        ApiCall::ProviderCredentials => "provider.credentials",
+        ApiCall::ProviderSetCredential { .. } => "provider.set_credential",
+        ApiCall::ProviderForgetCredential { .. } => "provider.forget_credential",
         ApiCall::SessionMessages { .. } => "session.messages",
         _ => "call",
     }

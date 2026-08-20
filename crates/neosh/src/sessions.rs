@@ -38,6 +38,12 @@ struct Stored {
     selection: Option<ModelSelection>,
     #[serde(default)]
     usage: Usage,
+    /// Put away rather than deleted. Defaulted, so a session written before archiving existed
+    /// comes back in the open list, which is where it was.
+    #[serde(default)]
+    archived: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    archived_at: Option<i64>,
     /// The system prompt is *not* stored. It comes from configuration, and a stale copy pinned into
     /// a saved session would silently outrank the one the user edited.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -83,6 +89,8 @@ impl From<&Session> for Stored {
             messages: s.messages.clone(),
             selection: s.selection.clone(),
             usage: s.usage,
+            archived: s.archived,
+            archived_at: s.archived_at,
             _reserved: None,
         }
     }
@@ -98,6 +106,8 @@ impl Stored {
         s.messages = self.messages;
         s.selection = self.selection;
         s.usage = self.usage;
+        s.archived = self.archived;
+        s.archived_at = self.archived_at;
         s
     }
 }
@@ -191,7 +201,11 @@ pub fn load(state: &Path) -> (Vec<Session>, Option<SessionId>) {
         sessions.truncate(RESTORE_LIMIT);
     }
 
-    let active = order.active.filter(|id| sessions.iter().any(|s| &s.id == id));
+    // An archived conversation is never the one you land in: it is the one you deliberately put
+    // away, and starting there would make archiving feel like it had not worked.
+    let active = order
+        .active
+        .filter(|id| sessions.iter().any(|s| &s.id == id && !s.archived));
     (sessions, active)
 }
 

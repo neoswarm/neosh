@@ -28,6 +28,11 @@ pub struct Session {
     /// clock in here, so this type stays deterministic and testable.
     pub created_at: i64,
     pub updated_at: i64,
+    /// Put away, not thrown away: still on disk, still openable, just not in the everyday list.
+    pub archived: bool,
+    /// When it was put away, in seconds since the epoch. Set by whoever archives it, for the same
+    /// reason `created_at` is: this type does not read a clock.
+    pub archived_at: Option<i64>,
 }
 
 impl Session {
@@ -44,6 +49,8 @@ impl Session {
             title: None,
             created_at: 0,
             updated_at: 0,
+            archived: false,
+            archived_at: None,
         }
     }
 
@@ -127,6 +134,8 @@ impl Session {
             usage: self.usage,
             // Filled in by the store, which is the only thing that knows.
             is_active: false,
+            archived: self.archived,
+            archived_at: self.archived_at,
         }
     }
 }

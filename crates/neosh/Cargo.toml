@@ -29,6 +29,7 @@ directories = { workspace = true }
 shellexpand = { workspace = true }
 sha2 = { workspace = true }
 secrecy = { workspace = true }
+unicode-segmentation = { workspace = true }
 async-trait = { workspace = true }
 crossterm = { workspace = true }
 url = "2"

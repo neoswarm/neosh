@@ -3,6 +3,7 @@ import type { BranchInfo } from "./BranchInfo";
 import type { BufferId } from "./BufferId";
 import type { CommandEntry } from "./CommandEntry";
 import type { CommitInfo } from "./CommitInfo";
+import type { CredentialInfo } from "./CredentialInfo";
 import type { ExtmarkId } from "./ExtmarkId";
 import type { ExtmarkInfo } from "./ExtmarkInfo";
 import type { InstanceConfig } from "./InstanceConfig";
@@ -27,6 +28,7 @@ import type { WorktreeInfo } from "./WorktreeInfo";
  */
 export type ApiOk =
   | { "ok": "unit" }
+  | { "ok": "bool"; value: boolean }
   | { "ok": "buf"; buf: BufferId }
   | { "ok": "win"; win: WindowId }
   | { "ok": "ns"; ns: NamespaceId }
@@ -51,6 +53,7 @@ export type ApiOk =
   | { "ok": "paths"; paths: Array<string> }
   | { "ok": "viewport"; viewport: Viewport | null }
   | { "ok": "sessions"; sessions: Array<SessionInfo> }
+  | { "ok": "credentials"; credentials: Array<CredentialInfo> }
   | { "ok": "session"; session: SessionInfo }
   | { "ok": "messages"; messages: Array<Message> }
   | { "ok": "status"; status: RepoStatus }

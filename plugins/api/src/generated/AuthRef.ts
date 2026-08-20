@@ -8,5 +8,6 @@
  */
 export type AuthRef =
   | { "kind": "env"; var: string }
+  | { "kind": "command"; argv: Array<string> }
   | { "kind": "inherited" }
   | { "kind": "none" };

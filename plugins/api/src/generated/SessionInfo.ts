@@ -30,4 +30,16 @@ export type SessionInfo = {
   updated_at: number;
   usage: Usage;
   is_active: boolean;
+  /**
+   * Put away rather than thrown away.
+   *
+   * An archived conversation keeps every message and can be brought back; it is simply not in
+   * the list you look at every day. It exists because the alternative verb people were reaching
+   * for was delete, and delete is the one thing in a workspace that cannot be undone.
+   */
+  archived: boolean;
+  /**
+   * Seconds since the epoch, stamped when it was archived. `None` while it is in the open list.
+   */
+  archived_at?: number | null;
 };

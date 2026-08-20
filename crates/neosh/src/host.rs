@@ -25,6 +25,7 @@ use neosh_script::{ScriptInbound, ScriptOutbound};
 use tokio::sync::mpsc;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
+use unicode_segmentation::UnicodeSegmentation;
 
 use crate::bridge::{PluginProvider, ScriptBridge};
 use crate::config::{Config, Resolved};
@@ -197,6 +198,33 @@ pub struct Host {
     repos: std::collections::HashMap<std::path::PathBuf, Option<neosh_vcs::Git>>,
     /// Where neosh was started, and the fallback for a session that names nowhere.
     cwd: std::path::PathBuf,
+    /// A key being typed in, if one is.
+    ///
+    /// The host collects this itself rather than lending a plugin a text field, because a plugin
+    /// field is a buffer, a buffer is drawn, and drawing it would put the key in a `UiEvent` — over
+    /// a process boundary, into whatever the frontend logs. Here the value never leaves this
+    /// struct: what gets drawn is a row of bullets.
+    secret: Option<SecretPrompt>,
+}
+
+/// A key being typed in, and who is waiting to hear how it went.
+struct SecretPrompt {
+    instance: neosh_proto::InstanceId,
+    label: String,
+    /// What has been typed. Zeroed when the prompt closes, so it does not sit in freed memory.
+    value: String,
+    /// The draft that was in the composer, put back afterwards. Borrowing the composer costs
+    /// nothing as long as it is given back.
+    draft: String,
+    /// The call to answer when this resolves, if a plugin asked for it.
+    waiting: Option<(PluginId, RequestId)>,
+}
+
+impl Drop for SecretPrompt {
+    fn drop(&mut self) {
+        use secrecy::zeroize::Zeroize;
+        self.value.zeroize();
+    }
 }
 
 impl Host {
@@ -257,6 +285,7 @@ impl Host {
             pstate: crate::pstate::PluginState::new(None),
             repos: Default::default(),
             cwd: std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
+            secret: None,
         }
     }
 
@@ -439,9 +468,9 @@ impl Host {
                 Ok(ApiOk::Unit)
             }
             // ---- sessions ----------------------------------------------
-            ApiCall::SessionList => {
-                Ok(ApiOk::Sessions { sessions: self.agent.sessions().list() })
-            }
+            ApiCall::SessionList { include_archived } => Ok(ApiOk::Sessions {
+                sessions: self.agent.sessions().list_with(include_archived),
+            }),
             ApiCall::SessionCurrent => {
                 let info = {
                     let store = self.agent.sessions();
@@ -529,6 +558,45 @@ impl Host {
                 self.persist_sessions();
                 Ok(ApiOk::Unit)
             }
+            ApiCall::SessionArchive { session, archived } => {
+                let leaving = archived && self.agent.sessions().active_id() == &session;
+                if leaving && self.active_turn.is_some() {
+                    return Err(ApiError::Busy {
+                        message: "a turn is running — interrupt it first".into(),
+                    });
+                }
+                // Archiving the only conversation you have is a reasonable thing to want, and
+                // "there is nowhere to go" is a bad answer to it. Somewhere to go is one line.
+                if leaving && self.agent.sessions().list().len() <= 1 {
+                    self.new_session_in(self.cwd.clone());
+                }
+                let at = now_secs();
+                self.agent.sessions().archive(&session, archived, at).map_err(|e| match e {
+                    neosh_agent::store::StoreError::LastSession => {
+                        ApiError::InvalidArgument { message: e.to_string() }
+                    }
+                    other => ApiError::NotFound { what: other.to_string() },
+                })?;
+                if leaving {
+                    self.enter_session();
+                }
+                self.persist_sessions();
+                Ok(ApiOk::Unit)
+            }
+            // ---- credentials -------------------------------------------
+            // The list says where each key comes from and never what it is; `ProviderSetCredential`
+            // is answered elsewhere, because the host has to read the keyboard before it can reply.
+            ApiCall::ProviderCredentials => {
+                Ok(ApiOk::Credentials { credentials: self.agent.providers().credentials() })
+            }
+            ApiCall::ProviderForgetCredential { instance } => {
+                neosh_provider::credentials::credentials().forget(&instance);
+                self.editor_message(MessageLevel::Info, format!("forgot the key for {instance}"));
+                Ok(ApiOk::Unit)
+            }
+            ApiCall::ProviderSetCredential { .. } => Err(ApiError::Internal {
+                message: "credential prompts are answered by the host loop".into(),
+            }),
             ApiCall::SessionRename { session, title } => {
                 self.agent
                     .sessions()
@@ -657,6 +725,20 @@ impl Host {
         });
     }
 
+    /// Start an empty conversation without switching to it.
+    ///
+    /// Exists so that archiving the only conversation you have has somewhere to land. It inherits
+    /// the model and system prompt for the same reason a new conversation does: changing what you
+    /// are talking to as a side effect of tidying up would be a strange thing to do.
+    fn new_session_in(&mut self, cwd: std::path::PathBuf) {
+        let mut session = neosh_agent::Session::new(cwd);
+        session.created_at = now_secs();
+        session.updated_at = session.created_at;
+        session.selection = self.agent.selection();
+        session.system = self.agent.session().system.clone();
+        self.agent.sessions().insert(session);
+    }
+
     fn editor_message(&mut self, level: MessageLevel, text: impl Into<String>) {
         let _ = self
             .editor
@@ -759,7 +841,11 @@ impl Host {
     fn refresh_status(&mut self) {
         // Reading is not a `Mode` — it is a place the keyboard is, and the whole reason it shows
         // here is that a key doing something different needs to say so before you press it.
-        let mode = if self.reading {
+        let mode = if self.secret.is_some() {
+            // Named in the status line because it is the one state where a keystroke does not do
+            // what it usually does, and you should be able to see that before you press one.
+            "key"
+        } else if self.reading {
             "reading"
         } else {
             match self.editor.mode() {
@@ -986,6 +1072,175 @@ impl Host {
             format!("{} {lines} line{}", if cut { "cut" } else { "copied" }, if lines == 1 { "" } else { "s" }),
         );
         true
+    }
+
+    // ---- typing in a key -------------------------------------------------
+
+    /// Start collecting a key for `instance`, borrowing the composer to do it.
+    ///
+    /// Returns the error a caller should be told about rather than opening a prompt that cannot
+    /// lead anywhere: a CLI login and a local endpoint have nothing to do with a key, and asking
+    /// for one would be asking for something that gets thrown away.
+    fn begin_secret(
+        &mut self,
+        instance: neosh_proto::InstanceId,
+        replace: bool,
+        waiting: Option<(PluginId, RequestId)>,
+    ) -> Result<(), ApiError> {
+        if self.secret.is_some() {
+            return Err(ApiError::Busy { message: "a key is already being entered".into() });
+        }
+        let (label, accepts, present) = {
+            let providers = self.agent.providers();
+            let cfg = providers
+                .instance(&instance)
+                .ok_or_else(|| ApiError::NotFound { what: format!("instance {instance}") })?;
+            let store = neosh_provider::credentials::credentials();
+            let source = store.source(cfg);
+            (
+                cfg.display_name.clone(),
+                !matches!(cfg.auth, neosh_proto::AuthRef::Inherited | neosh_proto::AuthRef::None),
+                source.is_usable(),
+            )
+        };
+        if !accepts {
+            return Err(ApiError::InvalidArgument {
+                message: format!("{instance} signs in on its own — it has nowhere to put a key"),
+            });
+        }
+        if present && !replace {
+            return Err(ApiError::InvalidArgument {
+                message: format!("{instance} already has a key — pass `replace` to change it"),
+            });
+        }
+
+        // Leave the transcript first, so the caret is where the bullets are.
+        self.leave_reading();
+        let draft = self.composer_text();
+        self.secret = Some(SecretPrompt { instance, label, value: String::new(), draft, waiting });
+        self.chat_line("");
+        self.chat_line("Paste or type the key, then Enter. Esc cancels. Nothing is echoed.");
+        self.render_secret();
+        self.refresh_status();
+        Ok(())
+    }
+
+    /// Draw the prompt: a label, and one bullet per grapheme.
+    ///
+    /// Bullets rather than nothing at all, because a paste that silently did not arrive is the
+    /// failure people actually hit. Bullets rather than the value, because this line is a buffer
+    /// and a buffer is sent to the frontend.
+    fn render_secret(&mut self) {
+        let Some(p) = self.secret.as_ref() else { return };
+        let n = p.value.graphemes(true).count();
+        // Capped: a 200-character key would push the label off a narrow composer. The overflow
+        // count is what tells you a long paste landed.
+        let shown = n.min(32);
+        let mut mask = "\u{2022}".repeat(shown);
+        if n > shown {
+            mask.push_str(&format!(" +{}", n - shown));
+        }
+        let line = format!("key for {}  {mask}", p.label);
+        self.set_composer(&line);
+    }
+
+    /// Every key while a key is being typed.
+    ///
+    /// Deliberately reached *before* the keymaps: while this prompt is up no binding fires, so a
+    /// stray `n` in the middle of a pasted key cannot start a conversation.
+    fn secret_key(&mut self, key: neosh_proto::KeyPress) {
+        let Some(p) = self.secret.as_mut() else { return };
+        match key.code {
+            KeyCode::Esc => {
+                self.finish_secret(false);
+                return;
+            }
+            KeyCode::Enter => {
+                self.finish_secret(true);
+                return;
+            }
+            KeyCode::Backspace => {
+                // By grapheme, like everything else here that steps through text.
+                let keep = p.value.graphemes(true).count().saturating_sub(1);
+                p.value = p.value.graphemes(true).take(keep).collect();
+            }
+            KeyCode::Char { ref c } if key.mods.ctrl => match c.as_str() {
+                "u" => p.value.clear(),
+                "c" => {
+                    self.finish_secret(false);
+                    return;
+                }
+                _ => return,
+            },
+            KeyCode::Char { ref c } if !key.mods.alt => p.value.push_str(c),
+            _ => return,
+        }
+        self.render_secret();
+    }
+
+    /// Pasting is how a key actually arrives.
+    ///
+    /// Surrounding whitespace is stripped: a key copied out of a web page brings a newline with it,
+    /// and a trailing newline in a bearer token is a 401 that looks exactly like a wrong key.
+    fn secret_paste(&mut self, text: &str) {
+        let Some(p) = self.secret.as_mut() else { return };
+        p.value.push_str(text.trim());
+        self.render_secret();
+    }
+
+    /// Store what was typed, or throw it away, and give the composer back.
+    fn finish_secret(&mut self, submit: bool) {
+        let Some(mut p) = self.secret.take() else { return };
+        let mut stored = false;
+        if submit {
+            let value = std::mem::take(&mut p.value);
+            let trimmed = value.trim();
+            if trimmed.is_empty() {
+                self.editor_message(MessageLevel::Warn, "nothing entered");
+            } else {
+                let secret = secrecy::SecretString::from(trimmed);
+                match neosh_provider::credentials::credentials().set(&p.instance, secret) {
+                    Ok(neosh_provider::credentials::Stored::Keychain) => {
+                        stored = true;
+                        let label = p.label.clone();
+                        self.editor_message(
+                            MessageLevel::Info,
+                            format!("{label}: key saved to the keychain"),
+                        );
+                    }
+                    Ok(neosh_provider::credentials::Stored::Session) => {
+                        stored = true;
+                        let label = p.label.clone();
+                        self.editor_message(
+                            MessageLevel::Warn,
+                            format!(
+                                "{label}: key kept for this run only — no keychain helper found. \
+                                 Install `secret-tool`, or point `auth` at a command in config.toml."
+                            ),
+                        );
+                    }
+                    // The helper's own message is not repeated: it can quote what it was given.
+                    Err(e) => {
+                        let label = p.label.clone();
+                        self.editor_message(
+                            MessageLevel::Error,
+                            format!("{label}: could not save the key ({e})"),
+                        );
+                    }
+                }
+            }
+        }
+        let draft = std::mem::take(&mut p.draft);
+        self.set_composer(&draft);
+        self.refresh_status();
+        if let Some((plugin, id)) = p.waiting.take() {
+            let response: ApiResponse = Ok(ApiOk::Bool { value: stored }).into();
+            let _ = self.bridge.script().send(ScriptInbound::Plugin {
+                plugin,
+                msg: PluginInbound::Response { id, response },
+            });
+        }
+        // `p` drops here, which zeroes whatever is left of the value.
     }
 
     /// Move into the transcript to read, navigate and select it.
@@ -1255,6 +1510,22 @@ impl Host {
             ScriptOutbound::Plugin { plugin, msg } => match msg {
                 PluginOutbound::Ready { .. } => {}
                 PluginOutbound::Call { id, call } => {
+                    // Answered when the prompt closes rather than now: the host has to read the
+                    // keyboard before it knows whether a key was entered, and the plugin is
+                    // waiting to hear exactly that.
+                    if let ApiCall::ProviderSetCredential { instance, replace } = &call {
+                        let waiting = Some((plugin.clone(), id.clone()));
+                        if let Err(e) =
+                            self.begin_secret(instance.clone(), *replace, waiting)
+                        {
+                            let response: ApiResponse = Err(e).into();
+                            let _ = self.bridge.script().send(ScriptInbound::Plugin {
+                                plugin,
+                                msg: PluginInbound::Response { id, response },
+                            });
+                        }
+                        return;
+                    }
                     if self.spawn_slow(&plugin, Some(id.clone()), &call) {
                         return;
                     }
@@ -1265,6 +1536,12 @@ impl Host {
                     });
                 }
                 PluginOutbound::Notify { call } => {
+                    if let ApiCall::ProviderSetCredential { instance, replace } = &call {
+                        if let Err(e) = self.begin_secret(instance.clone(), *replace, None) {
+                            tracing::warn!(%plugin, "{e}");
+                        }
+                        return;
+                    }
                     if self.spawn_slow(&plugin, None, &call) {
                         return;
                     }
@@ -1288,6 +1565,21 @@ impl Host {
     }
 
     fn handle_input(&mut self, input: InputEvent) -> bool {
+        // A key being typed in takes the keyboard whole, bindings included. Routing it through the
+        // keymaps first would mean a key containing `n` — every base64 key does — firing whatever
+        // `n` is bound to, halfway through the paste.
+        if self.secret.is_some() {
+            match input {
+                InputEvent::Key { key } => self.secret_key(key),
+                InputEvent::Paste { text } => self.secret_paste(&text),
+                other => return self.handle_input_uncaptured(other),
+            }
+            return true;
+        }
+        self.handle_input_uncaptured(input)
+    }
+
+    fn handle_input_uncaptured(&mut self, input: InputEvent) -> bool {
         match input {
             InputEvent::Key { key } => {
                 let res = self.editor.feed_key(key);
@@ -1438,7 +1730,11 @@ impl Host {
             for s in saved {
                 store.insert(s);
             }
-            let target = active.or_else(|| order.first().cloned());
+            // Never an archived one: with every conversation put away, the empty placeholder is
+            // the right place to land, and the list is empty because that is what you asked for.
+            let target = active.or_else(|| {
+                order.iter().find(|id| store.get(id).is_some_and(|s| !s.archived)).cloned()
+            });
             if let Some(id) = target
                 && store.switch(&id).is_ok()
             {
@@ -1567,6 +1863,10 @@ impl Host {
             ("edit.cut", "Cut what is selected"),
             ("edit.select_all", "Select everything here"),
             ("edit.newline", "Break the line instead of sending"),
+            // Built in rather than left to the model plugin: with `--clean`, or with plugins
+            // disabled, this is the only way to authenticate, and "install a plugin first" is a
+            // poor answer to "it says I have no API key".
+            ("provider.key", "Enter an API key for the provider this model belongs to"),
         ];
         for (name, desc) in commands {
             let _ = self.editor.apply(&plugin, ApiCall::CmdRegister {
@@ -1755,6 +2055,18 @@ impl Host {
                 self.select_all(win);
             }
             "edit.newline" => self.compose(TextEdit::Insert { text: "\n".into() }),
+            "provider.key" => {
+                // The instance serving the model you are on: the one you would be asked about, and
+                // the only one this command could mean without a picker to choose from.
+                match self.agent.selection() {
+                    Some(sel) => {
+                        if let Err(e) = self.begin_secret(sel.instance, true, None) {
+                            self.editor_message(MessageLevel::Warn, e.to_string());
+                        }
+                    }
+                    None => self.editor_message(MessageLevel::Warn, "no model is selected"),
+                }
+            }
             other => tracing::warn!("no built-in command {other}"),
         }
     }
