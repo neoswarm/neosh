@@ -232,9 +232,12 @@ impl Services {
     /// providers waits for the sum of five network round trips before anything appears; the slowest
     /// one should be the only cost.
     pub async fn list_models(&self, only: Option<InstanceId>, refresh: bool) -> ApiResult {
+        // Every configured instance, not only the ones with a driver loaded. A plan whose CLI is
+        // not installed still has a catalogue, and the list of what it offers is exactly how
+        // somebody decides whether installing it is worth their afternoon.
         let targets: Vec<_> = {
             let reg = self.agent.providers();
-            reg.usable_instances()
+            reg.instances()
                 .filter(|i| only.as_ref().is_none_or(|want| &i.id == want))
                 .cloned()
                 .collect()

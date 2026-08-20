@@ -131,6 +131,11 @@ fn underline(mut s: HighlightSpec) -> HighlightSpec {
     s
 }
 
+fn struck(mut s: HighlightSpec) -> HighlightSpec {
+    s.attrs.strikethrough = true;
+    s
+}
+
 fn shimmer(mut s: HighlightSpec, period_ms: u32) -> HighlightSpec {
     s.animate = Some(neosh_proto::Animation::Shimmer { period_ms });
     s
@@ -195,6 +200,9 @@ pub fn groups(variant: Variant) -> Vec<(&'static str, HighlightDef)> {
         ("Markdown.Heading", spec(bold(fg(r.accent)))),
         ("Markdown.Bold", spec(bold(fg(r.fg)))),
         ("Markdown.Italic", spec(italic(fg(r.fg)))),
+        // Struck-through text is text the answer has told you to disregard, so it reads at the
+        // weight of something disregarded: the line through it *and* a step back on the ramp.
+        ("Markdown.Strike", spec(struck(dim(fg(r.muted))))),
         ("Markdown.Code", spec(fg(r.active))),
         ("Markdown.Fence", spec(dim(fg(r.muted)))),
         ("Markdown.Bullet", spec(fg(r.accent))),
@@ -277,6 +285,7 @@ pub fn groups(variant: Variant) -> Vec<(&'static str, HighlightDef)> {
         ("Brand.Groq", spec(fg(rgb(0xf5, 0x5c, 0x36)))),
         ("Brand.DeepSeek", spec(fg(rgb(0x4d, 0x6b, 0xfe)))),
         ("Brand.XAI", spec(fg(r.fg))),
+        ("Brand.Cursor", spec(fg(rgb(0x7c, 0x8b, 0xa1)))),
         ("Brand.Mistral", spec(fg(rgb(0xff, 0x8a, 0x00)))),
         ("Brand.Together", spec(fg(rgb(0x0f, 0x6f, 0xff)))),
         ("Brand.Fireworks", spec(fg(rgb(0xff, 0x5a, 0x8a)))),

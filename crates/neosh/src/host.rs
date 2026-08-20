@@ -162,6 +162,8 @@ pub struct Host {
     /// Whether `agent.model` chose the current selection. A chosen model is never silently
     /// replaced; a remembered one is.
     selection_pinned: bool,
+    /// ACP drivers, kept so the permission mode can be mirrored into them.
+    acp_drivers: Vec<Arc<neosh_provider::drivers::AcpProvider>>,
     status: BufferId,
     status_ns: neosh_proto::NamespaceId,
     /// Where the transcript's own highlights live.
@@ -410,6 +412,7 @@ impl Host {
             hints: Default::default(),
             welcome_rows: 0,
             selection_pinned: false,
+            acp_drivers: Vec::new(),
             active_turn: None,
             keys_pending: false,
             keys_touched: false,
@@ -762,6 +765,7 @@ impl Host {
                 // still be on next week, and writing it to a file is how that happens.
                 let layer = (*self.agent.permissions()).clone().with_mode(mode);
                 self.agent.set_permissions(layer);
+                self.sync_acp_mode();
                 self.refresh_status();
                 Ok(ApiOk::PermissionMode { mode })
             }
@@ -1296,6 +1300,20 @@ impl Host {
         if rows.len() > 6 {
             self.chat_mark(6, 0, rows[6].len(), "Diagnostic.Warn");
         }
+    }
+
+    /// Drivers that answer their own permission prompts need to know what the mode is.
+    fn sync_acp_mode(&self) {
+        let mode = self.agent.permissions().mode();
+        for d in &self.acp_drivers {
+            d.set_mode(mode);
+        }
+    }
+
+    /// Take ownership of the ACP drivers, so the mode can be mirrored into them later.
+    pub fn adopt_acp_drivers(&mut self, drivers: Vec<Arc<neosh_provider::drivers::AcpProvider>>) {
+        self.acp_drivers = drivers;
+        self.sync_acp_mode();
     }
 
     /// The characters this terminal gets to draw the transcript with.
@@ -3455,7 +3473,15 @@ fn describe_api_error(name: &str, e: &ApiError) -> String {
 ///
 /// A free function rather than a method: listing models must not require a frontend, and a
 /// frontend must not be required to know about providers.
-pub fn install_builtin_providers(agent: &Agent) {
+/// Register every driver neosh ships, and hand back the ACP ones.
+///
+/// They come back because they need telling when the permission mode changes: an ACP agent asks
+/// its *client* for permission, and the driver has to answer synchronously with no way to reach
+/// the permission layer from inside a spawned turn. Mirroring the mode into the driver is the
+/// narrowest thing that works — see [`neosh_provider::drivers::acp`] for why that is a stated
+/// limitation rather than a design.
+pub fn install_builtin_providers(agent: &Agent) -> Vec<Arc<neosh_provider::drivers::AcpProvider>> {
+    let mut out = Vec::new();
     {
         let mut reg = agent.providers_mut();
         reg.register_driver(Arc::new(neosh_provider::drivers::AnthropicProvider));
@@ -3474,10 +3500,25 @@ pub fn install_builtin_providers(agent: &Agent) {
         if codex.available() {
             reg.register_driver(Arc::new(codex));
         }
+        // One driver, three programs: they all speak the Agent Client Protocol. Registered only
+        // where the program exists, for the same reason as the other two — a provider whose every
+        // turn fails with "no such file" is worse than one that is not offered.
+        for (kind, program, args) in [
+            ("cursor-cli", "cursor-agent", &["--acp"][..]),
+            ("grok-cli", "grok", &["--acp"][..]),
+            ("gemini-cli", "gemini", &["--experimental-acp"][..]),
+        ] {
+            let acp = Arc::new(neosh_provider::drivers::AcpProvider::new(kind, program, args));
+            if acp.available() {
+                reg.register_driver(acp.clone());
+                out.push(acp);
+            }
+        }
         for i in catalog::builtin_instances() {
             reg.add_instance(i);
         }
     }
+    out
 }
 
 /// Route one slow call to its service.

@@ -44,7 +44,7 @@ export async function activate({ neosh, subscriptions }: PluginContext) {
     if (!mode) return;
     await neosh.status.set("mode", {
       text: label(mode),
-      keys: "^Y",
+      keys: "⇧⇥",
       hl: mode === "allow" ? "Diagnostic.Warn" : mode === "deny" ? "Comment" : "Status.Line",
       priority: 5,
     });
@@ -60,7 +60,10 @@ export async function activate({ neosh, subscriptions }: PluginContext) {
   await neosh.cmd.register("permission.pick", () => pickMode(neosh, showMode), {
     desc: "Choose what the agent may do without asking",
   });
-  await neosh.keymap.set("chat", "<C-y>", "permission.pick", { desc: "Permission mode" });
+  // Shift-Tab, which is what codex uses for the same idea and what people's fingers already do.
+  // Not a control key: every free one is one somebody's `init.ts` has taken, and this is the sort
+  // of binding that should not need arguing about.
+  await neosh.keymap.set("chat", "<S-Tab>", "permission.pick", { desc: "Permission mode" });
   await showMode();
 
   subscriptions.push(

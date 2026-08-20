@@ -181,9 +181,9 @@ async function pickModel(neosh: Neosh): Promise<void> {
         label: c.display_name,
         badge: badgeFor(c, glyphs),
         group: headingFor(account),
-        // Listed, not hidden: a provider that vanished because its CLI is missing is a question
-        // with nowhere to ask it.
-        disabled: !c.driver_available,
+        // Selectable even when its driver is missing. Looking at what a provider offers is how you
+        // decide whether to install it, and a row you cannot land on is a question with nowhere to
+        // ask it. What cannot be chosen is a *model* on it, which is where the refusal belongs.
         value: c,
       });
     }
@@ -201,21 +201,34 @@ async function pickModel(neosh: Neosh): Promise<void> {
     hints: "↵ use   ⇥ providers   s sign in   r refresh   n add   esc close",
     placeholder: "nothing here yet — `s` to sign in, or `n` to name a model yourself",
     async items(c) {
-      if (!c.driver_available) return [];
+      // Listed even when the driver is missing. What a provider offers is how you decide whether
+      // installing its CLI is worth the afternoon, and an empty pane answers that with silence.
       const entries = await neosh.agent.listModels(c.instance).catch(() => [] as ModelEntry[]);
-      // Anything the user named themselves goes first: they typed it because the list did not
-      // have it, and burying it under the list that did not have it would be a poor joke.
+      // Why nothing here can be chosen, at the top, where it will be read before the list it is
+      // about. `⨯` on the rail says *that* it is unavailable; this says what to do.
+      const blocked: PaneItem<ModelEntry>[] = c.driver_available
+        ? []
+        : [{
+            label: "unavailable",
+            detail: describe(c.source),
+            disabled: true,
+            value: undefined as unknown as ModelEntry,
+          }];
+      // Anything the user named themselves goes next: they typed it because the list did not have
+      // it, and burying it under the list that did not have it would be a poor joke.
       const named: PaneItem<ModelEntry>[] = (await custom(neosh, c.instance)).map((m) => ({
         label: m.display_name,
         badge: { text: "yours", hl: "Comment" },
+        disabled: !c.driver_available,
         detail: m.id,
         keywords: m.id,
         value: { instance: c.instance, model: m } as ModelEntry,
       }));
-      return named.concat(entries.map((e) => ({
+      return blocked.concat(named).concat(entries.map((e) => ({
         label: e.model.display_name,
         badge: e.model.tier ? { text: tierLabel(e.model.tier), hl: tierHl(e.model.tier) } : undefined,
         detail: describeModel(e, showPricing),
+        disabled: !c.driver_available,
         keywords: `${e.model.id} ${e.model.family ?? ""}`,
         // Last year's models are reachable and out of the way. You go looking for one to
         // reproduce something, which is exactly when hiding it outright would be worst.
@@ -223,7 +236,10 @@ async function pickModel(neosh: Neosh): Promise<void> {
         value: e,
       })));
     },
-    itemAt: (items) => Math.max(0, items.findIndex((i) => i.value.model.id === current?.model)),
+    // Guarded, because not every row carries a model: the "why this is unavailable" row has no
+    // value at all, and reaching through it is how a picker crashes on open.
+    itemAt: (items) =>
+      Math.max(0, items.findIndex((i) => i.value?.model?.id === current?.model)),
     async onKey(key, ctx) {
       if (key.key.code.kind !== "char" || key.key.mods.ctrl || key.key.mods.alt) return;
       const c = ctx.rail;
@@ -393,7 +409,12 @@ function badgeFor(
   c: CredentialInfo,
   glyphs: { ascii: boolean },
 ): { text: string; hl: string } | undefined {
-  if (!c.driver_available) return { text: glyphs.ascii ? "-" : "⨯", hl: "Comment" };
+  // A plan whose CLI is not installed is not broken — it is one `brew install` away, and the
+  // detail line says which. `⨯` is for a provider nothing can serve at all.
+  if (!c.driver_available) {
+    const fixable = c.source.kind === "plan_missing";
+    return { text: fixable ? "!" : glyphs.ascii ? "-" : "⨯", hl: fixable ? "Account.Missing" : "Comment" };
+  }
   switch (c.source.kind) {
     case "missing":
     case "plan_missing":

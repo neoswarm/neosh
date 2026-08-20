@@ -160,9 +160,24 @@ fn render_into(text: &str, in_fence: &mut bool, lines: &mut Vec<String>, marks: 
         return;
     }
     // `split_inclusive` keeps a trailing partial line, which is exactly what a streaming tail is.
-    for raw_line in text.split_inclusive('\n') {
+    let raw: Vec<&str> = text.split_inclusive('\n').collect();
+    let mut at = 0;
+    while at < raw.len() {
+        let raw_line = raw[at];
         let line = raw_line.trim_end_matches(['\n', '\r']);
         let row = lines.len();
+
+        // A table is the one construct here that spans lines, so it is recognised before the
+        // per-line rules get a chance to read its pipes as prose. It is only a table once the
+        // delimiter row has arrived — until then it renders as the plain rows it currently is,
+        // which is the honest reading of half a table.
+        if !*in_fence
+            && let Some(taken) = table(&raw, at, lines, marks)
+        {
+            at += taken;
+            continue;
+        }
+        at += 1;
 
         if is_fence(line) {
             let language = line.trim_start().trim_start_matches(['`', '~']).trim();
@@ -191,6 +206,190 @@ fn render_into(text: &str, in_fence: &mut bool, lines: &mut Vec<String>, marks: 
         lines.push(render_block_line(line, row, marks));
     }
 }
+
+/// The widest a single column is allowed to be before it is clipped.
+const MAX_CELL: usize = 40;
+/// The widest a whole table is allowed to be before it becomes a list of records instead.
+const MAX_TABLE: usize = 100;
+
+/// Render a pipe table starting at `at`, if there is one. Returns how many source lines it ate.
+///
+/// A table is only a table once its delimiter row has arrived. Before that it is a row of text with
+/// pipes in it, and rendering it as a one-column table that becomes a three-column one a moment
+/// later is a flicker on the most visually complicated thing in an answer.
+fn table(raw: &[&str], at: usize, lines: &mut Vec<String>, marks: &mut Vec<Mark>) -> Option<usize> {
+    let header = cells(raw.get(at)?)?;
+    let aligns = delimiter(raw.get(at + 1)?, header.len())?;
+
+    let mut rows: Vec<Vec<String>> = Vec::new();
+    let mut taken = 2;
+    while let Some(next) = raw.get(at + taken) {
+        // A table ends at the first line that is not one of its rows. Complete lines only: half a
+        // row would be measured at half its eventual width and shift every column when it finished.
+        if !next.ends_with('\n') && at + taken + 1 == raw.len() {
+            break;
+        }
+        let Some(row) = cells(next) else { break };
+        rows.push(row);
+        taken += 1;
+    }
+
+    let columns = header.len();
+    let mut widths: Vec<usize> = header.iter().map(|c| display_width(c).min(MAX_CELL)).collect();
+    for row in &rows {
+        for (i, c) in row.iter().take(columns).enumerate() {
+            widths[i] = widths[i].max(display_width(c).min(MAX_CELL));
+        }
+    }
+
+    // Too wide to line up, so stop pretending. Columns that do not fit are not a table — they are a
+    // table with the right-hand ones off the edge, and reading a row means guessing which is which.
+    let total = widths.iter().sum::<usize>() + 2 * (columns.saturating_sub(1)) + 2;
+    if total > MAX_TABLE {
+        records(&header, &rows, lines, marks);
+        return Some(taken);
+    }
+
+    let line = |cs: &[String], widths: &[usize], aligns: &[Align]| -> String {
+        let mut out = String::from("  ");
+        for (i, w) in widths.iter().enumerate() {
+            let cell = cs.get(i).map(String::as_str).unwrap_or("");
+            let cell = clip(cell, *w);
+            let pad = w.saturating_sub(display_width(&cell));
+            match aligns.get(i).copied().unwrap_or(Align::Left) {
+                Align::Right => {
+                    out.push_str(&" ".repeat(pad));
+                    out.push_str(&cell);
+                }
+                Align::Centre => {
+                    out.push_str(&" ".repeat(pad / 2));
+                    out.push_str(&cell);
+                    out.push_str(&" ".repeat(pad - pad / 2));
+                }
+                Align::Left => {
+                    out.push_str(&cell);
+                    out.push_str(&" ".repeat(pad));
+                }
+            }
+            if i + 1 < widths.len() {
+                out.push_str("  ");
+            }
+        }
+        out.trim_end().to_string()
+    };
+
+    let head = line(&header, &widths, &aligns);
+    marks.push((lines.len(), 0, head.len(), "Markdown.Heading"));
+    lines.push(head);
+
+    // A rule under the header rather than a box around everything. The job is to separate the
+    // labels from the data; a full grid spends four times the ink saying the same thing.
+    let rule: String = format!(
+        "  {}",
+        widths
+            .iter()
+            .map(|w| "\u{2500}".repeat(*w))
+            .collect::<Vec<_>>()
+            .join("\u{2500}\u{2500}")
+    );
+    marks.push((lines.len(), 0, rule.len(), "Markdown.Rule"));
+    lines.push(rule);
+
+    for row in &rows {
+        lines.push(line(row, &widths, &aligns));
+    }
+    Some(taken)
+}
+
+/// A table too wide to line up, as one block per row.
+///
+/// The alternative is columns running off the right edge, where a row means guessing which value
+/// belongs to which label — which is worse than not having a table at all.
+fn records(header: &[String], rows: &[Vec<String>], lines: &mut Vec<String>, marks: &mut Vec<Mark>) {
+    let label = header.iter().map(|h| display_width(h)).max().unwrap_or(0).min(MAX_CELL);
+    for (n, row) in rows.iter().enumerate() {
+        if n > 0 {
+            lines.push(String::new());
+        }
+        for (i, cell) in row.iter().enumerate() {
+            let name = header.get(i).map(String::as_str).unwrap_or("");
+            let name = clip(name, label);
+            let pad = label.saturating_sub(display_width(&name));
+            let text = format!("  {name}{}  {cell}", " ".repeat(pad));
+            marks.push((lines.len(), 2, 2 + name.len(), "Markdown.Heading"));
+            lines.push(text);
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum Align {
+    Left,
+    Centre,
+    Right,
+}
+
+/// The cells of a pipe-table row, or nothing if this line is not one.
+fn cells(line: &str) -> Option<Vec<String>> {
+    let t = line.trim_end_matches(['\n', '\r']).trim();
+    if !t.contains('|') || t.is_empty() {
+        return None;
+    }
+    let inner = t.strip_prefix('|').unwrap_or(t);
+    let inner = inner.strip_suffix('|').unwrap_or(inner);
+    let out: Vec<String> = inner.split('|').map(|c| c.trim().to_string()).collect();
+    (out.len() >= 2).then_some(out)
+}
+
+/// The alignment row, `|---|:--:|--:|`, if this line is one of the right width.
+fn delimiter(line: &str, columns: usize) -> Option<Vec<Align>> {
+    let cs = cells(line)?;
+    if cs.len() != columns {
+        return None;
+    }
+    cs.iter()
+        .map(|c| {
+            let body = c.trim();
+            let dashes = body.trim_start_matches(':').trim_end_matches(':');
+            if dashes.len() < 1 || !dashes.chars().all(|ch| ch == '-') {
+                return None;
+            }
+            Some(match (body.starts_with(':'), body.ends_with(':')) {
+                (true, true) => Align::Centre,
+                (false, true) => Align::Right,
+                _ => Align::Left,
+            })
+        })
+        .collect()
+}
+
+/// Screen columns a string occupies.
+fn display_width(s: &str) -> usize {
+    use unicode_width::UnicodeWidthStr;
+    s.width()
+}
+
+/// Clip to a column budget without splitting a grapheme.
+fn clip(s: &str, max: usize) -> String {
+    use unicode_segmentation::UnicodeSegmentation;
+    use unicode_width::UnicodeWidthStr;
+    if s.width() <= max {
+        return s.to_string();
+    }
+    let mut out = String::new();
+    let mut used = 0;
+    for g in s.graphemes(true) {
+        let w = g.width();
+        if used + w > max.saturating_sub(1) {
+            break;
+        }
+        out.push_str(g);
+        used += w;
+    }
+    out.push('\u{2026}');
+    out
+}
+
 
 /// One non-fenced line: its block shape, then its inline runs.
 fn render_block_line(line: &str, row: usize, marks: &mut Vec<Mark>) -> String {
@@ -271,7 +470,7 @@ fn list_item(line: &str) -> Option<(String, &str)> {
     None
 }
 
-/// Inline runs: bold, italic, code, links. Returns the text with the markers removed.
+/// Inline runs: code, bold, italic, strikethrough, links. Returns the text with the markers gone.
 ///
 /// `at` is where this text will start in the finished row, so the marks it produces are already in
 /// the row's coordinates and the caller never has to shift them.
@@ -289,6 +488,15 @@ fn inline(text: &str, row: usize, at: usize, marks: &mut Vec<Mark>) -> String {
             out.push_str(&text[i + 1..end]);
             marks.push((row, from, at + out.len(), "Markdown.Code"));
             i = end + 1;
+            continue;
+        }
+        if text[i..].starts_with("~~")
+            && let Some(end) = find(text, i + 2, "~~")
+        {
+            let from = at + out.len();
+            out.push_str(&inline(&text[i + 2..end], row, from, marks));
+            marks.push((row, from, at + out.len(), "Markdown.Strike"));
+            i = end + 2;
             continue;
         }
         if text[i..].starts_with("**")
@@ -436,6 +644,12 @@ mod tests {
     }
 
     #[test]
+    fn struck_through_text_keeps_its_words_and_loses_its_tildes() {
+        assert_eq!(lines("~~wrong~~ right\n"), vec!["wrong right"]);
+        assert!(groups("~~wrong~~ right\n").contains(&"Markdown.Strike"));
+    }
+
+    #[test]
     fn a_marker_inside_backticks_stays_literal() {
         assert_eq!(lines("use `a * b` here\n"), vec!["use a * b here"]);
     }
@@ -456,6 +670,69 @@ mod tests {
     fn a_multibyte_answer_does_not_split_a_character() {
         let got = lines("日本語 **太字** \u{1f389}\n");
         assert_eq!(got, vec!["日本語 太字 \u{1f389}"]);
+    }
+
+    // ---- tables -----------------------------------------------------------
+
+    #[test]
+    fn a_table_is_laid_out_in_columns() {
+        let got = lines(
+            "| Pattern | Outcome |\n|---|---|\n| Table tail | Preserved |\n| Short | Yes |\n",
+        );
+        assert_eq!(got[0], "  Pattern     Outcome");
+        assert_eq!(got[2], "  Table tail  Preserved");
+        assert_eq!(got[3], "  Short       Yes", "and every row lines up with the header");
+        assert!(
+            got[1].trim_start().chars().all(|c| c == '\u{2500}'),
+            "a rule under the labels, not a box around everything: {:?}",
+            got[1]
+        );
+        assert_eq!(
+            display_width(&got[1]),
+            display_width(&got[2]),
+            "as wide as the widest row"
+        );
+    }
+
+    #[test]
+    fn alignment_is_honoured() {
+        let got = lines("| n | word |\n|--:|:-----|\n| 7 | seven |\n| 100 | hundred |\n");
+        assert!(got[2].starts_with("    7  seven"), "right-aligned: {:?}", got[2]);
+        assert!(got[3].starts_with("  100  hundred"), "and lines up: {:?}", got[3]);
+    }
+
+    #[test]
+    fn half_a_table_is_not_a_table_yet() {
+        // The delimiter row is what makes it one. Rendering a one-column table that becomes a
+        // three-column one a moment later is a flicker on the most visually busy thing in an answer.
+        assert_eq!(lines("| Pattern | Outcome |\n"), vec!["| Pattern | Outcome |"]);
+    }
+
+    #[test]
+    fn a_table_too_wide_to_line_up_becomes_records() {
+        // Columns running off the right edge mean guessing which value belongs to which label,
+        // which is worse than not having a table.
+        let wide = "x".repeat(40);
+        let got = lines(&format!(
+            "| a | b | c |\n|---|---|---|\n| {wide} | {wide} | {wide} |\n"
+        ));
+        assert_eq!(got[0], format!("  a  {wide}"));
+        assert_eq!(got[1], format!("  b  {wide}"));
+        assert_eq!(got[2], format!("  c  {wide}"));
+    }
+
+    #[test]
+    fn a_cell_that_will_not_fit_is_clipped_not_wrapped() {
+        let long = "y".repeat(80);
+        let got = lines(&format!("| a | b |\n|---|---|\n| {long} | ok |\n"));
+        assert!(got[2].contains('\u{2026}'), "clipped: {:?}", got[2]);
+        assert!(display_width(&got[2]) <= MAX_TABLE, "and inside the budget: {:?}", got[2]);
+    }
+
+    #[test]
+    fn pipes_inside_a_fence_are_not_a_table() {
+        let got = lines("```\n| a | b |\n|---|---|\n```\n");
+        assert_eq!(got, vec!["  | a | b |", "  |---|---|"]);
     }
 
     // ---- the incremental half ---------------------------------------------

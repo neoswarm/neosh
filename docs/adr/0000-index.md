@@ -32,3 +32,4 @@ implementation — and in two cases (0005, 0008) it did not, which is itself rec
 | [0024](0024-plans-and-keys-are-different-accounts.md) | A plan and an API key are different accounts | Accepted |
 | [0025](0025-motion-belongs-to-the-frontend.md) | Text that moves is a property of a highlight group | Accepted |
 | [0026](0026-a-block-is-settled-once-it-cannot-change.md) | A markdown block is settled once it cannot change | Accepted |
+| [0027](0027-one-driver-for-every-agent-that-speaks-acp.md) | One driver for every agent that speaks ACP | Accepted |

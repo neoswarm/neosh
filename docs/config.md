@@ -327,7 +327,7 @@ setting.
 
 ### What the agent may do
 
-The footer says what the agent is allowed to do without asking, and `^Y` changes it:
+The footer says what the agent is allowed to do without asking, and `⇧⇥` changes it:
 
 | | |
 |---|---|
@@ -340,7 +340,7 @@ The footer says what the agent is allowed to do without asking, and `^Y` changes
 workspace is refused whatever the setting says: "full access" means not being asked, not reaching
 the rest of the disk.
 
-`^Y` opens a list rather than cycling, because full access is one keystroke from `ask` in any cycle
+`⇧⇥` opens a list rather than cycling, because full access is one keystroke from `ask` in any cycle
 and arriving there by holding a key down is exactly the accident worth designing against.
 `permission.cycle` is bound to nothing by default, for people who want it.
 
@@ -361,13 +361,23 @@ back-ticks. Settled blocks are drawn once and never touched again; only the trai
 is redrawn per tick. Re-parsing the whole answer on every token is quadratic in its length, and the
 place that would show is the tail of the long answer you actually care about.
 
-Two things are deliberately not done:
+Tables are laid out in columns, with alignment honoured and a rule under the labels rather than a
+box around everything — the job is separating the labels from the data, and a full grid spends four
+times the ink saying it. A table too wide to line up becomes one block per row instead:
 
-- **No syntax highlighting inside fences.** Doing it properly is a grammar per language; doing it
-  with a regex over keywords colours the wrong words in exactly the code you are reading closely. A
-  fence gets one colour and its language in the corner.
-- **No table layout.** Column widths depend on the terminal, the content and the wrap policy, and a
-  table that reflows badly is harder to read than the pipes it came from.
+```
+  Provider  Kind                 Key
+  ──────────────────────────────────
+  Claude    plan                none
+  OpenAI    api key  $OPENAI_API_KEY
+```
+
+Columns running off the right edge would mean guessing which value belongs to which label, which is
+worse than not having a table.
+
+One thing is deliberately not done: **no syntax highlighting inside fences**. Doing it properly is a
+grammar per language; doing it with a regex over keywords colours the wrong words in exactly the
+code you are reading closely. A fence gets one colour and its language in the corner.
 
 `chat.markdown = false` shows exactly what the model sent, which is what you want when the question
 is "what did it actually say".
@@ -534,9 +544,25 @@ one:
   complete. So a Codex turn shows its tool activity live and then its answer all at once. That is
   the CLI's shape, not a shortcut.
 
-Adding a third is a driver plus a line in the catalogue. `AuthRef::Cli { program, login }` is the
-whole contract: name the program, name the command that logs in, and the account split, the rail
-grouping and the "not installed — run this" message all follow.
+Three more come from one driver, because Cursor's `cursor-agent`, xAI's `grok` and Google's
+`gemini --experimental-acp` all speak the **Agent Client Protocol** — JSON-RPC over stdio. A fourth
+ACP agent is a line in the catalogue rather than a file of code.
+
+ACP has one limitation worth knowing before you pick one. An ACP agent asks its *client* for
+permission, which means neosh has to answer, and it currently answers from the permission mode
+alone: under **full access** it takes the agent's allow-once option, and under anything else it
+refuses and says so. Routing those prompts into the same approval you get for a built-in tool call
+is the next step and needs the request to travel out of the driver and an answer to travel back.
+Until then the behaviour is conservative and stated rather than quietly permissive.
+
+Adding a plan behind a CLI that speaks neither is a driver plus a line in the catalogue.
+`AuthRef::Cli { program, login }` is the whole contract: name the program, name the command that
+logs in, and the account split, the rail grouping and the "not installed — run this" message all
+follow.
+
+A provider whose CLI is not installed still lists what it offers, greyed out, with the command that
+would fix it at the top. What a provider serves is how you decide whether installing it is worth
+your afternoon, and an empty pane answers that with silence.
 
 ### API keys
 

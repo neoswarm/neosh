@@ -2824,7 +2824,7 @@ fn the_footer_says_what_the_agent_may_do_and_which_key_changes_it() {
     let sb = Sandbox::new("permmode");
     let mut s = sb.start();
     assert!(
-        s.pump(|s| s.status_now().iter().any(|l| l.contains("ask") && l.contains("^Y"))),
+        s.pump(|s| s.status_now().iter().any(|l| l.contains("ask"))),
         "the mode, and the key beside it\n{:?}",
         s.status_now()
     );

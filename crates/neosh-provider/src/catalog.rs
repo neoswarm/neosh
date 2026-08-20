@@ -349,6 +349,33 @@ pub fn codex_cli_models() -> Vec<ModelInfo> {
 }
 
 
+/// Models reachable through an ACP agent.
+///
+/// Written down rather than discovered, because ACP has no "list models" call: the agent tells you
+/// what it has in `session/new`, which is a poor place to be finding out. `session/set_model` is
+/// how one is chosen, and an agent that only has one simply refuses the call and carries on — so a
+/// wrong entry here degrades to "the agent used its default", not to an error.
+fn acp_models(entries: &[(&str, &str, ModelTier, &str)]) -> Vec<ModelInfo> {
+    entries
+        .iter()
+        .map(|(id, name, tier, tagline)| {
+            let mut m = ModelInfo::undescribed(*id, *name);
+            m.capabilities = ModelCapabilities {
+                tools: true,
+                vision: true,
+                streaming: true,
+                thinking: false,
+                prompt_caching: false,
+                option_descriptors: Vec::new(),
+            };
+            m.family = Some("agent".to_string());
+            m.tier = Some(*tier);
+            m.tagline = Some((*tagline).to_string());
+            m
+        })
+        .collect()
+}
+
 fn instance(
     id: &str,
     driver: &str,
@@ -398,7 +425,8 @@ fn brand_for(id: &str) -> Option<Brand> {
         "openrouter" => (None, "\u{2b21}", "R", "Brand.OpenRouter"),
         "groq" => (None, "\u{25b6}", "Q", "Brand.Groq"),
         "deepseek" => (None, "\u{25c9}", "D", "Brand.DeepSeek"),
-        "xai" => (Some("\u{f099}"), "\u{2715}", "X", "Brand.XAI"),
+        "grok-cli" | "xai" => (Some("\u{f099}"), "\u{2715}", "X", "Brand.XAI"),
+        "cursor-cli" => (None, "\u{25e9}", "C", "Brand.Cursor"),
         "mistral" => (None, "\u{25a4}", "M", "Brand.Mistral"),
         "together" => (None, "\u{2b1f}", "T", "Brand.Together"),
         "fireworks" => (None, "\u{2748}", "F", "Brand.Fireworks"),
@@ -424,6 +452,23 @@ pub fn builtin_instances() -> Vec<InstanceConfig> {
         // --- plans: a subscription you already pay for -----------------
         instance("claude-cli", "claude-cli", "Claude", None, cli("claude", "claude login"), claude_cli_models()),
         instance("codex-cli", "codex-cli", "Codex", None, cli("codex", "codex login"), codex_cli_models()),
+        // Everything below speaks the Agent Client Protocol, so they are one driver pointed at
+        // three programs. A fourth is a line here, not a file.
+        instance("cursor-cli", "cursor-cli", "Cursor", None, cli("cursor-agent", "cursor-agent login"), acp_models(&[
+            ("gpt-5.6-sol", "GPT-5.6 Sol", ModelTier::Frontier, "Frontier agentic coding"),
+            ("claude-opus-5", "Claude Opus 5", ModelTier::Frontier, "Most capable for complex work"),
+            ("claude-sonnet-5", "Claude Sonnet 5", ModelTier::Balanced, "Best for everyday tasks"),
+            ("composer-1", "Composer", ModelTier::Fast, "Cursor's own, tuned for speed"),
+        ])),
+        instance("grok-cli", "grok-cli", "Grok", None, cli("grok", "grok login"), acp_models(&[
+            ("grok-4.6", "Grok 4.6", ModelTier::Frontier, "Latest Grok"),
+            ("grok-4.5", "Grok 4.5", ModelTier::Balanced, "Previous generation"),
+        ])),
+        instance("gemini-cli", "gemini-cli", "Gemini", None, cli("gemini", "gemini auth login"), acp_models(&[
+            ("gemini-3.1-pro-preview", "Gemini 3.1 Pro", ModelTier::Frontier, "Most capable Gemini"),
+            ("gemini-3.7-flash", "Gemini 3.7 Flash", ModelTier::Balanced, "Quick, for everyday work"),
+            ("gemini-3.1-flash-lite", "Gemini 3.1 Flash Lite", ModelTier::Fast, "Cheapest and fastest"),
+        ])),
         // --- API keys: billed per token --------------------------------
         instance("anthropic", "anthropic", "Anthropic", Some("https://api.anthropic.com"), env("ANTHROPIC_API_KEY"), anthropic_models()),
         instance("google", "google", "Google Gemini", Some("https://generativelanguage.googleapis.com/v1beta"), env("GEMINI_API_KEY"), seed_models("google")),
@@ -540,7 +585,7 @@ mod tests {
         for inst in builtin_instances() {
             let kind = inst.auth.account_kind();
             match inst.id.as_ref() {
-                "claude-cli" | "codex-cli" => {
+                "claude-cli" | "codex-cli" | "cursor-cli" | "grok-cli" | "gemini-cli" => {
                     assert_eq!(kind, neosh_proto::AccountKind::Plan, "{}", inst.id)
                 }
                 "ollama" | "llamacpp" | "lmstudio" | "vllm" => {
