@@ -134,12 +134,40 @@ export function byteOffsets(s: string): number[] {
 // Transport
 // ---------------------------------------------------------------------------
 
-/** The two ops the host installs. Everything else is built on these. */
+/** The ops the host installs. Everything else is built on these. */
 interface CoreOps {
   op_neosh_send(msg: unknown): void;
   op_neosh_next(): Promise<unknown>;
+  op_neosh_width(text: string): number;
+  op_neosh_clip(text: string, columns: number): string;
 }
 declare const Deno: { core: { ops: CoreOps } };
+
+/**
+ * How many terminal columns a string occupies.
+ *
+ * Use this for any layout with a column in it. JavaScript offers `String.length` (UTF-16 units) and
+ * `Array.from(s).length` (code points), and both are wrong for the text a model produces: `"日本"`
+ * is 2 code points and **4** columns, `"👋🏽"` is 2 code points and **2**, `"é"` may be 2 code points
+ * and **1**. Padding with either draws a ragged rule the first time a CJK model name appears.
+ *
+ * Synchronous — it is an op, not a host call, so calling it per row costs nothing. It uses the same
+ * measurement the renderer does, so a plugin and the frontend agree by construction.
+ */
+export function width(text: string): number {
+  return Deno.core.ops.op_neosh_width(text);
+}
+
+/** Truncate to at most `columns` columns, cutting on a grapheme boundary rather than mid-character. */
+export function clipToWidth(text: string, columns: number): string {
+  return Deno.core.ops.op_neosh_clip(text, Math.max(0, Math.floor(columns)));
+}
+
+/** Pad on the right to exactly `columns`, clipping if it is already wider. */
+export function padToWidth(text: string, columns: number): string {
+  const clipped = clipToWidth(text, columns);
+  return clipped + " ".repeat(Math.max(0, columns - width(clipped)));
+}
 
 /** Thrown when the host refuses a call. Carries the structured reason. */
 export class NeoshError extends Error {

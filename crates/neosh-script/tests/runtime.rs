@@ -336,3 +336,68 @@ fn the_bundled_plugins_are_the_ones_we_expect() {
         assert!(names.contains(expected), "missing bundled plugin {expected}; have {names:?}");
     }
 }
+
+/// Width is not a character count, and a plugin laying out a column has to know that.
+///
+/// Driven through the runtime rather than by calling the Rust function, because what is being
+/// asserted is that a *plugin* can reach it synchronously: an async round trip per row would make a
+/// picker feel like a network service, which is the whole reason these are ops.
+///
+/// Every string is built from escapes rather than written literally, so the test cannot quietly
+/// depend on how this file happens to be Unicode-normalised on disk.
+#[tokio::test]
+async fn a_plugin_can_measure_and_clip_by_terminal_columns() {
+    let dir = workspace("width");
+    let url = write_plugin(
+        &dir,
+        r#"
+import { clipToWidth, padToWidth, width } from "@neosh/api";
+import type { PluginContext } from "@neosh/api";
+
+const CJK = "日本";        // two characters, four columns
+const EMOJI = "👋";      // one character, two columns, two UTF-16 units
+const ACCENT = "é";          // two code points, one column
+
+export async function activate(ctx: PluginContext): Promise<void> {
+    const show = (s: string) => `${width(s)}/${Array.from(s).length}`;
+    const buf = await ctx.neosh.buf.create({ name: "w" });
+    await ctx.neosh.buf.setLines(buf, 0, -1, [
+        [
+            `ascii=${show("abc")}`,
+            `cjk=${show(CJK)}`,
+            `emoji=${show(EMOJI)}`,
+            `accent=${show(ACCENT)}`,
+        ].join(" "),
+        `clip=${clipToWidth(CJK + "語", 4)}`,
+        `pad=[${padToWidth(CJK, 6)}]`,
+    ]);
+}
+"#,
+    );
+
+    let (rt, mut rx) = ScriptRuntime::spawn();
+    load(&rt, "w", url);
+    let (calls, error) = activate(&rt, &mut rx, "w", |c| match c {
+        ApiCall::BufCreate { .. } => ApiOk::Buf { buf: neosh_proto::BufferId(1) },
+        _ => ApiOk::Unit,
+    })
+    .await;
+    assert_eq!(error, None);
+
+    let lines = match &calls[1] {
+        ApiCall::BufSetLines { lines, .. } => lines.clone(),
+        other => panic!("expected buf_set_lines, got {other:?}"),
+    };
+    assert_eq!(
+        lines[0], "ascii=3/3 cjk=4/2 emoji=2/1 accent=1/2",
+        "columns and code points are different numbers, and only one of them lays out a column"
+    );
+    // Four columns is two CJK characters, not two and a half: clipping cuts on a grapheme boundary.
+    assert_eq!(lines[1], format!("clip={}", "\u{65e5}\u{672c}"));
+    assert_eq!(
+        lines[2],
+        format!("pad=[{}  ]", "\u{65e5}\u{672c}"),
+        "padding counts columns, not characters"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}

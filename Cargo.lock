@@ -2303,6 +2303,8 @@ dependencies = [
  "tokio",
  "toml",
  "tracing",
+ "unicode-segmentation",
+ "unicode-width",
  "url",
 ]
 
