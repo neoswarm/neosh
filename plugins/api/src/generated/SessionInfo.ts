@@ -6,6 +6,18 @@ import type { Usage } from "./Usage";
 export type SessionInfo = {
   id: SessionId;
   cwd: string;
+  /**
+   * What to call the directory this conversation is in.
+   *
+   * The last segment of the path is the obvious answer and is wrong for the case that matters:
+   * a worktree is named by whoever created it, and a list of projects reading `wt-fe3c0d93`
+   * tells you nothing about which repository or branch that is. A checkout is named by the
+   * repository it belongs to, and a linked worktree adds the branch — `neosh · fix/thing` —
+   * because that is what a person means when they say which one they are in.
+   *
+   * Computed by the host so every frontend and plugin agrees, the same as `label`.
+   */
+  project: string;
   message_count: number;
   active_turn?: TurnId | null;
   /**

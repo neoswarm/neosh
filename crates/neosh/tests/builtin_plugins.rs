@@ -573,6 +573,41 @@ fn d_on_a_model_the_provider_serves_explains_rather_than_deleting() {
     assert_eq!(s.picker_now(), before, "and nothing moved");
 }
 
+/// A picker says which keys it answers to.
+///
+/// Every one of them is a list you arrived at by pressing something, and none of them used to say
+/// what to press next — which makes a modal you have to guess your way out of.
+#[test]
+fn a_picker_says_how_to_use_it() {
+    let sb = Sandbox::new("pickerhints");
+    let mut s = sb.start();
+    s.wait_for("PROJECTS");
+    s.ctrl("k");
+    assert!(
+        s.pump(|s| s.picker_named("[Go to]").iter().any(|l| l.contains("choose"))),
+        "the key strip is there\n{:?}",
+        s.picker_named("[Go to]")
+    );
+    let rows = s.picker_named("[Go to]");
+    let strip = rows.iter().find(|l| l.contains("choose")).expect("found above");
+    assert!(strip.contains("close"), "and how to get out again: {strip:?}");
+}
+
+/// Written from the bindings, not from a string, so rebinding one does not make the strip a lie.
+#[test]
+fn the_key_strip_says_the_keys_that_are_actually_bound() {
+    let sb = Sandbox::new("pickerhintsbound");
+    sb.write_config("[options]\n\"ui.keys.accept\" = \"<C-y>\"\n");
+    let mut s = sb.start_letting_config_choose();
+    s.wait_for("PROJECTS");
+    s.ctrl("k");
+    assert!(
+        s.pump(|s| s.picker_named("[Go to]").iter().any(|l| l.contains("^y choose"))),
+        "the strip follows the setting\n{:?}",
+        s.picker_named("[Go to]")
+    );
+}
+
 #[test]
 fn a_picker_owns_its_navigation_keys_while_it_is_open() {
     // `<C-n>` is bound globally to "new conversation". A raw capture only receives keys that no
@@ -1723,16 +1758,9 @@ fn a_worktree_is_created_under_the_configured_root_and_you_land_in_it() {
     s.type_text("feat/thing");
     s.enter();
 
-    // The path it proposes says both halves of the layout: the repository, then the branch with
-    // its slash flattened, because a directory is a name and not a path.
+    // The layout says both halves: the repository, then the branch with its slash flattened,
+    // because a directory is a name and not a path.
     let want = format!("{}/work/feat-thing", root.display());
-    assert!(
-        s.pump(|s| s.prompt_now().iter().any(|l| l.contains(&want))),
-        "proposed {want}\n{:?}",
-        s.prompt_now()
-    );
-    s.enter();
-
     assert!(
         s.pump(|_| std::path::Path::new(&want).is_dir()),
         "the worktree is on disk at {want}"
@@ -1741,6 +1769,63 @@ fn a_worktree_is_created_under_the_configured_root_and_you_land_in_it() {
         s.pump(|s| s.chat_now().iter().any(|l| l.contains("feat-thing"))),
         "and the conversation is in it\n{:?}",
         s.chat_now()
+    );
+}
+
+/// A worktree is named by the repository it belongs to and the branch it is on, not by whatever
+/// the directory happens to be called.
+///
+/// The directory is named by whoever created it, which for a worktree made by another tool is a
+/// string like `wt-fe3c0d93`. A panel of those says nothing about which checkout is which, and
+/// reads as somebody else's directory having wandered into your workspace.
+#[test]
+fn a_worktree_is_listed_by_its_repository_and_branch() {
+    let sb = Sandbox::new("wtname");
+    sb.git_init();
+    let root = sb.root.join("trees");
+    sb.write_config(&format!("[options]\n\"worktree.root\" = \"{}\"\n", root.display()));
+    let mut s = sb.start_letting_config_choose();
+    s.wait_for("PROJECTS");
+    // The original checkout is just the repository — adding its branch would put a word that
+    // changes on every `git switch` beside a name that never does.
+    assert!(
+        s.pump(|s| s.sidebar_now().iter().any(|l| l.contains("work") && !l.contains('\u{b7}'))),
+        "the main checkout is named plainly\n{:?}",
+        s.sidebar_now()
+    );
+
+    s.send(&command_with("git.worktree.new", "sideline"));
+    assert!(
+        s.pump(|s| s.sidebar_now().iter().any(|l| l.contains("work \u{b7} sideline"))),
+        "and the worktree says which repository and which branch\n{:?}",
+        s.sidebar_now()
+    );
+}
+
+/// One question. The location is a setting; asking again is asking somebody to repeat themselves.
+#[test]
+fn making_a_worktree_asks_only_for_the_branch() {
+    let sb = Sandbox::new("wtoneq");
+    sb.git_init();
+    let root = sb.root.join("trees");
+    sb.write_config(&format!("[options]\n\"worktree.root\" = \"{}\"\n", root.display()));
+    let mut s = sb.start_letting_config_choose();
+    s.wait_for("PROJECTS");
+
+    s.send(&command("git.worktree.new"));
+    s.wait_for("Branch for the new worktree");
+    s.type_text("quick");
+    s.enter();
+
+    let want = format!("{}/work/quick", root.display());
+    assert!(
+        s.pump(|_| std::path::Path::new(&want).is_dir()),
+        "it went straight to {want} without a second prompt"
+    );
+    assert!(
+        s.prompt_now().is_empty() || !s.prompt_now().iter().any(|l| l.contains("Create worktree at")),
+        "nothing asked where\n{:?}",
+        s.prompt_now()
     );
 }
 
@@ -1760,9 +1845,8 @@ fn an_empty_worktree_root_puts_them_beside_the_repository() {
     s.enter();
     let want = format!("{}/work-worktrees/side", sb.root.display());
     assert!(
-        s.pump(|s| s.prompt_now().iter().any(|l| l.contains(&want))),
-        "proposed {want}\n{:?}",
-        s.prompt_now()
+        s.pump(|_| std::path::Path::new(&want).is_dir()),
+        "the worktree went beside the repository, at {want}"
     );
 }
 

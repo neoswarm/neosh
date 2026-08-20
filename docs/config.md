@@ -164,6 +164,14 @@ New conversation
 one answer and is not asked at all — `^N` stays a single key everywhere the choice would be
 theatre. `session.new.here` skips it unconditionally, for a key of your own.
 
+Choosing it asks one question — the branch. The location is a setting, and asking again would be
+asking somebody to repeat themselves; the message says where it landed. `git.worktree.new <branch>
+<path>` takes an explicit path for the times you want one.
+
+A worktree is listed by the repository it belongs to and the branch it is on — `neosh · fix/thing`
+— rather than by its directory name. The directory is named by whoever created it, and a panel of
+those says nothing about which checkout is which.
+
 New worktrees go under `worktree.root`, laid out as `<root>/<repo>/<branch>`:
 
 ```toml
@@ -252,7 +260,11 @@ timeoutlen = 500   # how long to wait for the rest of a sequence
 ```
 
 `^K` searches every command by name, and `F1` lists every binding — both read the live registry, so
-a plugin loaded five minutes ago is in them without anything having been written down.
+a plugin loaded five minutes ago is in them without anything having been written down. Every picker
+carries a strip along its foot saying what it answers to, written from the bindings rather than from
+a string, so rebinding `ui.keys.*` changes what the strip says rather than making it a lie.
+
+`AGENTS.md` at the root of the repository has the whole key table in one place.
 
 ### Adding a project
 
