@@ -31,3 +31,4 @@ implementation — and in two cases (0005, 0008) it did not, which is itself rec
 | [0023](0023-archive-not-delete.md) | Archiving is the everyday verb; deleting is the exception | Accepted |
 | [0024](0024-plans-and-keys-are-different-accounts.md) | A plan and an API key are different accounts | Accepted |
 | [0025](0025-motion-belongs-to-the-frontend.md) | Text that moves is a property of a highlight group | Accepted |
+| [0026](0026-a-block-is-settled-once-it-cannot-change.md) | A markdown block is settled once it cannot change | Accepted |

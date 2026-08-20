@@ -301,6 +301,30 @@ lowest priority is the one you would most want kept. Nothing is ever cut in half
 reads as a key that exists and does something else. `ui.hints = false` gives the row back to the
 transcript; the full list is on the help key either way.
 
+### How an answer is drawn
+
+Answers are rendered as markdown as they arrive: headings lose their hashes, `- ` becomes a bullet,
+fenced code is indented under its language, and `**bold**` / `*italic*` / `` `code` `` /
+`[text](url)` have their markers **removed** rather than shown. A terminal can draw bold; drawing
+the asterisks as well is showing the same thing twice.
+
+The rendering is incremental, and the rule is that a block is settled once it cannot change — a
+paragraph followed by a blank line, a heading with its newline, a fence with its closing
+back-ticks. Settled blocks are drawn once and never touched again; only the trailing partial block
+is redrawn per tick. Re-parsing the whole answer on every token is quadratic in its length, and the
+place that would show is the tail of the long answer you actually care about.
+
+Two things are deliberately not done:
+
+- **No syntax highlighting inside fences.** Doing it properly is a grammar per language; doing it
+  with a regex over keywords colours the wrong words in exactly the code you are reading closely. A
+  fence gets one colour and its language in the corner.
+- **No table layout.** Column widths depend on the terminal, the content and the wrap policy, and a
+  table that reflows badly is harder to read than the pipes it came from.
+
+`chat.markdown = false` shows exactly what the model sent, which is what you want when the question
+is "what did it actually say".
+
 ### Theme and motion
 
 ```toml
@@ -444,6 +468,29 @@ a knob gets a working picker for it with no change to the switcher.
 Switching between two models that share an option keeps your setting; switching to one without it
 drops the setting rather than sending a value the driver would reject.
 
+### Plans
+
+Two plans ship: `claude-cli` and `codex-cli`. Both are the vendor's own CLI, driven as a provider.
+Neither needs an API key, neither stores a token, and neither is offered unless the program is
+actually on your `$PATH` — a provider whose every turn would fail with "no such file" is worse than
+one that is not listed.
+
+They are **agent drivers**: `claude -p` and `codex exec` run their own loop, with their own tools,
+their own sandbox and their own approval policy. So neosh's tool registry is not in play on those
+turns and `tool.pre` hooks observe rather than gate. Two consequences worth knowing before you pick
+one:
+
+- Neither driver overrides the CLI's sandbox. If a turn stops to ask for approval it wants, the
+  place to change that is `codex`'s or `claude`'s configuration, not neosh's. Loosening somebody
+  else's security policy to make turns run more smoothly is not a decision a wrapper should make.
+- `codex exec --json` has no token deltas — the protocol reports an assistant message when it is
+  complete. So a Codex turn shows its tool activity live and then its answer all at once. That is
+  the CLI's shape, not a shortcut.
+
+Adding a third is a driver plus a line in the catalogue. `AuthRef::Cli { program, login }` is the
+whole contract: name the program, name the command that logs in, and the account split, the rail
+grouping and the "not installed — run this" message all follow.
+
 ### API keys
 
 Only for the **API KEYS** group. A plan signs itself in — if the Claude entries are missing, the
@@ -549,7 +596,8 @@ Unknown keys are an **error**, not ignored. A typo that is silently skipped look
 setting that does not work.
 
 `auth` names *where a key is*, never a key: `{ kind = "env", var = "…" }`,
-`{ kind = "command", argv = [...] }`, or `{ kind = "none" }` for a local endpoint that wants none.
+`{ kind = "command", argv = [...] }`, `{ kind = "cli", program = "codex", login = "codex login" }`
+for a plan behind a vendor CLI, or `{ kind = "none" }` for a local endpoint that wants none.
 Nothing writes a secret to this file, and nothing reads one from it.
 
 ## Options

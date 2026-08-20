@@ -1093,8 +1093,15 @@ impl Session {
     /// The sidebar buffer's current contents, folded the way a frontend folds splices.
     /// The lines of the model picker, whatever pane they belong to.
     fn picker_now(&self) -> Vec<String> {
-        let Some(buf) = self.buffer_named("[Model]") else { return Vec::new() };
-        self.lines_of(buf)
+        self.picker_named("[Model]")
+    }
+
+    /// The contents of a picker window, by the title it was opened with.
+    fn picker_named(&self, name: &str) -> Vec<String> {
+        match self.buffer_named(name) {
+            Some(buf) => self.lines_of(buf),
+            None => Vec::new(),
+        }
     }
 
     fn sidebar_now(&self) -> Vec<String> {
@@ -2537,3 +2544,162 @@ export async function activate({ neosh }: PluginContext) {
   neosh.notify("vault ready");
 }
 "#;
+
+
+/// A two-pane picker with a slow provider between two quick ones.
+///
+/// The shape of the bug this reproduces: holding a movement key starts one lookup per row it passes
+/// through, and they finish in whatever order the network allows.
+const SLOW_RAIL: &str = r#"
+import type { PluginContext } from "@neosh/api";
+import { railPicker } from "@neosh/api/ui";
+
+const after = (neosh: any, ms: number) =>
+  new Promise<void>((done) => neosh.timer.after(ms, () => done()));
+
+export async function activate({ neosh }: PluginContext) {
+  await neosh.cmd.register("slow.pick", async () => {
+    await railPicker<string, string>(neosh, {
+      title: "Slow",
+      rail: [
+        { label: "First", value: "first" },
+        { label: "Dawdler", value: "dawdler" },
+        { label: "Last", value: "last" },
+      ],
+      async items(which) {
+        if (which === "dawdler") {
+          await after(neosh, 600);
+          return [];
+        }
+        return [{ label: `${which} arrived`, value: which }];
+      },
+    });
+  });
+  neosh.notify("slow ready");
+}
+"#;
+
+#[test]
+fn a_slow_provider_cannot_clobber_the_one_you_moved_on_to() {
+    let sb = Sandbox::new("railrace");
+    let dir = sb.root.join("config/plugins/slowrail");
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    std::fs::write(
+        dir.join("plugin.toml"),
+        "name = \"slowrail\"\nversion = \"0.1.0\"\nentry = \"main.ts\"\n",
+    )
+    .expect("write manifest");
+    std::fs::write(dir.join("main.ts"), SLOW_RAIL).expect("write plugin");
+
+    let mut s = sb.start();
+    s.wait_for("slow ready");
+    s.send(&command("slow.pick"));
+    s.wait_for("first arrived");
+
+    // Two moves in a row, without waiting: straight through the slow one and out the other side,
+    // which is what holding a movement key does.
+    s.special("left");
+    s.special("down");
+    s.special("down");
+    assert!(
+        s.pump(|s| s.picker_named("[Slow]").iter().any(|l| l.contains("last arrived"))),
+        "the provider you ended on decides what is listed\n{:?}",
+        s.picker_named("[Slow]")
+    );
+
+    // And it stays that way once the one you passed through finally replies. Pumping keeps events
+    // flowing while that happens, which is what gives the late answer its chance to land.
+    let until = Instant::now() + Duration::from_millis(1200);
+    while Instant::now() < until {
+        s.pump(|_| false);
+    }
+    assert!(
+        s.picker_named("[Slow]").iter().any(|l| l.contains("last arrived")),
+        "a late answer to a question you have moved on from is dropped\n{:?}",
+        s.picker_named("[Slow]")
+    );
+}
+
+
+// ---------------------------------------------------------------------------
+// Markdown in the transcript
+// ---------------------------------------------------------------------------
+
+fn markdown_fixture() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/markdown_turn.jsonl")
+}
+
+#[test]
+fn an_answer_is_rendered_as_markdown_while_it_streams() {
+    // The fixture arrives three characters at a time, so what this checks is the incremental path:
+    // headings, lists and fences all have to survive being cut in half by a token boundary.
+    let sb = Sandbox::new("mdstream");
+    let mut s = sb.spawn(&markdown_fixture(), Some("mock/mock"));
+    s.wait_for("PROJECTS");
+    s.type_text("tell me");
+    s.enter();
+    assert!(
+        s.pump(|s| s.chat_now().iter().any(|l| l == "That is all.")),
+        "the answer finished\n{:?}",
+        s.chat_now()
+    );
+
+    let chat = s.chat_now();
+    let has = |needle: &str| chat.iter().any(|l| l == needle);
+    assert!(has("What I found"), "the heading lost its hashes\n{chat:?}");
+    assert!(has("  \u{2022} the rule is drawn above the composer"), "bullets and bold\n{chat:?}");
+    assert!(has("  \u{2022} ui.hints turns the row off"), "inline code\n{chat:?}");
+    assert!(has("  \u{2022} links like the docs keep their words"), "link labels\n{chat:?}");
+    assert!(has("  rust"), "the fence says what language it is\n{chat:?}");
+    assert!(has("  fn main() {"), "and its contents are indented\n{chat:?}");
+    assert!(
+        has("      // ## not a heading"),
+        "nothing inside a fence is markup\n{chat:?}"
+    );
+    assert!(
+        !chat.iter().any(|l| l.contains("```") || l.contains("**")),
+        "no markers survive into the transcript\n{chat:?}"
+    );
+}
+
+#[test]
+fn a_rendered_answer_looks_the_same_after_switching_away_and_back() {
+    // Two renderers is how a reopened conversation stops looking like the one you were just in.
+    let sb = Sandbox::new("mdreplay");
+    let mut s = sb.spawn(&markdown_fixture(), Some("mock/mock"));
+    s.wait_for("PROJECTS");
+    s.type_text("tell me");
+    s.enter();
+    assert!(s.pump(|s| s.chat_now().iter().any(|l| l == "That is all.")), "the answer finished");
+    let live: Vec<String> = s.chat_now().into_iter().filter(|l| !l.trim().is_empty()).collect();
+
+    s.send(&command("session.new"));
+    assert!(s.pump(|s| !s.chat_now().iter().any(|l| l == "That is all.")), "somewhere else now");
+    // Closing the empty one lands back in the conversation it was opened from.
+    s.send(&command("session.close"));
+    assert!(
+        s.pump(|s| s.chat_now().iter().any(|l| l == "That is all.")),
+        "and back\n{:?}",
+        s.chat_now()
+    );
+    let replayed: Vec<String> = s.chat_now().into_iter().filter(|l| !l.trim().is_empty()).collect();
+    assert!(
+        replayed.ends_with(&live[live.len().saturating_sub(6)..]),
+        "the replay ends the way the live stream did\nlive: {live:?}\nback: {replayed:?}"
+    );
+}
+
+#[test]
+fn markdown_can_be_turned_off_for_when_you_want_what_was_actually_sent() {
+    let sb = Sandbox::new("mdoff");
+    sb.write_config("[options]\n\"chat.markdown\" = false\n");
+    let mut s = sb.spawn(&markdown_fixture(), Some("mock/mock"));
+    s.wait_for("PROJECTS");
+    s.type_text("tell me");
+    s.enter();
+    assert!(
+        s.pump(|s| s.chat_now().iter().any(|l| l.contains("## What I found"))),
+        "the hashes are still there\n{:?}",
+        s.chat_now()
+    );
+}

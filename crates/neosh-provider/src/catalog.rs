@@ -307,6 +307,48 @@ pub fn merge(discovered: Vec<ModelInfo>, seeds: &[ModelInfo]) -> Vec<ModelInfo> 
 }
 
 
+/// Reasoning-effort levels `codex` accepts.
+///
+/// Its own ladder, not the API's: the CLI passes this straight through to `model_reasoning_effort`,
+/// and a level it does not recognise is a config error rather than a graceful downgrade.
+const EFFORT_CODEX: &[&str] = &["minimal", "low", "medium", "high", "xhigh"];
+
+/// Models reachable through the `codex` CLI.
+///
+/// Ids rather than aliases, because unlike `claude`, `codex` has no alias to pin: `-m` takes a
+/// slug. Written out with rungs so the ladder works here too — this is the same catalogue the CLI
+/// ships, reduced to the part a picker needs.
+pub fn codex_cli_models() -> Vec<ModelInfo> {
+    use ModelTier::{Balanced, Fast, Frontier};
+    [
+        ("gpt-5.6-sol", "GPT-5.6 Sol", "gpt-5.6", Frontier, "Frontier agentic coding", false),
+        ("gpt-5.6-terra", "GPT-5.6 Terra", "gpt-5.6", Balanced, "Balanced, for everyday work", false),
+        ("gpt-5.6-luna", "GPT-5.6 Luna", "gpt-5.6", Fast, "Fast and affordable", false),
+        ("gpt-5.5", "GPT-5.5", "gpt-5", Frontier, "Complex coding and long-running work", true),
+        ("gpt-5.4", "GPT-5.4", "gpt-5", Balanced, "Strong for everyday coding", true),
+        ("gpt-5.4-mini", "GPT-5.4 Mini", "gpt-5", Fast, "Small, quick, cheap", true),
+    ]
+    .into_iter()
+    .map(|(id, name, family, tier, tagline, legacy)| {
+        let mut m = ModelInfo::undescribed(id, name);
+        m.capabilities = ModelCapabilities {
+            tools: true,
+            vision: true,
+            streaming: true,
+            thinking: true,
+            prompt_caching: true,
+            option_descriptors: vec![effort(EFFORT_CODEX, "medium")],
+        };
+        m.family = Some(family.to_string());
+        m.tier = Some(tier);
+        m.tagline = Some(tagline.to_string());
+        m.legacy = legacy;
+        m
+    })
+    .collect()
+}
+
+
 fn instance(
     id: &str,
     driver: &str,
@@ -381,6 +423,7 @@ pub fn builtin_instances() -> Vec<InstanceConfig> {
     vec![
         // --- plans: a subscription you already pay for -----------------
         instance("claude-cli", "claude-cli", "Claude", None, cli("claude", "claude login"), claude_cli_models()),
+        instance("codex-cli", "codex-cli", "Codex", None, cli("codex", "codex login"), codex_cli_models()),
         // --- API keys: billed per token --------------------------------
         instance("anthropic", "anthropic", "Anthropic", Some("https://api.anthropic.com"), env("ANTHROPIC_API_KEY"), anthropic_models()),
         instance("google", "google", "Google Gemini", Some("https://generativelanguage.googleapis.com/v1beta"), env("GEMINI_API_KEY"), seed_models("google")),
@@ -497,7 +540,9 @@ mod tests {
         for inst in builtin_instances() {
             let kind = inst.auth.account_kind();
             match inst.id.as_ref() {
-                "claude-cli" => assert_eq!(kind, neosh_proto::AccountKind::Plan, "{}", inst.id),
+                "claude-cli" | "codex-cli" => {
+                    assert_eq!(kind, neosh_proto::AccountKind::Plan, "{}", inst.id)
+                }
                 "ollama" | "llamacpp" | "lmstudio" | "vllm" => {
                     assert_eq!(kind, neosh_proto::AccountKind::Local, "{}", inst.id)
                 }

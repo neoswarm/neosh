@@ -126,6 +126,11 @@ fn italic(mut s: HighlightSpec) -> HighlightSpec {
     s
 }
 
+fn underline(mut s: HighlightSpec) -> HighlightSpec {
+    s.attrs.underline = true;
+    s
+}
+
 fn shimmer(mut s: HighlightSpec, period_ms: u32) -> HighlightSpec {
     s.animate = Some(neosh_proto::Animation::Shimmer { period_ms });
     s
@@ -182,6 +187,20 @@ pub fn groups(variant: Variant) -> Vec<(&'static str, HighlightDef)> {
         ("Agent.Tool", spec(fg(r.active))),
         ("Agent.ToolError", spec(bold(fg(r.danger)))),
         ("Agent.Usage", spec(dim(fg(r.muted)))),
+        // ---- markdown -----------------------------------------------------
+        // An answer is prose with structure in it, and the structure should be visible without
+        // being loud: the thing being read is the words. Hence one accent for headings and links,
+        // one quiet colour for code, and attributes rather than colour for emphasis — a paragraph
+        // where three words are a different hue is harder to read than one where they are bold.
+        ("Markdown.Heading", spec(bold(fg(r.accent)))),
+        ("Markdown.Bold", spec(bold(fg(r.fg)))),
+        ("Markdown.Italic", spec(italic(fg(r.fg)))),
+        ("Markdown.Code", spec(fg(r.active))),
+        ("Markdown.Fence", spec(dim(fg(r.muted)))),
+        ("Markdown.Bullet", spec(fg(r.accent))),
+        ("Markdown.Quote", spec(dim(fg(r.faint)))),
+        ("Markdown.Rule", link("Separator")),
+        ("Markdown.Link", spec(underline(fg(r.accent)))),
         // ---- conversation state -------------------------------------------
         // One hue per meaning: in motion, act now, broken, done.
         ("Status.Working", spec(fg(r.active))),

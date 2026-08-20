@@ -1359,9 +1359,19 @@ export async function railPicker<G, T>(
     cursor = Math.min(cursor, Math.max(0, rows.length - 1));
   };
 
+  // Bumped on every rail move, so a slow load cannot land after a faster one that came later.
+  let generation = 0;
+
   const load = async () => {
+    const mine = ++generation;
     const entry = railRows[railAt];
-    all = entry?.kind === "entry" ? await opts.items(entry.item.value).catch(() => []) : [];
+    const got = entry?.kind === "entry" ? await opts.items(entry.item.value).catch(() => []) : [];
+    // Holding a movement key starts one load per row, and they finish in whatever order the
+    // network allows — so the last *answer* is routinely not the last *question*. Without this,
+    // pressing down eight times lands you on a provider showing the empty list of a provider you
+    // passed through on the way, which reads as "this one has no models".
+    if (mine !== generation) return;
+    all = got;
     rebuild();
     cursor = Math.max(0, Math.min(opts.itemAt?.(all) ?? 0, Math.max(0, rows.length - 1)));
     // Land on something selectable rather than on a section header.

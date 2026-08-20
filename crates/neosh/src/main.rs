@@ -9,6 +9,7 @@ use neosh_proto::{InputEvent, ModelId};
 use neosh_provider::ProviderRegistry;
 use neosh_script::ScriptRuntime;
 
+mod markdown;
 mod bridge;
 mod config;
 mod frontend;

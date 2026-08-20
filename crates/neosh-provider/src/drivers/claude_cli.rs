@@ -86,7 +86,11 @@ impl ClaudeCliProvider {
     }
 }
 
-fn which(program: &str) -> Option<std::path::PathBuf> {
+/// Where a program is on `PATH`, or nothing.
+///
+/// Shared with the other CLI-backed drivers: whether a vendor CLI is installed is the same
+/// question every one of them has to answer before it can be offered.
+pub(crate) fn which(program: &str) -> Option<std::path::PathBuf> {
     if program.contains(std::path::MAIN_SEPARATOR) {
         let p = std::path::PathBuf::from(program);
         return p.is_file().then_some(p);

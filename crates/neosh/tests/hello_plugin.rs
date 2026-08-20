@@ -223,22 +223,28 @@ fn hello_plugin_satisfies_the_phase_0_definition_of_done() {
     // closes between tokens and three frames is the correct answer. The merge itself is asserted in
     // `neosh-core/tests/coalescing.rs`, where it is deterministic. Here we check the half that
     // cannot flap: nothing is duplicated, and the finished line arrives.
-    let appends: Vec<_> = s
-        .events
-        .iter()
-        .filter(|e| e["type"] == "buffer_lines")
-        .filter_map(|e| e["lines"][0]["text"].as_str())
-        .filter(|t| t.starts_with("All"))
-        .collect();
+    //
+    // Counted **per buffer**. Two of them carry this text — the transcript, and the plugin's own
+    // `[hello-stream]` — and adding them together measures nothing: it says three tokens produced
+    // six frames when each buffer saw three, which is exactly right.
+    let mut per_buffer: std::collections::BTreeMap<u64, Vec<&str>> = Default::default();
+    for e in s.events.iter().filter(|e| e["type"] == "buffer_lines") {
+        let Some(text) = e["lines"][0]["text"].as_str() else { continue };
+        if !text.starts_with("All") {
+            continue;
+        }
+        per_buffer.entry(e["buf"].as_u64().unwrap_or_default()).or_default().push(text);
+    }
     assert!(
-        appends.contains(&"All done."),
-        "the finished assistant line should reach the frontend: {appends:?}"
+        per_buffer.values().any(|v| v.contains(&"All done.")),
+        "the finished assistant line should reach the frontend: {per_buffer:?}"
     );
-    assert!(
-        appends.len() <= 3,
-        "a frontend must never see more frames than there were tokens, saw {}: {appends:?}",
-        appends.len()
-    );
+    for (buf, frames) in &per_buffer {
+        assert!(
+            frames.len() <= 3,
+            "buffer {buf} saw more frames than there were tokens: {frames:?}"
+        );
+    }
 }
 
 fn contains(events: &[Value], needle: &str) -> bool {

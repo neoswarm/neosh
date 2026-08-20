@@ -1,0 +1,84 @@
+{"type": "message_start", "model": "mock", "usage": {}}
+{"type": "block_start", "index": 0, "block": {"kind": "text"}}
+{"type": "text_delta", "index": 0, "text": "## "}
+{"type": "text_delta", "index": 0, "text": "Wha"}
+{"type": "text_delta", "index": 0, "text": "t I"}
+{"type": "text_delta", "index": 0, "text": " fo"}
+{"type": "text_delta", "index": 0, "text": "und"}
+{"type": "text_delta", "index": 0, "text": "\n\nT"}
+{"type": "text_delta", "index": 0, "text": "hre"}
+{"type": "text_delta", "index": 0, "text": "e t"}
+{"type": "text_delta", "index": 0, "text": "hin"}
+{"type": "text_delta", "index": 0, "text": "gs:"}
+{"type": "text_delta", "index": 0, "text": "\n\n-"}
+{"type": "text_delta", "index": 0, "text": " th"}
+{"type": "text_delta", "index": 0, "text": "e *"}
+{"type": "text_delta", "index": 0, "text": "*ru"}
+{"type": "text_delta", "index": 0, "text": "le*"}
+{"type": "text_delta", "index": 0, "text": "* i"}
+{"type": "text_delta", "index": 0, "text": "s d"}
+{"type": "text_delta", "index": 0, "text": "raw"}
+{"type": "text_delta", "index": 0, "text": "n a"}
+{"type": "text_delta", "index": 0, "text": "bov"}
+{"type": "text_delta", "index": 0, "text": "e t"}
+{"type": "text_delta", "index": 0, "text": "he "}
+{"type": "text_delta", "index": 0, "text": "com"}
+{"type": "text_delta", "index": 0, "text": "pos"}
+{"type": "text_delta", "index": 0, "text": "er\n"}
+{"type": "text_delta", "index": 0, "text": "- `"}
+{"type": "text_delta", "index": 0, "text": "ui."}
+{"type": "text_delta", "index": 0, "text": "hin"}
+{"type": "text_delta", "index": 0, "text": "ts`"}
+{"type": "text_delta", "index": 0, "text": " tu"}
+{"type": "text_delta", "index": 0, "text": "rns"}
+{"type": "text_delta", "index": 0, "text": " th"}
+{"type": "text_delta", "index": 0, "text": "e r"}
+{"type": "text_delta", "index": 0, "text": "ow "}
+{"type": "text_delta", "index": 0, "text": "off"}
+{"type": "text_delta", "index": 0, "text": "\n- "}
+{"type": "text_delta", "index": 0, "text": "lin"}
+{"type": "text_delta", "index": 0, "text": "ks "}
+{"type": "text_delta", "index": 0, "text": "lik"}
+{"type": "text_delta", "index": 0, "text": "e ["}
+{"type": "text_delta", "index": 0, "text": "the"}
+{"type": "text_delta", "index": 0, "text": " do"}
+{"type": "text_delta", "index": 0, "text": "cs]"}
+{"type": "text_delta", "index": 0, "text": "(ht"}
+{"type": "text_delta", "index": 0, "text": "tps"}
+{"type": "text_delta", "index": 0, "text": "://"}
+{"type": "text_delta", "index": 0, "text": "exa"}
+{"type": "text_delta", "index": 0, "text": "mpl"}
+{"type": "text_delta", "index": 0, "text": "e.i"}
+{"type": "text_delta", "index": 0, "text": "nva"}
+{"type": "text_delta", "index": 0, "text": "lid"}
+{"type": "text_delta", "index": 0, "text": ") k"}
+{"type": "text_delta", "index": 0, "text": "eep"}
+{"type": "text_delta", "index": 0, "text": " th"}
+{"type": "text_delta", "index": 0, "text": "eir"}
+{"type": "text_delta", "index": 0, "text": " wo"}
+{"type": "text_delta", "index": 0, "text": "rds"}
+{"type": "text_delta", "index": 0, "text": "\n\n`"}
+{"type": "text_delta", "index": 0, "text": "``r"}
+{"type": "text_delta", "index": 0, "text": "ust"}
+{"type": "text_delta", "index": 0, "text": "\nfn"}
+{"type": "text_delta", "index": 0, "text": " ma"}
+{"type": "text_delta", "index": 0, "text": "in("}
+{"type": "text_delta", "index": 0, "text": ") {"}
+{"type": "text_delta", "index": 0, "text": "\n  "}
+{"type": "text_delta", "index": 0, "text": "  /"}
+{"type": "text_delta", "index": 0, "text": "/ #"}
+{"type": "text_delta", "index": 0, "text": "# n"}
+{"type": "text_delta", "index": 0, "text": "ot "}
+{"type": "text_delta", "index": 0, "text": "a h"}
+{"type": "text_delta", "index": 0, "text": "ead"}
+{"type": "text_delta", "index": 0, "text": "ing"}
+{"type": "text_delta", "index": 0, "text": "\n}\n"}
+{"type": "text_delta", "index": 0, "text": "```"}
+{"type": "text_delta", "index": 0, "text": "\n\nT"}
+{"type": "text_delta", "index": 0, "text": "hat"}
+{"type": "text_delta", "index": 0, "text": " is"}
+{"type": "text_delta", "index": 0, "text": " al"}
+{"type": "text_delta", "index": 0, "text": "l.\n"}
+{"type": "block_stop", "index": 0}
+{"type": "message_delta", "stop_reason": {"kind": "end_turn"}, "usage": {"output_tokens": 3}}
+{"type": "message_stop"}

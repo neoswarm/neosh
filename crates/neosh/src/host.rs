@@ -53,6 +53,19 @@ enum Stream {
     Thinking,
 }
 
+/// One answer being written into the transcript.
+///
+/// The rows it occupies are `start .. start + rows`, and nothing else ever writes inside that
+/// range: everything appends after it, and the working line is gone by the time the first token
+/// arrives. That is what lets a patch be applied as a range replacement rather than by finding the
+/// text again — which is the same reasoning as the working line having no row index, arrived at the
+/// other way round.
+struct Answer {
+    md: crate::markdown::Md,
+    start: u32,
+    rows: u32,
+}
+
 /// Startup, as a state machine.
 ///
 /// Config runs before plugin discovery, so `init.ts` gets to decide what else loads — the same
@@ -185,6 +198,8 @@ pub struct Host {
     reading: bool,
     /// Set while output is streaming, so chunks append rather than starting a new line.
     streaming: Option<Stream>,
+    /// The answer currently being written, and where it sits in the transcript.
+    answer: Option<Answer>,
     startup: Startup,
     /// Set by the `quit` command; the run loop notices and shuts down cleanly.
     quitting: bool,
@@ -377,6 +392,7 @@ impl Host {
             keys_touched: false,
             reading: false,
             streaming: None,
+            answer: None,
             startup: Startup::default(),
             quitting: false,
             quit_armed: None,
@@ -1758,6 +1774,9 @@ impl Host {
     /// the truth, and a switch that reconstructed the buffer from a log of edits would drift the
     /// moment anything else touched it.
     fn enter_session(&mut self) {
+        // Not closed: the buffer is about to be replaced wholesale, so settling an answer into rows
+        // that are on their way out would write into the conversation being left behind.
+        self.answer = None;
         self.streaming = None;
         self.chat_top = 0;
         let ascii = self.option_bool("ui.ascii_only");
@@ -1808,6 +1827,9 @@ impl Host {
     /// so anything that has already happened belongs above it — a tool card appended underneath
     /// would leave the spinner stranded in the middle of the turn it is reporting on.
     fn chat_push(&mut self, lines: Vec<String>) -> u32 {
+        // Anything else writing into the transcript ends the answer: its rows are addressed by
+        // range, and something landing after them would make "the end of the answer" ambiguous.
+        self.close_answer();
         let plugin = PluginId::from(BUILTIN);
         let at = self.chat_end();
         let _ = self.editor.apply(&plugin, ApiCall::BufSetLines {
@@ -1842,6 +1864,101 @@ impl Host {
                 priority: 0,
             },
         });
+    }
+
+    /// Put the next piece of an answer into the transcript.
+    ///
+    /// Markdown is rendered as it arrives rather than after the fact, and the cost of that is a
+    /// range replacement of the trailing block per tick instead of an append. Bounded by the size
+    /// of one block, not by the size of the answer — see [`crate::markdown`] for why that
+    /// distinction is the whole design.
+    ///
+    /// With `chat.markdown` off this is the old append: text goes in exactly as it came out, which
+    /// is what you want when the question is "what did the model actually say".
+    fn answer_text(&mut self, text: &str) {
+        let plugin = PluginId::from(BUILTIN);
+        if !self.option_bool("chat.markdown") {
+            if self.streaming != Some(Stream::Text) {
+                self.open_answer_row();
+                self.streaming = Some(Stream::Text);
+            }
+            let _ = self
+                .editor
+                .apply(&plugin, ApiCall::BufAppendText { buf: self.chat, text: text.into() });
+            return;
+        }
+
+        if self.answer.is_none() {
+            let start = self.open_answer_row();
+            self.answer = Some(Answer { md: crate::markdown::Md::new(), start, rows: 1 });
+        }
+        let Some(mut a) = self.answer.take() else { return };
+        let patch = a.md.push(text);
+        self.apply_patch(&mut a, patch);
+        self.answer = Some(a);
+    }
+
+    /// The answer is over: settle its last block and stop treating the tail as provisional.
+    fn close_answer(&mut self) {
+        let Some(mut a) = self.answer.take() else { return };
+        let patch = a.md.finish();
+        self.apply_patch(&mut a, patch);
+        self.streaming = None;
+    }
+
+    /// Open the row an answer starts on, after a blank line separating it from what came before.
+    ///
+    /// The working line goes first, and it has to: it is the last line of the transcript, and this
+    /// writes at the end.
+    fn open_answer_row(&mut self) -> u32 {
+        self.end_working();
+        let n = self.editor.buffer(self.chat).map(|b| b.line_count() as i64).unwrap_or(0);
+        let _ = self.editor.apply(&PluginId::from(BUILTIN), ApiCall::BufSetLines {
+            buf: self.chat,
+            start: n,
+            end: n,
+            lines: vec![String::new()],
+        });
+        n.max(0) as u32
+    }
+
+    /// Replace the unsettled tail of an answer with its freshly rendered form.
+    fn apply_patch(&mut self, a: &mut Answer, patch: crate::markdown::Patch) {
+        let at = a.start + patch.from as u32;
+        let end = a.start + a.rows;
+        let rows = patch.lines.len();
+        let plugin = PluginId::from(BUILTIN);
+        // Settling a block that was already drawn correctly renders the same rows again. Writing
+        // them costs a frame on the wire and changes nothing on screen, which is the definition of
+        // a wasted frame — and `finish` does exactly this at the end of every answer.
+        let unchanged = self
+            .editor
+            .buffer(self.chat)
+            .map(|b| b.get_lines(at, end.max(at)) == patch.lines)
+            .unwrap_or(false);
+        if unchanged {
+            a.rows = patch.from as u32 + rows as u32;
+            return;
+        }
+        // Marks go with the rows they were on. Left behind, a mark from the previous render of the
+        // trailing block would clamp onto whatever replaced it — which is how a half-written bold
+        // run ends up colouring the wrong words for the rest of the answer.
+        let _ = self.editor.apply(&plugin, ApiCall::MarkClear {
+            ns: self.chat_ns,
+            buf: self.chat,
+            start: Some(at),
+            end: Some(end.max(at)),
+        });
+        let _ = self.editor.apply(&plugin, ApiCall::BufSetLines {
+            buf: self.chat,
+            start: at as i64,
+            end: end.max(at) as i64,
+            lines: patch.lines,
+        });
+        for (row, from, to, hl) in patch.marks {
+            self.chat_mark(at + row as u32, from, to, hl);
+        }
+        a.rows = patch.from as u32 + rows as u32;
     }
 
     /// Draw a question the way a transcript should: framed, so the eye can find where a turn began.
@@ -1952,6 +2069,7 @@ impl Host {
     fn stream_into_chat(&mut self, kind: Stream, text: &str) {
         let plugin = PluginId::from(BUILTIN);
         if self.streaming != Some(kind) {
+            self.close_answer();
             // Text is appended to the buffer's *last* line, so the working line has to stop being
             // it before anything streams. This is the one rule that keeps the invariant true.
             self.end_working();
@@ -1976,32 +2094,7 @@ impl Host {
                 self.bridge.broadcast(PluginEvent::TurnStarted { turn });
             }
             AgentEvent::Token { turn, text } => {
-                let plugin = PluginId::from(BUILTIN);
-                // The first token is the answer arriving, so the "still working" line goes. It is
-                // the *first* one specifically: leaving it above the answer would say a turn is in
-                // flight while you are reading its result.
-                if self.streaming != Some(Stream::Text) {
-                    // The first token is the answer arriving, so the working line goes. It has to
-                    // go *before* the append, because appending targets the last line and the
-                    // working line is it.
-                    self.end_working();
-                    let n = self
-                        .editor
-                        .buffer(self.chat)
-                        .map(|b| b.line_count() as i64)
-                        .unwrap_or(0);
-                    let _ = self.editor.apply(&plugin, ApiCall::BufSetLines {
-                        buf: self.chat,
-                        start: n,
-                        end: n,
-                        lines: vec![String::new()],
-                    });
-                    self.streaming = Some(Stream::Text);
-                }
-                // Append rather than rewrite: the whole point of the streaming fast path.
-                let _ = self
-                    .editor
-                    .apply(&plugin, ApiCall::BufAppendText { buf: self.chat, text: text.clone() });
+                self.answer_text(&text);
                 self.bridge.broadcast(PluginEvent::Token { turn, text });
             }
             AgentEvent::Thinking { turn, text } => {
@@ -2047,6 +2140,7 @@ impl Host {
                 self.bridge.broadcast(PluginEvent::ToolFinished { turn, call, result });
             }
             AgentEvent::TurnEnded { turn, stop_reason, usage } => {
+                self.close_answer();
                 self.end_working();
                 self.active_turn = None;
                 {
@@ -2771,6 +2865,16 @@ impl Host {
                 description: Some("Replaces the built-in system prompt when set.".into()),
             },
             OptionSpec {
+                name: "chat.markdown".into(),
+                ty: OptionType::Bool,
+                default: OptionValue::Bool(true),
+                description: Some(
+                    "Render answers as markdown: headings, lists, code blocks, and inline \
+                     emphasis with its markers removed. Off shows exactly what the model sent."
+                        .into(),
+                ),
+            },
+            OptionSpec {
                 name: "chat.show_thinking".into(),
                 ty: OptionType::Bool,
                 default: OptionValue::Bool(false),
@@ -3263,9 +3367,13 @@ pub fn install_builtin_providers(agent: &Agent) {
         // "no such file", on the one path that is supposed to work with no setup at all. The
         // instance stays configured either way, so a settings list can say the driver is missing
         // rather than the provider simply not existing.
-        let cli = neosh_provider::drivers::ClaudeCliProvider::default();
-        if cli.available() {
-            reg.register_driver(Arc::new(cli));
+        let claude = neosh_provider::drivers::ClaudeCliProvider::default();
+        if claude.available() {
+            reg.register_driver(Arc::new(claude));
+        }
+        let codex = neosh_provider::drivers::CodexCliProvider::default();
+        if codex.available() {
+            reg.register_driver(Arc::new(codex));
         }
         for i in catalog::builtin_instances() {
             reg.add_instance(i);
@@ -3340,7 +3448,12 @@ fn transcript(session: &neosh_agent::Session, ascii: bool) -> (Vec<String>, Vec<
                     lines.push(String::new());
                 }
                 ContentBlock::Text { text } => {
-                    lines.extend(text.lines().map(str::to_string));
+                    // Through the same renderer the live stream uses, so switching away and back
+                    // does not change what an answer looks like.
+                    let at = lines.len() as u32;
+                    let (rendered, styled) = crate::markdown::render(text);
+                    marks.extend(styled.into_iter().map(|(r, a, b, g)| (at + r as u32, a, b, g)));
+                    lines.extend(rendered);
                     lines.push(String::new());
                 }
                 ContentBlock::ToolUse { name, input, .. } => {

@@ -34,7 +34,7 @@ def main():
     ap.add_argument("--wait", type=int, default=1500, help="ms to settle after boot")
     ap.add_argument("--after", type=int, default=700, help="ms to settle after the last key")
     ap.add_argument("--cmd", default="./target/debug/neosh")
-    ap.add_argument("--arg", action="append", default=[])
+    ap.add_argument("--arg", action="append", default=[], nargs="?", const="")
     ap.add_argument("keys", nargs="*")
     a = ap.parse_args()
 
