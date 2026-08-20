@@ -98,8 +98,20 @@ impl ProviderRegistry {
     /// Preference order is described on [`default_selection`](Self::default_selection). The catalog arranges so that
     /// a zero-configuration install lands on a driver that needs no API key.
     /// Instances whose credentials are present, so a first run picks something that will work.
+    ///
+    /// Asks the credential store rather than the [`AuthRef`](neosh_proto::AuthRef) alone: a key you
+    /// typed in last week and a key in `$ANTHROPIC_API_KEY` are equally present, and an instance
+    /// that only looked unusable because the environment was empty should stop looking unusable the
+    /// moment you sign in.
     pub fn ready_instances(&self) -> impl Iterator<Item = &InstanceConfig> {
-        self.usable_instances().filter(|c| c.auth.is_available())
+        let store = crate::credentials::credentials();
+        self.usable_instances().filter(move |c| store.source(c).is_usable())
+    }
+
+    /// Every instance with the state of its credential, for a settings list.
+    pub fn credentials(&self) -> Vec<neosh_proto::CredentialInfo> {
+        crate::credentials::credentials()
+            .survey(self.instances(), |c| self.drivers.contains_key(&c.driver))
     }
 
     /// What to use when nothing has been chosen.

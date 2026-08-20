@@ -102,7 +102,7 @@ impl Provider for GoogleProvider {
     }
 
     async fn list_models(&self, instance: &InstanceConfig) -> Result<Vec<ModelInfo>, ProviderError> {
-        let Some(key) = resolve_auth(&instance.auth)? else {
+        let Some(key) = resolve_auth(instance)? else {
             return Ok(instance.models.clone());
         };
         let resp = http::client()
@@ -164,11 +164,11 @@ impl Provider for GoogleProvider {
     ) -> ProviderStream {
         let (tx, rx) = mpsc::channel::<ProviderEvent>(256);
         let base = Self::base(instance);
-        let auth = instance.auth.clone();
+        let config = instance.clone();
         let model = request.selection.model.0.clone();
 
         tokio::spawn(async move {
-            let key = match resolve_auth(&auth) {
+            let key = match resolve_auth(&config) {
                 Ok(Some(k)) => k,
                 Ok(None) => {
                     let _ = tx

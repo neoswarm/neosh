@@ -19,7 +19,8 @@ use crate::ids::{
 };
 use crate::options::{OptionEntry, OptionSpec, OptionValue};
 use crate::provider::{
-    DriverKind, InstanceConfig, InstanceId, ModelEntry, ModelSelection, ProviderEvent,
+    CredentialInfo, DriverKind, InstanceConfig, InstanceId, ModelEntry, ModelSelection,
+    ProviderEvent,
 };
 use crate::ui::{
     CursorMotion, ExtmarkInfo, ExtmarkOpts, FloatConfig, HighlightDef, KeyPress, MessageLevel,
@@ -332,10 +333,37 @@ pub enum ApiCall {
     },
     AgentListInstances,
 
+    // ---- credentials ---------------------------------------------------
+    // Three verbs, and *none of them carries a key*. Listing reports where a key comes from, never
+    // what it is; setting one hands the job to the host, which reads the keystrokes itself and puts
+    // the value straight into a secret store. Nothing a plugin can call returns a secret, so no
+    // plugin can leak one — which is a property of the protocol rather than of plugin authors
+    // being careful.
+    ProviderCredentials,
+    /// Ask the host to collect a key for `instance` from the keyboard.
+    ///
+    /// The host owns this prompt because a plugin one would put the key in a buffer, and a buffer
+    /// is drawn — the value would cross the frontend boundary in a `UiEvent` and land in whatever
+    /// the frontend logs. Answered when the prompt closes: `true` if a key was stored.
+    ProviderSetCredential {
+        instance: InstanceId,
+        /// Overwrite a key that is already there without asking. Off by default.
+        #[serde(default)]
+        replace: bool,
+    },
+    ProviderForgetCredential {
+        instance: InstanceId,
+    },
+
     // ---- sessions ------------------------------------------------------
     // A workspace is not one conversation. These are the verbs a thread list needs; what it looks
     // like is a plugin's business.
-    SessionList,
+    SessionList {
+        /// Include conversations that have been put away. Off by default, so every existing caller
+        /// keeps showing the list the user actually works in.
+        #[serde(default)]
+        include_archived: bool,
+    },
     SessionCurrent,
     /// Start a conversation. `cwd` defaults to the one neosh was started in, so opening a session
     /// in another checkout is one argument rather than another process.
@@ -360,6 +388,16 @@ pub enum ApiCall {
         session: SessionId,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         title: Option<String>,
+    },
+    /// Put a conversation away, or bring it back.
+    ///
+    /// Distinct from [`SessionClose`](Self::SessionClose), which deletes the file. Archiving the
+    /// active conversation moves you to the most recently used other one, exactly as closing does,
+    /// because there is always somewhere for the next thing you type.
+    SessionArchive {
+        session: SessionId,
+        #[serde(default = "yes")]
+        archived: bool,
     },
     /// The conversation itself, for a transcript view that wants to render it rather than replay
     /// the UI events that built it.
@@ -589,6 +627,7 @@ pub enum ApiCall {
 #[ts(export)]
 pub enum ApiOk {
     Unit,
+    Bool { value: bool },
     Buf { buf: BufferId },
     Win { win: WindowId },
     Ns { ns: NamespaceId },
@@ -614,6 +653,7 @@ pub enum ApiOk {
     /// `None` until the frontend has drawn the window at least once.
     Viewport { viewport: Option<Viewport> },
     Sessions { sessions: Vec<SessionInfo> },
+    Credentials { credentials: Vec<CredentialInfo> },
     Session { session: SessionInfo },
     Messages { messages: Vec<Message> },
     // ---- version control ----

@@ -20,6 +20,7 @@
 //! than pretending the two kinds are interchangeable.
 
 pub mod catalog;
+pub mod credentials;
 pub mod drivers;
 pub mod registry;
 pub mod sse;
@@ -80,19 +81,13 @@ pub trait Provider: Send + Sync {
     ) -> ProviderStream;
 }
 
-/// Resolve a secret from the environment.
+/// Resolve the key for an instance, from wherever it lives.
 ///
 /// Secrets are read at request time and never stored in a type that crosses a process boundary, is
 /// serialized, or is `Debug`-printed. [`secrecy::SecretString`] makes the last one structural
-/// rather than a review checklist item.
-pub fn resolve_auth(auth: &neosh_proto::AuthRef) -> Result<Option<secrecy::SecretString>, ProviderError> {
-    match auth {
-        neosh_proto::AuthRef::None | neosh_proto::AuthRef::Inherited => Ok(None),
-        neosh_proto::AuthRef::Env { var } => match std::env::var(var) {
-            Ok(v) if !v.trim().is_empty() => Ok(Some(secrecy::SecretString::from(v))),
-            _ => Err(ProviderError::MissingCredentials(format!(
-                "environment variable {var} is not set"
-            ))),
-        },
-    }
+/// rather than a review checklist item. [`credentials`] decides the order of the places it looks.
+pub fn resolve_auth(
+    instance: &InstanceConfig,
+) -> Result<Option<secrecy::SecretString>, ProviderError> {
+    credentials::credentials().resolve(&instance.id, &instance.auth)
 }

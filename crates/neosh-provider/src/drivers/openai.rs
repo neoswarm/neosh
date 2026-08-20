@@ -160,7 +160,7 @@ impl Provider for OpenAiCompatProvider {
     async fn list_models(&self, instance: &InstanceConfig) -> Result<Vec<ModelInfo>, ProviderError> {
         let base = Self::base(instance)?;
         let mut req = http::client().get(format!("{base}/models"));
-        if let Some(key) = resolve_auth(&instance.auth).unwrap_or(None) {
+        if let Some(key) = resolve_auth(instance).unwrap_or(None) {
             req = req.bearer_auth(key.expose_secret());
         }
         let resp = req.send().await.map_err(|e| ProviderError::Transport(e.to_string()))?;
@@ -215,7 +215,7 @@ impl Provider for OpenAiCompatProvider {
     ) -> ProviderStream {
         let (tx, rx) = mpsc::channel::<ProviderEvent>(256);
         let base = Self::base(instance);
-        let auth = instance.auth.clone();
+        let config = instance.clone();
         let extra = instance.extra_headers.clone();
 
         tokio::spawn(async move {
@@ -232,7 +232,7 @@ impl Provider for OpenAiCompatProvider {
             let mut req = http::client()
                 .post(format!("{base}/chat/completions"))
                 .header("content-type", "application/json");
-            match resolve_auth(&auth) {
+            match resolve_auth(&config) {
                 Ok(Some(key)) => req = req.bearer_auth(key.expose_secret()),
                 Ok(None) => {} // local endpoints legitimately need no credentials
                 Err(e) => {

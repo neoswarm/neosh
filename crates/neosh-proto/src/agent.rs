@@ -147,6 +147,17 @@ pub struct SessionInfo {
     pub usage: Usage,
     #[serde(default)]
     pub is_active: bool,
+    /// Put away rather than thrown away.
+    ///
+    /// An archived conversation keeps every message and can be brought back; it is simply not in
+    /// the list you look at every day. It exists because the alternative verb people were reaching
+    /// for was delete, and delete is the one thing in a workspace that cannot be undone.
+    #[serde(default)]
+    pub archived: bool,
+    /// Seconds since the epoch, stamped when it was archived. `None` while it is in the open list.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(type = "number | null")]
+    pub archived_at: Option<i64>,
 }
 
 // ---------------------------------------------------------------------------

@@ -242,6 +242,12 @@ impl ModelSelection {
 pub enum AuthRef {
     /// Read the key from this environment variable.
     Env { var: String },
+    /// Run a program and read the key from its standard output.
+    ///
+    /// The git-credential-helper pattern, and the reason neosh needs no opinion about your password
+    /// manager: `["pass", "show", "anthropic/key"]`, `["op", "read", "op://…"]`, `["secret-tool",
+    /// "lookup", …]` all work, and none of them puts a key in a file neosh wrote.
+    Command { argv: Vec<String> },
     /// The driver is a subprocess that carries its own credentials (e.g. an already-logged-in CLI).
     Inherited,
     /// No auth, e.g. a local llama.cpp or Ollama endpoint.
@@ -257,9 +263,64 @@ impl AuthRef {
     pub fn is_available(&self) -> bool {
         match self {
             Self::Env { var } => std::env::var_os(var).is_some_and(|v| !v.is_empty()),
+            // A helper is assumed to work for the same reason `Inherited` is: finding out costs a
+            // subprocess, and doing that for every instance every time a picker opens would make
+            // opening a picker slow in proportion to how well configured you are.
+            Self::Command { argv } => !argv.is_empty(),
             Self::Inherited | Self::None => true,
         }
     }
+}
+
+/// Where the key for an instance is coming from.
+///
+/// Reported so a settings list can say *why* something works, which is the difference between "it
+/// is signed in" and "it is signed in and will still be tomorrow".
+#[derive(TS, Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+#[ts(export)]
+pub enum CredentialSource {
+    /// This environment variable, which is set.
+    Env { var: String },
+    /// The OS keychain, via its command-line helper. Survives a restart.
+    Keychain,
+    /// Typed in this session and held in memory only. Gone when neosh exits.
+    Session,
+    /// A helper program named in configuration.
+    Command,
+    /// The driver brings its own login — a CLI you are already signed in to.
+    Inherited,
+    /// The endpoint needs no key at all.
+    NotNeeded,
+    /// Nothing to authenticate with.
+    Missing,
+}
+
+impl CredentialSource {
+    /// Whether a turn sent to this instance can authenticate.
+    pub fn is_usable(&self) -> bool {
+        !matches!(self, Self::Missing)
+    }
+
+    /// Whether it will still be there after a restart.
+    pub fn is_durable(&self) -> bool {
+        !matches!(self, Self::Session | Self::Missing)
+    }
+}
+
+/// An instance and the state of its credential. **Never carries the secret itself.**
+#[derive(TS, Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
+#[ts(export)]
+pub struct CredentialInfo {
+    pub instance: InstanceId,
+    pub display_name: String,
+    pub driver: DriverKind,
+    pub source: CredentialSource,
+    /// Whether this instance's driver is registered, so the entry is worth offering at all.
+    pub driver_available: bool,
+    /// Whether a key can be typed in for it. False for a CLI login or a local endpoint, where
+    /// asking for one would be asking for something that does nothing.
+    pub accepts_key: bool,
 }
 
 /// A configured driver.
