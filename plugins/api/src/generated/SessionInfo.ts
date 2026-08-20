@@ -29,6 +29,15 @@ export type SessionInfo = {
   created_at: number;
   updated_at: number;
   usage: Usage;
+  /**
+   * How full the context window was on the most recent request: input plus cache, for that one
+   * turn.
+   *
+   * Separate from `usage`, which is cumulative and therefore useless for this: a conversation
+   * that has spent 400k tokens across twenty turns is not 400k tokens *long*. The number people
+   * want is how much room is left, and only the last request knows it.
+   */
+  context_tokens: number;
   is_active: boolean;
   /**
    * Put away rather than thrown away.

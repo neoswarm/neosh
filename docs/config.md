@@ -301,6 +301,53 @@ lowest priority is the one you would most want kept. Nothing is ever cut in half
 reads as a key that exists and does something else. `ui.hints = false` gives the row back to the
 transcript; the full list is on the help key either way.
 
+### Saying something while it is working
+
+Typing while a turn is running does not start a second turn and is not refused. It is **steering**:
+the message is held, shown under the composer, and taken into the running turn at the next gap —
+between one round of tool calls and the next, or in place of the turn ending. The model sees it
+while it is still working, and can change what it does next.
+
+```
+  ⏵ read_file  src/main.rs
+✳ Working…  8s  ·  1 queued  ·  esc to interrupt
+```
+
+It is not injected into the provider stream, because a stream in flight cannot be interrupted
+without discarding what has already been generated. The gap between rounds is the earliest honest
+moment.
+
+It does not appear in the transcript until it has actually been said — a transcript that shows a
+question nobody has been asked is a transcript that is lying. And if the turn ends before there is
+a gap, the message becomes the next turn rather than being quietly dropped.
+
+Drivers that run their own loop (`claude-cli`, `codex-cli`) have exactly one round trip per turn,
+so steering them means the message lands as the next turn. That is a property of those CLIs, not a
+setting.
+
+### What the agent may do
+
+The footer says what the agent is allowed to do without asking, and `^Y` changes it:
+
+| | |
+|---|---|
+| `ask` | prompt before writing, running or connecting. The default |
+| `allow-listed` | only what `config.toml` already permits |
+| `full access` | no prompts |
+| `deny` | refuse everything; read-only |
+
+**Workspace containment applies in every mode, including full access.** A path outside the
+workspace is refused whatever the setting says: "full access" means not being asked, not reaching
+the rest of the disk.
+
+`^Y` opens a list rather than cycling, because full access is one keystroke from `ask` in any cycle
+and arriving there by holding a key down is exactly the accident worth designing against.
+`permission.cycle` is bound to nothing by default, for people who want it.
+
+The mode is for this session only and is never written to a file. A mode you switched on to get
+through one task should not still be on next week — the way to make it permanent is
+`[permissions] mode = "…"`, which is a thing you did on purpose.
+
 ### How an answer is drawn
 
 Answers are rendered as markdown as they arrive: headings lose their hashes, `- ` becomes a bullet,

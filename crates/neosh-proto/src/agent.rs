@@ -145,6 +145,15 @@ pub struct SessionInfo {
     pub updated_at: i64,
     #[serde(default)]
     pub usage: Usage,
+    /// How full the context window was on the most recent request: input plus cache, for that one
+    /// turn.
+    ///
+    /// Separate from `usage`, which is cumulative and therefore useless for this: a conversation
+    /// that has spent 400k tokens across twenty turns is not 400k tokens *long*. The number people
+    /// want is how much room is left, and only the last request knows it.
+    #[serde(default)]
+    #[ts(type = "number")]
+    pub context_tokens: u64,
     #[serde(default)]
     pub is_active: bool,
     /// Put away rather than thrown away.
@@ -231,8 +240,31 @@ pub enum PermissionMode {
     Ask,
     /// Allow anything matching the allow-list, prompt otherwise.
     AllowListed,
+    /// Allow everything, without asking.
+    ///
+    /// Exists because people were going to get it one way or another — by approving reflexively,
+    /// which is worse: it looks like consent and is not. Named plainly, shown in the status line
+    /// while it is on, and never the default. Workspace containment still applies: a path outside
+    /// the workspace is refused in every mode, because "full access" is about not being asked, not
+    /// about reaching the rest of the disk.
+    Allow,
     /// Refuse everything not explicitly allowed.
     Deny,
+}
+
+impl PermissionMode {
+    /// The word to show a person.
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Ask => "ask",
+            Self::AllowListed => "allow-listed",
+            Self::Allow => "full access",
+            Self::Deny => "deny",
+        }
+    }
+
+    /// The order they run in when cycling, loosest first, so the direction is predictable.
+    pub const ORDER: [Self; 4] = [Self::Allow, Self::AllowListed, Self::Ask, Self::Deny];
 }
 
 /// What an action wants to do. Checked before any filesystem, network or exec effect.

@@ -13,7 +13,7 @@
  * is how a policy quietly becomes permanent, and the file to edit for that is `config.toml`.
  */
 
-import type { Capability, HookOutcome, Neosh, PluginContext } from "@neosh/api";
+import type { Capability, HookOutcome, Neosh, PermissionMode, PluginContext } from "@neosh/api";
 import { picker } from "@neosh/api/ui";
 
 /** How long the user has. Past this the hook times out, which the host reads as a refusal. */
@@ -35,6 +35,33 @@ export async function activate({ neosh, subscriptions }: PluginContext) {
   // different decisions.
   const allowed = new Set<string>();
   subscriptions.push(neosh.session.onChange(() => allowed.clear()));
+
+  // What the agent may do without asking, in the footer, with the key that changes it. It belongs
+  // on screen the whole time it is anything other than the default: "full access" is a state you
+  // should never be in by accident, and the only way to guarantee that is to keep saying so.
+  const showMode = async () => {
+    const mode = await neosh.permission.mode().catch(() => null);
+    if (!mode) return;
+    await neosh.status.set("mode", {
+      text: label(mode),
+      keys: "^Y",
+      hl: mode === "allow" ? "Diagnostic.Warn" : mode === "deny" ? "Comment" : "Status.Line",
+      priority: 5,
+    });
+  };
+  await neosh.cmd.register("permission.cycle", async () => {
+    const order: PermissionMode[] = ["ask", "allow_listed", "allow", "deny"];
+    const now = await neosh.permission.mode().catch(() => "ask" as PermissionMode);
+    const next = order[(order.indexOf(now) + 1) % order.length] ?? "ask";
+    await neosh.permission.setMode(next);
+    await showMode();
+    neosh.notify(`permissions: ${label(next)}`, next === "allow" ? "warn" : "info");
+  }, { desc: "Cycle what the agent may do without asking" });
+  await neosh.cmd.register("permission.pick", () => pickMode(neosh, showMode), {
+    desc: "Choose what the agent may do without asking",
+  });
+  await neosh.keymap.set("chat", "<C-y>", "permission.pick", { desc: "Permission mode" });
+  await showMode();
 
   subscriptions.push(
     await neosh.hook.register(
@@ -71,6 +98,43 @@ export async function activate({ neosh, subscriptions }: PluginContext) {
       { blocking: true, timeoutMs: ASK_TIMEOUT_MS },
     ),
   );
+}
+
+/** The word for a mode, as it reads in the footer. */
+function label(mode: PermissionMode): string {
+  switch (mode) {
+    case "allow": return "full access";
+    case "allow_listed": return "allow-listed";
+    case "deny": return "deny";
+    default: return "ask";
+  }
+}
+
+/**
+ * Choose a mode from a list rather than cycling blindly past the dangerous one.
+ *
+ * Cycling is bound too, for people who know the order — but the default key opens this, because
+ * "full access" is one keystroke away from "ask" in any cycle, and arriving there by holding a key
+ * down is precisely the accident worth designing against.
+ */
+async function pickMode(neosh: Neosh, after: () => Promise<void>): Promise<void> {
+  const now = await neosh.permission.mode().catch(() => "ask" as PermissionMode);
+  const rows: Array<{ label: string; detail: string; value: PermissionMode }> = [
+    { label: "Ask", detail: "prompt before writing, running or connecting", value: "ask" },
+    { label: "Allow-listed", detail: "only what config.toml already permits", value: "allow_listed" },
+    { label: "Full access", detail: "no prompts — still confined to this workspace", value: "allow" },
+    { label: "Deny", detail: "refuse everything; read-only", value: "deny" },
+  ];
+  const chosen = await picker(neosh, rows, {
+    title: "Permissions",
+    width: 62,
+    height: rows.length,
+    selected: Math.max(0, rows.findIndex((r) => r.value === now)),
+  });
+  if (!chosen || chosen === now) return;
+  await neosh.permission.setMode(chosen);
+  await after();
+  neosh.notify(`permissions: ${label(chosen)}`, chosen === "allow" ? "warn" : "info");
 }
 
 /** What the user is actually being asked, in one line. */

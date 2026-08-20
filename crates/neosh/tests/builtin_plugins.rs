@@ -2703,3 +2703,144 @@ fn markdown_can_be_turned_off_for_when_you_want_what_was_actually_sent() {
         s.chat_now()
     );
 }
+
+
+// ---------------------------------------------------------------------------
+// Steering: saying something to a turn that is already running
+// ---------------------------------------------------------------------------
+
+#[test]
+fn typing_while_it_works_is_steering_rather_than_an_error() {
+    // It used to say "a turn is already running" and throw the sentence away. That is the one
+    // moment in the program where you know exactly what you want to say and cannot say it.
+    let sb = Sandbox::new("steer");
+    install_stall(&sb);
+    sb.write_config("[options]\n\"agent.model\" = \"stall/stall\"\n");
+    let mut s = sb.start_letting_config_choose();
+    s.wait_for("stall ready");
+
+    s.type_text("first");
+    s.enter();
+    assert!(s.pump(|s| s.chat_now().iter().any(|l| l.contains("first"))), "the turn started");
+
+    s.type_text("actually, do it differently");
+    s.enter();
+    assert!(
+        s.pump(|s| s.composer_chrome().iter().any(|t| t.contains("queued"))),
+        "it is held, and says so\n{:?}",
+        s.composer_chrome()
+    );
+    assert!(
+        s.composer_chrome().iter().any(|t| t.contains("do it differently")),
+        "and says what is waiting\n{:?}",
+        s.composer_chrome()
+    );
+    assert!(
+        !s.texts().iter().any(|t| t.contains("already running")),
+        "and does not refuse it\n{}",
+        s.transcript()
+    );
+    // Not in the transcript yet: the model has not been told, and a transcript showing a question
+    // nobody has been asked is a transcript that is lying.
+    assert!(
+        !s.chat_now().iter().any(|l| l.contains("do it differently")),
+        "not shown as asked until it has been\n{:?}",
+        s.chat_now()
+    );
+}
+
+#[test]
+fn a_message_queued_past_the_last_gap_becomes_the_next_turn() {
+    // Steering is taken into the running turn at the next gap. If the turn ends before there is
+    // one — interrupted, or simply finished — the question was still asked, and dropping it
+    // silently would be the worst possible reading of "queued".
+    let sb = Sandbox::new("steerleftover");
+    install_stall(&sb);
+    sb.write_config("[options]\n\"agent.model\" = \"stall/stall\"\n");
+    let mut s = sb.start_letting_config_choose();
+    s.wait_for("stall ready");
+
+    s.type_text("first");
+    s.enter();
+    assert!(s.pump(|s| s.chat_now().iter().any(|l| l.contains("esc to interrupt"))), "working");
+    s.type_text("second");
+    s.enter();
+    assert!(s.pump(|s| s.composer_chrome().iter().any(|t| t.contains("queued"))), "held");
+
+    s.special("esc");
+    assert!(
+        s.pump(|s| s.chat_now().iter().any(|l| l.contains("second"))),
+        "it was asked once there was room to ask it\n{:?}",
+        s.chat_now()
+    );
+}
+
+#[test]
+fn the_working_line_says_how_much_is_waiting() {
+    let sb = Sandbox::new("steercount");
+    install_stall(&sb);
+    sb.write_config("[options]\n\"agent.model\" = \"stall/stall\"\n");
+    let mut s = sb.start_letting_config_choose();
+    s.wait_for("stall ready");
+    s.type_text("go");
+    s.enter();
+    assert!(s.pump(|s| s.chat_now().iter().any(|l| l.contains("esc to interrupt"))), "working");
+
+    s.type_text("one");
+    s.enter();
+    s.type_text("two");
+    s.enter();
+    assert!(
+        s.pump(|s| s.chat_now().iter().any(|l| l.contains("2 queued"))),
+        "the line that says a turn is in flight also says what is behind it\n{:?}",
+        s.chat_now()
+    );
+}
+
+#[test]
+fn a_tool_call_says_what_came_back_not_only_that_it_ran() {
+    // A card that names the tool and nothing else is a card you have to take on trust, and "it
+    // ran" is not the thing you wanted to know.
+    let sb = Sandbox::new("toolresult");
+    let mut s = sb.start();
+    s.wait_for("PROJECTS");
+    s.type_text("go");
+    s.enter();
+    assert!(
+        s.pump(|s| s.chat_now().iter().any(|l| l.contains("read_file  .env"))),
+        "the call is shown with its subject\n{:?}",
+        s.chat_now()
+    );
+    assert!(
+        s.chat_now().iter().any(|l| l.trim_start().starts_with('\u{2717}')
+            && l.contains("could not read")),
+        "and what it came back with, under it\n{:?}",
+        s.chat_now()
+    );
+}
+
+#[test]
+fn the_footer_says_what_the_agent_may_do_and_which_key_changes_it() {
+    let sb = Sandbox::new("permmode");
+    let mut s = sb.start();
+    assert!(
+        s.pump(|s| s.status_now().iter().any(|l| l.contains("ask") && l.contains("^Y"))),
+        "the mode, and the key beside it\n{:?}",
+        s.status_now()
+    );
+    s.send(&command("permission.cycle"));
+    assert!(
+        s.pump(|s| s.status_now().iter().any(|l| l.contains("allow-listed"))),
+        "and it changes\n{:?}",
+        s.status_now()
+    );
+}
+
+impl Session {
+    fn status_now(&self) -> Vec<String> {
+        match self.buffer_named("[status]") {
+            Some(b) => self.lines_of(b),
+            None => Vec::new(),
+        }
+    }
+}

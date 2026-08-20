@@ -10,6 +10,7 @@
 import type {
   AccountKind,
   CredentialInfo,
+  ModelInfo,
   CredentialSource,
   ModelEntry,
   ModelSelection,
@@ -19,8 +20,8 @@ import type {
   PluginContext,
   ProviderOptionDescriptor,
 } from "@neosh/api";
-import type { RailItem } from "@neosh/api/ui";
-import { confirmDestructive, defineHighlights, picker, railPicker } from "@neosh/api/ui";
+import type { PaneItem, RailItem } from "@neosh/api/ui";
+import { confirmDestructive, defineHighlights, picker, prompt, railPicker } from "@neosh/api/ui";
 
 type SelectDescriptor = Extract<ProviderOptionDescriptor, { type: "select" }>;
 
@@ -67,14 +68,20 @@ export async function activate({ neosh, subscriptions }: PluginContext) {
   await neosh.hint.set("effort", { keys: "^E", label: "effort", priority: 11 });
 
   // The footer. The model and its options belong beside the composer rather than on a settings
-  // page: they are the two things you change mid-conversation.
+  // page: they are the two things you change mid-conversation — and each carries its own key,
+  // because a key is only memorable next to the thing it changes.
   const footer = async () => {
     const selection = await neosh.agent.selection().catch(() => null);
     if (!selection) {
-      await neosh.status.set("model", { text: "no model", hl: "Diagnostic.Warn", priority: 10 });
+      await neosh.status.set("model", {
+        text: "no model",
+        keys: "^P",
+        hl: "Diagnostic.Warn",
+        priority: 10,
+      });
+      await neosh.status.clear("effort");
       return;
     }
-    const options = (selection.options ?? []).map((o) => String(o.value)).join(" ");
     // Whether the next turn can authenticate belongs beside the model name, not in the error it
     // would otherwise become. "opus · no key" is something you fix before you have typed the
     // question; a failure on send is something you fix after losing your train of thought.
@@ -82,10 +89,20 @@ export async function activate({ neosh, subscriptions }: PluginContext) {
       .find((c) => c.instance === selection.instance);
     const unusable = cred?.source.kind === "missing";
     await neosh.status.set("model", {
-      text: `${selection.model}${options ? ` ${options}` : ""}${unusable ? "  no key" : ""}`,
+      text: `${selection.model}${unusable ? "  no key" : ""}`,
+      keys: "^P",
       hl: unusable ? "Diagnostic.Warn" : "Accent",
       priority: 10,
     });
+
+    // Its own segment, with its own key. Glued onto the model name they read as one word, and the
+    // one you want to change is whichever you are not looking at.
+    const options = (selection.options ?? []).map((o) => String(o.value)).join(" ");
+    if (options) {
+      await neosh.status.set("effort", { text: options, keys: "^E", priority: 11 });
+    } else {
+      await neosh.status.clear("effort");
+    }
   };
   await footer();
   subscriptions.push(neosh.session.onChange(() => void footer()));
@@ -181,12 +198,21 @@ async function pickModel(neosh: Neosh): Promise<void> {
     height: 14,
     rail,
     railAt: startAt,
-    hints: "↵ use   ⇥ providers   s sign in   e effort   ^N/^P move   esc close",
-    placeholder: "nothing here yet — `s` to sign in",
+    hints: "↵ use   ⇥ providers   s sign in   r refresh   n add   esc close",
+    placeholder: "nothing here yet — `s` to sign in, or `n` to name a model yourself",
     async items(c) {
       if (!c.driver_available) return [];
       const entries = await neosh.agent.listModels(c.instance).catch(() => [] as ModelEntry[]);
-      return entries.map((e) => ({
+      // Anything the user named themselves goes first: they typed it because the list did not
+      // have it, and burying it under the list that did not have it would be a poor joke.
+      const named: PaneItem<ModelEntry>[] = (await custom(neosh, c.instance)).map((m) => ({
+        label: m.display_name,
+        badge: { text: "yours", hl: "Comment" },
+        detail: m.id,
+        keywords: m.id,
+        value: { instance: c.instance, model: m } as ModelEntry,
+      }));
+      return named.concat(entries.map((e) => ({
         label: e.model.display_name,
         badge: e.model.tier ? { text: tierLabel(e.model.tier), hl: tierHl(e.model.tier) } : undefined,
         detail: describeModel(e, showPricing),
@@ -195,19 +221,34 @@ async function pickModel(neosh: Neosh): Promise<void> {
         // reproduce something, which is exactly when hiding it outright would be worst.
         section: e.model.legacy ? "superseded" : undefined,
         value: e,
-      }));
+      })));
     },
     itemAt: (items) => Math.max(0, items.findIndex((i) => i.value.model.id === current?.model)),
     async onKey(key, ctx) {
       if (key.key.code.kind !== "char" || key.key.mods.ctrl || key.key.mods.alt) return;
+      const c = ctx.rail;
       if (key.key.code.c === "s") {
-        const c = ctx.rail;
         if (!c) return "handled";
         if (!c.accepts_key) {
           neosh.notify(`${c.display_name}: ${describe(c.source)}`, "info");
           return "handled";
         }
         return (await signIn(neosh, c.instance, c)) ? "reload" : "handled";
+      }
+      // Ask the endpoint again. Discovery is cached for the session, which is right — it is a
+      // network round trip per provider — and wrong the moment you add a key, get given access to
+      // a new model, or start the local server the list was empty because of.
+      if (key.key.code.c === "r") {
+        if (!c) return "handled";
+        neosh.notify(`${c.display_name}: asking again…`);
+        await neosh.agent.listModels(c.instance, { refresh: true }).catch(() => []);
+        return "reload";
+      }
+      // A model the catalogue has not heard of. Vendors ship faster than any list is updated, and
+      // "I know the id, let me type it" is the difference between waiting for a release and not.
+      if (key.key.code.c === "n") {
+        if (!c) return "handled";
+        return (await addModel(neosh, c)) ? "reload" : "handled";
       }
       return undefined;
     },
@@ -386,6 +427,55 @@ function describeModel(e: ModelEntry, showPricing: boolean): string {
   }
   if (bits.length === 0) bits.push(String(e.model.id));
   return bits.join("  ·  ");
+}
+
+/**
+ * Models the user named themselves, for one provider.
+ *
+ * Kept in plugin state rather than in configuration, because it is a note about *this machine's*
+ * access — "my org has early access to this id" — not a decision worth committing to a repository.
+ * Stored per instance so the same id can mean different things on two endpoints.
+ */
+async function custom(neosh: Neosh, instance: string): Promise<ModelInfo[]> {
+  const all = await neosh.state.get<Record<string, ModelInfo[]>>("custom").catch(() => null);
+  return all?.[instance] ?? [];
+}
+
+/**
+ * Add a model the catalogue has never heard of.
+ *
+ * Two questions, because the id and the name are different things: the id is what goes on the wire
+ * and has to be exact, and the name is what you will read in a list forever afterwards. Defaulting
+ * the name to the id means answering the second one is optional.
+ *
+ * Nothing validates the id — nothing here *can*. Whether an endpoint serves it is a question only
+ * the endpoint can answer, and it answers it on the first turn.
+ */
+async function addModel(neosh: Neosh, c: CredentialInfo): Promise<boolean> {
+  const id = await prompt(neosh, `Model id on ${c.display_name}`, { width: 60 });
+  if (!id || !id.trim()) return false;
+  const name = await prompt(neosh, "Show it as", { initial: id.trim(), width: 60 });
+
+  const all =
+    (await neosh.state.get<Record<string, ModelInfo[]>>("custom").catch(() => null)) ?? {};
+  const mine = (all[c.instance] ?? []).filter((m) => m.id !== id.trim());
+  mine.unshift({
+    id: id.trim(),
+    display_name: (name ?? id).trim() || id.trim(),
+    capabilities: {
+      tools: true,
+      vision: false,
+      streaming: true,
+      thinking: false,
+      prompt_caching: false,
+      option_descriptors: [],
+    },
+    legacy: false,
+  } as ModelInfo);
+  all[c.instance] = mine;
+  await neosh.state.set("custom", all);
+  neosh.notify(`added ${c.instance}/${id.trim()}`);
+  return true;
 }
 
 /**

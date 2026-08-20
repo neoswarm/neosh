@@ -19,6 +19,7 @@ import type { ModelSelection } from "./ModelSelection";
 import type { NamespaceId } from "./NamespaceId";
 import type { OptionSpec } from "./OptionSpec";
 import type { OptionValue } from "./OptionValue";
+import type { PermissionMode } from "./PermissionMode";
 import type { ProviderEvent } from "./ProviderEvent";
 import type { Rect } from "./Rect";
 import type { SessionId } from "./SessionId";
@@ -204,6 +205,8 @@ export type ApiCall =
     instances: Array<InstanceConfig>;
   }
   | { "call": "provider_emit"; stream: StreamId; event: ProviderEvent }
+  | { "call": "permission_get_mode" }
+  | { "call": "permission_set_mode"; mode: PermissionMode }
   | { "call": "permission_check"; capability: Capability }
   | { "call": "opt_declare"; spec: OptionSpec }
   | { "call": "opt_set"; name: string; value: OptionValue }

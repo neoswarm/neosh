@@ -57,6 +57,7 @@ import type { OptionSpec } from "./generated/OptionSpec";
 import type { OptionType } from "./generated/OptionType";
 import type { OptionValue } from "./generated/OptionValue";
 import type { PermissionDecision } from "./generated/PermissionDecision";
+import type { PermissionMode } from "./generated/PermissionMode";
 import type { PluginEvent } from "./generated/PluginEvent";
 import type { Pricing } from "./generated/Pricing";
 import type { ProviderEvent } from "./generated/ProviderEvent";
@@ -89,7 +90,7 @@ export type {
   Gravity, HighlightDef, HighlightSpec, Hint, HookName, HookOutcome, HookPayload, InstanceConfig, KeyContext,
   KeymapEntry, KeymapScope, MessageLevel, Mode, ModelEntry, ModelInfo, ModelSelection, ModelTier, NamespaceId,
   OptionChoice, OptionEntry, OptionSelection, OptionSpec, OptionType, OptionValue,
-  Message, PermissionDecision, PluginEvent, Pricing, ProviderEvent, ProviderOptionDescriptor,
+  Message, PermissionDecision, PermissionMode, PluginEvent, Pricing, ProviderEvent, ProviderOptionDescriptor,
   Rect, RepoInfo, RepoStatus, SessionId, SessionInfo, StatusAlign, StatusSegment, StopReason,
   SurfaceCell, SurfaceId, TextEdit, ToolCall, ToolDef, ToolResult, TurnRequest, Usage, Viewport,
   WindowId, WindowLayout,
@@ -312,6 +313,14 @@ export interface Neosh {
   notify(message: string, level?: MessageLevel): void;
   /** Ask the host whether a side effect is allowed. */
   permit(capability: Capability): Promise<PermissionDecision>;
+  /**
+   * What the agent is allowed to do without asking, and how to change it.
+   *
+   * `setMode` lasts for this session only. A mode switched on to get through one task should not
+   * still be on next week, and writing it to a file is exactly how that happens — so it is not
+   * written to one.
+   */
+  readonly permission: PermissionApi;
 }
 
 export interface BufferApi {
@@ -682,8 +691,27 @@ export interface HintApi {
   clear(key: string): Promise<void>;
 }
 
+export interface PermissionApi {
+  mode(): Promise<PermissionMode>;
+  setMode(mode: PermissionMode): Promise<PermissionMode>;
+}
+
 export interface StatusApi {
-  set(key: string, segment: { text: string; hl?: string; align?: StatusAlign; priority?: number }): Promise<void>;
+  /**
+   * `keys` is drawn immediately after `text`, dimmed — the key that changes this thing, beside the
+   * thing it changes. Write it the way the user would press it (`^P`, `F1`), not the way a keymap
+   * spells it.
+   */
+  set(
+    key: string,
+    segment: {
+      text: string;
+      keys?: string;
+      hl?: string;
+      align?: StatusAlign;
+      priority?: number;
+    },
+  ): Promise<void>;
   clear(key: string): Promise<void>;
 }
 
@@ -1349,6 +1377,14 @@ export function __createContext(plugin: string, config: unknown, version: number
       },
       onChange: (cb) => listener(r.sessionListeners, cb),
     },
+    permission: {
+      async mode() {
+        return expect(await c({ call: "permission_get_mode" }), "permission_mode").mode;
+      },
+      async setMode(mode) {
+        return expect(await c({ call: "permission_set_mode", mode }), "permission_mode").mode;
+      },
+    },
     hint: {
       async set(key, hint) {
         await c({
@@ -1368,6 +1404,7 @@ export function __createContext(plugin: string, config: unknown, version: number
           key,
           segment: {
             text: segment.text,
+            keys: segment.keys ?? null,
             hl: segment.hl ?? null,
             align: segment.align ?? "left",
             priority: segment.priority ?? 0,

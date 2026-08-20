@@ -129,6 +129,8 @@ impl Editor {
                 | ApiCall::ProviderRegisterDriver { .. }
                 | ApiCall::ProviderEmit { .. }
                 | ApiCall::PermissionCheck { .. }
+                | ApiCall::PermissionGetMode
+                | ApiCall::PermissionSetMode { .. }
                 | ApiCall::RtpAdd { .. }
                 | ApiCall::RtpList
                 | ApiCall::PathComplete { .. }
@@ -992,6 +994,8 @@ fn call_name(call: &ApiCall) -> &'static str {
         ApiCall::GitAddWorktree { .. } => "git.addWorktree",
         ApiCall::GitRemoveWorktree { .. } => "git.removeWorktree",
         ApiCall::GenComplete { .. } => "gen.complete",
+        ApiCall::PermissionGetMode => "permission.mode",
+        ApiCall::PermissionSetMode { .. } => "permission.setMode",
         ApiCall::StatusSet { .. } => "status.set",
         ApiCall::HintSet { .. } => "hint.set",
         ApiCall::HintClear { .. } => "hint.clear",

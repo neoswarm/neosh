@@ -46,6 +46,12 @@ pub enum AgentEvent {
     ToolStarted { turn: TurnId, call: ToolCall },
     ToolFinished { turn: TurnId, call: ToolCall, result: ToolResult },
     TurnEnded { turn: TurnId, stop_reason: StopReason, usage: Usage },
+    /// A message typed while the turn was running has been taken into it.
+    ///
+    /// Emitted at the moment it enters the conversation rather than when it was typed, because
+    /// until then it is a draft the user can still change their mind about — and a transcript that
+    /// shows a question the model has not been told about is a transcript that is lying.
+    Steered { turn: TurnId, text: String },
     Notice { level: MessageLevel, text: String },
 }
 
@@ -70,6 +76,11 @@ pub struct Agent {
     /// Swappable, because a config reload can tighten permissions and a layer fixed at launch
     /// would report success while changing nothing.
     permissions: Arc<std::sync::RwLock<Arc<PermissionLayer>>>,
+    /// Things typed while a turn was running, waiting for a gap to be said in.
+    ///
+    /// Its own lock, and never held across an await: the turn loop drains it between rounds, and
+    /// the keyboard adds to it from a completely different task.
+    steering: Arc<std::sync::Mutex<Vec<String>>>,
     events: mpsc::UnboundedSender<AgentEvent>,
 }
 
@@ -87,6 +98,7 @@ impl Agent {
                 hooks: Arc::new(std::sync::RwLock::new(HookRegistry::new())),
                 providers: Arc::new(std::sync::RwLock::new(providers)),
                 permissions: Arc::new(std::sync::RwLock::new(permissions)),
+                steering: Arc::default(),
                 events: tx,
             },
             rx,
@@ -155,6 +167,34 @@ impl Agent {
     fn emit(&self, ev: AgentEvent) {
         // A dropped receiver means the host is shutting down; losing UI events then is fine.
         let _ = self.events.send(ev);
+    }
+
+    /// Say something to a turn that is already running.
+    ///
+    /// It is taken into the conversation at the next gap — between one round of tool calls and the
+    /// next, or in place of the turn ending. That is what makes it *steering* rather than a queued
+    /// follow-up: the model sees it while it is still working, and can change what it does next.
+    ///
+    /// Not injected into the provider stream, because a stream in flight cannot be interrupted
+    /// without discarding what has already been generated. The gap between rounds is the earliest
+    /// honest moment.
+    pub fn steer(&self, text: String) {
+        self.steering.lock().expect("steering lock poisoned").push(text);
+    }
+
+    /// Whether anything is waiting to be said.
+    pub fn steering_count(&self) -> usize {
+        self.steering.lock().expect("steering lock poisoned").len()
+    }
+
+    /// What is waiting, without taking it. For drawing it.
+    pub fn steering_texts(&self) -> Vec<String> {
+        self.steering.lock().expect("steering lock poisoned").clone()
+    }
+
+    /// Take what is waiting, leaving the queue empty.
+    pub fn take_steering(&self) -> Vec<String> {
+        std::mem::take(&mut *self.steering.lock().expect("steering lock poisoned"))
     }
 
     pub fn selection(&self) -> Option<ModelSelection> {
@@ -432,7 +472,13 @@ impl Agent {
             }
             stop = this_stop;
             if !matches!(stop, StopReason::ToolUse) || calls.is_empty() {
-                break;
+                // Nothing left to do — unless somebody typed while it was working. Carrying on
+                // rather than ending is the whole point: a follow-up that starts a new turn has
+                // lost the chance to change what this one does.
+                if cancel.is_cancelled() || !self.take_steering_into(&turn) {
+                    break;
+                }
+                continue;
             }
 
             let mut results = Vec::new();
@@ -444,6 +490,9 @@ impl Agent {
                 results.push((id, self.run_tool(bridge, call, &cancel).await));
             }
             self.session().push_tool_results(results);
+            // The gap between rounds: the model is about to be asked again anyway, so anything
+            // typed since the last one rides along with the tool results.
+            self.take_steering_into(&turn);
 
             if round + 1 == MAX_TOOL_ROUNDS {
                 stop = StopReason::Error {
@@ -459,6 +508,19 @@ impl Agent {
             usage: total,
         });
         end(self, stop, total)
+    }
+
+    /// Move anything queued into the conversation. Returns whether there was anything.
+    fn take_steering_into(&self, turn: &TurnId) -> bool {
+        let queued = self.take_steering();
+        if queued.is_empty() {
+            return false;
+        }
+        for text in queued {
+            self.session().push_user_text(text.clone());
+            self.emit(AgentEvent::Steered { turn: turn.clone(), text });
+        }
+        true
     }
 
     /// Run one tool call, through the hook and permission gates.

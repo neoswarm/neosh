@@ -253,6 +253,29 @@ fn tool_subject(call: &neosh_proto::ToolCall) -> String {
     subject_of(&call.name, &call.input)
 }
 
+/// One line saying what a tool call came back with.
+///
+/// The *shape* of the result, not the result: a card that inlined four hundred lines of file would
+/// bury the answer it was gathered for. What is useful at a glance is "it worked, and roughly how
+/// much came back", with the exception of an error — where the first line is the whole point.
+fn tool_summary(result: &neosh_proto::ToolResult) -> String {
+    let text = result.content.trim();
+    if text.is_empty() {
+        return if result.is_error { "failed".into() } else { "done".into() };
+    }
+    let first = text.lines().next().unwrap_or("").trim();
+    let lines = text.lines().count();
+    // Errors say what went wrong; successes say how much there is, once there is more than a line
+    // of it. By character, not byte: slicing a multi-byte boundary panics.
+    let clipped: String = first.chars().take(96).collect();
+    let ellipsis = if first.chars().count() > 96 { "\u{2026}" } else { "" };
+    if result.is_error || lines <= 1 {
+        format!("{clipped}{ellipsis}")
+    } else {
+        format!("{clipped}{ellipsis}  ({lines} lines)")
+    }
+}
+
 /// What a tool call is *about*, from whichever of its arguments says so.
 fn subject_of(_name: &str, input: &serde_json::Value) -> String {
     const KEYS: &[&str] = &["path", "file_path", "file", "pattern", "query", "command", "url"];
@@ -731,6 +754,17 @@ impl Host {
                 }
             }
 
+            ApiCall::PermissionGetMode => {
+                Ok(ApiOk::PermissionMode { mode: self.agent.permissions().mode() })
+            }
+            ApiCall::PermissionSetMode { mode } => {
+                // For this session only. A mode you switched on to get through one task should not
+                // still be on next week, and writing it to a file is how that happens.
+                let layer = (*self.agent.permissions()).clone().with_mode(mode);
+                self.agent.set_permissions(layer);
+                self.refresh_status();
+                Ok(ApiOk::PermissionMode { mode })
+            }
             ApiCall::HintSet { key, hint } => {
                 self.hints.insert(format!("{plugin}:{key}"), hint);
                 self.refresh_composer();
@@ -825,8 +859,13 @@ impl Host {
     }
 
     fn start_turn(&mut self, text: String) {
+        // Typing while it works is steering, not an error. The old behaviour — refuse, and make you
+        // wait with the sentence already written — is the one moment in the program where you know
+        // exactly what you want to say and cannot say it.
         if self.active_turn.is_some() {
-            self.editor_message(MessageLevel::Warn, "a turn is already running");
+            self.agent.steer(text);
+            self.draw_working();
+            self.refresh_composer();
             return;
         }
         let token = CancellationToken::new();
@@ -1019,6 +1058,12 @@ impl Host {
         for (_, _, seg) in left.iter().chain(right.iter()) {
             text.push_str("  ");
             push(&mut text, &mut marks, &seg.text, seg.hl.as_deref().unwrap_or("Status.Line"));
+            // The key that changes it, right after it. A key is only memorable once it has been
+            // seen next to the thing it does; a legend somewhere else is a second place to look.
+            if let Some(keys) = seg.keys.as_deref().filter(|k| !k.is_empty()) {
+                text.push(' ');
+                push(&mut text, &mut marks, keys, "Composer.HintKey");
+            }
         }
         if self.status_segments.is_empty() {
             // Before any plugin has contributed — and under `--clean`, where none will.
@@ -1105,16 +1150,33 @@ impl Host {
             );
         }
 
+        let row = lines.saturating_sub(1);
+        let indent = caret.chars().count();
+        let pad = " ".repeat(indent);
+
+        // What you typed while it was working, waiting for a gap to be said in. This outranks the
+        // shortcut row: an unsent sentence of yours is more urgent than a list of keys.
+        let queued = self.agent.steering_texts();
+        for (i, text) in queued.iter().take(2).enumerate() {
+            let more = queued.len().saturating_sub(2);
+            let tail = if i == 1 && more > 0 { format!("  (+{more} more)") } else { String::new() };
+            let one = text.lines().next().unwrap_or("").trim();
+            let body: String = one.chars().take(width.saturating_sub(indent + 10)).collect();
+            self.composer_mark(row, VirtTextPos::Below, vec![
+                chunk(pad.clone(), "Composer.Hint"),
+                chunk("queued ", "Status.Pending"),
+                chunk(format!("{body}{tail}"), "Composer.Hint"),
+            ]);
+        }
+
         // The shortcut row goes under the last line you have written — and steps aside once you are
-        // writing enough that it would cost you a line to look at.
-        if lines <= 2 {
-            let row = lines - 1;
-            let indent = caret.chars().count();
-            if let Some(chunks) = self.hint_row(width.saturating_sub(indent)) {
-                let mut v = vec![chunk(" ".repeat(indent), "Composer.Hint")];
-                v.extend(chunks);
-                self.composer_mark(row, VirtTextPos::Below, v);
-            }
+        // writing enough, or have enough queued, that it would cost you a line to look at.
+        if lines <= 2 && queued.is_empty()
+            && let Some(chunks) = self.hint_row(width.saturating_sub(indent))
+        {
+            let mut v = vec![chunk(pad, "Composer.Hint")];
+            v.extend(chunks);
+            self.composer_mark(row, VirtTextPos::Below, v);
         }
     }
 
@@ -1913,13 +1975,23 @@ impl Host {
     fn open_answer_row(&mut self) -> u32 {
         self.end_working();
         let n = self.editor.buffer(self.chat).map(|b| b.line_count() as i64).unwrap_or(0);
+        // A blank line between the last thing and the answer — unless there already is one. A tool
+        // card butted straight up against the sentence that follows it reads as one paragraph, and
+        // two blank lines reads as a gap somebody forgot to fill.
+        let blank_above = n <= 0
+            || self
+                .editor
+                .buffer(self.chat)
+                .map(|b| b.get_lines((n - 1) as u32, n as u32).iter().all(|l| l.trim().is_empty()))
+                .unwrap_or(true);
+        let rows = if blank_above { 1 } else { 2 };
         let _ = self.editor.apply(&PluginId::from(BUILTIN), ApiCall::BufSetLines {
             buf: self.chat,
             start: n,
             end: n,
-            lines: vec![String::new()],
+            lines: vec![String::new(); rows],
         });
-        n.max(0) as u32
+        (n.max(0) as u32) + (rows as u32 - 1)
     }
 
     /// Replace the unsettled tail of an answer with its freshly rendered form.
@@ -2015,6 +2087,12 @@ impl Host {
 
         let label = note.as_deref().unwrap_or(verb);
         let mut text = format!("{glyph} {label}\u{2026}  {elapsed}");
+        // What you typed while it was working, and the fact that it has not been said yet.
+        match self.agent.steering_count() {
+            0 => {}
+            1 => text.push_str("  \u{b7}  1 queued"),
+            n => text.push_str(&format!("  \u{b7}  {n} queued")),
+        }
         text.push_str("  \u{b7}  esc to interrupt");
 
         let plugin = PluginId::from(BUILTIN);
@@ -2125,13 +2203,20 @@ impl Host {
                 self.bridge.broadcast(PluginEvent::ToolStarted { turn, call });
             }
             AgentEvent::ToolFinished { turn, call, result } => {
-                // Errors show regardless: a tool that failed silently is a debugging session.
-                if result.is_error {
-                    let glyph = self.glyphs().fail;
-                    let first = result.content.lines().next().unwrap_or("").trim();
-                    let text = format!("  {glyph} {}: {first}", call.name);
+                // Every call gets an answer under it, not just the failures. A card that says what
+                // ran and nothing about what came back is a card you have to take on trust, and
+                // "it ran" is not the thing you wanted to know.
+                //
+                // Errors show even with tool cards off: a tool that failed silently is a debugging
+                // session, and the setting is about noise, not about hiding failures.
+                if result.is_error || self.option_bool("chat.show_tools") {
+                    let g = self.glyphs();
+                    let glyph = if result.is_error { g.fail } else { g.result };
+                    let summary = tool_summary(&result);
+                    let text = format!("    {glyph} {summary}");
                     let row = self.chat_push(vec![text.clone()]);
-                    self.chat_mark(row, 0, text.len(), "Agent.ToolError");
+                    let hl = if result.is_error { "Agent.ToolError" } else { "Agent.Usage" };
+                    self.chat_mark(row, 0, text.len(), hl);
                 }
                 if let Some(w) = self.working.as_mut() {
                     w.note = None;
@@ -2142,6 +2227,9 @@ impl Host {
             AgentEvent::TurnEnded { turn, stop_reason, usage } => {
                 self.close_answer();
                 self.end_working();
+                // Queued after the last gap this turn had. It is a question that was asked and not
+                // yet answered, so it becomes the next turn rather than being quietly dropped.
+                let leftover = self.agent.take_steering();
                 self.active_turn = None;
                 {
                     let mut s = self.agent.session();
@@ -2150,6 +2238,17 @@ impl Host {
                 self.persist_sessions();
                 self.streaming = None;
                 self.bridge.broadcast(PluginEvent::TurnEnded { turn, stop_reason, usage });
+                if !leftover.is_empty() {
+                    self.start_turn(leftover.join("\n"));
+                }
+            }
+            AgentEvent::Steered { text, .. } => {
+                // Drawn now rather than when it was typed: until the model has been told, a
+                // transcript showing the question is a transcript that is lying about what was
+                // asked.
+                self.chat_question(&text);
+                self.draw_working();
+                self.refresh_composer();
             }
             AgentEvent::Notice { level, text } => self.editor_message(level, text),
         }
@@ -3465,12 +3564,15 @@ fn transcript(session: &neosh_agent::Session, ascii: bool) -> (Vec<String>, Vec<
                     lines.push(text);
                 }
                 ContentBlock::ToolResult { is_error, content, .. } => {
-                    if *is_error {
-                        let first = content.lines().next().unwrap_or("").trim();
-                        let text = format!("  {} {first}", g.fail);
-                        marks.push((lines.len() as u32, 0, text.len(), "Agent.ToolError"));
-                        lines.push(text);
-                    }
+                    let glyph = if *is_error { g.fail } else { g.result };
+                    let summary = tool_summary(&neosh_proto::ToolResult {
+                        content: content.clone(),
+                        is_error: *is_error,
+                    });
+                    let text = format!("    {glyph} {summary}");
+                    let hl = if *is_error { "Agent.ToolError" } else { "Agent.Usage" };
+                    marks.push((lines.len() as u32, 0, text.len(), hl));
+                    lines.push(text);
                 }
                 // Reasoning is not replayed: it is shown live when `chat.show_thinking` is on, and
                 // reprinting it on every switch would bury the answer under the working out.
@@ -3495,6 +3597,8 @@ struct Glyphs {
     tool: &'static str,
     /// A tool that failed.
     fail: &'static str,
+    /// What a tool came back with.
+    result: &'static str,
     /// The working line's mark.
     work: &'static str,
 }
@@ -3502,9 +3606,15 @@ struct Glyphs {
 impl Glyphs {
     fn new(ascii: bool) -> Self {
         if ascii {
-            Self { bar: "|", tool: ">", fail: "x", work: "*" }
+            Self { bar: "|", tool: ">", fail: "x", result: "`-", work: "*" }
         } else {
-            Self { bar: "\u{258c}", tool: "\u{23f5}", fail: "\u{2717}", work: "\u{2733}" }
+            Self {
+                bar: "\u{258c}",
+                tool: "\u{23f5}",
+                fail: "\u{2717}",
+                result: "\u{2514}",
+                work: "\u{2733}",
+            }
         }
     }
 }

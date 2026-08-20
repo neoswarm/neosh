@@ -1,0 +1,4 @@
+name = "usage"
+version = "0.1.0"
+entry = "main.ts"
+description = "How full the context window is, and what the conversation has cost."

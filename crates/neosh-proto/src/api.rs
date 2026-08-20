@@ -11,8 +11,8 @@ use serde::{Deserialize, Serialize};
 use ts_rs::TS;
 
 use crate::agent::{
-    Capability, HookName, HookPayload, Message, PermissionDecision, SessionInfo, ToolDef,
-    ToolResult,
+    Capability, HookName, HookPayload, Message, PermissionDecision, PermissionMode, SessionInfo,
+    ToolDef, ToolResult,
 };
 use crate::ids::{
     BufferId, ExtmarkId, NamespaceId, RequestId, SessionId, StreamId, SurfaceId, WindowId,
@@ -451,6 +451,13 @@ pub enum ApiCall {
     // ---- permissions ---------------------------------------------------
     /// Ask the host whether a capability is allowed. Plugins performing side effects must call this
     /// rather than assume.
+    /// What the permission mode is right now.
+    PermissionGetMode,
+    /// Change it for this session. Not written to configuration: a mode you turned on to get
+    /// through one task should not still be on next week.
+    PermissionSetMode {
+        mode: PermissionMode,
+    },
     PermissionCheck {
         capability: Capability,
     },
@@ -654,6 +661,7 @@ pub enum ApiOk {
     Commands { commands: Vec<CommandEntry> },
     Keymaps { keymaps: Vec<KeymapEntry> },
     Permission { decision: PermissionDecision },
+    PermissionMode { mode: PermissionMode },
     FocusedWin { win: Option<WindowId> },
     Option { entry: Option<OptionEntry> },
     Options { options: Vec<OptionEntry> },
@@ -685,6 +693,13 @@ pub enum ApiOk {
 #[ts(export)]
 pub struct StatusSegment {
     pub text: String,
+    /// The key that changes this, written the way the user would press it — `^P`, `F1`.
+    ///
+    /// Beside what it acts on rather than in a list of its own, because a key is only memorable
+    /// once you have seen it next to the thing it does. A separate legend is a second place to
+    /// look, and the thing being looked up is right there.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keys: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hl: Option<String>,
     #[serde(default)]

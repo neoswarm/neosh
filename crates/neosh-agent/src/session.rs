@@ -16,6 +16,8 @@ pub struct Session {
     pub system: Option<String>,
     /// Running total across the session, for budget display.
     pub usage: Usage,
+    /// The prompt size of the most recent request: how full the window actually is.
+    pub context_tokens: u64,
     pub active_turn: Option<TurnId>,
     /// When the running turn started, in seconds since the epoch. Stamped by whoever starts the
     /// turn, for the same reason `created_at` is: this type does not read a clock.
@@ -44,6 +46,7 @@ impl Session {
             selection: None,
             system: None,
             usage: Usage::default(),
+            context_tokens: 0,
             active_turn: None,
             turn_started_at: None,
             title: None,
@@ -113,6 +116,12 @@ impl Session {
     }
 
     pub fn add_usage(&mut self, u: &Usage) {
+        // The most recent request's prompt is what fills the window. Replaced rather than summed:
+        // adding them would report a conversation as longer than any request it ever made.
+        let prompt = u.input_tokens + u.cache_read_tokens + u.cache_write_tokens;
+        if prompt > 0 {
+            self.context_tokens = prompt;
+        }
         self.usage.input_tokens += u.input_tokens;
         self.usage.output_tokens += u.output_tokens;
         self.usage.cache_read_tokens += u.cache_read_tokens;
@@ -132,6 +141,7 @@ impl Session {
             created_at: self.created_at,
             updated_at: self.updated_at,
             usage: self.usage,
+            context_tokens: self.context_tokens,
             // Filled in by the store, which is the only thing that knows.
             is_active: false,
             archived: self.archived,

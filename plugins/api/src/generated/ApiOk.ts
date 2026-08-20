@@ -14,6 +14,7 @@ import type { ModelSelection } from "./ModelSelection";
 import type { NamespaceId } from "./NamespaceId";
 import type { OptionEntry } from "./OptionEntry";
 import type { PermissionDecision } from "./PermissionDecision";
+import type { PermissionMode } from "./PermissionMode";
 import type { RepoStatus } from "./RepoStatus";
 import type { SessionInfo } from "./SessionInfo";
 import type { SurfaceId } from "./SurfaceId";
@@ -47,6 +48,7 @@ export type ApiOk =
   | { "ok": "commands"; commands: Array<CommandEntry> }
   | { "ok": "keymaps"; keymaps: Array<KeymapEntry> }
   | { "ok": "permission"; decision: PermissionDecision }
+  | { "ok": "permission_mode"; mode: PermissionMode }
   | { "ok": "focused_win"; win: WindowId | null }
   | { "ok": "option"; entry: OptionEntry | null }
   | { "ok": "options"; options: Array<OptionEntry> }
