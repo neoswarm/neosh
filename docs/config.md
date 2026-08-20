@@ -138,8 +138,8 @@ is active, so switching conversation switches which tree you are looking at.
 Conversations are saved as you go — one file each under `~/.local/state/neosh/sessions/` — and
 restored at startup, in the one you were last in. `--clean` neither reads nor writes them.
 
-Pin the projects you live in with `f` and they move to a `FAVORITES` section at the top; `J`/`K`
-reorder within a section, and a pinned project stays listed after its last conversation is closed,
+Pin the projects you live in with `f` and they move to the top of the list, marked with a heart;
+`J`/`K` reorder within a group, and a pinned project stays listed after its last conversation is gone,
 so `Enter` on it starts a new one. The arrangement is saved under
 `~/.local/state/neosh/plugin-state/` — not in your config, because an editor that rewrites the file
 you hand-edited because you pressed a key is one you stop trusting with it.
@@ -148,9 +148,27 @@ While a turn is running the row shows how long it has been running, next to the 
 with no clock is indistinguishable from wedged.
 
 In the panel (`<C-t>`): `↑`/`↓`, `j`/`k` or `^N`/`^P` move, `Enter` opens or folds, `Space` folds,
-`f` pins, `J`/`K` reorder, `n` new conversation here, `x` close, `r` rename, `?` every binding,
-`Esc` leaves. The foot of the panel lists the keys for whatever the cursor is on; set
-`sidebar.hints = false` once they are in your fingers.
+`f` pins, `J`/`K` reorder, `n` new conversation here, `x` archive, `u` unarchive, `X` delete,
+`r` rename, `?` every binding, `Esc` leaves. `J`/`K` work from a conversation row too — they move
+the project it is in, because you are looking at the project when you are looking at what is inside
+it. The foot of the panel lists the keys for whatever the cursor is on; set `sidebar.hints = false`
+once they are in your fingers.
+
+### Archiving, and the one verb that deletes
+
+`x` archives. Everything is kept — every message, the file on disk — it simply leaves the list you
+work in and appears under `ARCHIVED` at the foot of the panel, which only exists while there is
+something in it and starts shut. `u`, or opening it, brings it back to the top.
+
+It asks nothing, because it takes nothing away. Charging a confirmation for a reversible action is
+what teaches you to dismiss confirmations, which is how the one that matters stops working.
+
+`X` deletes: the file goes and there is no undo, so it asks — unless the conversation has nothing in
+it to lose, or you have set `ui.confirm_destructive = false`. Archiving the conversation you are in
+moves you to the most recently used other one, or starts a fresh one if there is no other.
+
+For plugins: `session.archive(id)`, `session.archive(id, false)`, and
+`session.list({ includeArchived: true })`. Plain `list()` leaves them out.
 
 ```toml
 [options]
@@ -305,6 +323,51 @@ switcher.
 Switching between two models that share an option keeps your setting; switching to one without it
 drops the setting rather than sending a value the driver would reject.
 
+Every row says where its key comes from — `$ANTHROPIC_API_KEY`, `keychain`, `credential helper`, or
+**your CLI login — no key needed**, which is why the Claude entries work with nothing configured.
+Rows that cannot authenticate sort last, and an endpoint with no key at all gets a `Sign in to …`
+row: it serves no models until it can authenticate, so without that row it would be invisible rather
+than merely unusable.
+
+### API keys
+
+`provider.auth` lists every configured provider and the state of its key; `provider.key` (built in,
+so it works with `--clean`) takes one for the provider you are on. Picking a model that has no key
+offers the same prompt rather than failing later, when the failure is between you and the question
+you were asking.
+
+**The prompt is the host's, not a plugin's.** Nothing is echoed — you get one bullet per character —
+and no plugin ever sees what you typed. There is no API call that returns a key, only ones that
+report where it came from, so a plugin cannot leak what it cannot read. See
+[ADR 0022](adr/0022-credentials-never-cross-the-plugin-boundary.md).
+
+Where it goes:
+
+| | Survives a restart | |
+|---|---|---|
+| OS keychain | yes | used automatically when `secret-tool` or `security` is installed |
+| this session | no | the fallback when neither is — say, over SSH with no session bus |
+
+neosh tells you which happened. It never writes a key to a file it controls.
+
+Four places a key is looked for, in order — one you typed this session, the keychain, a helper
+program, then the environment. Typed wins, because you typed it after seeing what the environment
+gave you.
+
+A helper is the answer if you already keep secrets somewhere:
+
+```toml
+[[providers]]
+id = "anthropic"
+driver = "anthropic"
+display_name = "Anthropic"
+base_url = "https://api.anthropic.com"
+auth = { kind = "command", argv = ["pass", "show", "anthropic/api-key"] }
+```
+
+Anything on `$PATH` works — `pass`, `op read`, `bw get`, `gopass`, your own script. Only the first
+line of its output is used, so tools that print metadata after the secret are fine.
+
 ### Git, and the prompts behind it
 
 `git.branch.new` asks what you are about to work on, has a model name the branch, and shows you the
@@ -367,7 +430,9 @@ plugin_dirs = ["~/src/neosh-plugins"]
 Unknown keys are an **error**, not ignored. A typo that is silently skipped looks exactly like a
 setting that does not work.
 
-Credentials are read from the environment by name. Nothing writes a secret to this file.
+`auth` names *where a key is*, never a key: `{ kind = "env", var = "…" }`,
+`{ kind = "command", argv = [...] }`, or `{ kind = "none" }` for a local endpoint that wants none.
+Nothing writes a secret to this file, and nothing reads one from it.
 
 ## Options
 

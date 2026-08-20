@@ -224,14 +224,18 @@ allow_roots = []
 [options]
 # "chat.show_thinking" = true
 
-# Extra provider instances, merged over the built-in catalog by id. Credentials are read from the
-# environment by name and are never stored here.
+# Extra provider instances, merged over the built-in catalog by id.
+#
+# `auth` says *where a key is*, never what it is — nothing writes a secret to this file. To enter
+# one instead, run `provider.auth` (or just pick a model that needs one): it goes to your keychain.
 # [[providers]]
 # id = "my-endpoint"
 # driver = "openai-compat"
 # display_name = "Local llama.cpp"
 # base_url = "http://localhost:8080/v1"
 # auth = { kind = "env", var = "MY_API_KEY" }
+# auth = { kind = "command", argv = ["pass", "show", "my-endpoint/key"] }  # or a helper
+# auth = { kind = "none" }                                                # or nothing at all
 
 # Extra plugin directories. Relative paths are relative to this file.
 # plugin_dirs = ["~/src/neosh-plugins"]

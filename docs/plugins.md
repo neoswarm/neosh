@@ -236,6 +236,50 @@ is one they stop trusting with it. And nothing secret belongs here: it is plain 
 
 ---
 
+## Keys, and the one thing you cannot do
+
+Your plugin can find out whether a provider is authenticated, and can ask for a key to be entered.
+It cannot read one.
+
+```ts
+for (const c of await neosh.agent.credentials()) {
+  // c.source.kind: "env" | "keychain" | "session" | "command" | "inherited" | "not_needed" | "missing"
+  // c.accepts_key: false for a CLI login or a local endpoint — nowhere to put one
+}
+
+// Settles when the prompt closes. `true` means a key was stored; never the key itself.
+const ok = await neosh.agent.setCredential("anthropic", { replace: true });
+await neosh.agent.forgetCredential("anthropic");
+```
+
+`setCredential` does **not** open a widget of yours, and there is no `mask: true` on `prompt` for
+you to reach for. The host reads the keystrokes itself, because a plugin field is a buffer, a buffer
+is drawn, and drawing it would put the key in a `UiEvent` — across a process boundary, into whatever
+the frontend logs. Masking is a rendering decision; the leak is a transport one.
+
+The consequence to design around: this is the one modal you cannot re-skin. You can decide *when* to
+ask and what to do afterwards — the model switcher re-queries the endpoint and reopens its list —
+but not what the prompt looks like. [ADR 0022](adr/0022-credentials-never-cross-the-plugin-boundary.md)
+records why that trade was made.
+
+---
+
+## Conversations
+
+```ts
+await neosh.session.list();                          // what the user works in
+await neosh.session.list({ includeArchived: true }); // plus what they put away
+await neosh.session.archive(id);                     // reversible, keeps everything
+await neosh.session.archive(id, false);              // back, and to the top of the list
+await neosh.session.close(id);                       // deletes the file. No undo.
+```
+
+`archive` and `close` are different verbs on purpose. If you are writing the thing a user presses
+when they are done with a conversation, it is `archive`; `close` is for when they have said they
+mean it. Gate `close` behind `confirmDestructive` and say that archiving keeps it.
+
+---
+
 ## What the runtime gives you
 
 A bare `deno_core`: the ECMAScript built-ins, `console`, `queueMicrotask`, `Deno.core`, and timers.
