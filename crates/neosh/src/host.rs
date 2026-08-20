@@ -2739,6 +2739,18 @@ impl Host {
     fn chat_question(&mut self, text: &str) {
         let glyph = self.glyphs().bar;
         let mut rows = Vec::new();
+        // A gap above, unless there already is one. Whatever came before was the end of the last
+        // answer — often a tool card, which has no trailing blank of its own — and a new question
+        // butted straight against it reads as another line of that answer rather than the start of
+        // something you said.
+        let gap = self
+            .editor
+            .buffer(self.chat)
+            .and_then(|b| b.lines().last().map(|l| !l.text.trim().is_empty()))
+            .unwrap_or(false);
+        if gap {
+            rows.push(String::new());
+        }
         for line in text.lines() {
             rows.push(format!("{glyph} {line}"));
         }
@@ -2748,8 +2760,9 @@ impl Host {
         rows.push(String::new());
         let at = self.chat_push(rows);
         let lines = text.lines().count().max(1) as u32;
+        let first = at + u32::from(gap);
         for i in 0..lines {
-            self.chat_mark(at + i, 0, glyph.len(), "Agent.User");
+            self.chat_mark(first + i, 0, glyph.len(), "Agent.User");
         }
     }
 

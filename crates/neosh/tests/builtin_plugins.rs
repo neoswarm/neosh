@@ -1179,6 +1179,18 @@ impl Session {
         }
     }
 
+    /// The highlight groups on each row of the transcript.
+    fn chat_groups(&self) -> Vec<Vec<String>> {
+        let name = self.events.iter().find_map(|e| {
+            let n = e["name"].as_str()?;
+            (e["type"] == "buffer_opened" && n.starts_with("[chat]")).then(|| n.to_string())
+        });
+        match name.and_then(|n| self.buffer_named(&n)) {
+            Some(b) => self.groups_of(b),
+            None => Vec::new(),
+        }
+    }
+
     fn sidebar_now(&self) -> Vec<String> {
         match self.buffer_named("[sidebar]") {
             Some(b) => self.lines_of(b),
@@ -1188,6 +1200,42 @@ impl Session {
 
     /// Replay every edit to one buffer, so what comes back is what is on screen now rather than
     /// everything that was ever drawn there.
+    /// The highlight groups on each row of a buffer, folded the same way its text is.
+    ///
+    /// Needed because a mark is not text: inserting a row above a marked one moves the mark with
+    /// it, and an off-by-one there is invisible in the transcript's contents and glaring on screen.
+    fn groups_of(&self, buf: u64) -> Vec<Vec<String>> {
+        let mut rows: Vec<Vec<String>> = Vec::new();
+        for e in &self.events {
+            if e["type"] != "buffer_lines" || e["buf"].as_u64() != Some(buf) {
+                continue;
+            }
+            let start = e["start"].as_i64().unwrap_or(0);
+            let old_end = e["old_end"].as_i64().unwrap_or(start);
+            let new: Vec<Vec<String>> = e["lines"]
+                .as_array()
+                .map(|a| {
+                    a.iter()
+                        .map(|l| {
+                            l["marks"]
+                                .as_array()
+                                .map(|ms| {
+                                    ms.iter()
+                                        .filter_map(|m| m["hl_group"].as_str().map(str::to_string))
+                                        .collect()
+                                })
+                                .unwrap_or_default()
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            let s = start.clamp(0, rows.len() as i64) as usize;
+            let en = if old_end < 0 { rows.len() } else { (old_end as usize).clamp(s, rows.len()) };
+            rows.splice(s..en, new);
+        }
+        rows
+    }
+
     fn lines_of(&self, buf: u64) -> Vec<String> {
         let mut lines: Vec<String> = Vec::new();
         for e in &self.events {
@@ -2907,6 +2955,48 @@ fn the_working_line_says_how_much_is_waiting() {
         s.pump(|s| s.chat_now().iter().any(|l| l.contains("2 queued"))),
         "the line that says a turn is in flight also says what is behind it\n{:?}",
         s.chat_now()
+    );
+}
+
+/// A question butted against whatever came before it reads as another line of that answer.
+///
+/// The case this exists for is a tool card, which has no trailing blank of its own: the previous
+/// turn ends with `└ 3 files`, and the next thing you said starts on the very next row.
+#[test]
+fn a_question_gets_a_gap_above_it_and_keeps_its_bar() {
+    let sb = Sandbox::new("questiongap");
+    let mut s = sb.start();
+    s.wait_for("PROJECTS");
+    s.type_text("go");
+    s.enter();
+    assert!(
+        s.pump(|s| s.chat_now().iter().any(|l| l.contains("read_file"))),
+        "the turn ran\n{:?}",
+        s.chat_now()
+    );
+    s.type_text("again");
+    s.enter();
+
+    assert!(
+        s.pump(|s| {
+            let rows = s.chat_now();
+            rows.iter().position(|l| l.contains("again")).is_some_and(|at| {
+                at > 0 && rows[at - 1].trim().is_empty()
+            })
+        }),
+        "there is a blank row above it\n{:?}",
+        s.chat_now()
+    );
+    // And the bar is *coloured* on the question rather than on the blank row above it. The gap
+    // shifts every row after it, which is exactly the sort of off-by-one that leaves the text
+    // looking perfectly correct and the colour one row out.
+    let rows = s.chat_now();
+    let at = rows.iter().position(|l| l.contains("again")).expect("found above");
+    let groups = s.chat_groups();
+    assert!(
+        groups.get(at).is_some_and(|g| g.iter().any(|h| h == "Agent.User")),
+        "the bar is coloured on the question, not on the gap: {:?}",
+        &groups[at.saturating_sub(1)..(at + 1).min(groups.len())]
     );
 }
 
