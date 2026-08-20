@@ -185,6 +185,128 @@ pub fn claude_cli_models() -> Vec<ModelInfo> {
     .collect()
 }
 
+/// A model in a seed list: enough to pick one, not enough to pretend it is a full description.
+///
+/// `(id, display name, family, tier, tagline, superseded)`.
+type Seed = (&'static str, &'static str, &'static str, ModelTier, &'static str, bool);
+
+/// Turn a seed list into models, with the option knobs every one of these endpoints understands.
+fn seeded(seeds: &[Seed]) -> Vec<ModelInfo> {
+    seeds
+        .iter()
+        .map(|(id, name, family, tier, tagline, legacy)| {
+            let mut m = ModelInfo::undescribed(*id, *name);
+            m.capabilities = ModelCapabilities {
+                tools: true,
+                vision: true,
+                streaming: true,
+                thinking: false,
+                prompt_caching: false,
+                option_descriptors: Vec::new(),
+            };
+            m.family = Some((*family).to_string());
+            m.tier = Some(*tier);
+            m.tagline = Some((*tagline).to_string());
+            m.legacy = *legacy;
+            m
+        })
+        .collect()
+}
+
+/// What a provider offers, written down, so its models are visible before you have a key.
+///
+/// # Why this exists at all
+///
+/// Every OpenAI-shaped endpoint answers `GET /v1/models`, and discovery is still how the real list
+/// is found. But discovery needs a key — so the picker used to show an empty pane for every
+/// provider you had not signed into yet, which is exactly backwards: the list is *how you decide
+/// whether to sign in*. A provider whose models you cannot see is a provider you cannot evaluate.
+///
+/// These are seeds, not truth. The moment a key is present, [`merge`] lets the endpoint's own
+/// answer decide what exists, and keeps only the description from here — because names, rungs and
+/// taglines are not in any `/v1/models` response and are what make the list readable.
+///
+/// Where the exact id is not certain, the vendor's stable alias is used in preference to a pinned
+/// version, for the same reason `claude-cli` lists `opus` rather than a dated id: an alias that
+/// resolves to something is better than an id that resolves to a 404.
+fn seed_models(instance: &str) -> Vec<ModelInfo> {
+    use ModelTier::{Balanced, Fast, Frontier};
+    seeded(match instance {
+        "openai" => &[
+            ("gpt-5.6-sol", "GPT-5.6 Sol", "sol", Frontier, "Frontier agentic coding", false),
+            ("gpt-5.6-terra", "GPT-5.6 Terra", "terra", Balanced, "Balanced, for everyday work", false),
+            ("gpt-5.6-luna", "GPT-5.6 Luna", "luna", Fast, "Fast and affordable", false),
+            ("gpt-5.5", "GPT-5.5", "gpt", Frontier, "Complex coding and long-running work", true),
+            ("gpt-5.4", "GPT-5.4", "gpt", Balanced, "Strong for everyday coding", true),
+            ("gpt-5.4-mini", "GPT-5.4 Mini", "gpt", Fast, "Small, quick, cheap", true),
+        ],
+        "google" => &[
+            ("gemini-3.1-pro-preview", "Gemini 3.1 Pro", "gemini-pro", Frontier, "Most capable Gemini", false),
+            ("gemini-3.7-flash", "Gemini 3.7 Flash", "gemini-flash", Balanced, "Quick, for everyday work", false),
+            ("gemini-3.1-flash-lite", "Gemini 3.1 Flash Lite", "gemini-flash-lite", Fast, "Cheapest and fastest", false),
+            ("gemini-2.5-pro", "Gemini 2.5 Pro", "gemini-pro", Frontier, "Previous generation", true),
+            ("gemini-2.5-flash", "Gemini 2.5 Flash", "gemini-flash", Balanced, "Previous generation", true),
+        ],
+        "xai" => &[
+            ("grok-4.6", "Grok 4.6", "grok", Frontier, "Latest Grok", false),
+            ("grok-4.5", "Grok 4.5", "grok", Balanced, "Previous generation", true),
+            ("grok-4.3", "Grok 4.3", "grok", Fast, "Older and cheaper", true),
+        ],
+        // Stable aliases: DeepSeek points these at whatever is current, so they do not go stale.
+        "deepseek" => &[
+            ("deepseek-reasoner", "DeepSeek Reasoner", "deepseek", Frontier, "Thinks before it answers", false),
+            ("deepseek-chat", "DeepSeek Chat", "deepseek", Balanced, "General purpose", false),
+        ],
+        "mistral" => &[
+            ("mistral-large-latest", "Mistral Large", "mistral", Frontier, "Most capable", false),
+            ("mistral-medium-latest", "Mistral Medium", "mistral", Balanced, "General purpose", false),
+            ("mistral-small-latest", "Mistral Small", "mistral", Fast, "Quick and cheap", false),
+            ("codestral-latest", "Codestral", "codestral", Balanced, "Tuned for code", false),
+        ],
+        // Deliberately nothing for Groq, Cerebras, Together, Fireworks and the local endpoints:
+        // they serve other people's models and the lineup changes weekly, so a written-down list
+        // would be wrong faster than it was useful. Discovery is the honest answer there, and the
+        // picker says so rather than showing an empty pane with no explanation.
+        _ => &[],
+    })
+}
+
+/// Let a discovered list decide what exists, and a seed list decide how it reads.
+///
+/// An endpoint knows what it serves and nothing about how to describe it: `/v1/models` returns ids
+/// and little else. The seeds know the display name, the rung and the one-line description, and
+/// nothing about what your account can actually reach. Each is authoritative over its own half.
+///
+/// Seeded models sort first and in the order written, so the list opens on the handful worth
+/// choosing between rather than on whatever an endpoint happened to return first — which for
+/// OpenRouter is four hundred models beginning with `aion-labs`.
+pub fn merge(discovered: Vec<ModelInfo>, seeds: &[ModelInfo]) -> Vec<ModelInfo> {
+    if discovered.is_empty() {
+        return seeds.to_vec();
+    }
+    let mut described: Vec<ModelInfo> = Vec::new();
+    let mut rest: Vec<ModelInfo> = Vec::new();
+    for m in discovered {
+        match seeds.iter().find(|s| s.id == m.id) {
+            // The seed's description, but the endpoint's capabilities: whether *this* deployment
+            // supports tools is a fact about the deployment, not about the model.
+            Some(seed) => {
+                let mut out = seed.clone();
+                out.context_window = m.context_window.or(seed.context_window);
+                out.max_output_tokens = m.max_output_tokens.or(seed.max_output_tokens);
+                out.pricing = m.pricing.clone().or_else(|| seed.pricing.clone());
+                described.push(out);
+            }
+            None => rest.push(m),
+        }
+    }
+    // Written order, not discovery order.
+    described.sort_by_key(|m| seeds.iter().position(|s| s.id == m.id).unwrap_or(usize::MAX));
+    described.extend(rest);
+    described
+}
+
+
 fn instance(
     id: &str,
     driver: &str,
@@ -261,14 +383,14 @@ pub fn builtin_instances() -> Vec<InstanceConfig> {
         instance("claude-cli", "claude-cli", "Claude", None, cli("claude", "claude login"), claude_cli_models()),
         // --- API keys: billed per token --------------------------------
         instance("anthropic", "anthropic", "Anthropic", Some("https://api.anthropic.com"), env("ANTHROPIC_API_KEY"), anthropic_models()),
-        instance("google", "google", "Google Gemini", Some("https://generativelanguage.googleapis.com/v1beta"), env("GEMINI_API_KEY"), vec![]),
+        instance("google", "google", "Google Gemini", Some("https://generativelanguage.googleapis.com/v1beta"), env("GEMINI_API_KEY"), seed_models("google")),
         // --- OpenAI-compatible endpoints -------------------------------
-        instance("openai", "openai-compat", "OpenAI", Some("https://api.openai.com/v1"), env("OPENAI_API_KEY"), vec![]),
+        instance("openai", "openai-compat", "OpenAI", Some("https://api.openai.com/v1"), env("OPENAI_API_KEY"), seed_models("openai")),
         instance("openrouter", "openai-compat", "OpenRouter", Some("https://openrouter.ai/api/v1"), env("OPENROUTER_API_KEY"), vec![]),
         instance("groq", "openai-compat", "Groq", Some("https://api.groq.com/openai/v1"), env("GROQ_API_KEY"), vec![]),
-        instance("deepseek", "openai-compat", "DeepSeek", Some("https://api.deepseek.com/v1"), env("DEEPSEEK_API_KEY"), vec![]),
-        instance("xai", "openai-compat", "xAI", Some("https://api.x.ai/v1"), env("XAI_API_KEY"), vec![]),
-        instance("mistral", "openai-compat", "Mistral", Some("https://api.mistral.ai/v1"), env("MISTRAL_API_KEY"), vec![]),
+        instance("deepseek", "openai-compat", "DeepSeek", Some("https://api.deepseek.com/v1"), env("DEEPSEEK_API_KEY"), seed_models("deepseek")),
+        instance("xai", "openai-compat", "xAI", Some("https://api.x.ai/v1"), env("XAI_API_KEY"), seed_models("xai")),
+        instance("mistral", "openai-compat", "Mistral", Some("https://api.mistral.ai/v1"), env("MISTRAL_API_KEY"), seed_models("mistral")),
         instance("together", "openai-compat", "Together", Some("https://api.together.xyz/v1"), env("TOGETHER_API_KEY"), vec![]),
         instance("fireworks", "openai-compat", "Fireworks", Some("https://api.fireworks.ai/inference/v1"), env("FIREWORKS_API_KEY"), vec![]),
         instance("cerebras", "openai-compat", "Cerebras", Some("https://api.cerebras.ai/v1"), env("CEREBRAS_API_KEY"), vec![]),
@@ -283,6 +405,57 @@ pub fn builtin_instances() -> Vec<InstanceConfig> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_provider_you_have_not_signed_into_still_lists_what_it_offers() {
+        // The picker used to show an empty pane for every provider without a key, which is exactly
+        // backwards: the list of models is *how you decide whether to sign in*.
+        for id in ["openai", "google", "xai", "deepseek", "mistral"] {
+            let inst = builtin_instances().into_iter().find(|i| i.id.0 == id).unwrap();
+            assert!(!inst.models.is_empty(), "{id} lists nothing before it has a key");
+            assert!(
+                inst.models.iter().all(|m| m.tier.is_some() && m.family.is_some()),
+                "{id} has a model off the ladder, so upgrade and downgrade would skip it"
+            );
+        }
+    }
+
+    #[test]
+    fn discovery_says_what_exists_and_the_catalogue_says_how_it_reads() {
+        let seeds = seed_models("openai");
+        let known = seeds[0].id.clone();
+        let discovered = vec![
+            ModelInfo::undescribed(known.0.as_str(), known.0.as_str()),
+            ModelInfo::undescribed("something-new", "something-new"),
+        ];
+        let merged = merge(discovered, &seeds);
+
+        assert_eq!(merged.len(), 2, "nothing invented, nothing dropped");
+        assert_eq!(merged[0].id, known, "a described model sorts first");
+        assert_eq!(merged[0].display_name, seeds[0].display_name, "and keeps its name");
+        assert!(merged[0].tier.is_some(), "and its rung");
+        assert_eq!(merged[1].id.0, "something-new", "and a model we had not heard of survives");
+    }
+
+    #[test]
+    fn a_seeded_model_the_endpoint_does_not_serve_is_not_offered() {
+        // The endpoint is the authority on what your account can reach. Keeping a seed it did not
+        // return would offer a model whose first turn is a 404.
+        let seeds = seed_models("openai");
+        let discovered = vec![ModelInfo::undescribed("only-this", "only-this")];
+        let merged = merge(discovered, &seeds);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].id.0, "only-this");
+    }
+
+    #[test]
+    fn nothing_from_the_endpoint_leaves_the_seeds_standing() {
+        // Offline, or no key. Falling through to an empty list would make the provider look broken
+        // rather than unauthenticated.
+        let seeds = seed_models("mistral");
+        assert_eq!(merge(vec![], &seeds).len(), seeds.len());
+    }
+
 
     #[test]
     fn every_builtin_instance_has_a_unique_id() {

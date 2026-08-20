@@ -283,12 +283,31 @@ Copying uses OSC 52, which travels back through the terminal connection — so i
 clipboard on the machine you are sitting at, not the one neosh is running on. Terminals that do not
 implement it ignore it silently; there is no way to detect support.
 
+### The row under the composer
+
+Under the field you type into is a row of shortcuts: `⏎ send`, `^P model`, `^T conversations`, and
+so on. It is not a hard-coded list. Every entry is registered by whoever owns the feature:
+
+```ts
+await neosh.hint.set("model", { keys: "^P", label: "model", priority: 10 });
+```
+
+Which means the row is always true. A plugin in `plugins.disabled` takes its shortcut with it,
+rather than leaving a key advertised that no longer does anything — and a plugin you install adds
+its own without neosh knowing it exists.
+
+Entries sort by `priority` and are dropped from the end when the terminal is too narrow, so the
+lowest priority is the one you would most want kept. Nothing is ever cut in half: half a shortcut
+reads as a key that exists and does something else. `ui.hints = false` gives the row back to the
+transcript; the full list is on the help key either way.
+
 ### Theme and motion
 
 ```toml
 [options]
 "ui.theme" = "dark"       # or "light"
 "ui.motion" = true        # text that moves while something is happening
+"ui.hints" = true         # the shortcut row under the composer
 "ui.ascii_only" = false   # for terminals without a decent font
 "ui.nerd_font" = false    # brand glyphs for providers, where the font has them
 ```
@@ -361,6 +380,33 @@ out of the way, and opened automatically while you are filtering.
 deliberately not detected: a terminal cannot be asked what its font contains, and guessing wrong
 draws a row of boxes, which reads as a broken program rather than as a missing font.
 `ui.ascii_only = true` reduces them to letters.
+
+#### What you see before you sign in
+
+Every provider lists models whether or not you have a key for it, because the list is *how you
+decide whether to sign in*. Those entries come from a written-down catalogue: enough to pick from,
+and never claimed to be complete.
+
+The moment a key is present the endpoint's own `/v1/models` decides what exists, and the catalogue
+keeps only the part it is authoritative about — the display name, the rung and the one-line
+description, none of which appear in any `/v1/models` response. A model the endpoint does not
+return is dropped, even if the catalogue lists it: offering one whose first turn is a 404 is worse
+than offering nothing.
+
+Providers that serve other people's models — Groq, Cerebras, Together, Fireworks — have no written
+catalogue on purpose. Their lineups change weekly, so a list here would be wrong faster than it was
+useful, and the picker says "discovery needs a key" rather than showing an empty pane.
+
+#### When the model you used last has stopped working
+
+Reopening a conversation restores the model it was using. If that model can no longer authenticate
+— an API-key provider, on a machine that does not have the key — neosh moves to one that can, keeps
+the product line where it can (`anthropic/claude-opus-5` becomes the Opus on your plan, not
+whatever sorts first), and says so in one line.
+
+A stored selection is a *record of what was used*, not an instruction. What you put in
+`agent.model` is an instruction, and is left alone even when it cannot authenticate: quietly using
+a different model would be worse than the error you get when you send.
 
 ### Moving along the ladder
 

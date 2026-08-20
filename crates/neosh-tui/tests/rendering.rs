@@ -1,7 +1,7 @@
 //! Width math, annotation placement, layout, and a real terminal snapshot.
 
 use neosh_proto::{
-    Anchor, BorderStyle, BufferId, Dock, ExtmarkId, ExtmarkOpts, ExtmarkRender, Extent,
+    Anchor, Gravity, BorderStyle, BufferId, Dock, ExtmarkId, ExtmarkOpts, ExtmarkRender, Extent,
     FloatConfig, HighlightDef, HighlightSpec, LineRender, NamespaceId, UiEvent, VirtChunk,
     VirtTextPos, WindowId, WindowLayout,
 };
@@ -180,12 +180,12 @@ fn mirror_with_windows() -> Mirror {
     m.apply(UiEvent::WindowOpened {
         win: WindowId(1),
         buf: BufferId(1),
-        layout: WindowLayout::Docked { dock: Dock::Main, size: None },
+        layout: WindowLayout::Docked { dock: Dock::Main, size: None, gravity: Gravity::Start },
     });
     m.apply(UiEvent::WindowOpened {
         win: WindowId(2),
         buf: BufferId(1),
-        layout: WindowLayout::Docked { dock: Dock::Left, size: Some(20) },
+        layout: WindowLayout::Docked { dock: Dock::Left, size: Some(20), gravity: Gravity::Start },
     });
     m
 }
@@ -215,7 +215,7 @@ fn a_side_dock_is_separated_from_what_is_beside_it() {
     m.apply(UiEvent::WindowOpened {
         win: WindowId(1),
         buf: BufferId(1),
-        layout: WindowLayout::Docked { dock: Dock::Left, size: Some(8) },
+        layout: WindowLayout::Docked { dock: Dock::Left, size: Some(8), gravity: Gravity::Start },
     });
     m.apply(UiEvent::BufferOpened { buf: BufferId(2), name: "main".into() });
     m.apply(UiEvent::BufferLines {
@@ -227,7 +227,7 @@ fn a_side_dock_is_separated_from_what_is_beside_it() {
     m.apply(UiEvent::WindowOpened {
         win: WindowId(2),
         buf: BufferId(2),
-        layout: WindowLayout::Docked { dock: Dock::Main, size: None },
+        layout: WindowLayout::Docked { dock: Dock::Main, size: None, gravity: Gravity::Start },
     });
 
     let cells = cells_of(&m, 20, 3);
@@ -244,12 +244,12 @@ fn the_rule_is_the_first_thing_given_up_when_space_runs_out() {
     m.apply(UiEvent::WindowOpened {
         win: WindowId(1),
         buf: BufferId(1),
-        layout: WindowLayout::Docked { dock: Dock::Left, size: Some(9) },
+        layout: WindowLayout::Docked { dock: Dock::Left, size: Some(9), gravity: Gravity::Start },
     });
     m.apply(UiEvent::WindowOpened {
         win: WindowId(2),
         buf: BufferId(2),
-        layout: WindowLayout::Docked { dock: Dock::Main, size: None },
+        layout: WindowLayout::Docked { dock: Dock::Main, size: None, gravity: Gravity::Start },
     });
     let rects = resolve_layout(&m, Rect::new(0, 0, 10, 4));
     let left = rects.iter().find(|(w, _)| *w == WindowId(1)).unwrap().1;
@@ -351,7 +351,7 @@ fn a_float_draws_over_its_dock() {
     m.apply(UiEvent::WindowOpened {
         win: WindowId(1),
         buf: BufferId(1),
-        layout: WindowLayout::Docked { dock: Dock::Main, size: None },
+        layout: WindowLayout::Docked { dock: Dock::Main, size: None, gravity: Gravity::Start },
     });
     m.apply(UiEvent::BufferOpened { buf: BufferId(2), name: "float".into() });
     m.apply(UiEvent::BufferLines {
@@ -399,13 +399,13 @@ fn docked_mirror(bottom: &[(u32, Option<u16>)]) -> Mirror {
     m.apply(UiEvent::WindowOpened {
         win: WindowId(1),
         buf: BufferId(1),
-        layout: WindowLayout::Docked { dock: Dock::Main, size: None },
+        layout: WindowLayout::Docked { dock: Dock::Main, size: None, gravity: Gravity::Start },
     });
     for (id, size) in bottom {
         m.apply(UiEvent::WindowOpened {
             win: WindowId(*id),
             buf: BufferId(1),
-            layout: WindowLayout::Docked { dock: Dock::Bottom, size: *size },
+            layout: WindowLayout::Docked { dock: Dock::Bottom, size: *size, gravity: Gravity::Start },
         });
     }
     m
@@ -500,7 +500,7 @@ fn main_window_with(lines: Vec<&str>) -> Mirror {
     m.apply(UiEvent::WindowOpened {
         win: WindowId(1),
         buf: BufferId(1),
-        layout: WindowLayout::Docked { dock: Dock::Main, size: None },
+        layout: WindowLayout::Docked { dock: Dock::Main, size: None, gravity: Gravity::Start },
     });
     m
 }
@@ -694,12 +694,12 @@ fn a_side_panel_clips_instead_of_wrapping() {
     m.apply(UiEvent::WindowOpened {
         win: WindowId(1),
         buf: BufferId(1),
-        layout: WindowLayout::Docked { dock: Dock::Left, size: Some(20) },
+        layout: WindowLayout::Docked { dock: Dock::Left, size: Some(20), gravity: Gravity::Start },
     });
     m.apply(UiEvent::WindowOpened {
         win: WindowId(2),
         buf: BufferId(1),
-        layout: WindowLayout::Docked { dock: Dock::Main, size: None },
+        layout: WindowLayout::Docked { dock: Dock::Main, size: None, gravity: Gravity::Start },
     });
     let rows = rows_of(&m, 60, 5);
     assert!(rows[1].starts_with("second row"), "row two is still row two: {rows:?}");
@@ -718,7 +718,7 @@ fn the_caret_lands_where_typing_goes() {
     m.apply(UiEvent::WindowOpened {
         win: WindowId(1),
         buf: BufferId(1),
-        layout: WindowLayout::Docked { dock: Dock::Bottom, size: Some(1) },
+        layout: WindowLayout::Docked { dock: Dock::Bottom, size: Some(1), gravity: Gravity::Start },
     });
     m.apply(UiEvent::CursorMoved { win: WindowId(1), row: 0, col: 5 });
 
@@ -744,7 +744,7 @@ fn the_caret_measures_columns_not_bytes() {
     m.apply(UiEvent::WindowOpened {
         win: WindowId(1),
         buf: BufferId(1),
-        layout: WindowLayout::Docked { dock: Dock::Bottom, size: Some(1) },
+        layout: WindowLayout::Docked { dock: Dock::Bottom, size: Some(1), gravity: Gravity::Start },
     });
     // Three bytes for 日, one for x: byte offset 4 is the end of the line, screen column 3.
     m.apply(UiEvent::CursorMoved { win: WindowId(1), row: 0, col: 4 });
@@ -769,7 +769,7 @@ fn a_focused_float_takes_the_caret() {
     m.apply(UiEvent::WindowOpened {
         win: WindowId(1),
         buf: BufferId(1),
-        layout: WindowLayout::Docked { dock: Dock::Bottom, size: Some(1) },
+        layout: WindowLayout::Docked { dock: Dock::Bottom, size: Some(1), gravity: Gravity::Start },
     });
     m.apply(UiEvent::BufferOpened { buf: BufferId(2), name: "prompt".into() });
     m.apply(UiEvent::BufferLines {
@@ -833,7 +833,7 @@ fn right_aligned_virtual_text_sits_against_the_window_edge() {
     m.apply(UiEvent::WindowOpened {
         win: WindowId(1),
         buf: BufferId(1),
-        layout: WindowLayout::Docked { dock: Dock::Main, size: None },
+        layout: WindowLayout::Docked { dock: Dock::Main, size: None, gravity: Gravity::Start },
     });
     let rows = rows_of(&m, 20, 3);
     assert_eq!(rows[0], "a thread          2m", "flush right on a 20-wide pane: {rows:?}");
@@ -854,7 +854,7 @@ fn right_alignment_measures_columns_not_bytes() {
     m.apply(UiEvent::WindowOpened {
         win: WindowId(1),
         buf: BufferId(1),
-        layout: WindowLayout::Docked { dock: Dock::Main, size: None },
+        layout: WindowLayout::Docked { dock: Dock::Main, size: None, gravity: Gravity::Start },
     });
     // Read cells rather than the joined string: the backend pads a wide glyph with a blank
     // continuation cell, so counting characters would measure the harness, not the layout.
@@ -877,7 +877,7 @@ fn right_aligned_text_that_does_not_fit_follows_the_line_instead_of_overflowing(
     m.apply(UiEvent::WindowOpened {
         win: WindowId(1),
         buf: BufferId(1),
-        layout: WindowLayout::Docked { dock: Dock::Main, size: None },
+        layout: WindowLayout::Docked { dock: Dock::Main, size: None, gravity: Gravity::Start },
     });
     let rows = rows_of(&m, 20, 4);
     assert!(rows.join("").contains("status"), "the annotation is still shown: {rows:?}");
@@ -899,7 +899,7 @@ fn a_row_can_carry_both_a_right_aligned_and_a_trailing_annotation() {
     m.apply(UiEvent::WindowOpened {
         win: WindowId(1),
         buf: BufferId(1),
-        layout: WindowLayout::Docked { dock: Dock::Main, size: None },
+        layout: WindowLayout::Docked { dock: Dock::Main, size: None, gravity: Gravity::Start },
     });
     // The grammar: `Eol` means "after the text", `Right` means "at the edge". Both fit on one row.
     let rows = rows_of(&m, 20, 3);
@@ -964,4 +964,120 @@ fn a_float_clips_a_long_row_rather_than_wrapping_it() {
     let rows = rows_of(&m, 40, 6);
     let with_second = rows.iter().find(|r| r.contains("second option"));
     assert!(with_second.is_some(), "row two is still row two: {rows:?}");
+}
+
+// ---------------------------------------------------------------------------
+// Chrome: virtual text drawn around a field you type into
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_prompt_on_an_empty_line_is_still_drawn() {
+    // Regression. Inline chunks used to be spliced in while walking the *gaps between* cut
+    // positions, and an empty line has one position and no gaps — so the prompt glyph vanished on
+    // an empty composer, which is the one moment it is doing all of the work.
+    let out = render_line(&line("", vec![mark(0, VirtTextPos::Inline, "> ")]), &theme());
+    assert_eq!(flatten(&out), vec!["> "]);
+}
+
+#[test]
+fn the_caret_moves_past_chrome_drawn_in_front_of_it() {
+    // A prompt is virtual: it occupies screen columns and no bytes. Without accounting for it the
+    // caret sits under the prompt rather than after it, and every keystroke appears one place to
+    // the left of where it lands.
+    let mut m = Mirror::new();
+    m.apply(UiEvent::BufferOpened { buf: BufferId(1), name: "composer".into() });
+    m.apply(UiEvent::BufferLines {
+        buf: BufferId(1),
+        start: 0,
+        old_end: 0,
+        lines: vec![line("hi", vec![mark(0, VirtTextPos::Inline, "\u{203a} ")])],
+    });
+    m.apply(UiEvent::WindowOpened {
+        win: WindowId(1),
+        buf: BufferId(1),
+        layout: WindowLayout::Docked { dock: Dock::Bottom, size: Some(1), gravity: Gravity::Start },
+    });
+    m.apply(UiEvent::CursorMoved { win: WindowId(1), row: 0, col: 2 });
+
+    let mut terminal = Terminal::new(TestBackend::new(20, 3)).unwrap();
+    let t = theme();
+    let mut caret = None;
+    terminal.draw(|f| caret = neosh_tui::render::draw(f, &m, &t)).unwrap();
+    assert_eq!(caret, Some((4, 2)), "two columns of prompt, then two of text");
+}
+
+#[test]
+fn a_line_drawn_above_the_first_row_pushes_the_caret_down() {
+    let mut m = Mirror::new();
+    m.apply(UiEvent::BufferOpened { buf: BufferId(1), name: "composer".into() });
+    m.apply(UiEvent::BufferLines {
+        buf: BufferId(1),
+        start: 0,
+        old_end: 0,
+        lines: vec![line("hi", vec![mark(0, VirtTextPos::Above, "----")])],
+    });
+    m.apply(UiEvent::WindowOpened {
+        win: WindowId(1),
+        buf: BufferId(1),
+        layout: WindowLayout::Docked { dock: Dock::Bottom, size: Some(2), gravity: Gravity::Start },
+    });
+    m.apply(UiEvent::CursorMoved { win: WindowId(1), row: 0, col: 2 });
+
+    let mut terminal = Terminal::new(TestBackend::new(20, 4)).unwrap();
+    let t = theme();
+    let mut caret = None;
+    terminal.draw(|f| caret = neosh_tui::render::draw(f, &m, &t)).unwrap();
+    assert_eq!(caret, Some((2, 3)), "the rule takes the first of the two rows");
+}
+
+#[test]
+fn short_content_settles_against_the_end_when_told_to() {
+    // Two lines in a five-row window. With `Gravity::End` they belong at the bottom, so a short
+    // conversation sits just above the composer instead of floating at the top of the screen.
+    let mut m = Mirror::new();
+    m.apply(UiEvent::BufferOpened { buf: BufferId(1), name: "chat".into() });
+    m.apply(UiEvent::BufferLines {
+        buf: BufferId(1),
+        start: 0,
+        old_end: 0,
+        lines: vec![line("first", vec![]), line("second", vec![])],
+    });
+    m.apply(UiEvent::WindowOpened {
+        win: WindowId(1),
+        buf: BufferId(1),
+        layout: WindowLayout::Docked { dock: Dock::Main, size: None, gravity: Gravity::End },
+    });
+
+    let mut terminal = Terminal::new(TestBackend::new(10, 5)).unwrap();
+    let t = theme();
+    terminal.draw(|f| { neosh_tui::render::draw(f, &m, &t); }).unwrap();
+    let rows: Vec<String> = (0..5)
+        .map(|y| (0..10).map(|x| terminal.backend().buffer()[(x, y)].symbol()).collect())
+        .collect();
+    assert_eq!(rows[3].trim_end(), "first");
+    assert_eq!(rows[4].trim_end(), "second");
+    assert_eq!(rows[0].trim(), "", "and nothing is drawn at the top");
+}
+
+#[test]
+fn the_default_gravity_leaves_content_where_it_has_always_been() {
+    let mut m = Mirror::new();
+    m.apply(UiEvent::BufferOpened { buf: BufferId(1), name: "chat".into() });
+    m.apply(UiEvent::BufferLines {
+        buf: BufferId(1),
+        start: 0,
+        old_end: 0,
+        lines: vec![line("first", vec![])],
+    });
+    m.apply(UiEvent::WindowOpened {
+        win: WindowId(1),
+        buf: BufferId(1),
+        layout: WindowLayout::Docked { dock: Dock::Main, size: None, gravity: Gravity::Start },
+    });
+
+    let mut terminal = Terminal::new(TestBackend::new(10, 4)).unwrap();
+    let t = theme();
+    terminal.draw(|f| { neosh_tui::render::draw(f, &m, &t); }).unwrap();
+    let top: String = (0..10).map(|x| terminal.backend().buffer()[(x, 0)].symbol()).collect();
+    assert_eq!(top.trim_end(), "first");
 }

@@ -480,28 +480,22 @@ async fn list_models(agent: &Agent) -> anyhow::Result<()> {
         // What the credential store says, not what the config file says: a key typed in last week
         // and put in the keychain is why an instance whose environment variable is unset works
         // anyway, and a listing that reported otherwise would send people looking for a bug.
-        let note = match neosh_provider::credentials::credentials().source(&inst) {
-            neosh_proto::CredentialSource::Env { var } => format!("  (${var})"),
-            neosh_proto::CredentialSource::Keychain => "  (key in the keychain)".to_string(),
-            neosh_proto::CredentialSource::Session => "  (key entered this run)".to_string(),
-            neosh_proto::CredentialSource::Command => "  (credential helper)".to_string(),
-            neosh_proto::CredentialSource::Plan { via } => format!("  (your {via} login)"),
-            neosh_proto::CredentialSource::PlanMissing { program, hint } => match hint {
-                Some(cmd) => format!("  ({program} is not installed — then run `{cmd}`)"),
-                None => format!("  ({program} is not installed)"),
-            },
-            neosh_proto::CredentialSource::Inherited => {
-                "  (uses an existing login)".to_string()
-            }
+        let source = neosh_provider::credentials::credentials().source(&inst);
+        let note = match source {
             neosh_proto::CredentialSource::NotNeeded => String::new(),
-            neosh_proto::CredentialSource::Missing => match &inst.auth {
-                neosh_proto::AuthRef::Env { var } => format!("  (no key — ${var} is not set)"),
-                _ => "  (no key)".to_string(),
-            },
+            other => format!("  ({})", other.summary(&inst.auth)),
         };
         say!("{} — {}{}", inst.id, inst.display_name, note);
         if models.is_empty() {
-            say!("    (no models listed; discovery needs credentials)");
+            // Why there is nothing, not just that there is nothing. The two causes need opposite
+            // fixes: one is a key, the other is starting the server.
+            match &inst.auth {
+                neosh_proto::AuthRef::None => say!(
+                    "    (nothing reachable at {})",
+                    inst.base_url.as_deref().unwrap_or("the configured address")
+                ),
+                _ => say!("    (no models listed \u{2014} discovery needs a key)"),
+            }
         }
         for m in models {
             say!("    {}/{}", inst.id, m.id);

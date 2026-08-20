@@ -535,7 +535,9 @@ export async function activate({ neosh }: PluginContext) {
         "the sequence ran the command: {:?}",
         s.messages()
     );
-    assert_eq!(s.composer(), Vec::<String>::new().as_slice(), "and typed nothing");
+    // Concatenated rather than compared to a literal: an empty composer is one empty line, and
+    // whether the frontend has been told about that line yet is not what this test is about.
+    assert_eq!(s.composer().concat(), "", "and typed nothing");
 }
 
 #[test]

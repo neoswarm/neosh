@@ -1125,7 +1125,7 @@ fn ctrl_c_clears_a_draft_before_it_considers_quitting() {
     // has to deal with the most local thing first and only ever leave as a last resort.
     let s = Sandbox::new("ctrlc-draft");
     let mut sess = s.start();
-    sess.wait_for("type a message");
+    sess.wait_for("agent workspace");
 
     for c in "hello there".chars() {
         sess.key_char(c);
@@ -1146,7 +1146,7 @@ fn ctrl_c_clears_a_draft_before_it_considers_quitting() {
 fn ctrl_c_twice_on_an_empty_composer_quits() {
     let s = Sandbox::new("ctrlc-quit");
     let mut sess = s.start();
-    sess.wait_for("type a message");
+    sess.wait_for("agent workspace");
 
     sess.key_ctrl('c');
     sess.wait_for("press ^C again to quit");
@@ -1160,7 +1160,7 @@ fn ctrl_c_twice_on_an_empty_composer_quits() {
 fn ctrl_q_quits_immediately() {
     let s = Sandbox::new("ctrlq");
     let mut sess = s.start();
-    sess.wait_for("type a message");
+    sess.wait_for("agent workspace");
     sess.key_ctrl('q');
     assert!(sess.exits_within(Duration::from_secs(10)), "^Q is the no-questions exit");
 }
@@ -1171,7 +1171,7 @@ fn a_termination_signal_leaves_through_the_ordinary_quit_path() {
     // terminal, or a `kill` leaves the user's shell in raw mode with the alternate screen on.
     let s = Sandbox::new("sigterm");
     let mut sess = s.start();
-    sess.wait_for("type a message");
+    sess.wait_for("agent workspace");
     sess.signal(libc_sigterm());
     assert!(sess.exits_within(Duration::from_secs(10)), "SIGTERM should shut down cleanly");
     assert!(sess.saw_shutdown(), "the frontend was told to shut down\n{}", sess.transcript());

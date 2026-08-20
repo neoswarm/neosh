@@ -15,10 +15,11 @@ use std::time::Duration;
 use neosh_agent::{Agent, AgentEvent, PluginBridge};
 use neosh_core::{CoreEffect, Editor};
 use neosh_proto::{
-    ApiCall, ApiError, ApiOk, ApiResponse, ApiResult, BufferId, CursorMotion, Dock, InputEvent,
+    ApiCall, ApiError, ApiOk, ApiResponse, ApiResult, BufferId, CursorMotion, Dock, Gravity,
+    InputEvent,
     KeyCode, MessageLevel, Mode, OptionSpec, OptionType, OptionValue, PluginEvent, PluginId,
-    PluginInbound, PluginOutbound, PluginResponse, RequestId, TextEdit, UiEvent, WindowId,
-    WindowLayout,
+    PluginInbound, PluginOutbound, PluginResponse, RequestId, TextEdit, UiEvent, VirtTextPos,
+    WindowId, WindowLayout,
 };
 use neosh_provider::catalog;
 use neosh_script::{ScriptInbound, ScriptOutbound};
@@ -137,6 +138,17 @@ pub struct Host {
     chat_top: u32,
     composer: BufferId,
     composer_win: WindowId,
+    /// Marks for the chrome around the composer: the prompt, the placeholder, the shortcut row.
+    /// Its own namespace so redrawing it cannot disturb anything else on that buffer.
+    composer_ns: neosh_proto::NamespaceId,
+    /// What the row under the composer says, keyed by whoever put it there.
+    hints: std::collections::BTreeMap<String, neosh_proto::Hint>,
+    /// How many leading transcript rows the welcome block last occupied, so redrawing it replaces
+    /// its own lines and a conversation is recognisable as "not that".
+    welcome_rows: usize,
+    /// Whether `agent.model` chose the current selection. A chosen model is never silently
+    /// replaced; a remembered one is.
+    selection_pinned: bool,
     status: BufferId,
     status_ns: neosh_proto::NamespaceId,
     /// Where the transcript's own highlights live.
@@ -223,8 +235,13 @@ pub struct Host {
 /// costs nothing because the name is already there. The keys tried are the ones every file and
 /// shell tool in practice uses.
 fn tool_subject(call: &neosh_proto::ToolCall) -> String {
+    subject_of(&call.name, &call.input)
+}
+
+/// What a tool call is *about*, from whichever of its arguments says so.
+fn subject_of(_name: &str, input: &serde_json::Value) -> String {
     const KEYS: &[&str] = &["path", "file_path", "file", "pattern", "query", "command", "url"];
-    let Some(map) = call.input.as_object() else { return String::new() };
+    let Some(map) = input.as_object() else { return String::new() };
     for key in KEYS {
         if let Some(v) = map.get(*key).and_then(|v| v.as_str()) {
             let one = v.lines().next().unwrap_or(v).trim();
@@ -302,17 +319,28 @@ impl Host {
 
         let chat = editor.create_buffer("[chat]");
         let chat_win =
-            editor.open_window(chat, WindowLayout::Docked { dock: Dock::Main, size: None });
+            editor.open_window(chat, WindowLayout::Docked {
+                dock: Dock::Main,
+                size: None,
+                // A conversation settles against the field you answer it in. Anchored to the top,
+                // a two-line exchange floats at the ceiling with a screen of nothing under it, and
+                // the eye has to travel the whole window between what was said and where you say
+                // the next thing.
+                gravity: Gravity::End,
+            });
 
         // Docked before the composer, so it takes the bottom-most row and the composer sits above
         // it. Without a status line the startup screen renders literally nothing — two empty
         // buffers — and "it opened an empty terminal" is indistinguishable from "it crashed".
         let status = editor.create_buffer("[status]");
-        editor.open_window(status, WindowLayout::Docked { dock: Dock::Bottom, size: Some(1) });
+        editor.open_window(status, WindowLayout::Docked { dock: Dock::Bottom, size: Some(1), gravity: Gravity::Start });
 
         let composer = editor.create_buffer("[composer]");
+        // Four rows: a rule, up to three lines of what you are writing, and the shortcut row that
+        // lives on the last of them as a virtual line. The rule is what makes the composer read as
+        // a field rather than as the last paragraph of the transcript.
         let composer_win =
-            editor.open_window(composer, WindowLayout::Docked { dock: Dock::Bottom, size: Some(3) });
+            editor.open_window(composer, WindowLayout::Docked { dock: Dock::Bottom, size: Some(4), gravity: Gravity::Start });
         editor.set_mode(Mode::Chat);
 
         let mut namespace = |name: &str| {
@@ -323,6 +351,7 @@ impl Host {
         };
         let status_ns = namespace("neosh.status");
         let chat_ns = namespace("neosh.chat");
+        let composer_ns = namespace("neosh.composer");
 
         Self {
             editor,
@@ -337,8 +366,12 @@ impl Host {
             status,
             status_ns,
             chat_ns,
+            composer_ns,
             working: None,
             status_segments: Default::default(),
+            hints: Default::default(),
+            welcome_rows: 0,
+            selection_pinned: false,
             active_turn: None,
             keys_pending: false,
             keys_touched: false,
@@ -472,6 +505,9 @@ impl Host {
         let _ = self
             .editor
             .apply(&plugin, ApiCall::WinSelect { win: self.composer_win, on: false });
+        // The placeholder appears and disappears with the text, so the chrome has to follow every
+        // write and not just every keystroke.
+        self.refresh_composer();
     }
 
     /// Route a plugin call: UI-domain calls to the core, agent-domain calls to the agent layer.
@@ -679,6 +715,17 @@ impl Host {
                 }
             }
 
+            ApiCall::HintSet { key, hint } => {
+                self.hints.insert(format!("{plugin}:{key}"), hint);
+                self.refresh_composer();
+                Ok(ApiOk::Unit)
+            }
+            ApiCall::HintClear { key } => {
+                self.hints.remove(&format!("{plugin}:{key}"));
+                self.refresh_composer();
+                Ok(ApiOk::Unit)
+            }
+
             ApiCall::StatusSet { key, segment } => {
                 // Namespaced by plugin, so two plugins choosing the same key cannot fight and
                 // unloading one takes only its own segments.
@@ -862,7 +909,11 @@ impl Host {
                 }
                 self.startup.pending_model = None;
                 self.agent.set_selection(selection);
+                // Chosen, not remembered: from here on the fallback leaves it alone even if it
+                // cannot authenticate, because the error is more use than a substitution.
+                self.selection_pinned = true;
                 self.refresh_status();
+                self.draw_welcome();
             }
             "ui.theme" => {
                 let Some(name) = value.as_str() else { return };
@@ -879,6 +930,7 @@ impl Host {
                     self.refresh_status();
                 }
             }
+            "ui.hints" => self.refresh_composer(),
             "ui.motion" => {
                 // Applied by stripping the animation from the groups that have one, so a frontend
                 // needs no concept of the setting: it animates what carries an animation, and with
@@ -989,10 +1041,280 @@ impl Host {
         }
     }
 
-    /// What the chat buffer says before anything has happened.
-    fn greet(&mut self) {
-        self.chat_line("neosh — type a message and press Enter.");
-        self.chat_line("");
+    /// Redraw the chrome around the composer: the rule, the prompt, the placeholder, the shortcuts.
+    ///
+    /// All of it is virtual text rather than characters in the buffer, which is the only version
+    /// that is correct: the composer's contents *are* the message, so a `› ` written into it would
+    /// be sent to the model, and a placeholder written into it would be sent the moment someone
+    /// pressed Enter without looking. Virtual text is drawn and never read back.
+    fn refresh_composer(&mut self) {
+        let plugin = PluginId::from(BUILTIN);
+        let _ = self.editor.apply(&plugin, ApiCall::MarkClear {
+            ns: self.composer_ns,
+            buf: self.composer,
+            start: None,
+            end: None,
+        });
+        if self.secret.is_some() {
+            // While a key is being typed the composer is borrowed and says so itself. Shortcuts
+            // that no longer work, advertised under a field where every keystroke is captured, is
+            // exactly the wrong thing to be reading.
+            return;
+        }
+
+        let ascii = self.option_bool("ui.ascii_only");
+        let text = self.composer_text();
+        let lines = self.editor.buffer(self.composer).map(|b| b.line_count()).unwrap_or(1).max(1);
+        let width = self
+            .editor
+            .window(self.composer_win)
+            .and_then(|w| w.viewport.map(|v| v.width as usize))
+            .unwrap_or(80);
+
+        // The rule. Drawn above the first line, so it moves with the field rather than being a row
+        // the transcript has to remember not to write on.
+        let rule = if ascii { "-" } else { "\u{2500}" };
+        self.composer_mark(0, VirtTextPos::Above, vec![chunk(rule.repeat(width), "Composer.Rule")]);
+
+        // The prompt, spliced in at column zero. The caret is pushed past it by the frontend, which
+        // is the only place that knows how wide it drew.
+        let caret = if ascii { "> " } else { "\u{203a} " };
+        self.composer_mark(0, VirtTextPos::Inline, vec![chunk(caret, "Composer.Prompt")]);
+
+        if text.is_empty() {
+            self.composer_mark(
+                0,
+                VirtTextPos::Eol,
+                vec![chunk("Ask anything, or run a command", "Composer.Placeholder")],
+            );
+        }
+
+        // The shortcut row goes under the last line you have written — and steps aside once you are
+        // writing enough that it would cost you a line to look at.
+        if lines <= 2 {
+            let row = lines - 1;
+            let indent = caret.chars().count();
+            if let Some(chunks) = self.hint_row(width.saturating_sub(indent)) {
+                let mut v = vec![chunk(" ".repeat(indent), "Composer.Hint")];
+                v.extend(chunks);
+                self.composer_mark(row, VirtTextPos::Below, v);
+            }
+        }
+    }
+
+    /// One virtual-text mark on the composer.
+    fn composer_mark(&mut self, row: u32, pos: VirtTextPos, virt_text: Vec<neosh_proto::VirtChunk>) {
+        let _ = self.editor.apply(&PluginId::from(BUILTIN), ApiCall::MarkSet {
+            ns: self.composer_ns,
+            buf: self.composer,
+            row,
+            col: 0,
+            opts: neosh_proto::ExtmarkOpts {
+                end_col: None,
+                hl_group: None,
+                virt_text,
+                virt_text_pos: pos,
+                on_delete: neosh_proto::OnDelete::Clamp,
+                priority: 0,
+            },
+        });
+    }
+
+    /// The shortcuts, as many as fit, in the order whoever registered them asked for.
+    ///
+    /// Truncation drops whole hints from the end rather than cutting one in half, because half a
+    /// shortcut is worse than no shortcut: it reads as a key that exists and does something else.
+    /// Nothing is ever dropped silently to nothing — a row too narrow for even one hint simply
+    /// does not appear, and the full list is still a keypress away.
+    fn hint_row(&self, width: usize) -> Option<Vec<neosh_proto::VirtChunk>> {
+        if !self.editor.options().bool("ui.hints").unwrap_or(true) {
+            return None;
+        }
+        let mut hints: Vec<(&String, &neosh_proto::Hint)> = self.hints.iter().collect();
+        hints.sort_by(|a, b| a.1.priority.cmp(&b.1.priority).then_with(|| a.0.cmp(b.0)));
+
+        let mut out: Vec<neosh_proto::VirtChunk> = Vec::new();
+        let mut used = 0usize;
+        for (_, h) in hints {
+            let gap = if out.is_empty() { 0 } else { 2 };
+            let cost = gap + display_width(&h.keys) + 1 + display_width(&h.label);
+            if used + cost > width {
+                break;
+            }
+            if gap > 0 {
+                out.push(chunk("  ", "Composer.Hint"));
+            }
+            out.push(chunk(h.keys.clone(), "Composer.HintKey"));
+            out.push(chunk(format!(" {}", h.label), "Composer.Hint"));
+            used += cost;
+        }
+        (!out.is_empty()).then_some(out)
+    }
+
+    /// What the transcript says before anything has happened.
+    ///
+    /// Redrawn rather than written once, because the two facts worth putting here — which model
+    /// answers, and whether it can — are not known when the first frame goes up: providers register
+    /// during startup and a plugin may add one later still. `welcome_rows` is how it knows what it
+    /// last wrote, so a redraw replaces its own lines and never a real turn's.
+    fn draw_welcome(&mut self) {
+        // Anything else in the buffer is a conversation. Leave it alone. "Empty" has to allow for
+        // the one blank line a buffer always has, which is not the same as no lines at all.
+        let blank = self
+            .editor
+            .buffer(self.chat)
+            .map(|b| b.line_count() <= 1 && b.get_lines(0, 1).iter().all(|l| l.is_empty()))
+            .unwrap_or(true);
+        let n = self.editor.buffer(self.chat).map(|b| b.line_count()).unwrap_or(0) as usize;
+        if !blank && n != self.welcome_rows {
+            return;
+        }
+        let replacing = if blank { n as i64 } else { self.welcome_rows as i64 };
+
+        let selection = self.agent.selection();
+        let account = selection.as_ref().and_then(|s| {
+            let reg = self.agent.providers();
+            let inst = reg.instances().find(|i| i.id == s.instance)?;
+            Some(neosh_provider::credentials::credentials().source(inst).summary(&inst.auth))
+        });
+        let model = match &selection {
+            Some(s) => match account {
+                Some(a) => format!("{}/{}  \u{b7}  {a}", s.instance, s.model),
+                None => format!("{}/{}", s.instance, s.model),
+            },
+            None => "nothing configured \u{2014} run `neosh --list-models`".to_string(),
+        };
+
+        let mut rows = vec![
+            String::new(),
+            "  neosh \u{2014} a terminal-first agent workspace".to_string(),
+            String::new(),
+            format!("  model      {model}"),
+            format!("  directory  {}", tilde(&self.cwd)),
+            String::new(),
+        ];
+        // Only when there is something to say. On a working setup the welcome should be four short
+        // lines and then out of the way.
+        if selection.as_ref().is_some_and(|s| !self.selection_is_usable(s)) {
+            rows.push("  This model cannot authenticate yet. Press ^P to pick another, or add a \
+                       key there."
+                .to_string());
+            rows.push(String::new());
+        }
+
+        let plugin = PluginId::from(BUILTIN);
+        let _ = self.editor.apply(&plugin, ApiCall::BufSetLines {
+            buf: self.chat,
+            start: 0,
+            end: replacing,
+            lines: rows.clone(),
+        });
+        self.welcome_rows = rows.len();
+        self.chat_mark(1, 2, 2 + "neosh".len(), "Accent");
+        self.chat_mark(1, 2 + "neosh".len(), rows[1].len(), "Comment");
+        for row in [3u32, 4] {
+            self.chat_mark(row, 0, 13, "Comment");
+        }
+        if rows.len() > 6 {
+            self.chat_mark(6, 0, rows[6].len(), "Diagnostic.Warn");
+        }
+    }
+
+    /// The characters this terminal gets to draw the transcript with.
+    fn glyphs(&self) -> Glyphs {
+        Glyphs::new(self.option_bool("ui.ascii_only"))
+    }
+
+    /// Move off a model that cannot authenticate, if there is somewhere sensible to move to.
+    ///
+    /// The case this exists for: a conversation started months ago against an API-key provider is
+    /// reopened on a machine with no key, and every launch greets you with "no key" over a model
+    /// you never chose today. A stored selection is a *record of what was used*, not an instruction
+    /// — so when it has stopped working, following it is the wrong kind of faithful.
+    ///
+    /// What `agent.model` says is a different matter and is left alone: that is a person telling
+    /// neosh which model to use, and quietly using another one would be worse than the error.
+    ///
+    /// The replacement keeps the product line where it can — `anthropic/claude-opus-5` becomes the
+    /// Opus you have on a plan, not whatever sorts first — because "same model, different way of
+    /// paying for it" is a switch nobody needs to think about, and any other switch is one they do.
+    fn ensure_usable_selection(&mut self) {
+        if self.selection_pinned {
+            return;
+        }
+        let Some(current) = self.agent.selection() else { return };
+        if self.selection_is_usable(&current) {
+            return;
+        }
+
+        let replacement = {
+            let reg = self.agent.providers();
+            let family = reg
+                .instances()
+                .find(|i| i.id == current.instance)
+                .and_then(|i| i.models.iter().find(|m| m.id == current.model))
+                .and_then(|m| m.family.clone());
+            let same_line = family.as_ref().and_then(|f| {
+                reg.ready_instances().find_map(|i| {
+                    let m = i
+                        .models
+                        .iter()
+                        .filter(|m| m.family.as_ref() == Some(f) && !m.legacy)
+                        .max_by_key(|m| m.tier.map(|t| t.rank()).unwrap_or(0))?;
+                    Some(neosh_proto::ModelSelection {
+                        instance: i.id.clone(),
+                        model: m.id.clone(),
+                        options: catalog::default_options(&m.capabilities),
+                    })
+                })
+            });
+            same_line.or_else(|| reg.default_selection())
+        };
+
+        let Some(next) = replacement else {
+            // Nothing works. Say so once, here, rather than letting the first message find out.
+            self.editor_message(
+                MessageLevel::Warn,
+                format!(
+                    "{} cannot authenticate, and nothing else is configured. Press ^P to add a key.",
+                    current.instance
+                ),
+            );
+            return;
+        };
+
+        let note = format!(
+            "{}/{} cannot authenticate \u{2014} using {}/{} instead.",
+            current.instance, current.model, next.instance, next.model
+        );
+        self.agent.set_selection(next);
+        self.editor_message(MessageLevel::Info, note);
+        self.refresh_status();
+    }
+
+    /// Whether a turn sent with this selection could authenticate.
+    fn selection_is_usable(&self, s: &neosh_proto::ModelSelection) -> bool {
+        let reg = self.agent.providers();
+        reg.instances()
+            .find(|i| i.id == s.instance)
+            .is_some_and(|i| neosh_provider::credentials::credentials().source(i).is_usable())
+    }
+
+    /// The shortcuts the host itself owns. Everything else on that row comes from a plugin.
+    fn seed_hints(&mut self) {
+        let ascii = self.option_bool("ui.ascii_only");
+        let (send, newline) =
+            if ascii { ("Enter", "S-Enter") } else { ("\u{23ce}", "\u{21e7}\u{23ce}") };
+        self.hints.insert(format!("{BUILTIN}:send"), neosh_proto::Hint {
+            keys: send.into(),
+            label: "send".into(),
+            priority: 0,
+        });
+        self.hints.insert(format!("{BUILTIN}:newline"), neosh_proto::Hint {
+            keys: newline.into(),
+            label: "newline".into(),
+            priority: 1,
+        });
     }
 
     fn option_bool(&self, name: &str) -> bool {
@@ -1438,22 +1760,38 @@ impl Host {
     fn enter_session(&mut self) {
         self.streaming = None;
         self.chat_top = 0;
-        let (lines, label) = {
+        let ascii = self.option_bool("ui.ascii_only");
+        let (lines, marks, label) = {
             let store = self.agent.sessions();
             let s = store.active();
-            (transcript(s), s.label())
+            let (lines, marks) = transcript(s, ascii);
+            (lines, marks, s.label())
         };
         let plugin = PluginId::from(BUILTIN);
+        let _ = self.editor.apply(&plugin, ApiCall::MarkClear {
+            ns: self.chat_ns,
+            buf: self.chat,
+            start: None,
+            end: None,
+        });
         let _ = self.editor.apply(&plugin, ApiCall::BufSetLines {
             buf: self.chat,
             start: 0,
             end: -1,
             lines,
         });
+        for (row, from, to, hl) in marks {
+            self.chat_mark(row, from, to, hl);
+        }
         let _ = self.editor.apply(&plugin, ApiCall::BufSetName {
             buf: self.chat,
             name: format!("[chat] {label}"),
         });
+        // Nothing of the previous conversation's welcome survives into this one: the buffer was
+        // just replaced wholesale, so what `welcome_rows` remembered is about text that is gone.
+        self.welcome_rows = 0;
+        self.ensure_usable_selection();
+        self.draw_welcome();
         self.set_composer("");
         self.refresh_status();
         self.bridge.broadcast(PluginEvent::SessionChanged {
@@ -1512,7 +1850,7 @@ impl Host {
     /// frontend loses a prefix on every line but the first, and the thing you scan for when
     /// scrolling back is *where the turns start*.
     fn chat_question(&mut self, text: &str) {
-        let glyph = if self.option_bool("ui.ascii_only") { "|" } else { "\u{258c}" };
+        let glyph = self.glyphs().bar;
         let mut rows = Vec::new();
         for line in text.lines() {
             rows.push(format!("{glyph} {line}"));
@@ -1554,7 +1892,7 @@ impl Host {
         let row = self.working_row();
 
         let ascii = self.option_bool("ui.ascii_only");
-        let glyph = if ascii { "*" } else { "\u{2733}" };
+        let glyph = Glyphs::new(ascii).work;
         let elapsed =
             if secs >= 60 { format!("{}m {}s", secs / 60, secs % 60) } else { format!("{secs}s") };
 
@@ -1674,8 +2012,7 @@ impl Host {
             }
             AgentEvent::ToolStarted { turn, call } => {
                 if self.option_bool("chat.show_tools") {
-                    let ascii = self.option_bool("ui.ascii_only");
-                    let glyph = if ascii { ">" } else { "\u{23f5}" };
+                    let glyph = self.glyphs().tool;
                     let text = format!("  {glyph} {}{}", call.name, tool_subject(&call));
                     let row = self.chat_push(vec![text.clone()]);
                     self.chat_mark(row, 0, 2 + glyph.len() + 1 + call.name.len(), "Agent.Tool");
@@ -1697,8 +2034,7 @@ impl Host {
             AgentEvent::ToolFinished { turn, call, result } => {
                 // Errors show regardless: a tool that failed silently is a debugging session.
                 if result.is_error {
-                    let ascii = self.option_bool("ui.ascii_only");
-                    let glyph = if ascii { "x" } else { "\u{2717}" };
+                    let glyph = self.glyphs().fail;
                     let first = result.content.lines().next().unwrap_or("").trim();
                     let text = format!("  {glyph} {}: {first}", call.name);
                     let row = self.chat_push(vec![text.clone()]);
@@ -1819,7 +2155,9 @@ impl Host {
             }
             return true;
         }
-        self.handle_input_uncaptured(input)
+        let handled = self.handle_input_uncaptured(input);
+        self.refresh_composer();
+        handled
     }
 
     fn handle_input_uncaptured(&mut self, input: InputEvent) -> bool {
@@ -2055,8 +2393,10 @@ impl Host {
     }
 
     pub fn begin_startup(&mut self, boot: Bootstrap) {
-        self.greet();
+        self.seed_hints();
+        self.draw_welcome();
         self.refresh_status();
+        self.refresh_composer();
         self.startup.reload = Some(boot.reload);
         self.startup.base_instances =
             self.agent.providers().instances().cloned().collect();
@@ -2222,6 +2562,9 @@ impl Host {
         // reload removed the plugin that put it there.
         let prefix = format!("{id}:");
         self.status_segments.retain(|k, _| !k.starts_with(&prefix));
+        // Same for its shortcuts: a row advertising `^P model` after the model plugin was unloaded
+        // is a key that does nothing, which is worse than a row with one fewer entry on it.
+        self.hints.retain(|k, _| !k.starts_with(&prefix));
         if let Some(drivers) = self.plugin_drivers.remove(id) {
             let mut reg = self.agent.providers_mut();
             for d in drivers {
@@ -2568,6 +2911,16 @@ impl Host {
             // is switched off must not take the setting away from everything else — which is
             // exactly what happened when the sidebar owned these and `plugins.disabled` was used.
             OptionSpec {
+                name: "ui.hints".into(),
+                ty: OptionType::Bool,
+                default: OptionValue::Bool(true),
+                description: Some(
+                    "Show the shortcut row under the composer. Off gives the transcript the row \
+                     back; the full list is still on the help key."
+                        .into(),
+                ),
+            },
+            OptionSpec {
                 name: "ui.ascii_only".into(),
                 ty: OptionType::Bool,
                 default: OptionValue::Bool(false),
@@ -2731,6 +3084,12 @@ impl Host {
                 ),
             }
         }
+        // Last, because it can only judge a selection once every driver that might serve it has
+        // registered — a plugin provider arriving late is exactly the case that would otherwise be
+        // mistaken for "this model does not work".
+        self.ensure_usable_selection();
+        self.draw_welcome();
+        self.refresh_composer();
     }
 
     /// Run a reload that arrived while startup was still in flight.
@@ -2964,24 +3323,40 @@ pub fn now_secs() -> i64 {
 ///
 /// Deliberately the *same* shape the live stream produces, so switching away and back does not
 /// change what a turn looks like.
-fn transcript(session: &neosh_agent::Session) -> Vec<String> {
+fn transcript(session: &neosh_agent::Session, ascii: bool) -> (Vec<String>, Vec<Mark>) {
     use neosh_proto::{ContentBlock, Role};
 
-    let mut lines = Vec::new();
+    let g = Glyphs::new(ascii);
+    let mut lines: Vec<String> = Vec::new();
+    let mut marks: Vec<Mark> = Vec::new();
     for message in &session.messages {
         for block in &message.content {
             match block {
-                ContentBlock::Text { text } => {
-                    let prefix = if message.role == Role::User { "› " } else { "" };
-                    for (i, line) in text.lines().enumerate() {
-                        lines.push(if i == 0 { format!("{prefix}{line}") } else { line.to_string() });
+                ContentBlock::Text { text } if message.role == Role::User => {
+                    for line in text.lines() {
+                        marks.push((lines.len() as u32, 0, g.bar.len(), "Agent.User"));
+                        lines.push(format!("{} {line}", g.bar));
                     }
                     lines.push(String::new());
                 }
-                ContentBlock::ToolUse { name, .. } => lines.push(format!("  ⚙ {name}")),
+                ContentBlock::Text { text } => {
+                    lines.extend(text.lines().map(str::to_string));
+                    lines.push(String::new());
+                }
+                ContentBlock::ToolUse { name, input, .. } => {
+                    let subject = subject_of(name, input);
+                    let text = format!("  {} {name}{subject}", g.tool);
+                    let split = 2 + g.tool.len() + 1 + name.len();
+                    marks.push((lines.len() as u32, 0, split, "Agent.Tool"));
+                    marks.push((lines.len() as u32, split, text.len(), "Agent.Usage"));
+                    lines.push(text);
+                }
                 ContentBlock::ToolResult { is_error, content, .. } => {
                     if *is_error {
-                        lines.push(format!("  ✗ {content}"));
+                        let first = content.lines().next().unwrap_or("").trim();
+                        let text = format!("  {} {first}", g.fail);
+                        marks.push((lines.len() as u32, 0, text.len(), "Agent.ToolError"));
+                        lines.push(text);
                     }
                 }
                 // Reasoning is not replayed: it is shown live when `chat.show_thinking` is on, and
@@ -2990,9 +3365,67 @@ fn transcript(session: &neosh_agent::Session) -> Vec<String> {
             }
         }
     }
-    if lines.is_empty() {
-        lines.push("neosh — type a message and press Enter.".to_string());
-        lines.push(String::new());
+    (lines, marks)
+}
+
+/// One highlighted span of the transcript: row, byte range, group.
+type Mark = (u32, usize, usize, &'static str);
+
+/// The characters the transcript is drawn with, at whatever fidelity the terminal has.
+///
+/// One place, because the live stream and the replay have to agree: a conversation that changes
+/// shape when you switch away and back reads as two different programs having written it.
+struct Glyphs {
+    /// The bar down the left of a question.
+    bar: &'static str,
+    /// A tool being called.
+    tool: &'static str,
+    /// A tool that failed.
+    fail: &'static str,
+    /// The working line's mark.
+    work: &'static str,
+}
+
+impl Glyphs {
+    fn new(ascii: bool) -> Self {
+        if ascii {
+            Self { bar: "|", tool: ">", fail: "x", work: "*" }
+        } else {
+            Self { bar: "\u{258c}", tool: "\u{23f5}", fail: "\u{2717}", work: "\u{2733}" }
+        }
     }
-    lines
+}
+
+/// A virtual-text chunk, which is three words of ceremony often enough to be worth a name.
+fn chunk(text: impl Into<String>, hl: &str) -> neosh_proto::VirtChunk {
+    neosh_proto::VirtChunk { text: text.into(), hl_group: Some(hl.to_string()) }
+}
+
+/// Screen columns a string occupies.
+///
+/// The host almost never needs this — columns are byte offsets and width is the frontend's job —
+/// but the shortcut row is laid out here, and a row measured in `char`s wraps the moment a hint
+/// uses `⇧` or `⏎`.
+fn display_width(s: &str) -> usize {
+    use unicode_width::UnicodeWidthStr;
+    s.width()
+}
+
+/// A path with the home directory written the way people say it.
+///
+/// Cosmetic, and worth it: the welcome block is four lines and one of them should not be an
+/// absolute path wide enough to wrap on its own.
+fn tilde(path: &std::path::Path) -> String {
+    let text = path.display().to_string();
+    match std::env::var_os("HOME") {
+        Some(home) if !home.is_empty() => {
+            let home = home.to_string_lossy().to_string();
+            match text.strip_prefix(&home) {
+                Some(rest) if rest.is_empty() => "~".to_string(),
+                Some(rest) if rest.starts_with('/') => format!("~{rest}"),
+                _ => text,
+            }
+        }
+        _ => text,
+    }
 }

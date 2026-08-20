@@ -26,6 +26,8 @@ import type { CredentialSource } from "./generated/CredentialSource";
 import type { CursorMotion } from "./generated/CursorMotion";
 import type { DiffTarget } from "./generated/DiffTarget";
 import type { Dock } from "./generated/Dock";
+import type { Gravity } from "./generated/Gravity";
+import type { Hint } from "./generated/Hint";
 import type { ExtmarkId } from "./generated/ExtmarkId";
 import type { FileChange } from "./generated/FileChange";
 import type { FileState } from "./generated/FileState";
@@ -84,7 +86,7 @@ import type { WorktreeInfo } from "./generated/WorktreeInfo";
 export type {
   AccountKind, ApiError, BranchInfo, Brand, BufferId, Capability, CommandEntry, CommitInfo,
   CredentialInfo, CredentialSource, DiffTarget, Dock, CursorMotion, ExtmarkId, ExtmarkInfo, ExtmarkOpts, FileChange, FileState, FloatConfig,
-  HighlightDef, HighlightSpec, HookName, HookOutcome, HookPayload, InstanceConfig, KeyContext,
+  Gravity, HighlightDef, HighlightSpec, Hint, HookName, HookOutcome, HookPayload, InstanceConfig, KeyContext,
   KeymapEntry, KeymapScope, MessageLevel, Mode, ModelEntry, ModelInfo, ModelSelection, ModelTier, NamespaceId,
   OptionChoice, OptionEntry, OptionSelection, OptionSpec, OptionType, OptionValue,
   Message, PermissionDecision, PluginEvent, Pricing, ProviderEvent, ProviderOptionDescriptor,
@@ -299,6 +301,7 @@ export interface Neosh {
   readonly gen: GenApi;
   readonly session: SessionApi;
   readonly status: StatusApi;
+  readonly hint: HintApi;
   readonly opt: OptionApi;
   readonly state: StateApi;
   readonly rtp: RuntimePathApi;
@@ -337,7 +340,16 @@ export interface BufferApi {
 }
 
 export interface WindowApi {
-  open(buf: BufferId, dock: Dock, opts?: { size?: number }): Promise<WindowId>;
+  /**
+   * `gravity` is which end short content settles against: `"start"` (the default) pins it to the
+   * top, `"end"` to the bottom, which is what makes a transcript read as a conversation rather
+   * than as a document that happens to be in a window.
+   */
+  open(
+    buf: BufferId,
+    dock: Dock,
+    opts?: { size?: number; gravity?: Gravity },
+  ): Promise<WindowId>;
   close(win: WindowId): Promise<void>;
   setBuf(win: WindowId, buf: BufferId): Promise<void>;
   /** `col` is a UTF-8 byte offset, not a character or display column. */
@@ -654,6 +666,22 @@ export interface SessionApi {
  * clear first and cannot leave two. Segments are namespaced per plugin, so two plugins choosing
  * `"model"` cannot collide, and unloading a plugin takes its segments with it.
  */
+/**
+ * The shortcut row under the composer.
+ *
+ * Whoever owns a feature owns its hint, which is the only arrangement that stays true: the row is
+ * built from what is actually registered right now, so a plugin that is switched off takes its
+ * shortcut with it rather than leaving a key advertised that no longer does anything.
+ *
+ * Write the key the way the user would press it — `^P`, `⇧⏎`, `F1` — not the way a keymap spells
+ * it. Hints are dropped from the end when the terminal is too narrow, so put the one you would
+ * most want seen at the lowest priority.
+ */
+export interface HintApi {
+  set(key: string, hint: { keys: string; label: string; priority?: number }): Promise<void>;
+  clear(key: string): Promise<void>;
+}
+
 export interface StatusApi {
   set(key: string, segment: { text: string; hl?: string; align?: StatusAlign; priority?: number }): Promise<void>;
   clear(key: string): Promise<void>;
@@ -1008,7 +1036,12 @@ export function __createContext(plugin: string, config: unknown, version: number
     },
     win: {
       async open(buf, dock, opts) {
-        const layout: WindowLayout = { kind: "docked", dock, size: opts?.size ?? null };
+        const layout: WindowLayout = {
+          kind: "docked",
+          dock,
+          size: opts?.size ?? null,
+          gravity: opts?.gravity ?? "start",
+        };
         return expect(await c({ call: "win_open", buf, layout }), "win").win;
       },
       async close(win) {
@@ -1315,6 +1348,18 @@ export function __createContext(plugin: string, config: unknown, version: number
         return expect(v, "messages").messages;
       },
       onChange: (cb) => listener(r.sessionListeners, cb),
+    },
+    hint: {
+      async set(key, hint) {
+        await c({
+          call: "hint_set",
+          key,
+          hint: { keys: hint.keys, label: hint.label, priority: hint.priority ?? 0 },
+        });
+      },
+      async clear(key) {
+        await c({ call: "hint_clear", key });
+      },
     },
     status: {
       async set(key, segment) {

@@ -8,6 +8,7 @@ import type { ExtmarkId } from "./ExtmarkId";
 import type { ExtmarkOpts } from "./ExtmarkOpts";
 import type { FloatConfig } from "./FloatConfig";
 import type { HighlightDef } from "./HighlightDef";
+import type { Hint } from "./Hint";
 import type { HookName } from "./HookName";
 import type { InstanceConfig } from "./InstanceConfig";
 import type { InstanceId } from "./InstanceId";
@@ -255,5 +256,7 @@ export type ApiCall =
   }
   | { "call": "status_set"; key: string; segment: StatusSegment }
   | { "call": "status_clear"; key: string }
+  | { "call": "hint_set"; key: string; hint: Hint }
+  | { "call": "hint_clear"; key: string }
   | { "call": "log"; level: MessageLevel; message: string }
   | { "call": "notify"; level: MessageLevel; message: string };

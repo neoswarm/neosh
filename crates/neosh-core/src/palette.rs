@@ -234,6 +234,15 @@ pub fn groups(variant: Variant) -> Vec<(&'static str, HighlightDef)> {
         ("Sidebar.Dim", link("Comment")),
         ("Sidebar.Selected", link("CursorLine")),
         ("Status.Line", link("Comment")),
+        // ---- the composer -------------------------------------------------
+        // The field you type into is chrome, not content: it should read as furniture at the
+        // bottom of the screen and never compete with what the model just said. Hence a rule at
+        // the faintest step on the ramp, and a prompt that is the one accented thing down there.
+        ("Composer.Rule", link("Separator")),
+        ("Composer.Prompt", spec(bold(fg(r.accent)))),
+        ("Composer.Placeholder", link("NonText")),
+        ("Composer.Hint", link("Comment")),
+        ("Composer.HintKey", spec(fg(r.muted))),
         // ---- provider marks -----------------------------------------------
         // One group per vendor, so a provider rail is legible at a glance and a theme can restyle
         // the lot. These are the *only* groups tied to something outside neosh, which is why they

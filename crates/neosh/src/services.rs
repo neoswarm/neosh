@@ -260,10 +260,15 @@ impl Services {
                     return (inst.id.clone(), models);
                 }
                 let models = match driver {
+                    // The endpoint decides what exists; the catalogue decides how it reads. Neither
+                    // alone is enough — a discovered id with no name or rung is unpickable, and a
+                    // written-down list is out of date the week after it is written.
                     Some(d) => match d.list_models(&inst).await {
-                        Ok(m) => m,
+                        Ok(m) => neosh_provider::catalog::merge(m, &inst.models),
                         Err(e) => {
-                            // Falling back to what was configured keeps an offline machine usable.
+                            // Falling back to what was configured keeps an offline machine usable —
+                            // and, more often, keeps a provider you have not signed into yet
+                            // showing what it offers, which is how you decide whether to.
                             tracing::debug!(instance = %inst.id, "model discovery failed: {e}");
                             inst.models.clone()
                         }

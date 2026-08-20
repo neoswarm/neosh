@@ -40,6 +40,10 @@ export async function activate({ neosh, subscriptions }: PluginContext) {
 
   await neosh.keymap.set("chat", "<C-k>", "commandPalette.toggle", { desc: "Command palette" });
   await neosh.keymap.set("chat", "<F1>", "help.keys", { desc: "Key bindings" });
+
+  // Last on the row, and the way out of it: whatever else got dropped for width is in here.
+  await neosh.hint.set("commands", { keys: "^K", label: "commands", priority: 30 });
+  await neosh.hint.set("keys", { keys: "F1", label: "keys", priority: 31 });
 }
 
 async function open(neosh: Neosh): Promise<void> {

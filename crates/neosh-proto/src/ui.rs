@@ -150,10 +150,28 @@ pub enum WindowLayout {
         /// Preferred extent along the dock's variable axis.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         size: Option<u16>,
+        /// Which end content settles against when there is not enough of it to fill the window.
+        #[serde(default)]
+        gravity: Gravity,
     },
     Float {
         config: FloatConfig,
     },
+}
+
+/// Which end of a window short content settles against.
+///
+/// A layout property rather than a rendering trick, so it survives the trip through the protocol and
+/// a different frontend resolves it the same way. `End` is what makes a transcript read as a
+/// conversation: three exchanges should sit just above the field you are typing into, not stranded
+/// at the top of an empty screen with the composer a long way below them.
+#[derive(TS, Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug, Default)]
+#[serde(rename_all = "snake_case")]
+#[ts(export)]
+pub enum Gravity {
+    #[default]
+    Start,
+    End,
 }
 
 /// A resolved rectangle in frontend cell space. Only ever travels frontend -> core (as viewport

@@ -61,6 +61,11 @@ export async function activate({ neosh, subscriptions }: PluginContext) {
   await neosh.keymap.set("chat", "<A-Up>", "model.upgrade", { desc: "A more capable model" });
   await neosh.keymap.set("chat", "<A-Down>", "model.downgrade", { desc: "A cheaper model" });
 
+  // On the row under the composer, because which model answers is the thing people change most
+  // often and the thing they are least likely to guess a key for.
+  await neosh.hint.set("model", { keys: "^P", label: "model", priority: 10 });
+  await neosh.hint.set("effort", { keys: "^E", label: "effort", priority: 11 });
+
   // The footer. The model and its options belong beside the composer rather than on a settings
   // page: they are the two things you change mid-conversation.
   const footer = async () => {

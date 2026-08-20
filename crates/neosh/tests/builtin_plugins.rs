@@ -2314,3 +2314,226 @@ fn the_working_line_is_gone_the_moment_there_is_an_answer() {
         s.chat_now()
     );
 }
+
+
+// ---------------------------------------------------------------------------
+// The composer: what it says, and what the keys under it do
+// ---------------------------------------------------------------------------
+
+impl Session {
+    /// Everything drawn *around* the composer that is not in the composer: the prompt, the
+    /// placeholder, the rule, the shortcut row. All of it is virtual text, so none of it can be
+    /// read back out of the buffer — which is the point, since the buffer's contents get sent.
+    fn composer_chrome(&self) -> Vec<String> {
+        let buf = self
+            .events
+            .iter()
+            .find_map(|e| {
+                (e["type"] == "buffer_opened" && e["name"] == "[composer]")
+                    .then(|| e["buf"].as_u64())?
+            })
+            .unwrap_or(u64::MAX);
+        let mut latest: Vec<String> = Vec::new();
+        for e in &self.events {
+            if e["type"] != "buffer_lines" || e["buf"].as_u64() != Some(buf) {
+                continue;
+            }
+            let mut found = Vec::new();
+            for line in e["lines"].as_array().into_iter().flatten() {
+                for m in line["marks"].as_array().into_iter().flatten() {
+                    let text: String = m["virt_text"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .filter_map(|c| c["text"].as_str())
+                        .collect();
+                    if !text.trim().is_empty() {
+                        found.push(text);
+                    }
+                }
+            }
+            if !found.is_empty() {
+                latest = found;
+            }
+        }
+        latest
+    }
+}
+
+#[test]
+fn the_row_under_the_composer_says_what_the_keys_do() {
+    let sb = Sandbox::new("hints");
+    let mut s = sb.start();
+    assert!(
+        s.pump(|s| s.composer_chrome().iter().any(|t| t.contains("^P"))),
+        "the model key is advertised where you would look for it\n{:?}",
+        s.composer_chrome()
+    );
+    let chrome = s.composer_chrome().join(" ");
+    assert!(chrome.contains("send"), "and so is the one key everybody needs: {chrome}");
+    assert!(
+        chrome.contains("F1 keys"),
+        "and the way to the ones that did not fit: {chrome}"
+    );
+}
+
+#[test]
+fn an_empty_composer_says_what_to_do_with_it() {
+    let sb = Sandbox::new("placeholder");
+    let mut s = sb.start();
+    assert!(
+        s.pump(|s| s.composer_chrome().iter().any(|t| t.contains("Ask anything"))),
+        "a prompt for the one field there is\n{:?}",
+        s.composer_chrome()
+    );
+    // And it goes away once there is something to send, or it would look like part of the message.
+    s.type_text("hi");
+    assert!(
+        s.pump(|s| !s.composer_chrome().iter().any(|t| t.contains("Ask anything"))),
+        "the placeholder steps aside\n{:?}",
+        s.composer_chrome()
+    );
+}
+
+#[test]
+fn the_welcome_says_which_account_answers() {
+    // The whole complaint the account split exists to answer: a fresh screen that says "no API
+    // key" tells you nothing about the plan you are actually on. This says which it is, before you
+    // have typed anything.
+    let sb = Sandbox::new("welcome");
+    let mut s = sb.start();
+    assert!(
+        s.pump(|s| s.chat_now().iter().any(|l| l.contains("model      mock/mock"))),
+        "the welcome names the model\n{:?}",
+        s.chat_now()
+    );
+}
+
+#[test]
+fn the_welcome_does_not_land_on_top_of_a_conversation() {
+    // Regression: the greeting was appended at startup unconditionally, so restoring a session
+    // printed "type a message and press Enter" *underneath* the last thing that was said.
+    let sb = Sandbox::new("welcomeconv");
+    let mut s = sb.start();
+    s.pump(|s| s.chat_now().iter().any(|l| l.contains("neosh")));
+    s.type_text("a question");
+    s.enter();
+    assert!(s.pump(|s| s.chat_now().iter().any(|l| l.contains("a question"))), "it was asked");
+    // It may stay at the top — that is where a header belongs. What it must never do is appear
+    // *below* the exchange, which is what happened when it was appended at startup regardless of
+    // what had already been restored into the buffer.
+    let chat = s.chat_now();
+    let welcome = chat.iter().position(|l| l.contains("agent workspace"));
+    let question = chat.iter().position(|l| l.contains("a question")).expect("the question is there");
+    if let Some(w) = welcome {
+        assert!(w < question, "the welcome stays above the conversation\n{chat:?}");
+    }
+}
+
+
+// ---------------------------------------------------------------------------
+// A model that has stopped working
+// ---------------------------------------------------------------------------
+
+impl Sandbox {
+    /// Put a conversation on disk that remembers a model needing an API key nobody has.
+    ///
+    /// Written as a file rather than produced by driving the UI, because the situation being tested
+    /// is specifically "this was chosen a long time ago, on a machine that had the key".
+    fn remember_a_conversation_using(&self, instance: &str, model: &str) {
+        let dir = self.root.join("state/sessions");
+        std::fs::create_dir_all(&dir).expect("session dir");
+        let cwd = self.work().display().to_string();
+        std::fs::write(
+            dir.join("aaaaaaaa-1111-2222-3333-444444444444.json"),
+            format!(
+                r#"{{"id":"aaaaaaaa-1111-2222-3333-444444444444","cwd":"{cwd}",
+                    "created_at":1,"updated_at":2,"messages":[],
+                    "selection":{{"instance":"{instance}","model":"{model}","options":[]}},
+                    "archived":false}}"#
+            ),
+        )
+        .expect("write session");
+    }
+}
+
+#[test]
+fn a_remembered_model_that_cannot_authenticate_gives_way_to_one_that_can() {
+    // The complaint this exists for: a conversation started against an API-key provider, reopened
+    // on a machine with no key, greeting you with "no key" over a model you did not choose today.
+    // A stored selection is a record of what was used, not an instruction.
+    let sb = Sandbox::new("staleselection");
+    sb.remember_a_conversation_using("anthropic", "claude-opus-5");
+    let mut s = sb.start_letting_config_choose();
+    assert!(
+        s.pump(|s| s.texts().iter().any(|t| t.contains("instead"))),
+        "it said what it swapped and what for\n{}",
+        s.transcript()
+    );
+    assert!(
+        s.texts().iter().any(|t| t.contains("anthropic/claude-opus-5 cannot authenticate")),
+        "and named the one that stopped working\n{}",
+        s.transcript()
+    );
+}
+
+#[test]
+fn a_model_you_asked_for_is_not_swapped_out_from_under_you() {
+    // The other half of the rule. `agent.model` is somebody saying which model to use; answering
+    // that with a different one would be worse than the error they get when they send.
+    let sb = Sandbox::new("pinnedselection");
+    let dir = sb.root.join("config/plugins/locked");
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    std::fs::write(
+        dir.join("plugin.toml"),
+        "name = \"locked\"\nversion = \"0.1.0\"\nentry = \"main.ts\"\npermissions = [\"providers\"]\n",
+    )
+    .expect("write manifest");
+    std::fs::write(dir.join("main.ts"), WANTS_A_KEY).expect("write plugin");
+    sb.write_config("[options]\n\"agent.model\" = \"vault/sealed\"\n");
+
+    let mut s = sb.start_letting_config_choose();
+    s.wait_for("vault ready");
+    assert!(
+        s.pump(|s| s.chat_now().iter().any(|l| l.contains("vault/sealed"))),
+        "the welcome still names the model that was asked for\n{:?}",
+        s.chat_now()
+    );
+    // The welcome still warns that it cannot authenticate — that is the honest thing to say. What
+    // must not happen is a substitution, which is the "instead" this looks for.
+    assert!(
+        !s.texts().iter().any(|t| t.contains("instead")),
+        "the choice stood\n{}",
+        s.transcript()
+    );
+}
+
+/// A driver whose instance wants a key from a variable that is never set.
+///
+/// Registered by a plugin rather than written in `config.toml`, because the point is an instance
+/// that *resolves* — there is a driver behind it — and still cannot authenticate. A configured
+/// instance with no driver loaded fails a different way, one step earlier.
+const WANTS_A_KEY: &str = r#"
+import type { PluginContext } from "@neosh/api";
+
+export async function activate({ neosh }: PluginContext) {
+  await neosh.provider.register("vault", [{
+    id: "vault",
+    driver: "vault",
+    display_name: "Vault",
+    auth: { kind: "env", var: "NEOSH_TEST_VAULT_KEY_NEVER_SET" },
+    models: [{
+      id: "sealed",
+      display_name: "Sealed",
+      capabilities: {
+        tools: false, vision: false, streaming: true, thinking: false, prompt_caching: false,
+        option_descriptors: [],
+      },
+    }],
+  }], async (_req, emit) => {
+    emit({ type: "message_start", model: "sealed", usage: {} });
+    emit({ type: "message_stop" });
+  });
+  neosh.notify("vault ready");
+}
+"#;

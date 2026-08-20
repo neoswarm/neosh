@@ -607,6 +607,14 @@ pub enum ApiCall {
     StatusClear {
         key: String,
     },
+    /// Put one shortcut on the row under the composer, or replace what is there under this key.
+    HintSet {
+        key: String,
+        hint: Hint,
+    },
+    HintClear {
+        key: String,
+    },
 
     // ---- misc ----------------------------------------------------------
     Log {
@@ -683,6 +691,22 @@ pub struct StatusSegment {
     pub align: StatusAlign,
     /// Lower sorts first within its side. Ties break by key, so the order is stable across redraws
     /// rather than depending on which plugin happened to load first.
+    #[serde(default)]
+    pub priority: i32,
+}
+
+/// One shortcut, as it reads on the row under the composer.
+///
+/// Split into the key and what it does rather than one pre-formatted string, because the row has to
+/// survive a narrow terminal: labels are dropped before keys are, and that decision cannot be made
+/// once the two have been glued together. The key is written the way the user would press it —
+/// `^P`, `⏎`, `esc` — which is the frontend's spelling of a binding, not the core's `<C-p>`.
+#[derive(TS, Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
+#[ts(export)]
+pub struct Hint {
+    pub keys: String,
+    pub label: String,
+    /// Lower sorts first. Ties break by key, so the row does not reshuffle when a plugin reloads.
     #[serde(default)]
     pub priority: i32,
 }

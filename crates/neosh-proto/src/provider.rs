@@ -480,6 +480,32 @@ pub enum CredentialSource {
 }
 
 impl CredentialSource {
+    /// How this reads in one short phrase, next to a provider's name.
+    ///
+    /// Lives here rather than in each caller because the same sentence has to appear in the model
+    /// picker, the welcome block and `--list-models`, and three copies of it is three chances for
+    /// one of them to still say "no API key" about an account that is on a plan — which is the
+    /// exact confusion the account split exists to remove.
+    pub fn summary(&self, auth: &AuthRef) -> String {
+        match self {
+            Self::Plan { via } => format!("your {via} login"),
+            Self::PlanMissing { program, hint } => match hint {
+                Some(cmd) => format!("{program} is not installed — then `{cmd}`"),
+                None => format!("{program} is not installed"),
+            },
+            Self::Env { var } => format!("${var}"),
+            Self::Keychain => "key in the keychain".into(),
+            Self::Session => "key entered this run".into(),
+            Self::Command => "credential helper".into(),
+            Self::Inherited => "uses an existing login".into(),
+            Self::NotNeeded => "no key needed".into(),
+            Self::Missing => match auth {
+                AuthRef::Env { var } => format!("no key — ${var} is not set"),
+                _ => "no key".into(),
+            },
+        }
+    }
+
     /// Whether a turn sent to this instance can authenticate.
     pub fn is_usable(&self) -> bool {
         !matches!(self, Self::Missing | Self::PlanMissing { .. })

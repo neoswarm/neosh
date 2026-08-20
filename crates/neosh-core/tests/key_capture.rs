@@ -5,7 +5,7 @@
 //! picker and lose the key that quits.
 
 use neosh_core::{CoreEffect, Editor};
-use neosh_proto::{
+use neosh_proto::{Gravity, 
     ApiCall, Dock, KeyCode, KeyMods, KeyPress, Mode, PluginId, WindowId, WindowLayout,
 };
 
@@ -25,7 +25,7 @@ fn setup() -> (Editor, PluginId, WindowId) {
     let mut e = Editor::new();
     let plugin = PluginId::from("picker");
     let buf = e.create_buffer("[picker]");
-    let win = e.open_window(buf, WindowLayout::Docked { dock: Dock::Main, size: None });
+    let win = e.open_window(buf, WindowLayout::Docked { dock: Dock::Main, size: None, gravity: Gravity::Start });
     e.apply(&plugin, ApiCall::CmdRegister { name: "picker.key".into(), desc: None })
         .expect("registers");
     e.apply(&plugin, ApiCall::FocusPush { win }).expect("focuses");
@@ -106,7 +106,7 @@ fn without_a_capture_the_key_is_reported_unhandled_as_before() {
 fn a_capture_only_applies_to_the_focused_window() {
     let (mut e, plugin, win) = setup();
     let other = e.create_buffer("[other]");
-    let other_win = e.open_window(other, WindowLayout::Docked { dock: Dock::Main, size: None });
+    let other_win = e.open_window(other, WindowLayout::Docked { dock: Dock::Main, size: None, gravity: Gravity::Start });
     e.apply(&plugin, ApiCall::KeymapCapture { win, command: "picker.key".into() }).unwrap();
     e.apply(&plugin, ApiCall::FocusPush { win: other_win }).unwrap();
     e.drain_effects();
@@ -216,6 +216,7 @@ fn closing_a_window_takes_the_keys_it_claimed_with_it() {
     let win = e.open_window(buf, neosh_proto::WindowLayout::Docked {
         dock: neosh_proto::Dock::Bottom,
         size: Some(3),
+        gravity: Gravity::Start,
     });
 
     e.apply(&plugin, ApiCall::KeymapSet {

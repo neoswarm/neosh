@@ -159,6 +159,8 @@ impl Editor {
                 | ApiCall::SessionMessages { .. }
                 | ApiCall::StatusSet { .. }
                 | ApiCall::StatusClear { .. }
+                | ApiCall::HintSet { .. }
+                | ApiCall::HintClear { .. }
                 | ApiCall::StateGet { .. }
                 | ApiCall::StateSet { .. }
                 | ApiCall::StateDelete { .. }
@@ -991,6 +993,8 @@ fn call_name(call: &ApiCall) -> &'static str {
         ApiCall::GitRemoveWorktree { .. } => "git.removeWorktree",
         ApiCall::GenComplete { .. } => "gen.complete",
         ApiCall::StatusSet { .. } => "status.set",
+        ApiCall::HintSet { .. } => "hint.set",
+        ApiCall::HintClear { .. } => "hint.clear",
         ApiCall::StatusClear { .. } => "status.clear",
         ApiCall::SessionList { .. } => "session.list",
         ApiCall::SessionCurrent => "session.current",

@@ -198,7 +198,7 @@ impl Mirror {
 mod tests {
     use super::*;
     use neosh_proto::{
-        Anchor, Dock, ExtmarkId, ExtmarkOpts, ExtmarkRender, Extent, FloatConfig, NamespaceId,
+        Anchor, Dock, ExtmarkId, Gravity, ExtmarkOpts, ExtmarkRender, Extent, FloatConfig, NamespaceId,
         VirtChunk, VirtTextPos,
     };
 
@@ -299,7 +299,7 @@ mod tests {
         m.apply(UiEvent::WindowOpened {
             win: WindowId(1),
             buf: BufferId(1),
-            layout: WindowLayout::Docked { dock: Dock::Main, size: None },
+            layout: WindowLayout::Docked { dock: Dock::Main, size: None, gravity: Gravity::Start },
         });
         let float = |z: i32| WindowLayout::Float {
             config: FloatConfig {
@@ -321,7 +321,7 @@ mod tests {
         m.apply(UiEvent::WindowOpened {
             win: WindowId(1),
             buf: BufferId(1),
-            layout: WindowLayout::Docked { dock: Dock::Main, size: None },
+            layout: WindowLayout::Docked { dock: Dock::Main, size: None, gravity: Gravity::Start },
         });
         m.apply(UiEvent::SurfaceClaimed {
             surface: SurfaceId(1),

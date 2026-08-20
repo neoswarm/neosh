@@ -200,9 +200,10 @@ pub fn render_line_in(
     cuts.dedup();
 
     let mut spans: Vec<Span<'static>> = Vec::new();
-    for w in cuts.windows(2) {
-        let (a, b) = (w[0], w[1]);
-
+    // Over cut *positions* rather than windows between them, because an empty line has exactly one
+    // position and no windows at all — and dropping its inline text there would mean the prompt
+    // glyph on an empty composer, the one place it is most needed, is the one place it vanishes.
+    for (i, &a) in cuts.iter().enumerate() {
         // Inline virtual text is spliced in at its column, shifting real text right.
         for m in visible.iter().filter(|m| {
             m.opts.virt_text_pos == VirtTextPos::Inline
@@ -217,6 +218,7 @@ pub fn render_line_in(
             }
         }
 
+        let Some(&b) = cuts.get(i + 1) else { continue };
         if a == b {
             continue;
         }
@@ -333,7 +335,7 @@ pub fn resolve_layout_with_rules(
     let mut main = area;
 
     let dock_of = |w: &WindowId| match mirror.windows.get(w).map(|w| &w.layout) {
-        Some(WindowLayout::Docked { dock, size }) => Some((*dock, *size)),
+        Some(WindowLayout::Docked { dock, size, .. }) => Some((*dock, *size)),
         _ => None,
     };
 
@@ -518,21 +520,7 @@ pub fn draw(frame: &mut Frame, mirror: &Mirror, theme: &Theme) -> Option<(u16, u
         // Wrapping is per window: the chat has to wrap or a long answer is silently cut off at the
         // right edge, while the sidebar and the status line must clip or one long path would push
         // everything below it off the screen.
-        let wraps = w.wraps();
-        let rendered: Vec<Line> = mirror
-            .buffers
-            .get(&w.buf)
-            .map(|b| {
-                b.lines
-                    .iter()
-                    .skip(w.top_line as usize)
-                    .flat_map(|l| render_line_in(l, theme, Some(inner.width as usize)))
-                    .flat_map(|l| {
-                        if wraps { wrap_line(&l, inner.width as usize) } else { vec![l] }
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
+        let rendered = rendered_lines(mirror, w, theme, inner.width);
 
         // Follow the tail. Taking the *first* n lines shows a long conversation's opening and
         // never its answer, which is the wrong end of every transcript ever written. An explicit
@@ -542,6 +530,22 @@ pub fn draw(frame: &mut Frame, mirror: &Mirror, theme: &Theme) -> Option<(u16, u
             rendered[rendered.len() - height..].to_vec()
         } else {
             rendered.into_iter().take(height).collect()
+        };
+
+        // Gravity only bites when the content does not fill the window — the case a scroll offset
+        // cannot express, because there is nothing to scroll. Done by shrinking the rectangle
+        // rather than by padding with blank rows, so nothing downstream has to know the difference
+        // between a line the buffer has and a line put there to take up room.
+        let inner = match (&w.layout, height.checked_sub(lines.len())) {
+            (
+                WindowLayout::Docked { gravity: neosh_proto::Gravity::End, .. },
+                Some(slack),
+            ) if slack > 0 => Rect {
+                y: inner.y.saturating_add(slack as u16),
+                height: inner.height.saturating_sub(slack as u16),
+                ..inner
+            },
+            _ => inner,
         };
 
         frame.render_widget(Paragraph::new(lines).style(theme.style("Normal")), inner);
@@ -574,6 +578,35 @@ pub fn draw(frame: &mut Frame, mirror: &Mirror, theme: &Theme) -> Option<(u16, u
     }
 
     caret
+}
+
+/// Every screen line a window's visible buffer range turns into, marks and wrapping applied.
+///
+/// Shared by drawing and by the caret, which is the point: gravity moves content down by however
+/// many rows it falls short, and the caret has to move by the *same* number. Two calculations of
+/// "how many lines is this" would agree until the first wrapped line, and then quietly stop.
+fn rendered_lines(
+    mirror: &Mirror,
+    w: &crate::mirror::MirrorWindow,
+    theme: &Theme,
+    width: u16,
+) -> Vec<Line<'static>> {
+    // Wrapping is per window: the chat has to wrap or a long answer is silently cut off at the
+    // right edge, while the sidebar and the status line must clip or one long path would push
+    // everything below it off the screen.
+    let wraps = w.wraps();
+    mirror
+        .buffers
+        .get(&w.buf)
+        .map(|b| {
+            b.lines
+                .iter()
+                .skip(w.top_line as usize)
+                .flat_map(|l| render_line_in(l, theme, Some(width as usize)))
+                .flat_map(|l| if wraps { wrap_line(&l, width as usize) } else { vec![l] })
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// Where the caret goes, in screen cells.
@@ -625,25 +658,79 @@ fn caret_position(
 
     let (row, col) = w.cursor;
     let buffer = mirror.buffers.get(&w.buf)?;
-    let text = buffer.lines.get(row as usize).map(|l| l.text.as_str()).unwrap_or("");
+    let line_render = buffer.lines.get(row as usize);
+    let text = line_render.map(|l| l.text.as_str()).unwrap_or("");
     // Byte offset to screen column happens here, and only here — the same conversion every mark
     // goes through, so a cursor after an emoji lands where the emoji ends.
     let mut column = display_col(text, col as usize) as u16;
+    // Virtual text is drawn but does not exist in the buffer, so the caret has to be pushed past
+    // whatever was spliced in ahead of it. Without this, chrome around a text field — a prompt
+    // glyph, a rule above it — silently moves the caret away from the character it is on, and the
+    // bug only shows up as "typing appears one column off", which is a nightmare to trace back.
+    column = column.saturating_add(inline_before(line_render, col as usize));
 
     // Saturating throughout: a row far below `top_line` must clamp to "off-screen" rather than
     // wrap around into a plausible-looking coordinate.
     let mut line = u16::try_from(row.saturating_sub(w.top_line)).unwrap_or(u16::MAX);
+    line = line.saturating_add(virt_rows_before(buffer, w.top_line, row));
+    // Content pushed down by gravity takes the caret with it.
+    if let WindowLayout::Docked { gravity: neosh_proto::Gravity::End, .. } = &w.layout {
+        let rows = rendered_lines(mirror, w, theme, inner.width).len();
+        line = line.saturating_add((inner.height as usize).saturating_sub(rows) as u16);
+    }
     if w.wraps() {
         // On a wrapped line the caret moves down as well as along.
         line = line.saturating_add(column / inner.width);
         column %= inner.width;
     }
-    let _ = theme;
-
     if line >= inner.height || column >= inner.width {
         return None;
     }
     Some((inner.x + column, inner.y + line))
+}
+
+/// How many screen columns of inline virtual text sit before `col` on this row.
+///
+/// Inline chunks are spliced in at their own column, so everything at or before the caret's byte
+/// offset displaces it. At-or-before rather than strictly-before: a prompt at column 0 has to push
+/// a caret that is also at column 0, which is where the caret spends most of its life in an empty
+/// composer.
+fn inline_before(line: Option<&LineRender>, col: usize) -> u16 {
+    let Some(line) = line else { return 0 };
+    let shift: usize = line
+        .marks
+        .iter()
+        .filter(|m| m.opts.virt_text_pos == VirtTextPos::Inline)
+        .filter(|m| (m.col as usize) <= col)
+        .flat_map(|m| m.opts.virt_text.iter())
+        .map(|c| width(&c.text))
+        .sum();
+    u16::try_from(shift).unwrap_or(u16::MAX)
+}
+
+/// How many extra screen rows the virtual lines between `top` and `row` take up.
+///
+/// `Above` on a row at or before the caret pushes it down; `Below` only counts for rows strictly
+/// before it, since a line under the caret's own row is drawn after the caret.
+fn virt_rows_before(buffer: &crate::mirror::MirrorBuffer, top: u32, row: u32) -> u16 {
+    let mut extra: usize = 0;
+    for (i, line) in buffer.lines.iter().enumerate().skip(top as usize) {
+        let i = i as u32;
+        if i > row {
+            break;
+        }
+        for m in &line.marks {
+            if m.opts.virt_text.is_empty() {
+                continue;
+            }
+            match m.opts.virt_text_pos {
+                VirtTextPos::Above => extra += 1,
+                VirtTextPos::Below if i < row => extra += 1,
+                _ => {}
+            }
+        }
+    }
+    u16::try_from(extra).unwrap_or(u16::MAX)
 }
 
 /// How long a notification stays on screen.

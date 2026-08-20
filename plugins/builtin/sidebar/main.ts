@@ -568,6 +568,9 @@ async function registerCommands(w: Wiring): Promise<void> {
   await neosh.keymap.set("chat", "<C-t>", "sidebar.focus", { desc: "Projects and conversations" });
   await neosh.keymap.set("chat", "<C-n>", "session.new", { desc: "New conversation" });
   await neosh.keymap.set("chat", "<C-o>", "project.open", { desc: "Add a project" });
+
+  await neosh.hint.set("sessions", { keys: "^T", label: "conversations", priority: 20 });
+  await neosh.hint.set("new", { keys: "^N", label: "new", priority: 21 });
 }
 
 async function activateTarget(
