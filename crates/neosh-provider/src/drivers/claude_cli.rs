@@ -244,6 +244,7 @@ mod tests {
             driver: DriverKind::from("claude-cli"),
             display_name: "Claude CLI".into(),
             base_url: None,
+            brand: None,
             auth: AuthRef::Inherited,
             models: vec![],
             extra_headers: vec![],

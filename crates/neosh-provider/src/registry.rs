@@ -147,19 +147,13 @@ mod tests {
         let mut r = ProviderRegistry::new();
         r.register_driver(std::sync::Arc::new(crate::drivers::MockProvider::new(vec![])));
 
-        let model = |id: &str| ModelInfo {
-            id: ModelId::from(id),
-            display_name: id.into(),
-            context_window: None,
-            max_output_tokens: None,
-            capabilities: Default::default(),
-            pricing: None,
-        };
+        let model = |id: &str| ModelInfo::undescribed(ModelId::from(id), id);
         let inst = |id: &str, auth: AuthRef| InstanceConfig {
             id: InstanceId::from(id),
             driver: DriverKind::from("mock"),
             display_name: id.into(),
             base_url: None,
+            brand: None,
             auth,
             models: vec![model("m")],
             extra_headers: vec![],
@@ -189,15 +183,9 @@ mod tests {
             driver: DriverKind::from("mock"),
             display_name: "only".into(),
             base_url: None,
+            brand: None,
             auth: AuthRef::Env { var: "NEOSH_TEST_DEFINITELY_UNSET_KEY".into() },
-            models: vec![ModelInfo {
-                id: ModelId::from("m"),
-                display_name: "m".into(),
-                context_window: None,
-                max_output_tokens: None,
-                capabilities: Default::default(),
-                pricing: None,
-            }],
+            models: vec![ModelInfo::undescribed(ModelId::from("m"), "m")],
             extra_headers: vec![],
         });
         assert!(r.default_selection().is_some());

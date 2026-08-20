@@ -214,6 +214,34 @@ pub fn groups(variant: Variant) -> Vec<(&'static str, HighlightDef)> {
         ("Sidebar.Dim", link("Comment")),
         ("Sidebar.Selected", link("CursorLine")),
         ("Status.Line", link("Comment")),
+        // ---- provider marks -----------------------------------------------
+        // One group per vendor, so a provider rail is legible at a glance and a theme can restyle
+        // the lot. These are the *only* groups tied to something outside neosh, which is why they
+        // are named after the company rather than after a role: there is no role to name, the
+        // whole job is "looks like that vendor".
+        //
+        // Approximations of brand hues, pulled toward the palette so a rail of eleven marks still
+        // looks like one program. A provider plugin adds its own group and nothing here changes.
+        ("Brand.Anthropic", spec(fg(rgb(0xd9, 0x7a, 0x57)))),
+        ("Brand.OpenAI", spec(fg(rgb(0x74, 0xaa, 0x9c)))),
+        ("Brand.Google", spec(fg(rgb(0x66, 0x9d, 0xf6)))),
+        ("Brand.OpenRouter", spec(fg(rgb(0x8b, 0x8b, 0xa7)))),
+        ("Brand.Groq", spec(fg(rgb(0xf5, 0x5c, 0x36)))),
+        ("Brand.DeepSeek", spec(fg(rgb(0x4d, 0x6b, 0xfe)))),
+        ("Brand.XAI", spec(fg(r.fg))),
+        ("Brand.Mistral", spec(fg(rgb(0xff, 0x8a, 0x00)))),
+        ("Brand.Together", spec(fg(rgb(0x0f, 0x6f, 0xff)))),
+        ("Brand.Fireworks", spec(fg(rgb(0xff, 0x5a, 0x8a)))),
+        ("Brand.Cerebras", spec(fg(rgb(0xf2, 0x54, 0x54)))),
+        // Anything on this machine. One group, because "local" is the distinction that matters.
+        ("Brand.Local", spec(fg(r.success))),
+        // ---- accounts ------------------------------------------------------
+        // A plan and a key cost different things. Saying so in colour means the picker does not
+        // have to say it in words on every row.
+        ("Account.Plan", spec(fg(r.success))),
+        ("Account.Key", spec(fg(r.accent))),
+        ("Account.Local", spec(dim(fg(r.muted)))),
+        ("Account.Missing", link("Diagnostic.Warn")),
     ]
 }
 

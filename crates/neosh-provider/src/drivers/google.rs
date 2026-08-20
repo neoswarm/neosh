@@ -6,7 +6,7 @@
 //! [`crate::sse::gemini`] so the agent loop sees one shape.
 
 use neosh_proto::{
-    ContentBlock, DriverKind, InstanceConfig, Message, ModelId, ModelInfo, ProviderEvent, Role,
+    ContentBlock, DriverKind, InstanceConfig, Message, ModelInfo, ProviderEvent, Role,
     ToolDef, TurnRequest,
 };
 use secrecy::ExposeSecret;
@@ -131,25 +131,21 @@ impl Provider for GoogleProvider {
                     .filter_map(|m| {
                         let full = m.get("name").and_then(Value::as_str)?;
                         let id = full.strip_prefix("models/").unwrap_or(full);
-                        Some(ModelInfo {
-                            id: ModelId::from(id),
-                            display_name: m
-                                .get("displayName")
-                                .and_then(Value::as_str)
-                                .unwrap_or(id)
-                                .to_string(),
-                            context_window: m.get("inputTokenLimit").and_then(Value::as_u64),
-                            max_output_tokens: m.get("outputTokenLimit").and_then(Value::as_u64),
-                            capabilities: neosh_proto::ModelCapabilities {
-                                tools: true,
-                                vision: true,
-                                streaming: true,
-                                thinking: true,
-                                prompt_caching: false,
-                                option_descriptors: vec![],
-                            },
-                            pricing: None,
-                        })
+                        let mut info = ModelInfo::undescribed(
+                            id,
+                            m.get("displayName").and_then(Value::as_str).unwrap_or(id),
+                        );
+                        info.context_window = m.get("inputTokenLimit").and_then(Value::as_u64);
+                        info.max_output_tokens = m.get("outputTokenLimit").and_then(Value::as_u64);
+                        info.capabilities = neosh_proto::ModelCapabilities {
+                            tools: true,
+                            vision: true,
+                            streaming: true,
+                            thinking: true,
+                            prompt_caching: false,
+                            option_descriptors: vec![],
+                        };
+                        Some(info)
                     })
                     .collect()
             })
@@ -262,7 +258,7 @@ mod tests {
         TurnRequest {
             selection: ModelSelection {
                 instance: InstanceId::from("google"),
-                model: ModelId::from("gemini-3-pro"),
+                model: neosh_proto::ModelId::from("gemini-3-pro"),
                 options: vec![],
             },
             system: Some("be brief".into()),

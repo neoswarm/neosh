@@ -33,6 +33,8 @@ use std::process::{Command, Stdio};
 use std::sync::{Arc, LazyLock, Mutex};
 
 use neosh_proto::{AuthRef, CredentialInfo, CredentialSource, InstanceConfig, InstanceId};
+
+
 use secrecy::{ExposeSecret, SecretString};
 
 /// The service name every keychain entry is filed under.
@@ -272,7 +274,9 @@ impl Credentials {
             return Ok(Some(entry.secret));
         }
         match auth {
-            AuthRef::None | AuthRef::Inherited => Ok(None),
+            // A plan carries its own login. There is nothing here to resolve, and nothing neosh
+            // could hand the driver if there were.
+            AuthRef::None | AuthRef::Inherited | AuthRef::Cli { .. } => Ok(None),
             AuthRef::Env { var } => match std::env::var(var) {
                 Ok(v) if !v.trim().is_empty() => Ok(Some(SecretString::from(v.trim()))),
                 _ => Err(crate::ProviderError::MissingCredentials(format!(
@@ -302,6 +306,18 @@ impl Credentials {
         match &cfg.auth {
             AuthRef::None => CredentialSource::NotNeeded,
             AuthRef::Inherited => CredentialSource::Inherited,
+            // Whether the CLI is *installed* is cheap to answer and worth answering: "run `codex
+            // login`" is a different problem from "install codex", and a picker that conflated
+            // them would send you to the wrong page. Whether you are signed *in* is deliberately
+            // not claimed — finding out means running it, and a wrong guess either way is worse
+            // than saying where to look.
+            AuthRef::Cli { program, login } => match which(program) {
+                Some(_) => CredentialSource::Plan { via: program.clone() },
+                None => CredentialSource::PlanMissing {
+                    program: program.clone(),
+                    hint: login.clone(),
+                },
+            },
             AuthRef::Command { argv } if !argv.is_empty() => CredentialSource::Command,
             AuthRef::Command { .. } => CredentialSource::Missing,
             AuthRef::Env { var } => {
@@ -326,6 +342,8 @@ impl Credentials {
                 display_name: cfg.display_name.clone(),
                 driver: cfg.driver.clone(),
                 source: self.source(cfg),
+                account: cfg.auth.account_kind(),
+                brand: cfg.brand.clone(),
                 driver_available: driver_available(cfg),
                 accepts_key: accepts_key(&cfg.auth),
             })
@@ -338,7 +356,7 @@ impl Credentials {
 /// A CLI login and a local endpoint have nowhere to put one, so offering to take one would be
 /// offering to do nothing — and looking one up costs a process launch to be told so.
 fn accepts_key(auth: &AuthRef) -> bool {
-    !matches!(auth, AuthRef::Inherited | AuthRef::None)
+    !matches!(auth, AuthRef::Inherited | AuthRef::None | AuthRef::Cli { .. })
 }
 
 /// Run a credential helper and take its first line.
@@ -378,6 +396,7 @@ mod tests {
             driver: DriverKind::from("openai-compat"),
             display_name: id.into(),
             base_url: None,
+            brand: None,
             auth,
             models: Vec::new(),
             extra_headers: Vec::new(),

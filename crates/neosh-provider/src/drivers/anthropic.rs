@@ -162,17 +162,14 @@ impl Provider for AnthropicProvider {
         let mut out = Vec::new();
         for m in v.get("data").and_then(Value::as_array).unwrap_or(&vec![]) {
             let Some(id) = m.get("id").and_then(Value::as_str) else { continue };
-            let mut info = known.iter().find(|k| k.id.0 == id).cloned().unwrap_or(ModelInfo {
-                id: ModelId::from(id),
-                display_name: m
-                    .get("display_name")
-                    .and_then(Value::as_str)
-                    .unwrap_or(id)
-                    .to_string(),
-                context_window: None,
-                max_output_tokens: None,
-                capabilities: Default::default(),
-                pricing: None,
+            let mut info = known.iter().find(|k| k.id.0 == id).cloned().unwrap_or_else(|| {
+                // Not in the catalogue: a model that shipped after this build. It gets a name and
+                // nothing editorial, which is honest — the alternative is guessing its tier from
+                // its id and putting it on the wrong rung of the ladder.
+                ModelInfo::undescribed(
+                    id,
+                    m.get("display_name").and_then(Value::as_str).unwrap_or(id),
+                )
             });
             if let Some(ctx) = m.get("max_input_tokens").and_then(Value::as_u64) {
                 info.context_window = Some(ctx);

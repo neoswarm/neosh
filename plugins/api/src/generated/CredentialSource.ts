@@ -7,6 +7,8 @@
  * is signed in" and "it is signed in and will still be tomorrow".
  */
 export type CredentialSource =
+  | { "kind": "plan"; via: string }
+  | { "kind": "plan_missing"; program: string; hint?: string | null }
   | { "kind": "env"; var: string }
   | { "kind": "keychain" }
   | { "kind": "session" }

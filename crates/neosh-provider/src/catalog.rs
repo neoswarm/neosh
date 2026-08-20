@@ -12,8 +12,8 @@
 //! than a graceful degradation.
 
 use neosh_proto::{
-    AuthRef, InstanceConfig, ModelCapabilities, ModelId, ModelInfo, OptionChoice, OptionSelection,
-    ProviderOptionValue, Pricing, ProviderOptionDescriptor,
+    AuthRef, Brand, InstanceConfig, ModelCapabilities, ModelId, ModelInfo, ModelTier, OptionChoice,
+    OptionSelection, Pricing, ProviderOptionDescriptor, ProviderOptionValue,
 };
 
 /// Reasoning-effort levels available on a given model generation.
@@ -74,14 +74,25 @@ pub fn default_options(caps: &ModelCapabilities) -> Vec<OptionSelection> {
 const EFFORT_5: &[&str] = &["low", "medium", "high", "xhigh", "max"];
 const EFFORT_46: &[&str] = &["low", "medium", "high", "max"];
 
+/// One entry in the Anthropic catalogue.
+///
+/// `family` and `tier` are what make "the best Opus" and "one rung down" answerable. They are
+/// written here rather than parsed out of the id, because the moment a vendor changes its naming
+/// scheme a parser puts a model on the wrong rung — and the failure is a turn billed at the wrong
+/// price, not an error.
+#[allow(clippy::too_many_arguments)]
 fn claude(
     id: &str,
     name: &str,
+    family: &str,
+    tier: ModelTier,
+    tagline: &str,
     ctx: u64,
     max_out: u64,
     price: (f64, f64),
     efforts: Option<&[&str]>,
     fast_mode: bool,
+    legacy: bool,
 ) -> ModelInfo {
     let mut descriptors = Vec::new();
     if let Some(levels) = efforts {
@@ -113,6 +124,10 @@ fn claude(
             cache_read_per_mtok: price.0 * 0.1,
             cache_write_per_mtok: price.0 * 1.25,
         }),
+        family: Some(family.into()),
+        tier: Some(tier),
+        legacy,
+        tagline: Some(tagline.into()),
     }
 }
 
@@ -122,15 +137,18 @@ fn claude(
 /// 4.7+ generations, and `effort` gained `xhigh` there, so a single flattened option set would
 /// produce 400s on half the catalog.
 pub fn anthropic_models() -> Vec<ModelInfo> {
+    use ModelTier::{Balanced, Fast, Frontier};
+    const OPUS: &str = "Most capable for complex work";
+    const SONNET: &str = "Best for everyday tasks";
     vec![
-        claude("claude-opus-5", "Claude Opus 5", 1_000_000, 128_000, (5.0, 25.0), Some(EFFORT_5), true),
-        claude("claude-fable-5", "Claude Fable 5", 1_000_000, 128_000, (10.0, 50.0), Some(EFFORT_5), false),
-        claude("claude-sonnet-5", "Claude Sonnet 5", 1_000_000, 128_000, (3.0, 15.0), Some(EFFORT_5), false),
-        claude("claude-opus-4-8", "Claude Opus 4.8", 1_000_000, 128_000, (5.0, 25.0), Some(EFFORT_5), true),
-        claude("claude-opus-4-7", "Claude Opus 4.7", 1_000_000, 128_000, (5.0, 25.0), Some(EFFORT_5), false),
-        claude("claude-opus-4-6", "Claude Opus 4.6", 1_000_000, 128_000, (5.0, 25.0), Some(EFFORT_46), false),
-        claude("claude-sonnet-4-6", "Claude Sonnet 4.6", 1_000_000, 128_000, (3.0, 15.0), Some(EFFORT_46), false),
-        claude("claude-haiku-4-5", "Claude Haiku 4.5", 200_000, 64_000, (1.0, 5.0), None, false),
+        claude("claude-opus-5", "Claude Opus 5", "opus", Frontier, OPUS, 1_000_000, 128_000, (5.0, 25.0), Some(EFFORT_5), true, false),
+        claude("claude-fable-5", "Claude Fable 5", "fable", Frontier, "Long-form writing and voice", 1_000_000, 128_000, (10.0, 50.0), Some(EFFORT_5), false, false),
+        claude("claude-sonnet-5", "Claude Sonnet 5", "sonnet", Balanced, SONNET, 1_000_000, 128_000, (3.0, 15.0), Some(EFFORT_5), false, false),
+        claude("claude-opus-4-8", "Claude Opus 4.8", "opus", Frontier, OPUS, 1_000_000, 128_000, (5.0, 25.0), Some(EFFORT_5), true, true),
+        claude("claude-opus-4-7", "Claude Opus 4.7", "opus", Frontier, OPUS, 1_000_000, 128_000, (5.0, 25.0), Some(EFFORT_5), false, true),
+        claude("claude-opus-4-6", "Claude Opus 4.6", "opus", Frontier, OPUS, 1_000_000, 128_000, (5.0, 25.0), Some(EFFORT_46), false, true),
+        claude("claude-sonnet-4-6", "Claude Sonnet 4.6", "sonnet", Balanced, SONNET, 1_000_000, 128_000, (3.0, 15.0), Some(EFFORT_46), false, true),
+        claude("claude-haiku-4-5", "Claude Haiku 4.5", "haiku", Fast, "Fastest, for quick answers", 200_000, 64_000, (1.0, 5.0), None, false, false),
     ]
 }
 
@@ -139,24 +157,32 @@ pub fn anthropic_models() -> Vec<ModelInfo> {
 /// The CLI accepts aliases and resolves them itself, so this is a short list of aliases rather than
 /// pinned ids — it stays correct as the CLI updates.
 pub fn claude_cli_models() -> Vec<ModelInfo> {
-    ["opus", "sonnet", "haiku"]
-        .iter()
-        .map(|alias| ModelInfo {
-            id: ModelId::from(*alias),
-            display_name: format!("Claude {} (via CLI)", title_case(alias)),
-            context_window: None,
-            max_output_tokens: None,
-            capabilities: ModelCapabilities {
-                tools: true,
-                vision: true,
-                streaming: true,
-                thinking: true,
-                prompt_caching: true,
-                option_descriptors: vec![effort(EFFORT_5, "high")],
-            },
-            pricing: None,
-        })
-        .collect()
+    use ModelTier::{Balanced, Fast, Frontier};
+    [
+        ("opus", Frontier, "Most capable for complex work"),
+        ("sonnet", Balanced, "Best for everyday tasks"),
+        ("haiku", Fast, "Fastest, for quick answers"),
+    ]
+    .into_iter()
+    .map(|(alias, tier, tagline)| {
+        let mut m = ModelInfo::undescribed(alias, format!("Claude {}", title_case(alias)));
+        m.capabilities = ModelCapabilities {
+            tools: true,
+            vision: true,
+            streaming: true,
+            thinking: true,
+            prompt_caching: true,
+            option_descriptors: vec![effort(EFFORT_5, "high")],
+        };
+        // The alias *is* the family: the CLI resolves it to whatever is current, which is the whole
+        // reason to pin an alias rather than an id. There is nothing older to fold away, so no
+        // entry here is ever legacy.
+        m.family = Some(alias.to_string());
+        m.tier = Some(tier);
+        m.tagline = Some(tagline.into());
+        m
+    })
+    .collect()
 }
 
 fn instance(
@@ -172,6 +198,7 @@ fn instance(
         driver: driver.into(),
         display_name: name.into(),
         base_url: base_url.map(str::to_string),
+        brand: brand_for(id),
         auth,
         models,
         extra_headers: Vec::new(),
@@ -180,6 +207,43 @@ fn instance(
 
 fn env(var: &str) -> AuthRef {
     AuthRef::Env { var: var.into() }
+}
+
+/// A plan: a vendor CLI that carries its own login.
+fn cli(program: &str, login: &str) -> AuthRef {
+    AuthRef::Cli { program: program.into(), login: Some(login.into()) }
+}
+
+/// How each provider is drawn.
+///
+/// Three marks per provider, because a terminal is not one thing: a Nerd Font glyph where the font
+/// has one, geometry where it does not, and a letter under `ui.ascii_only`. The colour is a
+/// highlight group rather than a value, so a theme restyles every mark at once and a 16-colour
+/// terminal still gets something.
+///
+/// Keyed by instance id rather than driver: `openai-compat` serves nine vendors, and drawing nine
+/// different companies with one mark is the same as drawing none.
+fn brand_for(id: &str) -> Option<Brand> {
+    // Nerd Font code points, all from the `nf-` ranges shipped since v3. Where a vendor has no
+    // glyph the field is `None` and the Unicode mark is used at every level — better a consistent
+    // shape than a box.
+    let (nerd, mark, ascii, hl) = match id {
+        "claude-cli" | "anthropic" => (Some("\u{f0e79}"), "\u{2733}", "A", "Brand.Anthropic"),
+        "codex-cli" | "openai" => (Some("\u{f0c9b}"), "\u{2b22}", "O", "Brand.OpenAI"),
+        "gemini-cli" | "google" => (Some("\u{f05d1}"), "\u{25c6}", "G", "Brand.Google"),
+        "openrouter" => (None, "\u{2b21}", "R", "Brand.OpenRouter"),
+        "groq" => (None, "\u{25b6}", "Q", "Brand.Groq"),
+        "deepseek" => (None, "\u{25c9}", "D", "Brand.DeepSeek"),
+        "xai" => (Some("\u{f099}"), "\u{2715}", "X", "Brand.XAI"),
+        "mistral" => (None, "\u{25a4}", "M", "Brand.Mistral"),
+        "together" => (None, "\u{2b1f}", "T", "Brand.Together"),
+        "fireworks" => (None, "\u{2748}", "F", "Brand.Fireworks"),
+        "cerebras" => (None, "\u{25d4}", "C", "Brand.Cerebras"),
+        "ollama" => (Some("\u{f0f3b}"), "\u{25b2}", "L", "Brand.Local"),
+        "llamacpp" | "lmstudio" | "vllm" => (None, "\u{25b3}", "L", "Brand.Local"),
+        _ => return None,
+    };
+    Some(Brand::new(nerd, mark, ascii, hl))
 }
 
 /// Every instance neosh knows about out of the box.
@@ -193,7 +257,9 @@ fn env(var: &str) -> AuthRef {
 /// config — never code.
 pub fn builtin_instances() -> Vec<InstanceConfig> {
     vec![
-        instance("claude-cli", "claude-cli", "Claude (CLI login)", None, AuthRef::Inherited, claude_cli_models()),
+        // --- plans: a subscription you already pay for -----------------
+        instance("claude-cli", "claude-cli", "Claude", None, cli("claude", "claude login"), claude_cli_models()),
+        // --- API keys: billed per token --------------------------------
         instance("anthropic", "anthropic", "Anthropic", Some("https://api.anthropic.com"), env("ANTHROPIC_API_KEY"), anthropic_models()),
         instance("google", "google", "Google Gemini", Some("https://generativelanguage.googleapis.com/v1beta"), env("GEMINI_API_KEY"), vec![]),
         // --- OpenAI-compatible endpoints -------------------------------
@@ -232,7 +298,11 @@ mod tests {
     fn zero_config_instance_comes_first() {
         let all = builtin_instances();
         assert_eq!(all[0].id.0, "claude-cli");
-        assert_eq!(all[0].auth, AuthRef::Inherited, "must not require an API key");
+        assert_eq!(
+            all[0].auth.account_kind(),
+            neosh_proto::AccountKind::Plan,
+            "a fresh install must land on a plan, not on something that needs a key"
+        );
         assert!(!all[0].models.is_empty(), "needs models so default_selection can resolve");
     }
 
@@ -244,6 +314,67 @@ mod tests {
         for i in &compat {
             assert!(i.base_url.is_some(), "{} needs a base URL", i.id);
         }
+    }
+
+    #[test]
+    fn every_instance_says_what_you_are_spending() {
+        // The split the flat list could not make. A plan and a key are different things to buy,
+        // bill and revoke, and a picker that shows them as one set cannot tell you which one the
+        // next turn spends.
+        for inst in builtin_instances() {
+            let kind = inst.auth.account_kind();
+            match inst.id.as_ref() {
+                "claude-cli" => assert_eq!(kind, neosh_proto::AccountKind::Plan, "{}", inst.id),
+                "ollama" | "llamacpp" | "lmstudio" | "vllm" => {
+                    assert_eq!(kind, neosh_proto::AccountKind::Local, "{}", inst.id)
+                }
+                _ => assert_eq!(kind, neosh_proto::AccountKind::ApiKey, "{}", inst.id),
+            }
+        }
+    }
+
+    #[test]
+    fn every_instance_has_something_to_draw() {
+        // A rail of provider marks with one blank in it reads as a bug, not as a provider without
+        // a logo.
+        for inst in builtin_instances() {
+            let brand = inst.brand.as_ref().unwrap_or_else(|| panic!("{} has no brand", inst.id));
+            assert!(!brand.mark.is_empty(), "{}", inst.id);
+            assert!(!brand.ascii.is_empty(), "{}", inst.id);
+            assert!(brand.hl.starts_with("Brand."), "{} must theme through a group", inst.id);
+        }
+    }
+
+    #[test]
+    fn every_catalogued_model_is_on_the_ladder() {
+        // `family` and `tier` are what make "the best Opus" and "one rung down" answerable. A model
+        // missing them is invisible to both.
+        for m in anthropic_models().into_iter().chain(claude_cli_models()) {
+            assert!(m.family.is_some(), "{} has no family", m.id);
+            assert!(m.tier.is_some(), "{} has no tier", m.id);
+            assert!(m.tagline.is_some(), "{} has nothing to say for itself", m.id);
+        }
+    }
+
+    #[test]
+    fn the_cli_aliases_cover_all_three_rungs() {
+        // The plan is the zero-setup path, so "one step down" has to work there before anywhere.
+        let tiers: Vec<_> = claude_cli_models().iter().filter_map(|m| m.tier).collect();
+        for rung in ModelTier::LADDER {
+            assert!(tiers.contains(&rung), "no {rung:?} available on the CLI plan");
+        }
+    }
+
+    #[test]
+    fn a_superseded_model_is_folded_away_but_not_removed() {
+        // You go looking for last year's model to reproduce something, which is exactly when
+        // deleting it from the catalogue would be worst.
+        let all = anthropic_models();
+        assert!(all.iter().any(|m| m.legacy), "nothing is marked superseded");
+        assert!(
+            all.iter().filter(|m| m.family.as_deref() == Some("opus") && !m.legacy).count() == 1,
+            "exactly one current model per line, or 'the best Opus' has no answer"
+        );
     }
 
     #[test]

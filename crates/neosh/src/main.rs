@@ -462,14 +462,8 @@ fn install_mock_provider(agent: &Agent, path: &std::path::Path) -> anyhow::Resul
         display_name: "Mock".into(),
         base_url: None,
         auth: neosh_proto::AuthRef::None,
-        models: vec![neosh_proto::ModelInfo {
-            id: ModelId::from("mock"),
-            display_name: "Mock".into(),
-            context_window: None,
-            max_output_tokens: None,
-            capabilities: Default::default(),
-            pricing: None,
-        }],
+        brand: None,
+        models: vec![neosh_proto::ModelInfo::undescribed(ModelId::from("mock"), "Mock")],
         extra_headers: vec![],
     });
     Ok(())
@@ -491,8 +485,13 @@ async fn list_models(agent: &Agent) -> anyhow::Result<()> {
             neosh_proto::CredentialSource::Keychain => "  (key in the keychain)".to_string(),
             neosh_proto::CredentialSource::Session => "  (key entered this run)".to_string(),
             neosh_proto::CredentialSource::Command => "  (credential helper)".to_string(),
+            neosh_proto::CredentialSource::Plan { via } => format!("  (your {via} login)"),
+            neosh_proto::CredentialSource::PlanMissing { program, hint } => match hint {
+                Some(cmd) => format!("  ({program} is not installed — then run `{cmd}`)"),
+                None => format!("  ({program} is not installed)"),
+            },
             neosh_proto::CredentialSource::Inherited => {
-                "  (uses an existing CLI login)".to_string()
+                "  (uses an existing login)".to_string()
             }
             neosh_proto::CredentialSource::NotNeeded => String::new(),
             neosh_proto::CredentialSource::Missing => match &inst.auth {
