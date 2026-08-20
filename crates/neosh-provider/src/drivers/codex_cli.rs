@@ -454,6 +454,9 @@ impl Provider for CodexCliProvider {
             let previous = thread.lock().expect("thread lock poisoned").clone();
 
             let mut cmd = Command::new(&program);
+            if !request.cwd.as_os_str().is_empty() {
+                cmd.current_dir(&request.cwd);
+            }
             cmd.arg("exec");
             if let Some(id) = &previous {
                 cmd.arg("resume").arg(id);
@@ -721,6 +724,7 @@ mod tests {
             extra_headers: vec![],
         };
         let req = TurnRequest {
+            cwd: std::path::PathBuf::new(),
             selection: ModelSelection {
                 instance: InstanceId::from("codex-cli"),
                 model: "gpt-5.6-terra".into(),

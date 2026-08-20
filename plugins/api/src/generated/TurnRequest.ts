@@ -5,6 +5,19 @@ import type { ToolDef } from "./ToolDef";
 
 export type TurnRequest = {
   selection: ModelSelection;
+  /**
+   * The directory this turn happens in.
+   *
+   * The conversation's, not the process's. A vendor CLI is an agent that reads files, runs
+   * commands and looks at git — all of it relative to where it was started — so a driver that
+   * spawns it in whatever directory neosh happened to be launched from is asking about the
+   * wrong repository. Every conversation carries a project; this is how a driver finds out
+   * which one.
+   *
+   * Empty means "wherever the host process is", which is what a driver with no opinion did
+   * before this field existed.
+   */
+  cwd: string;
   system?: string | null;
   messages: Array<Message>;
   tools?: Array<ToolDef>;

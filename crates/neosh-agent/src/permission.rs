@@ -68,6 +68,19 @@ impl PermissionLayer {
         &self.workspace
     }
 
+    /// Move the root every relative path is resolved against.
+    ///
+    /// Which follows the *conversation*, not the process. A conversation belongs to a project, and
+    /// a layer pinned to wherever neosh was launched refuses `src/main.rs` in every project but
+    /// one — with "outside the workspace", which is true and useless.
+    ///
+    /// The allow-lists are deliberately kept: they are about *what kind of thing* the agent may do,
+    /// not about which tree it does it in, and dropping them on every switch would silently
+    /// re-prompt for things the user has already permitted.
+    pub fn set_workspace(&mut self, workspace: impl Into<PathBuf>) {
+        self.workspace = workspace.into();
+    }
+
     /// Resolve a possibly-relative path and confirm it stays inside an allowed root.
     ///
     /// Returns the resolved path on success. `None` means the path escapes every root, by any

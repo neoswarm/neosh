@@ -420,6 +420,15 @@ impl Provider for AcpProvider {
         let session_slot = self.session.clone();
         let mode = *self.mode.lock().expect("mode lock poisoned");
         let model = request.selection.model.as_ref().to_string();
+        // The conversation's directory. ACP makes this explicit — `cwd` is a parameter of
+        // `session/new` — so unlike the other two drivers this one was always going to send
+        // *something*; it just used to send whatever directory neosh was launched from.
+        let workdir = if request.cwd.as_os_str().is_empty() {
+            std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."))
+        } else {
+            request.cwd.clone()
+        };
+        let cwd = workdir.display().to_string();
 
         tokio::spawn(async move {
             let fail = |tx: mpsc::Sender<ProviderEvent>, message: String| async move {
@@ -427,7 +436,10 @@ impl Provider for AcpProvider {
             };
 
             let mut cmd = Command::new(&program);
-            cmd.args(&args)
+            // Spawned there as well as told about it: an agent reads its own configuration
+            // relative to where it starts, and `session/new` is too late for that.
+            cmd.current_dir(&workdir)
+                .args(&args)
                 .stdin(Stdio::piped())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped());
@@ -505,9 +517,6 @@ impl Provider for AcpProvider {
             // 2. a session: continue the old one if the agent can, else start a fresh one and send
             //    the whole conversation.
             let previous = session_slot.lock().expect("session lock poisoned").clone();
-            let cwd = std::env::current_dir()
-                .map(|p| p.display().to_string())
-                .unwrap_or_else(|_| ".".into());
             let mut resumed = false;
             let mut session_id = None;
             if let Some(id) = previous {
@@ -790,6 +799,7 @@ mod tests {
             extra_headers: vec![],
         };
         let req = TurnRequest {
+            cwd: std::path::PathBuf::new(),
             selection: ModelSelection {
                 instance: InstanceId::from("ghost"),
                 model: "m".into(),

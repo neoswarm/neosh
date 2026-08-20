@@ -289,6 +289,7 @@ mod tests {
 
     fn request(options: Vec<OptionSelection>) -> TurnRequest {
         TurnRequest {
+            cwd: std::path::PathBuf::new(),
             selection: ModelSelection {
                 instance: InstanceId::from("anthropic"),
                 model: ModelId::from("claude-opus-5"),

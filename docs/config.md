@@ -132,8 +132,53 @@ it my setup".
 
 The sidebar groups conversations by the directory they were opened in. There is no project registry
 to maintain: opening a conversation somewhere else *is* how a second project appears, and
-`git.worktree.list` opens one in another worktree. `neosh.git` answers about whichever conversation
-is active, so switching conversation switches which tree you are looking at.
+`git.worktree.list` opens one in another worktree.
+
+**A conversation's directory is where its work happens**, not just where it is filed. Switching
+conversation moves four things with it: the repository `neosh.git` answers about, the root the
+agent's file tools resolve paths against, the directory the welcome block names, and — the one that
+matters most — the directory the model's own agent is started in. A vendor CLI reads files, runs
+commands and looks at git relative to where it was spawned, so a driver launched in whatever
+directory neosh happened to be started from is answering about the wrong repository. Drivers are
+told per turn, through `TurnRequest.cwd`.
+
+### Worktrees
+
+A worktree is a second checkout of the same repository on a different branch, and it is the answer
+to "I want to try something without disturbing what is checked out". neosh treats one as a
+*project*: it gets its own group in the sidebar, its own conversations, and its own branch in the
+footer.
+
+`^N` asks where a new conversation goes when there is something to ask:
+
+```
+New conversation
+>
+❯ Here                  /home/you/work/project
+  In a new worktree…    a branch of its own, checked out somewhere else
+  fix/thing             worktree  ·  ~/.nsh/project/fix-thing
+  Another directory…    somewhere else entirely
+```
+
+`Here` is selected, so `^N ⏎` is what `^N` always did. Outside a git repository the question has
+one answer and is not asked at all — `^N` stays a single key everywhere the choice would be
+theatre. `session.new.here` skips it unconditionally, for a key of your own.
+
+New worktrees go under `worktree.root`, laid out as `<root>/<repo>/<branch>`:
+
+```toml
+[options]
+"worktree.root" = "~/.nsh"   # the default. `~` expands.
+```
+
+A directory of neosh's own rather than a sibling of the repository, because a worktree is not part
+of the project you are working on and littering its parent with `project-worktrees/` is how people
+end up with checkouts they cannot account for. The repository name is a level of its own so two
+projects with a `main` branch do not collide, and a slash in a branch becomes a dash — `feat/thing`
+is one directory, not two, because the directory is a name and not a path.
+
+Setting it to `""` restores the sibling layout, for anyone who wants their trees next to the thing
+they are trees of.
 
 Conversations are saved as you go — one file each under `~/.local/state/neosh/sessions/` — and
 restored at startup, in the one you were last in. `--clean` neither reads nor writes them.

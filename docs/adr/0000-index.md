@@ -34,3 +34,4 @@ implementation — and in two cases (0005, 0008) it did not, which is itself rec
 | [0026](0026-a-block-is-settled-once-it-cannot-change.md) | A markdown block is settled once it cannot change | Accepted |
 | [0027](0027-one-driver-for-every-agent-that-speaks-acp.md) | One driver for every agent that speaks ACP | Accepted |
 | [0028](0028-the-transcript-is-a-place-you-go.md) | The transcript is a place you go, not a pane you focus | Accepted |
+| [0029](0029-a-conversation-carries-its-directory.md) | A conversation carries its directory, and everything follows it | Accepted |

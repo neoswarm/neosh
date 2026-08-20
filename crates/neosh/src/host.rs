@@ -685,6 +685,10 @@ impl Host {
                     i
                 };
                 if activate {
+                    // Before the redraw: the banner names the directory, and the file tools have
+                    // to be pointed at it before the first turn rather than after it.
+                    let here = { self.agent.sessions().active().cwd.clone() };
+                    self.work_in(here).await;
                     self.enter_session();
                 }
                 self.persist_sessions();
@@ -703,7 +707,7 @@ impl Host {
                     .switch(&session)
                     .map_err(|e| ApiError::NotFound { what: e.to_string() })?;
                 let cwd = { self.agent.sessions().active().cwd.clone() };
-                self.remember_repo(cwd).await;
+                self.work_in(cwd).await;
                 self.enter_session();
                 Ok(ApiOk::Unit)
             }
@@ -1021,6 +1025,19 @@ impl Host {
                 };
                 if self.editor.set_theme(variant) {
                     self.refresh_status();
+                }
+            }
+            "worktree.root" => {
+                // Expanded here, once, so nothing downstream has to know what `~` means. A path
+                // half the readers expand is a path that works until the day it does not.
+                let raw = value.as_str().unwrap_or_default();
+                if let Some(full) = expand_tilde(raw)
+                    && full != raw
+                {
+                    self.set_option_or_defer(
+                        "worktree.root".into(),
+                        OptionValue::Str(full),
+                    );
                 }
             }
             "ui.hints" => self.refresh_composer(),
@@ -3356,6 +3373,13 @@ impl Host {
         for dir in dirs {
             self.remember_repo(dir).await;
         }
+        // And the one that is active decides where "here" is, which is not necessarily where neosh
+        // was started: reopening the last conversation you were in should put you back in *its*
+        // project, not in whichever directory the shell happened to be sitting in.
+        let here = { self.agent.sessions().active().cwd.clone() };
+        if here.is_dir() {
+            self.work_in(here).await;
+        }
         self.enter_session();
         tracing::info!("restored {restored} conversation(s)");
     }
@@ -3371,14 +3395,30 @@ impl Host {
     }
 
     pub async fn discover_repo(&mut self, cwd: &std::path::Path) {
-        self.cwd = cwd.to_path_buf();
-        self.remember_repo(cwd.to_path_buf()).await;
+        self.work_in(cwd.to_path_buf()).await;
     }
 
     /// Look a directory up once and remember the answer, including "not a repository".
     ///
     /// The negative is cached too: a plain directory would otherwise cost a `git rev-parse` on
     /// every status refresh forever.
+    /// Point everything that means "here" at a directory.
+    ///
+    /// Called on every switch and on every new conversation, because *here* is a property of the
+    /// conversation. Three things follow it and each was pinned to the launch directory before:
+    /// the git repository plugins ask about, the root the agent's file tools resolve against, and
+    /// the directory the welcome banner names.
+    ///
+    /// The vendor CLI drivers are the fourth, and they are told per turn rather than held here —
+    /// see [`neosh_proto::TurnRequest::cwd`].
+    async fn work_in(&mut self, dir: std::path::PathBuf) {
+        self.cwd = dir.clone();
+        let mut layer = (*self.agent.permissions()).clone();
+        layer.set_workspace(dir.clone());
+        self.agent.set_permissions(layer);
+        self.remember_repo(dir).await;
+    }
+
     async fn remember_repo(&mut self, dir: std::path::PathBuf) {
         if self.repos.contains_key(&dir) {
             return;
@@ -3916,6 +3956,21 @@ impl Host {
                 ty: OptionType::Str,
                 default: OptionValue::Str("<S-Tab> <Left>".into()),
                 description: Some("Move back a pane in a two-pane widget.".into()),
+            },
+            // Where worktrees go. Host-owned rather than the git plugin's, for two reasons: it is
+            // a place neosh writes on your disk, which is the host's business to answer for, and
+            // the default has to be an absolute path — a plugin has no way to find your home
+            // directory, and a `~` that only some readers expand is worse than no `~` at all.
+            OptionSpec {
+                name: "worktree.root".into(),
+                ty: OptionType::Str,
+                default: OptionValue::Str(default_worktree_root()),
+                description: Some(
+                    "Where `git.worktree.new` puts a new worktree, as `<root>/<repo>/<branch>`. \
+                     A leading `~` is expanded. Empty means beside the repository instead, in \
+                     `<repo>-worktrees/`."
+                        .into(),
+                ),
             },
             // Display settings every widget reads. Declared here rather than by whichever plugin
             // happens to load first: two plugins declaring one name is an error, and a plugin that
@@ -4473,6 +4528,30 @@ fn chunk(text: impl Into<String>, hl: &str) -> neosh_proto::VirtChunk {
 fn display_width(s: &str) -> usize {
     use unicode_width::UnicodeWidthStr;
     s.width()
+}
+
+/// The other direction: `~/x` back into an absolute path.
+///
+/// Returns nothing when there is no home directory to substitute, which leaves the path exactly as
+/// written — a literal directory called `~` is a strange thing to have, but inventing a path is
+/// worse than honouring one.
+fn expand_tilde(raw: &str) -> Option<String> {
+    let rest = raw.strip_prefix('~')?;
+    if !(rest.is_empty() || rest.starts_with('/')) {
+        // `~other/x` is another user's home, which is not ours to resolve.
+        return None;
+    }
+    let home = std::env::var_os("HOME").filter(|h| !h.is_empty())?;
+    Some(format!("{}{rest}", home.to_string_lossy()))
+}
+
+/// Where worktrees go unless told otherwise.
+///
+/// `~/.nsh`, expanded at declare time so the default is already absolute — an option whose default
+/// value is a string only some readers understand is a trap for the first plugin that reads it
+/// without thinking.
+fn default_worktree_root() -> String {
+    expand_tilde("~/.nsh").unwrap_or_else(|| ".nsh".to_string())
 }
 
 /// A path with the home directory written the way people say it.

@@ -133,6 +133,26 @@ impl Session {
         ));
     }
 
+    /// `^N`, and wait until the conversation it starts is actually in the list.
+    ///
+    /// Worth a helper: starting one is now several round trips — it asks git whether there are
+    /// worktrees to offer before deciding whether to ask you anything — so a test that pressed the
+    /// key and immediately moved the cursor was moving it over a list about to gain a row.
+    fn new_conversation(&mut self) {
+        let before = self.sidebar_rows();
+        self.ctrl("n");
+        assert!(
+            self.pump(|s| s.sidebar_rows() > before),
+            "a conversation was started\n{:?}",
+            self.sidebar_now()
+        );
+    }
+
+    /// How many conversation rows the panel is showing, however they are named.
+    fn sidebar_rows(&self) -> usize {
+        self.sidebar_now().iter().filter(|l| l.starts_with("     ") || l.starts_with("       ")).count()
+    }
+
     fn ctrl(&mut self, c: &str) {
         self.send(&format!(
             r#"{{"type":"key","key":{{"code":{{"kind":"char","c":"{c}"}},"mods":{{"ctrl":true}}}}}}"#
@@ -1440,7 +1460,7 @@ fn moving_and_selecting_in_the_thread_list_switches_conversation() {
     s.enter();
     s.wait_for("first");
 
-    s.ctrl("n"); // a second conversation, now active
+    s.new_conversation(); // a second conversation, now active
     assert!(s.pump(|s| s.sidebar_now().iter().any(|l| l.contains("New conversation"))));
 
     // Into the list, down to the other row, select it.
@@ -1633,6 +1653,119 @@ fn adding_a_project_is_a_row_you_can_see_rather_than_a_key_you_have_to_know() {
     s.wait_for("Add project");
 }
 
+// ---------------------------------------------------------------------------
+// Worktrees
+// ---------------------------------------------------------------------------
+
+/// `^N` in a repository asks where the conversation goes, because there is a real answer that is
+/// not always "here".
+///
+/// Outside a repository it does not ask — the question would have one answer — so this also pins
+/// down that `session.new` stays a single key everywhere the choice would be theatre.
+#[test]
+fn a_new_conversation_in_a_repository_offers_a_worktree() {
+    let sb = Sandbox::new("newwhere");
+    sb.git_init();
+    let mut s = sb.start();
+    s.wait_for("PROJECTS");
+    s.ctrl("n");
+    // Waiting on the picker's own buffer, not on the words in it: "New conversation" is also what
+    // an unnamed conversation is called in the panel, so a text match passes before it opens.
+    assert!(
+        s.pump(|s| !s.picker_named("[New conversation]").is_empty()),
+        "the picker opened\n{:?}",
+        s.sidebar_now()
+    );
+    let rows = s.picker_named("[New conversation]");
+    assert!(rows.iter().any(|l| l.contains("Here")), "the default\n{rows:?}");
+    assert!(rows.iter().any(|l| l.contains("new worktree")), "and the other one\n{rows:?}");
+}
+
+#[test]
+fn a_new_conversation_outside_a_repository_does_not_ask() {
+    let sb = Sandbox::new("newnoask");
+    let mut s = sb.start();
+    s.wait_for("PROJECTS");
+    let before = s.sidebar_now().iter().filter(|l| l.contains("New conversation")).count();
+    s.ctrl("n");
+    assert!(
+        s.pump(|s| {
+            s.sidebar_now().iter().filter(|l| l.contains("New conversation")).count() > before
+        }),
+        "it just started one\n{:?}",
+        s.sidebar_now()
+    );
+    assert!(
+        s.picker_named("[New conversation]").is_empty(),
+        "without asking a question with one answer"
+    );
+}
+
+/// A worktree goes under `worktree.root`, as `<root>/<repo>/<branch>`, and you land in it.
+///
+/// The landing is the point. Creating a directory you then have to go and find is not a feature,
+/// it is a chore with extra steps — and `^N` offering it only makes sense if choosing it puts you
+/// where you asked to be.
+#[test]
+fn a_worktree_is_created_under_the_configured_root_and_you_land_in_it() {
+    let sb = Sandbox::new("wtnew");
+    sb.git_init();
+    let root = sb.root.join("trees");
+    sb.write_config(&format!(
+        "[options]\n\"worktree.root\" = \"{}\"\n",
+        root.display()
+    ));
+    let mut s = sb.start_letting_config_choose();
+    s.wait_for("PROJECTS");
+
+    s.send(&command("git.worktree.new"));
+    s.wait_for("Branch for the new worktree");
+    s.type_text("feat/thing");
+    s.enter();
+
+    // The path it proposes says both halves of the layout: the repository, then the branch with
+    // its slash flattened, because a directory is a name and not a path.
+    let want = format!("{}/work/feat-thing", root.display());
+    assert!(
+        s.pump(|s| s.prompt_now().iter().any(|l| l.contains(&want))),
+        "proposed {want}\n{:?}",
+        s.prompt_now()
+    );
+    s.enter();
+
+    assert!(
+        s.pump(|_| std::path::Path::new(&want).is_dir()),
+        "the worktree is on disk at {want}"
+    );
+    assert!(
+        s.pump(|s| s.chat_now().iter().any(|l| l.contains("feat-thing"))),
+        "and the conversation is in it\n{:?}",
+        s.chat_now()
+    );
+}
+
+/// An empty root restores the old sibling layout, for anyone who wants their trees beside the
+/// thing they are trees of.
+#[test]
+fn an_empty_worktree_root_puts_them_beside_the_repository() {
+    let sb = Sandbox::new("wtsibling");
+    sb.git_init();
+    sb.write_config("[options]\n\"worktree.root\" = \"\"\n");
+    let mut s = sb.start_letting_config_choose();
+    s.wait_for("PROJECTS");
+
+    s.send(&command("git.worktree.new"));
+    s.wait_for("Branch for the new worktree");
+    s.type_text("side");
+    s.enter();
+    let want = format!("{}/work-worktrees/side", sb.root.display());
+    assert!(
+        s.pump(|s| s.prompt_now().iter().any(|l| l.contains(&want))),
+        "proposed {want}\n{:?}",
+        s.prompt_now()
+    );
+}
+
 #[test]
 fn folding_a_project_hides_its_conversations_and_keeps_the_count() {
     let sb = Sandbox::new("fold");
@@ -1816,7 +1949,7 @@ fn archiving_takes_a_conversation_out_of_the_list_and_u_brings_it_back() {
     }
     s.enter();
     s.wait_for("keep");
-    s.ctrl("n"); // a second conversation, so the first is not the only one left
+    s.new_conversation(); // a second conversation, so the first is not the only one left
 
     s.enter_panel();
     assert!(s.pump(|s| s.sidebar_now().iter().any(|l| l.contains("keep"))));
@@ -1888,7 +2021,7 @@ fn deleting_a_conversation_with_something_in_it_asks_first() {
     }
     s.enter();
     s.wait_for("keep");
-    s.ctrl("n"); // a second conversation, so deleting the first is even allowed
+    s.new_conversation(); // a second conversation, so deleting the first is even allowed
 
     s.enter_panel();
     assert!(s.pump(|s| s.sidebar_now().iter().any(|l| l.contains("keep"))));
@@ -1959,7 +2092,7 @@ fn confirmation_can_be_switched_off() {
     }
     s.enter();
     s.wait_for("gone");
-    s.ctrl("n");
+    s.new_conversation();
 
     s.enter_panel();
     assert!(s.pump(|s| s.sidebar_now().iter().any(|l| l.contains("gone"))));
@@ -3205,6 +3338,122 @@ fn the_working_line_says_how_much_is_waiting() {
 ///
 /// The case this exists for is a tool card, which has no trailing blank of its own: the previous
 /// turn ends with `└ 3 files`, and the next thing you said starts on the very next row.
+// ---------------------------------------------------------------------------
+// A conversation happens where its project is
+// ---------------------------------------------------------------------------
+
+/// A provider that answers with the directory it was told the turn happens in.
+///
+/// Which is the only way to check this from outside: the thing that was wrong was what a *driver*
+/// received, and a driver is the far side of the provider boundary.
+const WHERE: &str = r#"
+import type { PluginContext } from "@neosh/api";
+
+export async function activate({ neosh }: PluginContext) {
+  await neosh.provider.register("where", [{
+    id: "where", driver: "where", display_name: "Where",
+    models: [{ id: "where-1", display_name: "Where One" }],
+  }], async (req, emit) => {
+    emit({ type: "text_delta", index: 0, text: `cwd=${req.cwd}` });
+    emit({ type: "message_stop" });
+  });
+  // Driven through the same calls a real plugin uses, so the test exercises the public path
+  // rather than a back door the product does not have.
+  await neosh.cmd.register("where.at", async (args) => {
+    await neosh.session.create({ cwd: args[0], activate: true });
+  }, { desc: "open a conversation in a directory" });
+  await neosh.cmd.register("where.goto", async (args) => {
+    const all = await neosh.session.list();
+    const found = all.find((s) => s.cwd === args[0]);
+    if (found) await neosh.session.switch(found.id);
+    else neosh.notify(`no conversation in ${args[0]}`, "warn");
+  }, { desc: "switch to the conversation in a directory" });
+  neosh.notify("where ready");
+}
+"#;
+
+fn install_where(sb: &Sandbox) {
+    let dir = sb.root.join("config/plugins/where");
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    std::fs::write(
+        dir.join("plugin.toml"),
+        "name = \"where\"\nversion = \"0.1.0\"\nentry = \"main.ts\"\npermissions = [\"providers\"]\n",
+    )
+    .expect("manifest");
+    std::fs::write(dir.join("main.ts"), WHERE).expect("plugin");
+}
+
+/// A turn happens in the conversation's project, not in whatever directory neosh was started from.
+///
+/// This was the whole bug. A conversation carried a `cwd` and the sidebar grouped by it, but the
+/// thing that actually does the work — a vendor CLI, which reads files and runs commands relative
+/// to where it was spawned — was never told. So every project's conversations ran in the same
+/// directory, and the grouping was decoration.
+#[test]
+fn a_turn_runs_in_the_project_the_conversation_belongs_to() {
+    let sb = Sandbox::new("turncwd");
+    install_where(&sb);
+    let elsewhere = sb.root.join("elsewhere");
+    std::fs::create_dir_all(&elsewhere).expect("mkdir");
+    sb.write_config("[options]\n\"agent.model\" = \"where/where-1\"\n");
+    let mut s = sb.start_letting_config_choose();
+    s.wait_for("where ready");
+    s.wait_for("PROJECTS");
+
+    // A conversation in a second directory, which is what adding a project amounts to.
+    s.send(&command_with("where.at", &elsewhere.display().to_string()));
+    assert!(
+        s.pump(|s| s.chat_now().iter().any(|l| l.contains("elsewhere"))),
+        "the banner names the project this conversation is in\n{:?}",
+        s.chat_now()
+    );
+
+    s.type_text("go");
+    s.enter();
+    let want = format!("cwd={}", elsewhere.display());
+    assert!(
+        s.pump(|s| s.chat_now().iter().any(|l| l.contains(&want))),
+        "and the driver was told to work there\n{:?}",
+        s.chat_now()
+    );
+}
+
+/// Switching back moves everything back with it.
+#[test]
+fn switching_conversations_moves_the_working_directory_too() {
+    let sb = Sandbox::new("switchcwd");
+    install_where(&sb);
+    let elsewhere = sb.root.join("elsewhere");
+    std::fs::create_dir_all(&elsewhere).expect("mkdir");
+    sb.write_config("[options]\n\"agent.model\" = \"where/where-1\"\n");
+    let mut s = sb.start_letting_config_choose();
+    s.wait_for("where ready");
+    s.wait_for("PROJECTS");
+    s.send(&command_with("where.at", &elsewhere.display().to_string()));
+    assert!(
+        s.pump(|s| s.chat_now().iter().any(|l| l.contains("elsewhere"))),
+        "in the second project\n{:?}",
+        s.chat_now()
+    );
+
+    // Back to the first, and a turn there must run in the original workspace again.
+    let home = format!("directory  {}", sb.work().display());
+    s.send(&command_with("where.goto", &sb.work().display().to_string()));
+    assert!(
+        s.pump(|s| s.chat_now().iter().any(|l| l.contains(&home))),
+        "back in the first\n{:?}",
+        s.chat_now()
+    );
+    s.type_text("go");
+    s.enter();
+    let want = format!("cwd={}", sb.work().display());
+    assert!(
+        s.pump(|s| s.chat_now().iter().any(|l| l.contains(&want))),
+        "back in the first project\n{:?}",
+        s.chat_now()
+    );
+}
+
 #[test]
 fn a_question_gets_a_gap_above_it_and_keeps_its_bar() {
     let sb = Sandbox::new("questiongap");

@@ -87,13 +87,6 @@ export async function activate({ neosh, subscriptions }: PluginContext) {
   }
 
   await neosh.opt.declare({
-    name: "git.worktree.root",
-    type: { type: "str" },
-    default: "",
-    description:
-      'Where new worktrees are created. Empty means a sibling of the repository, named "<repo>-<branch>". A relative path is resolved against the repository root.',
-  });
-  await neosh.opt.declare({
     name: "git.commit.confirm",
     type: { type: "bool" },
     default: true,
@@ -570,15 +563,7 @@ async function newWorktree(neosh: Neosh): Promise<void> {
   if (!branch || !branch.trim()) return;
   const name = slug(branch);
 
-  const configured = ((await neosh.opt.get<string>("git.worktree.root")) ?? "").trim();
-  const root = status.repo.root;
-  const repoName = root.split("/").filter(Boolean).pop() ?? "repo";
-  const base = configured
-    ? configured.startsWith("/")
-      ? configured
-      : `${root}/${configured}`
-    : `${parentOf(root)}/${repoName}-worktrees`;
-  const path = `${base}/${name.replace(/\//g, "-")}`;
+  const path = await worktreePath(neosh, status.repo.root, name);
 
   const taken = new Set((await neosh.git.branches({ includeRemote: true })).map((b) => b.name));
   const create = !taken.has(name);
@@ -596,6 +581,30 @@ async function newWorktree(neosh: Neosh): Promise<void> {
   // feature, it is a chore with extra steps.
   await neosh.session.create({ cwd: where.trim() });
   neosh.notify(`working in ${name}`);
+}
+
+/**
+ * Where a worktree for `branch` goes.
+ *
+ * `<root>/<repo>/<branch>` under `worktree.root`, which is `~/.nsh` unless configured — a
+ * directory of neosh's own rather than a sibling of the repository, because a worktree is not part
+ * of the project you are working on and littering its parent with `foo-worktrees/` is how people
+ * end up with checkouts they cannot account for. The repository name is a level of its own so two
+ * projects with a `main` branch do not collide.
+ *
+ * An empty `worktree.root` restores the sibling layout, for anyone who wants their trees next to
+ * the thing they are trees of.
+ *
+ * Slashes in a branch become dashes: `feat/thing` is one directory, not two, because the directory
+ * is a name and not a path.
+ */
+async function worktreePath(neosh: Neosh, repoRoot: string, branch: string): Promise<string> {
+  const leaf = branch.replace(/\//g, "-");
+  const repoName = repoRoot.split("/").filter(Boolean).pop() ?? "repo";
+  const configured = ((await neosh.opt.get<string>("worktree.root")) ?? "").trim();
+  if (configured === "") return `${parentOf(repoRoot)}/${repoName}-worktrees/${leaf}`;
+  const base = configured.startsWith("/") ? configured : `${repoRoot}/${configured}`;
+  return `${base}/${repoName}/${leaf}`;
 }
 
 async function removeWorktree(neosh: Neosh): Promise<void> {
