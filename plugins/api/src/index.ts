@@ -506,6 +506,16 @@ export interface AgentApi {
   setCredential(instance: string, opts?: { replace?: boolean }): Promise<boolean>;
   /** Drop a stored key from memory and from the keychain. The environment is not ours to clear. */
   forgetCredential(instance: string): Promise<void>;
+  /**
+   * The model this conversation will use changed, whoever changed it.
+   *
+   * Not the same as `opt.onChange` for `agent.model`: that option is a preference, and the
+   * selection also moves when a conversation is restored, when a stored model turns out not to
+   * authenticate, and when a provider registers late and the model somebody asked for finally
+   * becomes reachable. Anything that names the model — a footer, a context meter measuring against
+   * its window — wants this one.
+   */
+  onSelectionChange(cb: (e: { selection: ModelSelection }) => void): Disposable;
   onTurnStart(cb: (e: { turn: string }) => void): Disposable;
   /** One streamed chunk of assistant text. Chunks are provider-sized, not characters. */
   onToken(cb: (e: { turn: string; text: string }) => void): Disposable;
@@ -828,6 +838,7 @@ interface Registered {
   bufferListeners: Map<number, Array<(e: { buf: BufferId; start: number; oldEnd: number; newEnd: number }) => void>>;
   optionListeners: Array<(e: { name: string; value: OptionValue }) => void>;
   sessionListeners: Array<(e: { session: SessionId }) => void>;
+  selectionListeners: Array<(e: { selection: ModelSelection }) => void>;
   options: Set<string>;
   /// Timer handles this plugin armed, cleared on unload.
   timers: Set<number>;
@@ -849,6 +860,7 @@ function reg(plugin: string): Registered {
       bufferListeners: new Map(),
       optionListeners: [],
       sessionListeners: [],
+      selectionListeners: [],
       options: new Set(),
       timers: new Set(),
       agentListeners: { turnStart: [], token: [], thinking: [], turnEnd: [], toolStart: [], toolEnd: [] },
@@ -1224,6 +1236,7 @@ export function __createContext(plugin: string, config: unknown, version: number
       async forgetCredential(instance) {
         await c({ call: "provider_forget_credential", instance });
       },
+      onSelectionChange: (cb) => listener(r.selectionListeners, cb),
       onTurnStart: (cb) => listener(r.agentListeners.turnStart as Array<(e: { turn: string }) => void>, cb),
       onToken: (cb) => listener(r.agentListeners.token as Array<(e: { turn: string; text: string }) => void>, cb),
       onThinking: (cb) => listener(r.agentListeners.thinking as Array<(e: { turn: string; text: string }) => void>, cb),
@@ -1534,6 +1547,9 @@ export async function __dispatch(plugin: string, msg: Record<string, unknown>): 
         break;
       case "session_changed":
         for (const cb of r.sessionListeners) cb({ session: ev.session });
+        break;
+      case "selection_changed":
+        for (const cb of r.selectionListeners) cb({ selection: ev.selection });
         break;
       case "focus_changed":
       case "shutdown":

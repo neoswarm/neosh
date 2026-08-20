@@ -3,6 +3,7 @@ import type { BufferId } from "./BufferId";
 import type { HookName } from "./HookName";
 import type { HookPayload } from "./HookPayload";
 import type { KeyContext } from "./KeyContext";
+import type { ModelSelection } from "./ModelSelection";
 import type { OptionValue } from "./OptionValue";
 import type { SessionId } from "./SessionId";
 import type { StopReason } from "./StopReason";
@@ -47,5 +48,6 @@ export type PluginEvent =
   | { "type": "focus_changed"; win?: WindowId | null }
   | { "type": "option_changed"; name: string; value: OptionValue }
   | { "type": "session_changed"; session: SessionId }
+  | { "type": "selection_changed"; selection: ModelSelection }
   | { "type": "provider_cancel"; stream: StreamId }
   | { "type": "shutdown" };

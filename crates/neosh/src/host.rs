@@ -617,7 +617,7 @@ impl Host {
                         what: format!("no driver serves instance {}", selection.instance),
                     });
                 }
-                self.agent.set_selection(selection);
+                self.select_model(selection);
                 Ok(ApiOk::Unit)
             }
             ApiCall::AgentListInstances => Ok(ApiOk::Instances {
@@ -1001,7 +1001,7 @@ impl Host {
                     return;
                 }
                 self.startup.pending_model = None;
-                self.agent.set_selection(selection);
+                self.select_model(selection);
                 // Chosen, not remembered: from here on the fallback leaves it alone even if it
                 // cannot authenticate, because the error is more use than a substitution.
                 self.selection_pinned = true;
@@ -1039,6 +1039,15 @@ impl Host {
             }
             _ => {}
         }
+    }
+
+    /// How wide the status strip is, or zero if the frontend has not said yet.
+    fn status_width(&self) -> usize {
+        self.editor
+            .windows()
+            .find(|w| w.buf == self.status)
+            .and_then(|w| w.viewport.map(|v| v.width as usize))
+            .unwrap_or(0)
     }
 
     /// Redraw the status line.
@@ -1083,6 +1092,60 @@ impl Host {
         left.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
         right.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
 
+        // Drop what does not fit, least important first.
+        //
+        // Both sides at once, because the two halves are competing for one line and the loser is
+        // whichever segment is worth least, not whichever side it happens to be on. Without this,
+        // a wide left half and a right half that no longer fits means the right half is written
+        // straight over the end of the left one — two segments in the same columns, which reads
+        // as a corrupted line rather than as a full one.
+        //
+        // Nothing is truncated. Half a token count is a wrong token count, and a bar cut short is
+        // a bar reading a level nothing is at.
+        {
+            let width = self.status_width();
+            // The mode word, the space each side of the line, and the single column that keeps the
+            // two halves from touching.
+            let mut used = display_width(mode) + 3;
+            let cost = |seg: &neosh_proto::StatusSegment| {
+                2 + display_width(&seg.text)
+                    + seg
+                        .keys
+                        .as_deref()
+                        .filter(|k| !k.is_empty())
+                        .map_or(0, |k| 1 + display_width(k))
+            };
+            let mut order: Vec<(i32, String)> =
+                left.iter().chain(right.iter()).map(|(p, k, _)| (*p, k.clone())).collect();
+            // Least important last in the strip, so least important first out of it.
+            order.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| b.1.cmp(&a.1)));
+            let mut dropped: std::collections::HashSet<String> = Default::default();
+            for (_, key) in &order {
+                let seg = left
+                    .iter()
+                    .chain(right.iter())
+                    .find(|(_, k, _)| k == key)
+                    .map(|(_, _, s)| s)
+                    .expect("came from those lists");
+                used += cost(seg);
+            }
+            for (_, key) in order.iter() {
+                if width == 0 || used <= width {
+                    break;
+                }
+                let seg = left
+                    .iter()
+                    .chain(right.iter())
+                    .find(|(_, k, _)| k == key)
+                    .map(|(_, _, s)| s)
+                    .expect("came from those lists");
+                used -= cost(seg);
+                dropped.insert(key.clone());
+            }
+            left.retain(|(_, k, _)| !dropped.contains(k));
+            right.retain(|(_, k, _)| !dropped.contains(k));
+        }
+
         // Marks are built alongside the text so a segment's colour cannot drift from its columns.
         let mut text = String::from(" ");
         let mut marks: Vec<(usize, usize, String)> = Vec::new();
@@ -1123,12 +1186,7 @@ impl Host {
             for (_, _, seg) in right.iter() {
                 segment(&mut tail, &mut tail_marks, seg);
             }
-            let width = self
-                .editor
-                .windows()
-                .find(|w| w.buf == self.status)
-                .and_then(|w| w.viewport.map(|v| v.width as usize))
-                .unwrap_or(0);
+            let width = self.status_width();
             let used = display_width(&text) + display_width(&tail) + 1;
             if width > used {
                 text.push_str(&" ".repeat(width - used));
@@ -1521,9 +1579,22 @@ impl Host {
             "{}/{} cannot authenticate \u{2014} using {}/{} instead.",
             current.instance, current.model, next.instance, next.model
         );
-        self.agent.set_selection(next);
+        self.select_model(next);
         self.editor_message(MessageLevel::Info, note);
         self.refresh_status();
+    }
+
+    /// Set the model this conversation will use, and tell everyone.
+    ///
+    /// Every path that changes a selection goes through here. There are five of them — a plugin
+    /// asking, `agent.model` resolving, a stored model that cannot authenticate being moved off, a
+    /// provider registering late, and the first usable one at startup — and only the first is a
+    /// deliberate act by somebody who could plausibly redraw their own footer. The other four used
+    /// to change the model silently, leaving the strip naming a model that was no longer in use and
+    /// a context meter measuring against the wrong window.
+    fn select_model(&mut self, selection: neosh_proto::ModelSelection) {
+        self.agent.set_selection(selection.clone());
+        self.bridge.broadcast(PluginEvent::SelectionChanged { selection });
     }
 
     /// Whether a turn sent with this selection could authenticate.
@@ -4020,7 +4091,7 @@ impl Host {
             let fallback = self.agent.providers().default_selection();
             match fallback {
                 Some(s) => {
-                    self.agent.set_selection(s);
+                    self.select_model(s);
                     self.refresh_status();
                 }
                 None => self.editor_message(
@@ -4067,10 +4138,12 @@ impl Host {
         if let Some(m) = self.startup.cli_model.take() {
             self.set_option_or_defer("agent.model".into(), OptionValue::Str(m));
         }
-        if self.agent.selection().is_none()
-            && let Some(s) = self.agent.providers().default_selection()
-        {
-            self.agent.set_selection(s);
+        if self.agent.selection().is_none() {
+            // The read guard is released before anything takes `&mut self`.
+            let first = self.agent.providers().default_selection();
+            if let Some(s) = first {
+                self.select_model(s);
+            }
         }
         // The "no usable model" warning waits until plugins have loaded: a session whose only
         // provider comes from a plugin has nothing to select at this point, and warning here would

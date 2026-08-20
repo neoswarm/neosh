@@ -324,13 +324,23 @@ implement it ignore it silently; there is no way to detect support.
 ### The strip along the bottom
 
 ```
- chat  ask ⇧⇥  38% of 200k  ↑12k ↓4k                              claude-opus-5 ^P  high ^E
+ chat  ask ⇧⇥  main  ███░░░░░ 38% of 200k  ↑12k ↓4k          claude-opus-5 ^P  High ^E
 ```
 
-Left is what the conversation is *spending* — the permission mode, how full the context window is,
-tokens in and out. Right is what it is spending it *on*. They are separated because they change at
-different rates, and interleaving two things that move at different speeds makes both harder to
-read.
+Left is what the conversation is *spending* — the permission mode, the branch, how full the context
+window is, tokens in and out. Right is what it is spending it *on*. They are separated because they
+change at different rates, and interleaving two things that move at different speeds makes both
+harder to read.
+
+The context meter is drawn from the moment a conversation opens, empty, rather than appearing once
+a turn has been spent. The one time you most want to know how much room a model has is *before*
+deciding what to do with it, and a 200k window and a 1M one are different tools. The bar is for the
+shape of the answer — plenty of room, getting full, nearly out — and the number beside it for the
+rest; the colour changes past 70% and again past 90%.
+
+When the strip is too narrow for everything in it, whole segments are dropped, least important
+first. Nothing is truncated: half a token count is a wrong token count, and a bar cut short reads
+as a level nothing is at.
 
 Every entry carries the key that changes it, immediately after it. That is the whole rule: a key is
 memorable once it has been seen beside the thing it does, and a legend somewhere else is a second
@@ -500,15 +510,17 @@ would have prompted about rather than allowing it.
 right.
 
 ```
- PLANS                  │ ❯ Claude Opus           Frontier  Most capable for complex work
-  ✳ Claude            ✓ │   Claude Sonnet         Balanced  Best for everyday tasks
- API KEYS               │   Claude Haiku          Fast      Fastest, for quick answers
-  ✳ Anthropic         ! │
-  ⬢ OpenAI            ! │   ▸ 4 superseded
+Model                                                              ⇧⇥ providers
+> 
+ PLANS                  │ ❯ Claude Opus 5         Frontier  Most capable for complex work
+  ✳ Claude            ✓ │   Claude Fable 5        Frontier  Long-form writing and voice
+  ⬢ Codex             ✓ │   Claude Sonnet 5       Balanced  Best for everyday tasks
+ API KEYS               │   Claude Haiku 4.5      Fast      Fastest, for quick answers
+  ✳ Anthropic         ! │   ▸ 5 superseded
  LOCAL                  │
   ▲ Ollama              │
 ────────────────────────┴──────────────────────────────────────────────────────────
- ↵ use   ⇥ providers   s sign in   e effort   ^N/^P move   esc close
+ ↵ use   ^S sign in   ^R refresh   ^A add   ^D remove   esc close
 ```
 
 The rail is grouped by **what a turn costs you**, which is the distinction one flat list could not
@@ -521,9 +533,31 @@ make:
 | **LOCAL** | on this machine | costs nothing, needs nothing |
 
 The marker at the right edge of each rail entry: `✓` it will work, `!` it needs a key or its CLI is
-missing, `⨯` no driver provides it. Typing filters the model list; `⇥` and `←`/`→` move between the
-panes; `s` signs in to whatever the rail is on. Superseded models fold behind a count — reachable,
-out of the way, and opened automatically while you are filtering.
+missing, `⨯` no driver provides it. Superseded models fold behind a count — reachable, out of the
+way, and opened automatically while you are filtering.
+
+Typing filters the model list. `⇧⇥` and `←` reach the provider rail, `⇥` and `→` come back, and the
+title row says which of the two the key would take you to right now — a legend can only tell you a
+key exists, and a second pane with no visible way into it is a pane nobody finds.
+
+The picker's own actions are **chords**, not letters:
+
+| | |
+|---|---|
+| `^S` | sign in to whatever the rail is on |
+| `^R` | ask that endpoint again — after adding a key, gaining access, or starting a local server |
+| `^A` | add a model by id, for something the catalogue has never heard of |
+| `^D` | remove one you added |
+
+Chords because every bare letter the picker takes is a letter the filter can never contain. These
+used to be `s`, `r`, `n` and `d`, which between them made it impossible to search for "sonnet".
+
+`^A` asks twice — the id, which goes on the wire and has to be exact, and the name, which is what
+you will read in the list forever afterwards. Nothing validates the id, because nothing here can:
+whether an endpoint serves it is a question only the endpoint can answer, and it answers on the
+first turn. What you add is kept per provider in plugin state rather than in configuration — it is
+a note about *this machine's* access, not a decision worth committing to a repository. `^D` takes
+it back out, and refuses on a model the provider serves, which is not yours to delete.
 
 `ui.nerd_font = true` swaps the geometric provider marks for real brand glyphs. Off by default and
 deliberately not detected: a terminal cannot be asked what its font contains, and guessing wrong

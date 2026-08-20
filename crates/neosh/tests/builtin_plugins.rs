@@ -452,6 +452,107 @@ fn the_rail_is_reachable_and_choosing_a_provider_lists_its_models() {
     );
 }
 
+/// A model you named yourself can be taken back out.
+///
+/// `n` existed and `d` did not, which meant a mistyped id was a row you had to read past forever —
+/// and the most likely thing to be in a hand-typed list of model ids is a typo.
+#[test]
+fn a_model_you_added_yourself_can_be_removed_again() {
+    let sb = Sandbox::new("customdel");
+    let mut s = sb.start();
+    s.wait_for("PROJECTS");
+    s.ctrl("p");
+    s.wait_for("Model");
+
+    // `^A`, then the id, then the name it shows as.
+    s.ctrl("a");
+    assert!(s.pump(|s| !s.prompt_now().is_empty()), "the id prompt opened");
+    s.type_text("acme-1");
+    s.enter();
+    assert!(
+        s.pump(|s| s.prompt_now().iter().any(|l| l.contains("Show it as"))),
+        "then it asks what to call it\n{:?}",
+        s.prompt_now()
+    );
+    s.type_text("!");
+    s.enter();
+    assert!(
+        s.pump(|s| s.picker_now().iter().any(|l| l.contains("acme-1") && l.contains("yours"))),
+        "and it is in the list, marked as yours\n{:?}",
+        s.picker_now()
+    );
+
+    // Onto it — it sorts above the provider's own models — and out.
+    s.special("up");
+    s.ctrl("d");
+    assert!(
+        s.pump(|s| !s.picker_now().iter().any(|l| l.contains("acme-1"))),
+        "and out again\n{:?}",
+        s.picker_now()
+    );
+    assert!(
+        s.saw("removed"),
+        "and it says so"
+    );
+}
+
+/// The filter can contain any letter, including the ones the picker's own actions used to take.
+///
+/// Regression: sign-in, refresh, add and remove were on bare `s`, `r`, `n` and `d`, checked before
+/// the filter ever saw the key. So typing "sonnet" opened a sign-in prompt on the `s`, and there
+/// was no way to search a long model list for anything whose name contained one of four very
+/// common letters.
+#[test]
+fn typing_a_model_name_filters_rather_than_firing_a_command() {
+    let sb = Sandbox::new("filterletters");
+    install_other(&sb);
+    let mut s = sb.start();
+    s.wait_for("other ready");
+    s.wait_for("PROJECTS");
+    s.ctrl("p");
+    s.wait_for("Model");
+    // Onto the provider with two models to tell apart.
+    s.special("back_tab");
+    s.special("down");
+    assert!(s.pump(|s| s.picker_now().iter().any(|l| l.contains("Other Two"))));
+    s.special("tab");
+
+    // Every letter here is one that used to be a command.
+    s.type_text("nd");
+    assert!(
+        s.pump(|s| {
+            let rows = s.picker_now();
+            rows.iter().any(|l| l.contains("> nd"))
+        }),
+        "the letters went into the filter\n{:?}",
+        s.picker_now()
+    );
+    assert!(
+        s.prompt_now().is_empty() && !s.saw("asking again"),
+        "and fired nothing: {:?}",
+        s.prompt_now()
+    );
+}
+
+/// `d` on a model the provider serves is not a deletion. It is not ours to delete, and saying
+/// which of the two a row is beats doing nothing at all.
+#[test]
+fn d_on_a_model_the_provider_serves_explains_rather_than_deleting() {
+    let sb = Sandbox::new("customdel2");
+    let mut s = sb.start();
+    s.wait_for("PROJECTS");
+    s.ctrl("p");
+    s.wait_for("Model");
+    let before = s.picker_now();
+
+    s.ctrl("d");
+    assert!(
+        s.pump(|s| s.saw("nothing of yours to remove")),
+        "it says which kind of row this is"
+    );
+    assert_eq!(s.picker_now(), before, "and nothing moved");
+}
+
 #[test]
 fn a_picker_owns_its_navigation_keys_while_it_is_open() {
     // `<C-n>` is bound globally to "new conversation". A raw capture only receives keys that no
@@ -1169,6 +1270,23 @@ impl Session {
     /// The lines of the model picker, whatever pane they belong to.
     fn picker_now(&self) -> Vec<String> {
         self.picker_named("[Model]")
+    }
+
+    /// The newest buffer with a name, for widgets that open one per use.
+    ///
+    /// A prompt asks two questions by opening two buffers both called `[prompt]`, so matching the
+    /// first one means reading the answer to a question that has already been answered.
+    fn latest_named(&self, name: &str) -> Option<u64> {
+        self.events.iter().rev().find_map(|e| {
+            (e["type"] == "buffer_opened" && e["name"] == name).then(|| e["buf"].as_u64())?
+        })
+    }
+
+    fn prompt_now(&self) -> Vec<String> {
+        match self.latest_named("[prompt]") {
+            Some(b) => self.lines_of(b),
+            None => Vec::new(),
+        }
     }
 
     /// The contents of a picker window, by the title it was opened with.
@@ -2526,6 +2644,131 @@ fn the_shortcut_row_comes_back_if_you_ask_for_it() {
     assert!(chrome.contains("send"), "and the one key everybody needs: {chrome}");
 }
 
+/// A provider whose model says how big its window is, and which reports having filled a third of
+/// it. Enough for the meter to be a real number rather than a shape.
+const WIDE: &str = r#"
+import type { PluginContext } from "@neosh/api";
+
+export async function activate({ neosh }: PluginContext) {
+  await neosh.provider.register("wide", [{
+    id: "wide", driver: "wide", display_name: "Wide",
+    models: [{ id: "wide-1", display_name: "Wide One", context_window: 300000 }],
+  }], async (_req, emit) => {
+    emit({ type: "message_start", model: "wide-1", usage: { input_tokens: 100000 } });
+    emit({ type: "text_delta", index: 0, text: "ok" });
+    emit({
+      type: "message_delta",
+      stop_reason: { kind: "end_turn" },
+      usage: { input_tokens: 100000, output_tokens: 20 },
+    });
+    emit({ type: "message_stop" });
+  });
+  neosh.notify("wide ready");
+}
+"#;
+
+fn install_wide(sb: &Sandbox) {
+    let dir = sb.root.join("config/plugins/wide");
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    std::fs::write(
+        dir.join("plugin.toml"),
+        "name = \"wide\"\nversion = \"0.1.0\"\nentry = \"main.ts\"\npermissions = [\"providers\"]\n",
+    )
+    .expect("manifest");
+    std::fs::write(dir.join("main.ts"), WIDE).expect("plugin");
+}
+
+/// How full the window is, drawn as a bar and said as a percentage — and drawn *before* anything
+/// has been spent.
+///
+/// It used to appear only once a turn had gone through, so the one moment you could not see how
+/// much room a model has was before deciding what to do with it. A 200k window and a 1M window are
+/// different tools and the difference matters most at the start.
+#[test]
+fn the_context_meter_is_there_before_the_first_turn() {
+    let sb = Sandbox::new("ctxmeter");
+    install_wide(&sb);
+    sb.write_config("[options]\n\"agent.model\" = \"wide/wide-1\"\n");
+    let mut s = sb.start_letting_config_choose();
+    s.wait_for("wide ready");
+
+    assert!(
+        s.pump(|s| s.status_now().iter().any(|l| l.contains("of 300k"))),
+        "the window is on the strip before a single token has been spent\n{:?}",
+        s.status_now()
+    );
+    assert!(
+        s.status_now().iter().any(|l| l.contains("0% of 300k")),
+        "and it reads empty rather than being absent\n{:?}",
+        s.status_now()
+    );
+    assert!(
+        s.status_now().iter().any(|l| l.contains('\u{2591}')),
+        "as a bar, not only as a number\n{:?}",
+        s.status_now()
+    );
+
+    s.type_text("go");
+    s.enter();
+    assert!(
+        s.pump(|s| s.status_now().iter().any(|l| l.contains("33% of 300k"))),
+        "and it fills\n{:?}",
+        s.status_now()
+    );
+    assert!(
+        s.status_now().iter().any(|l| l.contains('\u{2588}')),
+        "with filled cells\n{:?}",
+        s.status_now()
+    );
+}
+
+/// One gauge, not two. The sidebar drew a context meter and so did the usage plugin; for as long
+/// as no model in the catalogue reported a window, only one of them ever appeared. The moment one
+/// did, the footer had two bars in it that disagreed about what "used" meant.
+#[test]
+fn there_is_exactly_one_context_meter() {
+    let sb = Sandbox::new("onemeter");
+    install_wide(&sb);
+    sb.write_config("[options]\n\"agent.model\" = \"wide/wide-1\"\n");
+    let mut s = sb.start_letting_config_choose();
+    s.wait_for("wide ready");
+    s.type_text("go");
+    s.enter();
+    assert!(s.pump(|s| s.status_now().iter().any(|l| l.contains("33% of 300k"))));
+
+    let line = s.status_now().join(" ");
+    let bars = line.match_indices('\u{2588}').count();
+    assert!(bars > 0 && bars <= 8, "one bar of at most eight cells, not two: {line:?}");
+}
+
+/// A strip too narrow for everything drops whole segments, least important first, rather than
+/// writing the right half over the end of the left one.
+#[test]
+fn a_narrow_status_strip_drops_segments_rather_than_overlapping_them() {
+    let sb = Sandbox::new("narrowstatus");
+    install_wide(&sb);
+    sb.write_config("[options]\n\"agent.model\" = \"wide/wide-1\"\n");
+    let mut s = sb.start_letting_config_choose();
+    s.wait_for("wide ready");
+    assert!(s.pump(|s| s.status_now().iter().any(|l| l.contains("of 300k"))));
+
+    s.viewport("[status]", 40, 1);
+    assert!(
+        s.pump(|s| {
+            let line = s.status_now().join("");
+            !line.contains("of 300k") && line.contains("chat")
+        }),
+        "the meter went and the mode stayed\n{:?}",
+        s.status_now()
+    );
+    let line = s.status_now().join("");
+    assert!(
+        line.chars().count() <= 41,
+        "and the line still fits the window: {} chars of 40\n{line:?}",
+        line.chars().count()
+    );
+}
+
 #[test]
 fn a_key_shown_beside_what_it_changes_is_not_repeated_on_the_shortcut_row() {
     // The rule the footer exists for. Saying it twice costs a row and teaches nothing the first
@@ -3040,6 +3283,26 @@ fn the_footer_says_what_the_agent_may_do_and_which_key_changes_it() {
 }
 
 impl Session {
+    /// The window showing a named buffer, if the frontend was told about one.
+    fn window_of(&self, name: &str) -> Option<u64> {
+        let buf = self.buffer_named(name)?;
+        self.events.iter().find_map(|e| {
+            (e["type"] == "window_opened" && e["buf"].as_u64() == Some(buf))
+                .then(|| e["win"].as_u64())?
+        })
+    }
+
+    /// Tell the core how big a window really is.
+    ///
+    /// A stdio frontend has no geometry of its own, so nothing reports this unless a test does —
+    /// which means anything that depends on real width is untested until it is said out loud here.
+    fn viewport(&mut self, name: &str, width: u16, height: u16) {
+        let Some(win) = self.window_of(name) else { return };
+        self.send(&format!(
+            r#"{{"type":"viewport_changed","win":{win},"width":{width},"height":{height},"top_line":0}}"#
+        ));
+    }
+
     fn status_now(&self) -> Vec<String> {
         match self.buffer_named("[status]") {
             Some(b) => self.lines_of(b),

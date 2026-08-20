@@ -120,12 +120,9 @@ export async function activate({ neosh, subscriptions }: PluginContext) {
   await footer();
   subscriptions.push(neosh.session.onChange(() => void footer()));
   subscriptions.push(neosh.agent.onTurnEnd(() => void footer()));
-  subscriptions.push(
-    neosh.opt.onChange((e) => {
-      if (e.name === "agent.model") void footer();
-    }),
-  );
-  // Set after every switch too, since `setSelection` does not fire an option change.
+  // Whoever changed it — this plugin, a stored model that would not authenticate, or a provider
+  // registering late and finally serving the model somebody asked for in their config.
+  subscriptions.push(neosh.agent.onSelectionChange(() => void footer()));
   refreshFooter = footer;
 }
 
@@ -235,7 +232,13 @@ async function pickModel(neosh: Neosh): Promise<void> {
     height: 14,
     rail,
     railAt: startAt,
-    hints: "↵ use   ⇥ providers   s sign in   r refresh   n add   esc close",
+    railLabel: "providers",
+    paneLabel: "models",
+    // Chords, not bare letters. Bare letters were nicer to read and made it impossible to type
+    // "sonnet" into the filter: the `s` signed you in instead. Anything the picker takes for
+    // itself is a letter the filter can never contain.
+    ownKeys: ["<C-s>", "<C-r>", "<C-a>", "<C-d>"],
+    hints: "↵ use   ^S sign in   ^R refresh   ^A add   ^D remove   esc close",
     placeholder: "nothing here yet — `s` to sign in, or `n` to name a model yourself",
     async items(c) {
       // Listed even when the driver is missing. What a provider offers is how you decide whether
@@ -278,9 +281,10 @@ async function pickModel(neosh: Neosh): Promise<void> {
     itemAt: (items) =>
       Math.max(0, items.findIndex((i) => i.value?.model?.id === current?.model)),
     async onKey(key, ctx) {
-      if (key.key.code.kind !== "char" || key.key.mods.ctrl || key.key.mods.alt) return;
+      if (key.key.code.kind !== "char" || !key.key.mods.ctrl || key.key.mods.alt) return;
       const c = ctx.rail;
-      if (key.key.code.c === "s") {
+      const pressed = key.key.code.c.toLowerCase();
+      if (pressed === "s") {
         if (!c) return "handled";
         if (!c.accepts_key) {
           neosh.notify(`${c.display_name}: ${describe(c.source)}`, "info");
@@ -291,7 +295,7 @@ async function pickModel(neosh: Neosh): Promise<void> {
       // Ask the endpoint again. Discovery is cached for the session, which is right — it is a
       // network round trip per provider — and wrong the moment you add a key, get given access to
       // a new model, or start the local server the list was empty because of.
-      if (key.key.code.c === "r") {
+      if (pressed === "r") {
         if (!c) return "handled";
         neosh.notify(`${c.display_name}: asking again…`);
         await neosh.agent.listModels(c.instance, { refresh: true }).catch(() => []);
@@ -299,9 +303,24 @@ async function pickModel(neosh: Neosh): Promise<void> {
       }
       // A model the catalogue has not heard of. Vendors ship faster than any list is updated, and
       // "I know the id, let me type it" is the difference between waiting for a release and not.
-      if (key.key.code.c === "n") {
+      if (pressed === "a") {
         if (!c) return "handled";
         return (await addModel(neosh, c)) ? "reload" : "handled";
+      }
+      // And out again. Anything you can add you must be able to take back — a typo in an id is the
+      // most likely thing to be in this list, and a wrong entry that cannot be removed is a row
+      // you have to read past forever.
+      if (pressed === "d") {
+        const id = ctx.item?.model?.id;
+        if (!c || !id) return "handled";
+        if (!(await custom(neosh, c.instance)).some((m) => m.id === id)) {
+          neosh.notify(
+            `${id} is in ${c.display_name}'s own catalogue — there is nothing of yours to remove`,
+            "info",
+          );
+          return "handled";
+        }
+        return (await removeModel(neosh, c.instance, id)) ? "reload" : "handled";
       }
       return undefined;
     },
@@ -533,6 +552,30 @@ async function addModel(neosh: Neosh, c: CredentialInfo): Promise<boolean> {
   all[c.instance] = mine;
   await neosh.state.set("custom", all);
   neosh.notify(`added ${c.instance}/${id.trim()}`);
+  return true;
+}
+
+/**
+ * Take back a model you named yourself.
+ *
+ * Only ever removes from your own list. A model the provider serves is not yours to delete, and
+ * the refusal says which of the two this row is rather than silently doing nothing.
+ */
+async function removeModel(neosh: Neosh, instance: string, id: string): Promise<boolean> {
+  const all =
+    (await neosh.state.get<Record<string, ModelInfo[]>>("custom").catch(() => null)) ?? {};
+  const mine = (all[instance] ?? []).filter((m) => m.id !== id);
+  if (mine.length === 0) delete all[instance];
+  else all[instance] = mine;
+  await neosh.state.set("custom", all);
+  neosh.notify(`removed ${instance}/${id}`);
+
+  // If it was the one in use, the conversation is now pointed at a model nothing lists. Say so
+  // rather than letting the next turn be the thing that finds out.
+  const current = await neosh.agent.selection().catch(() => null);
+  if (current?.instance === instance && current.model === id) {
+    neosh.notify(`${id} was the model in use — pick another before sending`, "warn");
+  }
   return true;
 }
 

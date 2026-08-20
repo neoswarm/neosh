@@ -225,6 +225,26 @@ function watchKeys(neosh: Neosh): void {
 }
 
 /**
+ * How to write the key bound to an action, the way a person would press it.
+ *
+ * Read from the setting rather than hard-coded, so a rebinding shows up in the affordance too —
+ * the whole point of putting the key on screen is that it is the key that works.
+ */
+function keyLabel(keys: Map<WidgetAction, KeySpec[]>, action: WidgetAction): string {
+  const spec = keys.get(action)?.[0];
+  if (!spec) return "";
+  const pretty: Record<string, string> = {
+    "<Tab>": "⇥",
+    "<S-Tab>": "⇧⇥",
+    "<Left>": "←",
+    "<Right>": "→",
+    "<CR>": "↵",
+    "<Esc>": "esc",
+  };
+  return pretty[spec.lhs] ?? spec.lhs.replace(/^<C-(.)>$/, "^$1").replace(/^<|>$/g, "");
+}
+
+/**
  * Which action a key press means, or `null` if it is ordinary input.
  *
  * `only` is the set of actions the asking widget can actually carry out, and it is not an
@@ -785,8 +805,9 @@ async function bindWidgetKeys(
   win: WindowId,
   command: string,
   keys: Map<WidgetAction, KeySpec[]>,
+  extra: readonly string[] = [],
 ): Promise<void> {
-  const lhs = new Set<string>();
+  const lhs = new Set<string>(extra);
   for (const specs of keys.values()) {
     for (const spec of specs) lhs.add(spec.lhs);
   }
@@ -1244,6 +1265,14 @@ export interface RailPickerOptions<G, T> {
   /** The key strip at the foot. Keep it to one line. */
   hints?: string;
   /**
+   * What the two panes are called, for the affordance in the title row.
+   *
+   * `"providers"` and `"models"` rather than `"panes"` and `"list"`, wherever the caller knows —
+   * a key labelled with what it reaches is a key somebody presses.
+   */
+  railLabel?: string;
+  paneLabel?: string;
+  /**
    * Shown in place of the list when there is nothing in it.
    *
    * Not decoration: an empty pane beside a populated rail reads as a broken widget, and the two
@@ -1251,6 +1280,18 @@ export interface RailPickerOptions<G, T> {
    * it can authenticate — need different things done about them.
    */
   placeholder?: string;
+  /**
+   * Keys `onKey` wants that a *binding elsewhere* would otherwise take.
+   *
+   * The raw capture only receives what no keymap claimed, so a caller reaching for `<C-s>` gets
+   * nothing — that key belongs to the transcript reader. Listing it here binds it to this widget
+   * for as long as the widget is open, the same way its own movement keys are bound.
+   *
+   * Bare letters do not need this and should not use it: they reach `onKey` already, and taking
+   * one means it can never be typed into the filter — which is how a model picker ends up unable
+   * to search for "sonnet".
+   */
+  ownKeys?: readonly string[];
   /**
    * A key the caller wants for itself, checked before the widget's own.
    *
@@ -1306,6 +1347,8 @@ export async function railPicker<G, T>(
 
   watchKeys(neosh);
   const keys = await widgetKeys(neosh);
+  const railLabel = opts.railLabel ?? "panes";
+  const paneLabel = opts.paneLabel ?? "list";
 
   // ---- rail rows, headings interleaved ------------------------------------
   type RailRow =
@@ -1499,8 +1542,22 @@ export async function railPicker<G, T>(
     const lines: string[] = [];
     const marks: { line: number; mark: Mark }[] = [];
 
-    lines.push(opts.title ?? "");
-    marks.push({ line: 0, mark: { from: 0, to: byteLength(lines[0]!), hl: "Float.Title" } });
+    // The title row, and at its right edge the key for *the pane you are not in*. Live rather
+    // than a legend: the shortcut row below can only say the key exists, and a two-pane widget
+    // whose second pane has no visible way in is a pane nobody finds.
+    const title = opts.title ?? "";
+    const cross = focus === "pane" ? `${keyLabel(keys, "pane_prev")} ${railLabel}` : `${keyLabel(keys, "pane_next")} ${paneLabel}`;
+    const gap = Math.max(1, total - width(title) - width(cross));
+    lines.push(`${title}${" ".repeat(gap)}${cross}`);
+    marks.push({ line: 0, mark: { from: 0, to: byteLength(title), hl: "Float.Title" } });
+    marks.push({
+      line: 0,
+      mark: {
+        from: byteLength(title) + gap,
+        to: byteLength(lines[0]!),
+        hl: "Composer.HintKey",
+      },
+    });
     lines.push(`> ${query}`);
     lines.push("─".repeat(railWidth) + "┬" + "─".repeat(paneWidth));
     marks.push({ line: 2, mark: { from: 0, to: byteLength(lines[2]!), hl: "Separator" } });
@@ -1703,7 +1760,7 @@ export async function railPicker<G, T>(
 
   await neosh.focus.push(win);
   disposers.push(await neosh.keymap.capture(win, command));
-  await bindWidgetKeys(neosh, win, command, keys);
+  await bindWidgetKeys(neosh, win, command, keys, opts.ownKeys ?? []);
   await load();
   await render();
   return done;

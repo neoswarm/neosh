@@ -12,6 +12,7 @@
  */
 
 import type { ModelEntry, Neosh, PluginContext, SessionInfo } from "@neosh/api";
+import { meter } from "@neosh/api/ui";
 
 export async function activate({ neosh, subscriptions }: PluginContext) {
   await neosh.opt.declare({
@@ -36,9 +37,13 @@ export async function activate({ neosh, subscriptions }: PluginContext) {
   // Turn end is when both numbers change, and the only time either can.
   subscriptions.push(neosh.agent.onTurnEnd(() => void refresh()));
   subscriptions.push(neosh.session.onChange(() => void refresh()));
+  // The model is half of the meter: the same conversation is 40% of one window and 8% of another.
+  // The *selection*, not the `agent.model` option — a model that resolves late, or one swapped out
+  // because it could not authenticate, changes the denominator without anybody setting anything.
+  subscriptions.push(neosh.agent.onSelectionChange(() => void refresh()));
   subscriptions.push(
     neosh.opt.onChange((e) => {
-      if (e.name === "usage.show_tokens") void refresh();
+      if (e.name === "usage.show_tokens" || e.name === "ui.ascii_only") void refresh();
     }),
   );
 }
@@ -54,6 +59,26 @@ async function contextWindow(neosh: Neosh): Promise<number | undefined> {
   return model?.model.context_window ?? undefined;
 }
 
+/**
+ * How many cells the bar is. Eight, because the useful resolution here is about an eighth.
+ *
+ * A meter is for the shape of the answer — plenty of room, getting full, nearly out — and the
+ * number beside it is for the rest. Thirty cells would be a graph of something that only ever
+ * moves in one direction.
+ */
+const CELLS = 8;
+
+/**
+ * The context meter: a bar, then the percentage, then what it is a percentage of.
+ *
+ * Drawn even at zero, which is the change that matters. It used to appear only once a turn had
+ * been spent, so the one moment you could not see how much room a model has was *before* choosing
+ * what to do with it — and a model with a 200k window and one with a million are different tools.
+ *
+ * One colour for the whole segment rather than a lit part and a dim part: a status segment carries
+ * one highlight, and two glyphs of very different weight already say where the fill ends. The
+ * colour is then free to say the thing colour is good at, which is how worried to be.
+ */
 async function drawContext(neosh: Neosh, session: SessionInfo) {
   const used = session.context_tokens ?? 0;
   const window = await contextWindow(neosh);
@@ -66,13 +91,11 @@ async function drawContext(neosh: Neosh, session: SessionInfo) {
     }
     return;
   }
-  if (used === 0) {
-    await neosh.status.clear("context");
-    return;
-  }
-  const percent = Math.min(100, (used / window) * 100);
+  const ascii = (await neosh.opt.get<boolean>("ui.ascii_only").catch(() => false)) ?? false;
+  const fraction = Math.min(1, used / window);
+  const percent = fraction * 100;
   await neosh.status.set("context", {
-    text: `${percent.toFixed(0)}% of ${short(window)}`,
+    text: `${meter(fraction, CELLS, { ascii })} ${percent.toFixed(0)}% of ${short(window)}`,
     hl: percent > 90 ? "Meter.Full" : percent > 70 ? "Meter.Warn" : "Comment",
     priority: 20,
   });

@@ -22,13 +22,11 @@
 
 import type { Disposable, Neosh, PluginContext, SessionInfo, WindowId } from "@neosh/api";
 import {
-  compact,
   confirmDestructive,
   configureMotion,
   CursoredList,
   elapsed,
   type ListRow,
-  meter,
   money,
   onTick,
   pathPicker,
@@ -999,21 +997,15 @@ async function installFooter(neosh: Neosh, subscriptions: PluginContext["subscri
           .find((e) => e.model.id === selection.model)?.model
       : undefined;
     const u = current.usage;
-    const context = model?.context_window ?? null;
-    if (!context || context <= 0 || u.input_tokens + u.output_tokens === 0) {
-      await neosh.status.clear("context");
+    // The context meter is *not* here. It was, and so was one in the usage plugin, and for as long
+    // as no model in the catalogue reported a window only one of them ever drew — so two gauges of
+    // the same thing, disagreeing about what "used" means, sat in the same footer the moment one
+    // did. The usage plugin owns it: it is named for the job and it reads the context the last
+    // request actually carried, rather than adding up totals that count a cached prompt twice.
+    if (u.input_tokens + u.output_tokens === 0) {
       await neosh.status.clear("cost");
       return;
     }
-    // What would be *sent*, not the running total: cache reads and prior outputs are already part
-    // of the messages, so counting them again would show 140%.
-    const fraction = Math.min(1, (u.input_tokens + u.output_tokens) / context);
-    await neosh.status.set("context", {
-      text: `${meter(fraction, 8)} ${compact(u.input_tokens + u.output_tokens)}`,
-      hl: fraction > 0.9 ? "Meter.Full" : fraction > 0.7 ? "Meter.Warn" : "Meter.Fill",
-      align: "right",
-      priority: 10,
-    });
 
     const p = model?.pricing;
     if (!p) return;
@@ -1037,6 +1029,8 @@ async function installFooter(neosh: Neosh, subscriptions: PluginContext["subscri
   subscriptions.push(neosh.agent.onTurnStart(() => void refresh()));
   subscriptions.push(neosh.agent.onTurnEnd(() => void refresh()));
   subscriptions.push(neosh.session.onChange(() => void refresh()));
+  // The cost depends on the model's prices, so a switch changes it without a turn happening.
+  subscriptions.push(neosh.agent.onSelectionChange(() => void refresh()));
   // The clock only ticks while something is running, so this costs nothing at rest.
   subscriptions.push(onTick(() => void refresh()));
 }
