@@ -19,6 +19,8 @@ import type { BufferId } from "./generated/BufferId";
 import type { Capability } from "./generated/Capability";
 import type { CommitInfo } from "./generated/CommitInfo";
 import type { CommandEntry } from "./generated/CommandEntry";
+import type { CredentialInfo } from "./generated/CredentialInfo";
+import type { CredentialSource } from "./generated/CredentialSource";
 import type { CursorMotion } from "./generated/CursorMotion";
 import type { DiffTarget } from "./generated/DiffTarget";
 import type { Dock } from "./generated/Dock";
@@ -77,8 +79,8 @@ import type { WindowLayout } from "./generated/WindowLayout";
 import type { WorktreeInfo } from "./generated/WorktreeInfo";
 
 export type {
-  ApiError, BranchInfo, BufferId, Capability, CommandEntry, CommitInfo, DiffTarget, Dock,
-  CursorMotion, ExtmarkId, ExtmarkInfo, ExtmarkOpts, FileChange, FileState, FloatConfig,
+  ApiError, BranchInfo, BufferId, Capability, CommandEntry, CommitInfo, CredentialInfo,
+  CredentialSource, DiffTarget, Dock, CursorMotion, ExtmarkId, ExtmarkInfo, ExtmarkOpts, FileChange, FileState, FloatConfig,
   HighlightDef, HighlightSpec, HookName, HookOutcome, HookPayload, InstanceConfig, KeyContext,
   KeymapEntry, KeymapScope, MessageLevel, Mode, ModelEntry, ModelInfo, ModelSelection, NamespaceId,
   OptionChoice, OptionEntry, OptionSelection, OptionSpec, OptionType, OptionValue,
@@ -431,6 +433,27 @@ export interface AgentApi {
    */
   listModels(instance?: string, opts?: { refresh?: boolean }): Promise<ModelEntry[]>;
   listInstances(): Promise<InstanceConfig[]>;
+  /**
+   * Where each configured provider's key comes from — and never what it is.
+   *
+   * There is deliberately no call that returns a secret. A plugin can find out that `anthropic` is
+   * authenticated from the keychain, and can ask the host to collect a new key; it cannot read one,
+   * so it cannot leak one.
+   */
+  credentials(): Promise<CredentialInfo[]>;
+  /**
+   * Ask the host to collect an API key for `instance` from the keyboard.
+   *
+   * The host runs this prompt itself: a plugin one would have to put the key in a buffer, and a
+   * buffer is drawn — the value would cross the frontend boundary and land in whatever it logs.
+   * What comes back is whether a key was stored, never the key.
+   *
+   * Rejects when the instance signs in on its own (a CLI login) or needs no key at all, and when it
+   * already has one unless you pass `replace`.
+   */
+  setCredential(instance: string, opts?: { replace?: boolean }): Promise<boolean>;
+  /** Drop a stored key from memory and from the keychain. The environment is not ours to clear. */
+  forgetCredential(instance: string): Promise<void>;
   onTurnStart(cb: (e: { turn: string }) => void): Disposable;
   /** One streamed chunk of assistant text. Chunks are provider-sized, not characters. */
   onToken(cb: (e: { turn: string; text: string }) => void): Disposable;
@@ -551,8 +574,13 @@ export interface GenApi {
  * away from one is not a way to lose it.
  */
 export interface SessionApi {
-  /** Most recently active first, with exactly one flagged `is_active`. */
-  list(): Promise<SessionInfo[]>;
+  /**
+   * Most recently active first, with exactly one flagged `is_active`.
+   *
+   * Archived conversations are left out unless you ask for them. That is what archiving is for, and
+   * a list that included them by default would make every caller responsible for remembering.
+   */
+  list(opts?: { includeArchived?: boolean }): Promise<SessionInfo[]>;
   current(): Promise<SessionInfo>;
   /**
    * Start one. It inherits the model and system prompt you are using — starting a conversation
@@ -570,6 +598,14 @@ export interface SessionApi {
   close(session: SessionId): Promise<void>;
   /** Pass `null` to clear a title and go back to the first-message label. */
   rename(session: SessionId, title: string | null): Promise<void>;
+  /**
+   * Put a conversation away, or bring it back.
+   *
+   * Not `close`: nothing is deleted, every message survives, and `list({ includeArchived: true })`
+   * still finds it. Archiving the active conversation moves you to the most recently used other
+   * one — or to a fresh empty one if there is no other.
+   */
+  archive(session: SessionId, archived?: boolean): Promise<void>;
   /** The conversation itself, for a transcript view that renders rather than replays. */
   messages(session?: SessionId): Promise<Message[]>;
   /** Fires whenever the active conversation changes — switched, created, or closed. */
@@ -1081,6 +1117,21 @@ export function __createContext(plugin: string, config: unknown, version: number
       async listInstances() {
         return expect(await c({ call: "agent_list_instances" }), "instances").instances;
       },
+      async credentials() {
+        return expect(await c({ call: "provider_credentials" }), "credentials").credentials;
+      },
+      async setCredential(instance, opts) {
+        // Does not settle until the prompt closes — the answer is what the user did.
+        const v = await c({
+          call: "provider_set_credential",
+          instance,
+          replace: opts?.replace ?? false,
+        });
+        return expect(v, "bool").value;
+      },
+      async forgetCredential(instance) {
+        await c({ call: "provider_forget_credential", instance });
+      },
       onTurnStart: (cb) => listener(r.agentListeners.turnStart as Array<(e: { turn: string }) => void>, cb),
       onToken: (cb) => listener(r.agentListeners.token as Array<(e: { turn: string; text: string }) => void>, cb),
       onThinking: (cb) => listener(r.agentListeners.thinking as Array<(e: { turn: string; text: string }) => void>, cb),
@@ -1197,8 +1248,12 @@ export function __createContext(plugin: string, config: unknown, version: number
       },
     },
     session: {
-      async list() {
-        return expect(await c({ call: "session_list" }), "sessions").sessions;
+      async list(opts) {
+        const v = await c({
+          call: "session_list",
+          include_archived: opts?.includeArchived ?? false,
+        });
+        return expect(v, "sessions").sessions;
       },
       async current() {
         return expect(await c({ call: "session_current" }), "session").session;
@@ -1220,6 +1275,9 @@ export function __createContext(plugin: string, config: unknown, version: number
       },
       async rename(session, title) {
         await c({ call: "session_rename", session, title });
+      },
+      async archive(session, archived) {
+        await c({ call: "session_archive", session, archived: archived ?? true });
       },
       async messages(session) {
         const v = await c({ call: "session_messages", session: session ?? null });
