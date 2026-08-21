@@ -428,6 +428,13 @@ pub enum ApiCall {
     // ---- agent ---------------------------------------------------------
     AgentSend {
         text: String,
+        /// Files to send with it, by path. Copied into the workspace's own directory on the way
+        /// through, so a caller may hand over a temporary file and forget about it.
+        ///
+        /// Anything already on the composer's attachment row goes too — this is *extra*, for a
+        /// plugin that has produced an image of its own rather than one somebody pasted.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        images: Vec<String>,
     },
     AgentCancel,
     AgentGetSelection,
@@ -455,6 +462,29 @@ pub enum ApiCall {
     /// driver that has none and for a conversation that has not run a turn yet — there has been
     /// nothing to ask.
     AgentDriverCommands,
+    /// Attach an image to whatever is about to be sent.
+    ///
+    /// `path` names a file; `None` means "whatever image is on the system clipboard", which is the
+    /// one a key is bound to and the one a terminal cannot deliver any other way — bracketed paste
+    /// is a text protocol and a PNG will never arrive down it.
+    ///
+    /// The bytes are copied into the workspace's directory, sniffed for what they actually are and
+    /// shrunk if they are enormous. The answer says what was attached, so a caller can report it.
+    ChatAttach {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        path: Option<String>,
+    },
+    /// What is attached to the composer right now, oldest first.
+    ChatAttachments,
+    /// Take something off the attachment row.
+    ///
+    /// `index` names one; `None` takes off the newest, which is the one you just added and
+    /// therefore the one you meant. See [`ApiCall::ChatDetachAll`] for the whole row.
+    ChatDetach {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        index: Option<u32>,
+    },
+    ChatDetachAll,
     /// Replace what is in the composer.
     ///
     /// The composer is the host's, not a buffer a plugin may write to directly: it has a cursor, a
@@ -953,10 +983,29 @@ pub enum ApiOk {
     },
     Contributions { contributions: Vec<Contribution> },
     Windows { windows: Vec<WindowInfo> },
+    Attachments { attachments: Vec<AttachmentInfo> },
     // ---- the swarm ----
     SwarmSelf { node: Option<NodeInfo> },
     SwarmNodes { nodes: Vec<SwarmNode> },
     SwarmAgents { agents: Vec<SwarmAgent> },
+}
+
+/// An image the composer is holding, as far as anything outside the host is concerned.
+///
+/// The size is in here because it is the part you cannot see for yourself: an attachment is a row
+/// that says "png", and whether that row is forty kilobytes or four megabytes is the whole of what
+/// you would want to know before sending it.
+#[derive(TS, Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
+#[ts(export)]
+pub struct AttachmentInfo {
+    /// Where the bytes are, in the workspace's directory.
+    pub path: String,
+    /// `image/png`, `image/jpeg`, `image/gif` or `image/webp`, read off the bytes.
+    pub media_type: String,
+    pub width: u32,
+    pub height: u32,
+    /// On disk, after any shrinking.
+    pub bytes: u32,
 }
 
 /// One piece of the status line.

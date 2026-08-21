@@ -11,6 +11,7 @@
  */
 
 import type { Activity } from "./generated/Activity";
+import type { AttachmentInfo } from "./generated/AttachmentInfo";
 import type { ApiCall } from "./generated/ApiCall";
 import type { ApiError } from "./generated/ApiError";
 import type { ApiOk } from "./generated/ApiOk";
@@ -111,6 +112,7 @@ export type {
   AgentCommand, AgentState, AgentSummary,
   Contribution, CredentialInfo, CredentialSource, DiffTarget, Dock, CursorMotion, ExtmarkId, ExtmarkInfo, ExtmarkOpts, FileChange, FileState, FloatConfig,
   Gravity, HighlightDef, HighlightSpec, Hint, HookName, HookOutcome, HookPayload, InstanceConfig, KeyContext,
+  AttachmentInfo,
   KeymapEntry, KeymapScope, MessageLevel, Mode, ModelEntry, ModelInfo, ModelSelection, ModelTier, NamespaceId,
   OptionChoice, OptionEntry, OptionSelection, OptionSpec, OptionType, OptionValue,
   DriverCommand, PlanState, PlanStep, TaskId, TaskStatus,
@@ -539,7 +541,14 @@ export interface FocusApi {
 }
 
 export interface AgentApi {
-  send(text: string): Promise<void>;
+  /**
+   * Send a message. Anything on the composer's attachment row goes with it.
+   *
+   * `images` are extra paths to attach on the way through, for a plugin that has *produced* a
+   * picture rather than one somebody pasted — a rendered chart, a screenshot it took. The
+   * bytes are copied into the workspace, so a temporary file may be handed over and forgotten.
+   */
+  send(text: string, opts?: { images?: string[] }): Promise<void>;
   cancel(): Promise<void>;
   selection(): Promise<ModelSelection | null>;
   /** Hot-swap the model. Takes effect on the next turn. */
@@ -572,6 +581,29 @@ export interface AgentApi {
    * event, which is the other half — one says what has been typed, this puts the answer back.
    */
   setDraft(text: string): Promise<void>;
+  /**
+   * Attach an image to whatever is about to be sent.
+   *
+   * With a path, that file. Without one, whatever image is on the system clipboard — which is
+   * the only way a picture can reach a terminal at all: bracketed paste is a text protocol, and a
+   * screenshot pasted into one arrives as nothing. That is why `^V` is a key rather than a paste.
+   *
+   * The bytes are copied into the workspace's own directory, sniffed for what they actually are
+   * rather than what they are called, and shrunk if they are enormous. Rejects when there is no
+   * image to be had, with a reason worth showing.
+   */
+  attach(path?: string): Promise<AttachmentInfo>;
+  /** What is attached to the composer right now, oldest first. */
+  attachments(): Promise<AttachmentInfo[]>;
+  /**
+   * Take something off the attachment row: the one at `index`, or the newest.
+   *
+   * Answers with what came off, or nothing if there was nothing there — the row may have
+   * gone out with a send between asking and answering, and that is not an error.
+   */
+  detach(index?: number): Promise<AttachmentInfo | null>;
+  /** Take the whole attachment row off. Answers with what was on it. */
+  detachAll(): Promise<AttachmentInfo[]>;
   /**
    * Where each configured provider's key comes from — and never what it is.
    *
@@ -1616,8 +1648,8 @@ export function __createContext(plugin: string, config: unknown, version: number
       },
     },
     agent: {
-      async send(text) {
-        await c({ call: "agent_send", text });
+      async send(text, opts) {
+        await c({ call: "agent_send", text, images: opts?.images ?? [] });
       },
       async cancel() {
         await c({ call: "agent_cancel" });
@@ -1644,6 +1676,24 @@ export function __createContext(plugin: string, config: unknown, version: number
       },
       async setDraft(text) {
         await c({ call: "chat_set_draft", text });
+      },
+      async attach(path) {
+        const v = await c({ call: "chat_attach", path: path ?? null });
+        // Exactly one, because exactly one was asked for. An empty answer would mean the host
+        // silently attached nothing, which it does not — it rejects.
+        const [one] = expect(v, "attachments").attachments;
+        if (!one) throw new Error("nothing was attached");
+        return one;
+      },
+      async attachments() {
+        return expect(await c({ call: "chat_attachments" }), "attachments").attachments;
+      },
+      async detach(index) {
+        const v = await c({ call: "chat_detach", index: index ?? null });
+        return expect(v, "attachments").attachments[0] ?? null;
+      },
+      async detachAll() {
+        return expect(await c({ call: "chat_detach_all" }), "attachments").attachments;
       },
       async credentials() {
         return expect(await c({ call: "provider_credentials" }), "credentials").credentials;

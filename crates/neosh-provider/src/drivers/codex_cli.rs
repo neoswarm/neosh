@@ -195,23 +195,37 @@ impl CodexCliProvider {
             .clone()
     }
 
-    /// The newest user message. A turn takes one input; the thread supplies the history.
-    fn prompt_from(messages: &[Message]) -> String {
-        messages
+    /// The newest user message, as the input items a turn takes. The thread supplies the history.
+    ///
+    /// A picture goes as `localImage` — the *path*, not the bytes. The server is a process on this
+    /// machine reading a file this machine wrote, so base64 down a pipe would be a megabyte of
+    /// encoding to save nothing, and codex resizes and encodes it itself on the way to the model.
+    fn input_from(messages: &[Message]) -> Vec<Value> {
+        let Some(m) = messages.iter().rev().find(|m| m.role == Role::User) else {
+            return vec![json!({"type": "text", "text": ""})];
+        };
+        let text = m
+            .content
             .iter()
-            .rev()
-            .find(|m| m.role == Role::User)
-            .map(|m| {
-                m.content
-                    .iter()
-                    .filter_map(|b| match b {
-                        ContentBlock::Text { text } => Some(text.as_str()),
-                        _ => None,
-                    })
-                    .collect::<Vec<_>>()
-                    .join("\n")
+            .filter_map(|b| match b {
+                ContentBlock::Text { text } => Some(text.as_str()),
+                _ => None,
             })
-            .unwrap_or_default()
+            .collect::<Vec<_>>()
+            .join("\n");
+        let mut items: Vec<Value> = m
+            .content
+            .iter()
+            .filter_map(|b| match b {
+                ContentBlock::Image { path, .. } => Some(json!({
+                    "type": "localImage",
+                    "path": path,
+                })),
+                _ => None,
+            })
+            .collect();
+        items.push(json!({"type": "text", "text": text}));
+        items
     }
 }
 
@@ -830,7 +844,7 @@ async fn run_turn(
     let asking = asker.is_some();
     let mut params = json!({
         "threadId": live.thread.clone().unwrap_or_default(),
-        "input": [{ "type": "text", "text": CodexCliProvider::prompt_from(&request.messages) }],
+        "input": CodexCliProvider::input_from(&request.messages),
         "model": request.selection.model.as_ref(),
         "sandboxPolicy": sandbox_policy(mode),
         "approvalPolicy": approval_policy(mode, asking),

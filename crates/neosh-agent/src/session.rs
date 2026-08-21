@@ -7,6 +7,56 @@ use neosh_proto::{
     ToolResult, TurnId, Usage,
 };
 
+/// One thing somebody said: the words, and anything they attached to them.
+///
+/// A pair rather than two arguments everywhere, because they travel together the whole way — into
+/// the queue, out of it, through the turn, into the message. Almost every one of these has an
+/// empty `images`, which is exactly why it is a field on the thing that is said rather than a
+/// second queue running alongside the first and getting out of step with it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Prompt {
+    pub text: String,
+    /// Already [`ContentBlock`]s, because that is what they become and there is nothing in between
+    /// for them to be.
+    pub images: Vec<ContentBlock>,
+}
+
+impl Prompt {
+    pub fn text(text: impl Into<String>) -> Self {
+        Self { text: text.into(), images: Vec::new() }
+    }
+
+    /// The message this is, images first.
+    ///
+    /// Before the words on purpose: "what is wrong with this?" reads as a question about the
+    /// picture when the picture is what the sentence is pointing at, and every provider we target
+    /// passes block order through untouched.
+    ///
+    /// An empty text block is kept when it is *all* there is, because a message with no content at
+    /// all is one a driver would skip past to re-ask the question before it. It is dropped when
+    /// there is a picture to carry the message instead — several providers reject an empty text
+    /// block outright, and a picture on its own is a perfectly good thing to send.
+    pub fn blocks(&self) -> Vec<ContentBlock> {
+        let mut out = self.images.clone();
+        if out.is_empty() || !self.text.is_empty() {
+            out.push(ContentBlock::Text { text: self.text.clone() });
+        }
+        out
+    }
+}
+
+impl From<String> for Prompt {
+    fn from(text: String) -> Self {
+        Self::text(text)
+    }
+}
+
+impl From<&str> for Prompt {
+    fn from(text: &str) -> Self {
+        Self::text(text)
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Session {
     pub id: SessionId,
@@ -26,7 +76,7 @@ pub struct Session {
     ///
     /// Per conversation rather than per process: several turns can be in flight at once, and a
     /// single queue would hand what you typed here to whichever one reached a gap first.
-    pub steering: Vec<String>,
+    pub steering: Vec<Prompt>,
     /// When the running turn started, in seconds since the epoch. Stamped by whoever starts the
     /// turn, for the same reason `created_at` is: this type does not read a clock.
     pub turn_started_at: Option<i64>,
@@ -107,8 +157,12 @@ impl Session {
     }
 
     pub fn push_user_text(&mut self, text: impl Into<String>) {
-        self.messages
-            .push(Message { role: Role::User, content: vec![ContentBlock::Text { text: text.into() }] });
+        self.push_user(&Prompt::text(text));
+    }
+
+    /// What was said, with whatever came with it.
+    pub fn push_user(&mut self, prompt: &Prompt) {
+        self.messages.push(Message { role: Role::User, content: prompt.blocks() });
     }
 
     pub fn push_assistant(&mut self, msg: Message) {
@@ -232,6 +286,37 @@ mod tests {
         let mut s = Session::new("/tmp");
         s.push_assistant(Message { role: Role::Assistant, content: vec![] });
         assert!(s.messages.is_empty());
+    }
+
+    #[test]
+    fn a_picture_can_carry_a_message_on_its_own() {
+        // Several providers reject an empty text block, so a message that is only a screenshot
+        // must not have one bolted onto it.
+        let p = Prompt {
+            text: String::new(),
+            images: vec![ContentBlock::Image {
+                path: "/x/a.png".into(),
+                media_type: "image/png".into(),
+            }],
+        };
+        assert_eq!(p.blocks().len(), 1);
+
+        // And a message that is only words is exactly what it always was, empty or not: dropping
+        // the block here would leave nothing, and a driver handed nothing re-asks the question
+        // before it.
+        assert_eq!(Prompt::text("").blocks(), vec![ContentBlock::Text { text: String::new() }]);
+    }
+
+    #[test]
+    fn a_question_points_at_its_picture_rather_than_trailing_it() {
+        let p = Prompt {
+            text: "what is wrong here".into(),
+            images: vec![ContentBlock::Image {
+                path: "/x/a.png".into(),
+                media_type: "image/png".into(),
+            }],
+        };
+        assert!(matches!(p.blocks()[0], ContentBlock::Image { .. }), "the picture comes first");
     }
 
     #[test]

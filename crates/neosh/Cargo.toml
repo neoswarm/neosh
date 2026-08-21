@@ -36,6 +36,8 @@ unicode-width = { workspace = true }
 async-trait = { workspace = true }
 crossterm = { workspace = true }
 url = "2"
+image = { workspace = true }
+uuid = { workspace = true }
 tokio-stream = { workspace = true }
 
 [dev-dependencies]

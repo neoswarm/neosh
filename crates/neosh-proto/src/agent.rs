@@ -47,6 +47,22 @@ pub enum ContentBlock {
         #[serde(default)]
         is_error: bool,
     },
+    /// A picture, as somewhere to find it rather than as the picture.
+    ///
+    /// The bytes are not in here and that is deliberate. A screenshot is a megabyte of base64, a
+    /// conversation holds as many as you paste into it, and a message is written to the session
+    /// file, read back on every attach, and sent down the socket to whoever is looking — so the
+    /// bytes would be copied on every one of those and the transcript on disk would be mostly
+    /// pictures. They are written once into the workspace's own directory and every message that
+    /// mentions them says where; a driver reads the file when it builds its request, which is the
+    /// only moment anything actually needs them.
+    Image {
+        /// Where the bytes are, absolute. Written by the workspace, read by a driver.
+        path: String,
+        /// `image/png`, `image/jpeg`, `image/gif` or `image/webp` — the four every provider we
+        /// target accepts. Read off the bytes rather than off the file name, which is a claim.
+        media_type: String,
+    },
 }
 
 #[derive(TS, Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]

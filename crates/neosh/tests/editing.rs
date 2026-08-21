@@ -624,3 +624,118 @@ export async function activate({ neosh }: PluginContext) {
     s.ch("a");
     assert!(s.pump(|s| s.messages().iter().any(|m| m == "leader fired")));
 }
+
+// ---------------------------------------------------------------------------
+// Attachments
+// ---------------------------------------------------------------------------
+
+/// A PNG on disk, so these exercise the real sniffing and decoding rather than a shape.
+fn png_at(path: &Path, w: u32, h: u32) -> PathBuf {
+    let img = image::RgbaImage::from_pixel(w, h, image::Rgba([7, 8, 9, 255]));
+    let mut bytes = Vec::new();
+    image::DynamicImage::ImageRgba8(img)
+        .write_to(&mut std::io::Cursor::new(&mut bytes), image::ImageFormat::Png)
+        .expect("encode");
+    std::fs::write(path, bytes).expect("write");
+    path.to_path_buf()
+}
+
+/// Dragging a file onto a terminal window pastes its path. That is the only gesture a terminal has
+/// for "this file", so it has to mean the file — not a line of text nobody asked to type.
+#[test]
+fn a_pasted_image_path_is_attached_rather_than_typed_out() {
+    let sb = Sandbox::new("attachpaste");
+    let shot = png_at(&sb.root.join("work/shot.png"), 40, 20);
+    let mut s = sb.start();
+    s.ready();
+
+    s.send(&json!({"type": "paste", "text": shot.display().to_string()}));
+    s.type_text("what is this");
+    s.wait_composer(&["what is this"]);
+
+    s.special("enter", &[]);
+    assert!(
+        s.pump(|s| s.chat().iter().any(|l| l.contains("[png]"))),
+        "the picture is part of the question, so the transcript says it was asked\n{:?}",
+        s.chat()
+    );
+    assert!(
+        s.chat().iter().any(|l| l.contains("what is this")),
+        "and so are the words\n{:?}",
+        s.chat()
+    );
+}
+
+/// The other half, and the one that is easy to get wrong: everything that is *not* unambiguously
+/// an image path is text, because swallowing something somebody meant to type is far worse than
+/// making them press a key.
+#[test]
+fn a_paste_that_is_not_an_image_is_ordinary_text() {
+    let sb = Sandbox::new("attachtext");
+    let notes = sb.root.join("work/notes.txt");
+    std::fs::write(&notes, "hello").expect("write");
+    let shot = png_at(&sb.root.join("work/shot.png"), 8, 8);
+    let mut s = sb.start();
+    s.ready();
+
+    // A file that exists and is not an image.
+    s.send(&json!({"type": "paste", "text": notes.display().to_string()}));
+    s.wait_composer(&[notes.display().to_string().as_str()]);
+
+    s.press(json!({"kind": "char", "c": "u"}), &["ctrl"]);
+    s.wait_composer(&[""]);
+
+    // A sentence that happens to contain a real image path.
+    let sentence = format!("look at {} please", shot.display());
+    s.send(&json!({"type": "paste", "text": sentence.clone()}));
+    s.wait_composer(&[sentence.as_str()]);
+}
+
+/// What was attached has to be *in the message*, not only on the screen: the transcript is rebuilt
+/// from the conversation, and a picture that lives in the draft is one that vanishes on the first
+/// switch and was never sent to anything.
+#[test]
+fn what_is_attached_is_part_of_the_message_that_was_stored() {
+    let sb = Sandbox::new("attachstored");
+    let shot = png_at(&sb.root.join("work/shot.png"), 12, 34);
+    let mut s = sb.start();
+    s.ready();
+
+    s.send(&json!({"type": "paste", "text": shot.display().to_string()}));
+    s.type_text("describe it");
+    s.wait_composer(&["describe it"]);
+    s.special("enter", &[]);
+    assert!(s.pump(|s| s.chat().iter().any(|l| l.contains("[png]"))), "sent");
+
+    let dir = sb.root.join("state/sessions");
+    let stored = |s: &mut Session| -> String {
+        // Written when the turn ends, so this is pumped rather than read once.
+        let _ = s.pump(|_| false);
+        std::fs::read_dir(&dir)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter(|e| e.path().extension().is_some_and(|x| x == "json"))
+            .filter(|e| e.file_name() != "order.json")
+            .filter_map(|e| std::fs::read_to_string(e.path()).ok())
+            .collect::<String>()
+    };
+    let saved = stored(&mut s);
+    assert!(
+        saved.contains("\"type\": \"image\""),
+        "the conversation on disk carries the picture, not just the words\n{saved}"
+    );
+    assert!(
+        saved.contains("image/png"),
+        "with what it is, read off the bytes\n{saved}"
+    );
+    // The bytes themselves are beside the conversations, once, rather than inside it.
+    assert!(
+        !saved.contains("iVBORw0KGgo"),
+        "a transcript that is mostly base64 is a transcript nothing can read back quickly\n{saved}"
+    );
+    let kept = std::fs::read_dir(sb.root.join("state/images"))
+        .expect("the workspace keeps what was attached")
+        .count();
+    assert_eq!(kept, 1, "one attachment, one file");
+}

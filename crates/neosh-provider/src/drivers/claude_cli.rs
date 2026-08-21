@@ -306,22 +306,49 @@ impl ClaudeCliProvider {
 
     /// The CLI takes a single prompt, not a message array, so we send only the newest user turn
     /// and let `--resume` supply the history it already has.
-    fn prompt_from(messages: &[Message]) -> String {
-        messages
+    ///
+    /// A string when that is all there is, and the Anthropic block array when the message carries
+    /// a picture — the CLI's stdin takes the same `content` the API does, so this is the API's
+    /// answer rather than a shape of the CLI's own. Plain text stays a plain string on purpose:
+    /// it is what every existing test and every reader expects to see going down that pipe.
+    fn prompt_from(messages: &[Message]) -> Value {
+        let Some(m) = messages.iter().rev().find(|m| m.role == Role::User) else {
+            return Value::String(String::new());
+        };
+        let text = m
+            .content
             .iter()
-            .rev()
-            .find(|m| m.role == Role::User)
-            .map(|m| {
-                m.content
-                    .iter()
-                    .filter_map(|b| match b {
-                        ContentBlock::Text { text } => Some(text.as_str()),
-                        _ => None,
-                    })
-                    .collect::<Vec<_>>()
-                    .join("\n")
+            .filter_map(|b| match b {
+                ContentBlock::Text { text } => Some(text.as_str()),
+                _ => None,
             })
-            .unwrap_or_default()
+            .collect::<Vec<_>>()
+            .join("\n");
+        let images: Vec<Value> = m
+            .content
+            .iter()
+            .filter_map(|b| match b {
+                ContentBlock::Image { path, media_type } => Some(json!({
+                    "type": "image",
+                    "source": {
+                        "type": "base64",
+                        "media_type": media_type,
+                        "data": crate::image::base64_at(path)?,
+                    },
+                })),
+                _ => None,
+            })
+            .collect();
+        if images.is_empty() {
+            return Value::String(text);
+        }
+        // The picture first. A question about an image reads as one when the image is what the
+        // sentence is pointing at, and the CLI passes the order through.
+        let mut blocks = images;
+        if !text.is_empty() {
+            blocks.push(json!({"type": "text", "text": text}));
+        }
+        Value::Array(blocks)
     }
 }
 
@@ -534,13 +561,16 @@ async fn run_turn(
     }
 
     let prompt = ClaudeCliProvider::prompt_from(&request.messages);
-    live.say(&prompt).await?;
+    live.say(prompt).await?;
 
     // Nothing after this point returns `Err`: the process is up and talking, so whatever happens
     // is something it said, and the turn keeps whatever it produced before it.
     let mut refused = 0usize;
     let mut interrupted = false;
     let mut finished = false;
+    // Whether anybody is still listening. Once nobody is, the turn is not over — the *process* is
+    // still mid-answer — so this keeps reading and stops forwarding. See where it is set.
+    let mut abandoned = false;
     // Whether the context question in flight is the one that ends the turn.
     let mut ending = false;
     // How full the CLI's context is, asked while it works rather than once at the end.
@@ -648,12 +678,14 @@ async fn run_turn(
                     // turn that could only be interrupted between questions could not be
                     // interrupted at all while one was open.
                     let answer = match &asker {
-                        Some(a) => tokio::select! {
+                        // Nobody to ask once the turn has been abandoned, and a question with
+                        // nobody behind it is a drain that never finishes.
+                        Some(a) if !abandoned => tokio::select! {
                             biased;
                             () = cancel.cancelled() => PermissionAnswer::Deny,
                             answer = a.ask(ask.request.clone()) => answer,
                         },
-                        None => PermissionAnswer::Deny,
+                        _ => PermissionAnswer::Deny,
                     };
                     if answer == PermissionAnswer::Deny {
                         refused += 1;
@@ -676,11 +708,35 @@ async fn run_turn(
                     continue;
                 }
                 for ev in control_failure(&v).into_iter().chain(sse::claude_cli_line(&v, &mut live.state)) {
+                    if abandoned {
+                        break;
+                    }
                     if tx.send(ev).await.is_err() {
-                        // The receiver is gone: the turn was abandoned. The process is not — it
-                        // holds the conversation, and there is every chance the next turn is about
-                        // to ask it something.
-                        return Ok(Outcome::Done);
+                        // The receiver is gone: the turn was abandoned — `<Esc>`, or a switch away
+                        // from a conversation whose turn was still running. The *process* is not
+                        // abandoned; it holds the conversation and the next turn is about to ask
+                        // it something. Which is exactly why this cannot return here.
+                        //
+                        // The CLI is mid-answer, and everything it has not written yet is still in
+                        // the pipe. Returning leaves it there, and `live.lines` outlives the turn —
+                        // so the *next* turn reads the rest of this one as its own. That is how an
+                        // interrupted `/compact` came back as the answer to the question typed
+                        // after it: `Compaction canceled.` under a message about something else,
+                        // arriving before the reply it was actually waiting for.
+                        //
+                        // So the turn stops being forwarded and starts being drained: ask it to
+                        // stop, then read to the `result` that ends it, and leave the process at a
+                        // turn boundary where the next prompt starts clean. The 5s deadline the
+                        // interrupt arms is the bound — past that it is killed, as it already was.
+                        abandoned = true;
+                        if !interrupted {
+                            interrupted = true;
+                            let _ = live.control(&json!({"subtype": "interrupt"})).await;
+                            giveup
+                                .as_mut()
+                                .reset(tokio::time::Instant::now() + Duration::from_secs(5));
+                        }
+                        break;
                     }
                 }
                 // The turn is over, and the process is not. Before letting it go back to waiting,
@@ -688,7 +744,12 @@ async fn run_turn(
                 // [`context_usage`].
                 if v.get("type").and_then(|t| t.as_str()) == Some("result") {
                     finished = true;
-                    if !ending && live.control(&json!({"subtype": "get_context_usage"})).await.is_ok()
+                    // Not when it has been abandoned: there is nobody to tell, and asking would
+                    // re-arm the deadline that an interrupt has already pointed at killing the
+                    // process — which is the one thing draining exists to avoid.
+                    if !abandoned
+                        && !ending
+                        && live.control(&json!({"subtype": "get_context_usage"})).await.is_ok()
                     {
                         ending = true;
                         // Bounded, because an install that will not answer must not hold the turn
@@ -898,7 +959,7 @@ impl Live {
     }
 
     /// Put a question to it.
-    async fn say(&mut self, prompt: &str) -> Result<(), String> {
+    async fn say(&mut self, prompt: Value) -> Result<(), String> {
         write_line(&mut self.stdin, &claude_control::user_message(prompt))
             .await
             .map_err(|e| format!("could not send the prompt to claude: {e}"))
@@ -999,6 +1060,64 @@ mod tests {
             Message { role: Role::User, content: vec![ContentBlock::Text { text: "new".into() }] },
         ];
         assert_eq!(ClaudeCliProvider::prompt_from(&msgs), "new");
+    }
+
+    /// Plain text stays a plain *string* on the wire, not a one-element array. Both are the same
+    /// message to the CLI, and this is the one every reader of that pipe expects to see.
+    #[test]
+    fn a_message_with_no_picture_in_it_goes_as_it_always_did() {
+        let msgs =
+            vec![Message { role: Role::User, content: vec![ContentBlock::Text { text: "hi".into() }] }];
+        assert!(ClaudeCliProvider::prompt_from(&msgs).is_string());
+    }
+
+    #[test]
+    fn a_picture_goes_as_the_block_the_api_takes_and_goes_first() {
+        let dir = std::env::temp_dir().join(format!("neosh-cli-img-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let png = dir.join("a.png");
+        std::fs::write(&png, b"\x89PNG\r\n\x1a\n-not-really").expect("write");
+
+        let msgs = vec![Message {
+            role: Role::User,
+            content: vec![
+                ContentBlock::Image {
+                    path: png.display().to_string(),
+                    media_type: "image/png".into(),
+                },
+                ContentBlock::Text { text: "what is this".into() },
+            ],
+        }];
+        let v = ClaudeCliProvider::prompt_from(&msgs);
+        let blocks = v.as_array().expect("an array once there is more than text in it");
+        assert_eq!(blocks[0]["type"], "image", "the picture the sentence points at comes first");
+        assert_eq!(blocks[0]["source"]["media_type"], "image/png");
+        assert!(
+            blocks[0]["source"]["data"].as_str().is_some_and(|d| d.starts_with("iVBORw0KGgo")),
+            "and it is the actual bytes, base64\n{v}"
+        );
+        assert_eq!(blocks[1]["text"], "what is this");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A workspace directory can be cleared out between the day a conversation was had and the day
+    /// it is reopened. The rest of the message is still a question worth asking.
+    #[test]
+    fn an_image_whose_file_has_gone_is_dropped_rather_than_failing_the_turn() {
+        let msgs = vec![Message {
+            role: Role::User,
+            content: vec![
+                ContentBlock::Image {
+                    path: "/definitely/not/here.png".into(),
+                    media_type: "image/png".into(),
+                },
+                ContentBlock::Text { text: "still a question".into() },
+            ],
+        }];
+        assert_eq!(
+            ClaudeCliProvider::prompt_from(&msgs),
+            Value::String("still a question".into()),
+        );
     }
 
     #[test]

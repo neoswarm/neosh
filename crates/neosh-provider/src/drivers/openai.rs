@@ -57,7 +57,28 @@ impl OpenAiCompatProvider {
                         })
                         .collect::<Vec<_>>()
                         .join("\n");
-                    if !text.is_empty() {
+                    // A picture only fits in the *array* form of `content`. A string and a
+                    // one-element array are the same message to the server, so the array is only
+                    // reached for when there is something in it that a string cannot hold.
+                    let images: Vec<Value> = m
+                        .content
+                        .iter()
+                        .filter_map(|b| match b {
+                            ContentBlock::Image { path, media_type } => Some(json!({
+                                "type": "image_url",
+                                "image_url": { "url": crate::image::data_url(path, media_type)? },
+                            })),
+                            _ => None,
+                        })
+                        .collect();
+                    if !images.is_empty() {
+                        let mut parts = Vec::new();
+                        if !text.is_empty() {
+                            parts.push(json!({"type": "text", "text": text}));
+                        }
+                        parts.extend(images);
+                        out.push(json!({"role": "user", "content": parts}));
+                    } else if !text.is_empty() {
                         out.push(json!({"role": "user", "content": text}));
                     }
                     for b in &m.content {

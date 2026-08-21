@@ -149,7 +149,18 @@ export type ApiCall =
   | { "call": "focus_push"; win: WindowId }
   | { "call": "focus_pop" }
   | { "call": "focus_current" }
-  | { "call": "agent_send"; text: string }
+  | {
+    "call": "agent_send";
+    text: string;
+    /**
+     * Files to send with it, by path. Copied into the workspace's own directory on the way
+     * through, so a caller may hand over a temporary file and forget about it.
+     *
+     * Anything already on the composer's attachment row goes too — this is *extra*, for a
+     * plugin that has produced an image of its own rather than one somebody pasted.
+     */
+    images?: Array<string>;
+  }
   | { "call": "agent_cancel" }
   | { "call": "agent_get_selection" }
   | { "call": "agent_set_selection"; selection: ModelSelection }
@@ -167,6 +178,10 @@ export type ApiCall =
   }
   | { "call": "agent_list_instances" }
   | { "call": "agent_driver_commands" }
+  | { "call": "chat_attach"; path?: string | null }
+  | { "call": "chat_attachments" }
+  | { "call": "chat_detach"; index?: number | null }
+  | { "call": "chat_detach_all" }
   | { "call": "chat_set_draft"; text: string }
   | { "call": "provider_credentials" }
   | {

@@ -16,7 +16,7 @@ pub mod turn;
 pub use agent::{Agent, AgentEvent, DriverAsker, TurnOutcome};
 pub use hooks::HookRegistry;
 pub use permission::PermissionLayer;
-pub use session::Session;
+pub use session::{Prompt, Session};
 pub use tools::{BuiltinTool, ToolCtx, ToolRegistry};
 pub use turn::{TurnAssembler, TurnUpdate};
 

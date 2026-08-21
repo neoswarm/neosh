@@ -134,6 +134,24 @@ per decision, and records the *reasoning*, not the choice.
   head is how it started and the tail is what it decided, and it is the second one you were waiting
   for. And **one row of air between actions**, which is the cheapest structure there is. See ADR
   0040.
+- **A terminal cannot paste a picture, so pasting one is a key.** Bracketed paste is a text
+  protocol: a screenshot arrives as nothing, and a dragged file arrives as its path. `^V` asks the
+  system clipboard through whichever of `wl-paste`/`xclip`/`pngpaste`/`osascript`/`powershell` is
+  there; a pasted line that is unambiguously a path to an image becomes that image. An attachment
+  is a **chip above the field**, never a token in it — the message you send is the message you
+  typed. `ContentBlock::Image` carries a *path*, not bytes: a transcript that is mostly base64 is
+  one nothing can read back, so the bytes live once in the state directory and a driver reads them
+  when it builds its request. The media type is read off the bytes, because a `.png` that is really
+  a JPEG fails the turn. See ADR 0041.
+- **A vendor CLI outlives the turn, so an abandoned turn has to be *drained*.** `Live::lines` is
+  per conversation. A turn that is walked away from — `<Esc>`, a switch — leaves the CLI mid-answer
+  with the rest of it in the pipe, and the next turn reads it as its own: someone else's reply, and
+  then nothing. Stop forwarding, interrupt, read to the `result` that ends it, and leave the process
+  at a turn boundary. See ADR 0041.
+- **Everything queued into one gap is one message.** A delegating driver is handed the *newest* user
+  message and nothing else, so N queued messages meant N-1 questions drawn as asked and never put to
+  anybody — which reads exactly like being ignored. `take_steering_into` joins them, in the order
+  they were typed. See ADR 0041.
 - **Redrawing a row means clearing its marks first.** A mark clamps rather than dies when the line
   under it is replaced, and at equal priority the *narrower* one wins — so a row rewritten every
   tick accumulates marks and ends up painted by the shortest one from several seconds ago.
@@ -171,8 +189,12 @@ check a diff band, a syntax colour or a dim attribute, none of which the plain d
 narrows it to the rows containing a string.
 
 Keys are literal text or `<c-p>` / `<cr>` / `<esc>` / `<s-tab>` / `<wait:400>`; `--arg=` passes
-through to the binary. Several real bugs — a float silently losing two rows of content, a binding
-that had never once fired — were invisible to the test suite and obvious on screen.
+through to the binary. `<paste:text>` arrives as a real **bracketed paste**, which is a different
+thing from typing the same characters — an image path becoming an attachment, a `/` that dismisses
+the menu, a pasted `<esc>` that must not interrupt: none of it is reachable by typing.
+
+Several real bugs — a float silently losing two rows of content, a binding that had never once
+fired — were invisible to the test suite and obvious on screen.
 
 After editing anything under `plugins/`, `touch crates/neosh-script/src/loader.rs` before building:
 the plugin tree is embedded with `include_dir!` and cargo will not notice otherwise.
@@ -192,6 +214,8 @@ registry — this table is what ships.
 | `⏎` | Send. While a turn is running, **steer** it: the message is held and taken in at the next gap. |
 | `⇧⏎` | Newline, so a pasted snippet stays one message |
 | `^Y` | Take the last thing you queued back into the composer, to change it or drop it. Readline's yank: `^U`/`^W` kill, `^Y` brings it back |
+| `^V` | Attach the image on the clipboard. A key rather than a paste, because a terminal's paste can only ever hand over text |
+| `⌥V` | Take the last attached image back off |
 | `^P` | Pick a model. Mid-turn too — the running agent is told, and thinks the rest with it |
 | `^E` | Reasoning effort and the other per-model options |
 | `⌥↑` `⌥↓` | One rung up or down the capability ladder, same provider |
@@ -213,6 +237,9 @@ registry — this table is what ships.
 | `^Q` | Close this terminal. Whatever is running keeps running — `neosh` puts you back |
 | `F1` | Every binding, live |
 | `Esc` | Interrupt the turn in this conversation. The agent is asked to stop, so the conversation survives it |
+
+Dragging an image onto the terminal pastes its path, and a pasted path to an image is attached
+rather than typed out. What is attached sits above the field until the message goes.
 
 Composer editing is a text field: `←`/`→` by character and `^←`/`^→` by word, `Home`/`End` and
 `^Home`/`^End` for the ends, shift with any of them to select, `^W` and `^U` to delete a word or

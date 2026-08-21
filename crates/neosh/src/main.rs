@@ -17,6 +17,7 @@ mod cards;
 mod diff;
 mod logo;
 mod config;
+mod images;
 mod frontend;
 mod host;
 mod paths;

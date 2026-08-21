@@ -27,7 +27,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::hooks::{self, HookRegistry};
 use crate::permission::PermissionLayer;
-use crate::session::Session;
+use crate::session::{Prompt, Session};
 use crate::store::SessionStore;
 use crate::tools::{ToolCtx, ToolHandler, ToolRegistry};
 use crate::turn::{TurnAssembler, TurnUpdate};
@@ -65,7 +65,7 @@ pub enum AgentEvent {
     /// Emitted at the moment it enters the conversation rather than when it was typed, because
     /// until then it is a draft the user can still change their mind about — and a transcript that
     /// shows a question the model has not been told about is a transcript that is lying.
-    Steered { session: SessionId, turn: TurnId, text: String },
+    Steered { session: SessionId, turn: TurnId, prompt: Prompt },
     /// The driver's own loop reported on itself — a sub-agent, a plan, a compaction, the commands
     /// it accepts. See [`neosh_proto::Activity`].
     ///
@@ -224,8 +224,8 @@ impl Agent {
     ///
     /// Addressed to a conversation, because what you type belongs to the one you typed it in — not
     /// to whichever turn happens to reach a gap first.
-    pub fn steer(&self, session: &SessionId, text: String) {
-        self.with(session, |s| s.steering.push(text));
+    pub fn steer(&self, session: &SessionId, prompt: Prompt) {
+        self.with(session, |s| s.steering.push(prompt));
     }
 
     /// Whether anything is waiting to be said.
@@ -234,12 +234,12 @@ impl Agent {
     }
 
     /// What is waiting, without taking it. For drawing it.
-    pub fn steering_texts(&self, session: &SessionId) -> Vec<String> {
+    pub fn steering_queue(&self, session: &SessionId) -> Vec<Prompt> {
         self.with(session, |s| s.steering.clone()).unwrap_or_default()
     }
 
     /// Take what is waiting, leaving the queue empty.
-    pub fn take_steering(&self, session: &SessionId) -> Vec<String> {
+    pub fn take_steering(&self, session: &SessionId) -> Vec<Prompt> {
         self.with(session, |s| std::mem::take(&mut s.steering)).unwrap_or_default()
     }
 
@@ -249,7 +249,7 @@ impl Agent {
     /// you meant to change. Queued messages are taken into the turn oldest-first, so this can race
     /// a gap and find the queue already empty — which is why it answers with what it removed
     /// instead of a count somebody would have to check twice.
-    pub fn unqueue_last(&self, session: &SessionId) -> Option<String> {
+    pub fn unqueue_last(&self, session: &SessionId) -> Option<Prompt> {
         self.with(session, |s| s.steering.pop()).flatten()
     }
 
@@ -438,8 +438,8 @@ impl Agent {
     }
 
     /// Run one user turn to completion in the conversation on screen.
-    pub async fn run_turn(&self, bridge: &dyn PluginBridge, text: String) -> TurnOutcome {
-        self.run_turn_with(bridge, text, CancellationToken::new()).await
+    pub async fn run_turn(&self, bridge: &dyn PluginBridge, prompt: impl Into<Prompt>) -> TurnOutcome {
+        self.run_turn_with(bridge, prompt, CancellationToken::new()).await
     }
 
     /// The same, with a caller-supplied cancellation token.
@@ -449,11 +449,11 @@ impl Agent {
     pub async fn run_turn_with(
         &self,
         bridge: &dyn PluginBridge,
-        text: String,
+        prompt: impl Into<Prompt>,
         cancel: CancellationToken,
     ) -> TurnOutcome {
         let session = self.sessions().active_id().clone();
-        self.run_turn_in(bridge, session, text, cancel).await
+        self.run_turn_in(bridge, session, prompt.into(), cancel).await
     }
 
     /// Run one user turn to completion **in a named conversation**.
@@ -466,9 +466,10 @@ impl Agent {
         &self,
         bridge: &dyn PluginBridge,
         session: SessionId,
-        text: String,
+        prompt: Prompt,
         cancel: CancellationToken,
     ) -> TurnOutcome {
+        let Prompt { text, images } = prompt;
         let turn = TurnId::new();
         self.with(&session, |s| s.active_turn = Some(turn.clone()));
 
@@ -510,7 +511,9 @@ impl Agent {
         });
 
         self.emit(AgentEvent::TurnStarted { session: session.clone(), turn: turn.clone() });
-        self.with(&session, |s| s.push_user_text(text));
+        // The hook may have rewritten the words; what was attached is not its business and rides
+        // through untouched.
+        self.with(&session, |s| s.push_user(&Prompt { text, images }));
 
         let selection = self.with(&session, |s| s.selection.clone()).flatten();
         let Some(selection) = selection else {
@@ -723,19 +726,31 @@ impl Agent {
     }
 
     /// Move anything queued into the conversation. Returns whether there was anything.
+    ///
+    /// Everything waiting becomes *one* message, which is not a tidying-up: a driver that keeps
+    /// the conversation on its own side is handed the newest user message and nothing else, so two
+    /// things queued into the same gap meant the older one was drawn in the transcript as a
+    /// question and then never asked. It is the same join the end-of-turn path does with what is
+    /// left over, for the same reason — the queue is unsent conversation, and it goes in the order
+    /// it was typed.
     fn take_steering_into(&self, session: &SessionId, turn: &TurnId) -> bool {
         let queued = self.take_steering(session);
         if queued.is_empty() {
             return false;
         }
-        for text in queued {
-            self.with(session, |s| s.push_user_text(text.clone()));
-            self.emit(AgentEvent::Steered {
-                session: session.clone(),
-                turn: turn.clone(),
-                text,
-            });
-        }
+        let prompt = Prompt {
+            text: queued.iter().map(|p| p.text.as_str()).collect::<Vec<_>>().join("\n\n"),
+            images: queued.into_iter().flat_map(|p| p.images).collect(),
+        };
+        self.with(session, |s| s.push_user(&prompt));
+        // Drawn at the moment it enters the conversation, with whatever came with it — the picture
+        // is part of the question, and a transcript showing the sentence without it is showing
+        // half of what was asked.
+        self.emit(AgentEvent::Steered {
+            session: session.clone(),
+            turn: turn.clone(),
+            prompt,
+        });
         true
     }
 

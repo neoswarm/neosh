@@ -4,7 +4,8 @@
 Usage: shot.py [--cols N] [--rows N] [--wait MS] [--after MS] [--color] key [key ...]
 
 Keys are literal text, or a name in angle brackets: <cr> <esc> <tab> <c-p> <up> <pageup> ...
-A key of the form <wait:400> sleeps that many milliseconds.
+A key of the form <wait:400> sleeps that many milliseconds, and <paste:text> arrives as a real
+bracketed paste rather than as the keystrokes that would spell it.
 
 --color prints what colour every run of every row is, instead of the plain screen. A band behind a
 diff line and a syntax colour on top of it are both invisible to the plain dump, and "it looked
@@ -39,6 +40,11 @@ def encode(tok: str) -> str:
     if name.startswith("a-"):
         rest = name[2:]
         return "\x1b" + (NAMED.get(rest, rest))
+    # A bracketed paste, which is a different thing from typing the same characters: neosh binds
+    # `/`, reads a pasted image path as an attachment, and treats a pasted `<esc>` as text rather
+    # than an interrupt. None of that is reachable by typing.
+    if name.startswith("paste:"):
+        return "\x1b[200~" + tok[len("<paste:"):-1] + "\x1b[201~"
     # Raw bytes, as hex: <raw:1b5b313b3341>. The escape hatch for keys whose encoding is the
     # question — a control character no name covers, or the sequence one particular terminal sends
     # for a chord. Without it, "does neosh see Ctrl+/" is unanswerable except by pressing it.
