@@ -1,0 +1,14 @@
+{"type": "message_start", "model": "mock", "usage": {}}
+{"type": "activity", "activity": {"kind": "commands", "commands": [{"name": "compact", "description": "Summarise the conversation so far"}, {"name": "review", "description": "Review a path", "argument_hint": "[path]"}]}}
+{"type": "block_start", "index": 0, "block": {"kind": "text"}}
+{"type": "text_delta", "index": 0, "text": "Hello."}
+{"type": "block_stop", "index": 0}
+{"type": "message_delta", "stop_reason": {"kind": "end_turn"}, "usage": {}}
+{"type": "message_stop"}
+
+{"type": "message_start", "model": "mock", "usage": {}}
+{"type": "block_start", "index": 0, "block": {"kind": "text"}}
+{"type": "text_delta", "index": 0, "text": "Compacted."}
+{"type": "block_stop", "index": 0}
+{"type": "message_delta", "stop_reason": {"kind": "end_turn"}, "usage": {}}
+{"type": "message_stop"}

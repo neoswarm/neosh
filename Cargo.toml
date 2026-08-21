@@ -8,6 +8,7 @@ members = [
     "crates/neosh-agent",
     "crates/neosh-script",
     "crates/neosh-tui",
+    "crates/neosh-syntax",
     "crates/neosh",
 ]
 
@@ -26,6 +27,7 @@ neosh-vcs = { path = "crates/neosh-vcs" }
 neosh-agent = { path = "crates/neosh-agent" }
 neosh-script = { path = "crates/neosh-script" }
 neosh-tui = { path = "crates/neosh-tui" }
+neosh-syntax = { path = "crates/neosh-syntax" }
 
 # async
 tokio = { version = "1.53", features = ["rt", "rt-multi-thread", "macros", "sync", "time", "process", "io-util", "fs", "signal"] }

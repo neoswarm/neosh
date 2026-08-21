@@ -3070,6 +3070,284 @@ fn the_context_meter_is_there_before_the_first_turn() {
     );
 }
 
+/// A plugin that writes down every draft it is told about.
+///
+/// Which is the whole of what a completion menu does before it decides whether to open — so this is
+/// the contract, with nothing in the way of reading it.
+const WATCHER: &str = r#"
+import type { PluginContext } from "@neosh/api";
+
+export async function activate({ neosh }: PluginContext) {
+  const buf = await neosh.buf.create({ name: "[drafts]", scratch: true });
+  const seen: string[] = [];
+  neosh.agent.onComposerChange(({ text }) => {
+    seen.push(`draft<${text}>`);
+    void neosh.buf.setLines(buf, 0, -1, seen);
+  });
+  neosh.notify("watcher ready");
+}
+"#;
+
+// ---------------------------------------------------------------------------
+// The slash menu
+// ---------------------------------------------------------------------------
+
+/// Put a lone `/` in the composer and wait for the menu it opens.
+///
+/// Retried, because plugins load asynchronously and nothing in the protocol announces "every
+/// builtin is up" — a `/` typed a millisecond too early is a `/` in the composer and no menu.
+/// Backspaced between attempts so the field is left holding exactly one slash whichever attempt
+/// won, which is what the tests below then type into.
+fn open_slash_menu(s: &mut Session) {
+    for _ in 0..20 {
+        s.type_text("/");
+        s.drain_for(Duration::from_millis(150));
+        if s.buffer_named("[Run]").is_some() {
+            return;
+        }
+        s.special("backspace");
+        s.drain_for(Duration::from_millis(50));
+    }
+    panic!("the slash menu never opened\n{}", s.transcript());
+}
+
+/// Typing `/compact` and pressing enter must send `/compact`.
+///
+/// It did not. The menu opened on the `/`, kept the keyboard, fuzzy-matched `compact` over every
+/// command's *description* — six letters that occur in that order in a great deal of English — and
+/// `↵` ran whichever unrelated command that put under the cursor. Meanwhile `/compact` itself was
+/// not in the list, because a driver only reports its commands after a turn has run and this
+/// conversation had not run one. So the one thing the user typed was the one thing that could not
+/// happen, and what happened instead was silent.
+#[test]
+fn a_command_the_menu_has_never_heard_of_is_sent_to_the_agent_as_typed() {
+    let sb = Sandbox::new("slashunknown");
+    let mut s = sb.start();
+
+    open_slash_menu(&mut s);
+
+    s.type_text("compact");
+    // The composer is the field: what was typed is in it, whatever the menu is doing.
+    assert!(
+        s.pump(|s| s.composer_now().iter().any(|l| l == "/compact")),
+        "and the composer says what was typed\n{:?}",
+        s.composer_now()
+    );
+
+    s.enter();
+    assert!(
+        s.pump(|s| s.chat_now().iter().any(|l| l.contains("/compact"))),
+        "and enter sends it\n{:?}",
+        s.chat_now()
+    );
+    // The failure mode this replaces: something else ran instead. `chat.read` was the usual
+    // winner, and it leaves the mode line saying so.
+    assert!(
+        !s.status_now().iter().any(|l| l.contains("reading")),
+        "rather than running whatever happened to match\n{:?}",
+        s.status_now()
+    );
+}
+
+/// A command the *driver* named is one row of the same list, and choosing it sends it.
+///
+/// The two vocabularies differ in exactly one place — what accepting does. A neosh command runs and
+/// the draft is cleared, because it was never a message. A driver command *is* a message and, if it
+/// is finished being typed, it goes: asking for a second confirmation of a row you picked out of a
+/// list is a keystroke that answers nothing.
+#[test]
+fn a_command_the_driver_named_is_offered_and_sent_as_a_message() {
+    let sb = Sandbox::new("slashdriver");
+    let script =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/driver_commands.jsonl");
+    let mut s = sb.spawn(&script, Some("mock/mock"));
+
+    // Nothing knows the driver's commands until a turn has run — the handshake is what says.
+    s.type_text("hi");
+    s.enter();
+    assert!(s.pump(|s| s.chat_now().iter().any(|l| l.contains("Hello."))), "a turn ran");
+
+    open_slash_menu(&mut s);
+    s.type_text("comp");
+    assert!(
+        s.pump(|s| s.lines_of(s.buffer_named("[Run]").unwrap_or(u64::MAX))
+            .iter()
+            .any(|l| l.contains("Summarise the conversation so far"))),
+        "the driver's own command, in the driver's own words\n{:?}",
+        s.buffer_named("[Run]").map(|b| s.lines_of(b))
+    );
+
+    s.enter();
+    assert!(
+        s.pump(|s| s.chat_now().iter().any(|l| l.contains("/compact"))),
+        "and choosing it asks for it\n{:?}",
+        s.chat_now()
+    );
+}
+
+/// Escape leaves what was typed where it was being typed.
+#[test]
+fn dismissing_the_slash_menu_keeps_the_draft() {
+    let sb = Sandbox::new("slashescape");
+    let mut s = sb.start();
+    open_slash_menu(&mut s);
+    s.type_text("git");
+    s.special("esc");
+    assert!(
+        s.pump(|s| s.composer_now().iter().any(|l| l == "/git")),
+        "still there, mid-word\n{:?}",
+        s.composer_now()
+    );
+}
+
+/// A search borrows the composer, and what is in it then is not a draft.
+///
+/// `/` in the transcript types into the same field the composer uses, which is deliberate — a float
+/// over the thing you are searching would hide the answer. The cost is that anything watching the
+/// draft sees `/`, then `/n`, then `/ne`. For the slash-command menu, which opens on exactly a lone
+/// `/`, that means opening a picker on top of the search the moment it starts and taking the
+/// keyboard off it.
+///
+/// So the event is about the *draft*, and a borrowed field has none.
+fn drafts(s: &Session) -> Vec<String> {
+    s.buffer_named("[drafts]").map(|b| s.lines_of(b)).unwrap_or_default()
+}
+
+#[test]
+fn a_search_is_not_broadcast_as_a_draft() {
+    let sb = Sandbox::new("searchdraft");
+    let dir = sb.root.join("config/plugins/watcher");
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    std::fs::write(
+        dir.join("plugin.toml"),
+        "name = \"watcher\"\nversion = \"0.1.0\"\nentry = \"main.ts\"\n",
+    )
+    .expect("manifest");
+    std::fs::write(dir.join("main.ts"), WATCHER).expect("plugin");
+
+    let mut s = sb.start();
+    s.wait_for("watcher ready");
+
+    // An ordinary draft is broadcast, or the event would be useless.
+    s.type_text("hi");
+    assert!(
+        s.pump(|s| drafts(s).iter().any(|l| l.contains("draft<hi>"))),
+        "typing in the composer is a draft\n{:?}",
+        drafts(&s)
+    );
+
+    // Now the search. Every one of these keystrokes lands in the same buffer.
+    s.ctrl("s");
+    s.type_text("/neosh");
+    assert!(
+        s.pump(|s| s.composer_now().iter().any(|l| l.contains("/neosh"))),
+        "the search is being typed\n{:?}",
+        s.composer_now()
+    );
+
+    // Back to the composer, and one more character. Waiting for *that* to be recorded is what makes
+    // the negative below mean anything: events reach a plugin in order, so a draft recorded after
+    // the search proves every keystroke of the search was already handled — or dropped.
+    s.special("esc");
+    s.special("esc");
+    s.type_text("z");
+    assert!(
+        s.pump(|s| drafts(s).iter().any(|l| l.contains("draft<hiz>"))),
+        "the composer is the draft again\n{:?}",
+        drafts(&s)
+    );
+
+    let seen = drafts(&s);
+    assert!(
+        !seen.iter().any(|l| l.contains("draft</")),
+        "and not one keystroke of the search was announced as a draft\n{seen:?}"
+    );
+}
+
+/// A driver that reports its own context occupancy while it works, the way a vendor CLI does.
+///
+/// The catalogue says this model has a 300k window. The driver says the window is 128k and that it
+/// has 64k in it — which is the situation that matters, because an agent driver's window is
+/// whatever *it* decided and it is the only thing that knows what it is still holding.
+const REPORTER: &str = r#"
+import type { PluginContext } from "@neosh/api";
+const nap = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+export async function activate({ neosh }: PluginContext) {
+  await neosh.provider.register("reporter", [{
+    id: "reporter", driver: "reporter", display_name: "Reporter",
+    models: [{ id: "reporter-1", display_name: "Reporter One", context_window: 300000 }],
+  }], async (_req, emit) => {
+    emit({ type: "message_start", model: "reporter-1", usage: {} });
+    // Mid-turn, before a single token of answer and long before the turn ends.
+    emit({ type: "activity", activity: { kind: "context", used: 64000, total: 128000 } });
+    await nap(900);
+    emit({ type: "block_start", index: 0, block: { kind: "text" } });
+    emit({ type: "text_delta", index: 0, text: "ok" });
+    emit({ type: "block_stop", index: 0 });
+    emit({ type: "message_delta", stop_reason: { kind: "end_turn" }, usage: {} });
+    emit({ type: "message_stop" });
+  }, { agentLoop: true });
+  neosh.notify("reporter ready");
+}
+"#;
+
+fn install_reporter(sb: &Sandbox) {
+    let dir = sb.root.join("config/plugins/reporter");
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    std::fs::write(
+        dir.join("plugin.toml"),
+        "name = \"reporter\"\nversion = \"0.1.0\"\nentry = \"main.ts\"\npermissions = [\"providers\"]\n",
+    )
+    .expect("manifest");
+    std::fs::write(dir.join("main.ts"), REPORTER).expect("plugin");
+}
+
+/// The meter believes the driver, and moves while the turn is still running.
+///
+/// Two faults, one symptom. The number came from the usage of the last *request*, and the window
+/// came from neosh's catalogue — so for an agent driver, which holds the conversation on its own
+/// side and prunes and compacts it without telling anybody, both halves were guesses. And it was
+/// only ever recomputed when a turn *ended*, which for an agent driver is minutes: a fresh
+/// conversation read `0%` and stayed there for the whole of its first turn, which is exactly when
+/// somebody looks at it.
+#[test]
+fn the_context_meter_believes_the_driver_and_moves_while_it_works() {
+    let sb = Sandbox::new("ctxreport");
+    install_reporter(&sb);
+    sb.write_config("[options]\n\"agent.model\" = \"reporter/reporter-1\"\n");
+    let mut s = sb.start_letting_config_choose();
+    s.wait_for("reporter ready");
+
+    // Before the turn: nothing has been reported, so the catalogue is the best guess there is.
+    assert!(
+        s.pump(|s| s.status_now().iter().any(|l| l.contains("0% of 300k"))),
+        "the catalogue is the fallback, not a lie\n{:?}",
+        s.status_now()
+    );
+
+    s.type_text("go");
+    s.enter();
+    // 64k of 128k. Both halves are the driver's: the catalogue would have said 21% of 300k.
+    assert!(
+        s.pump(|s| s.status_now().iter().any(|l| l.contains("50% of 128k"))),
+        "the driver's own numerator and its own denominator\n{:?}",
+        s.status_now()
+    );
+    assert!(
+        !s.status_now().iter().any(|l| l.contains("of 300k")),
+        "and not the catalogue's window once it has been told\n{:?}",
+        s.status_now()
+    );
+    // The driver sent that before it wrote a word of the answer, so seeing it here means the meter
+    // did not wait for the turn to be over.
+    assert!(
+        !s.saw("ok"),
+        "and it arrived before the answer did, not after the turn\n{}",
+        s.transcript()
+    );
+}
+
 /// One gauge, not two. The sidebar drew a context meter and so did the usage plugin; for as long
 /// as no model in the catalogue reported a window, only one of them ever appeared. The moment one
 /// did, the footer had two bars in it that disagreed about what "used" meant.
@@ -3558,6 +3836,55 @@ fn the_working_line_says_how_much_is_waiting() {
     );
 }
 
+/// The queue is unsent conversation, so it reads with the conversation and not with the furniture.
+///
+/// Under the field it sat below the shortcut row and one line above the status bar, in the strip
+/// the eye has been trained to skip. Above it, it is the last thing between what has been said and
+/// what you are saying — which is what it is.
+#[test]
+fn what_is_queued_sits_above_the_composer_and_says_how_to_take_it_back() {
+    let sb = Sandbox::new("steerplace");
+    install_stall(&sb);
+    sb.write_config("[options]\n\"agent.model\" = \"stall/stall\"\n");
+    let mut s = sb.start_letting_config_choose();
+    s.wait_for("stall ready");
+    s.type_text("go");
+    s.enter();
+    assert!(s.pump(|s| s.chat_now().iter().any(|l| l.contains("esc to interrupt"))), "working");
+
+    s.type_text("and check the tests");
+    s.enter();
+    assert!(
+        s.pump(|s| s.composer_chrome().iter().any(|t| t.contains("and check the tests"))),
+        "held, and shown\n{:?}",
+        s.composer_chrome()
+    );
+    assert!(
+        s.composer_chrome().iter().any(|t| t.contains("edit")),
+        "with the key that undoes it\n{:?}",
+        s.composer_chrome()
+    );
+    assert!(
+        !s.composer_now().iter().any(|l| l.contains("and check the tests")),
+        "and it is chrome, not something that would be sent twice: {:?}",
+        s.composer_now()
+    );
+
+    // Enter is a decision made in half a second about a sentence you were still writing. This is
+    // the other half of it: the message comes back to be changed rather than being lost to a typo.
+    s.send(&command("chat.queue.edit"));
+    assert!(
+        s.pump(|s| s.composer_now().iter().any(|l| l.contains("and check the tests"))),
+        "back where it can be edited\n{:?}",
+        s.composer_now()
+    );
+    assert!(
+        s.pump(|s| !s.composer_chrome().iter().any(|t| t.contains("and check the tests"))),
+        "and out of the queue, not in both places\n{:?}",
+        s.composer_chrome()
+    );
+}
+
 /// A question butted against whatever came before it reads as another line of that answer.
 ///
 /// The case this exists for is a tool card, which has no trailing blank of its own: the previous
@@ -3729,7 +4056,7 @@ fn a_tool_calls_dot_says_whether_it_is_still_going() {
     assert!(
         s.pump(|s| {
             let rows = s.chat_now();
-            let Some(at) = rows.iter().position(|l| l.contains("read_file(.env)")) else {
+            let Some(at) = rows.iter().position(|l| l.contains("read_file  .env")) else {
                 return false;
             };
             // Failed, because `.env` is not there — which is the point: the dot reports how it
@@ -3816,12 +4143,12 @@ fn a_tool_call_says_what_came_back_not_only_that_it_ran() {
     s.type_text("go");
     s.enter();
     assert!(
-        s.pump(|s| s.chat_now().iter().any(|l| l.contains("read_file(.env)"))),
+        s.pump(|s| s.chat_now().iter().any(|l| l.contains("read_file  .env"))),
         "the call is shown with its subject\n{:?}",
         s.chat_now()
     );
     assert!(
-        s.pump(|s| s.chat_now().iter().any(|l| l.contains('\u{23bf}')
+        s.pump(|s| s.chat_now().iter().any(|l| l.contains('\u{2502}')
             && l.contains("could not read"))),
         "and what it came back with, under it\n{:?}",
         s.chat_now()
@@ -3848,7 +4175,7 @@ fn an_edit_card_shows_the_change_and_how_much_of_it() {
     let rows = s.chat_now();
     let header = rows
         .iter()
-        .position(|l| l.starts_with('\u{23fa}') && l.contains("edit(") && l.contains("main.rs"))
+        .position(|l| l.starts_with('\u{23fa}') && l.contains("edit  ") && l.contains("main.rs"))
         .expect("the card's header");
     assert!(
         rows[header].ends_with("+2 -1"),
@@ -3946,15 +4273,57 @@ fn the_welcome_says_how_to_read_the_transcript() {
 fn the_footer_says_what_the_agent_may_do_and_which_key_changes_it() {
     let sb = Sandbox::new("permmode");
     let mut s = sb.start();
+    // Full access out of the box — see `PermissionsConfig::default` — which is precisely why the
+    // row has to be there in every mode rather than only the surprising ones.
     assert!(
-        s.pump(|s| s.status_now().iter().any(|l| l.contains("ask"))),
+        s.pump(|s| s.status_now().iter().any(|l| l.contains("full access \u{21e7}\u{21e5}"))),
         "the mode, and the key beside it\n{:?}",
         s.status_now()
     );
     s.send(&command("permission.cycle"));
     assert!(
-        s.pump(|s| s.status_now().iter().any(|l| l.contains("allow-listed"))),
+        s.pump(|s| s.status_now().iter().any(|l| l.contains("deny"))),
         "and it changes\n{:?}",
+        s.status_now()
+    );
+}
+
+/// The mode belongs to the conversation, not to the terminal it is read in.
+///
+/// The failure this is here to catch is silent and in the dangerous direction: a mode kept in one
+/// shared place means switching away from a conversation you had put in `deny` and into any other
+/// one leaves that other one in `deny` too — and, worse, coming back the other way carries full
+/// access into a conversation somebody had deliberately locked down.
+#[test]
+fn a_permission_mode_belongs_to_the_conversation_it_was_chosen_in() {
+    let sb = Sandbox::new("permsession");
+    let mut s = sb.start();
+    assert!(
+        s.pump(|s| s.status_now().iter().any(|l| l.contains("full access"))),
+        "the configured default to start from\n{:?}",
+        s.status_now()
+    );
+
+    s.send(&command("permission.cycle")); // full access -> deny
+    assert!(
+        s.pump(|s| s.status_now().iter().any(|l| l.contains("deny"))),
+        "this one is set\n{:?}",
+        s.status_now()
+    );
+
+    // A conversation that has never been given a mode takes the configured one, not whatever the
+    // conversation you came from happened to be left in.
+    s.send(&command("session.new"));
+    assert!(
+        s.pump(|s| s.status_now().iter().any(|l| l.contains("full access"))),
+        "a new one is its own\n{:?}",
+        s.status_now()
+    );
+
+    s.send(&command("session.close"));
+    assert!(
+        s.pump(|s| s.status_now().iter().any(|l| l.contains("deny"))),
+        "and going back is going back to it\n{:?}",
         s.status_now()
     );
 }

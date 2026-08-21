@@ -24,6 +24,14 @@ pub trait Frontend: Send {
     async fn shutdown(&mut self) -> anyhow::Result<()> {
         Ok(())
     }
+    /// Send the viewer away and keep going.
+    ///
+    /// Nothing for a frontend that *is* the process — there is nobody to send away, and the run
+    /// loop is about to end anyway. It means something only for a workspace serving a terminal,
+    /// which is the one place `quit` and `stop` are different words.
+    async fn detach(&mut self) -> anyhow::Result<()> {
+        Ok(())
+    }
 }
 
 /// Renders to the terminal.

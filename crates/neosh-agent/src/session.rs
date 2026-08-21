@@ -3,8 +3,8 @@
 use std::path::PathBuf;
 
 use neosh_proto::{
-    ContentBlock, Message, ModelSelection, Role, SessionId, SessionInfo, ToolCallId, ToolResult,
-    TurnId, Usage,
+    ContentBlock, Message, ModelSelection, PermissionMode, Role, SessionId, SessionInfo, ToolCallId,
+    ToolResult, TurnId, Usage,
 };
 
 #[derive(Debug, Clone)]
@@ -18,6 +18,8 @@ pub struct Session {
     pub usage: Usage,
     /// The prompt size of the most recent request: how full the window actually is.
     pub context_tokens: u64,
+    /// What the driver says the window is. See [`neosh_proto::SessionInfo::context_window`].
+    pub context_window: Option<u64>,
     pub active_turn: Option<TurnId>,
     /// Things said to *this* conversation while its turn was running, waiting for a gap to be
     /// taken in.
@@ -41,6 +43,12 @@ pub struct Session {
     /// When it was put away, in seconds since the epoch. Set by whoever archives it, for the same
     /// reason `created_at` is: this type does not read a clock.
     pub archived_at: Option<i64>,
+    /// What this conversation lets the agent do without asking, when it has been told.
+    ///
+    /// See [`neosh_proto::SessionInfo::permission_mode`]. `None` is not a mode — it means nobody
+    /// has chosen one here and the configured default applies, which is what makes changing that
+    /// default in `config.toml` reach every conversation that has not overridden it.
+    pub permission_mode: Option<PermissionMode>,
 }
 
 impl Session {
@@ -53,6 +61,7 @@ impl Session {
             system: None,
             usage: Usage::default(),
             context_tokens: 0,
+            context_window: None,
             active_turn: None,
             steering: Vec::new(),
             turn_started_at: None,
@@ -61,6 +70,7 @@ impl Session {
             updated_at: 0,
             archived: false,
             archived_at: None,
+            permission_mode: None,
         }
     }
 
@@ -131,11 +141,27 @@ impl Session {
         });
     }
 
+    /// What the driver says is in its window, and how big the window is.
+    ///
+    /// Believed over anything derived from usage, and it is not a close call. A prompt size is the
+    /// tokens *this request* sent; an agent driver holds the conversation on its own side, decides
+    /// for itself what to keep and when to compact, and is the only thing that can answer "how
+    /// full is it". Where it does answer, guessing alongside it would be inventing a second number
+    /// for a question that already has one.
+    pub fn set_context(&mut self, used: u64, window: u64) {
+        self.context_tokens = used;
+        self.context_window = (window > 0).then_some(window);
+    }
+
     pub fn add_usage(&mut self, u: &Usage) {
         // The most recent request's prompt is what fills the window. Replaced rather than summed:
         // adding them would report a conversation as longer than any request it ever made.
+        //
+        // Skipped entirely once a driver has told us: this is the estimate, and it is wrong in the
+        // direction that matters — it counts one request rather than the conversation the agent is
+        // holding, which for a CLI that compacts on its own is not the same thing at all.
         let prompt = u.input_tokens + u.cache_read_tokens + u.cache_write_tokens;
-        if prompt > 0 {
+        if prompt > 0 && self.context_window.is_none() {
             self.context_tokens = prompt;
         }
         self.usage.input_tokens += u.input_tokens;
@@ -165,10 +191,12 @@ impl Session {
             updated_at: self.updated_at,
             usage: self.usage,
             context_tokens: self.context_tokens,
+            context_window: self.context_window,
             // Filled in by the store, which is the only thing that knows.
             is_active: false,
             archived: self.archived,
             archived_at: self.archived_at,
+            permission_mode: self.permission_mode,
         }
     }
 }

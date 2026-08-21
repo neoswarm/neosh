@@ -554,6 +554,14 @@ export interface AgentApi {
    */
   onComposerChange(cb: (e: { text: string }) => void): Disposable;
   /**
+   * What a driver's own loop said about itself — a sub-agent, a plan, a compaction, how full its
+   * context is.
+   *
+   * The only signal that moves *during* a turn. Everything else about usage arrives when the turn
+   * ends, which for an agent driver can be twenty minutes after the number changed.
+   */
+  onActivity(cb: (e: { session: SessionId; turn: string; activity: Activity }) => void): Disposable;
+  /**
    * A turn has begun.
    *
    * Every turn event says which conversation it belongs to. A workspace runs several at once, so
@@ -906,6 +914,7 @@ interface Registered {
   sessionListeners: Array<(e: { session: SessionId }) => void>;
   selectionListeners: Array<(e: { selection: ModelSelection }) => void>;
   composerListeners: Array<(e: { text: string }) => void>;
+  activityListeners: Array<(e: { session: SessionId; turn: string; activity: Activity }) => void>;
   options: Set<string>;
   /// Timer handles this plugin armed, cleared on unload.
   timers: Set<number>;
@@ -929,6 +938,7 @@ function reg(plugin: string): Registered {
       sessionListeners: [],
       selectionListeners: [],
       composerListeners: [],
+      activityListeners: [],
       options: new Set(),
       timers: new Set(),
       agentListeners: { turnStart: [], token: [], thinking: [], turnEnd: [], toolStart: [], toolEnd: [] },
@@ -1313,6 +1323,7 @@ export function __createContext(plugin: string, config: unknown, version: number
       },
       onSelectionChange: (cb) => listener(r.selectionListeners, cb),
       onComposerChange: (cb) => listener(r.composerListeners, cb),
+      onActivity: (cb) => listener(r.activityListeners, cb),
       onTurnStart: (cb) =>
         listener(r.agentListeners.turnStart as Array<(e: { session: string; turn: string }) => void>, cb),
       onToken: (cb) =>
@@ -1663,6 +1674,10 @@ export async function __dispatch(plugin: string, msg: Record<string, unknown>): 
         break;
       case "composer_changed":
         for (const cb of r.composerListeners) cb({ text: ev.text });
+        break;
+      case "activity":
+        for (const cb of r.activityListeners)
+          cb({ session: ev.session, turn: ev.turn, activity: ev.activity });
         break;
       case "focus_changed":
       case "shutdown":

@@ -164,6 +164,108 @@ fn overlapping_highlights_resolve_by_priority() {
     assert_eq!(fg, Some(ratatui::style::Color::Indexed(9)), "the higher priority wins");
 }
 
+#[test]
+fn at_equal_priority_the_narrower_highlight_wins() {
+    // A fenced block is code and this word in it is a keyword: both are true, both are set at the
+    // priority a renderer uses for ordinary colouring, and the specific one is the one worth
+    // saying. Resolving it by which was set last makes the answer depend on a caller's loop order.
+    let span = |col, end, group: &str| ExtmarkRender {
+        ns: NamespaceId(1),
+        id: ExtmarkId(1),
+        col,
+        opts: ExtmarkOpts {
+            hl_group: Some(group.into()),
+            end_col: Some(end),
+            ..Default::default()
+        },
+    };
+    let mut t = theme();
+    t.set("Narrow", HighlightDef::Spec {
+        spec: HighlightSpec { fg: Some(neosh_proto::Color::Indexed { i: 9 }), ..Default::default() },
+    });
+    let narrow = neosh_proto::Color::Indexed { i: 9 };
+    // Whichever order they arrive in.
+    for marks in [
+        vec![span(0, 6, "V"), span(2, 4, "Narrow")],
+        vec![span(2, 4, "Narrow"), span(0, 6, "V")],
+    ] {
+        let out = render_line(&line("abcdef", marks), &t);
+        let at = |c: char| {
+            out[0].spans.iter().find(|s| s.content.contains(c)).unwrap().style.fg
+        };
+        assert_eq!(at('c'), Some(ratatui::style::Color::Indexed(9)), "{narrow:?}");
+        assert_ne!(at('a'), Some(ratatui::style::Color::Indexed(9)), "outside it, the broad one");
+    }
+}
+
+#[test]
+fn a_row_background_sits_under_every_highlight_on_the_row() {
+    // The rule the whole diff redesign rests on: a line a diff added is green *and* the code on it
+    // is syntax-coloured. If the band replaced the token colours the diff would be back to being
+    // two colours of text, and if a token colour replaced the band the line would be striped.
+    let band = ExtmarkRender {
+        ns: NamespaceId(1),
+        id: ExtmarkId(1),
+        col: 0,
+        opts: ExtmarkOpts { line_hl_group: Some("Band".into()), ..Default::default() },
+    };
+    let word = ExtmarkRender {
+        ns: NamespaceId(1),
+        id: ExtmarkId(2),
+        col: 2,
+        opts: ExtmarkOpts {
+            hl_group: Some("Word".into()),
+            end_col: Some(5),
+            ..Default::default()
+        },
+    };
+    let mut t = theme();
+    t.set("Band", HighlightDef::Spec {
+        spec: HighlightSpec {
+            bg: Some(neosh_proto::Color::Indexed { i: 22 }),
+            ..Default::default()
+        },
+    });
+    t.set("Word", HighlightDef::Spec {
+        spec: HighlightSpec {
+            fg: Some(neosh_proto::Color::Indexed { i: 9 }),
+            ..Default::default()
+        },
+    });
+    let out = render_line(&line("abcdefg", vec![band, word]), &t);
+    let bg = ratatui::style::Color::Indexed(22);
+    for s in &out[0].spans {
+        assert_eq!(s.style.bg, Some(bg), "every span keeps the band: {:?}", s.content);
+    }
+    let coloured = out[0].spans.iter().find(|s| s.content.contains('c')).unwrap();
+    assert_eq!(coloured.style.fg, Some(ratatui::style::Color::Indexed(9)), "and its own colour");
+}
+
+#[test]
+fn a_banded_row_carries_its_background_across_a_wrap() {
+    // A band that stops halfway down a wrapped line reads as two lines, one of which changed.
+    let mut t = theme();
+    t.set("Band", HighlightDef::Spec {
+        spec: HighlightSpec {
+            bg: Some(neosh_proto::Color::Indexed { i: 22 }),
+            ..Default::default()
+        },
+    });
+    let band = ExtmarkRender {
+        ns: NamespaceId(1),
+        id: ExtmarkId(1),
+        col: 0,
+        opts: ExtmarkOpts { line_hl_group: Some("Band".into()), ..Default::default() },
+    };
+    let out = render_line(&line("abcdefghij", vec![band]), &t);
+    let wrapped = neosh_tui::render::wrap_line(&out[0], 4);
+    assert!(wrapped.len() > 1, "it wrapped");
+    let bg = ratatui::style::Color::Indexed(22);
+    for l in &wrapped {
+        assert_eq!(l.style.bg, Some(bg), "{l:?}");
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Layout
 // ---------------------------------------------------------------------------
@@ -277,6 +379,48 @@ fn a_screen_anchored_float_is_centred() {
     let rects = resolve_layout(&m, Rect::new(0, 0, 100, 30));
     let f = rects.iter().find(|(w, _)| *w == WindowId(3)).unwrap().1;
     assert_eq!(f, Rect::new(40, 12, 20, 6));
+}
+
+/// A completion is placed by naming the dock it completes, and nothing else.
+///
+/// The float's *bottom* edge meets the bottom strip, not its top-left corner. Anchoring the corner
+/// would make every caller subtract its own height first — and the day one of them is a row out,
+/// the menu sits on top of the field it is a menu for, which is the one place it must never be.
+#[test]
+fn a_dock_anchored_float_sits_flush_against_the_dock_whatever_its_height() {
+    let mut m = mirror_with_windows();
+    m.apply(UiEvent::WindowOpened {
+        win: WindowId(3),
+        buf: BufferId(1),
+        layout: WindowLayout::Docked {
+            dock: Dock::Bottom,
+            size: Some(4),
+            gravity: Gravity::Start,
+            wrap: None,
+        },
+    });
+    let float = |n: u16| WindowLayout::Float {
+        config: FloatConfig {
+            anchor: Anchor::Dock { dock: Dock::Bottom },
+            width: Extent::Fixed { n: 30 },
+            height: Extent::Fixed { n },
+            border: BorderStyle::None,
+            ..Default::default()
+        },
+    };
+    m.apply(UiEvent::WindowOpened { win: WindowId(4), buf: BufferId(1), layout: float(6) });
+    let rects = resolve_layout(&m, Rect::new(0, 0, 100, 30));
+    let bottom = rects.iter().find(|(w, _)| *w == WindowId(3)).unwrap().1;
+    let f = rects.iter().find(|(w, _)| *w == WindowId(4)).unwrap().1;
+    assert_eq!(f.y + f.height, bottom.y, "the float's foot meets the strip's head");
+    let main = rects.iter().find(|(w, _)| *w == WindowId(1)).unwrap().1;
+    assert_eq!(f.x, main.x, "and its left edge lines up with what it is completing");
+
+    // Same anchor, taller list: it grows upwards, and the edge that touches stays touching.
+    m.apply(UiEvent::WindowOpened { win: WindowId(5), buf: BufferId(1), layout: float(12) });
+    let rects = resolve_layout(&m, Rect::new(0, 0, 100, 30));
+    let tall = rects.iter().find(|(w, _)| *w == WindowId(5)).unwrap().1;
+    assert_eq!(tall.y + tall.height, bottom.y, "however many rows it turned out to need");
 }
 
 #[test]

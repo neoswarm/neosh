@@ -42,12 +42,22 @@ struct Stored {
     /// how much room is left without having to send something first.
     #[serde(default)]
     context_tokens: u64,
+    /// And the window it was a fraction of, when a driver said. Persisted with it for the same
+    /// reason: a reopened conversation should read the same as it did before it was closed, and a
+    /// meter whose denominator changed on reload would move without anything having happened.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    context_window: Option<u64>,
     /// Put away rather than deleted. Defaulted, so a session written before archiving existed
     /// comes back in the open list, which is where it was.
     #[serde(default)]
     archived: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     archived_at: Option<i64>,
+    /// What the agent may do without asking here. Absent for a conversation that has never been
+    /// given one, which then takes whatever `config.toml` says — so raising or lowering the default
+    /// still reaches every conversation that never overrode it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    permission_mode: Option<neosh_proto::PermissionMode>,
     /// The system prompt is *not* stored. It comes from configuration, and a stale copy pinned into
     /// a saved session would silently outrank the one the user edited.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -94,8 +104,10 @@ impl From<&Session> for Stored {
             selection: s.selection.clone(),
             usage: s.usage,
             context_tokens: s.context_tokens,
+            context_window: s.context_window,
             archived: s.archived,
             archived_at: s.archived_at,
+            permission_mode: s.permission_mode,
             _reserved: None,
         }
     }
@@ -112,8 +124,10 @@ impl Stored {
         s.selection = self.selection;
         s.usage = self.usage;
         s.context_tokens = self.context_tokens;
+        s.context_window = self.context_window;
         s.archived = self.archived;
         s.archived_at = self.archived_at;
+        s.permission_mode = self.permission_mode;
         s
     }
 }
@@ -256,6 +270,28 @@ mod tests {
         assert_eq!(loaded[0].messages.len(), 1);
         assert_eq!(loaded[0].usage.input_tokens, 7);
         assert_eq!(loaded[0].cwd, original.cwd);
+    }
+
+    /// A mode you chose for one conversation is a decision, not a mood.
+    ///
+    /// It survives the workspace stopping, and a conversation that never had one comes back
+    /// without one — so raising or lowering `permissions.mode` in `config.toml` still reaches every
+    /// conversation that never overrode it, rather than being frozen into each one at creation.
+    #[test]
+    fn a_conversations_permission_mode_is_saved_and_the_absence_of_one_is_too() {
+        let t = tmp("permmode");
+        let mut locked = session("careful now");
+        locked.permission_mode = Some(neosh_proto::PermissionMode::Deny);
+        let ordinary = session("anything at all");
+        save(&t.0, &locked).expect("save");
+        save(&t.0, &ordinary).expect("save");
+
+        let (loaded, _) = load(&t.0);
+        let of = |id: &neosh_proto::SessionId| {
+            loaded.iter().find(|s| &s.id == id).expect("saved").permission_mode
+        };
+        assert_eq!(of(&locked.id), Some(neosh_proto::PermissionMode::Deny));
+        assert_eq!(of(&ordinary.id), None, "and none is not a mode");
     }
 
     #[test]

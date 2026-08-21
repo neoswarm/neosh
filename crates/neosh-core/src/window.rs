@@ -21,6 +21,14 @@ pub struct Window {
     pub layout: WindowLayout,
     /// `(row, byte_col)` in the buffer.
     pub cursor: (u32, u32),
+    /// The first buffer row the window was last asked to show.
+    ///
+    /// What was *asked for*, not what the frontend reported drawing — the two differ for exactly
+    /// as long as it takes a frame to come back, and the frontend's report is the one that arrives
+    /// too late to be scrolled from. Kept here rather than only in whoever did the scrolling
+    /// because a client attaching to a workspace that is already running has to be told where the
+    /// transcript sits, and "wherever the top is" would drop it back to the beginning.
+    pub top_line: u32,
     /// Where a selection started, if one is running. The other end is always the cursor.
     ///
     /// Held per window rather than per buffer: the same buffer shown twice is two places you can
@@ -37,7 +45,16 @@ pub struct Window {
 
 impl Window {
     pub fn new(id: WindowId, buf: BufferId, layout: WindowLayout) -> Self {
-        Self { id, buf, layout, cursor: (0, 0), anchor: None, goal_col: None, viewport: None }
+        Self {
+            id,
+            buf,
+            layout,
+            cursor: (0, 0),
+            top_line: 0,
+            anchor: None,
+            goal_col: None,
+            viewport: None,
+        }
     }
 
     pub fn is_float(&self) -> bool {

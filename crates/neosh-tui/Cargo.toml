@@ -22,3 +22,4 @@ unicode-segmentation = { workspace = true }
 
 [dev-dependencies]
 insta = { workspace = true }
+neosh-core = { workspace = true }

@@ -11,6 +11,8 @@ use neosh_script::ScriptRuntime;
 
 mod markdown;
 mod bridge;
+mod client;
+mod daemon;
 mod cards;
 mod diff;
 mod logo;
@@ -79,10 +81,33 @@ struct Cli {
     /// Start with no config, no plugins and no trust decisions. The bug-report flag.
     #[arg(long)]
     clean: bool,
+
+    /// Be the workspace: hold the sessions, the plugins and the turns, and serve terminals.
+    ///
+    /// Started for you the first time you run `neosh`, so this is here for watching one boot when
+    /// it will not — run it in a terminal and the errors that were going to `/dev/null` arrive on
+    /// screen instead.
+    #[arg(long)]
+    serve: bool,
+
+    /// Do everything in this process, as neosh did before there was a workspace to attach to.
+    ///
+    /// Nothing survives the terminal closing. It is what `--ui-protocol=stdio` needs — a pipe has
+    /// no one to hand a running workspace to — and what a test that wants one process rather than
+    /// two needs.
+    #[arg(long)]
+    no_daemon: bool,
 }
 
 #[derive(Subcommand, Debug)]
 enum Cmd {
+    /// Say what the workspace is holding: how long it has been up, and what is running in it.
+    Status,
+    /// Stop the workspace, and everything running in it.
+    ///
+    /// Closing a terminal does not do this, which is the point of the workspace being a process of
+    /// its own. This is how you say you meant it.
+    Stop,
     /// Write a starter config: `init.ts`, `config.toml`, and types for your editor.
     Init(InitArgs),
     /// Allow this project's `.neosh/` to run code.
@@ -178,7 +203,22 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
         Some(Cmd::Init(args)) => return run_init(&paths, &cwd, args),
         Some(Cmd::Trust(args)) => return run_trust(&paths, &cwd, args),
         Some(Cmd::Paths) => return run_paths(&paths, &cwd),
+        Some(Cmd::Status) => return run_status(&paths).await,
+        Some(Cmd::Stop) => return run_stop(&paths).await,
         None => {}
+    }
+
+    // The ordinary case: be a terminal looking at a workspace, starting one if there is not one
+    // already. Everything below this — config, plugins, the agent — belongs to the workspace, and
+    // a client that built any of it would be paying for a second copy it never uses.
+    //
+    // `--clean` stays in-process on purpose. It means "read and write nothing", and attaching to a
+    // workspace that has been running with somebody's real config is the opposite of that.
+    if !cli.serve && !cli.no_daemon && !cli.clean && cli.ui_protocol == UiProtocol::Terminal
+        && cli.mock_script.is_none()
+        && !cli.list_models
+    {
+        return run_client(&cli, &paths, &cwd).await;
     }
 
     // Keep the config directory's API types in step with this binary, so `tsc` in someone's
@@ -233,8 +273,17 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
         return list_models(&agent).await;
     }
 
-    let (frontend, input_rx): (Box<dyn Frontend>, _) = match cli.ui_protocol {
-        UiProtocol::Terminal => {
+    // Serving a terminal rather than being one. Bound before anything expensive so a second
+    // workspace fails immediately with a sentence rather than after ten seconds of loading
+    // plugins it is about to throw away.
+    let mut serving = match cli.serve {
+        true => Some(daemon::Daemon::bind(&paths.socket()).await?),
+        false => None,
+    };
+
+    let (frontend, input_rx): (Box<dyn Frontend>, _) = match (&mut serving, cli.ui_protocol) {
+        (Some(d), _) => d.wire(),
+        (None, UiProtocol::Terminal) => {
             let (f, rx) = TerminalUi::enter().map_err(|e| {
                 anyhow::anyhow!(
                     "could not take over the terminal ({e}). If this is not an interactive \
@@ -243,7 +292,7 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             })?;
             (Box::new(f), rx)
         }
-        UiProtocol::Stdio => {
+        (None, UiProtocol::Stdio) => {
             let (f, rx) = StdioFrontend::new();
             (Box::new(f), rx)
         }
@@ -255,6 +304,9 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
     let input_rx = with_signals(input_rx);
 
     let mut host = Host::new(agent.clone(), bridge.clone(), frontend);
+    if let Some(d) = &serving {
+        host.serve(d.live());
+    }
     host.adopt_agent_drivers(agent_drivers);
     host.discover_repo(&cwd).await;
     // `--clean` reads and writes nothing, which has to include conversations.
@@ -275,11 +327,25 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
         cli_plugin_dirs: cli.plugin_dirs.clone(),
     });
 
-    match host.run(script_rx, agent_rx, input_rx).await {
+    // Accepting terminals runs alongside the host, not instead of it: clients come and go while
+    // the run loop below never learns that anybody did.
+    let socket = serving.as_ref().map(|_| paths.socket());
+    if let Some(d) = serving {
+        tokio::spawn(d.serve());
+    }
+
+    let result = match host.run(script_rx, agent_rx, input_rx).await {
         // The consumer closing the pipe ends the session; it is not something to report.
         Err(e) if e.downcast_ref::<Disconnected>().is_some() => Ok(()),
         other => other,
+    };
+    // A workspace that is gone should not leave something behind for the next `neosh` to try to
+    // connect to. It would be removed by whoever binds next anyway; doing it here means `neosh
+    // status` says "no workspace" straight away rather than after the next start.
+    if let Some(path) = socket {
+        daemon::Daemon::cleanup(&path);
     }
+    result
 }
 
 /// Forward frontend input, and turn SIGINT/SIGTERM into the same `quit` command the key runs.
@@ -336,6 +402,87 @@ fn with_signals(
     });
 
     rx
+}
+
+/// Be a terminal looking at a workspace, starting one if there is not one already.
+///
+/// The whole of the client is here and in [`crate::client`]: connect, draw, send keys. It builds no
+/// config, loads no plugins and holds no conversation — which is why a second terminal costs a
+/// socket rather than a second copy of everything.
+async fn run_client(cli: &Cli, paths: &Paths, cwd: &std::path::Path) -> anyhow::Result<()> {
+    let socket = paths.socket();
+    let args = client::workspace_args(
+        &cli.config_dir,
+        cwd,
+        &cli.model,
+        &cli.plugin_dirs,
+        &cli.mock_script,
+    );
+    let stream = client::connect_or_start(&socket, &args).await?;
+    match client::attach(stream).await? {
+        // Nothing to say. The terminal is back and the work carries on without it, which is what
+        // was asked for — announcing it every time would be a program congratulating itself.
+        client::Ended::Detached(neosh_proto::DetachReason::Asked) => {}
+        client::Ended::Detached(neosh_proto::DetachReason::TakenOver) => {
+            say!("neosh: this workspace is now open in another terminal.");
+        }
+        client::Ended::Detached(neosh_proto::DetachReason::Stopping)
+        | client::Ended::Stopped => {}
+    }
+    Ok(())
+}
+
+/// What the workspace is holding, without disturbing it.
+async fn run_status(paths: &Paths) -> anyhow::Result<()> {
+    let socket = paths.socket();
+    let Some(s) = client::status(&socket).await? else {
+        say!("no workspace running ({})", socket.display());
+        return Ok(());
+    };
+    let word = |n: usize, one: &str| if n == 1 { one.to_string() } else { format!("{one}s") };
+    say!(
+        "running  ·  up {}  ·  {} {}  ·  {}",
+        friendly(s.uptime_secs),
+        s.conversations,
+        word(s.conversations, "conversation"),
+        if s.attached { "a terminal is attached".to_string() } else { format!("nobody watching for {}", friendly(s.idle_secs)) }
+    );
+    if s.running.is_empty() {
+        say!("nothing running");
+        return Ok(());
+    }
+    say!("");
+    for t in &s.running {
+        say!("  {:>8}  {}  ({})", friendly(t.elapsed_secs), t.label, t.cwd);
+    }
+    Ok(())
+}
+
+/// A duration a person would say out loud.
+fn friendly(secs: u64) -> String {
+    match secs {
+        0..=59 => format!("{secs}s"),
+        60..=3599 => format!("{}m", secs / 60),
+        _ => format!("{}h {:02}m", secs / 3600, (secs % 3600) / 60),
+    }
+}
+
+async fn run_stop(paths: &Paths) -> anyhow::Result<()> {
+    let socket = paths.socket();
+    // Said before stopping, because whatever is running is about to be. Nobody should discover
+    // afterwards that they killed a turn they would have waited for.
+    if let Some(s) = client::status(&socket).await?
+        && !s.running.is_empty()
+    {
+        for t in &s.running {
+            say!("stopping after {}: {}", friendly(t.elapsed_secs), t.label);
+        }
+    }
+    match client::stop(&socket).await? {
+        true => say!("stopped"),
+        false => say!("no workspace running ({})", socket.display()),
+    }
+    Ok(())
 }
 
 fn run_init(paths: &Paths, cwd: &std::path::Path, args: &InitArgs) -> anyhow::Result<()> {
@@ -460,8 +607,14 @@ fn install_mock_provider(agent: &Agent, path: &std::path::Path) -> anyhow::Resul
         .collect::<Result<_, _>>()
         .map_err(|e| anyhow::anyhow!("{}: {e}", path.display()))?;
 
+    // Paced only when asked. A test that needs a turn to still be running while the terminal is
+    // closed under it has no other way to arrange one without a real model and a real wait.
+    let mock = match std::env::var("NEOSH_MOCK_DELAY_MS").ok().and_then(|v| v.parse::<u64>().ok()) {
+        Some(ms) if ms > 0 => MockProvider::new(turns).paced(std::time::Duration::from_millis(ms)),
+        _ => MockProvider::new(turns),
+    };
     let mut reg = agent.providers_mut();
-    reg.register_driver(Arc::new(MockProvider::new(turns)));
+    reg.register_driver(Arc::new(mock));
     reg.add_instance(neosh_proto::InstanceConfig {
         id: "mock".into(),
         driver: "mock".into(),

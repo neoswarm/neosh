@@ -243,17 +243,70 @@ impl Agent {
         self.with(session, |s| std::mem::take(&mut s.steering)).unwrap_or_default()
     }
 
-    /// The policy, rooted at the directory a turn is running in.
+    /// Take the most recently queued message back out, if there is one.
     ///
-    /// The shared layer's root follows the conversation on screen, which is right for a plugin
-    /// asking a question and wrong for a turn: the turn may not be the one on screen, and by the
-    /// time it finishes it may not be the one on screen either.
-    fn permissions_in(&self, cwd: &Path) -> Arc<PermissionLayer> {
+    /// The last rather than the first, because it is the one you just typed and therefore the one
+    /// you meant to change. Queued messages are taken into the turn oldest-first, so this can race
+    /// a gap and find the queue already empty — which is why it answers with what it removed
+    /// instead of a count somebody would have to check twice.
+    pub fn unqueue_last(&self, session: &SessionId) -> Option<String> {
+        self.with(session, |s| s.steering.pop()).flatten()
+    }
+
+    /// The policy a turn runs under: the conversation's mode, rooted at the conversation's
+    /// directory.
+    ///
+    /// Both halves are per conversation for the same reason. The shared layer follows whichever
+    /// conversation is *on screen*, which is right for a plugin asking a question and wrong for a
+    /// turn — the turn may not be the one on screen, and by the time it finishes it may not be the
+    /// one on screen either. A mode taken from the screen would mean looking at a read-only
+    /// conversation while another one is mid-edit silently changed what that other one was allowed
+    /// to do.
+    ///
+    /// A conversation with no mode of its own takes the shared one, which is where `config.toml`
+    /// lands. That is what keeps the configured default a default rather than a one-time value
+    /// stamped into every conversation ever created.
+    fn permissions_for(&self, session: &SessionId, cwd: &Path) -> Arc<PermissionLayer> {
         let base = self.permissions();
-        if cwd.as_os_str().is_empty() || base.workspace() == cwd {
-            return base;
+        let mode = self.with(session, |s| s.permission_mode).flatten();
+        let rooted = !cwd.as_os_str().is_empty() && base.workspace() != cwd;
+        match (mode.filter(|m| *m != base.mode()), rooted) {
+            (None, false) => base,
+            (None, true) => Arc::new(base.rooted_at(cwd)),
+            (Some(m), false) => Arc::new((*base).clone().with_mode(m)),
+            (Some(m), true) => Arc::new(base.rooted_at(cwd).with_mode(m)),
         }
-        Arc::new(base.rooted_at(cwd))
+    }
+
+    /// What this conversation lets the agent do without asking, resolved.
+    ///
+    /// The conversation's own answer when it has one, the configured one otherwise — never `None`,
+    /// because every caller of this wants a mode and not a question about whether one was set.
+    ///
+    /// The layer's own mode is the *configured* one and stays that way, whatever any conversation
+    /// is set to. That is what makes the fallback a fallback: put one conversation in `deny` while
+    /// the shared layer follows it, and the next conversation you open — which has never been given
+    /// a mode and so falls back — inherits `deny` from a setting that was never about it.
+    pub fn permission_mode(&self, session: &SessionId) -> neosh_proto::PermissionMode {
+        self.with(session, |s| s.permission_mode).flatten().unwrap_or_else(|| self.permissions().mode())
+    }
+
+    /// Give this conversation a mode of its own, taking effect on the turn already running.
+    pub fn set_permission_mode(&self, session: &SessionId, mode: neosh_proto::PermissionMode) {
+        self.with(session, |s| s.permission_mode = Some(mode));
+    }
+
+    /// The policy a question asked *outside* any turn is answered by: the conversation on screen.
+    ///
+    /// A plugin calling `neosh.permit` is not in a turn and has no conversation of its own, so the
+    /// one being looked at is the only conversation the question can be about.
+    fn permissions_here(&self) -> Arc<PermissionLayer> {
+        let here = self.sessions().active_id().clone();
+        let base = self.permissions();
+        match self.with(&here, |s| s.permission_mode).flatten().filter(|m| *m != base.mode()) {
+            None => base,
+            Some(m) => Arc::new((*base).clone().with_mode(m)),
+        }
     }
 
     pub fn selection(&self) -> Option<ModelSelection> {
@@ -365,7 +418,7 @@ impl Agent {
         capability: neosh_proto::Capability,
         turn: Option<TurnId>,
     ) -> neosh_proto::PermissionDecision {
-        match self.permissions().check(&capability) {
+        match self.permissions_here().check(&capability) {
             neosh_proto::PermissionDecision::Prompt => {
                 let hooks: Vec<_> =
                     self.hooks().blocking(HookName::PermissionPre).cloned().collect();
@@ -750,7 +803,7 @@ impl Agent {
                         // Rooted at the conversation this turn belongs to, not at whichever one is
                         // on screen: `src/main.rs` has to mean the same file for the whole turn,
                         // however much switching happens while it runs.
-                        permissions: self.permissions_in(cwd),
+                        permissions: self.permissions_for(session, cwd),
                         // Only offer to ask if something is actually listening; otherwise `permit`
                         // would wait on a hook nobody registered.
                         approve: (!approver.hooks.is_empty()).then_some(&approver as &dyn crate::tools::Approver),

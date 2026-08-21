@@ -4,6 +4,7 @@ import type { WindowId } from "./WindowId";
 
 export type InputEvent =
   | { "type": "ready"; width: number; height: number }
+  | { "type": "attached"; width: number; height: number }
   | { "type": "key"; key: KeyPress }
   | { "type": "paste"; text: string }
   | { "type": "resize"; width: number; height: number }

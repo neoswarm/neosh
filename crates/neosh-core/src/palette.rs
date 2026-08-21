@@ -17,6 +17,13 @@
 //!   "it moved there" flash, so it always means "look here now".
 //! - **Three hues do the work.** Cyan for in motion, amber for act now, red for broken. Everything
 //!   else is a shade of the text colour. A fourth hue would mean memorising a legend.
+//! - **Except in code, where seven do.** `Syntax.*` is the one group family that breaks the rule
+//!   above, and it breaks it because it is not part of the same vocabulary. Every other colour here
+//!   is a *state* — something is running, something needs you, something broke — and a state you
+//!   have to look up is a state you will misread. The colour of a string literal is not a state; it
+//!   is a convention every editor has already taught its reader, and one that no glyph or attribute
+//!   can carry instead. So code gets a palette of its own, it is confined to the inside of a diff
+//!   or a fence, and it never leaks out into the chrome.
 //!
 //! Values are declared as truecolor and down-converted at the terminal boundary
 //! (`neosh_tui::theme`), so nothing here reasons about what a terminal supports.
@@ -81,6 +88,35 @@ struct Roles {
     logo: [Color; 6],
     /// The shadow the logo's letters cast.
     logo_edge: Color,
+    /// The band behind a line a diff added, and behind the one it removed.
+    ///
+    /// Dark and desaturated on purpose. The band answers "did this line change", and the code on
+    /// top of it still has to answer "what does it say" — so it is a wash rather than a colour,
+    /// and every syntax hue keeps its contrast against it.
+    diff_add_bg: Color,
+    diff_del_bg: Color,
+    /// The same, one step further, for the gutter those bands run behind.
+    diff_add_gutter: Color,
+    diff_del_gutter: Color,
+    /// The code palette. Seven hues, which is more than the rest of this file allows itself; see
+    /// the note on the rules above for why code gets to be the exception.
+    code: Code,
+}
+
+/// What a token in a piece of code is coloured by.
+///
+/// Deliberately small: seven distinctions is what a reader can hold without a legend, and every
+/// grammar in the world maps onto them. A finer set — `storage.modifier` apart from `keyword`,
+/// `variable.parameter` apart from `variable` — is a distinction a highlighter can make and a
+/// person reading a twelve-line diff in a chat window cannot use.
+struct Code {
+    comment: Color,
+    keyword: Color,
+    string: Color,
+    number: Color,
+    function: Color,
+    ty: Color,
+    constant: Color,
 }
 
 const DARK: Roles = Roles {
@@ -105,6 +141,19 @@ const DARK: Roles = Roles {
         rgb(0x5f, 0x68, 0x77),
     ],
     logo_edge: rgb(0x3a, 0x40, 0x4c),
+    diff_add_bg: rgb(0x14, 0x2b, 0x1e),
+    diff_del_bg: rgb(0x38, 0x1b, 0x1c),
+    diff_add_gutter: rgb(0x1d, 0x3d, 0x2a),
+    diff_del_gutter: rgb(0x4c, 0x24, 0x26),
+    code: Code {
+        comment: rgb(0x6b, 0x74, 0x87),
+        keyword: rgb(0xc6, 0x8f, 0xe6),
+        string: rgb(0x98, 0xc3, 0x79),
+        number: rgb(0xd1, 0x9a, 0x66),
+        function: rgb(0x61, 0xaf, 0xef),
+        ty: rgb(0xe5, 0xc0, 0x7b),
+        constant: rgb(0x56, 0xb6, 0xc2),
+    },
 };
 
 const LIGHT: Roles = Roles {
@@ -131,6 +180,19 @@ const LIGHT: Roles = Roles {
         rgb(0x9a, 0xa5, 0xb5),
     ],
     logo_edge: rgb(0xc3, 0xc9, 0xd2),
+    diff_add_bg: rgb(0xda, 0xfb, 0xe1),
+    diff_del_bg: rgb(0xff, 0xeb, 0xe9),
+    diff_add_gutter: rgb(0xac, 0xee, 0xbb),
+    diff_del_gutter: rgb(0xff, 0xce, 0xcb),
+    code: Code {
+        comment: rgb(0x6a, 0x73, 0x7d),
+        keyword: rgb(0xa6, 0x26, 0xa4),
+        string: rgb(0x0a, 0x30, 0x69),
+        number: rgb(0x98, 0x68, 0x01),
+        function: rgb(0x82, 0x50, 0xdf),
+        ty: rgb(0xc1, 0x84, 0x01),
+        constant: rgb(0x05, 0x50, 0xae),
+    },
 };
 
 fn fg(c: Color) -> HighlightSpec {
@@ -300,10 +362,49 @@ pub fn groups(variant: Variant) -> Vec<(&'static str, HighlightDef)> {
         ("Git.Ahead", spec(fg(r.success))),
         ("Git.Behind", spec(fg(r.attention))),
         // ---- diffs --------------------------------------------------------
+        // Two families, and the split matters. `Diff.Add` and `Diff.Delete` are *foreground*: they
+        // colour the `+5 -1` on a card header and in a turn's summary, where the number is the
+        // whole message. `Diff.AddLine` and `Diff.DelLine` are the *band* behind a changed line of
+        // code, and they are background only — because the foreground of that line is already
+        // spoken for by what the code says. A green `+` and a green band say the same thing twice;
+        // a green band and a syntax-coloured line say two different things at once.
         ("Diff.Add", spec(fg(r.success))),
         ("Diff.Delete", spec(fg(r.danger))),
+        ("Diff.AddLine", spec(bg(r.diff_add_bg))),
+        ("Diff.DelLine", spec(bg(r.diff_del_bg))),
+        // The `+` and `-` themselves, which stay saturated so the two kinds of line are told apart
+        // without relying on colour at all — and so a 16-colour terminal that flattens both bands
+        // to nothing still has the sign.
+        ("Diff.SignAdd", spec(bold(fg(r.success)))),
+        ("Diff.SignDel", spec(bold(fg(r.danger)))),
+        // The line-number column. One step further into the hue than the band it runs beside, so
+        // the numbers separate from the code without becoming a third thing to read.
+        ("Diff.Gutter", spec(dim(fg(r.faint)))),
+        ("Diff.GutterAdd", spec(HighlightSpec {
+            fg: Some(r.muted),
+            bg: Some(r.diff_add_gutter),
+            ..HighlightSpec::default()
+        })),
+        ("Diff.GutterDel", spec(HighlightSpec {
+            fg: Some(r.muted),
+            bg: Some(r.diff_del_gutter),
+            ..HighlightSpec::default()
+        })),
         ("Diff.Header", spec(bold(fg(r.accent)))),
         ("Diff.Hunk", spec(dim(fg(r.active)))),
+        // ---- code ---------------------------------------------------------
+        // The one place seven hues are allowed; see the note on the rules at the top of this file.
+        // `Syntax.Text` exists so a highlighter always has something to name, and so a theme can
+        // paint plain code differently from plain prose without either knowing about the other.
+        ("Syntax.Text", spec(fg(r.fg))),
+        ("Syntax.Comment", spec(italic(fg(r.code.comment)))),
+        ("Syntax.Keyword", spec(fg(r.code.keyword))),
+        ("Syntax.String", spec(fg(r.code.string))),
+        ("Syntax.Number", spec(fg(r.code.number))),
+        ("Syntax.Function", spec(fg(r.code.function))),
+        ("Syntax.Type", spec(fg(r.code.ty))),
+        ("Syntax.Constant", spec(fg(r.code.constant))),
+        ("Syntax.Punct", spec(fg(r.muted))),
         // ---- meters -------------------------------------------------------
         ("Meter.Fill", spec(fg(r.active))),
         ("Meter.Empty", spec(dim(fg(r.faint)))),
@@ -443,6 +544,51 @@ mod tests {
             "Agent.TaskIdle",
             "Diff.Add",
             "Diff.Delete",
+            "Diff.AddLine",
+            "Diff.DelLine",
+            "Diff.SignAdd",
+            "Diff.SignDel",
+            "Diff.Gutter",
+            "Diff.GutterAdd",
+            "Diff.GutterDel",
+        ] {
+            assert!(names.contains(required), "{required} is missing from the palette");
+        }
+    }
+
+    #[test]
+    fn the_band_behind_a_changed_line_is_a_background_and_nothing_else() {
+        // The whole point of the split: a `Diff.AddLine` that also set a foreground would override
+        // the syntax colour of every token on the line it sits under, and the diff would go back
+        // to being two colours of text. Checked here rather than trusted, because the failure is
+        // silent — the code is still readable, it is just no longer highlighted.
+        for variant in [Variant::Dark, Variant::Light] {
+            for name in ["Diff.AddLine", "Diff.DelLine"] {
+                let def = groups(variant).into_iter().find(|(n, _)| *n == name).map(|(_, d)| d);
+                let Some(HighlightDef::Spec { spec }) = def else {
+                    panic!("{variant:?}: {name} is not a spec");
+                };
+                assert!(spec.bg.is_some(), "{variant:?}: {name} has no band");
+                assert!(spec.fg.is_none(), "{variant:?}: {name} sets a foreground");
+            }
+        }
+    }
+
+    #[test]
+    fn code_has_a_colour_for_every_token_a_highlighter_can_produce() {
+        // `neosh-syntax` maps every scope it sees onto one of these. A name here that the palette
+        // does not define is a token class that silently renders as plain text.
+        let names: BTreeSet<_> = contract().into_iter().collect();
+        for required in [
+            "Syntax.Text",
+            "Syntax.Comment",
+            "Syntax.Keyword",
+            "Syntax.String",
+            "Syntax.Number",
+            "Syntax.Function",
+            "Syntax.Type",
+            "Syntax.Constant",
+            "Syntax.Punct",
         ] {
             assert!(names.contains(required), "{required} is missing from the palette");
         }

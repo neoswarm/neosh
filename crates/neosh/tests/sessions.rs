@@ -801,7 +801,8 @@ fn coming_back_to_a_running_agent_turn_shows_what_it_has_done() {
 
     s.type_text("what is in src");
     s.enter();
-    s.wait_for("main.rs");
+    // The call has come back: its card is folded to a header carrying the size of what it returned.
+    s.wait_for("1 line");
 
     s.command("t.other");
     s.wait_for("switched to");
@@ -819,13 +820,12 @@ fn coming_back_to_a_running_agent_turn_shows_what_it_has_done() {
     );
     s.drain_for(Duration::from_millis(300));
     let now = s.chat_now();
+    // The card, *finished*. A look-at-something call folds to its header, and the size on the end
+    // of that header is read off the result — so a card saying `1 line` is a card whose answer came
+    // back with the replay, which is the whole point of this test.
     assert!(
-        now.iter().any(|l| l.contains("list_dir")),
-        "and the tool it called\n{now:?}"
-    );
-    assert!(
-        now.iter().any(|l| l.contains("main.rs")),
-        "and what that tool came back with\n{now:?}"
+        now.iter().any(|l| l.contains("list_dir") && l.contains("1 line")),
+        "and the tool it called, with what it came back with\n{now:?}"
     );
     assert!(
         now.iter().any(|l| l.contains("what is in src")),

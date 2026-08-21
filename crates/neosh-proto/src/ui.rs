@@ -25,7 +25,7 @@
 use serde::{Deserialize, Serialize};
 use ts_rs::TS;
 
-use crate::ids::{BufferId, ExtmarkId, NamespaceId, SurfaceId, WindowId};
+use crate::ids::{BufferId, ExtmarkId, NamespaceId, SessionId, SurfaceId, WindowId};
 
 // ---------------------------------------------------------------------------
 // Geometry
@@ -57,6 +57,22 @@ pub enum Anchor {
     Window { win: WindowId },
     /// Positioned within the whole screen.
     Screen,
+    /// Positioned against the corner of a dock's strip, whatever is docked there.
+    ///
+    /// The anchor a completion menu needs, and the one it could not otherwise have: the thing it
+    /// is completing is the message field, the message field is whatever is docked at the bottom,
+    /// and a plugin has no way to name that window. `Anchor::Screen` puts a `/` menu in the middle
+    /// of the transcript it is nothing to do with; `Anchor::Cursor` follows a caret that is inside
+    /// the field and therefore under the menu.
+    ///
+    /// The float lands *flush against* that strip on the main region's side of it, so a menu over
+    /// the composer is `Anchor::Dock { dock: Dock::Bottom }` and nothing else — no height to
+    /// subtract, no offset to keep in step with how many rows the list is showing. An offset from
+    /// there still means what it always means: a negative row lifts it further clear.
+    ///
+    /// `Dock::Main` is the main region's own top-left, for a float that wants to sit over the
+    /// transcript and nothing else.
+    Dock { dock: Dock },
 }
 
 /// A size request along one axis. Resolved by the frontend against the real viewport.
@@ -363,6 +379,19 @@ pub struct ExtmarkOpts {
     pub end_col: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hl_group: Option<String>,
+    /// A background for the whole rendered row, not just the bytes the mark covers.
+    ///
+    /// The distinction is the difference between a diff line that is green and a diff line whose
+    /// *text* is green: the band has to reach the right edge of the window to read as one line, and
+    /// how wide the window is is not known where the row is written. So the group is carried and
+    /// the frontend fills to its own edge — which is also what makes the band survive a resize.
+    ///
+    /// It sits *under* every ranged `hl_group` on the row rather than competing with them, so a
+    /// syntax colour on top keeps its foreground and inherits this background. Nothing else in the
+    /// mark vocabulary composes; this one has to, because "which line changed" and "what does this
+    /// word mean" are two facts about the same character.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub line_hl_group: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub virt_text: Vec<VirtChunk>,
     #[serde(default)]
@@ -656,8 +685,17 @@ pub struct KeyPress {
 #[serde(tag = "type", rename_all = "snake_case")]
 #[ts(export)]
 pub enum InputEvent {
-    /// Sent once on connect, before anything else.
+    /// Sent once on connect, before anything else, by a frontend that has been listening since the
+    /// core started.
     Ready { width: u16, height: u16 },
+    /// Sent once on connect by a frontend that has *not* — one attaching to a workspace that was
+    /// already running, and whose mirror is therefore empty.
+    ///
+    /// Distinct from [`InputEvent::Ready`] because the answer to it is different: everything has
+    /// to be said again from the beginning ([`crate::UiEvent`] is a delta stream, and a delta into
+    /// nothing is nothing). Folding the two together and always re-announcing would mean the
+    /// in-process case sends its whole state twice at startup, into a mirror that already has it.
+    Attached { width: u16, height: u16 },
     Key { key: KeyPress },
     /// Bracketed paste arrives whole rather than as synthetic keystrokes.
     Paste { text: String },
@@ -693,4 +731,105 @@ pub enum InputEvent {
     Repaint,
     /// The frontend is going away (terminal closed, socket dropped).
     Disconnected,
+}
+
+// ---------------------------------------------------------------------------
+// Attaching to a workspace that is already running
+// ---------------------------------------------------------------------------
+
+/// What a client says to the workspace it has connected to.
+///
+/// # Why this is a second envelope rather than raw [`InputEvent`]s
+///
+/// [`InputEvent`] is what a *view* does — a key, a resize, a command. It has nothing to say about
+/// the connection carrying it, and it should not: the same events come from a terminal that owns
+/// the process, where there is no connection to talk about. Attaching, detaching and being told
+/// somebody else took over are facts about the wire, so they live on the wire's own type and the
+/// view protocol stays exactly what it was.
+#[derive(TS, Serialize, Deserialize, Clone, PartialEq, Debug)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+#[ts(export)]
+pub enum ClientMessage {
+    /// The first message on a connection, and the only one allowed to be first.
+    ///
+    /// The size comes with it because a workspace that has been running headless has no idea how
+    /// big the terminal now looking at it is, and drawing one frame at the wrong size before the
+    /// first resize arrives is a visible flash of the wrong layout.
+    Attach {
+        /// Refused rather than negotiated. A client built against a different protocol is almost
+        /// always a neosh that was upgraded while its workspace kept running, and rendering a
+        /// partial UI is a worse answer than saying so.
+        protocol_version: u32,
+        width: u16,
+        height: u16,
+    },
+    Input {
+        #[serde(flatten)]
+        event: InputEvent,
+    },
+    /// Leave. The workspace, and anything running in it, carries on without a viewer.
+    Detach,
+    /// Leave, and take the workspace with you.
+    Stop,
+    /// What is running, for a client that only wants to ask.
+    Status,
+}
+
+/// What the workspace says back.
+#[derive(TS, Serialize, Deserialize, Clone, PartialEq, Debug)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+#[ts(export)]
+pub enum ServerMessage {
+    /// The attach was accepted. Everything needed to draw follows immediately.
+    Attached { protocol_version: u32 },
+    /// It was not, and this is why. The connection closes after this.
+    Refused { reason: String, protocol_version: u32 },
+    /// One coalesced batch, ending in [`UiEvent::Flush`] — the same batch a frontend in the same
+    /// process would have been handed.
+    Events { batch: Vec<UiEvent> },
+    /// This client is no longer the one attached.
+    Detached { reason: DetachReason },
+    Status { status: WorkspaceStatus },
+}
+
+#[derive(TS, Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+#[ts(export)]
+pub enum DetachReason {
+    /// The client asked to leave.
+    Asked,
+    /// Another client attached. One view at a time, and the newest one wins — a client that has
+    /// gone away without saying so is indistinguishable from one that is merely quiet, so refusing
+    /// the new terminal would mean a crashed one locks you out of your own workspace until it is
+    /// noticed and killed.
+    TakenOver,
+    /// The workspace is shutting down.
+    Stopping,
+}
+
+/// What a workspace is holding, for `neosh status`.
+#[derive(TS, Serialize, Deserialize, Clone, PartialEq, Debug, Default)]
+#[ts(export)]
+pub struct WorkspaceStatus {
+    /// Seconds since the workspace started.
+    #[ts(type = "number")]
+    pub uptime_secs: u64,
+    /// Seconds since a client was last attached, or 0 while one is.
+    #[ts(type = "number")]
+    pub idle_secs: u64,
+    pub attached: bool,
+    pub conversations: usize,
+    /// One line per conversation with a turn in flight: what it is called and what it is doing.
+    pub running: Vec<RunningTurn>,
+}
+
+#[derive(TS, Serialize, Deserialize, Clone, PartialEq, Debug)]
+#[ts(export)]
+pub struct RunningTurn {
+    pub session: SessionId,
+    pub label: String,
+    /// The directory the conversation belongs to.
+    pub cwd: String,
+    #[ts(type = "number")]
+    pub elapsed_secs: u64,
 }

@@ -259,8 +259,27 @@ pub struct Host {
     /// The answer currently being written, and where it sits in the transcript.
     answer: Option<Answer>,
     startup: Startup,
-    /// Set by the `quit` command; the run loop notices and shuts down cleanly.
+    /// Set by the `stop` command — and by `quit`, when this host *is* the process; the run loop
+    /// notices and shuts down cleanly.
     quitting: bool,
+    /// What `quit` means for this host.
+    ///
+    /// Two different things, and they used to be the same thing because there was only ever one
+    /// place to be. In a workspace serving a terminal, `^Q` closes the *terminal*: the turns keep
+    /// running, the plugins stay loaded, and reattaching puts you back where you were. Stopping
+    /// the workspace is a thing you say on purpose, with `neosh stop`.
+    on_quit: OnQuit,
+    /// Set by `quit` while serving; the run loop sends the viewer away and carries on.
+    detaching: bool,
+    /// Where to report what this workspace is holding, when it is a workspace rather than a
+    /// process somebody is watching.
+    live: Option<std::sync::Arc<crate::daemon::Live>>,
+    /// When that report was last made, so a streaming turn does not remake it per frame.
+    live_at: Option<std::time::Instant>,
+    /// How many turns were running when it was made. A change here skips the rate limit: whether
+    /// something is running is the one thing a status query is actually about, and answering it a
+    /// second late is answering the wrong question.
+    live_turns: usize,
     /// When `<C-c>` was last pressed with nothing left to cancel.
     ///
     /// Quitting on the first press would be wrong: `<C-c>` is muscle memory, and in a workspace
@@ -302,6 +321,18 @@ pub struct Host {
     /// a process boundary, into whatever the frontend logs. Here the value never leaves this
     /// struct: what gets drawn is a row of bullets.
     secret: Option<SecretPrompt>,
+}
+
+/// What `quit` does.
+///
+/// Not a setting: it follows from whether this host is the process you are looking at or a
+/// workspace something else is looking at, and nothing else gets a vote.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum OnQuit {
+    /// This host is the program. `quit` ends it.
+    Stop,
+    /// This host is a workspace with a viewer. `quit` sends the viewer away.
+    Detach,
 }
 
 /// A turn in flight, in whichever conversation it belongs to.
@@ -548,6 +579,11 @@ impl Host {
             answer: None,
             startup: Startup::default(),
             quitting: false,
+            on_quit: OnQuit::Stop,
+            detaching: false,
+            live: None,
+            live_at: None,
+            live_turns: 0,
             quit_armed: None,
             plugin_drivers: Default::default(),
             plugin_permissions: Default::default(),
@@ -914,15 +950,14 @@ impl Host {
             }
 
             ApiCall::PermissionGetMode => {
-                Ok(ApiOk::PermissionMode { mode: self.agent.permissions().mode() })
+                Ok(ApiOk::PermissionMode { mode: self.agent.permission_mode(&self.active_session()) })
             }
             ApiCall::PermissionSetMode { mode } => {
-                // For this session only. A mode you switched on to get through one task should not
-                // still be on next week, and writing it to a file is how that happens.
-                let layer = (*self.agent.permissions()).clone().with_mode(mode);
-                self.agent.set_permissions(layer);
-                self.sync_agent_drivers();
-                self.refresh_status();
+                // The conversation's, and saved with it. A mode is a property of what you are
+                // working on — a scratch question in someone else's checkout and the branch you
+                // have been on all week are not the same risk — and one that reset every time you
+                // reopened the workspace would be a setting you had to re-make every morning.
+                self.set_permission_mode(mode);
                 Ok(ApiOk::PermissionMode { mode })
             }
             ApiCall::HintSet { key, hint } => {
@@ -1408,6 +1443,7 @@ impl Host {
                 opts: neosh_proto::ExtmarkOpts {
                     end_col: Some(to as u32),
                     hl_group: Some(hl),
+                    line_hl_group: None,
                     virt_text: vec![],
                     virt_text_pos: neosh_proto::VirtTextPos::Eol,
                     on_delete: neosh_proto::OnDelete::Clamp,
@@ -1437,7 +1473,13 @@ impl Host {
         // place to say so. Compared rather than fired blind: this also runs on a resize and on a
         // redraw, and a completion menu that reopened every time the window changed width would be
         // unusable.
-        if self.draft != text {
+        //
+        // And not while the field is lent to something else. A search and a key prompt both type
+        // into this buffer, and what is in it then is *not* the draft — the `/` that starts a
+        // search is a search, and a completion menu that opened on top of it would take the
+        // keyboard away from the thing the user had just started.
+        let borrowed = self.secret.is_some() || self.search.is_some();
+        if self.draft != text && !borrowed {
             self.draft.clone_from(&text);
             self.bridge.broadcast(PluginEvent::ComposerChanged { text: text.clone() });
         }
@@ -1458,6 +1500,45 @@ impl Host {
         self.composer_mark(0, VirtTextPos::Above, vec![chunk("", "Composer.Rule")]);
         let rule = if ascii { "-" } else { "\u{2500}" };
         self.composer_mark(0, VirtTextPos::Above, vec![chunk(rule.repeat(width), "Composer.Rule")]);
+
+        // What you typed while it was working, waiting for a gap to be said in — between the rule
+        // and the field, which is where it belongs and not where it was.
+        //
+        // Under the field it sat below the shortcut row, in the strip the eye has learned to read
+        // as chrome, one row above the status line: a sentence of yours, filed with the furniture.
+        // Above the field it is the last thing between the transcript and what you are typing,
+        // which is exactly what it is — the queue is *unsent conversation*, and it reads in order
+        // with everything else that has been said.
+        //
+        // Drawn after the rule so it lands under it: marks at the same position stack in the order
+        // they were set.
+        let queued = self.agent.steering_texts(&self.active_session());
+        let take = queued.len().min(3);
+        for (i, text) in queued.iter().take(take).enumerate() {
+            let more = queued.len() - take;
+            let mut v = vec![
+                chunk("  ", "Composer.Hint"),
+                // Only the first row is labelled. Three rows each saying "queued" is a column of
+                // the same word, and the word is not the part you are checking.
+                chunk(if i == 0 { "queued " } else { "       " }, "Status.Pending"),
+            ];
+            let one = text.lines().next().unwrap_or("").trim();
+            let tail = if i + 1 == take && more > 0 { format!("  (+{more} more)") } else { String::new() };
+            let key = if ascii { "S-Up" } else { "\u{21e7}\u{2191}" };
+            // The label, the gap either side of it, and the word after it, so a long message is
+            // clipped rather than pushing the key that undoes it off the edge.
+            let room = width.saturating_sub(9 + tail.chars().count() + display_width(key) + 7);
+            let body: String = one.chars().take(room).collect();
+            v.push(chunk(format!("{body}{tail}"), "Composer.Hint"));
+            // On the last row, so it is next to the message it would take back rather than
+            // attached to the oldest one.
+            if i + 1 == take {
+                v.push(chunk("  ", "Composer.Hint"));
+                v.push(chunk(key, "Composer.HintKey"));
+                v.push(chunk(" edit", "Composer.Hint"));
+            }
+            self.composer_mark(0, VirtTextPos::Above, v);
+        }
 
         // The prompt, spliced in at column zero. The caret is pushed past it by the frontend, which
         // is the only place that knows how wide it drew.
@@ -1488,21 +1569,6 @@ impl Host {
         let indent = caret.chars().count();
         let pad = " ".repeat(indent);
 
-        // What you typed while it was working, waiting for a gap to be said in. This outranks the
-        // shortcut row: an unsent sentence of yours is more urgent than a list of keys.
-        let queued = self.agent.steering_texts(&self.active_session());
-        for (i, text) in queued.iter().take(2).enumerate() {
-            let more = queued.len().saturating_sub(2);
-            let tail = if i == 1 && more > 0 { format!("  (+{more} more)") } else { String::new() };
-            let one = text.lines().next().unwrap_or("").trim();
-            let body: String = one.chars().take(width.saturating_sub(indent + 10)).collect();
-            self.composer_mark(row, VirtTextPos::Below, vec![
-                chunk(pad.clone(), "Composer.Hint"),
-                chunk("queued ", "Status.Pending"),
-                chunk(format!("{body}{tail}"), "Composer.Hint"),
-            ]);
-        }
-
         // Reading is the one place a shortcut row earns its line, whatever `ui.hints` says. The
         // keys mean something different here, they are not written down anywhere else, and the
         // composer is not being typed into — so the row is free and the question it answers is
@@ -1515,8 +1581,8 @@ impl Host {
         }
 
         // The shortcut row goes under the last line you have written — and steps aside once you are
-        // writing enough, or have enough queued, that it would cost you a line to look at.
-        if lines <= 2 && queued.is_empty()
+        // writing enough that it would cost you a line to look at.
+        if lines <= 2
             && let Some(chunks) = self.hint_row(width.saturating_sub(indent))
         {
             let mut v = vec![chunk(pad, "Composer.Hint")];
@@ -1601,6 +1667,7 @@ impl Host {
             opts: neosh_proto::ExtmarkOpts {
                 end_col: None,
                 hl_group: None,
+                line_hl_group: None,
                 virt_text,
                 virt_text_pos: pos,
                 on_delete: neosh_proto::OnDelete::Clamp,
@@ -1680,7 +1747,7 @@ impl Host {
         let mut marks: Vec<Mark> = Vec::new();
         let mut say = |rows: &mut Vec<String>, text: String, spans: Vec<(usize, usize, &'static str)>| {
             let at = rows.len() as u32;
-            marks.extend(spans.into_iter().map(|(a, b, g)| (at, a, b, g)));
+            marks.extend(spans.into_iter().map(|(a, b, g)| Mark::at(at, a, b, g)));
             rows.push(text);
         };
         // The word, where there is room for it and a terminal that can draw it. Narrower than
@@ -1752,9 +1819,7 @@ impl Host {
             lines: rows.clone(),
         });
         self.welcome_rows = rows.len();
-        for (row, from, to, hl) in marks {
-            self.chat_mark(row, from, to, hl);
-        }
+        self.draw_marks(&marks, 0);
     }
 
     /// Push the permission mode out to every driver that runs its own agent loop.
@@ -1763,10 +1828,79 @@ impl Host {
     /// be only the API call, so `permissions.mode` in `config.toml` reached the built-in tools and
     /// no further, and the drivers stayed on whatever they were told at startup.
     fn sync_agent_drivers(&self) {
-        let mode = self.agent.permissions().mode();
+        let mode = self.agent.permission_mode(&self.active_session());
         for d in &self.agent_drivers {
             d.set_permission_mode(mode);
         }
+    }
+
+    /// Set the mode for the conversation on screen, and tell everything that has to be told.
+    ///
+    /// The conversation holds it; nothing else does. What the agent drivers hold is a *copy* — they
+    /// police their own tool calls inside their own process, and there is no way to reach the
+    /// permission layer from in there — so they are told, every time, from here. The footer is told
+    /// for the ordinary reason: it is how anybody knows.
+    fn set_permission_mode(&mut self, mode: neosh_proto::PermissionMode) {
+        let here = self.active_session();
+        self.agent.set_permission_mode(&here, mode);
+        self.sync_agent_drivers();
+        self.refresh_status();
+        self.persist_sessions();
+    }
+
+    /// Serve a terminal rather than be one: `quit` sends the viewer away, and what this workspace
+    /// is holding is reported to `live` for `neosh status` to read.
+    pub fn serve(&mut self, live: std::sync::Arc<crate::daemon::Live>) {
+        self.on_quit = OnQuit::Detach;
+        self.live = Some(live);
+    }
+
+    /// Tell whoever is asking what is running here.
+    ///
+    /// A status query has to be answerable *while* the host is busy, because that is exactly when
+    /// somebody asks — so it is a snapshot the accept loop can read rather than a question put to
+    /// the run loop, and this is what keeps the snapshot true.
+    ///
+    /// Called from every path that could have changed the answer, and rate-limited to once a
+    /// second rather than reasoned about: a streaming turn flushes a frame every few milliseconds
+    /// and each report locks the session store and formats a line per running turn. A second is
+    /// finer than any of these numbers are quoted at.
+    fn report_live(&mut self) {
+        if self.live.is_none() {
+            return;
+        }
+        let fresh = self.live_at.is_some_and(|at| at.elapsed() < Duration::from_secs(1));
+        if fresh && self.rounds.len() == self.live_turns {
+            return;
+        }
+        self.live_at = Some(std::time::Instant::now());
+        self.live_turns = self.rounds.len();
+        self.report_live_now();
+    }
+
+    /// The report itself, whatever was asked a moment ago.
+    ///
+    /// Separate so the paths where the answer has certainly changed — a viewer arriving or
+    /// leaving — do not silently do nothing because a frame went past half a second earlier.
+    fn report_live_now(&self) {
+        let Some(live) = &self.live else { return };
+        let store = self.agent.sessions();
+        let running: Vec<neosh_proto::RunningTurn> = self
+            .rounds
+            .iter()
+            .filter_map(|(id, round)| {
+                let s = store.get(id)?;
+                Some(neosh_proto::RunningTurn {
+                    session: id.clone(),
+                    label: s.label(),
+                    cwd: s.cwd.display().to_string(),
+                    elapsed_secs: round.started.elapsed().as_secs(),
+                })
+            })
+            .collect();
+        let conversations = store.iter().filter(|s| !s.archived).count();
+        drop(store);
+        live.report(conversations, running);
     }
 
     /// Take ownership of the agent drivers, so the mode can be mirrored into them later and a
@@ -2831,6 +2965,7 @@ impl Host {
                     opts: neosh_proto::ExtmarkOpts {
                         end_col: Some((from + pat.len()) as u32),
                         hl_group: Some("Search".into()),
+                        line_hl_group: None,
                         virt_text: Vec::new(),
                         virt_text_pos: VirtTextPos::Eol,
                         on_delete: neosh_proto::OnDelete::Invalidate,
@@ -2943,9 +3078,7 @@ impl Host {
             end: -1,
             lines,
         });
-        for (row, from, to, hl) in marks {
-            self.chat_mark(row, from, to, hl);
-        }
+        self.draw_marks(&marks, 0);
         let _ = self.editor.apply(&plugin, ApiCall::BufSetName {
             buf: self.chat,
             name: format!("[chat] {label}"),
@@ -2957,6 +3090,11 @@ impl Host {
         // addressed a buffer that no longer exists.
         self.cards = cards;
         self.ensure_usable_selection();
+        // The mode belongs to the conversation, and a driver holds one mode for its whole process
+        // rather than one per conversation — so arriving somewhere has to say which. Without it, a
+        // conversation set to `ask` runs its next tool call under the full access of the one you
+        // just left.
+        self.sync_agent_drivers();
         self.draw_welcome();
         self.replay_round();
         self.set_composer("");
@@ -3002,12 +3140,11 @@ impl Host {
             state,
             took: None,
             exit: None,
+            output: None,
         };
-        let (text, spans) = cards::header(&g, &head, &root, width);
-        let row = self.chat_push(vec![text]);
-        for (from, to, hl) in spans {
-            self.chat_mark(row, from, to, hl);
-        }
+        let card = cards::header(&g, &head, &root, width);
+        let row = self.chat_push(vec![card.text.clone()]);
+        self.chat_row(row, &card);
         self.cards.push(Card {
             id: call.id.clone(),
             name: call.name.clone(),
@@ -3039,11 +3176,9 @@ impl Host {
                 let limits = self.limits();
                 let width = self.chat_width();
                 let rows = cards::body(&g, &serde_json::Value::Null, result, limits, false, width);
-                for (text, spans) in rows {
-                    let row = self.chat_push(vec![text]);
-                    for (from, to, hl) in spans {
-                        self.chat_mark(row, from, to, hl);
-                    }
+                for r in rows {
+                    let row = self.chat_push(vec![r.text.clone()]);
+                    self.chat_row(row, &r);
                 }
             }
             return;
@@ -3084,6 +3219,7 @@ impl Host {
             // worth printing is the renderer's decision, in one place, for both.
             took: card.took.or_else(|| card.started.map(|s| s.elapsed())),
             exit: card.exit,
+            output: card.result.as_ref().map(|r| lines_in(&r.content)),
         };
         cards::header(&self.glyphs(), &head, &self.root(), self.chat_width())
     }
@@ -3104,7 +3240,7 @@ impl Host {
             .collect();
         let plugin = PluginId::from(BUILTIN);
         for i in live {
-            let (text, spans) = self.card_header(i);
+            let card = self.card_header(i);
             let row = self.cards[i].row;
             let _ = self.editor.apply(&plugin, ApiCall::MarkClear {
                 ns: self.chat_ns,
@@ -3116,11 +3252,9 @@ impl Host {
                 buf: self.chat,
                 start: row as i64,
                 end: row as i64 + 1,
-                lines: vec![text],
+                lines: vec![card.text.clone()],
             });
-            for (from, to, hl) in spans {
-                self.chat_mark(row, from, to, hl);
-            }
+            self.chat_row(row, &card);
         }
     }
 
@@ -3150,21 +3284,17 @@ impl Host {
             start: Some(row),
             end: Some(row + 1 + old_body),
         });
-        let mut lines = vec![header.0];
-        lines.extend(body.iter().map(|(t, _)| t.clone()));
+        let mut lines = vec![header.text.clone()];
+        lines.extend(body.iter().map(|r| r.text.clone()));
         let _ = self.editor.apply(&plugin, ApiCall::BufSetLines {
             buf: self.chat,
             start: row as i64,
             end: (row + 1 + old_body) as i64,
             lines,
         });
-        for (from, to, hl) in header.1 {
-            self.chat_mark(row, from, to, hl);
-        }
-        for (k, (_, spans)) in body.iter().enumerate() {
-            for (from, to, hl) in spans {
-                self.chat_mark(row + 1 + k as u32, *from, *to, hl);
-            }
+        self.chat_row(row, &header);
+        for (k, r) in body.iter().enumerate() {
+            self.chat_row(row + 1 + k as u32, r);
         }
         let new_body = body.len() as u32;
         self.cards[i].body = new_body;
@@ -3250,12 +3380,10 @@ impl Host {
         if gap {
             lines.push(String::new());
         }
-        lines.extend(rows.iter().map(|(t, _)| t.clone()));
+        lines.extend(rows.iter().map(|r| r.text.clone()));
         let at = self.chat_push(lines) + u32::from(gap);
-        for (k, (_, spans)) in rows.iter().enumerate() {
-            for (from, to, hl) in spans {
-                self.chat_mark(at + k as u32, *from, *to, hl);
-            }
+        for (k, r) in rows.iter().enumerate() {
+            self.chat_row(at + k as u32, r);
         }
     }
 
@@ -3348,12 +3476,55 @@ impl Host {
             opts: neosh_proto::ExtmarkOpts {
                 end_col: Some(to as u32),
                 hl_group: Some(hl.to_string()),
+                line_hl_group: None,
                 virt_text: vec![],
                 virt_text_pos: neosh_proto::VirtTextPos::Eol,
                 on_delete: neosh_proto::OnDelete::Clamp,
                 priority: 0,
             },
         });
+    }
+
+    /// Draw a rebuilt transcript's marks, `by` rows down from where they were computed.
+    fn draw_marks(&mut self, marks: &[Mark], by: u32) {
+        for m in marks.iter().map(|m| m.shifted(by)) {
+            match m.span {
+                Some((from, to)) => self.chat_mark(m.row, from, to, m.hl),
+                None => self.chat_band(m.row, m.hl),
+            }
+        }
+    }
+
+    /// Put a band behind a whole transcript row, out to whatever edge it is drawn against.
+    ///
+    /// A point mark rather than a ranged one: what it covers is the row, and giving it an end
+    /// column would be saying the band stops somewhere, which is the bug this exists to fix.
+    fn chat_band(&mut self, row: u32, hl: &str) {
+        let _ = self.editor.apply(&PluginId::from(BUILTIN), ApiCall::MarkSet {
+            ns: self.chat_ns,
+            buf: self.chat,
+            row,
+            col: 0,
+            opts: neosh_proto::ExtmarkOpts {
+                end_col: None,
+                hl_group: None,
+                line_hl_group: Some(hl.to_string()),
+                virt_text: vec![],
+                virt_text_pos: neosh_proto::VirtTextPos::Eol,
+                on_delete: neosh_proto::OnDelete::Clamp,
+                priority: 0,
+            },
+        });
+    }
+
+    /// Draw one card row at `row`: its spans, and the band behind it.
+    fn chat_row(&mut self, row: u32, r: &cards::Row) {
+        for (from, to, hl) in &r.spans {
+            self.chat_mark(row, *from, *to, hl);
+        }
+        if let Some(band) = r.band {
+            self.chat_band(row, band);
+        }
     }
 
     /// Put the next piece of an answer into the transcript.
@@ -3539,7 +3710,7 @@ impl Host {
         }
         let rows = self.footer();
         let at = self.chat_end();
-        let mut lines: Vec<String> = rows.iter().map(|(t, _)| t.clone()).collect();
+        let mut lines: Vec<String> = rows.iter().map(|r| r.text.clone()).collect();
         lines.push(String::new());
         let _ = self.editor.apply(&PluginId::from(BUILTIN), ApiCall::BufSetLines {
             buf: self.chat,
@@ -3549,10 +3720,8 @@ impl Host {
         });
         self.plan_rows = rows.len() as u32;
         self.working = true;
-        for (k, (_, spans)) in rows.iter().enumerate() {
-            for (from, to, hl) in spans {
-                self.chat_mark(at as u32 + k as u32, *from, *to, hl);
-            }
+        for (k, r) in rows.iter().enumerate() {
+            self.chat_row(at as u32 + k as u32, r);
         }
         self.draw_working();
     }
@@ -3589,7 +3758,7 @@ impl Host {
         // question gets one: butted up against the last tool card, the checklist reads as part of
         // its output.
         if !rows.is_empty() {
-            rows.insert(0, (String::new(), Vec::new()));
+            rows.insert(0, cards::Row::default());
         }
         rows
     }
@@ -3681,10 +3850,27 @@ impl Host {
             end: row as i64 + 1,
             lines: vec![text.clone()],
         });
+        // Cleared first, and this is not tidiness. A mark clamps rather than dies when the line
+        // under it is replaced, so this row accumulated one pair per tick — and where two marks
+        // overlap at equal priority the *narrower* one wins, so the tail of a shorter label from
+        // three seconds ago went on painting over the label being drawn now. What that looked like
+        // was the thing this line exists to prevent: `/compact` sat there with its note in the dead
+        // grey of finished text, not moving, exactly like a hang.
+        let _ = self.editor.apply(&plugin, ApiCall::MarkClear {
+            ns: self.chat_ns,
+            buf: self.chat,
+            start: Some(row),
+            end: Some(row + 1),
+        });
         // Only the label moves. A clock and a hint sweeping along with it would turn a status line
         // into a light show, and the thing you actually want to read is the number.
         let label_end = glyph.len() + 1 + label.len() + "\u{2026}".len();
-        let hl = if note.is_some() { "Status.Pending" } else { "Status.Streaming" };
+        // The sweep, note or no note. `Status.Pending` is for waiting on something outside the
+        // program, and a note on this row is never that: it is the turn's own loop saying what it
+        // is doing — compacting, running a sub-agent — which is the same "working" the verb means,
+        // said more precisely. Swapping the sweep for the slower pulse there took the movement away
+        // from the *longest* silence in the program, which is the one that most needs it.
+        let hl = "Status.Streaming";
         self.chat_mark(row, 0, label_end, hl);
         self.chat_mark(row, label_end, text.len(), "Agent.Usage");
     }
@@ -3883,8 +4069,8 @@ impl Host {
                     self.refresh_composer();
                 }
             }
-            AgentEvent::Activity { session, activity, .. } => {
-                self.handle_activity(session, activity, on_screen);
+            AgentEvent::Activity { session, turn, activity } => {
+                self.handle_activity(session, turn, activity, on_screen);
             }
             AgentEvent::Notice { level, text, .. } => self.editor_message(level, text),
         }
@@ -3902,10 +4088,19 @@ impl Host {
     fn handle_activity(
         &mut self,
         session: neosh_proto::SessionId,
+        turn: neosh_proto::TurnId,
         activity: neosh_proto::Activity,
         on_screen: bool,
     ) {
         use neosh_proto::{Activity, TaskStatus};
+        // Out to plugins before it is drawn, and whatever it is. A meter, a plan view and a status
+        // line all want this and none of them caused it — and it is the only thing that moves
+        // *during* a turn, which for an agent driver can be twenty minutes long.
+        self.bridge.broadcast(PluginEvent::Activity {
+            session: session.clone(),
+            turn,
+            activity: activity.clone(),
+        });
         match activity {
             Activity::Plan { steps } => {
                 let Some(r) = self.rounds.get_mut(&session) else { return };
@@ -3984,11 +4179,9 @@ impl Host {
                     r.plan.clear();
                 }
                 if on_screen {
-                    let (text, spans) = cards::compaction(&self.glyphs(), before, after);
-                    let row = self.chat_push(vec![text]);
-                    for (from, to, hl) in spans {
-                        self.chat_mark(row, from, to, hl);
-                    }
+                    let r = cards::compaction(&self.glyphs(), before, after);
+                    let row = self.chat_push(vec![r.text.clone()]);
+                    self.chat_row(row, &r);
                     self.redraw_footer();
                     self.draw_working();
                 }
@@ -3996,9 +4189,16 @@ impl Host {
             Activity::Commands { commands } => {
                 self.driver_commands.insert(session, commands);
             }
-            // Nothing draws a context meter yet. Kept rather than dropped so the driver that
-            // reports one is not the thing that has to change when something does.
-            Activity::Context { .. } => {}
+            // The driver's own answer to "how full is it", which beats anything derived. A prompt
+            // size counts one request; this counts the conversation the agent is holding, and it
+            // brings the window with it — a vendor CLI's window is whatever that CLI decided, not
+            // whatever a catalogue says the model has.
+            Activity::Context { used, total } => {
+                if let Some(s) = self.agent.sessions().get_mut(&session) {
+                    s.set_context(used, total);
+                }
+                self.persist_sessions();
+            }
         }
     }
 
@@ -4141,6 +4341,21 @@ impl Host {
             InputEvent::ViewportChanged { win, width, height, top_line } => {
                 self.editor.set_viewport(win, neosh_core::Viewport { width, height, top_line });
             }
+            InputEvent::Attached { .. } => {
+                // A client that has never seen any of this. Whatever was queued was queued for
+                // whoever was looking before — and nobody may have been — so it is dropped rather
+                // than sent to a mirror it makes no sense against, and the whole state is said
+                // again in its place. See `Editor::republish`.
+                let _ = self.editor.drain_ui();
+                self.editor.republish();
+                self.draw_welcome();
+                // Every plugin holding a surface has to paint it again: the editor forwards cells
+                // and does not keep them, so a claim is all that could be republished.
+                self.bridge.broadcast(neosh_proto::PluginEvent::ViewAttached);
+                // Certainly changed, and not subject to the once-a-second rule: "is anyone
+                // watching" is the one field of the report a viewer arriving is entirely about.
+                self.report_live_now();
+            }
             InputEvent::Ready { .. } | InputEvent::Resize { .. } => {
                 // A resize changes nothing the core owns; the frontend re-lays-out from the
                 // declarative geometry it already has. Redraw so it takes effect.
@@ -4167,6 +4382,9 @@ impl Host {
 
     /// Emit one coalesced frame.
     async fn flush(&mut self) -> anyhow::Result<()> {
+        // Anything worth drawing is something that might have changed what this workspace is
+        // holding — a turn started, a conversation opened, an answer landed.
+        self.report_live();
         let mut batch = self.editor.drain_ui();
         if batch.is_empty() {
             return Ok(());
@@ -4230,6 +4448,7 @@ impl Host {
                     self.draw_working();
                     self.tick_cards();
                     self.tick_footer();
+                    self.report_live();
                 }
                 () = &mut keys, if waiting => {
                     waiting = false;
@@ -4243,6 +4462,14 @@ impl Host {
 
             if self.quitting {
                 break;
+            }
+            // The viewer asked to leave. The workspace does not: this is the whole difference
+            // between closing a window and stopping the work in it.
+            if std::mem::take(&mut self.detaching) {
+                self.persist_sessions();
+                self.flush().await?;
+                self.frontend.detach().await?;
+                self.report_live_now();
             }
             if std::mem::take(&mut self.keys_touched) {
                 waiting = self.keys_pending;
@@ -4468,7 +4695,8 @@ impl Host {
         let plugin = PluginId::from(BUILTIN);
         let commands = [
             ("config.reload", "Re-read config.toml and init.ts, and reload every plugin"),
-            ("quit", "Close neosh"),
+            ("quit", "Close this terminal. Whatever is running keeps running"),
+            ("stop", "Stop the workspace, and everything running in it"),
             ("interrupt", "Stop what is running, or leave"),
             ("chat.scroll_up", "Scroll the transcript up a screen"),
             ("chat.scroll_down", "Scroll the transcript down a screen"),
@@ -4478,6 +4706,10 @@ impl Host {
                 "Read the transcript: hjkl move, [ ] turns, { } blocks, / finds, yc takes the code",
             ),
             ("chat.toggle_card", "Open or fold the tool card under the cursor, while reading"),
+            (
+                "chat.queue.edit",
+                "Take the last thing you queued back into the composer, to change it or drop it",
+            ),
             ("edit.copy", "Copy what is selected"),
             ("edit.cut", "Cut what is selected"),
             ("edit.select_all", "Select everything here"),
@@ -4515,6 +4747,10 @@ impl Host {
                 ("<C-s>", "chat.read", "Read, select and copy the transcript"),
                 ("<C-x>", "edit.cut", "Cut the selection"),
                 ("<C-a>", "edit.select_all", "Select everything"),
+                // `⌥↑` is the model ladder and `⌥↓` its other half, so the queue takes the shift
+                // pair. Both are "up, to the thing before this one", which is what makes them
+                // rememberable — and neither is a chord anybody's `init.ts` has taken.
+                ("<S-Up>", "chat.queue.edit", "Edit the last queued message"),
             ] {
                 let _ = self.editor.apply(&plugin, ApiCall::KeymapSet {
                     mode,
@@ -4661,12 +4897,40 @@ impl Host {
     fn run_builtin(&mut self, name: &str, args: Vec<String>) {
         match name {
             "config.reload" => self.reload_config(),
-            "quit" => self.quitting = true,
+            "quit" => match self.on_quit {
+                OnQuit::Stop => self.quitting = true,
+                OnQuit::Detach => self.detaching = true,
+            },
+            "stop" => self.quitting = true,
             "interrupt" => self.interrupt(),
             "chat.scroll_up" => self.scroll_chat(-1),
             "chat.scroll_down" => self.scroll_chat(1),
             "chat.scroll_end" => self.scroll_chat(0),
             "chat.read" => self.enter_reading(),
+            // Sending while a turn runs *queues*, which is the right default and is also the one
+            // send you cannot take back by pressing anything. Enter is a decision made in half a
+            // second about a sentence you were still writing; this is the other half of it.
+            //
+            // Back into the composer rather than simply dropped, because "I queued the wrong thing"
+            // and "I queued the right thing badly" are the same keystroke away from each other, and
+            // a key that deleted your sentence to fix a typo in it would be a worse trade than
+            // having no key at all. Whatever is already in the composer keeps its place after it.
+            "chat.queue.edit" => {
+                let here = self.active_session();
+                match self.agent.unqueue_last(&here) {
+                    None => self.editor_message(MessageLevel::Info, "nothing queued"),
+                    Some(text) => {
+                        let draft = self.composer_text();
+                        let joined = match draft.trim().is_empty() {
+                            true => text,
+                            false => format!("{text}\n{draft}"),
+                        };
+                        self.set_composer(&joined);
+                        self.draw_working();
+                        self.refresh_composer();
+                    }
+                }
+            }
             "chat.toggle_card" => {
                 if self.reading {
                     self.toggle_card_here();
@@ -5439,6 +5703,17 @@ async fn run_slow(svc: Services, call: ApiCall) -> ApiResult {
 ///
 /// Zero rather than a panic: a wrong timestamp sorts a list oddly, and refusing to create a session
 /// because the system clock is unset would be a much worse trade.
+/// How many lines a tool wrote, as the card counts them.
+///
+/// Trailing blank lines are not lines anybody read. A `Read` whose output ends with a newline —
+/// which almost every file does — would otherwise be reported as one line longer than it is, and a
+/// card that is out by one about something this easy to check is a card nothing else on it is
+/// believed.
+fn lines_in(content: &str) -> usize {
+    let body = content.trim_end();
+    if body.is_empty() { 0 } else { body.lines().count() }
+}
+
 pub fn now_secs() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -5462,12 +5737,12 @@ fn transcript(
 
     let g = Glyphs::new(ascii);
     let root = session.cwd.as_path();
-    // Which calls have an answer, whether it was a failure, and what it exited with. Gathered
-    // first because a result always comes *after* the call it answers, and a dot that only turns
-    // green on the second pass over the buffer is a dot that flickers on every switch. The status
-    // is here for the same reason: it belongs on the header, which is written before the result
-    // that carries it has been reached.
-    type Answer = (bool, Option<i64>);
+    // Which calls have an answer, whether it was a failure, what it exited with, and how much it
+    // came back with. Gathered first because a result always comes *after* the call it answers, and
+    // a dot that only turns green on the second pass over the buffer is a dot that flickers on
+    // every switch. The other three are here for the same reason: they all belong on the header,
+    // which is written before the result carrying them has been reached.
+    type Answer = (bool, Option<i64>, usize);
     let answered: std::collections::HashMap<&neosh_proto::ToolCallId, Answer> = session
         .messages
         .iter()
@@ -5475,7 +5750,11 @@ fn transcript(
         .filter_map(|b| match b {
             ContentBlock::ToolResult { tool_use_id, is_error, content } => Some((
                 tool_use_id,
-                (*is_error, is_error.then(|| cards::exit_code(content)).flatten()),
+                (
+                    *is_error,
+                    is_error.then(|| cards::exit_code(content)).flatten(),
+                    lines_in(content),
+                ),
             )),
             _ => None,
         })
@@ -5500,16 +5779,16 @@ fn transcript(
         if n == 0 {
             return;
         }
-        for m in marks.iter_mut().filter(|m| m.0 >= at) {
-            m.0 += n;
+        for m in marks.iter_mut().filter(|m| m.row >= at) {
+            m.row += n;
         }
         for c in cards.iter_mut().filter(|c| c.row >= at) {
             c.row += n;
         }
-        for (k, (text, spans)) in rows.into_iter().enumerate() {
+        for (k, r) in rows.into_iter().enumerate() {
             let row = at + k as u32;
-            marks.extend(spans.into_iter().map(|(a, b, h)| (row, a, b, h)));
-            lines.insert(row as usize, text);
+            marks.extend(Mark::of(row, &r));
+            lines.insert(row as usize, r.text);
         }
     }
     // A gap, unless there already is one: what came before was often a tool card, which has no
@@ -5526,10 +5805,10 @@ fn transcript(
             return;
         }
         gap(lines);
-        for (text, spans) in rows {
+        for r in rows {
             let row = lines.len() as u32;
-            marks.extend(spans.into_iter().map(|(a, b, h)| (row, a, b, h)));
-            lines.push(text);
+            marks.extend(Mark::of(row, &r));
+            lines.push(r.text);
         }
     };
 
@@ -5541,7 +5820,7 @@ fn transcript(
                     summarise(&mut lines, &mut marks, &mut changes);
                     gap(&mut lines);
                     for line in text.lines() {
-                        marks.push((lines.len() as u32, 0, g.bar.len(), "Agent.User"));
+                        marks.push(Mark::at(lines.len() as u32, 0, g.bar.len(), "Agent.User"));
                         lines.push(format!("{} {line}", g.bar));
                     }
                     lines.push(String::new());
@@ -5551,7 +5830,9 @@ fn transcript(
                     // does not change what an answer looks like.
                     let at = lines.len() as u32;
                     let (rendered, styled) = crate::markdown::render(text);
-                    marks.extend(styled.into_iter().map(|(r, a, b, g)| (at + r as u32, a, b, g)));
+                    marks.extend(
+                        styled.into_iter().map(|(r, a, b, g)| Mark::at(at + r as u32, a, b, g)),
+                    );
                     lines.extend(rendered);
                     lines.push(String::new());
                 }
@@ -5561,13 +5842,13 @@ fn transcript(
                     // The dot says how it went, which the conversation already records: a call
                     // with a result somewhere after it is finished, and one without is still
                     // running. Nothing here has to remember anything.
-                    let (state, exit) = match answered.get(id) {
-                        Some((true, exit)) => (ToolState::Failed, *exit),
-                        Some((false, _)) => (ToolState::Done, None),
-                        None => (ToolState::Running, None),
+                    let (state, exit, output) = match answered.get(id) {
+                        Some((true, exit, n)) => (ToolState::Failed, *exit, Some(*n)),
+                        Some((false, _, n)) => (ToolState::Done, None, Some(*n)),
+                        None => (ToolState::Running, None, None),
                     };
-                    let head = cards::Head { name, input, state, took: None, exit };
-                    let (text, spans) = cards::header(&g, &head, root, width);
+                    let head = cards::Head { name, input, state, took: None, exit, output };
+                    let card = cards::header(&g, &head, root, width);
                     let at = lines.len() as u32;
                     cards.push(Card {
                         id: id.clone(),
@@ -5583,8 +5864,8 @@ fn transcript(
                         body: 0,
                         expanded: false,
                     });
-                    marks.extend(spans.into_iter().map(|(a, b, h)| (at, a, b, h)));
-                    lines.push(text);
+                    marks.extend(Mark::of(at, &card));
+                    lines.push(card.text.clone());
                 }
                 ContentBlock::ToolUse { .. } => {}
                 // Errors show even with tool cards off, exactly as they do live: the setting is
@@ -5621,10 +5902,10 @@ fn transcript(
                                 false,
                                 width,
                             );
-                            for (text, spans) in rows {
+                            for r in rows {
                                 let row = lines.len() as u32;
-                                marks.extend(spans.into_iter().map(|(a, b, h)| (row, a, b, h)));
-                                lines.push(text);
+                                marks.extend(Mark::of(row, &r));
+                                lines.push(r.text);
                             }
                         }
                     }
@@ -5644,8 +5925,36 @@ fn transcript(
     (lines, marks, cards)
 }
 
-/// One highlighted span of the transcript: row, byte range, group.
-type Mark = (u32, usize, usize, &'static str);
+/// One highlight in a rebuilt transcript, before it becomes an extmark.
+///
+/// `span` is `None` for a band — a group behind the whole row rather than behind a range of bytes
+/// on it. The two travel in one list because they are written together and have to arrive together:
+/// a diff row whose band was applied on a later pass would be green a frame after it was green.
+#[derive(Clone, Copy)]
+struct Mark {
+    row: u32,
+    span: Option<(usize, usize)>,
+    hl: &'static str,
+}
+
+impl Mark {
+    fn at(row: u32, from: usize, to: usize, hl: &'static str) -> Self {
+        Self { row, span: Some((from, to)), hl }
+    }
+
+    /// Every mark a card row carries, ready to be shifted onto whatever row it lands on.
+    fn of(row: u32, r: &cards::Row) -> Vec<Self> {
+        r.spans
+            .iter()
+            .map(|(a, b, h)| Self::at(row, *a, *b, h))
+            .chain(r.band.map(|h| Self { row, span: None, hl: h }))
+            .collect()
+    }
+
+    fn shifted(self, by: u32) -> Self {
+        Self { row: self.row + by, ..self }
+    }
+}
 
 
 /// A virtual-text chunk, which is three words of ceremony often enough to be worth a name.

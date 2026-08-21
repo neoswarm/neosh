@@ -62,8 +62,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use neosh_proto::{
-    ContentBlock, DriverKind, InstanceConfig, Message, ModelInfo, PermissionMode, ProviderEvent,
-    Role, SessionId, TurnRequest,
+    Activity, ContentBlock, DriverKind, InstanceConfig, Message, ModelInfo, PermissionMode,
+    ProviderEvent, Role, SessionId, TurnRequest,
 };
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -512,6 +512,16 @@ async fn run_turn(
     let mut refused = 0usize;
     let mut interrupted = false;
     let mut finished = false;
+    // Whether the context question in flight is the one that ends the turn.
+    let mut ending = false;
+    // How full the CLI's context is, asked while it works rather than once at the end.
+    //
+    // This is what the meter is for, and it only means anything if it moves: "should I start a new
+    // conversation?" is a question about the turn you are in, and an answer that arrives when that
+    // turn finishes has arrived too late to act on. The CLI answers this mid-turn — it is its own
+    // accounting rather than a request to the model — so it is asked on a clock.
+    let mut clock = tokio::time::interval(Duration::from_secs(5));
+    clock.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     // Reset the moment an interrupt is asked for; until then it never fires.
     let giveup = tokio::time::sleep(Duration::from_secs(86_400));
     tokio::pin!(giveup);
@@ -540,6 +550,9 @@ async fn run_turn(
                     live.mode = mode;
                 }
             }
+            _ = clock.tick(), if !interrupted && !ending => {
+                let _ = live.control(&json!({"subtype": "get_context_usage"})).await;
+            }
             // Asked to stop, not killed. A killed CLI takes the conversation with it, and the next
             // turn would resume into a history that has never heard of the work it interrupted.
             () = cancel.cancelled(), if !interrupted => {
@@ -547,12 +560,18 @@ async fn run_turn(
                 let _ = live.control(&json!({"subtype": "interrupt"})).await;
                 giveup.as_mut().reset(tokio::time::Instant::now() + Duration::from_secs(5));
             }
-            // It was asked politely and did not stop. Now it is killed, and the slot is emptied so
-            // the next turn does not write into a pipe with nothing on the other end.
-            () = &mut giveup, if interrupted => {
-                let _ = live.child.start_kill();
-                *slot = None;
-                return Ok(());
+            // The deadline, which two different waits arm and which therefore means two things.
+            // After an interrupt: it was asked politely and did not stop, so now it is killed and
+            // the slot emptied, or the next turn writes into a pipe with nothing behind it. After
+            // the context question: nothing at all went wrong — the turn is already finished and
+            // that was an extra — so it is simply given up on.
+            () = &mut giveup, if interrupted || ending => {
+                if interrupted {
+                    let _ = live.child.start_kill();
+                    *slot = None;
+                    return Ok(());
+                }
+                break;
             }
             line = live.lines.next_line() => {
                 let line = match line {
@@ -602,6 +621,16 @@ async fn run_turn(
                     }
                     continue;
                 }
+                // How full the context is. Matched by *shape* rather than by request id: several
+                // of these are asked over a long turn, they all answer the same question, and the
+                // only one that matters is the newest.
+                if let Some(ev) = context_usage(&v) {
+                    let _ = tx.send(ev).await;
+                    if ending {
+                        break;
+                    }
+                    continue;
+                }
                 for ev in control_failure(&v).into_iter().chain(sse::claude_cli_line(&v, &mut live.state)) {
                     if tx.send(ev).await.is_err() {
                         // The receiver is gone: the turn was abandoned. The process is not — it
@@ -610,10 +639,21 @@ async fn run_turn(
                         return Ok(());
                     }
                 }
-                // The turn is over, and the process is not. It goes back to waiting on stdin for
-                // whatever is asked next, which is the whole point of keeping it.
+                // The turn is over, and the process is not. Before letting it go back to waiting,
+                // ask the one question only it can answer: how full its context is. See
+                // [`context_usage`].
                 if v.get("type").and_then(|t| t.as_str()) == Some("result") {
                     finished = true;
+                    if !ending && live.control(&json!({"subtype": "get_context_usage"})).await.is_ok()
+                    {
+                        ending = true;
+                        // Bounded, because an install that will not answer must not hold the turn
+                        // open. Two seconds is far more than a local answer takes.
+                        giveup.as_mut().reset(
+                            tokio::time::Instant::now() + Duration::from_secs(2),
+                        );
+                        continue;
+                    }
                     break;
                 }
             }
@@ -653,6 +693,30 @@ async fn run_turn(
             .await;
     }
     Ok(())
+}
+
+/// How full the CLI says its context is.
+///
+/// The one number neosh could not have worked out for itself, and the reason for asking. What a
+/// turn's usage reports is the size of *one request*; what fills a window is the conversation the
+/// agent is holding — which it prunes, compacts and reorders on its own, and about which a client
+/// counting its own messages is guessing.
+///
+/// Recognised by shape rather than by request id, because over a long turn several are asked and
+/// any of their answers is a good one.
+///
+/// The window comes with it, and that half matters just as much. A vendor CLI's window is whatever
+/// that CLI decided: `claude` running `claude-haiku-4-5` answers `maxTokens: 200000`, while neosh's
+/// own catalogue entry for the selected model said a million. Dividing a half-known numerator by an
+/// invented denominator is how a meter reads `2%` where the agent itself would say `8%`.
+fn context_usage(v: &Value) -> Option<ProviderEvent> {
+    if v.get("type").and_then(Value::as_str) != Some("control_response") {
+        return None;
+    }
+    let r = v.pointer("/response/response")?;
+    let used = r.get("totalTokens").and_then(Value::as_u64)?;
+    let total = r.get("maxTokens").and_then(Value::as_u64).filter(|t| *t > 0)?;
+    Some(ProviderEvent::Activity { activity: Activity::Context { used, total } })
 }
 
 /// A control request the CLI refused, as something the transcript can say.
@@ -751,15 +815,22 @@ impl Live {
         })
     }
 
-    /// Ask the running session to change something about itself.
-    async fn control(&mut self, request: &Value) -> Result<(), String> {
+    /// Ask the running session to change something about itself, or to say something about itself.
+    ///
+    /// Hands back the id it used. Most of these are fire-and-forget — ordering on one pipe is
+    /// enough, and the answer to `set_model` is only interesting when it is a refusal, which
+    /// arrives on the same stdout as everything else. The one caller that keeps the id is the one
+    /// waiting for an answer with a number in it.
+    async fn control(&mut self, request: &Value) -> Result<String, String> {
+        let id = neosh_proto::RequestId::new().to_string();
         let message = json!({
             "type": "control_request",
-            "request_id": neosh_proto::RequestId::new().to_string(),
+            "request_id": id,
             "request": request,
         });
         write_line(&mut self.stdin, &message)
             .await
+            .map(|()| id)
             .map_err(|e| format!("could not reach the running claude session: {e}"))
     }
 
