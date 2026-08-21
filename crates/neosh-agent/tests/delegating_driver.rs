@@ -7,16 +7,17 @@
 
 use neosh_agent::turn::{TurnAssembler, TurnUpdate};
 use neosh_proto::{ContentBlock, Role};
-use neosh_provider::sse::claude_cli_line;
+use neosh_provider::sse::{ClaudeState, claude_cli_line};
 
 /// One real `claude -p` session: read a file, then answer from it.
 fn replay() -> (TurnAssembler, Vec<TurnUpdate>) {
     let raw = include_str!("fixtures/claude_cli_tool_turn.jsonl");
     let mut a = TurnAssembler::new();
+    let mut state = ClaudeState::default();
     let mut updates = Vec::new();
     for line in raw.lines().filter(|l| !l.trim().is_empty()) {
         let v: serde_json::Value = serde_json::from_str(line).expect("fixture is JSON");
-        for ev in claude_cli_line(&v) {
+        for ev in claude_cli_line(&v, &mut state) {
             updates.extend(a.push(ev));
         }
     }

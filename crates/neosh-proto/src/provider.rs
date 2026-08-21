@@ -24,7 +24,7 @@ use serde::{Deserialize, Serialize};
 use ts_rs::TS;
 
 use crate::agent::{Message, StopReason, ToolDef, Usage};
-use crate::ids::{StreamId, ToolCallId};
+use crate::ids::{SessionId, StreamId, TaskId, ToolCallId};
 
 // ---------------------------------------------------------------------------
 // Identity
@@ -569,6 +569,17 @@ fn auth_none() -> AuthRef {
 #[ts(export)]
 pub struct TurnRequest {
     pub selection: ModelSelection,
+    /// Which conversation this turn belongs to.
+    ///
+    /// A driver that keeps anything between turns needs this and cannot derive it. A vendor CLI
+    /// holds the history on its side and hands back a session id to resume into; a driver that
+    /// kept one of those per *process* — as this one did — would resume the second conversation
+    /// into the first one's history, and neither of them would ever say anything was wrong.
+    ///
+    /// Several conversations run at once by design, so "the current one" is not a thing a driver
+    /// may assume. Empty for a caller that has no conversation to name, such as a one-shot
+    /// generation — a driver keying state by this must treat that as "keep nothing".
+    pub conversation: SessionId,
     /// The directory this turn happens in.
     ///
     /// The conversation's, not the process's. A vendor CLI is an agent that reads files, runs
@@ -590,6 +601,138 @@ pub struct TurnRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(type = "number | null")]
     pub max_output_tokens: Option<u64>,
+}
+
+/// How a step of a plan is going.
+#[derive(TS, Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
+#[serde(rename_all = "snake_case")]
+#[ts(export)]
+pub enum PlanState {
+    Pending,
+    Active,
+    Done,
+}
+
+/// One line of the agent's own checklist.
+#[derive(TS, Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
+#[ts(export)]
+pub struct PlanStep {
+    pub text: String,
+    pub state: PlanState,
+}
+
+/// Where a sub-agent got to.
+#[derive(TS, Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
+#[serde(rename_all = "snake_case")]
+#[ts(export)]
+pub enum TaskStatus {
+    Running,
+    /// It kept going without us. The turn is no longer waiting on it, which is the sense in which
+    /// a backgrounded task has ended: not that it stopped, but that it stopped being this turn's
+    /// business. It may report again later.
+    Backgrounded,
+    Done,
+    Failed,
+    Cancelled,
+}
+
+/// A command the driver itself accepts, as opposed to one neosh implements.
+///
+/// Reported rather than configured. Which commands exist depends on the install — `claude` counts
+/// project `.claude/commands/`, plugins and MCP prompts among them — so any list written here
+/// would be wrong on the first machine that had one of its own.
+#[derive(TS, Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
+#[ts(export)]
+pub struct DriverCommand {
+    /// Without the leading slash.
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// What to type after it, when the driver says — `"[message]"`, `"<branch>"`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub argument_hint: Option<String>,
+}
+
+/// Something the driver's own loop did that is not part of the message it is producing.
+///
+/// [`ProviderEvent`] mirrors the Messages SSE shape, and for a model driver that is the whole
+/// story: a model emits content blocks and nothing else. An agent driver is *running a loop* — it
+/// spawns sub-agents, keeps a plan, compacts its own context, and knows which commands it will
+/// accept. None of that is a content block, and the two ways to force it into one are both bad:
+/// invent assistant text nobody wrote, or drop it. neosh dropped it, in one line
+/// (`sse.rs`: *"non-model event families must be ignored"*), which is why a running sub-agent was
+/// invisible and `/compact` looked like a hang.
+///
+/// This is a decision about **shape, not access**. Every one of these already arrives on the
+/// transport the driver uses — for `claude` they are `{"type":"system",…}` lines on the same stdout
+/// the content blocks come down, and `Plan` is read out of an ordinary `TodoWrite` call. Nothing
+/// here needs a privileged channel; it needed somewhere to go.
+#[derive(TS, Serialize, Deserialize, Clone, PartialEq, Debug)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+#[ts(export)]
+pub enum Activity {
+    /// A sub-agent started.
+    TaskStarted {
+        task: TaskId,
+        /// What it was asked to do, in one line.
+        title: String,
+        /// Which kind of sub-agent, when the driver distinguishes them.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        role: Option<String>,
+        /// The call that spawned it, when a call did. Absent for a task the driver started on its
+        /// own — a background job, a member of a workflow.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        parent_call: Option<ToolCallId>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        model: Option<String>,
+    },
+    /// It is still going, and here is what it is up to.
+    TaskProgress {
+        task: TaskId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        summary: Option<String>,
+        /// The last tool it called, which is the cheapest possible "it is not stuck".
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        last_tool: Option<String>,
+        #[serde(default)]
+        usage: Usage,
+    },
+    /// It stopped being the turn's business — finished, failed, cancelled, or backgrounded.
+    ///
+    /// Idempotent by [`TaskId`]: a driver may say so twice, once as a status patch and once as the
+    /// report that carries the summary, and a receiver keyed by task sees one ending either way.
+    TaskEnded {
+        task: TaskId,
+        status: TaskStatus,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        summary: Option<String>,
+    },
+    /// The plan, whole.
+    ///
+    /// Whole rather than patched because a patch is only correct if the previous state was, and a
+    /// checklist that drifts is worse than no checklist. Every driver that has one reports it this
+    /// way anyway.
+    Plan { steps: Vec<PlanStep> },
+    /// The driver started compacting its own context, and is not answering until it is done.
+    Compacting,
+    /// It finished. Token counts either side when the driver says.
+    Compacted {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(type = "number | null")]
+        before: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(type = "number | null")]
+        after: Option<u64>,
+    },
+    /// What this driver accepts as a slash command, learned at handshake.
+    Commands { commands: Vec<DriverCommand> },
+    /// How full the context window is, as of now.
+    Context {
+        #[ts(type = "number")]
+        used: u64,
+        #[ts(type = "number")]
+        total: u64,
+    },
 }
 
 /// Normalized streaming events.
@@ -653,6 +796,13 @@ pub enum ProviderEvent {
         #[serde(default)]
         is_error: bool,
     },
+    /// Something the driver's loop did that is not part of the message. See [`Activity`].
+    ///
+    /// Never terminal and never ordered against the content blocks: a sub-agent reports while the
+    /// parent is mid-sentence, and a plan changes between two tool calls. Nothing in the assembler
+    /// reads these, so a driver can start sending one without the shape of the produced messages
+    /// changing at all.
+    Activity { activity: Activity },
     /// Transport or provider error. Terminal for the stream.
     Error {
         message: String,

@@ -1,0 +1,4 @@
+name = "slash"
+version = "0.1.0"
+entry = "main.ts"
+description = "Type / to reach a command — neosh's own, and whatever the driver says it accepts."

@@ -128,6 +128,7 @@ mod tests {
 
     fn req() -> TurnRequest {
         TurnRequest {
+            conversation: neosh_proto::SessionId::from("test"),
             cwd: std::path::PathBuf::new(),
             selection: ModelSelection {
                 instance: InstanceId::from("mock"),

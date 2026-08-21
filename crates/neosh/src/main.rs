@@ -11,6 +11,9 @@ use neosh_script::ScriptRuntime;
 
 mod markdown;
 mod bridge;
+mod cards;
+mod diff;
+mod logo;
 mod config;
 mod frontend;
 mod host;
@@ -214,11 +217,11 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
     let (script, script_rx) = ScriptRuntime::spawn();
     let bridge = Arc::new(ScriptBridge::new(script));
 
-    let mut acp_drivers = Vec::new();
+    let mut agent_drivers = Vec::new();
     match &cli.mock_script {
         Some(path) => install_mock_provider(&agent, path)?,
         None => {
-            acp_drivers = host::install_builtin_providers(&agent);
+            agent_drivers = host::install_builtin_providers(&agent);
             for i in resolved.providers.clone() {
                 agent.providers_mut().add_instance(i);
             }
@@ -252,7 +255,7 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
     let input_rx = with_signals(input_rx);
 
     let mut host = Host::new(agent.clone(), bridge.clone(), frontend);
-    host.adopt_acp_drivers(acp_drivers);
+    host.adopt_agent_drivers(agent_drivers);
     host.discover_repo(&cwd).await;
     // `--clean` reads and writes nothing, which has to include conversations.
     host.restore_sessions((!paths.clean).then(|| paths.state.clone())).await;

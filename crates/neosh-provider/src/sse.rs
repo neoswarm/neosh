@@ -10,7 +10,12 @@
 //! verbatim inside a `{"type":"stream_event","event":{...}}` envelope, so the HTTPS driver and the
 //! subprocess driver share this parser exactly rather than each growing their own.
 
-use neosh_proto::{BlockStartKind, ProviderEvent, StopReason, ToolCallId, Usage};
+use std::collections::{BTreeMap, HashMap};
+
+use neosh_proto::{
+    Activity, BlockStartKind, DriverCommand, PlanState, PlanStep, ProviderEvent, StopReason, TaskId,
+    TaskStatus, ToolCallId, Usage,
+};
 use serde_json::Value;
 
 fn u64_at(v: &Value, key: &str) -> u64 {
@@ -154,16 +159,48 @@ fn str_at(v: &Value, key: &str) -> Option<String> {
 ///
 /// The CLI multiplexes several event families on one stream; only `stream_event` carries model
 /// output, and its `event` field is the raw Anthropic SSE payload.
-pub fn claude_cli_line(v: &Value) -> Vec<ProviderEvent> {
+pub fn claude_cli_line(v: &Value, state: &mut ClaudeState) -> Vec<ProviderEvent> {
+    // A sub-agent's traffic is stamped with the call that started it, and only half of it arrives:
+    // the CLI streams `stream_event` for the top-level agent alone and reports a sub-agent as
+    // whole `assistant` and `user` messages. Reading those `user` lines put a column of results
+    // into the transcript whose calls had never been mentioned — answers to questions nobody saw
+    // asked, with no card to sit under. A sub-agent's own account of what it did comes back as the
+    // result of the `Agent` call, under that call's card, and as `task_*` lines that are *not*
+    // stamped this way, which is how the swarm is followed without the transcript being invaded.
+    if !v.get("parent_tool_use_id").is_none_or(Value::is_null) {
+        return Vec::new();
+    }
     let Some(kind) = v.get("type").and_then(Value::as_str) else { return Vec::new() };
     match kind {
-        "stream_event" => v.get("event").and_then(anthropic).into_iter().collect(),
+        "stream_event" => {
+            let events: Vec<ProviderEvent> = v.get("event").and_then(anthropic).into_iter().collect();
+            state.said |= events.iter().any(|e| {
+                matches!(e, ProviderEvent::TextDelta { .. } | ProviderEvent::BlockStart { .. })
+            });
+            events
+        }
         // The CLI runs its own tools, and reports each result as a user message carrying
         // `tool_result` blocks. Dropping these leaves a transcript full of calls and no answers,
         // which reads as a tool that hung — so they are the other half of the stream, not chatter.
-        "user" => tool_results(v.get("message").unwrap_or(&Value::Null)),
+        //
+        // The same results are also where a newly created plan step learns its number, so the
+        // tracker sees them before they are turned into events.
+        "user" => {
+            let message = v.get("message").unwrap_or(&Value::Null);
+            let mut out = state.plan.saw_results(message);
+            out.extend(tool_results(message));
+            out
+        }
+        // Whole assistant messages, which `stream_event` has already said everything about — with
+        // one exception. A tool call arrives here with its arguments *complete*, where the stream
+        // delivers them as JSON fragments that are only parsed at block close. The plan is read out
+        // of ordinary tool calls, so this is the copy that can be read without reassembling
+        // anything.
+        "assistant" => state.plan.saw_calls(v.get("message").unwrap_or(&Value::Null)),
+        "system" => system_line(v, state),
         // A `result` with is_error signals the CLI itself failed (auth, spawn, quota).
         "result" if v.get("is_error").and_then(Value::as_bool) == Some(true) => {
+            state.said = false;
             vec![ProviderEvent::Error {
                 message: v
                     .get("result")
@@ -173,8 +210,191 @@ pub fn claude_cli_line(v: &Value) -> Vec<ProviderEvent> {
                 retryable: false,
             }]
         }
+        // A turn that said nothing, which is not the same as a turn that did nothing. The only
+        // account of it is on this line, so it is turned into the message the turn never sent —
+        // rather than left as a question with a blank under it.
+        "result" => {
+            let said = std::mem::replace(&mut state.said, false);
+            let text = v.get("result").and_then(Value::as_str).unwrap_or_default().trim();
+            if said || text.is_empty() {
+                return Vec::new();
+            }
+            // A `message_start` first, and not for form's sake: block indices are only unique
+            // within a message, so a bare `block_start { index: 0 }` would land on top of the
+            // block 0 of whatever the *previous* turn said and quietly replace it.
+            vec![
+                ProviderEvent::MessageStart { model: None, usage: Usage::default() },
+                ProviderEvent::BlockStart { index: 0, block: BlockStartKind::Text },
+                ProviderEvent::TextDelta { index: 0, text: text.to_string() },
+                ProviderEvent::BlockStop { index: 0 },
+                ProviderEvent::MessageStop,
+            ]
+        }
         _ => Vec::new(),
     }
+}
+
+/// What reading the CLI's stream needs to remember between lines.
+///
+/// Mirrors [`OpenAiState`]: the parser stays a function of one line plus what came before it,
+/// rather than the driver growing a second understanding of the wire format.
+#[derive(Debug, Default)]
+pub struct ClaudeState {
+    plan: Plan,
+    /// Whether anything has been said since the last `result` line.
+    ///
+    /// Some turns produce no message at all. `/compact` is the clearest one: two status lines, a
+    /// boundary, and a `result` whose `result` field carries the only sentence anybody wrote. With
+    /// nothing watching for that, the turn arrived as a question with no answer under it.
+    said: bool,
+}
+
+fn activity(a: Activity) -> ProviderEvent {
+    ProviderEvent::Activity { activity: a }
+}
+
+/// The `{"type":"system"}` families — everything the CLI says about its own loop rather than about
+/// the message it is producing.
+///
+/// These were dropped wholesale until the transcript had somewhere to put them. See
+/// [`neosh_proto::Activity`].
+fn system_line(v: &Value, state: &mut ClaudeState) -> Vec<ProviderEvent> {
+    let str_at = |k: &str| v.get(k).and_then(Value::as_str).map(str::to_string);
+    let task = || v.get("task_id").and_then(Value::as_str).map(|s| TaskId(s.to_string()));
+    match v.get("subtype").and_then(Value::as_str) {
+        // The handshake. Among a great deal else it lists every command this install accepts —
+        // project commands, plugin commands and MCP prompts included, which is exactly why the
+        // list cannot be written down anywhere in neosh.
+        Some("init") => {
+            let Some(names) = v.get("slash_commands").and_then(Value::as_array) else {
+                return Vec::new();
+            };
+            let commands = names
+                .iter()
+                .filter_map(Value::as_str)
+                .map(|name| DriverCommand {
+                    name: name.to_string(),
+                    description: None,
+                    argument_hint: None,
+                })
+                .collect();
+            vec![activity(Activity::Commands { commands })]
+        }
+        Some("task_started") => {
+            let Some(task) = task() else { return Vec::new() };
+            vec![activity(Activity::TaskStarted {
+                task,
+                title: str_at("description").unwrap_or_else(|| "sub-agent".into()),
+                role: str_at("subagent_type"),
+                parent_call: str_at("tool_use_id").map(ToolCallId),
+                model: str_at("model"),
+            })]
+        }
+        Some("task_progress") => {
+            let Some(task) = task() else { return Vec::new() };
+            vec![activity(Activity::TaskProgress {
+                task,
+                summary: str_at("summary").or_else(|| str_at("description")),
+                last_tool: str_at("last_tool_name"),
+                usage: task_usage(v.get("usage")),
+            })]
+        }
+        // The status patch. Only worth an event when it says the task stopped being ours: a patch
+        // that renames it is not news, and a stream of non-events would push everything else off
+        // the screen.
+        Some("task_updated") => {
+            let (Some(task), Some(patch)) = (task(), v.get("patch")) else { return Vec::new() };
+            let status = patch
+                .get("status")
+                .and_then(Value::as_str)
+                .and_then(task_status)
+                .or_else(|| {
+                    (patch.get("is_backgrounded").and_then(Value::as_bool) == Some(true))
+                        .then_some(TaskStatus::Backgrounded)
+                });
+            match status {
+                Some(TaskStatus::Running) | None => Vec::new(),
+                Some(status) => vec![activity(Activity::TaskEnded {
+                    task,
+                    status,
+                    summary: patch.get("error").and_then(Value::as_str).map(str::to_string),
+                })],
+            }
+        }
+        // The report, which is the one that carries what the sub-agent actually concluded.
+        Some("task_notification") => {
+            let Some(task) = task() else { return Vec::new() };
+            vec![activity(Activity::TaskEnded {
+                task,
+                status: str_at("status").as_deref().and_then(task_status).unwrap_or(TaskStatus::Done),
+                summary: str_at("summary"),
+            })]
+        }
+        // A snapshot of what is running unattended. Redundant with `task_started` for anything this
+        // stream watched begin — and not redundant at all for a task that was already running when
+        // the conversation was resumed, which is the case where "is something still going?" is a
+        // question somebody actually has. Announcing them is safe: a receiver keys by task id.
+        Some("background_tasks_changed") => v
+            .get("tasks")
+            .and_then(Value::as_array)
+            .map(|tasks| {
+                tasks
+                    .iter()
+                    .filter_map(|t| {
+                        Some(activity(Activity::TaskStarted {
+                            task: TaskId(t.get("task_id").and_then(Value::as_str)?.to_string()),
+                            title: t
+                                .get("description")
+                                .and_then(Value::as_str)
+                                .unwrap_or("sub-agent")
+                                .to_string(),
+                            role: t.get("task_type").and_then(Value::as_str).map(str::to_string),
+                            parent_call: None,
+                            model: None,
+                        }))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default(),
+        // `status` is the CLI narrating itself. `requesting` is every turn and says nothing;
+        // `compacting` is the several seconds where it answers nothing at all, which without this
+        // is indistinguishable from a hang.
+        Some("status") if str_at("status").as_deref() == Some("compacting") => {
+            vec![activity(Activity::Compacting)]
+        }
+        // Compaction landed, and this is the only line with the numbers on it.
+        Some("compact_boundary") => {
+            let meta = v.get("compact_metadata");
+            let n = |k: &str| meta.and_then(|m| m.get(k)).and_then(Value::as_u64);
+            // A boundary resets the conversation the CLI is holding, so a plan built from calls
+            // that are no longer in its context is a checklist for work it can no longer see.
+            state.plan.clear();
+            vec![activity(Activity::Compacted { before: n("pre_tokens"), after: n("post_tokens") })]
+        }
+        _ => Vec::new(),
+    }
+}
+
+fn task_status(s: &str) -> Option<TaskStatus> {
+    match s {
+        "completed" | "succeeded" | "success" => Some(TaskStatus::Done),
+        "failed" | "error" => Some(TaskStatus::Failed),
+        "cancelled" | "canceled" | "killed" | "stopped" => Some(TaskStatus::Cancelled),
+        "backgrounded" => Some(TaskStatus::Backgrounded),
+        "running" | "in_progress" | "pending" | "paused" => Some(TaskStatus::Running),
+        _ => None,
+    }
+}
+
+/// A task's usage, which the CLI reports in its own shape rather than the Messages one — a total,
+/// not a breakdown. Put in `output_tokens` because that is the field a total is least wrong in:
+/// what a sub-agent cost is dominated by what it produced.
+fn task_usage(v: Option<&Value>) -> Usage {
+    let Some(v) = v else { return Usage::default() };
+    if let Some(total) = v.get("total_tokens").and_then(Value::as_u64) {
+        return Usage { output_tokens: total, ..Usage::default() };
+    }
+    usage_from(v)
 }
 
 /// The `tool_result` blocks of a message, if it has any.
@@ -212,6 +432,143 @@ fn result_text(content: Option<&Value>) -> String {
             .collect::<Vec<_>>()
             .join("\n"),
         _ => String::new(),
+    }
+}
+
+/// The agent's own checklist, rebuilt from the calls that maintain it.
+///
+/// There is no plan channel. A plan is not something the CLI announces — it is a tool the agent
+/// calls, and the list is whatever those calls have added up to. So this reads them: `TodoWrite`,
+/// which carries the whole list every time, and the `TaskCreate` / `TaskUpdate` pair that replaced
+/// it in recent versions and carries one step at a time. Both are supported because which one an
+/// install has is not something neosh gets to decide.
+///
+/// The awkward part is that `TaskCreate` does not say which number it got — the *result* does
+/// (`"Task #2 created successfully: …"`). So a create is held until its result comes back. That is
+/// the CLI's own numbering rather than an invented one, which matters because `TaskUpdate` refers
+/// to steps by it.
+#[derive(Debug, Default)]
+struct Plan {
+    /// Steps by the number the CLI gave them. Ordered: a checklist that reshuffles between two
+    /// draws is one nobody can read.
+    steps: BTreeMap<u32, PlanStep>,
+    /// Creates waiting for the result that names them, by tool call id.
+    naming: HashMap<String, String>,
+}
+
+impl Plan {
+    fn clear(&mut self) {
+        self.steps.clear();
+        self.naming.clear();
+    }
+
+    fn emit(&self) -> Vec<ProviderEvent> {
+        vec![activity(Activity::Plan { steps: self.steps.values().cloned().collect() })]
+    }
+
+    /// Tool calls, whole, from an `assistant` line.
+    fn saw_calls(&mut self, message: &Value) -> Vec<ProviderEvent> {
+        let Some(blocks) = message.get("content").and_then(Value::as_array) else {
+            return Vec::new();
+        };
+        let mut changed = false;
+        for b in blocks.iter().filter(|b| b.get("type").and_then(Value::as_str) == Some("tool_use"))
+        {
+            let (Some(name), Some(input)) =
+                (b.get("name").and_then(Value::as_str), b.get("input"))
+            else {
+                continue;
+            };
+            match name {
+                // The whole list, every time. Replacing rather than merging is the point: this
+                // call *is* the plan, including the steps it silently dropped.
+                "TodoWrite" => {
+                    let Some(todos) = input.get("todos").and_then(Value::as_array) else { continue };
+                    self.steps = todos
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(i, t)| {
+                            let text = t.get("content").and_then(Value::as_str)?.trim();
+                            (!text.is_empty()).then(|| {
+                                (i as u32, PlanStep {
+                                    text: text.to_string(),
+                                    state: plan_state(t.get("status").and_then(Value::as_str)),
+                                })
+                            })
+                        })
+                        .collect();
+                    self.naming.clear();
+                    changed = true;
+                }
+                "TaskCreate" => {
+                    if let (Some(id), Some(subject)) = (
+                        b.get("id").and_then(Value::as_str),
+                        input.get("subject").and_then(Value::as_str),
+                    ) {
+                        self.naming.insert(id.to_string(), subject.to_string());
+                    }
+                }
+                "TaskUpdate" => {
+                    let Some(n) = input.get("taskId").and_then(number) else { continue };
+                    if let Some(step) = self.steps.get_mut(&n) {
+                        step.state = plan_state(input.get("status").and_then(Value::as_str));
+                        if let Some(subject) = input.get("subject").and_then(Value::as_str) {
+                            step.text = subject.to_string();
+                        }
+                        changed = true;
+                    }
+                }
+                _ => {}
+            }
+        }
+        if changed { self.emit() } else { Vec::new() }
+    }
+
+    /// The results of those calls, from a `user` line. Only a held `TaskCreate` is looking for one.
+    fn saw_results(&mut self, message: &Value) -> Vec<ProviderEvent> {
+        if self.naming.is_empty() {
+            return Vec::new();
+        }
+        let Some(blocks) = message.get("content").and_then(Value::as_array) else {
+            return Vec::new();
+        };
+        let mut changed = false;
+        for b in
+            blocks.iter().filter(|b| b.get("type").and_then(Value::as_str) == Some("tool_result"))
+        {
+            let Some(id) = b.get("tool_use_id").and_then(Value::as_str) else { continue };
+            let Some(text) = self.naming.remove(id) else { continue };
+            // `Task #2 created successfully: …`. A create that failed says something else entirely,
+            // and a step with no number is a step `TaskUpdate` could never reach again.
+            if let Some(n) = result_text(b.get("content"))
+                .split_once('#')
+                .and_then(|(_, rest)| number(&Value::String(rest.to_string())))
+            {
+                self.steps.insert(n, PlanStep { text, state: PlanState::Pending });
+                changed = true;
+            }
+        }
+        if changed { self.emit() } else { Vec::new() }
+    }
+}
+
+fn plan_state(s: Option<&str>) -> PlanState {
+    match s {
+        Some("completed" | "done") => PlanState::Done,
+        Some("in_progress" | "active") => PlanState::Active,
+        _ => PlanState::Pending,
+    }
+}
+
+/// A step number, however it was spelled. `TaskUpdate` sends `"1"`; nothing says it always will.
+fn number(v: &Value) -> Option<u32> {
+    match v {
+        Value::Number(n) => n.as_u64().and_then(|n| u32::try_from(n).ok()),
+        Value::String(s) => {
+            let digits: String = s.trim().chars().take_while(char::is_ascii_digit).collect();
+            digits.parse().ok()
+        }
+        _ => None,
     }
 }
 
@@ -491,12 +848,29 @@ mod tests {
         r#"{"type":"rate_limit_event","rate_limit_info":{"status":"allowed"}}"#,
     ];
 
+    /// Every line in order, through one parser state, the way the driver reads them.
+    fn cli(lines: &[&str]) -> Vec<ProviderEvent> {
+        let mut state = ClaudeState::default();
+        lines
+            .iter()
+            .flat_map(|l| claude_cli_line(&serde_json::from_str(l).unwrap(), &mut state))
+            .collect()
+    }
+
+    /// The one activity of a kind, or a panic naming what was there instead.
+    fn only_activity(events: &[ProviderEvent]) -> Vec<&Activity> {
+        events
+            .iter()
+            .filter_map(|e| match e {
+                ProviderEvent::Activity { activity } => Some(activity),
+                _ => None,
+            })
+            .collect()
+    }
+
     #[test]
     fn parses_real_claude_cli_output() {
-        let events: Vec<ProviderEvent> = REAL_CLI_LINES
-            .iter()
-            .flat_map(|l| claude_cli_line(&serde_json::from_str(l).unwrap()))
-            .collect();
+        let events = cli(REAL_CLI_LINES);
 
         assert!(matches!(events[0], ProviderEvent::MessageStart { .. }));
         assert!(matches!(
@@ -511,13 +885,249 @@ mod tests {
             ProviderEvent::MessageDelta { stop_reason: Some(StopReason::EndTurn), .. }
         ));
         assert_eq!(events[6], ProviderEvent::MessageStop);
-        assert_eq!(events.len(), 7, "non-model event families must be ignored, not mapped");
+        assert_eq!(
+            events.len(),
+            7,
+            "a line that says nothing about the loop or the message stays unmapped"
+        );
+    }
+
+    /// A real capture of a turn that ran the `Agent` tool. The sub-agent's three calls arrive as
+    /// whole `assistant` messages the CLI never streams, so reading its `user` lines put results
+    /// in the transcript with no card to sit under; its report comes back on the parent's own
+    /// call, which is the line worth keeping.
+    const REAL_SUBAGENT_LINES: &[&str] = &[
+        r#"{"type":"user","message":{"role":"user","content":[{"tool_use_id":"toolu_inner","type":"tool_result","content":"drwxr-xr-x - meszmate .git\n","is_error":false}]},"parent_tool_use_id":"toolu_agent","session_id":"s"}"#,
+        r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_inner2","name":"Bash","input":{"command":"ls"}}]},"parent_tool_use_id":"toolu_agent","session_id":"s"}"#,
+        r#"{"type":"user","message":{"role":"user","content":[{"tool_use_id":"toolu_agent","type":"tool_result","content":[{"type":"text","text":"Full listing of /tmp/cwdprobe"}]}]},"parent_tool_use_id":null,"session_id":"s"}"#,
+    ];
+
+    #[test]
+    fn a_sub_agents_results_are_not_the_conversations_results() {
+        let events = cli(REAL_SUBAGENT_LINES);
+        assert_eq!(
+            events,
+            vec![ProviderEvent::ToolResult {
+                id: ToolCallId("toolu_agent".into()),
+                content: "Full listing of /tmp/cwdprobe".into(),
+                is_error: false,
+            }],
+            "only the `Agent` call's own result belongs to this conversation"
+        );
+    }
+
+    /// A real capture of a turn that made a three-step plan and ran one sub-agent, on
+    /// `claude 2.1.237`. Everything the loop said about itself is here and nothing else is: no
+    /// `stream_event`, so what this pins is exactly the families that used to be dropped.
+    const REAL_ACTIVITY_LINES: &[&str] = &[
+        r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_01NVuDGUeC1xTjRgpWsTpQza","name":"TaskCreate","input":{"subject":"Clear desk surface","description":"Remove all items from desk and organize them"},"caller":{"type":"direct"}}]}}"#,
+        r#"{"type":"user","message":{"role":"user","content":[{"tool_use_id":"toolu_01NVuDGUeC1xTjRgpWsTpQza","type":"tool_result","content":"Task #1 created successfully: Clear desk surface"}]}}"#,
+        r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_01EWUHzrGFrNezWY5iANJvb5","name":"TaskCreate","input":{"subject":"Organize desk drawers","description":"Sort and arrange items in desk drawers"},"caller":{"type":"direct"}}]}}"#,
+        r#"{"type":"user","message":{"role":"user","content":[{"tool_use_id":"toolu_01EWUHzrGFrNezWY5iANJvb5","type":"tool_result","content":"Task #2 created successfully: Organize desk drawers"}]}}"#,
+        r#"{"type":"system","subtype":"background_tasks_changed","tasks":[{"task_id":"a0618fd73e2bcb9ba","task_type":"local_agent","description":"Say hello"}]}"#,
+        r#"{"type":"system","subtype":"task_started","task_id":"a0618fd73e2bcb9ba","tool_use_id":"toolu_01VERa8BPA1ye6fSEenrQ1AB","description":"Say hello","subagent_type":"general-purpose","task_type":"local_agent","prompt":"Reply with only the word hello."}"#,
+        r#"{"type":"system","subtype":"task_updated","task_id":"a0618fd73e2bcb9ba","patch":{"status":"completed","end_time":1787281698599}}"#,
+        r#"{"type":"system","subtype":"task_notification","task_id":"a0618fd73e2bcb9ba","tool_use_id":"toolu_01VERa8BPA1ye6fSEenrQ1AB","status":"completed","summary":"hello","usage":{"total_tokens":6656,"tool_uses":0,"duration_ms":1289}}"#,
+        r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_01UFmF7pB2UFv1rp4QF1pY2h","name":"TaskUpdate","input":{"taskId":"1","status":"in_progress"},"caller":{"type":"direct"}}]}}"#,
+    ];
+
+    #[test]
+    fn a_plan_is_rebuilt_from_the_calls_that_maintain_it() {
+        let events = cli(REAL_ACTIVITY_LINES);
+        let plans: Vec<&Vec<PlanStep>> = only_activity(&events)
+            .into_iter()
+            .filter_map(|a| match a {
+                Activity::Plan { steps } => Some(steps),
+                _ => None,
+            })
+            .collect();
+
+        // One per change, and the first arrives with the *result* of the create — not the call,
+        // which does not yet know what number it got.
+        assert_eq!(plans.len(), 3, "a plan is reported when it changes, not when it is asked for");
+        assert_eq!(plans[0].len(), 1);
+        assert_eq!(
+            plans[2],
+            &vec![
+                PlanStep { text: "Clear desk surface".into(), state: PlanState::Active },
+                PlanStep { text: "Organize desk drawers".into(), state: PlanState::Pending },
+            ],
+            "`TaskUpdate` reaches step 1 by the CLI's own number"
+        );
+    }
+
+    #[test]
+    fn a_whole_todo_list_replaces_the_plan_rather_than_adding_to_it() {
+        // The older shape, still what an install one version back sends. Two calls, and the second
+        // drops a step: a plan that merged them would keep showing work that is no longer planned.
+        let events = cli(&[
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"t1","name":"TodoWrite","input":{"todos":[{"content":"one","status":"completed"},{"content":"two","status":"in_progress"},{"content":"three","status":"pending"}]}}]}}"#,
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"t2","name":"TodoWrite","input":{"todos":[{"content":"one","status":"completed"}]}}]}}"#,
+        ]);
+        let plans: Vec<&Vec<PlanStep>> = only_activity(&events)
+            .into_iter()
+            .filter_map(|a| match a {
+                Activity::Plan { steps } => Some(steps),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(plans[0].len(), 3);
+        assert_eq!(plans[0][1].state, PlanState::Active);
+        assert_eq!(plans[1].len(), 1, "the newest call is the plan, not an addition to it");
+    }
+
+    #[test]
+    fn a_sub_agent_is_followed_from_start_to_report() {
+        let events = cli(REAL_ACTIVITY_LINES);
+        let tasks: Vec<&Activity> = only_activity(&events)
+            .into_iter()
+            .filter(|a| !matches!(a, Activity::Plan { .. }))
+            .collect();
+        let id = TaskId("a0618fd73e2bcb9ba".into());
+
+        assert_eq!(
+            tasks[0],
+            &Activity::TaskStarted {
+                task: id.clone(),
+                title: "Say hello".into(),
+                role: Some("local_agent".into()),
+                parent_call: None,
+                model: None,
+            },
+            "the background snapshot announces it, for the resumed conversation that never saw it start"
+        );
+        assert_eq!(
+            tasks[1],
+            &Activity::TaskStarted {
+                task: id.clone(),
+                title: "Say hello".into(),
+                role: Some("general-purpose".into()),
+                // The call whose card it belongs under. Without this the swarm is a flat list
+                // beside the transcript rather than part of it.
+                parent_call: Some(ToolCallId("toolu_01VERa8BPA1ye6fSEenrQ1AB".into())),
+                model: None,
+            }
+        );
+        assert_eq!(
+            tasks[2],
+            &Activity::TaskEnded { task: id.clone(), status: TaskStatus::Done, summary: None },
+            "the status patch"
+        );
+        assert_eq!(
+            tasks[3],
+            &Activity::TaskEnded {
+                task: id,
+                status: TaskStatus::Done,
+                summary: Some("hello".into()),
+            },
+            "and the report, which is the one that says what it concluded"
+        );
+    }
+
+    /// A real `/compact`, captured on `claude 2.1.237`. Three lines, no message and no
+    /// `message_stop` at all — which is why a turn used to be reported as having crashed.
+    const REAL_COMPACT_LINES: &[&str] = &[
+        r#"{"type":"system","subtype":"status","status":"compacting"}"#,
+        r#"{"type":"system","subtype":"status","status":null,"compact_result":"success"}"#,
+        r#"{"type":"system","subtype":"compact_boundary","compact_metadata":{"trigger":"manual","pre_tokens":20317,"post_tokens":1597,"cumulative_dropped_tokens":18720,"duration_ms":19927}}"#,
+    ];
+
+    #[test]
+    fn a_turn_that_produced_no_message_still_says_what_happened() {
+        // `/compact` is the case: two status lines, a boundary, and a `result` carrying the only
+        // sentence anybody wrote. Read as "no message", the turn arrived as a question with a
+        // blank under it — which is what a crash looks like.
+        let mut lines = REAL_COMPACT_LINES.to_vec();
+        lines.push(
+            r#"{"type":"result","subtype":"success","is_error":false,"num_turns":0,"result":"Compacted the conversation."}"#,
+        );
+        let events = cli(&lines);
+        let text: Vec<&ProviderEvent> = events
+            .iter()
+            .filter(|e| !matches!(e, ProviderEvent::Activity { .. }))
+            .collect();
+        assert_eq!(
+            text,
+            vec![
+                // The `message_start` matters: without it this block 0 lands on top of the last
+                // thing the previous turn said.
+                &ProviderEvent::MessageStart { model: None, usage: Usage::default() },
+                &ProviderEvent::BlockStart { index: 0, block: BlockStartKind::Text },
+                &ProviderEvent::TextDelta { index: 0, text: "Compacted the conversation.".into() },
+                &ProviderEvent::BlockStop { index: 0 },
+                &ProviderEvent::MessageStop,
+            ]
+        );
+    }
+
+    #[test]
+    fn a_turn_that_did_say_something_does_not_say_it_twice() {
+        // The same `result` line carries a copy of the answer that was just streamed. Emitting it
+        // unconditionally would print every answer twice, which is a worse bug than the one above.
+        let mut lines = REAL_CLI_LINES.to_vec();
+        lines.push(
+            r#"{"type":"result","subtype":"success","is_error":false,"result":"1, 2, 3"}"#,
+        );
+        let events = cli(&lines);
+        assert_eq!(
+            events.iter().filter(|e| matches!(e, ProviderEvent::TextDelta { .. })).count(),
+            1,
+            "the streamed answer is the answer"
+        );
+    }
+
+    #[test]
+    fn compaction_is_said_out_loud_at_both_ends() {
+        let events = cli(REAL_COMPACT_LINES);
+        assert_eq!(
+            only_activity(&events),
+            vec![
+                &Activity::Compacting,
+                &Activity::Compacted { before: Some(20317), after: Some(1597) },
+            ],
+            "twenty seconds of silence needs a start, and the numbers only exist on the boundary"
+        );
+    }
+
+    #[test]
+    fn a_compaction_throws_away_a_plan_the_cli_can_no_longer_see() {
+        let mut lines: Vec<&str> = vec![
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"t1","name":"TodoWrite","input":{"todos":[{"content":"one","status":"pending"}]}}]}}"#,
+        ];
+        lines.extend_from_slice(REAL_COMPACT_LINES);
+        lines.push(
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"t2","name":"TaskUpdate","input":{"taskId":"0","status":"completed"}}]}}"#,
+        );
+        let events = cli(&lines);
+        let plans = only_activity(&events)
+            .into_iter()
+            .filter(|a| matches!(a, Activity::Plan { .. }))
+            .count();
+        assert_eq!(plans, 1, "the update lands on a step that no longer exists, and says nothing");
+    }
+
+    #[test]
+    fn the_handshake_says_which_commands_this_install_accepts() {
+        let events = cli(&[
+            r#"{"type":"system","subtype":"init","session_id":"s","model":"claude-opus-5","slash_commands":["compact","context","init","security-review"]}"#,
+        ]);
+        let [Activity::Commands { commands }] = only_activity(&events)[..] else {
+            panic!("expected the command list");
+        };
+        assert_eq!(commands.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(), [
+            "compact",
+            "context",
+            "init",
+            "security-review"
+        ]);
     }
 
     #[test]
     fn message_start_carries_cache_usage() {
         let v: Value = serde_json::from_str(REAL_CLI_LINES[0]).unwrap();
-        let [ProviderEvent::MessageStart { usage, model }] = &claude_cli_line(&v)[..] else {
+        let mut state = ClaudeState::default();
+        let [ProviderEvent::MessageStart { usage, model }] = &claude_cli_line(&v, &mut state)[..]
+        else {
             panic!("expected MessageStart");
         };
         assert_eq!(usage.cache_read_tokens, 12078);

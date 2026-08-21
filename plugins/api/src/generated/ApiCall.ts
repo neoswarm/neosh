@@ -151,6 +151,8 @@ export type ApiCall =
     refresh: boolean;
   }
   | { "call": "agent_list_instances" }
+  | { "call": "agent_driver_commands" }
+  | { "call": "chat_set_draft"; text: string }
   | { "call": "provider_credentials" }
   | {
     "call": "provider_set_credential";
@@ -203,6 +205,16 @@ export type ApiCall =
     "call": "provider_register_driver";
     driver: DriverKind;
     instances: Array<InstanceConfig>;
+    /**
+     * Whether this driver runs its own agent loop, like `claude` or anything speaking ACP.
+     *
+     * It changes what the host does with the stream, not how the stream is produced: an agent
+     * driver is sent no tool list, because it brings its own, and neosh's tool registry, hooks
+     * and permission layer therefore do not gate what it does. Saying so is the honest option
+     * — a plugin shipping an agent driver that claimed to be a model driver would have the
+     * host run its tool calls a second time.
+     */
+    agent_loop: boolean;
   }
   | { "call": "provider_emit"; stream: StreamId; event: ProviderEvent }
   | { "call": "permission_get_mode" }

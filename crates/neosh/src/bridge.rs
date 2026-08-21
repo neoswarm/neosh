@@ -187,11 +187,19 @@ pub struct PluginProvider {
     driver: DriverKind,
     plugin: PluginId,
     bridge: Arc<ScriptBridge>,
+    /// Declared at registration. See [`ApiCall::ProviderRegisterDriver`] for why a plugin gets to
+    /// say this at all.
+    agent_loop: bool,
 }
 
 impl PluginProvider {
-    pub fn new(driver: DriverKind, plugin: PluginId, bridge: Arc<ScriptBridge>) -> Self {
-        Self { driver, plugin, bridge }
+    pub fn new(
+        driver: DriverKind,
+        plugin: PluginId,
+        bridge: Arc<ScriptBridge>,
+        agent_loop: bool,
+    ) -> Self {
+        Self { driver, plugin, bridge, agent_loop }
     }
 }
 
@@ -199,6 +207,10 @@ impl PluginProvider {
 impl Provider for PluginProvider {
     fn driver(&self) -> DriverKind {
         self.driver.clone()
+    }
+
+    fn delegates_agent_loop(&self) -> bool {
+        self.agent_loop
     }
 
     async fn list_models(

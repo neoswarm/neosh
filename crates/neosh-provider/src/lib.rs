@@ -19,6 +19,7 @@
 //! Its trade-off is explicit in [`Provider::delegates_agent_loop`], and the host surfaces it rather
 //! than pretending the two kinds are interchangeable.
 
+pub mod approval;
 pub mod catalog;
 pub mod credentials;
 pub mod drivers;

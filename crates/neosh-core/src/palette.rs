@@ -77,6 +77,10 @@ struct Roles {
     /// and the world has already decided what colour a heart is — painting it anything else reads
     /// as a decision the user has to decode.
     favorite: Color,
+    /// The faces of the logo, top row first: bright at the lit edge, falling away downward.
+    logo: [Color; 6],
+    /// The shadow the logo's letters cast.
+    logo_edge: Color,
 }
 
 const DARK: Roles = Roles {
@@ -92,6 +96,15 @@ const DARK: Roles = Roles {
     plan: rgb(0xc4, 0xb5, 0xfd),
     accent: rgb(0xa5, 0xb4, 0xfc),
     favorite: rgb(0xfb, 0x64, 0x7b),
+    logo: [
+        rgb(0xf8, 0xfa, 0xfc),
+        rgb(0xe2, 0xe8, 0xf0),
+        rgb(0xc4, 0xcc, 0xd8),
+        rgb(0xa1, 0xaa, 0xb8),
+        rgb(0x7e, 0x87, 0x97),
+        rgb(0x5f, 0x68, 0x77),
+    ],
+    logo_edge: rgb(0x3a, 0x40, 0x4c),
 };
 
 const LIGHT: Roles = Roles {
@@ -107,6 +120,17 @@ const LIGHT: Roles = Roles {
     plan: rgb(0x7c, 0x3a, 0xed),
     accent: rgb(0x4f, 0x46, 0xe5),
     favorite: rgb(0xe1, 0x1d, 0x48),
+    // Reversed against a light background: the lit edge is the dark one, as a steel letter on
+    // paper is darkest where it stands up.
+    logo: [
+        rgb(0x1e, 0x29, 0x3b),
+        rgb(0x33, 0x41, 0x55),
+        rgb(0x47, 0x55, 0x69),
+        rgb(0x64, 0x74, 0x8b),
+        rgb(0x7f, 0x8c, 0x9f),
+        rgb(0x9a, 0xa5, 0xb5),
+    ],
+    logo_edge: rgb(0xc3, 0xc9, 0xd2),
 };
 
 fn fg(c: Color) -> HighlightSpec {
@@ -204,6 +228,29 @@ pub fn groups(variant: Variant) -> Vec<(&'static str, HighlightDef)> {
         ("Agent.ToolRunning", spec(pulse(fg(r.attention), 2600))),
         ("Agent.ToolDone", spec(fg(r.success))),
         ("Agent.ToolFailed", spec(bold(fg(r.danger)))),
+        // The subject of a call that has not come back: the command, the path, the query. A sweep
+        // rather than the dot's pulse, because this is a *run* of text — a band travelling along
+        // the command you are waiting on is legible from across the room, and a single glyph
+        // brightening and dimming is not. It settles into the quiet colour the moment it lands.
+        ("Agent.ToolLive", spec(shimmer(fg(r.active), 2000))),
+        // What sort of thing a call is, worn by the tool's own name. Colour rather than a second
+        // vocabulary: the name stays whatever the tool calls itself, and the column becomes
+        // scannable without the transcript describing tools that do not exist.
+        ("Agent.ToolRead", spec(fg(r.active))),
+        ("Agent.ToolEdit", spec(fg(r.success))),
+        ("Agent.ToolRun", spec(fg(r.attention))),
+        ("Agent.ToolNet", spec(fg(r.accent))),
+        // The agent's own checklist. Three states and three weights, so which line is being worked
+        // on is answerable at a glance rather than by reading all of them: what is done recedes,
+        // what is next is ordinary text, and the one in hand sweeps like a running call — it *is*
+        // a running call, from the plan's point of view.
+        ("Agent.PlanDone", spec(dim(fg(r.success)))),
+        ("Agent.PlanActive", spec(shimmer(fg(r.active), 2000))),
+        ("Agent.PlanTodo", spec(fg(r.muted))),
+        // A sub-agent, while it is out. Same sweep as a running call for the same reason, and the
+        // quiet colour once it is not this turn's business any more.
+        ("Agent.TaskLive", spec(shimmer(fg(r.accent), 2000))),
+        ("Agent.TaskIdle", spec(dim(fg(r.muted)))),
         // ---- markdown -----------------------------------------------------
         // An answer is prose with structure in it, and the structure should be visible without
         // being loud: the thing being read is the words. Hence one accent for headings and links,
@@ -263,6 +310,19 @@ pub fn groups(variant: Variant) -> Vec<(&'static str, HighlightDef)> {
         // A context window nearly full is the one number that changes what you do next.
         ("Meter.Warn", spec(fg(r.attention))),
         ("Meter.Full", spec(bold(fg(r.danger)))),
+        // ---- the logo -----------------------------------------------------
+        // The word on the welcome screen, lit like brushed metal: a grey ramp down the faces of
+        // the letters and one dark grey for the shadow under them. Greys and not the accent, so
+        // the one coloured thing on that screen is still the key that does something. Six faces
+        // rather than a gradient the frontend computes, because a theme should be able to repaint
+        // the word — in its own metal, or flat — without the frontend knowing it is a word.
+        ("Logo.Face0", spec(fg(r.logo[0]))),
+        ("Logo.Face1", spec(fg(r.logo[1]))),
+        ("Logo.Face2", spec(fg(r.logo[2]))),
+        ("Logo.Face3", spec(fg(r.logo[3]))),
+        ("Logo.Face4", spec(fg(r.logo[4]))),
+        ("Logo.Face5", spec(fg(r.logo[5]))),
+        ("Logo.Edge", spec(fg(r.logo_edge))),
         // ---- widgets ------------------------------------------------------
         // Named so widget authors inherit the theme instead of picking colours. `@neosh/api/ui`
         // links its own groups to these.
@@ -356,6 +416,35 @@ mod tests {
             let all = groups(variant);
             let unique: BTreeSet<_> = all.iter().map(|(n, _)| *n).collect();
             assert_eq!(unique.len(), all.len(), "{variant:?} has a duplicate group");
+        }
+    }
+
+    #[test]
+    fn every_group_the_transcript_asks_for_is_defined() {
+        // A mark whose group does not exist is not an error anywhere: it is drawn in the default
+        // colour, which is exactly what a card looks like when it is working. These are the names
+        // `neosh/src/cards.rs` writes, and the only way to notice a typo in one is to say so here.
+        let names: BTreeSet<_> = contract().into_iter().collect();
+        for required in [
+            "Agent.ToolRunning",
+            "Agent.ToolDone",
+            "Agent.ToolFailed",
+            "Agent.ToolLive",
+            "Agent.ToolRead",
+            "Agent.ToolEdit",
+            "Agent.ToolRun",
+            "Agent.ToolNet",
+            "Agent.Tool",
+            "Agent.Usage",
+            "Agent.PlanDone",
+            "Agent.PlanActive",
+            "Agent.PlanTodo",
+            "Agent.TaskLive",
+            "Agent.TaskIdle",
+            "Diff.Add",
+            "Diff.Delete",
+        ] {
+            assert!(names.contains(required), "{required} is missing from the palette");
         }
     }
 

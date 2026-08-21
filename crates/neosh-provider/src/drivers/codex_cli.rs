@@ -1,4 +1,4 @@
-//! Drive the `codex` CLI as a provider.
+//! Drive `codex app-server` as a provider.
 //!
 //! # Why this exists
 //!
@@ -7,48 +7,149 @@
 //! two, the two most common plans a terminal agent's user already has are both reachable with no
 //! setup at all.
 //!
+//! # Why `app-server` and not `exec`
+//!
+//! Both are the same binary. `codex exec --json` is the one-shot: it takes a prompt, prints a line
+//! per thing that happened, and exits. It is simpler, and it cannot do four things that matter:
+//!
+//! 1. **Stream.** `exec` reports an assistant message *whole, on completion*. `app-server` sends
+//!    `item/agentMessage/delta` and `item/reasoning/textDelta`, so an answer arrives as it is
+//!    written rather than all at once at the end.
+//! 2. **Ask.** `exec` is non-interactive — there is nobody for it to ask — so neosh's `ask` mode
+//!    could only fail closed, stopping at the first write. `app-server` sends
+//!    `item/commandExecution/requestApproval` and `item/fileChange/requestApproval` as JSON-RPC
+//!    requests and blocks on the reply, which is the same shape ACP uses and reaches the same
+//!    person. See ADR 0032, which planned exactly this.
+//! 3. **Stop.** `turn/interrupt` asks the turn to end. Killing `exec` ends the process holding the
+//!    thread.
+//! 4. **Say what it is doing.** `turn/plan/updated` is a real checklist, `thread/tokenUsage/updated`
+//!    carries the context window, and `collabAgentToolCall` / `subAgentActivity` are the swarm.
+//!    None of it exists in `exec`'s output. See [`neosh_proto::Activity`].
+//!
+//! And it costs nothing: `model/list` already needed an `app-server`, so this is one transport
+//! where there were two.
+//!
 //! # What it actually is
 //!
-//! An **agent driver**. `codex exec` runs its own loop, with its own tools, its own sandbox and its
-//! own approval policy — so neosh's tool registry is not in play and `tool.pre` hooks observe
-//! rather than gate. [`Provider::delegates_agent_loop`] is how that is said out loud rather than
-//! quietly assumed.
+//! An **agent driver**. Codex runs its own loop, with its own tools and its own sandbox — so
+//! neosh's tool registry is not in play and `tool.pre` hooks observe rather than gate.
+//! [`Provider::delegates_agent_loop`] is how that is said out loud rather than quietly assumed.
 //!
-//! The sandbox is deliberately not overridden here. `codex` has a policy, the user configured it,
-//! and a wrapper that silently passed `--dangerously-bypass-approvals-and-sandbox` to make turns
-//! run more smoothly would be making a security decision on somebody else's behalf. What that
-//! means in practice: a turn that wants to write a file may stop and say it needs approval, and
-//! the answer is to configure `codex`, not neosh.
+//! # One process per conversation
 //!
-//! # The wire format
-//!
-//! `codex exec --json` emits one JSON object per line, documented as `ThreadEvent`: a
-//! `thread.started`, then `item.started` / `item.updated` / `item.completed` for each thing the
-//! agent does, then `turn.completed`. Unlike the Anthropic SSE that `claude_cli` re-uses verbatim,
-//! there are **no token deltas** — an assistant message arrives whole, on completion. So a turn
-//! through this driver shows its tool activity live and then its answer all at once. That is a
-//! property of the CLI, not a shortcut taken here.
+//! Started once and kept, like `claude_cli` — but simpler, because there is nothing here that has
+//! to be said on a command line. The model, the effort, the sandbox, the approval policy and even
+//! the directory are all parameters of `turn/start`, so **nothing ever needs a new process**: a
+//! change to any of them takes effect on the next turn with no relaunch at all. What the process
+//! holds is the thread, and `thread/resume` puts it back if it ever has to be replaced.
 
+use std::collections::HashMap;
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use neosh_proto::{
-    BlockStartKind, ContentBlock, DriverKind, InstanceConfig, Message, ModelCapabilities, ModelInfo,
-    ModelTier, OptionChoice, ProviderEvent, ProviderOptionDescriptor, Role, StopReason, ToolCallId,
-    TurnRequest, Usage,
+    Activity, BlockStartKind, Capability, ContentBlock, DriverKind, InstanceConfig, Message,
+    ModelCapabilities, ModelInfo, ModelTier, OptionChoice, PermissionMode, PermissionOption,
+    PermissionOptionKind, PlanState, PlanStep, ProviderEvent, ProviderOptionDescriptor, Role,
+    SessionId, StopReason, TaskId, TaskStatus, ToolCallId, TurnRequest, Usage,
 };
+use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
+use crate::approval::{PermissionAnswer, PermissionAsker, PermissionRequest};
 use crate::{Provider, ProviderError, ProviderStream, catalog};
+
+/// How much the sandbox lets through, for neosh's mode.
+///
+/// * `deny` → `readOnly`. It may look and reason; it may not touch anything.
+/// * `ask` → `readOnly` as well, but paired with an approval policy that *asks* — which is the
+///   whole difference this transport makes. Under `codex exec` there was nobody to ask, so `ask`
+///   meant a turn that stopped at the first write; now it means a turn that stops and enquires.
+/// * `allow_listed` → `workspaceWrite`, which is codex's own idea of the same bargain neosh's
+///   allow-list makes: effects are fine inside the tree you are working in.
+/// * `allow` → `dangerFullAccess`. The name is the protocol's and it is not being softened here;
+///   it is what "full access" means, and it happens only because somebody went and chose it.
+pub fn sandbox_policy(mode: PermissionMode) -> Value {
+    match mode {
+        PermissionMode::Deny | PermissionMode::Ask => json!({ "type": "readOnly" }),
+        PermissionMode::AllowListed => json!({ "type": "workspaceWrite" }),
+        PermissionMode::Allow => json!({ "type": "dangerFullAccess" }),
+    }
+}
+
+/// Whether codex should stop and ask before stepping outside its sandbox.
+///
+/// `on-request` only where there is both something to ask about and somebody to ask. `deny` never
+/// asks because there is nothing to grant — read-only is the answer, not a starting position — and
+/// `allow` never asks because being asked is precisely what it opted out of. Without an asker every
+/// mode is `never`: a policy that routes decisions to a pipe nobody reads turns a turn into a hang,
+/// which is worse than the refusal it replaced.
+pub fn approval_policy(mode: PermissionMode, asking: bool) -> &'static str {
+    match mode {
+        PermissionMode::Ask | PermissionMode::AllowListed if asking => "on-request",
+        _ => "never",
+    }
+}
+
+/// A change asked for while a turn is running.
+///
+/// Thinner than [`super::claude_cli`]'s, and for a good reason: the model, the effort and the
+/// sandbox are all parameters of `turn/start`, so the only way to change them is to start the next
+/// turn — there is nothing to send mid-flight and nothing to keep here.
+#[derive(Debug, Default)]
+struct Tune {
+    /// The turn to interrupt, once one is running. Written by the reader when `turn/start` answers.
+    turn: Option<String>,
+}
+
+/// One conversation's app-server, and the thread it is holding.
+#[derive(Debug, Default)]
+struct Conversation {
+    /// Locked for the length of a turn. One thread, one stdin: two turns at once would interleave
+    /// two conversations down one pipe.
+    live: tokio::sync::Mutex<Option<Live>>,
+    tune: Mutex<Tune>,
+}
+
+/// A `codex app-server` that is still running, between turns as well as during them.
+#[derive(Debug)]
+struct Live {
+    child: tokio::process::Child,
+    stdin: tokio::process::ChildStdin,
+    lines: tokio::io::Lines<BufReader<tokio::process::ChildStdout>>,
+    /// Kept so a failure can be reported with its cause. `codex` logs here in normal operation, so
+    /// its contents are not evidence of failure on their own — only of what went wrong when
+    /// something did.
+    stderr: Arc<Mutex<String>>,
+    /// The thread this conversation is, once one has been started.
+    thread: Option<String>,
+    /// Where the thread was started. `turn/start` takes a directory too, but the thread's own is
+    /// what the agent's tools resolve against, so a conversation that moved needs a new one.
+    cwd: std::path::PathBuf,
+    /// Request ids, which have to be unique within the connection.
+    next_id: u64,
+}
 
 #[derive(Debug)]
 pub struct CodexCliProvider {
     program: String,
-    /// The CLI owns conversation history; we hold its thread id and resume into it.
-    thread: Arc<Mutex<Option<String>>>,
+    /// One live app-server per conversation.
+    ///
+    /// Per conversation, not per driver. There is one of these objects for the whole program and
+    /// several conversations may be mid-turn at once, so a single thread id here — which is what
+    /// it used to be — meant the second conversation resumed into the first one's history, and
+    /// nothing anywhere would have said so.
+    live: Arc<Mutex<HashMap<SessionId, Arc<Conversation>>>>,
+    /// What neosh's permission mode is, mirrored here because the driver is told out of band and
+    /// the next turn has to act on it.
+    mode: Arc<Mutex<PermissionMode>>,
+    /// Who to ask when codex wants to step outside its sandbox. `None` in a test or a headless
+    /// run, and the approval policy is then `never` rather than a question nobody hears.
+    asker: Arc<Mutex<Option<Arc<dyn PermissionAsker>>>>,
 }
 
 impl Default for CodexCliProvider {
@@ -59,7 +160,12 @@ impl Default for CodexCliProvider {
 
 impl CodexCliProvider {
     pub fn new(program: impl Into<String>) -> Self {
-        Self { program: program.into(), thread: Arc::default() }
+        Self {
+            program: program.into(),
+            live: Arc::default(),
+            mode: Arc::new(Mutex::new(PermissionMode::Ask)),
+            asker: Arc::default(),
+        }
     }
 
     /// Whether the CLI is on `PATH`. Used to decide if this instance is offerable at all.
@@ -67,12 +173,29 @@ impl CodexCliProvider {
         super::claude_cli::which(&self.program).is_some()
     }
 
-    /// Forget the CLI-side thread, so the next turn starts a new one.
-    pub fn reset_session(&self) {
-        *self.thread.lock().expect("thread lock poisoned") = None;
+    /// Let go of a conversation's app-server, so nothing is left running for a conversation nobody
+    /// has.
+    pub fn shutdown(&self, conversation: &SessionId) {
+        let Some(slot) = self.live.lock().expect("live lock poisoned").remove(conversation) else {
+            return;
+        };
+        tokio::spawn(async move {
+            if let Some(live) = slot.live.lock().await.take() {
+                live.close().await;
+            }
+        });
     }
 
-    /// The newest user message. `codex exec` takes one prompt; `resume` supplies the history.
+    fn slot(&self, conversation: &SessionId) -> Arc<Conversation> {
+        self.live
+            .lock()
+            .expect("live lock poisoned")
+            .entry(conversation.clone())
+            .or_default()
+            .clone()
+    }
+
+    /// The newest user message. A turn takes one input; the thread supplies the history.
     fn prompt_from(messages: &[Message]) -> String {
         messages
             .iter()
@@ -92,169 +215,372 @@ impl CodexCliProvider {
     }
 }
 
-/// Turn one `ThreadEvent` line into provider events.
+/// What reading the app-server's notification stream needs to remember between lines.
 ///
-/// A free function taking already-parsed JSON, so the mapping is testable against recorded output
+/// The protocol identifies everything by an opaque item id; [`ProviderEvent`] addresses blocks by
+/// position. This is the translation, plus the two things that can only be known by having watched:
+/// whether an item streamed before it completed, and what the connection has been complaining about.
+#[derive(Debug, Default)]
+pub struct CodexState {
+    next_index: u32,
+    /// Which block index an item was given.
+    blocks: HashMap<String, u32>,
+    /// Items that streamed at least one delta. Their `item/completed` carries the whole text again,
+    /// and emitting that would print the answer twice.
+    streamed: std::collections::HashSet<String>,
+    /// The last complaint. See [`codex_complaint`].
+    complaint: Option<String>,
+}
+
+impl CodexState {
+    /// A new turn on the same thread. Block indices restart, because a `message_start` went with it.
+    fn begin(&mut self) {
+        self.next_index = 0;
+        self.blocks.clear();
+        self.streamed.clear();
+        self.complaint = None;
+    }
+
+    /// The block an item writes into, opening one the first time it is seen.
+    fn index(&mut self, id: &str) -> u32 {
+        if let Some(i) = self.blocks.get(id) {
+            return *i;
+        }
+        let i = self.next_index;
+        self.next_index += 1;
+        self.blocks.insert(id.to_string(), i);
+        i
+    }
+
+    /// What the turn should say went wrong, if it ended without an answer.
+    pub fn complaint(&self) -> Option<&str> {
+        self.complaint.as_deref()
+    }
+}
+
+fn activity(a: Activity) -> ProviderEvent {
+    ProviderEvent::Activity { activity: a }
+}
+
+fn str_at<'a>(v: &'a Value, key: &str) -> Option<&'a str> {
+    v.get(key).and_then(Value::as_str)
+}
+
+/// Turn one app-server notification into provider events.
+///
+/// A free function taking already-parsed JSON, so the mapping is testable against recorded traffic
 /// without a `codex` binary anywhere near it — which matters, because the CLI is exactly the kind
-/// of dependency CI does not have.
-///
-/// `index` is the caller's block counter: this protocol identifies items by an opaque id, and
-/// `ProviderEvent` addresses blocks by position, so the translation has to keep the count.
-pub fn codex_events(v: &serde_json::Value, next_index: &mut u32) -> Vec<ProviderEvent> {
-    let kind = v.get("type").and_then(|t| t.as_str()).unwrap_or_default();
-    let item = v.get("item");
-    let detail = |name: &str| item.and_then(|i| i.get(name)).and_then(|x| x.as_str());
-    let item_type = item.and_then(|i| i.get("type")).and_then(|t| t.as_str()).unwrap_or_default();
-    let item_id = item.and_then(|i| i.get("id")).and_then(|x| x.as_str()).unwrap_or("item");
-
-    let mut block = |kind: BlockStartKind, body: Vec<ProviderEvent>| {
-        let index = *next_index;
-        *next_index += 1;
-        let mut out = vec![ProviderEvent::BlockStart { index, block: kind }];
-        out.extend(body.into_iter().map(|e| reindex(e, index)));
-        out.push(ProviderEvent::BlockStop { index });
-        out
-    };
-
-    match (kind, item_type) {
-        ("thread.started", _) => vec![ProviderEvent::MessageStart { model: None, usage: Usage::default() }],
-
-        // Answers and reasoning arrive whole, on completion — there is no delta event in this
-        // protocol. Emitting them on `item.started` would print an empty block.
-        ("item.completed", "agent_message") => {
-            let text = detail("text").unwrap_or_default().to_string();
-            block(BlockStartKind::Text, vec![ProviderEvent::TextDelta { index: 0, text }])
+/// of dependency CI does not have, and because a logged-out one cannot produce an answer to record.
+pub fn app_server_event(v: &Value, state: &mut CodexState) -> Vec<ProviderEvent> {
+    let Some(method) = str_at(v, "method") else { return Vec::new() };
+    let p = v.get("params").unwrap_or(&Value::Null);
+    match method {
+        "turn/started" => {
+            state.begin();
+            vec![ProviderEvent::MessageStart { model: None, usage: Usage::default() }]
         }
-        ("item.completed", "reasoning") => {
-            let text = detail("text").unwrap_or_default().to_string();
-            block(BlockStartKind::Thinking, vec![ProviderEvent::ThinkingDelta { index: 0, text }])
-        }
-
-        // Tool activity is shown as it starts, because that is the part of an agent turn worth
-        // watching. The result is not fed back to neosh's tool layer — codex already ran it.
-        ("item.started", "command_execution") => {
-            let command = detail("command").unwrap_or_default();
-            block(
-                BlockStartKind::ToolUse { id: ToolCallId::from(item_id), name: "shell".into() },
-                vec![ProviderEvent::ToolInputDelta {
-                    index: 0,
-                    partial_json: serde_json::json!({ "command": command }).to_string(),
-                }],
-            )
-        }
-        ("item.started", "mcp_tool_call") => {
-            let server = detail("server").unwrap_or_default();
-            let tool = detail("tool").unwrap_or_default();
-            let arguments = item
-                .and_then(|i| i.get("arguments"))
-                .cloned()
-                .unwrap_or(serde_json::Value::Null);
-            block(
-                BlockStartKind::ToolUse {
-                    id: ToolCallId::from(item_id),
-                    name: format!("{server}.{tool}"),
-                },
-                vec![ProviderEvent::ToolInputDelta {
-                    index: 0,
-                    partial_json: arguments.to_string(),
-                }],
-            )
-        }
-        ("item.started", "web_search") => {
-            let query = detail("query").unwrap_or_default();
-            block(
-                BlockStartKind::ToolUse { id: ToolCallId::from(item_id), name: "web_search".into() },
-                vec![ProviderEvent::ToolInputDelta {
-                    index: 0,
-                    partial_json: serde_json::json!({ "query": query }).to_string(),
-                }],
-            )
-        }
-        // A patch is only reported once, on completion, and the interesting part is which files.
-        ("item.completed", "file_change") => {
-            let paths: Vec<&str> = item
-                .and_then(|i| i.get("changes"))
-                .and_then(|c| c.as_array())
-                .map(|a| a.iter().filter_map(|c| c.get("path").and_then(|p| p.as_str())).collect())
+        "item/started" => p.get("item").map(|i| item_started(i, state)).unwrap_or_default(),
+        "item/completed" => p.get("item").map(|i| item_completed(i, state)).unwrap_or_default(),
+        // The answer, as it is written. This is the whole reason for this transport.
+        "item/agentMessage/delta" => stream_delta(p, state, false),
+        "item/reasoning/textDelta" | "item/reasoning/summaryTextDelta" => stream_delta(p, state, true),
+        // The checklist, whole every time — which is how a plan should arrive. See
+        // [`neosh_proto::Activity::Plan`].
+        "turn/plan/updated" => {
+            let steps = p
+                .get("plan")
+                .and_then(Value::as_array)
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|s| {
+                            let text = str_at(s, "step")?.trim();
+                            (!text.is_empty()).then(|| PlanStep {
+                                text: text.to_string(),
+                                state: match str_at(s, "status") {
+                                    Some("completed") => PlanState::Done,
+                                    Some("inProgress") => PlanState::Active,
+                                    _ => PlanState::Pending,
+                                },
+                            })
+                        })
+                        .collect()
+                })
                 .unwrap_or_default();
-            block(
-                BlockStartKind::ToolUse { id: ToolCallId::from(item_id), name: "apply_patch".into() },
-                vec![ProviderEvent::ToolInputDelta {
-                    index: 0,
-                    partial_json: serde_json::json!({ "path": paths.join(", ") }).to_string(),
-                }],
-            )
+            vec![activity(Activity::Plan { steps })]
         }
-
-        ("turn.completed", _) => {
-            let usage = v.get("usage");
-            let n = |k: &str| usage.and_then(|u| u.get(k)).and_then(|x| x.as_u64()).unwrap_or(0);
-            vec![
-                ProviderEvent::MessageDelta {
-                    stop_reason: Some(StopReason::EndTurn),
-                    usage: Usage {
-                        input_tokens: n("input_tokens"),
-                        output_tokens: n("output_tokens"),
-                        cache_read_tokens: n("cached_input_tokens"),
-                        cache_write_tokens: n("cache_write_input_tokens"),
-                        thinking_tokens: n("reasoning_output_tokens"),
-                    },
+        // Both at once, from one message: what the turn has spent, and how full the window is. The
+        // second is a number nothing else in neosh could have known — a context meter over a vendor
+        // CLI is otherwise a guess about a window whose size is the vendor's business.
+        "thread/tokenUsage/updated" => {
+            let usage = p.get("tokenUsage");
+            let n = |side: &str, key: &str| {
+                usage
+                    .and_then(|u| u.get(side))
+                    .and_then(|b| b.get(key))
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0)
+            };
+            let mut out = vec![ProviderEvent::MessageDelta {
+                stop_reason: None,
+                usage: Usage {
+                    input_tokens: n("last", "inputTokens"),
+                    output_tokens: n("last", "outputTokens"),
+                    cache_read_tokens: n("last", "cachedInputTokens"),
+                    cache_write_tokens: n("last", "cacheWriteInputTokens"),
+                    thinking_tokens: n("last", "reasoningOutputTokens"),
                 },
+            }];
+            let window = usage.and_then(|u| u.get("modelContextWindow")).and_then(Value::as_u64);
+            if let Some(total) = window.filter(|t| *t > 0) {
+                out.push(activity(Activity::Context { used: n("total", "totalTokens"), total }));
+            }
+            out
+        }
+        // No token counts on this one, unlike `claude`'s boundary. Saying it happened is still worth
+        // a row: the conversation the agent is holding was just replaced by a summary of itself.
+        "context/compacted" => vec![activity(Activity::Compacted { before: None, after: None })],
+        "turn/completed" => {
+            let turn = p.get("turn").unwrap_or(&Value::Null);
+            let stop = match str_at(turn, "status") {
+                Some("failed") => StopReason::Error {
+                    message: turn
+                        .get("error")
+                        .and_then(|e| str_at(e, "message"))
+                        .or_else(|| state.complaint())
+                        .unwrap_or("the turn failed")
+                        .to_string(),
+                },
+                // `cancelled` is what an interrupt produces, and the turn keeps whatever it wrote.
+                _ => StopReason::EndTurn,
+            };
+            vec![
+                ProviderEvent::MessageDelta { stop_reason: Some(stop), usage: Usage::default() },
                 ProviderEvent::MessageStop,
             ]
         }
+        // Collected, not emitted. See [`codex_complaint`].
+        "error" | "warning" => {
+            if let Some(text) = codex_complaint(p) {
+                state.complaint = Some(text);
+            }
+            Vec::new()
+        }
+        _ => Vec::new(),
+    }
+}
 
-        // The one terminal failure. A bare `error` line is *not* one — see [`codex_complaint`].
-        ("turn.failed", _) => vec![ProviderEvent::Error {
-            message: v
-                .pointer("/error/message")
-                .and_then(|m| m.as_str())
-                .unwrap_or("the turn failed")
-                .to_string(),
-            retryable: false,
-        }],
+/// One `item/*Delta` notification, on the block its item opened.
+fn stream_delta(p: &Value, state: &mut CodexState, thinking: bool) -> Vec<ProviderEvent> {
+    let (Some(id), Some(text)) = (str_at(p, "itemId"), str_at(p, "delta")) else {
+        return Vec::new();
+    };
+    state.streamed.insert(id.to_string());
+    let index = state.index(id);
+    let text = text.to_string();
+    vec![if thinking {
+        ProviderEvent::ThinkingDelta { index, text }
+    } else {
+        ProviderEvent::TextDelta { index, text }
+    }]
+}
 
-        // Everything else — `turn.started`, `item.updated`, todo lists, collab tools — is either
-        // covered by an event we already emit or has nothing to show. Ignored rather than guessed
-        // at: an unknown item type appearing in the transcript as a blank block is worse than not
-        // appearing at all.
+/// A tool call, complete on arrival.
+///
+/// Codex names an item once and never revises its arguments, so the block opens and closes in one
+/// go: the card appears the moment the call starts, with its subject already on it, and the answer
+/// arrives later as a [`ProviderEvent::ToolResult`].
+fn call(id: &str, name: &str, input: Value, state: &mut CodexState) -> Vec<ProviderEvent> {
+    let index = state.index(id);
+    vec![
+        ProviderEvent::BlockStart {
+            index,
+            block: BlockStartKind::ToolUse { id: ToolCallId::from(id), name: name.to_string() },
+        },
+        ProviderEvent::ToolInputDelta { index, partial_json: input.to_string() },
+        ProviderEvent::BlockStop { index },
+    ]
+}
+
+fn item_started(item: &Value, state: &mut CodexState) -> Vec<ProviderEvent> {
+    let (Some(kind), Some(id)) = (str_at(item, "type"), str_at(item, "id")) else {
+        return Vec::new();
+    };
+    match kind {
+        // Opened empty; the deltas fill it. `item/completed` carries the whole text as well, which
+        // is what makes this safe: an item that never streamed still says everything it had.
+        "agentMessage" => {
+            let index = state.index(id);
+            vec![ProviderEvent::BlockStart { index, block: BlockStartKind::Text }]
+        }
+        "reasoning" => {
+            let index = state.index(id);
+            vec![ProviderEvent::BlockStart { index, block: BlockStartKind::Thinking }]
+        }
+        "commandExecution" => {
+            let input = json!({
+                "command": str_at(item, "command").unwrap_or_default(),
+                "cwd": str_at(item, "cwd").unwrap_or_default(),
+            });
+            call(id, "shell", input, state)
+        }
+        // The patch, as codex computed it before applying it — so the card has the diff from the
+        // moment the call appears rather than after the fact. `cards::edits_of` reads the unified
+        // form; see ADR 0034.
+        "fileChange" => {
+            let input = json!({ "changes": item.get("changes").cloned().unwrap_or(json!([])) });
+            call(id, "apply_patch", input, state)
+        }
+        "mcpToolCall" => {
+            let name = format!(
+                "{}/{}",
+                str_at(item, "server").unwrap_or("mcp"),
+                str_at(item, "tool").unwrap_or("call")
+            );
+            call(id, &name, item.get("arguments").cloned().unwrap_or(json!({})), state)
+        }
+        "dynamicToolCall" => {
+            let name = str_at(item, "tool").unwrap_or("tool").to_string();
+            call(id, &name, item.get("arguments").cloned().unwrap_or(json!({})), state)
+        }
+        "webSearch" => {
+            call(id, "web_search", json!({ "query": str_at(item, "query").unwrap_or_default() }), state)
+        }
+        // A sub-agent. Two shapes, because codex has two: one it spawned as a tool call, and one
+        // running against its own thread.
+        "collabAgentToolCall" => vec![activity(Activity::TaskStarted {
+            task: TaskId::from(id),
+            title: str_at(item, "prompt").unwrap_or("sub-agent").to_string(),
+            role: str_at(item, "tool").map(str::to_string),
+            parent_call: None,
+            model: str_at(item, "model").map(str::to_string),
+        })],
+        "subAgentActivity" => vec![activity(Activity::TaskStarted {
+            task: TaskId::from(str_at(item, "agentThreadId").unwrap_or(id)),
+            title: str_at(item, "agentPath").unwrap_or("sub-agent").to_string(),
+            role: None,
+            parent_call: None,
+            model: None,
+        })],
+        "contextCompaction" => vec![activity(Activity::Compacted { before: None, after: None })],
+        _ => Vec::new(),
+    }
+}
+
+fn item_completed(item: &Value, state: &mut CodexState) -> Vec<ProviderEvent> {
+    let (Some(kind), Some(id)) = (str_at(item, "type"), str_at(item, "id")) else {
+        return Vec::new();
+    };
+    // A result belongs to the call, whether or not this stream ever mentioned the call — a turn
+    // resumed mid-flight can meet the second half of one.
+    let result = |content: String, is_error: bool| {
+        vec![ProviderEvent::ToolResult { id: ToolCallId::from(id), content, is_error }]
+    };
+    match kind {
+        "agentMessage" | "reasoning" => {
+            let index = state.index(id);
+            let mut out = Vec::new();
+            // Only for an item that never streamed. Otherwise this is a second copy of the answer.
+            if !state.streamed.contains(id) {
+                let text = match kind {
+                    "agentMessage" => str_at(item, "text").unwrap_or_default().to_string(),
+                    _ => item
+                        .get("content")
+                        .or_else(|| item.get("summary"))
+                        .and_then(Value::as_array)
+                        .map(|a| {
+                            a.iter().filter_map(Value::as_str).collect::<Vec<_>>().join("\n")
+                        })
+                        .unwrap_or_default(),
+                };
+                if !text.is_empty() {
+                    out.push(if kind == "agentMessage" {
+                        ProviderEvent::TextDelta { index, text }
+                    } else {
+                        ProviderEvent::ThinkingDelta { index, text }
+                    });
+                }
+            }
+            out.push(ProviderEvent::BlockStop { index });
+            out
+        }
+        "commandExecution" => {
+            let code = item.get("exitCode").and_then(Value::as_i64);
+            let output = str_at(item, "aggregatedOutput").unwrap_or_default();
+            let failed = code.is_some_and(|c| c != 0);
+            // The convention `cards::exit_code` reads, so a failed command says what it exited
+            // with rather than only that it did.
+            let content = match (failed, code) {
+                (true, Some(c)) => format!("Exit code {c}\n{output}"),
+                _ => output.to_string(),
+            };
+            result(content, failed)
+        }
+        "fileChange" => {
+            let failed = str_at(item, "status").is_some_and(|s| s != "completed" && s != "applied");
+            let files: Vec<&str> = item
+                .get("changes")
+                .and_then(Value::as_array)
+                .map(|a| a.iter().filter_map(|c| str_at(c, "path")).collect())
+                .unwrap_or_default();
+            result(
+                if failed {
+                    format!("patch {}", str_at(item, "status").unwrap_or("failed"))
+                } else {
+                    files.join("\n")
+                },
+                failed,
+            )
+        }
+        "mcpToolCall" | "dynamicToolCall" => {
+            let error = item.get("error").and_then(|e| str_at(e, "message"));
+            match error {
+                Some(message) => result(message.to_string(), true),
+                None => result(
+                    item.get("result")
+                        .map(|r| {
+                            str_at(r, "text").map(str::to_string).unwrap_or_else(|| r.to_string())
+                        })
+                        .unwrap_or_default(),
+                    false,
+                ),
+            }
+        }
+        "webSearch" => {
+            let n = item.get("results").and_then(Value::as_array).map_or(0, |a| a.len());
+            result(format!("{n} result(s)"), false)
+        }
+        "collabAgentToolCall" => vec![activity(Activity::TaskEnded {
+            task: TaskId::from(id),
+            status: match str_at(item, "status") {
+                Some("failed") => TaskStatus::Failed,
+                _ => TaskStatus::Done,
+            },
+            summary: None,
+        })],
+        "subAgentActivity" => vec![activity(Activity::TaskEnded {
+            task: TaskId::from(str_at(item, "agentThreadId").unwrap_or(id)),
+            status: TaskStatus::Done,
+            summary: None,
+        })],
         _ => Vec::new(),
     }
 }
 
 /// A complaint that is not, on its own, a failure.
 ///
-/// Learned from real output: a 401 produces eleven `{"type":"error","message":"Reconnecting… 2/5"}`
-/// lines before the CLI gives up, and an `item.completed` carrying an `error` item for things like
-/// "falling back from WebSockets to HTTPS". Treating any of those as terminal would abort a turn
-/// that was about to succeed on the third attempt.
+/// Learned from real output: a 401 produces eleven `error` notifications reading
+/// `"Reconnecting... 2/5"` before codex gives up, and a `warning` for things like falling back from
+/// WebSockets to HTTPS. Treating any of those as terminal would abort a turn that was about to
+/// succeed on the third attempt.
 ///
 /// So they are collected rather than emitted, and the last one becomes the *reason* if the turn
 /// ends without an answer — which is the message worth showing, and much better than the raw
 /// tracing lines on stderr that would otherwise be reported instead.
-pub fn codex_complaint(v: &serde_json::Value) -> Option<String> {
-    let kind = v.get("type").and_then(|t| t.as_str())?;
-    match kind {
-        "error" => v.get("message").and_then(|m| m.as_str()).map(str::to_string),
-        "item.completed"
-            if v.pointer("/item/type").and_then(|t| t.as_str()) == Some("error") =>
-        {
-            v.pointer("/item/message").and_then(|m| m.as_str()).map(str::to_string)
-        }
-        _ => None,
-    }
-}
-
-/// Put a block-body event on the block it belongs to.
-fn reindex(ev: ProviderEvent, index: u32) -> ProviderEvent {
-    match ev {
-        ProviderEvent::TextDelta { text, .. } => ProviderEvent::TextDelta { index, text },
-        ProviderEvent::ThinkingDelta { text, .. } => ProviderEvent::ThinkingDelta { index, text },
-        ProviderEvent::ToolInputDelta { partial_json, .. } => {
-            ProviderEvent::ToolInputDelta { index, partial_json }
-        }
-        other => other,
-    }
+pub fn codex_complaint(p: &Value) -> Option<String> {
+    p.get("error")
+        .and_then(|e| str_at(e, "message"))
+        .or_else(|| str_at(p, "message"))
+        .map(str::to_string)
 }
 
 /// Ask a running `codex app-server` what models it serves.
@@ -447,136 +773,432 @@ impl Provider for CodexCliProvider {
     ) -> ProviderStream {
         let (tx, rx) = mpsc::channel::<ProviderEvent>(256);
         let program = self.program.clone();
-        let thread = self.thread.clone();
+        let slot = self.slot(&request.conversation);
+        let mode = *self.mode.lock().expect("mode lock poisoned");
+        let asker = self.asker.lock().expect("asker lock poisoned").clone();
 
         tokio::spawn(async move {
-            let prompt = Self::prompt_from(&request.messages);
-            let previous = thread.lock().expect("thread lock poisoned").clone();
-
-            let mut cmd = Command::new(&program);
-            if !request.cwd.as_os_str().is_empty() {
-                cmd.current_dir(&request.cwd);
-            }
-            cmd.arg("exec");
-            if let Some(id) = &previous {
-                cmd.arg("resume").arg(id);
-            }
-            cmd.arg("--json")
-                // The workspace is wherever neosh was started, which is not always a repository.
-                // Without this, `codex exec` refuses to run there at all.
-                .arg("--skip-git-repo-check")
-                .args(["--model", request.selection.model.as_ref()]);
-            if let Some(effort) = request.selection.option_str("effort") {
-                cmd.args(["-c", &format!("model_reasoning_effort=\"{effort}\"")]);
-            }
-            // Last, so it is unambiguously the positional prompt and not the value of a flag.
-            cmd.arg(&prompt);
-
-            cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
-
-            let mut child = match cmd.spawn() {
-                Ok(c) => c,
-                Err(e) => {
-                    let _ = tx
-                        .send(ProviderEvent::Error {
-                            message: format!("could not run {program:?}: {e}"),
-                            retryable: false,
-                        })
-                        .await;
-                    return;
-                }
-            };
-
-            let stdout = child.stdout.take().expect("stdout was piped");
-            let stderr = child.stderr.take().expect("stderr was piped");
-            let mut lines = BufReader::new(stdout).lines();
-
-            // Keep stderr so a failure can be reported with its actual cause rather than an exit
-            // code. `codex` logs to stderr in normal operation, so this is not evidence of failure
-            // on its own — only of what went wrong when something did.
-            let stderr_buf = Arc::new(Mutex::new(String::new()));
+            let mut guard = slot.live.lock().await;
+            if let Err(message) =
+                run_turn(&program, &slot, &mut guard, request, mode, asker, cancel, &tx).await
             {
-                let buf = stderr_buf.clone();
-                tokio::spawn(async move {
-                    let mut l = BufReader::new(stderr).lines();
-                    while let Ok(Some(line)) = l.next_line().await {
-                        let mut b = buf.lock().expect("stderr lock poisoned");
-                        b.push_str(&line);
-                        b.push('\n');
-                    }
-                });
-            }
-
-            let mut index = 0u32;
-            let mut saw_stop = false;
-            let mut last_complaint: Option<String> = None;
-            loop {
-                tokio::select! {
-                    biased;
-                    () = cancel.cancelled() => {
-                        // Cancellation must reap the child, or an interrupted turn leaves an agent
-                        // running in the background — still editing files, still spending money.
-                        let _ = child.start_kill();
-                        break;
-                    }
-                    line = lines.next_line() => {
-                        match line {
-                            Ok(Some(line)) => {
-                                let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) else {
-                                    continue; // non-JSON chatter on stdout is not fatal
-                                };
-                                if v.get("type").and_then(|t| t.as_str()) == Some("thread.started")
-                                    && let Some(id) =
-                                        v.get("thread_id").and_then(|s| s.as_str())
-                                {
-                                    *thread.lock().expect("thread lock poisoned") =
-                                        Some(id.to_string());
-                                }
-                                if let Some(reason) = codex_complaint(&v) {
-                                    last_complaint = Some(reason);
-                                    continue;
-                                }
-                                for ev in codex_events(&v, &mut index) {
-                                    saw_stop |= matches!(ev, ProviderEvent::MessageStop);
-                                    if tx.send(ev).await.is_err() {
-                                        let _ = child.start_kill();
-                                        return;
-                                    }
-                                }
-                            }
-                            Ok(None) => break,
-                            Err(e) => {
-                                let _ = tx.send(ProviderEvent::Error {
-                                    message: format!("reading {program} output: {e}"),
-                                    retryable: false,
-                                }).await;
-                                break;
-                            }
-                        }
-                    }
-                }
-            }
-
-            let status = child.wait().await;
-            if !saw_stop && !cancel.is_cancelled() {
-                // What the CLI said, in preference to what it logged: `codex` writes tracing
-                // lines to stderr in normal operation, and the last thing it complained about on
-                // the protocol is both shorter and actually about this turn.
-                let logged = stderr_buf.lock().expect("stderr lock poisoned").trim().to_string();
-                let code = status.map(|s| s.code().unwrap_or(-1)).unwrap_or(-1);
-                let message = last_complaint.or_else(|| (!logged.is_empty()).then_some(logged));
-                let _ = tx
-                    .send(ProviderEvent::Error {
-                        message: message.unwrap_or_else(|| {
-                            format!("{program} exited with status {code} before finishing the turn")
-                        }),
-                        retryable: false,
-                    })
-                    .await;
+                // A failure the process cannot recover from leaves nothing worth keeping: the next
+                // turn starts a fresh app-server rather than writing into a pipe whose other end
+                // has gone.
+                *guard = None;
+                let _ = tx.send(ProviderEvent::Error { message, retryable: false }).await;
             }
         });
 
         Box::pin(tokio_stream::wrappers::ReceiverStream::new(rx))
+    }
+}
+
+/// One turn, on an app-server that is either already running or about to be.
+///
+/// The `Err` case is for a failure that ends the turn *and* the process. Everything a running
+/// server reports about itself, including its own errors, arrives as events instead.
+#[allow(clippy::too_many_arguments)]
+async fn run_turn(
+    program: &str,
+    conversation: &Conversation,
+    slot: &mut Option<Live>,
+    request: TurnRequest,
+    mode: PermissionMode,
+    asker: Option<Arc<dyn PermissionAsker>>,
+    cancel: CancellationToken,
+    tx: &mpsc::Sender<ProviderEvent>,
+) -> Result<(), String> {
+    // The thread's directory is what the agent's tools resolve against, so a conversation that has
+    // moved needs a new thread — the one thing here that a running server cannot be talked out of.
+    // Even that keeps the process.
+    if slot.as_ref().is_some_and(|l| l.cwd != request.cwd)
+        && let Some(live) = slot.take()
+    {
+        live.close().await;
+    }
+    if slot.is_none() {
+        *slot = Some(Live::spawn(program, &request.cwd).await?);
+    }
+    let live = slot.as_mut().expect("a server was just put there");
+    if live.thread.is_none() {
+        live.start_thread(&request.cwd, mode).await?;
+    }
+
+    // Everything that would have been a command-line argument is a parameter of this one call, so
+    // a model, an effort or a sandbox that changed since the last turn needs nothing but this.
+    let asking = asker.is_some();
+    let mut params = json!({
+        "threadId": live.thread.clone().unwrap_or_default(),
+        "input": [{ "type": "text", "text": CodexCliProvider::prompt_from(&request.messages) }],
+        "model": request.selection.model.as_ref(),
+        "sandboxPolicy": sandbox_policy(mode),
+        "approvalPolicy": approval_policy(mode, asking),
+    });
+    if let Some(effort) = request.selection.option_str("effort")
+        && let Some(map) = params.as_object_mut()
+    {
+        map.insert("effort".into(), Value::String(effort.to_string()));
+    }
+    let started = live.request("turn/start", params).await?;
+
+    let mut state = CodexState::default();
+    let mut turn: Option<String> = None;
+    let mut interrupted = false;
+    let mut finished = false;
+    let giveup = tokio::time::sleep(Duration::from_secs(86_400));
+    tokio::pin!(giveup);
+
+    loop {
+        tokio::select! {
+            biased;
+            // Asked to stop, not killed. A killed server takes the thread with it, and the next
+            // turn would resume into a history that never heard of the work it interrupted.
+            () = cancel.cancelled(), if !interrupted => {
+                interrupted = true;
+                if let Some(id) = &turn {
+                    let params = json!({ "threadId": live.thread, "turnId": id });
+                    let _ = live.notify_request("turn/interrupt", params).await;
+                }
+                giveup.as_mut().reset(tokio::time::Instant::now() + Duration::from_secs(5));
+            }
+            () = &mut giveup, if interrupted => {
+                let _ = live.child.start_kill();
+                *slot = None;
+                return Ok(());
+            }
+            line = live.lines.next_line() => {
+                let line = match line {
+                    Ok(Some(line)) => line,
+                    Ok(None) => break,
+                    Err(e) => {
+                        let _ = tx.send(ProviderEvent::Error {
+                            message: format!("reading {program} app-server: {e}"),
+                            retryable: false,
+                        }).await;
+                        *slot = None;
+                        return Ok(());
+                    }
+                };
+                let Ok(v) = serde_json::from_str::<Value>(&line) else { continue };
+
+                // The reply to `turn/start`, which is the only place the turn's own id appears —
+                // and `turn/interrupt` needs it.
+                if v.get("id").and_then(Value::as_u64) == Some(started)
+                    && let Some(id) = v.pointer("/result/turn/id").and_then(Value::as_str)
+                {
+                    turn = Some(id.to_string());
+                    conversation.tune.lock().expect("tune lock poisoned").turn = turn.clone();
+                    continue;
+                }
+                // A question codex is blocked on. This is the whole reason `ask` mode means
+                // something here: `codex exec` had nobody to ask and could only refuse.
+                if let Some(ask) = approval_request(&v, &request.cwd) {
+                    // Raced against the cancellation, not awaited on its own. A prompt with
+                    // nobody at the keyboard is exactly when somebody reaches for `<Esc>`, and a
+                    // turn that could only be interrupted between questions could not be
+                    // interrupted at all while one was open.
+                    let answer = match &asker {
+                        Some(a) => tokio::select! {
+                            biased;
+                            () = cancel.cancelled() => PermissionAnswer::Deny,
+                            answer = a.ask(ask.request.clone()) => answer,
+                        },
+                        None => PermissionAnswer::Deny,
+                    };
+                    let reply = json!({
+                        "jsonrpc": "2.0",
+                        "id": ask.id,
+                        "result": { "decision": decision(&ask, &answer) },
+                    });
+                    if write_line(&mut live.stdin, &reply).await.is_err() {
+                        *slot = None;
+                        break;
+                    }
+                    continue;
+                }
+                for ev in app_server_event(&v, &mut state) {
+                    finished |= matches!(ev, ProviderEvent::MessageStop);
+                    if tx.send(ev).await.is_err() {
+                        // The receiver is gone: the turn was abandoned. The process is not — it
+                        // holds the thread, and the next turn is probably about to use it.
+                        return Ok(());
+                    }
+                }
+                if finished {
+                    break;
+                }
+            }
+        }
+    }
+
+    if !finished && !cancel.is_cancelled() {
+        // Only reachable when the process died mid-turn. Its own complaint beats its stderr, which
+        // is full of ordinary tracing.
+        let detail = state
+            .complaint()
+            .map(str::to_string)
+            .or_else(|| {
+                slot.as_ref().and_then(|l| {
+                    let b = l.stderr.lock().expect("stderr lock poisoned");
+                    (!b.trim().is_empty()).then(|| b.trim().to_string())
+                })
+            })
+            .unwrap_or_else(|| format!("{program} app-server stopped before finishing the turn"));
+        *slot = None;
+        let _ = tx.send(ProviderEvent::Error { message: detail, retryable: false }).await;
+    }
+    Ok(())
+}
+
+/// One approval request, read into something a person can be asked.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Approval {
+    /// The JSON-RPC id to answer on.
+    pub id: u64,
+    /// Whether this is about running something or about writing something, which is the only thing
+    /// that changes about the answer: the two decisions are different enums in the protocol.
+    pub file_change: bool,
+    pub request: PermissionRequest,
+}
+
+/// The option id for "yes, and stop asking for the rest of this conversation".
+const FOR_SESSION: &str = "accept-for-session";
+/// The option id for "yes, this once".
+const ONCE: &str = "accept";
+/// The option id for "no".
+const DECLINE: &str = "decline";
+
+/// Read a server-to-client approval request, if that is what this is.
+///
+/// The two the protocol sends are `item/commandExecution/requestApproval` and
+/// `item/fileChange/requestApproval`. Both block the turn until they are answered.
+pub fn approval_request(v: &Value, cwd: &std::path::Path) -> Option<Approval> {
+    let id = v.get("id").and_then(Value::as_u64)?;
+    let method = str_at(v, "method")?;
+    let p = v.get("params")?;
+    let file_change = match method {
+        "item/commandExecution/requestApproval" => false,
+        "item/fileChange/requestApproval" => true,
+        _ => return None,
+    };
+    let (title, capability) = if file_change {
+        let root = str_at(p, "grantRoot").unwrap_or_default();
+        (
+            format!("Write to {}", if root.is_empty() { "the workspace" } else { root }),
+            Capability::WriteFile { path: root.to_string() },
+        )
+    } else {
+        let command = str_at(p, "command").unwrap_or_default();
+        (format!("Run {command}"), Capability::Exec { command: command.to_string() })
+    };
+    // Worded here rather than by the agent, because unlike ACP and the `claude` control protocol,
+    // codex sends the *decisions it accepts* as a schema and no sentences to go with them. These
+    // are the three that mean something in every case; the amendment-carrying ones are codex
+    // negotiating with its own policy files and are not a question for a person.
+    let options = vec![
+        PermissionOption {
+            id: ONCE.into(),
+            label: "Yes".into(),
+            kind: PermissionOptionKind::AllowOnce,
+        },
+        PermissionOption {
+            id: FOR_SESSION.into(),
+            label: "Yes, and don't ask again this session".into(),
+            kind: PermissionOptionKind::AllowAlways,
+        },
+        PermissionOption {
+            id: DECLINE.into(),
+            label: "No".into(),
+            kind: PermissionOptionKind::RejectOnce,
+        },
+    ];
+    let reason = str_at(p, "reason").filter(|r| !r.is_empty());
+    Some(Approval {
+        id,
+        file_change,
+        request: PermissionRequest {
+            title: match reason {
+                Some(r) => format!("{title} — {r}"),
+                None => title,
+            },
+            capability,
+            options,
+            cwd: cwd.to_path_buf(),
+        },
+    })
+}
+
+/// The decision string for an answer. Both enums share these three spellings.
+pub fn decision(ask: &Approval, answer: &PermissionAnswer) -> &'static str {
+    let _ = ask;
+    match answer {
+        PermissionAnswer::Option(id) if id == FOR_SESSION => "acceptForSession",
+        PermissionAnswer::Option(id) if id == DECLINE => "decline",
+        // Anything else that is an answer at all is a yes, taken as the narrowest one — including
+        // a policy answer, which is a yes to the question rather than a choice between the ways of
+        // saying it.
+        PermissionAnswer::Option(_) | PermissionAnswer::Allow => "accept",
+        PermissionAnswer::Deny => "decline",
+    }
+}
+
+impl Live {
+    async fn spawn(program: &str, cwd: &std::path::Path) -> Result<Self, String> {
+        let mut cmd = Command::new(program);
+        if !cwd.as_os_str().is_empty() {
+            cmd.current_dir(cwd);
+        }
+        cmd.arg("app-server")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+        let mut child =
+            cmd.spawn().map_err(|e| format!("could not run {program} app-server: {e}"))?;
+        let stdout = child.stdout.take().expect("stdout was piped");
+        let stderr = child.stderr.take().expect("stderr was piped");
+        let stdin = child.stdin.take().expect("stdin was piped");
+
+        let buf = Arc::new(Mutex::new(String::new()));
+        {
+            let buf = buf.clone();
+            tokio::spawn(async move {
+                let mut l = BufReader::new(stderr).lines();
+                while let Ok(Some(line)) = l.next_line().await {
+                    let mut b = buf.lock().expect("stderr lock poisoned");
+                    b.push_str(&line);
+                    b.push('\n');
+                }
+            });
+        }
+
+        let mut live = Self {
+            child,
+            stdin,
+            lines: BufReader::new(stdout).lines(),
+            stderr: buf,
+            thread: None,
+            cwd: cwd.to_path_buf(),
+            next_id: 1,
+        };
+        live.handshake().await?;
+        Ok(live)
+    }
+
+    /// `initialize`, then `initialized`. Both are required before anything else is answered.
+    async fn handshake(&mut self) -> Result<(), String> {
+        let id = self
+            .request(
+                "initialize",
+                json!({ "clientInfo": {
+                    "name": "neosh", "title": "neosh", "version": env!("CARGO_PKG_VERSION"),
+                } }),
+            )
+            .await?;
+        self.await_reply(id).await?;
+        write_line(
+            &mut self.stdin,
+            &json!({ "jsonrpc": "2.0", "method": "initialized", "params": {} }),
+        )
+        .await
+        .map_err(|e| format!("codex app-server: {e}"))
+    }
+
+    async fn start_thread(&mut self, cwd: &std::path::Path, mode: PermissionMode) -> Result<(), String> {
+        let id = self
+            .request(
+                "thread/start",
+                json!({
+                    "cwd": cwd.display().to_string(),
+                    "sandbox": match mode {
+                        PermissionMode::Deny | PermissionMode::Ask => "read-only",
+                        PermissionMode::AllowListed => "workspace-write",
+                        PermissionMode::Allow => "danger-full-access",
+                    },
+                }),
+            )
+            .await?;
+        let reply = self.await_reply(id).await?;
+        self.thread = reply
+            .pointer("/thread/id")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .ok_or_else(|| "codex app-server started no thread".to_string())?
+            .into();
+        Ok(())
+    }
+
+    /// Send a request and hand back its id.
+    async fn request(&mut self, method: &str, params: Value) -> Result<u64, String> {
+        let id = self.next_id;
+        self.next_id += 1;
+        let message = json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params });
+        write_line(&mut self.stdin, &message)
+            .await
+            .map(|()| id)
+            .map_err(|e| format!("could not reach the running codex app-server: {e}"))
+    }
+
+    /// Send a request whose reply nothing is waiting for. `turn/interrupt` is one: what it does is
+    /// visible as a `turn/completed`, which the turn loop is already reading.
+    async fn notify_request(&mut self, method: &str, params: Value) -> Result<(), String> {
+        self.request(method, params).await.map(|_| ())
+    }
+
+    /// Read until the reply to `id`, which is the only safe way to wait for one: notifications are
+    /// interleaved with replies from the first message onward.
+    ///
+    /// Only used before a turn starts, when nothing else is listening. Once one has, the turn loop
+    /// owns the stream.
+    async fn await_reply(&mut self, id: u64) -> Result<Value, String> {
+        while let Ok(Some(line)) = self.lines.next_line().await {
+            let Ok(v) = serde_json::from_str::<Value>(&line) else { continue };
+            if v.get("id").and_then(Value::as_u64) != Some(id) {
+                continue;
+            }
+            if let Some(e) = v.get("error") {
+                return Err(format!("codex app-server: {e}"));
+            }
+            return Ok(v.get("result").cloned().unwrap_or(Value::Null));
+        }
+        Err("codex app-server stopped before answering".into())
+    }
+
+    /// Tell it there is nothing more coming, and wait for it to go.
+    async fn close(mut self) {
+        drop(self.stdin);
+        if tokio::time::timeout(Duration::from_secs(3), self.child.wait()).await.is_err() {
+            let _ = self.child.start_kill();
+        }
+    }
+}
+
+/// Write one JSON line to the server's stdin, flushed, because it is waiting on it.
+async fn write_line(
+    stdin: &mut tokio::process::ChildStdin,
+    value: &Value,
+) -> std::io::Result<()> {
+    let mut line = value.to_string();
+    line.push('\n');
+    stdin.write_all(line.as_bytes()).await?;
+    stdin.flush().await
+}
+
+impl super::AgentDriver for CodexCliProvider {
+    fn set_permission_mode(&self, mode: PermissionMode) {
+        // Nothing to send: the sandbox and the approval policy are parameters of the next
+        // `turn/start`, so the mode is applied by asking the next question rather than by telling
+        // the server about it now.
+        *self.mode.lock().expect("mode lock poisoned") = mode;
+    }
+
+    fn set_permission_asker(&self, asker: Arc<dyn PermissionAsker>) {
+        *self.asker.lock().expect("asker lock poisoned") = Some(asker);
+    }
+
+    fn close_conversation(&self, conversation: &SessionId) {
+        self.shutdown(conversation);
     }
 }
 
@@ -585,122 +1207,221 @@ mod tests {
     use super::*;
     use neosh_proto::{AuthRef, InstanceId, ModelSelection};
 
-    fn ev(line: &str, index: &mut u32) -> Vec<ProviderEvent> {
-        codex_events(&serde_json::from_str(line).expect("fixture parses"), index)
+    /// Every line in order, through one parser state, the way the driver reads them.
+    fn replay(lines: &[&str]) -> Vec<ProviderEvent> {
+        let mut state = CodexState::default();
+        lines
+            .iter()
+            .flat_map(|l| app_server_event(&serde_json::from_str(l).expect("fixture parses"), &mut state))
+            .collect()
+    }
+
+    fn only_activity(events: &[ProviderEvent]) -> Vec<&Activity> {
+        events
+            .iter()
+            .filter_map(|e| match e {
+                ProviderEvent::Activity { activity } => Some(activity),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// A turn as the app-server reports it: the handshake shapes are a real capture from
+    /// `codex-cli 0.148.0`; the answer path follows the protocol schema, since a logged-out codex
+    /// cannot produce one to record.
+    const TURN: &[&str] = &[
+        r#"{"jsonrpc":"2.0","method":"turn/started","params":{"threadId":"t1","turn":{"id":"u1","items":[],"status":"inProgress"}}}"#,
+        r#"{"jsonrpc":"2.0","method":"item/started","params":{"threadId":"t1","turnId":"u1","startedAtMs":1,"item":{"type":"reasoning","id":"r1","content":[]}}}"#,
+        r#"{"jsonrpc":"2.0","method":"item/reasoning/textDelta","params":{"threadId":"t1","turnId":"u1","itemId":"r1","contentIndex":0,"delta":"weighing it"}}"#,
+        r#"{"jsonrpc":"2.0","method":"item/completed","params":{"threadId":"t1","turnId":"u1","item":{"type":"reasoning","id":"r1","content":["weighing it"]}}}"#,
+        r#"{"jsonrpc":"2.0","method":"item/started","params":{"threadId":"t1","turnId":"u1","startedAtMs":2,"item":{"type":"commandExecution","id":"c1","command":"cargo test","cwd":"/work","commandActions":[],"status":"inProgress"}}}"#,
+        r#"{"jsonrpc":"2.0","method":"item/completed","params":{"threadId":"t1","turnId":"u1","item":{"type":"commandExecution","id":"c1","command":"cargo test","cwd":"/work","commandActions":[],"status":"failed","exitCode":101,"aggregatedOutput":"one test failed"}}}"#,
+        r#"{"jsonrpc":"2.0","method":"turn/plan/updated","params":{"threadId":"t1","turnId":"u1","plan":[{"step":"read the test","status":"completed"},{"step":"fix it","status":"inProgress"}]}}"#,
+        r#"{"jsonrpc":"2.0","method":"item/started","params":{"threadId":"t1","turnId":"u1","startedAtMs":3,"item":{"type":"agentMessage","id":"a1","text":""}}}"#,
+        r#"{"jsonrpc":"2.0","method":"item/agentMessage/delta","params":{"threadId":"t1","turnId":"u1","itemId":"a1","delta":"It fails "}}"#,
+        r#"{"jsonrpc":"2.0","method":"item/agentMessage/delta","params":{"threadId":"t1","turnId":"u1","itemId":"a1","delta":"on line 3."}}"#,
+        r#"{"jsonrpc":"2.0","method":"item/completed","params":{"threadId":"t1","turnId":"u1","item":{"type":"agentMessage","id":"a1","text":"It fails on line 3."}}}"#,
+        r#"{"jsonrpc":"2.0","method":"thread/tokenUsage/updated","params":{"threadId":"t1","turnId":"u1","tokenUsage":{"last":{"inputTokens":120,"outputTokens":40,"cachedInputTokens":80,"reasoningOutputTokens":12,"totalTokens":160},"total":{"inputTokens":300,"outputTokens":90,"cachedInputTokens":80,"reasoningOutputTokens":12,"totalTokens":390},"modelContextWindow":272000}}}"#,
+        r#"{"jsonrpc":"2.0","method":"turn/completed","params":{"threadId":"t1","turn":{"id":"u1","items":[],"status":"completed"}}}"#,
+    ];
+
+    #[test]
+    fn an_answer_arrives_as_it_is_written() {
+        // The whole reason for this transport. `codex exec` reports an assistant message once, on
+        // completion; here it streams, and the `item/completed` that repeats it must not print it
+        // a second time.
+        let events = replay(TURN);
+        let text: Vec<&str> = events
+            .iter()
+            .filter_map(|e| match e {
+                ProviderEvent::TextDelta { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(text, ["It fails ", "on line 3."], "streamed once, not streamed and repeated");
     }
 
     #[test]
-    fn an_answer_arrives_as_one_text_block() {
-        // No token deltas in this protocol: the message is complete when it is reported. A driver
-        // that emitted on `item.started` would open a block and put nothing in it.
-        let mut i = 0;
-        assert!(ev(r#"{"type":"item.started","item":{"id":"a","type":"agent_message","text":""}}"#, &mut i).is_empty());
-        let got = ev(
-            r#"{"type":"item.completed","item":{"id":"a","type":"agent_message","text":"done"}}"#,
-            &mut i,
+    fn an_item_that_never_streamed_still_says_everything_it_had() {
+        // The other half of the same rule. Not every item streams — a short one can complete
+        // before a delta is sent — and dropping its text on that basis loses the answer entirely.
+        let events = replay(&[
+            r#"{"jsonrpc":"2.0","method":"turn/started","params":{"threadId":"t1","turn":{"id":"u1"}}}"#,
+            r#"{"jsonrpc":"2.0","method":"item/started","params":{"item":{"type":"agentMessage","id":"a1","text":""}}}"#,
+            r#"{"jsonrpc":"2.0","method":"item/completed","params":{"item":{"type":"agentMessage","id":"a1","text":"done"}}}"#,
+        ]);
+        assert!(
+            events.iter().any(|e| matches!(e, ProviderEvent::TextDelta { text, .. } if text == "done")),
+            "{events:?}"
         );
-        assert_eq!(got.len(), 3);
-        assert!(matches!(got[0], ProviderEvent::BlockStart { index: 0, block: BlockStartKind::Text }));
-        assert!(matches!(&got[1], ProviderEvent::TextDelta { index: 0, text } if text == "done"));
-        assert!(matches!(got[2], ProviderEvent::BlockStop { index: 0 }));
     }
 
     #[test]
-    fn a_command_the_agent_ran_is_shown_with_what_it_ran() {
-        let mut i = 0;
-        let got = ev(
-            r#"{"type":"item.started","item":{"id":"c1","type":"command_execution",
-                "command":"ls -la","aggregated_output":"","status":"in_progress"}}"#,
-            &mut i,
-        );
-        match &got[0] {
+    fn a_command_is_a_card_before_it_is_an_answer() {
+        let events = replay(TURN);
+        let call = events.iter().find_map(|e| match e {
             ProviderEvent::BlockStart { block: BlockStartKind::ToolUse { id, name }, .. } => {
-                assert_eq!(name, "shell");
-                assert_eq!(id.0, "c1", "the CLI's own id, so an update can find its block");
+                Some((id.clone(), name.clone()))
             }
-            other => panic!("expected a tool block, got {other:?}"),
-        }
+            _ => None,
+        });
+        assert_eq!(call, Some((ToolCallId::from("c1"), "shell".into())));
+        // The exit code is not in the protocol's idea of a result, so it is written into the text
+        // in the convention the card reads. See `cards::exit_code`.
         assert!(
-            matches!(&got[1], ProviderEvent::ToolInputDelta { partial_json, .. }
-                if partial_json.contains("ls -la")),
-            "and the command is in the input, where the transcript looks for a subject"
+            events.iter().any(|e| matches!(
+                e,
+                ProviderEvent::ToolResult { content, is_error: true, .. }
+                    if content.starts_with("Exit code 101")
+            )),
+            "{events:?}"
         );
     }
 
     #[test]
-    fn blocks_are_numbered_in_the_order_they_open() {
-        let mut i = 0;
-        let a = ev(r#"{"type":"item.completed","item":{"id":"a","type":"reasoning","text":"hm"}}"#, &mut i);
-        let b = ev(r#"{"type":"item.completed","item":{"id":"b","type":"agent_message","text":"hi"}}"#, &mut i);
-        assert!(matches!(a[0], ProviderEvent::BlockStart { index: 0, .. }));
-        assert!(matches!(b[0], ProviderEvent::BlockStart { index: 1, .. }));
-        assert!(matches!(b[1], ProviderEvent::TextDelta { index: 1, .. }), "and so is the body");
+    fn the_plan_and_the_context_window_come_off_the_same_stream() {
+        let events = replay(TURN);
+        let acts = only_activity(&events);
+        assert!(acts.contains(&&Activity::Plan {
+            steps: vec![
+                PlanStep { text: "read the test".into(), state: PlanState::Done },
+                PlanStep { text: "fix it".into(), state: PlanState::Active },
+            ],
+        }));
+        // A number nothing else in neosh could have known: how big this model's window is, is the
+        // vendor's business and codex is the one being told.
+        assert!(acts.contains(&&Activity::Context { used: 390, total: 272_000 }));
     }
 
     #[test]
-    fn a_finished_turn_carries_what_it_cost() {
-        let mut i = 0;
-        let got = ev(
-            r#"{"type":"turn.completed","usage":{"input_tokens":10,"cached_input_tokens":4,
-                "cache_write_input_tokens":2,"output_tokens":7,"reasoning_output_tokens":3}}"#,
-            &mut i,
+    fn a_turn_ends_once_and_says_why() {
+        let events = replay(TURN);
+        assert_eq!(events.iter().filter(|e| **e == ProviderEvent::MessageStop).count(), 1);
+        assert!(events.iter().any(|e| matches!(
+            e,
+            ProviderEvent::MessageDelta { stop_reason: Some(StopReason::EndTurn), .. }
+        )));
+    }
+
+    /// A real capture: this is what a logged-out `codex app-server` does with a turn, eleven
+    /// complaints deep and then a failure.
+    #[test]
+    fn reconnecting_is_not_a_failure_until_it_is() {
+        let events = replay(&[
+            r#"{"jsonrpc":"2.0","method":"turn/started","params":{"threadId":"t1","turn":{"id":"u1"}}}"#,
+            r#"{"jsonrpc":"2.0","method":"error","params":{"error":{"message":"Reconnecting... 2/5"}}}"#,
+            r#"{"jsonrpc":"2.0","method":"warning","params":{"threadId":"t1","message":"Falling back from WebSockets to HTTPS transport."}}"#,
+            r#"{"jsonrpc":"2.0","method":"error","params":{"error":{"message":"unexpected status 401 Unauthorized"}}}"#,
+            r#"{"jsonrpc":"2.0","method":"turn/completed","params":{"threadId":"t1","turn":{"id":"u1","status":"failed"}}}"#,
+        ]);
+        assert!(
+            !events.iter().any(|e| matches!(e, ProviderEvent::Error { .. })),
+            "a complaint mid-turn is not the turn's answer\n{events:?}"
         );
-        match &got[0] {
-            ProviderEvent::MessageDelta { usage, stop_reason } => {
-                assert_eq!(usage.input_tokens, 10);
-                assert_eq!(usage.output_tokens, 7);
-                assert_eq!(usage.cache_read_tokens, 4);
-                assert_eq!(usage.thinking_tokens, 3);
-                assert_eq!(*stop_reason, Some(StopReason::EndTurn));
+        let stop = events.iter().find_map(|e| match e {
+            ProviderEvent::MessageDelta { stop_reason: Some(StopReason::Error { message }), .. } => {
+                Some(message.clone())
             }
-            other => panic!("expected a message delta, got {other:?}"),
-        }
-        assert!(matches!(got[1], ProviderEvent::MessageStop));
-    }
-
-    #[test]
-    fn a_failed_turn_becomes_an_error_event() {
-        let mut i = 0;
-        let got = ev(r#"{"type":"turn.failed","error":{"message":"rate limited"}}"#, &mut i);
-        assert!(matches!(&got[0], ProviderEvent::Error { message, .. } if message == "rate limited"));
-    }
-
-    #[test]
-    fn a_retry_notice_does_not_end_the_turn() {
-        // Taken from real output: an unauthenticated `codex exec` emits eleven of these before it
-        // gives up. Treating the first as terminal would abort a turn that was about to succeed on
-        // the third attempt.
-        let line = r#"{"type":"error","message":"Reconnecting... 2/5 (401 Unauthorized)"}"#;
-        let mut i = 0;
-        assert!(ev(line, &mut i).is_empty(), "not a stream event");
+            _ => None,
+        });
         assert_eq!(
-            codex_complaint(&serde_json::from_str(line).unwrap()).as_deref(),
-            Some("Reconnecting... 2/5 (401 Unauthorized)"),
-            "but kept, because it is the reason if nothing else arrives"
+            stop.as_deref(),
+            Some("unexpected status 401 Unauthorized"),
+            "and the last one is the reason, not the first"
         );
     }
 
     #[test]
-    fn a_non_fatal_error_item_is_kept_as_a_reason_rather_than_drawn() {
-        // Also from real output. "Falling back from WebSockets to HTTPS" is a thing that happened,
-        // not a thing the user asked about.
-        let line = r#"{"type":"item.completed","item":{"id":"item_0","type":"error",
-            "message":"Falling back from WebSockets to HTTPS transport."}}"#;
-        let mut i = 0;
-        assert!(ev(line, &mut i).is_empty());
-        assert!(
-            codex_complaint(&serde_json::from_str(line).unwrap())
-                .is_some_and(|m| m.contains("Falling back")),
+    fn an_approval_reaches_a_person_with_the_command_on_it() {
+        // The thing `codex exec` could not do at all: it was non-interactive, so `ask` mode could
+        // only fail closed at the first write.
+        let v: Value = serde_json::from_str(
+            r#"{"jsonrpc":"2.0","id":7,"method":"item/commandExecution/requestApproval","params":{"threadId":"t1","turnId":"u1","itemId":"c9","startedAtMs":1,"command":"rm -rf build","reason":"outside the sandbox"}}"#,
+        )
+        .unwrap();
+        let ask = approval_request(&v, std::path::Path::new("/work")).expect("an approval");
+        assert_eq!(ask.id, 7);
+        assert!(!ask.file_change);
+        assert_eq!(ask.request.capability, Capability::Exec { command: "rm -rf build".into() });
+        assert!(ask.request.title.contains("rm -rf build"));
+        assert!(ask.request.title.contains("outside the sandbox"), "{}", ask.request.title);
+
+        assert_eq!(decision(&ask, &PermissionAnswer::Deny), "decline");
+        assert_eq!(decision(&ask, &PermissionAnswer::Allow), "accept");
+        assert_eq!(
+            decision(&ask, &PermissionAnswer::Option(FOR_SESSION.into())),
+            "acceptForSession"
         );
     }
 
     #[test]
-    fn an_item_type_we_have_never_heard_of_is_ignored() {
-        // Rather than rendered as an empty block. The CLI adds item types faster than this file
-        // will be updated, and a blank card in the transcript reads as a bug in neosh.
-        let mut i = 0;
-        assert!(ev(r#"{"type":"item.started","item":{"id":"x","type":"telepathy"}}"#, &mut i).is_empty());
-        assert_eq!(i, 0, "and it does not consume a block index");
+    fn an_ordinary_notification_is_not_an_approval() {
+        // Notifications have no `id`, which is the whole difference — and answering one would be
+        // sending a reply to a message nobody is waiting on.
+        let v: Value =
+            serde_json::from_str(r#"{"jsonrpc":"2.0","method":"turn/started","params":{}}"#).unwrap();
+        assert_eq!(approval_request(&v, std::path::Path::new("/work")), None);
+    }
+
+    #[test]
+    fn every_mode_says_something_different_to_the_sandbox() {
+        use PermissionMode::*;
+        assert_eq!(sandbox_policy(Deny), json!({"type": "readOnly"}));
+        assert_eq!(sandbox_policy(Ask), json!({"type": "readOnly"}));
+        assert_eq!(sandbox_policy(AllowListed), json!({"type": "workspaceWrite"}));
+        assert_eq!(sandbox_policy(Allow), json!({"type": "dangerFullAccess"}));
+    }
+
+    #[test]
+    fn nothing_is_asked_when_there_is_nobody_to_ask() {
+        // A policy that routes decisions to a pipe nobody reads turns a turn into a hang, which is
+        // worse than the refusal it replaced.
+        for m in [
+            PermissionMode::Deny,
+            PermissionMode::Ask,
+            PermissionMode::AllowListed,
+            PermissionMode::Allow,
+        ] {
+            assert_eq!(approval_policy(m, false), "never", "{m:?} with no asker");
+        }
+        assert_eq!(approval_policy(PermissionMode::Ask, true), "on-request");
+        assert_eq!(approval_policy(PermissionMode::AllowListed, true), "on-request");
+        // Neither end of the range asks: `deny` has nothing to grant, and `allow` opted out.
+        assert_eq!(approval_policy(PermissionMode::Deny, true), "never");
+        assert_eq!(approval_policy(PermissionMode::Allow, true), "never");
+    }
+
+    fn inst() -> InstanceConfig {
+        InstanceConfig {
+            id: InstanceId::from("codex-cli"),
+            driver: DriverKind::from("codex-cli"),
+            display_name: "Codex".into(),
+            base_url: None,
+            brand: None,
+            auth: AuthRef::Inherited,
+            models: vec![],
+            extra_headers: vec![],
+        }
     }
 
     #[test]
@@ -713,21 +1434,12 @@ mod tests {
         use futures::StreamExt;
         let p = CodexCliProvider::new("definitely-not-a-real-binary-xyzzy");
         assert!(!p.available());
-        let inst = InstanceConfig {
-            id: InstanceId::from("codex-cli"),
-            driver: DriverKind::from("codex-cli"),
-            display_name: "Codex".into(),
-            base_url: None,
-            brand: None,
-            auth: AuthRef::Inherited,
-            models: vec![],
-            extra_headers: vec![],
-        };
         let req = TurnRequest {
+            conversation: SessionId::from("test"),
             cwd: std::path::PathBuf::new(),
             selection: ModelSelection {
                 instance: InstanceId::from("codex-cli"),
-                model: "gpt-5.6-terra".into(),
+                model: "gpt-5.6".into(),
                 options: vec![],
             },
             system: None,
@@ -738,68 +1450,8 @@ mod tests {
             tools: vec![],
             max_output_tokens: None,
         };
-        let got: Vec<_> = p.stream(&inst, req, CancellationToken::new()).collect().await;
+        let got: Vec<_> = p.stream(&inst(), req, CancellationToken::new()).collect().await;
         assert_eq!(got.len(), 1);
         assert!(matches!(got[0], ProviderEvent::Error { retryable: false, .. }));
-    }
-
-    /// A real `model/list` entry, copied verbatim from `codex app-server` on a signed-in machine.
-    ///
-    /// Recorded rather than hand-written because the point of discovery is that it answers
-    /// questions no catalogue of ours could — the `ultra` effort level here is one nobody wrote
-    /// down, and a fixture I invented would not have it.
-    const SOL: &str = include_str!("../../tests/fixtures/codex_model_sol.json");
-    const MINI: &str = include_str!("../../tests/fixtures/codex_model_mini.json");
-
-    fn parse(raw: &str) -> ModelInfo {
-        codex_model(&serde_json::from_str(raw).expect("fixture is JSON")).expect("a model")
-    }
-
-    #[test]
-    fn a_discovered_model_keeps_the_name_and_blurb_the_cli_gave_it() {
-        let m = parse(SOL);
-        assert_eq!(m.id.as_ref(), "gpt-5.6-sol");
-        assert_eq!(m.display_name, "GPT-5.6-Sol");
-        assert_eq!(m.tagline.as_deref(), Some("Latest frontier agentic coding model."));
-        assert!(!m.legacy);
-    }
-
-    /// The whole reason to ask rather than to write a list down: this ladder has a level our own
-    /// `EFFORT_CODEX` never had, and it arrives with the CLI's own description of each rung.
-    #[test]
-    fn the_effort_ladder_is_the_one_this_model_actually_accepts() {
-        let m = parse(SOL);
-        let ProviderOptionDescriptor::Select { options, current_value, .. } =
-            &m.capabilities.option_descriptors[0]
-        else {
-            panic!("effort should be a select");
-        };
-        let ids: Vec<&str> = options.iter().map(|o| o.id.as_str()).collect();
-        assert_eq!(ids, ["low", "medium", "high", "xhigh", "max", "ultra"]);
-        assert_eq!(current_value.as_deref(), Some("low"));
-        assert!(options.iter().find(|o| o.id == "low").expect("low").is_default);
-        assert_eq!(
-            options[0].description.as_deref(),
-            Some("Fast responses with lighter reasoning")
-        );
-    }
-
-    /// `hidden` is the CLI's "not in the default picker" flag, which is what `legacy` means here:
-    /// reachable, folded away, and the reason you went looking is that you are reproducing
-    /// something.
-    #[test]
-    fn a_model_the_cli_hides_is_offered_as_superseded_rather_than_dropped() {
-        let m = parse(MINI);
-        assert!(m.legacy);
-        assert_eq!(m.tier, Some(ModelTier::Fast));
-    }
-
-    #[test]
-    fn the_rung_comes_from_the_name_and_an_unknown_one_lands_in_the_middle() {
-        assert_eq!(codex_tier("gpt-5.6-sol"), ModelTier::Frontier);
-        assert_eq!(codex_tier("gpt-5.6-luna"), ModelTier::Fast);
-        assert_eq!(codex_tier("gpt-5.4-mini"), ModelTier::Fast);
-        assert_eq!(codex_tier("gpt-5.6-terra"), ModelTier::Balanced);
-        assert_eq!(codex_tier("something-new"), ModelTier::Balanced);
     }
 }

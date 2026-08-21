@@ -7,9 +7,6 @@ the same public API a third-party plugin author uses — the built-in chat UI is
 same `ApiCall` surface `examples/hello-plugin` is. If something needed a private escape hatch, the
 API would be wrong.
 
-> **Status: Phase 0.** One vertical slice, proving the plugin boundary is real. See
-> [Scope](#scope) for what is deliberately not built yet.
-
 ## Try it
 
 ```bash
@@ -198,7 +195,7 @@ does, so day-to-day work on the core rebuilds in seconds.
 
 ## Scope
 
-Phase 0 deliberately does **not** include: codebase indexing and embeddings, multi-file diff review,
+What is deliberately **not** built yet: codebase indexing and embeddings, multi-file diff review,
 checkpoints and rollback, a plugin manager with a lockfile, themes, or MCP. The architecture is
 shaped so each of those is an addition rather than a rewrite — see `docs/adr/` for where each one
 attaches.

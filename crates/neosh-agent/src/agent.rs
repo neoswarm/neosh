@@ -17,8 +17,9 @@ use std::sync::Arc;
 
 use futures::StreamExt;
 use neosh_proto::{
-    ContentBlock, HookName, HookOutcome, HookPayload, Message, MessageLevel, ModelSelection, Role,
-    SessionId, StopReason, ToolCall, ToolCallId, ToolResult, TurnId, TurnRequest, Usage,
+    Activity, ContentBlock, HookName, HookOutcome, HookPayload, Message, MessageLevel,
+    ModelSelection, Role, SessionId, StopReason, ToolCall, ToolCallId, ToolResult, TurnId,
+    TurnRequest, Usage,
 };
 use neosh_provider::ProviderRegistry;
 use tokio::sync::mpsc;
@@ -52,12 +53,27 @@ pub enum AgentEvent {
     ToolStarted { session: SessionId, turn: TurnId, call: ToolCall },
     ToolFinished { session: SessionId, turn: TurnId, call: ToolCall, result: ToolResult },
     TurnEnded { session: SessionId, turn: TurnId, stop_reason: StopReason, usage: Usage },
+    /// What the turn has produced so far is now in the conversation's messages.
+    ///
+    /// The host keeps its own record of a running turn, because until this lands there is nothing
+    /// to rebuild a transcript from — and for an agent driver, which streams its whole loop down
+    /// one connection, that is the entire turn rather than the tail of one round. This is the
+    /// moment that record stops being the truth and starts being a duplicate of it.
+    Committed { session: SessionId, turn: TurnId },
     /// A message typed while the turn was running has been taken into it.
     ///
     /// Emitted at the moment it enters the conversation rather than when it was typed, because
     /// until then it is a draft the user can still change their mind about — and a transcript that
     /// shows a question the model has not been told about is a transcript that is lying.
     Steered { session: SessionId, turn: TurnId, text: String },
+    /// The driver's own loop reported on itself — a sub-agent, a plan, a compaction, the commands
+    /// it accepts. See [`neosh_proto::Activity`].
+    ///
+    /// Not folded into the other variants and not persisted with the messages: this is a live
+    /// account of *how* the answer is being produced, and it is true only while it is happening. A
+    /// plan from yesterday's turn read back out of a transcript would be a checklist for work that
+    /// is already finished.
+    Activity { session: SessionId, turn: TurnId, activity: Activity },
     Notice { session: SessionId, level: MessageLevel, text: String },
 }
 
@@ -71,7 +87,9 @@ impl AgentEvent {
             | Self::ToolStarted { session, .. }
             | Self::ToolFinished { session, .. }
             | Self::TurnEnded { session, .. }
+            | Self::Committed { session, .. }
             | Self::Steered { session, .. }
+            | Self::Activity { session, .. }
             | Self::Notice { session, .. } => session,
         }
     }
@@ -275,6 +293,10 @@ impl Agent {
 
         let request = TurnRequest {
             selection,
+            // A one-shot generation is nobody's conversation: it borrows the model and the
+            // directory and leaves nothing behind, so a driver that keeps state per conversation
+            // has nothing to keep.
+            conversation: SessionId::from(""),
             cwd: self.session().cwd.clone(),
             system,
             messages: vec![Message {
@@ -482,6 +504,7 @@ impl Agent {
             };
             let request = TurnRequest {
                 selection: selection.clone(),
+                conversation: session.clone(),
                 cwd: cwd.clone(),
                 system,
                 messages,
@@ -557,6 +580,13 @@ impl Agent {
                                 });
                             }
                         }
+                        // Every driver, not only a delegating one: a model driver that grows a
+                        // plan tomorrow should need no change here.
+                        TurnUpdate::Activity { activity } => self.emit(AgentEvent::Activity {
+                            session: session.clone(),
+                            turn: turn.clone(),
+                            activity,
+                        }),
                         TurnUpdate::ToolReady { .. } | TurnUpdate::ToolMalformed { .. } => {}
                     }
                 }
@@ -567,12 +597,19 @@ impl Agent {
             let calls = assembler.tool_calls();
             let (produced, this_stop, usage) = assembler.finish();
             total.merge(&usage);
+            let recorded = !produced.is_empty();
             self.with(&session, |s| {
                 s.add_usage(&usage);
                 for m in produced {
                     s.push_message(m);
                 }
             });
+            if recorded {
+                self.emit(AgentEvent::Committed {
+                    session: session.clone(),
+                    turn: turn.clone(),
+                });
+            }
 
             if cancelled {
                 stop = StopReason::Cancelled;
@@ -599,7 +636,14 @@ impl Agent {
                 let call = ToolCall { id: id.clone(), turn: turn.clone(), name, input };
                 results.push((id, self.run_tool(bridge, &session, &cwd, call, &cancel).await));
             }
+            let recorded = !results.is_empty();
             self.with(&session, |s| s.push_tool_results(results));
+            if recorded {
+                self.emit(AgentEvent::Committed {
+                    session: session.clone(),
+                    turn: turn.clone(),
+                });
+            }
             // The gap between rounds: the model is about to be asked again anyway, so anything
             // typed since the last one rides along with the tool results.
             self.take_steering_into(&session, &turn);
@@ -810,19 +854,118 @@ struct HookApprover<'a> {
 #[async_trait::async_trait]
 impl crate::tools::Approver for HookApprover<'_> {
     async fn ask(&self, capability: neosh_proto::Capability) -> neosh_proto::PermissionDecision {
-        let turn = self.turn.clone();
-        let (outcome, _payload) = hooks::run_blocking(
+        let (outcome, _) = ask_hooks(
             self.hooks.clone(),
             self.bridge,
-            HookName::PermissionPre,
-            HookPayload::PermissionPre { turn, capability: capability.clone() },
+            HookPayload::PermissionPre {
+                turn: self.turn.clone(),
+                capability,
+                title: None,
+                // A built-in tool offers none: the question is "may this happen", and the answers
+                // to that are yes and no.
+                options: Vec::new(),
+                chosen: None,
+            },
         )
         .await;
         match outcome {
             HookOutcome::Veto { reason } => neosh_proto::PermissionDecision::Deny { reason },
-            // `Continue` from a hook that was asked "may this happen" is a yes. `Modify` is not
-            // meaningful for a yes/no question and is read the same way.
+            // `Continue` from a hook that was asked "may this happen" is a yes. `Modify` is read
+            // the same way here, because a yes/no question has nothing else to carry back.
             _ => neosh_proto::PermissionDecision::Allow,
+        }
+    }
+}
+
+/// Run the `permission_pre` hooks and read back the payload they may have changed.
+async fn ask_hooks(
+    regs: Vec<crate::hooks::HookReg>,
+    bridge: &dyn PluginBridge,
+    payload: HookPayload,
+) -> (HookOutcome, Option<String>) {
+    let (outcome, payload) =
+        hooks::run_blocking(regs, bridge, HookName::PermissionPre, payload).await;
+    let chosen = match payload {
+        HookPayload::PermissionPre { chosen, .. } => chosen,
+        _ => None,
+    };
+    (outcome, chosen)
+}
+
+/// Sends an agent driver's permission request to the same prompt a tool call reaches.
+///
+/// The driver has a question and no idea who answers it; this has the hook registry, the plugin
+/// bridge and the permission layer, and no idea what ACP is. That separation is the point — see
+/// ADR 0032.
+///
+/// Policy is consulted first, exactly as [`crate::tools::ToolCtx::permit`] does for a built-in
+/// tool. Without that, `full access` would still open a prompt, and a workspace read would open one
+/// too — for something neosh's own `read_file` does without asking. Only a `Prompt` reaches a
+/// person, which is what makes the two paths one behaviour rather than two that resemble each
+/// other.
+pub struct DriverAsker {
+    hooks: Arc<std::sync::RwLock<crate::hooks::HookRegistry>>,
+    permissions: Arc<std::sync::RwLock<Arc<PermissionLayer>>>,
+    bridge: Arc<dyn PluginBridge>,
+}
+
+impl std::fmt::Debug for DriverAsker {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("DriverAsker")
+    }
+}
+
+impl DriverAsker {
+    pub fn new(agent: &Agent, bridge: Arc<dyn PluginBridge>) -> Self {
+        Self { hooks: agent.hooks.clone(), permissions: agent.permissions.clone(), bridge }
+    }
+}
+
+#[async_trait::async_trait]
+impl neosh_provider::approval::PermissionAsker for DriverAsker {
+    async fn ask(
+        &self,
+        request: neosh_provider::approval::PermissionRequest,
+    ) -> neosh_provider::approval::PermissionAnswer {
+        use neosh_provider::approval::PermissionAnswer;
+
+        let layer = {
+            let guard = self.permissions.read().expect("permission lock poisoned");
+            guard.rooted_at(&request.cwd)
+        };
+        match layer.check(&request.capability) {
+            neosh_proto::PermissionDecision::Allow => return PermissionAnswer::Allow,
+            neosh_proto::PermissionDecision::Deny { .. } => return PermissionAnswer::Deny,
+            neosh_proto::PermissionDecision::Prompt => {}
+        }
+
+        let regs: Vec<_> = {
+            let guard = self.hooks.read().expect("hook lock poisoned");
+            guard.blocking(HookName::PermissionPre).cloned().collect()
+        };
+        // Fail closed, and for the same reason a hook that times out is a veto: an agent whose
+        // request nobody can hear must not proceed as though somebody said yes.
+        if regs.is_empty() {
+            return PermissionAnswer::Deny;
+        }
+
+        let (outcome, chosen) = ask_hooks(
+            regs,
+            self.bridge.as_ref(),
+            HookPayload::PermissionPre {
+                turn: None,
+                capability: request.capability,
+                title: Some(request.title),
+                options: request.options,
+                chosen: None,
+            },
+        )
+        .await;
+        match outcome {
+            HookOutcome::Veto { .. } => PermissionAnswer::Deny,
+            // An option the prompt named is taken verbatim — that is the whole reason the agent's
+            // own options travelled out there. A yes with nothing named is still a yes.
+            _ => chosen.map_or(PermissionAnswer::Allow, PermissionAnswer::Option),
         }
     }
 }

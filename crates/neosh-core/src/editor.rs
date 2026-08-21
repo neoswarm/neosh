@@ -130,6 +130,8 @@ impl Editor {
                 | ApiCall::AgentSetSelection { .. }
                 | ApiCall::AgentListModels { .. }
                 | ApiCall::AgentListInstances
+                | ApiCall::AgentDriverCommands
+                | ApiCall::ChatSetDraft { .. }
                 | ApiCall::ToolRegister { .. }
                 | ApiCall::ToolUnregister { .. }
                 | ApiCall::ToolList

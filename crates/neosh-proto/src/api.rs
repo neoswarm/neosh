@@ -19,8 +19,8 @@ use crate::ids::{
 };
 use crate::options::{OptionEntry, OptionSpec, OptionValue};
 use crate::provider::{
-    CredentialInfo, DriverKind, InstanceConfig, InstanceId, ModelEntry, ModelSelection,
-    ProviderEvent,
+    CredentialInfo, DriverCommand, DriverKind, InstanceConfig, InstanceId, ModelEntry,
+    ModelSelection, ProviderEvent,
 };
 use crate::ui::{
     CursorMotion, ExtmarkInfo, ExtmarkOpts, FloatConfig, HighlightDef, KeyPress, MessageLevel,
@@ -332,6 +332,23 @@ pub enum ApiCall {
         refresh: bool,
     },
     AgentListInstances,
+    /// What the driver behind this conversation accepts as a slash command.
+    ///
+    /// Reported by the driver at its handshake rather than configured, because which commands exist
+    /// depends on the install: `claude` counts project `.claude/commands/`, plugin commands and MCP
+    /// prompts among its own, and an ACP agent sends whatever its vendor built in. Empty for a
+    /// driver that has none and for a conversation that has not run a turn yet — there has been
+    /// nothing to ask.
+    AgentDriverCommands,
+    /// Replace what is in the composer.
+    ///
+    /// The composer is the host's, not a buffer a plugin may write to directly: it has a cursor, a
+    /// height that follows its content, and a draft that is parked and restored when conversations
+    /// change. This is the one supported way to put words in somebody's mouth, and it exists so
+    /// completion — of a command, a path, a file — can be a plugin.
+    ChatSetDraft {
+        text: String,
+    },
 
     // ---- credentials ---------------------------------------------------
     // Three verbs, and *none of them carries a key*. Listing reports where a key comes from, never
@@ -440,6 +457,15 @@ pub enum ApiCall {
     ProviderRegisterDriver {
         driver: DriverKind,
         instances: Vec<InstanceConfig>,
+        /// Whether this driver runs its own agent loop, like `claude` or anything speaking ACP.
+        ///
+        /// It changes what the host does with the stream, not how the stream is produced: an agent
+        /// driver is sent no tool list, because it brings its own, and neosh's tool registry, hooks
+        /// and permission layer therefore do not gate what it does. Saying so is the honest option
+        /// — a plugin shipping an agent driver that claimed to be a model driver would have the
+        /// host run its tool calls a second time.
+        #[serde(default)]
+        agent_loop: bool,
     },
     /// Push one event for an in-flight plugin-implemented stream. See
     /// [`crate::provider::ProviderEmit`].
@@ -659,6 +685,7 @@ pub enum ApiOk {
     Tools { tools: Vec<ToolDef> },
     Names { names: Vec<String> },
     Commands { commands: Vec<CommandEntry> },
+    DriverCommands { commands: Vec<DriverCommand> },
     Keymaps { keymaps: Vec<KeymapEntry> },
     Permission { decision: PermissionDecision },
     PermissionMode { mode: PermissionMode },
