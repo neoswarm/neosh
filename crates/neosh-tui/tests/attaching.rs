@@ -23,11 +23,11 @@ fn a_workspace() -> (Editor, BufferId, neosh_proto::WindowId) {
     let mut e = Editor::new();
     let p = plugin();
 
-    let chat = match e.apply(&p, ApiCall::BufCreate { name: Some("[chat]".into()), scratch: true }) {
+    let chat = match e.apply(&p, ApiCall::BufCreate { name: Some("[chat]".into()), scratch: true, kind: None }) {
         Ok(neosh_proto::ApiOk::Buf { buf }) => buf,
         other => panic!("{other:?}"),
     };
-    let composer = match e.apply(&p, ApiCall::BufCreate { name: Some("[composer]".into()), scratch: true })
+    let composer = match e.apply(&p, ApiCall::BufCreate { name: Some("[composer]".into()), scratch: true, kind: None })
     {
         Ok(neosh_proto::ApiOk::Buf { buf }) => buf,
         other => panic!("{other:?}"),

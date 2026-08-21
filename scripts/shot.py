@@ -29,11 +29,16 @@ def encode(tok: str) -> str:
     name = tok[1:-1].lower()
     if name in NAMED:
         return NAMED[name]
-    if name.startswith("c-") and len(name) == 3:
+    if name.startswith("c-") and len(name) == 3 and name[2].isalpha():
         return chr(ord(name[2].upper()) - 64)
     if name.startswith("a-"):
         rest = name[2:]
         return "\x1b" + (NAMED.get(rest, rest))
+    # Raw bytes, as hex: <raw:1b5b313b3341>. The escape hatch for keys whose encoding is the
+    # question — a control character no name covers, or the sequence one particular terminal sends
+    # for a chord. Without it, "does neosh see Ctrl+/" is unanswerable except by pressing it.
+    if name.startswith("raw:"):
+        return bytes.fromhex(name[4:]).decode("latin-1")
     raise SystemExit(f"unknown key {tok}")
 
 def desc(key):

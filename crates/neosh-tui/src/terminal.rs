@@ -8,7 +8,8 @@ use std::io::{self, Stdout};
 
 use crossterm::event::{
     DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode as CtCode, KeyEvent,
-    KeyEventKind, KeyModifiers,
+    KeyEventKind, KeyModifiers, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags,
+    PushKeyboardEnhancementFlags,
 };
 use crossterm::terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode};
 use crossterm::{execute, ExecutableCommand};
@@ -81,6 +82,43 @@ pub fn to_input_event(ev: Event) -> Option<InputEvent> {
 pub struct TerminalFrontend {
     terminal: Terminal<CrosstermBackend<Stdout>>,
     theme: Theme,
+    /// Whether the keyboard enhancement flags were pushed, and therefore have to be popped.
+    ///
+    /// Kept rather than re-asked on the way out: `supports_keyboard_enhancement` queries the
+    /// terminal and waits for a reply, and doing that while tearing down — possibly on a panic
+    /// path, possibly after the terminal has gone away — is how an exit hangs.
+    enhanced: bool,
+}
+
+/// Ask the terminal for unambiguous keys, if it knows how.
+///
+/// Without this, three things are impossible rather than merely awkward. `Cmd`/`Super` never
+/// arrives at all, so a `<D-…>` binding is accepted, listed, shown in the footer and never fires.
+/// `Ctrl` with anything that is not a letter collapses onto the C0 control it shares a byte with —
+/// `Ctrl+/` is indistinguishable from `Ctrl+7`, which is why neither is a key anybody can usefully
+/// bind. And `Esc` is ambiguous with the start of an escape sequence, which is what makes a
+/// terminal wait before deciding you pressed it.
+///
+/// Failure is not an error. Most terminals do not implement this, `execute` on an unsupported
+/// sequence is a no-op there, and the answer is simply the keyboard everyone has always had.
+fn enable_enhanced_keys(stdout: &mut Stdout) -> bool {
+    // An environment variable rather than an option, because this runs before there is any config:
+    // the terminal has to be in the right mode before the first keystroke, and config arrives from
+    // a plugin runtime that has not started yet. It exists because "my terminal claims to support
+    // this and is wrong about it" is a thing that happens, and the symptom — every key arriving
+    // twice, or `Esc` never arriving — is one you cannot fix from inside a program you cannot type
+    // into.
+    if std::env::var_os("NEOSH_NO_ENHANCED_KEYS").is_some() {
+        return false;
+    }
+    if !matches!(crossterm::terminal::supports_keyboard_enhancement(), Ok(true)) {
+        return false;
+    }
+    // Deliberately not `REPORT_EVENT_TYPES`: it adds key-release events, which this frontend
+    // discards, so the only thing it would buy is twice the input to throw half of away.
+    let flags = KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+        | KeyboardEnhancementFlags::REPORT_ALTERNATE_KEYS;
+    execute!(stdout, PushKeyboardEnhancementFlags(flags)).is_ok()
 }
 
 impl TerminalFrontend {
@@ -89,8 +127,9 @@ impl TerminalFrontend {
         enable_raw_mode()?;
         let mut stdout = io::stdout();
         execute!(stdout, EnterAlternateScreen, EnableBracketedPaste)?;
+        let enhanced = enable_enhanced_keys(&mut stdout);
         let terminal = Terminal::new(CrosstermBackend::new(stdout))?;
-        Ok(Self { terminal, theme: Theme::new(ColorDepth::detect()) })
+        Ok(Self { terminal, theme: Theme::new(ColorDepth::detect()), enhanced })
     }
 
     pub fn size(&self) -> io::Result<(u16, u16)> {
@@ -164,6 +203,12 @@ impl TerminalFrontend {
     /// type `reset`.
     pub fn leave(&mut self) -> io::Result<()> {
         disable_raw_mode()?;
+        // Before leaving the alternate screen, and only if we pushed: popping a stack we never
+        // pushed to would take away whatever the *shell* had set, and a terminal left in enhanced
+        // mode after neosh exits is a shell where `Esc` behaves differently than it did.
+        if self.enhanced {
+            let _ = self.terminal.backend_mut().execute(PopKeyboardEnhancementFlags);
+        }
         self.terminal.backend_mut().execute(DisableBracketedPaste)?;
         self.terminal.backend_mut().execute(LeaveAlternateScreen)?;
         self.terminal.show_cursor()?;
