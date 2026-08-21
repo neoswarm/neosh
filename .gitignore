@@ -1,3 +1,8 @@
 /target
 node_modules/
 *.snap.new
+
+# macOS AppleDouble sidecars. This volume is not HFS+, so every file gets a `._` twin —
+# 380 of them, which makes `git status` unreadable and puts junk one `git add -A` away from a commit.
+._*
+.DS_Store

@@ -15,6 +15,7 @@
 //! `plugins/api/src/generated/`, and CI fails if the result differs from what is committed.
 
 pub mod agent;
+pub mod ascp;
 pub mod api;
 pub mod ids;
 pub mod options;
@@ -24,6 +25,7 @@ pub mod ui;
 pub mod vcs;
 
 pub use agent::*;
+pub use ascp::*;
 pub use api::*;
 pub use ids::*;
 pub use options::*;

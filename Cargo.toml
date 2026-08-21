@@ -5,6 +5,7 @@ members = [
     "crates/neosh-core",
     "crates/neosh-provider",
     "crates/neosh-vcs",
+    "crates/neosh-swarm",
     "crates/neosh-agent",
     "crates/neosh-script",
     "crates/neosh-tui",
@@ -24,13 +25,14 @@ neosh-proto = { path = "crates/neosh-proto" }
 neosh-core = { path = "crates/neosh-core" }
 neosh-provider = { path = "crates/neosh-provider" }
 neosh-vcs = { path = "crates/neosh-vcs" }
+neosh-swarm = { path = "crates/neosh-swarm" }
 neosh-agent = { path = "crates/neosh-agent" }
 neosh-script = { path = "crates/neosh-script" }
 neosh-tui = { path = "crates/neosh-tui" }
 neosh-syntax = { path = "crates/neosh-syntax" }
 
 # async
-tokio = { version = "1.53", features = ["rt", "rt-multi-thread", "macros", "sync", "time", "process", "io-util", "fs", "signal"] }
+tokio = { version = "1.53", features = ["rt", "rt-multi-thread", "macros", "sync", "time", "process", "io-util", "fs", "signal", "net"] }
 tokio-util = { version = "0.7", features = ["rt"] }
 tokio-stream = "0.1"
 futures = "0.3"
@@ -77,6 +79,11 @@ pin-project-lite = "0.2"
 shellexpand = "3"
 # Content hashing for the project-config trust store.
 sha2 = "0.10"
+# ASCP node identity. A peer is authorised by its public key being in a list you wrote, so the
+# signature check is the whole of the authorisation and there is no CA to run.
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+rand = "0.8"
+hex = "0.4"
 # Embeds the `@neosh/api` source tree so `neosh init` can emit types matching the running binary.
 include_dir = "0.7"
 
