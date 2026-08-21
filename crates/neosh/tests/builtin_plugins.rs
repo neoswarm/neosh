@@ -502,9 +502,16 @@ fn a_model_you_added_yourself_can_be_removed_again() {
         s.picker_now()
     );
 
-    // Onto it — it sorts above the provider's own models — and out.
+    // Onto it — it sorts above the provider's own models — and out. Asked about first: you named
+    // this one yourself, so nothing will offer it back.
     s.special("up");
     s.ctrl("d");
+    assert!(
+        s.pump(|s| s.saw("Remove acme-1")),
+        "it asks before taking it away\n{}",
+        s.transcript()
+    );
+    s.key("y");
     assert!(
         s.pump(|s| !s.picker_now().iter().any(|l| l.contains("acme-1"))),
         "and out again\n{:?}",
@@ -2020,14 +2027,11 @@ impl Session {
     }
 }
 
-#[test]
-fn archiving_takes_a_conversation_out_of_the_list_and_u_brings_it_back() {
-    // The everyday verb. It asks nothing, because there is nothing to lose — which is the whole
-    // reason it exists beside the one that does ask.
-    let sb = Sandbox::new("archive");
-    let mut s = sb.start();
-    s.wait_for("PROJECTS");
-
+/// Start a conversation called `keep`, then archive it from the panel.
+///
+/// Shared by both archive tests: getting there is six keystrokes of setup and neither test is about
+/// the setup.
+fn archive_one(s: &mut Session) {
     for c in ["k", "e", "e", "p"] {
         s.key(c);
     }
@@ -2043,51 +2047,72 @@ fn archiving_takes_a_conversation_out_of_the_list_and_u_brings_it_back() {
         "the cursor is on a conversation\n{:?}",
         s.sidebar_now()
     );
-    let panel_only = s.open_windows().len();
     s.key("x");
+}
+
+#[test]
+fn archiving_takes_a_conversation_out_of_the_panel_altogether() {
+    // The everyday verb, and it asks nothing, because there is nothing to lose. What it leaves
+    // behind is one row saying how many — not a section of dim rows in the column you work in.
+    let sb = Sandbox::new("archive");
+    let mut s = sb.start();
+    s.wait_for("PROJECTS");
+
+    let panel_only = s.open_windows().len();
+    archive_one(&mut s);
     assert!(
-        s.pump(|s| s.sidebar_now().iter().any(|l| l.contains("ARCHIVED"))),
-        "an archived section appeared\n{:?}",
+        s.pump(|s| s.sidebar_now().iter().any(|l| l.contains("Archived"))),
+        "a door to the archive appeared\n{:?}",
         s.sidebar_now()
     );
     assert_eq!(s.open_windows().len(), panel_only, "and nothing asked");
 
+    // Not folded away, not dimmed at the foot: gone. Every row of the panel is drained first, so
+    // this is about what the panel says *now* rather than what it ever said.
     assert!(
         s.pump(|s| !s.sidebar_now().iter().any(|l| l.contains("keep"))),
-        "and it left the everyday list\n{:?}",
+        "and it left the panel entirely\n{:?}",
         s.sidebar_now()
     );
+    // Including with everything unfolded — there is no state of this panel that shows it.
+    s.key("j");
+    s.key(" ");
+    s.drain_for(Duration::from_millis(400));
+    assert!(
+        !s.sidebar_now().iter().any(|l| l.contains("keep")),
+        "no fold brings it back\n{:?}",
+        s.sidebar_now()
+    );
+}
 
-    // Down to the archive heading. Where the cursor landed when the row under it was archived is
-    // not something this test should assert, so it steps until the hints say it has arrived — the
-    // hints being contextual is exactly what makes that legible.
-    let on_heading =
-        |s: &Session| s.sidebar_now().iter().any(|l| l.contains("show what is put away"));
-    let mut found = on_heading(&s);
-    for _ in 0..6 {
-        if found {
-            break;
-        }
-        // Stepping first and waiting after: waiting on a predicate that is not yet true costs the
-        // whole budget, and a test that spends thirty seconds arriving is a test people delete.
-        s.key("j");
-        found = s.pump(on_heading);
-    }
-    assert!(found, "never reached the archive heading\n{:?}", s.sidebar_now());
-    s.enter();
+#[test]
+fn the_archive_is_a_place_you_go_and_come_back_from() {
+    // `a` in the panel — and `^F` from anywhere — opens what you have put away, as a list you can
+    // filter. `^U` on a row puts it back without switching to it, because tidying and going
+    // somewhere are different things.
+    let sb = Sandbox::new("browse");
+    let mut s = sb.start();
+    s.wait_for("PROJECTS");
+
+    archive_one(&mut s);
+    assert!(s.pump(|s| s.sidebar_now().iter().any(|l| l.contains("Archived"))));
+
+    s.key("a");
+    assert!(
+        s.pump(|s| s.picker_named("[Archived conversations]").iter().any(|l| l.contains("keep"))),
+        "the archive opened with it in\n{:?}",
+        s.picker_named("[Archived conversations]")
+    );
+
+    s.ctrl("u");
     assert!(
         s.pump(|s| s.sidebar_now().iter().any(|l| l.contains("keep"))),
-        "unfolding the archive shows what is in it\n{:?}",
+        "`^U` put it back in the list\n{:?}",
         s.sidebar_now()
     );
-
-    // And `u` on it puts it back where it was.
-    s.key("j");
-    assert!(s.pump(|s| s.sidebar_now().iter().any(|l| l.contains("u unarchive"))));
-    s.key("u");
     assert!(
-        s.pump(|s| !s.sidebar_now().iter().any(|l| l.contains("ARCHIVED"))),
-        "the section goes away with the last thing in it\n{:?}",
+        s.pump(|s| !s.sidebar_now().iter().any(|l| l.contains("Archived"))),
+        "and the door went with the last thing behind it\n{:?}",
         s.sidebar_now()
     );
 }
@@ -2119,6 +2144,26 @@ fn deleting_a_conversation_with_something_in_it_asks_first() {
     s.key("X");
     assert!(s.pump(|s| s.open_windows().len() > panel_only), "the dialog opened");
 
+    // What is at stake, in the dialog, rather than a bare "are you sure?" you learn to clear.
+    assert!(
+        s.pump(|s| s.saw("messages, in")),
+        "it says what there is to lose\n{}",
+        s.transcript()
+    );
+    // And the answer that cannot be undone is not drawn like the one beside it.
+    let dialog = s.buffer_named("[confirm]").expect("the dialog buffer");
+    assert!(
+        s.groups_of(dialog).iter().any(|row| row.iter().any(|g| g == "Diagnostic.Error")),
+        "the destructive answer is coloured as one\n{:?}",
+        s.groups_of(dialog)
+    );
+    // The row under the cursor is banded rather than repainted, which is what leaves the colour
+    // above intact. A ranged group across the same bytes would take it.
+    assert!(
+        s.wire().contains(r#""line_hl_group":"Picker.Selected""#),
+        "the cursor row is a band under the text, not a group over it"
+    );
+
     // The cursor starts on the answer that changes nothing: `<CR>` is reflex by the second time you
     // have seen a dialog, and a reflex must not delete anything.
     s.enter();
@@ -2142,8 +2187,11 @@ fn deleting_a_conversation_with_something_in_it_asks_first() {
 }
 
 #[test]
-fn an_empty_conversation_is_deleted_without_being_asked_about() {
-    // A dialog for something with nothing to lose is friction that teaches you to dismiss dialogs.
+fn deleting_asks_even_when_there_is_nothing_in_it_to_lose() {
+    // It used to go straight through for an empty conversation, on the grounds that a dialog for
+    // something with nothing to lose is friction. What that actually bought was a key whose
+    // behaviour depended on state you cannot see from the row it is pointed at — so the one time it
+    // did stop and ask was the one time your fingers were already through it.
     let sb = Sandbox::new("nodialog");
     let mut s = sb.start();
     s.wait_for("PROJECTS");
@@ -2153,15 +2201,24 @@ fn an_empty_conversation_is_deleted_without_being_asked_about() {
     }));
 
     s.enter_panel();
+    let panel_only = s.open_windows().len();
     s.key("X");
+    assert!(s.pump(|s| s.open_windows().len() > panel_only), "it asked anyway");
+    assert!(
+        s.pump(|s| s.saw("Nothing has been said in it yet")),
+        "and said what there was to lose\n{}",
+        s.transcript()
+    );
+
+    // `y` answers it outright, which is the point of a dialog with two answers and no filter.
+    s.key("y");
     assert!(
         s.pump(|s| {
             s.sidebar_now().iter().filter(|l| l.contains("New conversation")).count() == 1
         }),
-        "gone, with nothing asked\n{:?}",
+        "answering yes deleted it\n{:?}",
         s.sidebar_now()
     );
-    assert!(!s.saw("Delete \""), "and no dialog appeared\n{}", s.transcript());
 }
 
 #[test]
@@ -2304,8 +2361,26 @@ fn the_key_list_opens_from_the_panel_and_any_key_dismisses_it() {
 
     s.enter_panel();
     s.key("?");
-    s.wait_for("PROJECT PANEL");
+    // The panel's section is named after its buffer kind and is generated from the live registry —
+    // it used to be a hand-written list in the palette, which is exactly the drift this replaced.
+    // It comes first because `?` was pressed *in* the panel.
+    s.wait_for("neosh.sidebar");
     let keys = s.buffer_named("[keys]").expect("key list buffer");
+    assert!(
+        s.pump(|s| {
+            let lines = s.lines_of(keys);
+            let first = lines.iter().position(|l| l.contains("neosh.sidebar"));
+            let chat = lines.iter().position(|l| l.trim() == "CHAT");
+            matches!((first, chat), (Some(f), Some(c)) if f < c)
+        }),
+        "the panel you are standing in is listed before the global bindings\n{:?}",
+        s.lines_of(keys)
+    );
+    assert!(
+        s.lines_of(keys).iter().any(|l| l.contains("Archive this conversation")),
+        "and its verbs are there, described by the command that owns them\n{:?}",
+        s.lines_of(keys)
+    );
     // The text is written before the float is opened, so seeing the text is not seeing the window.
     assert!(s.pump(|s| s.windows_for(keys).len() == 1), "it is on screen\n{}", s.transcript());
 
@@ -4354,5 +4429,192 @@ impl Session {
             Some(b) => self.lines_of(b),
             None => Vec::new(),
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Extending a bundled panel from outside it
+// ---------------------------------------------------------------------------
+
+/// A plugin that has never heard of the sidebar's source, adding to the sidebar.
+///
+/// Everything it does is on the public surface: a contribution point for rows, a contribution point
+/// for a verb, and a key bound at the *buffer kind* rather than at a window it cannot name. If any
+/// of that ever needs a private path into the panel, these tests stop compiling against the API a
+/// third party has.
+const EXTENDER: &str = r#"
+import type { PluginContext } from "@neosh/api";
+
+export async function activate({ neosh, subscriptions }: PluginContext) {
+  subscriptions.push(await neosh.cmd.register("acme.touched", (args) => {
+    // The row under the cursor arrives as arguments, which is the whole reason the panel binds the
+    // key rather than the contributor doing it.
+    neosh.notify(`acme touched ${args.join(" ")}`);
+  }, { desc: "Touch the row" }));
+
+  subscriptions.push(await neosh.ext.contribute("sidebar.section", "todo", {
+    title: "ACME",
+    at: "below",
+    rows: [{ text: "Ship the thing", command: "acme.touched", args: ["from-row"] }],
+  }));
+
+  subscriptions.push(await neosh.ext.contribute("sidebar.action", "touch", {
+    key: "t",
+    label: "touch",
+    command: "acme.touched",
+    on: "any",
+  }));
+
+  neosh.notify("acme ready");
+}
+"#;
+
+fn install_extender(sb: &Sandbox) {
+    let dir = sb.root.join("config/plugins/acme");
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    std::fs::write(
+        dir.join("plugin.toml"),
+        "name = \"acme\"\nversion = \"0.1.0\"\nentry = \"main.ts\"\n",
+    )
+    .expect("manifest");
+    std::fs::write(dir.join("main.ts"), EXTENDER).expect("plugin");
+}
+
+/// Rows somebody else contributed are in the panel, and pressing `↵` on one runs their command.
+#[test]
+fn a_third_party_can_put_rows_in_the_sidebar() {
+    let sb = Sandbox::new("extendrows");
+    install_extender(&sb);
+    let mut s = sb.start();
+    s.wait_for("acme ready");
+    s.wait_for("PROJECTS");
+
+    assert!(
+        s.pump(|s| s.sidebar_now().iter().any(|l| l.contains("Ship the thing"))),
+        "the contributed row is drawn\n{:?}",
+        s.sidebar_now()
+    );
+
+    // Into the panel, then down to their row and press it. Walked rather than jumped: the cursor
+    // wraps, so a fixed number of presses would depend on how many rows the panel happens to have.
+    s.ctrl("t");
+    assert!(
+        s.pump(|s| s.sidebar_now().iter().any(|l| l.contains("↵ open"))),
+        "in the panel\n{:?}",
+        s.sidebar_now()
+    );
+    let mut landed = false;
+    for _ in 0..12 {
+        if s.sidebar_cursor().is_some_and(|r| r.contains("Ship the thing")) {
+            landed = true;
+            break;
+        }
+        s.key("j");
+        s.drain_for(Duration::from_millis(120));
+    }
+    assert!(landed, "the cursor can be put on a contributed row\n{:?}", s.sidebar_now());
+
+    s.special("enter");
+    assert!(
+        s.pump(|s| s.saw("acme touched from-row")),
+        "the contributed command ran with the arguments it asked for\n{:?}",
+        s.sidebar_now()
+    );
+}
+
+/// A verb contributed by somebody else is a real binding on the panel: it fires on its key, and the
+/// row under the cursor is handed to it.
+///
+/// The key is bound at `buf_kind` scope, which is the part that could not be done before — the
+/// panel's window id is private to the panel and changes every time it is toggled, so a third party
+/// had no name to bind against.
+#[test]
+fn a_third_party_verb_fires_on_its_key_with_the_row_it_was_pointed_at() {
+    let sb = Sandbox::new("extendverb");
+    install_extender(&sb);
+    let mut s = sb.start();
+    s.wait_for("acme ready");
+    s.wait_for("PROJECTS");
+
+    s.ctrl("t");
+    // The panel lands on the conversation you are in, so the row under the cursor is a session.
+    assert!(
+        s.pump(|s| s.sidebar_now().iter().any(|l| l.contains("↵ open"))),
+        "the cursor is on a conversation\n{:?}",
+        s.sidebar_now()
+    );
+
+    s.key("t");
+    assert!(
+        s.pump(|s| s.saw("acme touched session")),
+        "the contributed key fired, and was told which row\n{}",
+        s.transcript()
+    );
+}
+
+/// The panel's own keys are ordinary bindings, so the registry knows them — and so anybody can
+/// replace one.
+///
+/// This is the claim the whole rewrite rests on. Before it, the panel resolved keys in a private
+/// switch statement: `F1` could not list them, `^K` could not run them, and rebinding `x` meant
+/// forking the plugin.
+#[test]
+fn the_panels_keys_are_in_the_registry_and_a_user_can_rebind_them() {
+    let sb = Sandbox::new("panelkeys");
+    std::fs::write(
+        sb.root.join("config/init.ts"),
+        r#"import type { PluginContext } from "@neosh/api";
+export async function activate({ neosh }: PluginContext) {
+  await neosh.cmd.register("mine.shout", () => neosh.notify("mine ran"), { desc: "Shout" });
+  // Exactly what a third party writes to take a key inside somebody else's panel.
+  await neosh.keymap.set("chat", "x", "mine.shout", {
+    scope: { kind: "buf_kind", name: "neosh.sidebar" },
+    desc: "Shout instead of archiving",
+  });
+  neosh.notify("init done");
+}
+"#,
+    )
+    .expect("init.ts");
+
+    let mut s = sb.start();
+    s.wait_for("init done");
+    s.wait_for("PROJECTS");
+
+    s.ctrl("t");
+    assert!(
+        s.pump(|s| s.sidebar_now().iter().any(|l| l.contains("↵ open"))),
+        "in the panel, on a conversation\n{:?}",
+        s.sidebar_now()
+    );
+
+    // `x` archives a conversation by default. Bound by the user, it does not.
+    let before = s.sidebar_rows();
+    s.key("x");
+    assert!(
+        s.pump(|s| s.saw("mine ran")),
+        "the user's binding won\n{}",
+        s.transcript()
+    );
+    assert_eq!(
+        s.sidebar_rows(),
+        before,
+        "and the default it replaced did not also happen\n{:?}",
+        s.sidebar_now()
+    );
+}
+
+impl Session {
+    /// The panel row the cursor is on, read from the highlight rather than from a count.
+    ///
+    /// A count would be a test that passes for the wrong reason the moment the panel gains a row.
+    fn sidebar_cursor(&self) -> Option<String> {
+        let buf = self.buffer_named("[sidebar]")?;
+        let text = self.lines_of(buf);
+        let groups = self.groups_of(buf);
+        groups
+            .iter()
+            .position(|row| row.iter().any(|g| g == "Sidebar.Selected"))
+            .and_then(|i| text.get(i).cloned())
     }
 }

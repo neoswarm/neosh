@@ -11,7 +11,7 @@
  * through the same key.
  */
 
-import type { Neosh, PluginContext } from "@neosh/api";
+import type { KeymapEntry, Neosh, PluginContext } from "@neosh/api";
 import { byteLength } from "@neosh/api";
 import { picker } from "@neosh/api/ui";
 
@@ -112,6 +112,15 @@ async function showKeys(neosh: Neosh): Promise<void> {
   const commands = await neosh.cmd.list();
   const describe = new Map(commands.map((c) => [c.name, c.desc ?? ""]));
 
+  // Which panel you asked from, if you asked from one.
+  //
+  // `?` in the sidebar means "what can I do *here*", and a list that answers with thirty global
+  // bindings and puts the panel's own keys below the fold has answered a different question. The
+  // window is found by kind rather than by anything the panel told us, so this works for a panel
+  // this plugin has never heard of.
+  const here = (await neosh.win.list().catch(() => []))
+    .find((w) => w.focused)?.kind ?? null;
+
   interface Row {
     text: string;
     /** Byte range of the key itself, so it can be highlighted apart from its description. */
@@ -120,22 +129,59 @@ async function showKeys(neosh: Neosh): Promise<void> {
   }
   const rows: Row[] = [];
 
-  for (const mode of modes) {
-    const maps = await neosh.keymap.list(mode);
-    if (maps.length === 0) continue;
+  /** One group of bindings under a heading, keys padded to a common column. */
+  const emit = (title: string, maps: KeymapEntry[]) => {
+    if (maps.length === 0) return;
     if (rows.length > 0) rows.push({ text: "" });
-    rows.push({ text: mode.toUpperCase(), heading: true });
+    rows.push({ text: title, heading: true });
     const width = Math.max(...maps.map((m) => m.lhs.length));
     for (const m of [...maps].sort((a, b) => a.lhs.localeCompare(b.lhs))) {
       const note = m.desc ?? describe.get(m.command) ?? m.command;
-      const lhs = m.lhs.padEnd(width);
-      rows.push({ text: `  ${lhs}  ${note}`, key: [2, 2 + byteLength(m.lhs)] });
+      rows.push({ text: `  ${m.lhs.padEnd(width)}  ${note}`, key: [2, 2 + byteLength(m.lhs)] });
+    }
+  };
+
+  for (const mode of modes) {
+    const maps = await neosh.keymap.list(mode);
+    if (maps.length === 0) continue;
+    // Bindings scoped to a buffer kind get a section of their own, named after the kind.
+    //
+    // Not cosmetic: a panel's keys are ordinary bindings now, so `^N` is legitimately two things —
+    // "new conversation" everywhere and "next row" in the sidebar — and one flat list showing the
+    // same key twice with no way to tell which is which is worse than not listing them. The heading
+    // is where the answer goes, and it is read from the binding rather than written down, so a
+    // panel somebody else wrote gets a section here without knowing this exists.
+    const byKind = new Map<string, KeymapEntry[]>();
+    const plain: KeymapEntry[] = [];
+    for (const m of maps) {
+      if (m.scope.kind === "buf_kind") {
+        const list = byKind.get(m.scope.name) ?? [];
+        list.push(m);
+        byKind.set(m.scope.name, list);
+      } else {
+        plain.push(m);
+      }
+    }
+    // The panel you are standing in goes first; everything else keeps its alphabetical place.
+    const ordered = [...byKind].sort((a, b) =>
+      a[0] === here ? -1 : b[0] === here ? 1 : a[0].localeCompare(b[0])
+    );
+    const first = ordered.filter(([kind]) => kind === here);
+    for (const [kind, list] of first) emit(`${mode.toUpperCase()}  ·  ${kind}`, list);
+    emit(mode.toUpperCase(), plain);
+    for (const [kind, list] of ordered.filter(([kind]) => kind !== here)) {
+      emit(`${mode.toUpperCase()}  ·  ${kind}`, list);
     }
   }
 
-  // The panel's own keys are a capture rather than a keymap, so the registry cannot know them and
-  // this is the one place they are written down.
-  for (const [title, keys] of [["PROJECT PANEL", PANEL_KEYS], ["COMPOSER", COMPOSER_KEYS], [
+  // What is left: keys that are not bindings at all, but what the *host* does with a key nothing
+  // claimed. The registry cannot know these, so this is the one place they are written down.
+  //
+  // The project panel used to be on this list and no longer is — its keys became ordinary bindings,
+  // so they come out of the registry above, complete with whatever a third party has added to them.
+  // That is the difference this section is now measuring: everything above is discovered,
+  // everything below had to be remembered.
+  for (const [title, keys] of [["COMPOSER", COMPOSER_KEYS], [
     "READING THE TRANSCRIPT",
     READING_KEYS,
   ]] as const) {
@@ -228,16 +274,3 @@ const READING_KEYS: [string, string][] = [
   ["Esc q", "leave"],
 ];
 
-const PANEL_KEYS: [string, string][] = [
-  ["j / k", "move"],
-  ["Enter", "open a conversation, or fold a project"],
-  ["Space", "fold or unfold a project"],
-  ["f", "pin a project to the top"],
-  ["J / K", "move a project up or down"],
-  ["n", "new conversation in this project"],
-  ["o", "open another project"],
-  ["r", "rename a conversation"],
-  ["x", "close a conversation"],
-  ["?", "this list"],
-  ["Esc", "back to the composer"],
-];

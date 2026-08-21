@@ -631,11 +631,22 @@ async function removeWorktree(neosh: Neosh): Promise<void> {
     { title: "Remove worktree", width: 78 },
   );
   if (!chosen) return;
+  // The conversations that go with it. They are deleted below, and a dialog that does not mention
+  // them is a dialog you agreed to something else in: removing a worktree is a git operation, and
+  // losing what you talked about in it is not.
+  const doomed = (await neosh.session.list().catch(() => []))
+    .filter((s) => s.cwd === chosen.path && !s.is_active).length;
   // A worktree is a directory with your work in it. The same gate as deleting a conversation, and
   // the same reason: `git worktree remove` does not put it back.
   if (!(await confirmDestructive(neosh, `Remove the worktree at ${chosen.path}?`, {
     yes: "Remove",
     no: "Keep",
+    detail: [
+      chosen.branch ? `The branch ${chosen.branch} stays; the checkout goes.` : "The checkout goes.",
+      ...(doomed > 0
+        ? [`${doomed} ${doomed === 1 ? "conversation" : "conversations"} in it will be deleted too.`]
+        : []),
+    ],
   }))) {
     return;
   }

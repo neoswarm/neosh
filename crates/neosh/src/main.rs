@@ -25,6 +25,7 @@ mod scaffold;
 mod services;
 mod sessions;
 mod trust;
+mod vars;
 
 use bridge::ScriptBridge;
 use frontend::{Disconnected, Frontend, StdioFrontend, TerminalUi};

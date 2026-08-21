@@ -201,7 +201,7 @@ While a turn is running the row shows how long it has been running, next to the 
 with no clock is indistinguishable from wedged.
 
 In the panel (`<C-t>`): `↑`/`↓`, `j`/`k` or `^N`/`^P` move, `Enter` opens or folds, `Space` folds,
-`f` pins, `J`/`K` reorder, `n` new conversation here, `x` archive, `u` unarchive, `X` delete,
+`f` pins, `J`/`K` reorder, `n` new conversation here, `x` archive, `X` delete, `a` the archive,
 `r` rename, `?` every binding, `Esc` leaves. `J`/`K` work from a conversation row too — they move
 the project it is in, because you are looking at the project when you are looking at what is inside
 it. The foot of the panel lists the keys for whatever the cursor is on; set `sidebar.hints = false`
@@ -209,16 +209,24 @@ once they are in your fingers.
 
 ### Archiving, and the one verb that deletes
 
-`x` archives. Everything is kept — every message, the file on disk — it simply leaves the list you
-work in and appears under `ARCHIVED` at the foot of the panel, which only exists while there is
-something in it and starts shut. `u`, or opening it, brings it back to the top.
+`x` archives. Everything is kept — every message, the file on disk — it simply leaves the panel. Not
+into a section at the foot of it: **archived conversations are not rows in the sidebar at all.** What
+is left behind is one row, `┈ Archived` with a count, and only while there is something behind it.
 
 It asks nothing, because it takes nothing away. Charging a confirmation for a reversible action is
 what teaches you to dismiss confirmations, which is how the one that matters stops working.
 
-`X` deletes: the file goes and there is no undo, so it asks — unless the conversation has nothing in
-it to lose, or you have set `ui.confirm_destructive = false`. Archiving the conversation you are in
-moves you to the most recently used other one, or starts a fresh one if there is no other.
+`a` in the panel, or `<C-f>` from anywhere, opens what you have put away as a list you can filter —
+each row with the project it came from, how many messages it holds and when it went. `↵` restores
+one and switches to it, `^U` puts it back without going there, and `^X` deletes it.
+
+`X` deletes: the file goes and there is no undo, so it always asks — including for a conversation
+with nothing in it yet, because a key that stops and asks only sometimes is a key you cannot predict.
+The dialog says how much is at stake and which project it is in, `y` and `n` answer it outright, and
+`Esc` means no. `ui.confirm_destructive = false` turns off every one of these, everywhere.
+
+Archiving the conversation you are in moves you to the most recently used other one, or starts a
+fresh one if there is no other.
 
 For plugins: `session.archive(id)`, `session.archive(id, false)`, and
 `session.list({ includeArchived: true })`. Plain `list()` leaves them out.

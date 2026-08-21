@@ -51,15 +51,81 @@ pub enum Mode {
     Chat,
 }
 
-/// Scope a keymap applies at. Resolution order is float/window -> buffer -> global; the first
+/// Scope a keymap applies at. Resolution order is window -> buffer -> kind -> global; the first
 /// binding found wins, which is what stops every plugin fighting over `<Esc>`.
-#[derive(TS, Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Hash, Debug)]
+#[derive(TS, Serialize, Deserialize, Clone, PartialEq, Eq, Hash, Debug)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 #[ts(export)]
 pub enum KeymapScope {
     Global,
-    Buffer { buf: BufferId },
-    Window { win: WindowId },
+    Buffer {
+        buf: BufferId,
+    },
+    Window {
+        win: WindowId,
+    },
+    /// Every window showing a buffer of this [`ApiCall::BufSetKind`] kind, including ones that do
+    /// not exist yet.
+    ///
+    /// This is the scope a third party binds at. A panel's window id is private to the plugin that
+    /// opened it and changes every time the panel is closed and reopened, so `Window` can only ever
+    /// be claimed by the owner; a *kind* is a name the owner publishes once and anybody can map
+    /// against. It is Neovim's `FileType` autocmd plus a buffer-local map, minus the autocmd —
+    /// binding `d` on `neosh.sidebar` is a statement about sidebars, not about a window that
+    /// happens to be open now.
+    BufKind {
+        /// The kind, not the discriminant — `name` because `kind` is already the tag this enum is
+        /// serialized under.
+        name: String,
+    },
+}
+
+/// What a shared variable is *about*.
+///
+/// Deliberately not a free-form string. A scope that was `"project:/home/me/x"` would be one typo
+/// away from a value nothing ever reads again, and the host is the only thing that can say whether a
+/// conversation still exists — which is what lets it throw away the vars of one that does not.
+#[derive(TS, Serialize, Deserialize, Clone, PartialEq, Eq, Hash, Debug)]
+#[serde(tag = "scope", rename_all = "snake_case")]
+#[ts(export)]
+pub enum VarScope {
+    /// The workspace. Survives every conversation in it.
+    Global,
+    /// One conversation. Deleted with it.
+    Session { session: SessionId },
+    /// A directory some conversation lives in — what the sidebar calls a project. Keyed by path
+    /// rather than by an id because a project has no identity beyond where it is.
+    Project { cwd: String },
+}
+
+/// One item somebody put on a contribution point.
+#[derive(TS, Serialize, Deserialize, Clone, PartialEq, Debug)]
+#[ts(export)]
+pub struct Contribution {
+    pub point: String,
+    pub id: String,
+    /// Which plugin contributed it. Stamped by the host, so a row in a panel can always be traced
+    /// to the thing that put it there — and so `plugins.disabled` takes its rows with it.
+    pub plugin: String,
+    #[ts(type = "unknown")]
+    pub item: serde_json::Value,
+    pub priority: i32,
+}
+
+/// A window as somebody else sees it.
+#[derive(TS, Serialize, Deserialize, Clone, PartialEq, Debug)]
+#[ts(export)]
+pub struct WindowInfo {
+    pub win: WindowId,
+    pub buf: BufferId,
+    /// What the buffer in it declared itself to be, if anything.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
+    pub name: String,
+    pub layout: WindowLayout,
+    /// Whether this is the window keys are going to.
+    #[serde(default)]
+    pub focused: bool,
 }
 
 #[derive(TS, Serialize, Deserialize, Clone, PartialEq, Debug)]
@@ -72,6 +138,9 @@ pub enum ApiCall {
         name: Option<String>,
         #[serde(default)]
         scratch: bool,
+        /// What this buffer *is*, so that somebody else can say something about it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        kind: Option<String>,
     },
     BufLineCount {
         buf: BufferId,
@@ -105,6 +174,20 @@ pub enum ApiCall {
     BufSetName {
         buf: BufferId,
         name: String,
+    },
+    /// Declare what a buffer is — `neosh.sidebar`, `neosh.transcript`, `acme.tasks`.
+    ///
+    /// A kind is the handle everything else in the extension surface hangs off: it is what
+    /// [`KeymapScope::Kind`] binds against and what [`ApiCall::WinList`] reports, so publishing one
+    /// is how a panel becomes something a third party can map keys into and find on screen. Reverse
+    /// domain by convention; nothing enforces it.
+    BufSetKind {
+        buf: BufferId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        kind: Option<String>,
+    },
+    BufGetKind {
+        buf: BufferId,
     },
     /// Subscribe to changes. Delivered as [`crate::plugin::PluginEvent::BufferChanged`].
     BufAttach {
@@ -146,6 +229,12 @@ pub enum ApiCall {
         win: WindowId,
         top_line: u32,
     },
+    /// Every window that is open, what is in it, and where it sits.
+    ///
+    /// The counterpart to [`ApiCall::BufSetKind`]: kinds make panels nameable, this makes them
+    /// findable. Without it a plugin can only ever act on windows it opened itself, which means the
+    /// only way to extend somebody else's panel is to replace it.
+    WinList,
 
     // ---- editing -------------------------------------------------------
     // Motions and edits are verbs the core resolves, not positions the caller computes. Two
@@ -530,6 +619,86 @@ pub enum ApiCall {
         key: String,
     },
 
+    // ---- contributions -------------------------------------------------
+    // How one plugin adds something to another plugin's surface without either of them knowing the
+    // other exists.
+    //
+    // A *point* is a name a host plugin agrees to read — `sidebar.section`, `palette.entry`,
+    // `project.action` — and a contribution is a JSON item on it, usually carrying the name of a
+    // command to run. That indirection is the whole trick: the sidebar renders rows it did not
+    // write and invokes commands it has never heard of, and neither side imports the other.
+    //
+    // It is deliberately data rather than a callback. A contribution survives being listed by the
+    // palette, described in `F1`, and disabled by the user, none of which is possible for a
+    // function pointer held inside somebody's closure.
+    /// Add an item to a point, replacing whatever this plugin had put there under the same `id`.
+    ExtContribute {
+        point: String,
+        id: String,
+        #[ts(type = "unknown")]
+        item: serde_json::Value,
+        /// Where it sorts among the contributions on this point. Ties break on plugin id, so the
+        /// order is stable across restarts rather than being load order.
+        #[serde(default)]
+        priority: i32,
+    },
+    /// Withdraw one. Silently fine if it was never there.
+    ExtRemove {
+        point: String,
+        id: String,
+    },
+    /// Everything contributed to a point, in priority order, whoever contributed it.
+    ExtList {
+        point: String,
+    },
+
+    // ---- events --------------------------------------------------------
+    /// Say that something happened, to whoever cares.
+    ///
+    /// Plugin-defined and broadcast, the equivalent of Neovim's `User` autocmd. The core neither
+    /// knows nor validates what the names mean; it only guarantees that a plugin cannot forge
+    /// `from`, so a listener can tell who said it.
+    ///
+    /// Fire and forget on purpose. An emitter that could be blocked, or could read a reply, would
+    /// make every listener part of the emitter's critical path — which is how an extension surface
+    /// turns into a place where one slow plugin wedges the panel. Something that needs an answer
+    /// asks for one with a command or a contribution point.
+    EventEmit {
+        name: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(type = "unknown")]
+        data: Option<serde_json::Value>,
+    },
+
+    // ---- shared variables ----------------------------------------------
+    // The other half of plugin state: what a plugin remembers *about something*, where the point is
+    // that everybody can see it.
+    //
+    // `State` is private by construction and that is right for a panel's fold set. It is wrong for
+    // "this project is a favourite", which four plugins have an opinion about and which stopped
+    // being the sidebar's business the moment a second panel existed. A var is scoped to the thing
+    // it describes — the workspace, a conversation, a project — namespaced by convention, readable
+    // and writable by anyone, and persisted.
+    VarGet {
+        scope: VarScope,
+        key: String,
+    },
+    VarSet {
+        scope: VarScope,
+        key: String,
+        #[ts(type = "unknown")]
+        value: serde_json::Value,
+    },
+    VarDelete {
+        scope: VarScope,
+        key: String,
+    },
+    /// Everything set on one scope. The way a panel reads its whole arrangement in one call rather
+    /// than one round trip per project.
+    VarAll {
+        scope: VarScope,
+    },
+
     // ---- runtime path --------------------------------------------------
     /// Add a directory to search for plugins.
     ///
@@ -713,6 +882,14 @@ pub enum ApiOk {
         #[ts(type = "unknown")]
         value: serde_json::Value,
     },
+    /// A JSON object, as `VarAll` answers. Distinct from `Json` so the TS side gets a map rather
+    /// than `unknown` for the one call whose answer is always a bag of keys.
+    Vars {
+        #[ts(type = "Record<string, unknown>")]
+        vars: serde_json::Map<String, serde_json::Value>,
+    },
+    Contributions { contributions: Vec<Contribution> },
+    Windows { windows: Vec<WindowInfo> },
 }
 
 /// One piece of the status line.

@@ -3,10 +3,18 @@ import type { BufferId } from "./BufferId";
 import type { WindowId } from "./WindowId";
 
 /**
- * Scope a keymap applies at. Resolution order is float/window -> buffer -> global; the first
+ * Scope a keymap applies at. Resolution order is window -> buffer -> kind -> global; the first
  * binding found wins, which is what stops every plugin fighting over `<Esc>`.
  */
-export type KeymapScope = { "kind": "global" } | {
-  "kind": "buffer";
-  buf: BufferId;
-} | { "kind": "window"; win: WindowId };
+export type KeymapScope =
+  | { "kind": "global" }
+  | { "kind": "buffer"; buf: BufferId }
+  | { "kind": "window"; win: WindowId }
+  | {
+    "kind": "buf_kind";
+    /**
+     * The kind, not the discriminant — `name` because `kind` is already the tag this enum is
+     * serialized under.
+     */
+    name: string;
+  };

@@ -278,7 +278,7 @@ impl KeymapTable {
             .maps
             .iter()
             .filter(|((m, _, _), _)| mode.is_none_or(|want| *m == want))
-            .map(|((m, s, k), b)| (*m, *s, k.clone(), b.clone()))
+            .map(|((m, s, k), b)| (*m, s.clone(), k.clone(), b.clone()))
             .collect();
         v.sort_by(|a, b| format_keys(&a.2).cmp(&format_keys(&b.2)));
         v
@@ -286,12 +286,16 @@ impl KeymapTable {
 
     /// Resolve a pending sequence.
     ///
-    /// `scopes` must be supplied most-specific-first — focused window, then its buffer, then
-    /// global. An exact match in a nearer scope beats a longer possible match in a farther one.
+    /// `scopes` must be supplied most-specific-first — focused window, then its buffer, then that
+    /// buffer's kind, then global. An exact match in a nearer scope beats a longer possible match
+    /// in a farther one.
     pub fn resolve(&self, mode: Mode, scopes: &[KeymapScope], seq: &[KeyPress]) -> KeyResolution {
         for scope in scopes {
-            if let Some(b) = self.maps.get(&(mode, *scope, seq.to_vec())) {
-                return KeyResolution::Matched { command: b.command.clone(), scope: *scope };
+            if let Some(b) = self.maps.get(&(mode, scope.clone(), seq.to_vec())) {
+                return KeyResolution::Matched {
+                    command: b.command.clone(),
+                    scope: scope.clone(),
+                };
             }
         }
         let could_extend = self.maps.keys().any(|(m, s, k)| {
@@ -437,14 +441,14 @@ mod tests {
     fn nearer_scope_wins_over_global() {
         let mut t = table();
         let win = KeymapScope::Window { win: neosh_proto::WindowId(7) };
-        t.set(Mode::Normal, win, "<C-p>", Binding {
+        t.set(Mode::Normal, win.clone(), "<C-p>", Binding {
             command: "float.close".into(),
             desc: None,
             owner: None,
         }, &none())
         .unwrap();
 
-        let scopes = [win, KeymapScope::Global];
+        let scopes = [win.clone(), KeymapScope::Global];
         let key = parse_keys("<C-p>").unwrap();
         match t.resolve(Mode::Normal, &scopes, &key) {
             KeyResolution::Matched { command, scope } => {
@@ -453,6 +457,57 @@ mod tests {
             }
             other => panic!("expected the window-scoped binding, got {other:?}"),
         }
+    }
+
+    /// The scope a third party binds at, and the reason it exists: the panel's window id is private
+    /// to whoever opened it, so a binding that had to name one could only ever be made by the owner.
+    #[test]
+    fn a_kind_binding_covers_a_window_the_binder_never_saw() {
+        let mut t = table();
+        let kind = KeymapScope::BufKind { name: "neosh.sidebar".into() };
+        t.set(Mode::Chat, kind.clone(), "d", Binding {
+            command: "acme.delete".into(),
+            desc: None,
+            owner: Some("acme".into()),
+        }, &none())
+        .unwrap();
+
+        // What `active_scopes` produces for a freshly opened sidebar: a window and buffer nobody
+        // has bound anything on, and the kind its buffer declared.
+        let scopes = [
+            KeymapScope::Window { win: neosh_proto::WindowId(42) },
+            KeymapScope::Buffer { buf: neosh_proto::BufferId(9) },
+            kind.clone(),
+            KeymapScope::Global,
+        ];
+        assert_eq!(
+            t.resolve(Mode::Chat, &scopes, &parse_keys("d").unwrap()),
+            KeyResolution::Matched { command: "acme.delete".into(), scope: kind }
+        );
+    }
+
+    /// Kind sits *between* buffer and global, and both halves of that matter: a binding on one
+    /// buffer is about one thing on screen and beats one about every sidebar there will ever be,
+    /// and a panel has to be able to take a key back from a global default.
+    #[test]
+    fn kind_loses_to_buffer_and_beats_global() {
+        let mut t = table();
+        let buf = KeymapScope::Buffer { buf: neosh_proto::BufferId(9) };
+        let kind = KeymapScope::BufKind { name: "neosh.sidebar".into() };
+        let b = |cmd: &str| Binding { command: cmd.into(), desc: None, owner: None };
+        t.set(Mode::Chat, buf.clone(), "x", b("this.buffer"), &none()).unwrap();
+        t.set(Mode::Chat, kind.clone(), "x", b("every.sidebar"), &none()).unwrap();
+        t.set(Mode::Chat, KeymapScope::Global, "x", b("anywhere"), &none()).unwrap();
+        t.set(Mode::Chat, kind.clone(), "y", b("every.sidebar"), &none()).unwrap();
+        t.set(Mode::Chat, KeymapScope::Global, "y", b("anywhere"), &none()).unwrap();
+
+        let scopes = [buf, kind, KeymapScope::Global];
+        let matched = |seq: &str| match t.resolve(Mode::Chat, &scopes, &parse_keys(seq).unwrap()) {
+            KeyResolution::Matched { command, .. } => command,
+            other => panic!("expected a match for {seq}, got {other:?}"),
+        };
+        assert_eq!(matched("x"), "this.buffer");
+        assert_eq!(matched("y"), "every.sidebar");
     }
 
     #[test]

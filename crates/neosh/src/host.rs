@@ -302,6 +302,11 @@ pub struct Host {
     /// What plugins remember between runs: pinned projects, fold state, whatever a panel needs to
     /// still be arranged the way you left it.
     pstate: crate::pstate::PluginState,
+    /// What *everybody* remembers about a project or a conversation — favourites, colours, tags.
+    ///
+    /// Separate from `pstate` because it is separate in kind: state is private to whoever wrote it,
+    /// a var describes a thing and is shared. See [`crate::vars`].
+    vars: crate::vars::Vars,
     /// Repositories by directory, discovered on demand.
     ///
     /// Keyed rather than singular because the *conversation* decides which repository is in play:
@@ -590,6 +595,7 @@ impl Host {
             model_cache: Default::default(),
             state_dir: None,
             pstate: crate::pstate::PluginState::new(None),
+            vars: crate::vars::Vars::new(None),
             repos: Default::default(),
             cwd: std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
             projects: Default::default(),
@@ -784,6 +790,39 @@ impl Host {
                 self.pstate.delete(&plugin.0, &key);
                 Ok(ApiOk::Unit)
             }
+            // ---- shared variables ---------------------------------------
+            // Not keyed by the caller, which is the entire difference from state above: a var
+            // describes a project or a conversation, and a second panel that could not see the
+            // first one's favourites would be a second panel nobody can switch to.
+            ApiCall::VarGet { scope, key } => {
+                Ok(ApiOk::Json { value: self.vars.get(&scope, &key) })
+            }
+            ApiCall::VarSet { scope, key, value } => {
+                self.vars.set(&scope, key.clone(), value.clone());
+                self.bridge.broadcast(PluginEvent::VarChanged {
+                    scope,
+                    key,
+                    value: Some(value),
+                });
+                Ok(ApiOk::Unit)
+            }
+            ApiCall::VarDelete { scope, key } => {
+                self.vars.delete(&scope, &key);
+                self.bridge.broadcast(PluginEvent::VarChanged { scope, key, value: None });
+                Ok(ApiOk::Unit)
+            }
+            ApiCall::VarAll { scope } => Ok(ApiOk::Vars { vars: self.vars.all(&scope) }),
+            // ---- events -------------------------------------------------
+            // `from` is stamped here rather than taken from the call, so "who said this" is one of
+            // the few things in a plugin message that cannot be forged.
+            ApiCall::EventEmit { name, data } => {
+                self.bridge.broadcast(PluginEvent::Event {
+                    name,
+                    data,
+                    from: plugin.0.clone(),
+                });
+                Ok(ApiOk::Unit)
+            }
             // ---- sessions ----------------------------------------------
             ApiCall::SessionList { include_archived } => {
                 let list = self.agent.sessions().list_with(include_archived);
@@ -883,6 +922,10 @@ impl Host {
                 if let Some(dir) = &self.state_dir {
                     crate::sessions::forget(dir, &session);
                 }
+                // Whatever anybody tagged this conversation with goes too. Left behind it is a row
+                // in `vars.json` per conversation ever deleted, and a future id collision inherits
+                // somebody's stale colour.
+                self.vars.forget_session(&session);
                 if closing_active {
                     self.enter_session();
                 }
@@ -1175,6 +1218,11 @@ impl Host {
                     // Broadcast, not just to the owner: a setting is shared state, and the plugin
                     // that declared `ui.theme` is rarely the one that changes it.
                     self.bridge.broadcast(PluginEvent::OptionChanged { name, value });
+                }
+                CoreEffect::ContributionsChanged { point } => {
+                    // Broadcast for the same reason: the plugin that *renders* a point is never the
+                    // one that just contributed to it, and it is the one that has to redraw.
+                    self.bridge.broadcast(PluginEvent::ContributionsChanged { point });
                 }
             }
         }
@@ -4515,6 +4563,7 @@ impl Host {
         let Some(dir) = state_dir else { return };
         self.state_dir = Some(dir.clone());
         self.pstate = crate::pstate::PluginState::new(Some(dir.clone()));
+        self.vars = crate::vars::Vars::new(Some(dir.clone()));
 
         let (saved, active) = crate::sessions::load(&dir);
         if saved.is_empty() {

@@ -1,6 +1,7 @@
 # 0023 — Archiving is the everyday verb; deleting is the exception
 
-**Status:** accepted
+**Status:** accepted — the verbs stand; where the archive lives and when the dialog appears were
+revisited in [0039](0039-the-archive-is-a-place-you-go.md).
 
 ## Context
 
@@ -49,4 +50,5 @@ not worked.
 - **`session.close` is unchanged and still means delete.** Archiving is a new verb beside it, not a
   redefinition of an old one, so a plugin that meant delete still gets delete.
 - **The archived section only appears when there is something in it**, and starts shut. An empty
-  section is a permanent reminder of a feature you are not using.
+  section is a permanent reminder of a feature you are not using. *(Superseded: 0039 takes the
+  section out of the panel entirely and leaves one row that opens it as a picker.)*

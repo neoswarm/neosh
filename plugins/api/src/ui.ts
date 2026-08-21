@@ -392,6 +392,34 @@ export interface PickerOptions<T> {
    * the list leaves it there.
    */
   onQuery?(query: string): void;
+  /**
+   * Keys `onKey` wants that a *binding elsewhere* would otherwise take.
+   *
+   * The raw capture only receives what no keymap claimed, so a caller reaching for `<C-x>` gets
+   * nothing — that key belongs to the composer. Listing it here binds it to this widget for as long
+   * as the widget is open, and drops it again with the window.
+   *
+   * A picker with a filter should only ever ask for chords. A bare letter taken here is a letter the
+   * filter can never contain, which is how a list of conversations ends up unable to search for one
+   * with an `x` in its name.
+   */
+  ownKeys?: readonly string[];
+  /**
+   * A key the caller wants for itself, checked before the widget's own.
+   *
+   * Return `"close"` to dismiss, `"reload"` to re-read the rows, `"handled"` to redraw, and nothing
+   * at all to let the widget have the key. This is what puts a verb on a row — unarchive, delete,
+   * rename — without a second modal in front of the list you were reading.
+   *
+   * `"reload"` re-runs `source` when there is one, and otherwise re-ranks `items`: the very array
+   * you passed in, so a caller that mutates it in place gets a list that has caught up with what it
+   * just did. A row acted on is a row that has to leave, and closing the list and opening it again
+   * loses your place in it.
+   */
+  onKey?(
+    key: KeyContext,
+    ctx: { item: T | undefined; query: string },
+  ): Promise<"handled" | "reload" | "close" | undefined> | "handled" | "reload" | "close" | undefined;
 }
 
 const NS = "neosh.ui.picker";
@@ -647,7 +675,24 @@ export async function picker<T>(
     await neosh.cmd.register(command, async (_args, key) => {
       if (!key || closed) return;
       const before = cursor;
-      // Settings first, so a rebound key wins over what the widget would otherwise do with it.
+      // The caller first: a verb it put on a key is a verb about the row under the cursor, and the
+      // widget's own handling of that key would be about the filter.
+      const outcome = await opts.onKey?.(key, { item: visible[cursor]?.item.value, query });
+      if (closed) return;
+      if (outcome === "close") {
+        await close(null);
+        return;
+      }
+      if (outcome === "reload") {
+        await refetch();
+        await render();
+        return;
+      }
+      if (outcome === "handled") {
+        await render();
+        return;
+      }
+      // Settings next, so a rebound key wins over what the widget would otherwise do with it.
       const action = actionFor(keys, key.key);
       switch (action) {
         case "dismiss":
@@ -731,7 +776,7 @@ export async function picker<T>(
   // `<C-c>` is bound globally to `interrupt`, which would arm "press again to quit" while a picker
   // is on screen — the one moment the user obviously meant "close this". A window-scoped binding
   // outranks the global one and is dropped with the window.
-  await bindWidgetKeys(neosh, win, command, keys);
+  await bindWidgetKeys(neosh, win, command, keys, opts.ownKeys ?? []);
   await refetch();
   await render();
   if (opts.onHighlight) {
@@ -760,46 +805,250 @@ function dropSegment(text: string): string {
 // Derived widgets
 // ---------------------------------------------------------------------------
 
-/** Yes/no, as a two-item picker. Resolves `false` when dismissed. */
+export interface ConfirmOptions {
+  /** What the affirming answer says. A verb — `Delete`, `Remove`, `Sign out` — never `OK`. */
+  yes?: string;
+  /** What the answer that changes nothing says. */
+  no?: string;
+  /**
+   * Under the question, dimmed: what exactly is at stake, and what to do instead.
+   *
+   * The part that makes a dialog worth stopping for. "Are you sure?" is a speed bump you learn to
+   * clear without reading; "4 messages, in neosh · main" and "archiving keeps it" is a question you
+   * can answer without leaving the dialog to go and check.
+   */
+  detail?: string[];
+  /**
+   * The affirming answer cannot be undone.
+   *
+   * Starts on the answer that changes nothing — `<CR>` is reflex by the second time you have seen a
+   * dialog, and a reflex must not delete anything — and draws the other one in the theme's error
+   * colour, so the row that destroys something does not look like the row beside it.
+   */
+  dangerous?: boolean;
+  width?: number;
+}
+
+const CONFIRM_NS = "neosh.ui.confirm";
+
+/**
+ * Ask a yes/no question, and mean it. Resolves `false` when dismissed.
+ *
+ * A dialog rather than a two-row picker, because the picker's title is one clipped line and the
+ * question is the whole point: what is about to happen, to what, and what the alternative is. It
+ * wraps, it carries `detail`, and when the answer is destructive it says so in colour rather than
+ * relying on you to read a verb.
+ *
+ * `y` and `n` answer it outright, `↑`/`↓` and `j`/`k` move between the two, `<CR>` takes the one
+ * under the cursor, and `<Esc>` — like every other float in the workspace — means no.
+ */
 export async function confirm(
   neosh: Neosh,
   question: string,
-  opts: { yes?: string; no?: string; dangerous?: boolean } = {},
+  opts: ConfirmOptions = {},
 ): Promise<boolean> {
-  const chosen = await picker<boolean>(
-    neosh,
-    [
-      { label: opts.yes ?? "Yes", value: true },
-      { label: opts.no ?? "No", value: false },
-    ],
-    {
-      title: question,
-      height: 2,
-      width: Math.max(24, question.length + 4),
-      filter: false,
-      // A prompt about something irreversible starts on the answer that changes nothing. `<CR>` is
-      // reflex by the time you have seen a dialog twice, and a reflex should not delete anything.
-      selected: opts.dangerous ? 1 : 0,
-    },
+  const yes = opts.yes ?? "Yes";
+  const no = opts.no ?? "No";
+  const width = Math.min(78, Math.max(36, opts.width ?? 58));
+  const asked = wrapText(question, width - 2);
+  const detail = (opts.detail ?? []).flatMap((d) => wrapText(d, width - 2));
+  const answers = [yes, no];
+  const strip = clipTo(
+    `y ${yes.toLowerCase()}   n ${no.toLowerCase()}   ↵ choose   esc cancel`,
+    width - 2,
   );
-  return chosen === true;
+
+  // On the answer that changes nothing, when the other one cannot be taken back.
+  let cursor = opts.dangerous ? 1 : 0;
+
+  const buf = await neosh.buf.create({ name: "[confirm]", scratch: true });
+  const ns = await neosh.ns.create(CONFIRM_NS);
+
+  watchKeys(neosh);
+  const keys = await widgetKeys(neosh);
+
+  /** Where each part of the dialog starts, so the marks do not have to count rows twice. */
+  const detailAt = asked.length + 1;
+  const answersAt = detailAt + (detail.length === 0 ? 0 : detail.length + 1);
+  const stripAt = answersAt + answers.length + 1;
+
+  const win = await neosh.float.open(buf, {
+    anchor: { kind: "screen" },
+    width: { kind: "fixed", n: width },
+    height: { kind: "fixed", n: stripAt + 1 },
+    border: "rounded",
+    focusable: true,
+    closeOnBlur: true,
+    // Above a picker: this is asked *from* one often enough that being drawn under it would make
+    // the workspace look wedged.
+    z: 260,
+  });
+
+  const render = async () => {
+    const lines: string[] = asked.map((l) => ` ${l}`);
+    lines.push("");
+    if (detail.length > 0) {
+      lines.push(...detail.map((l) => ` ${l}`));
+      lines.push("");
+    }
+    answers.forEach((a, i) => lines.push(`${i === cursor ? `${CURSOR_MARKER}` : BLANK_MARKER}${a}`));
+    lines.push("");
+    lines.push(` ${strip}`);
+    await neosh.buf.setLines(buf, 0, -1, lines);
+
+    // Cleared first: this is redrawn on every keystroke, and a mark whose line was replaced under it
+    // clamps rather than dies — so the rows would end up wearing the colours of the ones before.
+    await neosh.ns.clear(ns, buf);
+    for (let i = 0; i < asked.length; i++) {
+      await neosh.ns.mark(ns, buf, i, 0, {
+        hlGroup: "Title",
+        endCol: byteLength(lines[i] ?? ""),
+      });
+    }
+    for (let i = 0; i < detail.length; i++) {
+      await neosh.ns.mark(ns, buf, detailAt + i, 0, {
+        hlGroup: "Comment",
+        endCol: byteLength(lines[detailAt + i] ?? ""),
+      });
+    }
+    for (let i = 0; i < answers.length; i++) {
+      const line = answersAt + i;
+      // The band is the row's *background* rather than a group across its bytes, so the answer keeps
+      // whatever colour said what it was. A ranged group here would leave the destructive row
+      // looking exactly like the safe one for as long as the cursor is on it.
+      if (i === cursor) {
+        await neosh.ns.mark(ns, buf, line, 0, { lineHlGroup: "Picker.Selected" });
+      }
+      if (opts.dangerous && i === 0) {
+        await neosh.ns.mark(ns, buf, line, byteLength(BLANK_MARKER), {
+          hlGroup: "Diagnostic.Error",
+          endCol: byteLength(lines[line] ?? ""),
+        });
+      }
+    }
+    await neosh.ns.mark(ns, buf, stripAt, 0, {
+      hlGroup: "Sidebar.Dim",
+      endCol: byteLength(lines[stripAt] ?? ""),
+    });
+    // The caret marks the answer, since there is nothing here to type into.
+    await neosh.win.setCursor(win, answersAt + cursor, 0);
+  };
+
+  let settle: (v: boolean) => void = () => {};
+  const done = new Promise<boolean>((resolve) => {
+    settle = resolve;
+  });
+
+  const command = `${CONFIRM_NS}.key.${++pickerSeq}`;
+  const disposers: Disposable[] = [];
+  let closed = false;
+  const close = async (value: boolean) => {
+    if (closed) return;
+    closed = true;
+    for (const d of disposers) d.dispose();
+    await neosh.win.close(win).catch(() => {});
+    settle(value);
+  };
+
+  disposers.push(
+    await neosh.cmd.register(command, async (_args, key) => {
+      if (!key || closed) return;
+      switch (actionFor(keys, key.key)) {
+        case "dismiss":
+          await close(false);
+          return;
+        case "accept":
+          await close(cursor === 0);
+          return;
+        case "next":
+        case "last":
+          cursor = answers.length - 1;
+          break;
+        case "prev":
+        case "first":
+          cursor = 0;
+          break;
+        default: {
+          if (key.key.code.kind !== "char" || key.key.mods.ctrl || key.key.mods.alt) return;
+          switch (key.key.code.c.toLowerCase()) {
+            // Answering outright, which is what anyone who has read the question wants. Nothing here
+            // filters, so the letters are free — and `y`/`n` are the two nobody has to be told.
+            case "y":
+              await close(true);
+              return;
+            case "n":
+            case "q":
+              await close(false);
+              return;
+            case "j":
+              cursor = answers.length - 1;
+              break;
+            case "k":
+              cursor = 0;
+              break;
+            default:
+              return;
+          }
+        }
+      }
+      await render();
+    }, { desc: "confirm key" }),
+  );
+
+  await neosh.focus.push(win);
+  disposers.push(await neosh.keymap.capture(win, command));
+  await bindWidgetKeys(neosh, win, command, keys);
+  await render();
+  return done;
 }
 
 /**
  * Ask before something that cannot be undone — unless the user has said not to.
  *
  * One place, so `ui.confirm_destructive` means the same thing everywhere and a plugin does not have
- * to know the option exists. The bar is *irreversible*, not merely significant: closing a panel or
- * switching a model asks nothing, because you can put those back.
+ * to know the option exists. The bar is *irreversible*, not merely significant: closing a panel,
+ * switching a model or archiving a conversation asks nothing, because you can put those back. A
+ * dialog charged for a reversible action is what teaches people to clear dialogs without reading
+ * them, which is how the one that matters stops working.
  */
 export async function confirmDestructive(
   neosh: Neosh,
   question: string,
-  opts: { yes?: string; no?: string } = {},
+  opts: Omit<ConfirmOptions, "dangerous"> = {},
 ): Promise<boolean> {
   const ask = (await neosh.opt.get<boolean>("ui.confirm_destructive").catch(() => true)) ?? true;
   if (!ask) return true;
   return confirm(neosh, question, { ...opts, dangerous: true });
+}
+
+/**
+ * Break text into lines of at most `width` characters.
+ *
+ * Counted in characters and not columns: measuring display width is the frontend's job, and this
+ * feeds a float that is sized with a column to spare. A word longer than the line is left long and
+ * clipped where it is drawn, by the one thing that knows where its own edge is.
+ */
+function wrapText(text: string, width: number): string[] {
+  const out: string[] = [];
+  for (const paragraph of text.split("\n")) {
+    let line = "";
+    for (const word of paragraph.split(/\s+/).filter((w) => w !== "")) {
+      const next = line === "" ? word : `${line} ${word}`;
+      if (line !== "" && Array.from(next).length > width) {
+        out.push(line);
+        line = word;
+      } else {
+        line = next;
+      }
+    }
+    out.push(line);
+  }
+  return out;
+}
+
+function clipTo(text: string, width: number): string {
+  const chars = Array.from(text);
+  return chars.length <= width ? text : `${chars.slice(0, Math.max(1, width - 1)).join("")}…`;
 }
 
 /**
