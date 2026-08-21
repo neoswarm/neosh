@@ -109,6 +109,17 @@ impl Git {
 
     // ---- reading --------------------------------------------------------
 
+    /// The `origin` remote's URL, if there is one.
+    ///
+    /// The only thing about a checkout that is the same on every machine that has it, which is what
+    /// makes it the basis for saying two computers have the same project. `None` for a repository
+    /// with no remote — a perfectly ordinary state, and one where there is nothing to compare.
+    pub async fn origin_url(&self) -> Option<String> {
+        let out = self.git(["remote", "get-url", "origin"]).await.ok()?;
+        let url = out.stdout.trim();
+        (!url.is_empty()).then(|| url.to_string())
+    }
+
     /// Branch, upstream and ahead/behind.
     pub async fn info(&self) -> Result<RepoInfo, VcsError> {
         Ok(self.status().await?.repo)

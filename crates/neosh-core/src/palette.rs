@@ -434,6 +434,11 @@ pub fn groups(variant: Variant) -> Vec<(&'static str, HighlightDef)> {
         ("Sidebar.Dim", link("Comment")),
         ("Sidebar.Selected", link("CursorLine")),
         ("Sidebar.Favorite", spec(fg(r.favorite))),
+        // Work happening on another computer. Linked to `Comment` rather than given a colour of
+        // its own: a remote row is still one of your conversations, and painting it a fourth
+        // colour would make the panel read as two lists rather than one workspace that happens to
+        // span machines. What says where it is running is the host name on the end of the row.
+        ("Sidebar.Remote", link("Comment")),
         ("Status.Line", link("Comment")),
         // ---- the composer -------------------------------------------------
         // The field you type into is chrome, not content: it should read as furniture at the

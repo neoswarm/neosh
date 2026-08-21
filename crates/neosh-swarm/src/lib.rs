@@ -17,10 +17,12 @@
 
 pub mod handshake;
 pub mod identity;
+pub mod node;
 pub mod wire;
 
 pub use handshake::{accept, dial, Peer};
 pub use identity::Identity;
+pub use node::{spawn, PeerAddress, SwarmConfig, SwarmEvent, SwarmHandle, SwarmRequest};
 
 use neosh_proto::NodeId;
 

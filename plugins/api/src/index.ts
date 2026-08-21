@@ -20,6 +20,9 @@ import type { BufferId } from "./generated/BufferId";
 import type { Capability } from "./generated/Capability";
 import type { CommitInfo } from "./generated/CommitInfo";
 import type { CommandEntry } from "./generated/CommandEntry";
+import type { AgentCommand } from "./generated/AgentCommand";
+import type { AgentState } from "./generated/AgentState";
+import type { AgentSummary } from "./generated/AgentSummary";
 import type { Contribution } from "./generated/Contribution";
 import type { AccountKind } from "./generated/AccountKind";
 import type { Brand } from "./generated/Brand";
@@ -88,6 +91,14 @@ import type { ToolDef } from "./generated/ToolDef";
 import type { ToolResult } from "./generated/ToolResult";
 import type { TurnRequest } from "./generated/TurnRequest";
 import type { Usage } from "./generated/Usage";
+import type { NodeCapabilities } from "./generated/NodeCapabilities";
+import type { NodeId } from "./generated/NodeId";
+import type { NodeInfo } from "./generated/NodeInfo";
+import type { ProjectKey } from "./generated/ProjectKey";
+import type { RemoteProject } from "./generated/RemoteProject";
+import type { StreamEvent } from "./generated/StreamEvent";
+import type { SwarmAgent } from "./generated/SwarmAgent";
+import type { SwarmNode } from "./generated/SwarmNode";
 import type { VarScope } from "./generated/VarScope";
 import type { Viewport } from "./generated/Viewport";
 import type { WindowId } from "./generated/WindowId";
@@ -97,6 +108,7 @@ import type { WorktreeInfo } from "./generated/WorktreeInfo";
 
 export type {
   AccountKind, Activity, ApiError, BranchInfo, Brand, BufferId, Capability, CommandEntry, CommitInfo,
+  AgentCommand, AgentState, AgentSummary,
   Contribution, CredentialInfo, CredentialSource, DiffTarget, Dock, CursorMotion, ExtmarkId, ExtmarkInfo, ExtmarkOpts, FileChange, FileState, FloatConfig,
   Gravity, HighlightDef, HighlightSpec, Hint, HookName, HookOutcome, HookPayload, InstanceConfig, KeyContext,
   KeymapEntry, KeymapScope, MessageLevel, Mode, ModelEntry, ModelInfo, ModelSelection, ModelTier, NamespaceId,
@@ -105,6 +117,8 @@ export type {
   Message, PermissionDecision, PermissionMode, PermissionOption, PermissionOptionKind, PluginEvent, Pricing, ProviderEvent, ProviderOptionDescriptor,
   Rect, RepoInfo, RepoStatus, SessionId, SessionInfo, StatusAlign, StatusSegment, StopReason,
   SurfaceCell, SurfaceId, TextEdit, ToolCall, ToolDef, ToolResult, TurnRequest, Usage,
+  NodeCapabilities, NodeId, NodeInfo, ProjectKey, RemoteProject, StreamEvent,
+  SwarmAgent, SwarmNode,
   VarScope, Viewport,
   WindowId, WindowInfo, WindowLayout,
   WorktreeInfo,
@@ -330,6 +344,7 @@ export interface Neosh {
   readonly vars: VarApi;
   readonly ext: ExtensionApi;
   readonly event: EventApi;
+  readonly swarm: SwarmApi;
   readonly rtp: RuntimePathApi;
   readonly path: PathApi;
   readonly timer: TimerApi;
@@ -994,6 +1009,56 @@ export interface EventApi {
   onAny(cb: (e: { name: string; data: unknown; from: string }) => void): Disposable;
 }
 
+/**
+ * The other computers.
+ *
+ * ASCP — see `docs/ascp/SPEC.md`. Everything here is a *description* of what another machine is
+ * running, or a *request* to it, and never a handle: an agent belongs to the node it was started on
+ * for the whole of its life, because its files, its shell and its credentials are there.
+ *
+ * Empty and harmless when no swarm is configured, which is the default. A plugin that draws remote
+ * agents needs no special case for the single-machine setup — `nodes()` is simply empty.
+ */
+export interface SwarmApi {
+  /** This machine, or `null` when the swarm is not running. */
+  self(): Promise<NodeInfo | null>;
+  /** Every node known, up or down. A node that has gone keeps its agents, marked `up: false`. */
+  nodes(): Promise<SwarmNode[]>;
+  /** Every agent on every reachable node, flattened, each carrying the node it belongs to. */
+  agents(): Promise<SwarmAgent[]>;
+  /**
+   * Which *other* machines have this project.
+   *
+   * The answer to "is this project on more than this computer". Empty when it is only here. Keyed
+   * on {@link ProjectKey}, which is the normalised git remote — the one thing about a checkout that
+   * is the same on every machine that has it.
+   */
+  hostsOf(project: ProjectKey): Promise<string[]>;
+  /**
+   * Ask a node to do something with one of its agents.
+   *
+   * Settles when that machine answers — every ASCP command is answered exactly once — and rejects
+   * with the owner's reason when it says no. A node may refuse anything; `NodeCapabilities` on its
+   * {@link SwarmNode} says in advance what it is likely to accept, so a menu can grey out a verb
+   * rather than offering one that will bounce.
+   */
+  command(node: NodeId, session: string, command: AgentCommand): Promise<void>;
+  /**
+   * Watch a remote conversation: its history now, then everything as it happens, delivered to
+   * {@link onStream}.
+   *
+   * Drop it when you stop looking. A subscription is the difference between a quiet swarm and one
+   * where every machine sends every token to every other one.
+   */
+  subscribe(node: NodeId, session: string): Promise<void>;
+  unsubscribe(node: NodeId, session: string): Promise<void>;
+  /** A node joined, left, or changed what it is running. Redraw. */
+  onChange(cb: () => void): Disposable;
+  onStream(
+    cb: (e: { node: NodeId; session: string; event: StreamEvent }) => void,
+  ): Disposable;
+}
+
 export interface RuntimePathApi {
   /**
    * Add a directory to search for plugins.
@@ -1063,6 +1128,10 @@ interface Registered {
   composerListeners: Array<(e: { text: string }) => void>;
   activityListeners: Array<(e: { session: SessionId; turn: string; activity: Activity }) => void>;
   varListeners: Array<(e: { scope: VarScope; key: string; value: unknown }) => void>;
+  swarmListeners: Array<() => void>;
+  swarmStreamListeners: Array<
+    (e: { node: NodeId; session: string; event: StreamEvent }) => void
+  >;
   contributionListeners: Array<(e: { point: string }) => void>;
   /**
    * Listeners by event name, plus `null` for the ones that asked for everything.
@@ -1097,6 +1166,8 @@ function reg(plugin: string): Registered {
       composerListeners: [],
       activityListeners: [],
       varListeners: [],
+      swarmListeners: [],
+      swarmStreamListeners: [],
       contributionListeners: [],
       eventListeners: new Map(),
       options: new Set(),
@@ -1269,6 +1340,35 @@ export function __createContext(plugin: string, config: unknown, version: number
       },
       onChange(cb) {
         return listener(r.contributionListeners, cb);
+      },
+    },
+    swarm: {
+      async self() {
+        return expect(await c({ call: "swarm_self" }), "swarm_self").node ?? null;
+      },
+      async nodes() {
+        return expect(await c({ call: "swarm_nodes" }), "swarm_nodes").nodes;
+      },
+      async agents() {
+        return expect(await c({ call: "swarm_agents" }), "swarm_agents").agents;
+      },
+      async hostsOf(project) {
+        return expect(await c({ call: "swarm_hosts_of", project }), "names").names;
+      },
+      async command(node, session, command) {
+        await c({ call: "swarm_command", node, session, command });
+      },
+      async subscribe(node, session) {
+        await c({ call: "swarm_subscribe", node, session });
+      },
+      async unsubscribe(node, session) {
+        await c({ call: "swarm_unsubscribe", node, session });
+      },
+      onChange(cb) {
+        return listener(r.swarmListeners, cb);
+      },
+      onStream(cb) {
+        return listener(r.swarmStreamListeners, cb);
       },
     },
     event: {
@@ -1921,6 +2021,14 @@ export async function __dispatch(plugin: string, msg: Record<string, unknown>): 
       case "var_changed":
         for (const cb of r.varListeners)
           cb({ scope: ev.scope, key: ev.key, value: ev.value });
+        break;
+      case "swarm_changed":
+        for (const cb of [...r.swarmListeners]) cb();
+        break;
+      case "swarm_stream":
+        for (const cb of [...r.swarmStreamListeners]) {
+          cb({ node: ev.node, session: ev.session, event: ev.event });
+        }
         break;
       case "contributions_changed":
         for (const cb of r.contributionListeners) cb({ point: ev.point });

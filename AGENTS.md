@@ -66,6 +66,14 @@ per decision, and records the *reasoning*, not the choice.
   key in a panel is an ordinary binding pointed at a named command, so `F1` lists it and `init.ts`
   can move it; a `switch` on `KeyContext` inside a plugin is the thing this replaced. Keep the
   capture, but only as a sink for keys nothing claimed. See ADR 0040.
+- **An agent belongs to the machine it was started on.** ASCP moves *descriptions* of agents and
+  *requests* to their owners, never the agent: its files, shell and credentials are there, and a
+  conversation that could migrate is one whose `cwd` means something else afterwards. The owner may
+  refuse anything, and enforces regardless of what it advertised in `NodeCapabilities`. ASCP does no
+  NAT traversal — plain TCP, with Tailscale or the like underneath — and does not trust the network
+  to say who may steer an agent: a node is its ed25519 public key, and authorisation is a list you
+  wrote. `accepts_approvals` is separate from `accepts_commands` and off by default, because
+  steering is a message and approving is a write to that machine's disk. See ADR 0041.
 - `Editor::handles` is a **deny-list**. A new API call that is not added to it silently routes to
   the core.
 - **A driver's account of its own loop is not a content block.** Sub-agents, plans, compaction and

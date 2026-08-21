@@ -5,9 +5,11 @@ import type { HookName } from "./HookName";
 import type { HookPayload } from "./HookPayload";
 import type { KeyContext } from "./KeyContext";
 import type { ModelSelection } from "./ModelSelection";
+import type { NodeId } from "./NodeId";
 import type { OptionValue } from "./OptionValue";
 import type { SessionId } from "./SessionId";
 import type { StopReason } from "./StopReason";
+import type { StreamEvent } from "./StreamEvent";
 import type { StreamId } from "./StreamId";
 import type { ToolCall } from "./ToolCall";
 import type { ToolResult } from "./ToolResult";
@@ -59,5 +61,12 @@ export type PluginEvent =
   | { "type": "event"; name: string; data?: unknown; from: string }
   | { "type": "var_changed"; scope: VarScope; key: string; value?: unknown }
   | { "type": "contributions_changed"; point: string }
+  | { "type": "swarm_changed" }
+  | {
+    "type": "swarm_stream";
+    node: NodeId;
+    session: SessionId;
+    event: StreamEvent;
+  }
   | { "type": "provider_cancel"; stream: StreamId }
   | { "type": "shutdown" };

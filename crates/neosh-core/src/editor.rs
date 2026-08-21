@@ -199,6 +199,14 @@ impl Editor {
                 | ApiCall::VarAll { .. }
                 // Emitting is a broadcast to every plugin, and the bridge is what holds them.
                 | ApiCall::EventEmit { .. }
+                // The swarm is sockets and other machines. None of it is UI state.
+                | ApiCall::SwarmSelf
+                | ApiCall::SwarmNodes
+                | ApiCall::SwarmAgents
+                | ApiCall::SwarmHostsOf { .. }
+                | ApiCall::SwarmCommand { .. }
+                | ApiCall::SwarmSubscribe { .. }
+                | ApiCall::SwarmUnsubscribe { .. }
         )
     }
 

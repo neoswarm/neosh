@@ -315,6 +315,15 @@ pub struct Host {
     /// Separate from `pstate` because it is separate in kind: state is private to whoever wrote it,
     /// a var describes a thing and is shared. See [`crate::vars`].
     vars: crate::vars::Vars,
+    /// What the other machines are running. Empty and inert unless `[swarm]` names a peer.
+    swarm: crate::swarm::Swarm,
+    /// The running node, if there is one. `None` when the swarm is off, which is the default.
+    swarm_node: Option<neosh_swarm::SwarmHandle>,
+    /// Commands sent to peers that have not been answered yet, and who to settle when they are.
+    swarm_pending: std::collections::HashMap<String, (PluginId, RequestId)>,
+    swarm_next_command: u64,
+    /// The node's events, held here between construction and the loop taking them.
+    swarm_events: Option<tokio::sync::mpsc::UnboundedReceiver<neosh_swarm::SwarmEvent>>,
     /// Repositories by directory, discovered on demand.
     ///
     /// Keyed rather than singular because the *conversation* decides which repository is in play:
@@ -327,6 +336,15 @@ pub struct Host {
     cwd: std::path::PathBuf,
     /// What to call each directory a conversation lives in, worked out once when it is first seen.
     projects: std::collections::HashMap<std::path::PathBuf, String>,
+    /// What each directory is called *across machines*. See [`neosh_proto::ProjectKey`].
+    ///
+    /// Separate from `projects`, which is a label for this screen. This is an identity, resolved
+    /// from the git remote once when a directory is first seen and remembered, because a workspace
+    /// that ran `git remote get-url` on every inventory publish would run it several times a
+    /// second while a turn is going.
+    project_keys: std::collections::HashMap<std::path::PathBuf, neosh_proto::ProjectKey>,
+    /// What to call this machine to other machines.
+    swarm_name: String,
     /// A key being typed in, if one is.
     ///
     /// The host collects this itself rather than lending a plugin a text field, because a plugin
@@ -643,9 +661,16 @@ impl Host {
             state_dir: None,
             pstate: crate::pstate::PluginState::new(None),
             vars: crate::vars::Vars::new(None),
+            swarm: Default::default(),
+            swarm_node: None,
+            swarm_pending: Default::default(),
+            swarm_next_command: 0,
+            swarm_events: None,
             repos: Default::default(),
             cwd: std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
             projects: Default::default(),
+            project_keys: Default::default(),
+            swarm_name: machine_name(),
             secret: None,
         };
         // Before anything reads one. Conversations are restored — and therefore drawn — before the
@@ -867,6 +892,53 @@ impl Host {
                 Ok(ApiOk::Unit)
             }
             ApiCall::VarAll { scope } => Ok(ApiOk::Vars { vars: self.vars.all(&scope) }),
+            // ---- the swarm ----------------------------------------------
+            ApiCall::SwarmSelf => Ok(ApiOk::SwarmSelf { node: self.swarm_self() }),
+            ApiCall::SwarmNodes => Ok(ApiOk::SwarmNodes {
+                nodes: self
+                    .swarm
+                    .peers()
+                    .map(|p| neosh_proto::SwarmNode {
+                        info: p.info.clone(),
+                        capabilities: p.capabilities.clone(),
+                        up: p.up,
+                        reason: p.reason.clone(),
+                        agents: p.agents.clone(),
+                    })
+                    .collect(),
+            }),
+            ApiCall::SwarmAgents => Ok(ApiOk::SwarmAgents {
+                agents: self
+                    .swarm
+                    .agents()
+                    .map(|(node, agent)| neosh_proto::SwarmAgent {
+                        node: node.clone(),
+                        agent: agent.clone(),
+                    })
+                    .collect(),
+            }),
+            ApiCall::SwarmHostsOf { project } => Ok(ApiOk::Names {
+                names: self.swarm.hosts_of(&project).into_iter().map(str::to_string).collect(),
+            }),
+            ApiCall::SwarmSubscribe { node, session } => {
+                match &self.swarm_node {
+                    Some(h) => {
+                        h.send(neosh_swarm::SwarmRequest::Subscribe { node, session });
+                        Ok(ApiOk::Unit)
+                    }
+                    None => Err(ApiError::NotFound { what: "the swarm is not running".into() }),
+                }
+            }
+            ApiCall::SwarmUnsubscribe { node, session } => {
+                if let Some(h) = &self.swarm_node {
+                    h.send(neosh_swarm::SwarmRequest::Unsubscribe { node, session });
+                }
+                Ok(ApiOk::Unit)
+            }
+            // Taken over before dispatch, because its answer comes from another machine.
+            ApiCall::SwarmCommand { .. } => {
+                Err(ApiError::Internal { message: "swarm.command is answered asynchronously".into() })
+            }
             // ---- events -------------------------------------------------
             // `from` is stamped here rather than taken from the call, so "who said this" is one of
             // the few things in a plugin message that cannot be forged.
@@ -1284,6 +1356,340 @@ impl Host {
                 }
             }
         }
+    }
+
+    // ---- the swarm -------------------------------------------------------
+
+    /// Start a node, if the configuration asks for one.
+    ///
+    /// Off unless somebody said otherwise: a workspace must not open a port because it was
+    /// upgraded. Every failure here is a warning rather than an error — a swarm that cannot start
+    /// is a feature that is unavailable, not a reason the editor should refuse to run.
+    fn start_swarm(&mut self, cfg: &crate::config::SwarmConfig) {
+        if cfg.peers.is_empty() && cfg.listen.is_none() {
+            return;
+        }
+        let Some(state) = self.state_dir.clone() else {
+            self.editor_message(
+                MessageLevel::Warn,
+                "the swarm needs somewhere to keep its key, and --clean has nowhere",
+            );
+            return;
+        };
+
+        let path = neosh_swarm::identity::key_path(&state);
+        let mut identity = match neosh_swarm::Identity::load_or_create(&path) {
+            Ok(i) => i,
+            Err(e) => {
+                self.editor_message(MessageLevel::Error, format!("swarm identity: {e}"));
+                return;
+            }
+        };
+
+        // The allow-list *is* the authorisation, so a peer without a key is not one: it can be
+        // dialled and will be turned away, which is a louder failure than trusting whoever answers
+        // that address.
+        let mut peers = Vec::new();
+        for p in &cfg.peers {
+            match &p.id {
+                Some(id) => {
+                    let id = neosh_proto::NodeId(id.clone());
+                    identity.allow(id.clone(), p.name.clone().unwrap_or_else(|| p.addr.clone()));
+                    peers.push(neosh_swarm::PeerAddress {
+                        addr: p.addr.clone(),
+                        expect: Some(id),
+                    });
+                }
+                None => self.editor_message(
+                    MessageLevel::Warn,
+                    format!("swarm peer {} has no id, so it cannot be authorised", p.addr),
+                ),
+            }
+        }
+
+        let listen = match cfg.listen.as_deref().map(str::parse::<std::net::SocketAddr>) {
+            Some(Ok(a)) => Some(a),
+            Some(Err(e)) => {
+                self.editor_message(
+                    MessageLevel::Warn,
+                    format!("swarm.listen is not an address: {e}"),
+                );
+                None
+            }
+            None => None,
+        };
+
+        if let Some(name) = &cfg.name {
+            self.swarm_name = name.clone();
+        }
+        let node_cfg = neosh_swarm::SwarmConfig {
+            name: self.swarm_name.clone(),
+            listen,
+            peers,
+            accepts_commands: cfg.accepts_commands,
+            accepts_approvals: cfg.accepts_approvals,
+            heartbeat: Duration::from_secs(cfg.heartbeat_secs.max(1)),
+        };
+        let (handle, events) = neosh_swarm::spawn(
+            std::sync::Arc::new(identity),
+            node_cfg,
+            env!("CARGO_PKG_VERSION").to_string(),
+        );
+        self.editor_message(
+            MessageLevel::Info,
+            format!("swarm: this node is {}", handle.id().short()),
+        );
+        self.swarm_node = Some(handle);
+        self.swarm_events = Some(events);
+    }
+
+    fn swarm_self(&self) -> Option<neosh_proto::NodeInfo> {
+        let h = self.swarm_node.as_ref()?;
+        Some(neosh_proto::NodeInfo {
+            id: h.id().clone(),
+            name: self.swarm_name.clone(),
+            os: std::env::consts::OS.to_string(),
+            version: env!("CARGO_PKG_VERSION").to_string(),
+        })
+    }
+
+    /// Send a command to a peer and remember who is waiting for the answer.
+    fn begin_swarm_command(
+        &mut self,
+        node: neosh_proto::NodeId,
+        session: neosh_proto::SessionId,
+        command: neosh_proto::AgentCommand,
+        waiting: (PluginId, RequestId),
+    ) {
+        let Some(handle) = &self.swarm_node else {
+            self.answer_swarm(waiting, Err(ApiError::NotFound {
+                what: "the swarm is not running".into(),
+            }));
+            return;
+        };
+        // Ids are per host rather than random: a counter is enough to correlate within one
+        // connection, and it makes a packet capture readable.
+        self.swarm_next_command += 1;
+        let id = format!("c{}", self.swarm_next_command);
+        self.swarm_pending.insert(id.clone(), waiting);
+        handle.send(neosh_swarm::SwarmRequest::Command { node, id, session, command });
+    }
+
+    fn answer_swarm(&self, waiting: (PluginId, RequestId), result: Result<ApiOk, ApiError>) {
+        let (plugin, id) = waiting;
+        let response: ApiResponse = result.into();
+        let _ = self.bridge.script().send(ScriptInbound::Plugin {
+            plugin,
+            msg: PluginInbound::Response { id, response },
+        });
+    }
+
+    /// Everything this machine is running, as the wire describes it.
+    ///
+    /// Recomputed whole rather than tracked incrementally. A workspace has tens of conversations,
+    /// not thousands, and a delta scheme whose bookkeeping can drift is a board that is subtly
+    /// wrong on the machine you are not sitting at — which is the one case you cannot check.
+    fn local_inventory(&mut self) -> Vec<neosh_proto::AgentSummary> {
+        let sessions = self.agent.sessions().list_with(false);
+        sessions
+            .into_iter()
+            .map(|s| {
+                let info = self.named(s);
+                let key = self.project_key(std::path::Path::new(&info.cwd));
+                let model = self.model_for(&info.id);
+                crate::swarm::summarise(&info, key, model)
+            })
+            .collect()
+    }
+
+    /// What a directory is called across machines. See [`neosh_proto::ProjectKey`].
+    ///
+    /// Cached with the repository, because it is one `git remote get-url` and the answer does not
+    /// change while a checkout is open.
+    fn project_key(&mut self, cwd: &std::path::Path) -> neosh_proto::ProjectKey {
+        if let Some(key) = self.project_keys.get(cwd) {
+            return key.clone();
+        }
+        // Not cached: a directory whose remote has not been read yet would otherwise keep the
+        // guess for ever, and `remember_repo` fills the real answer in a moment later.
+        neosh_proto::ProjectKey::from_dir_name(
+            &cwd.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(),
+        )
+    }
+
+    fn model_for(&self, _session: &neosh_proto::SessionId) -> Option<String> {
+        self.agent.selection().map(|s| s.model.to_string())
+    }
+
+    /// The checkouts this machine can start something in, for a peer's "new conversation over
+    /// there" menu.
+    ///
+    /// Derived from where conversations already are rather than from a scan of the disk: a list of
+    /// every git repository on somebody's laptop is both slow to produce and more than a peer needs
+    /// to know.
+    fn local_projects(&self, agents: &[neosh_proto::AgentSummary]) -> Vec<neosh_proto::RemoteProject> {
+        let mut out: Vec<neosh_proto::RemoteProject> = Vec::new();
+        for a in agents {
+            if out.iter().any(|p| p.cwd == a.cwd) {
+                continue;
+            }
+            out.push(neosh_proto::RemoteProject {
+                key: a.project.clone(),
+                name: a.project_name.clone(),
+                cwd: a.cwd.clone(),
+                active: true,
+            });
+        }
+        out.sort_by(|a, b| a.name.cmp(&b.name));
+        out
+    }
+
+    /// Tell every peer what changed here. Cheap enough to call on any session event.
+    pub fn publish_inventory(&mut self) {
+        if self.swarm_node.is_none() {
+            return;
+        }
+        let agents = self.local_inventory();
+        let mut keys = std::collections::HashMap::new();
+        for a in &agents {
+            keys.insert(a.project.clone(), a.project_name.clone());
+        }
+        self.swarm.set_local_projects(keys);
+        let projects = self.local_projects(&agents);
+        if let Some(h) = &self.swarm_node {
+            h.send(neosh_swarm::SwarmRequest::Publish { full: true, agents, gone: Vec::new() });
+            h.send(neosh_swarm::SwarmRequest::Projects { projects });
+        }
+    }
+
+    /// One event from the swarm.
+    pub fn on_swarm_event(&mut self, event: neosh_swarm::SwarmEvent) {
+        use neosh_swarm::SwarmEvent as E;
+        match event {
+            E::PeerUp { node, capabilities } => {
+                let first = self.swarm.peer(&node.id).is_none_or(|p| !p.up);
+                self.swarm.peer_up(node.clone(), capabilities);
+                if first {
+                    self.editor_message(
+                        MessageLevel::Info,
+                        format!("{} joined the swarm", node.name),
+                    );
+                    // It has just connected and knows nothing about us until we say so.
+                    self.publish_inventory();
+                }
+                self.bridge.broadcast(PluginEvent::SwarmChanged);
+            }
+            E::PeerDown { node, reason } => {
+                let name = self
+                    .swarm
+                    .peer(&node)
+                    .map(|p| p.info.name.clone())
+                    .unwrap_or_else(|| node.short().to_string());
+                self.swarm.peer_down(&node, reason);
+                self.editor_message(MessageLevel::Warn, format!("lost {name}"));
+                // Anything still waiting on that machine will never be answered by it.
+                let orphaned: Vec<String> = self.swarm_pending.keys().cloned().collect();
+                for id in orphaned {
+                    if let Some(waiting) = self.swarm_pending.remove(&id) {
+                        self.answer_swarm(waiting, Err(ApiError::NotFound {
+                            what: format!("{name} went away before answering"),
+                        }));
+                    }
+                }
+                self.bridge.broadcast(PluginEvent::SwarmChanged);
+            }
+            E::Inventory { node, full, agents, gone } => {
+                self.swarm.inventory(&node, full, agents, gone);
+                self.bridge.broadcast(PluginEvent::SwarmChanged);
+            }
+            E::Stream { node, session, event } => {
+                self.bridge.broadcast(PluginEvent::SwarmStream { node, session, event });
+            }
+            E::Answer { id, result, .. } => {
+                let (ok, message) = match result {
+                    Ok(_) => (true, String::new()),
+                    Err(r) => (false, refusal_text(&r)),
+                };
+                self.on_swarm_reply(&id, ok, message);
+            }
+            E::Subscribed { .. } | E::Unsubscribed { .. } => {}
+            E::Command { node, id, session, command } => {
+                self.run_swarm_command(node, id, session, command);
+            }
+        }
+    }
+
+    /// A peer asked us to do something. Answer exactly once, whatever happens.
+    fn run_swarm_command(
+        &mut self,
+        node: neosh_proto::NodeId,
+        id: String,
+        session: neosh_proto::SessionId,
+        command: neosh_proto::AgentCommand,
+    ) {
+        use neosh_proto::AgentCommand as C;
+        let known = self.agent.sessions().list_with(true).iter().any(|s| s.id == session);
+        let result = match command {
+            C::NewSession { cwd, .. } => {
+                let dir = cwd
+                    .map(std::path::PathBuf::from)
+                    .unwrap_or_else(|| self.cwd.clone());
+                if dir.is_dir() {
+                    self.new_session_in(dir);
+                    Ok(Some(self.agent.sessions().active_id().clone()))
+                } else {
+                    Err(neosh_proto::Refusal::Failed {
+                        message: format!("{} is not a directory here", dir.display()),
+                    })
+                }
+            }
+            _ if !known => Err(neosh_proto::Refusal::NoSuchAgent),
+            C::Send { text } => {
+                self.start_turn_in(session.clone(), text);
+                Ok(None)
+            }
+            C::Interrupt => {
+                if let Some(t) = self.turns.get(&session) {
+                    t.cancel();
+                }
+                Ok(None)
+            }
+            C::Rename { title } => {
+                let _ = self.agent.sessions().rename(&session, title);
+                self.publish_inventory();
+                Ok(None)
+            }
+            C::Archive { archived } => {
+                let at = now_secs();
+                let _ = self.agent.sessions().archive(&session, archived, at);
+                self.publish_inventory();
+                Ok(None)
+            }
+            // Declared in the protocol and not yet carried out here. Refusing by name is the
+            // honest answer: a silent success would be a remote machine believing it had changed
+            // a model or approved a call when it had not.
+            C::SetModel { .. } | C::Approve { .. } => Err(neosh_proto::Refusal::NotPermitted {
+                what: "not implemented on this node yet".into(),
+            }),
+        };
+        if let Some(h) = &self.swarm_node {
+            h.send(neosh_swarm::SwarmRequest::Answer {
+                node,
+                id,
+                result,
+            });
+        }
+    }
+
+    /// Settle a command we sent, when the far end answers.
+    pub fn on_swarm_reply(&mut self, id: &str, ok: bool, message: String) {
+        let Some(waiting) = self.swarm_pending.remove(id) else { return };
+        let result = if ok {
+            Ok(ApiOk::Unit)
+        } else {
+            Err(ApiError::Denied { reason: message })
+        };
+        self.answer_swarm(waiting, result);
     }
 
     /// Act on an option the host itself owns. Everything else is a plugin's business.
@@ -4486,6 +4892,18 @@ impl Host {
                         }
                         return;
                     }
+                    // Answered when the owning machine answers, not now. Every ASCP command is
+                    // replied to exactly once, so this settles — unless the peer has gone, which
+                    // the swarm reports as a disconnect and which settles it too.
+                    if let ApiCall::SwarmCommand { node, session, command } = &call {
+                        self.begin_swarm_command(
+                            node.clone(),
+                            session.clone(),
+                            command.clone(),
+                            (plugin.clone(), id.clone()),
+                        );
+                        return;
+                    }
                     if self.spawn_slow(&plugin, Some(id.clone()), &call) {
                         return;
                     }
@@ -4664,9 +5082,20 @@ impl Host {
         tokio::pin!(clock);
         let mut ticking = false;
 
+        // Taken out of the host so the loop can own it. `None` when `[swarm]` names nobody, in
+        // which case `recv` on it is never ready and this costs a branch that is never taken.
+        let mut swarm_rx = self.swarm_events.take();
+
         loop {
             tokio::select! {
                 Some(out) = script_rx.recv() => self.handle_script_out(out).await,
+                Some(ev) = async {
+                    match swarm_rx.as_mut() {
+                        Some(rx) => rx.recv().await,
+                        // Never ready, rather than ready-with-nothing: the latter would spin.
+                        None => std::future::pending().await,
+                    }
+                } => self.on_swarm_event(ev),
                 Some(ev) = agent_rx.recv() => self.handle_agent_event(ev),
                 Some(input) = input_rx.recv() => {
                     // A repaint changes nothing, so it must not go through the input path: the
@@ -4896,6 +5325,11 @@ impl Host {
             // every redraw of the panel and is not worth a `rev-parse` each time.
             let (branch, main) = g.identity().await;
             self.projects.insert(dir.clone(), project_name(&dir, branch, main));
+            // Asked here for the same reason and at the same time as the name: once per directory,
+            // and the answer does not change while a checkout is open.
+            if let Some(key) = g.origin_url().await.and_then(|u| neosh_proto::ProjectKey::from_remote(&u)) {
+                self.project_keys.insert(dir.clone(), key);
+            }
         }
         self.repos.insert(dir, found);
     }
@@ -4920,7 +5354,13 @@ impl Host {
         self.startup.reload = Some(boot.reload);
         self.startup.base_instances =
             self.agent.providers().instances().cloned().collect();
+        // Started once, at boot, and never on reload: the allow-list and the listening socket are
+        // decided by config, and re-reading them would mean tearing down live connections whenever
+        // somebody pressed `^R`. Changing the swarm is a restart, and saying so is kinder than a
+        // reload that half-works.
+        let swarm = boot.resolved.swarm.clone();
         self.apply_config(boot.resolved, boot.cli_model, boot.cli_plugin_dirs);
+        self.start_swarm(&swarm);
     }
 
     /// Apply one resolved configuration. Shared by startup and reload — if reload took a different
@@ -6023,6 +6463,30 @@ async fn run_slow(svc: Services, call: ApiCall) -> ApiResult {
 fn lines_in(content: &str) -> usize {
     let body = content.trim_end();
     if body.is_empty() { 0 } else { body.lines().count() }
+}
+
+/// A refusal, in words a person can act on.
+fn refusal_text(r: &neosh_proto::Refusal) -> String {
+    use neosh_proto::Refusal as R;
+    match r {
+        R::NoSuchAgent => "that conversation is not there any more".into(),
+        R::NotPermitted { what } => what.clone(),
+        R::Busy { message } | R::Failed { message } => message.clone(),
+    }
+}
+
+/// What to call this machine when nobody has said.
+///
+/// The hostname, which is what a person would answer if asked which computer they were at. Read
+/// from the environment rather than a syscall: `HOSTNAME` and `COMPUTERNAME` cover unix shells and
+/// Windows, and "neosh" is a name rather than a failure for the case where neither is set.
+fn machine_name() -> String {
+    std::env::var("HOSTNAME")
+        .or_else(|_| std::env::var("COMPUTERNAME"))
+        .ok()
+        .map(|h| h.split('.').next().unwrap_or(&h).to_string())
+        .filter(|h| !h.is_empty())
+        .unwrap_or_else(|| "neosh".to_string())
 }
 
 pub fn now_secs() -> i64 {

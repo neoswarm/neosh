@@ -46,3 +46,4 @@ implementation — and in two cases (0005, 0008) it did not, which is itself rec
 | [0038](0038-a-conversation-owns-its-permissions.md) | A conversation owns its permissions, and starts with all of them | Accepted |
 | [0039](0039-the-archive-is-a-place-you-go.md) | The archive is a place you go, and the question is worth asking | Accepted |
 | [0040](0040-a-panel-is-a-surface-not-a-program.md) | A panel is a surface, not a program | Accepted |
+| [0041](0041-an-agent-belongs-to-its-machine.md) | An agent belongs to its machine, and the swarm is a view of it | Accepted |

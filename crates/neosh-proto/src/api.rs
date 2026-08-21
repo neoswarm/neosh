@@ -14,6 +14,7 @@ use crate::agent::{
     Capability, HookName, HookPayload, Message, PermissionDecision, PermissionMode, SessionInfo,
     ToolDef, ToolResult,
 };
+use crate::ascp::{AgentCommand, AgentSummary, NodeCapabilities, NodeId, NodeInfo, ProjectKey};
 use crate::ids::{
     BufferId, ExtmarkId, NamespaceId, RequestId, SessionId, StreamId, SurfaceId, WindowId,
 };
@@ -110,6 +111,31 @@ pub struct Contribution {
     #[ts(type = "unknown")]
     pub item: serde_json::Value,
     pub priority: i32,
+}
+
+/// A node, as a plugin sees it: what it is, and what it has.
+#[derive(TS, Serialize, Deserialize, Clone, PartialEq, Debug)]
+#[ts(export)]
+pub struct SwarmNode {
+    pub info: NodeInfo,
+    pub capabilities: NodeCapabilities,
+    /// `false` for a machine we have lost touch with. Its agents are still described, because they
+    /// were real a moment ago and probably still are — what changed is that we cannot see them.
+    pub up: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    pub agents: Vec<AgentSummary>,
+}
+
+/// One remote agent, with the node it belongs to attached.
+///
+/// Flattened for the common case, which is drawing a list: an agent is addressed as `(node,
+/// session)`, and a row that carried only the session would be a row you cannot act on.
+#[derive(TS, Serialize, Deserialize, Clone, PartialEq, Debug)]
+#[ts(export)]
+pub struct SwarmAgent {
+    pub node: NodeInfo,
+    pub agent: AgentSummary,
 }
 
 /// A window as somebody else sees it.
@@ -699,6 +725,43 @@ pub enum ApiCall {
         scope: VarScope,
     },
 
+    // ---- the swarm -----------------------------------------------------
+    // Other machines. The capability is in the host because it needs sockets and signatures; every
+    // decision about what to *show* is a plugin's, which is why this surface is descriptions and
+    // requests rather than anything that draws.
+    /// This node: who we are, and whether the swarm is running at all.
+    SwarmSelf,
+    /// Every node we know of, up or down, with what it is running.
+    SwarmNodes,
+    /// Every agent on every peer that is reachable, flattened.
+    SwarmAgents,
+    /// Which machines have a project, by its cross-machine key. Empty when it is only here.
+    SwarmHostsOf {
+        project: ProjectKey,
+    },
+    /// Ask a node to do something with one of its agents.
+    ///
+    /// Settles when the owner answers — every command is answered exactly once, so this cannot
+    /// hang on a peer that simply ignored it, only on one that has gone, which times out.
+    SwarmCommand {
+        node: NodeId,
+        session: SessionId,
+        command: AgentCommand,
+    },
+    /// Watch a remote conversation: history now, then everything as it happens.
+    ///
+    /// Delivered as [`crate::plugin::PluginEvent::SwarmStream`]. Idempotent, and worth dropping
+    /// when you stop looking — a subscription is the difference between a quiet swarm and one where
+    /// every machine sends every token to everyone.
+    SwarmSubscribe {
+        node: NodeId,
+        session: SessionId,
+    },
+    SwarmUnsubscribe {
+        node: NodeId,
+        session: SessionId,
+    },
+
     // ---- runtime path --------------------------------------------------
     /// Add a directory to search for plugins.
     ///
@@ -890,6 +953,10 @@ pub enum ApiOk {
     },
     Contributions { contributions: Vec<Contribution> },
     Windows { windows: Vec<WindowInfo> },
+    // ---- the swarm ----
+    SwarmSelf { node: Option<NodeInfo> },
+    SwarmNodes { nodes: Vec<SwarmNode> },
+    SwarmAgents { agents: Vec<SwarmAgent> },
 }
 
 /// One piece of the status line.
