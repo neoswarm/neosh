@@ -274,6 +274,46 @@ a string, so rebinding `ui.keys.*` changes what the strip says rather than makin
 
 `AGENTS.md` at the root of the repository has the whole key table in one place.
 
+### Your terminal decides which keys it can send
+
+A key neosh never receives is a key no amount of rebinding will fix, and two of the defaults are in
+that position on a Mac out of the box. Neither is a neosh setting — both are your terminal's.
+
+**`F1` needs `fn` on macOS.** Apple's top row controls brightness and volume by default, so `F1`
+dims the screen and `fn`+`F1` is what reaches an application. Either press `fn`+`F1`, or turn on
+*System Settings → Keyboard → Keyboard Shortcuts → Function Keys → Use F1, F2, etc. as standard
+function keys*. Everything `F1` shows is also in `^K`, which needs no such arrangement.
+
+**`⌥↑` / `⌥↓` need Option-as-Alt.** macOS treats Option as a compose key — `⌥p` is `π`, not
+`Alt+p` — so a terminal has to be told to send it as a modifier instead:
+
+| Terminal | Setting |
+|---|---|
+| Terminal.app | Settings → Profiles → Keyboard → *Use Option as Meta key* |
+| iTerm2 | Settings → Profiles → Keys → Left Option key → *Esc+* |
+| Ghostty | `macos-option-as-alt = left` |
+| Alacritty | `option_as_alt = "Left"` |
+| kitty | `macos_option_as_alt left` |
+
+Setting the *left* Option key only, where that is offered, keeps the right one for typing `£` and
+`—`.
+
+**Enhanced keys, where the terminal has them.** On startup neosh asks the terminal for the
+[Kitty keyboard protocol](https://sw.kovidgoyal.net/kitty/keyboard-protocol/) — supported by kitty,
+Ghostty, WezTerm, foot, rio, Alacritty, iTerm2 and Windows Terminal — and quietly does without on
+terminals that lack it. It buys three things that are otherwise impossible rather than awkward:
+
+- **`⌘` arrives at all.** Without it `Super` is never sent, so a `<D-k>` binding is accepted,
+  listed, shown in the footer and never fires.
+- **`Ctrl` with punctuation is distinguishable.** In a plain terminal `Ctrl+/` and `Ctrl+7` are the
+  same byte, which is why neither is a key worth binding.
+- **`Esc` is unambiguous**, so nothing waits to find out whether more of a sequence is coming.
+
+`NEOSH_NO_ENHANCED_KEYS=1` turns the request off. It is an environment variable rather than an
+option because the terminal has to be in the right mode before the first keystroke, which is before
+there is any config — and because the symptom of a terminal that answers this question wrongly is
+one you cannot fix from inside a program you can no longer type into.
+
 ### Adding a project
 
 `^O` anywhere, `o` in the project panel, or `Enter` on the `+ Add project` row. It offers the
