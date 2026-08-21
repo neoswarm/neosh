@@ -86,6 +86,10 @@ rand = "0.8"
 hex = "0.4"
 # Embeds the `@neosh/api` source tree so `neosh init` can emit types matching the running binary.
 include_dir = "0.7"
+# Images. `base64` is how every provider we target wants the bytes; `image` is for sniffing what
+# was actually on the clipboard and shrinking a 4K screenshot before it is sent five times.
+base64 = "0.22"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
 
 # dev
 insta = { version = "1.48", features = ["json", "redactions"] }

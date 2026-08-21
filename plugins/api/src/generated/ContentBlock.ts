@@ -24,4 +24,16 @@ export type ContentBlock =
     tool_use_id: ToolCallId;
     content: string;
     is_error: boolean;
+  }
+  | {
+    "type": "image";
+    /**
+     * Where the bytes are, absolute. Written by the workspace, read by a driver.
+     */
+    path: string;
+    /**
+     * `image/png`, `image/jpeg`, `image/gif` or `image/webp` — the four every provider we
+     * target accepts. Read off the bytes rather than off the file name, which is a claim.
+     */
+    media_type: string;
   };

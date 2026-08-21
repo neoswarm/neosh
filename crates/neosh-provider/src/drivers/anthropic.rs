@@ -56,6 +56,14 @@ impl AnthropicProvider {
                 "content": content,
                 "is_error": is_error,
             }),
+            ContentBlock::Image { path, media_type } => json!({
+                "type": "image",
+                "source": {
+                    "type": "base64",
+                    "media_type": media_type,
+                    "data": crate::image::base64_at(path)?,
+                },
+            }),
         })
     }
 

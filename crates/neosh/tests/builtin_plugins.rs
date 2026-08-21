@@ -4039,6 +4039,92 @@ fn the_working_line_says_how_much_is_waiting() {
     );
 }
 
+/// A driver that answers with the message it was actually handed.
+///
+/// The point of view that matters here. Everything else in this file can see what was drawn, and
+/// what was drawn is not what was asked — the transcript writes a queued message down the moment
+/// it enters the conversation, whether or not anything ever went out with it. Only the driver
+/// knows, so the driver says.
+///
+/// It naps first, so there is a window in which to queue something while it is out.
+const PARROT: &str = r#"
+import type { PluginContext } from "@neosh/api";
+const nap = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+export async function activate({ neosh }: PluginContext) {
+  await neosh.provider.register("parrot", [{
+    id: "parrot", driver: "parrot", display_name: "Parrot",
+    models: [{ id: "parrot", display_name: "Parrot" }],
+  }], async (req, emit) => {
+    await nap(900);
+    const last = [...req.messages].reverse().find((m) => m.role === "user");
+    const said = (last?.content ?? [])
+      .map((b: { type: string; text?: string }) => (b.type === "text" ? b.text ?? "" : ""))
+      .join(" ")
+      .split("\n")
+      .map((l: string) => l.trim())
+      .filter(Boolean)
+      .join(" + ");
+    emit({ type: "message_start", model: "parrot", usage: {} });
+    emit({ type: "block_start", index: 0, block: { kind: "text" } });
+    emit({ type: "text_delta", index: 0, text: "asked: " + said });
+    emit({ type: "block_stop", index: 0 });
+    emit({ type: "message_delta", stop_reason: { kind: "end_turn" }, usage: {} });
+    emit({ type: "message_stop" });
+  });
+  neosh.notify("parrot ready");
+}
+"#;
+
+fn install_parrot(sb: &Sandbox) {
+    let dir = sb.root.join("config/plugins/parrot");
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    std::fs::write(
+        dir.join("plugin.toml"),
+        "name = \"parrot\"\nversion = \"0.1.0\"\nentry = \"main.ts\"\npermissions = [\"providers\"]\n",
+    )
+    .expect("manifest");
+    std::fs::write(dir.join("main.ts"), PARROT).expect("plugin");
+}
+
+/// Two things queued into the same gap are two things that were asked.
+///
+/// They used to become two user *messages*, and a driver that keeps the conversation on its own
+/// side is handed the newest one and nothing else — so the older question was drawn in the
+/// transcript as asked and then never put to anybody. From the outside that is indistinguishable
+/// from an agent that read your message and ignored it, which is exactly what it looked like.
+///
+/// Asserted on what the driver says it was handed, because the transcript cannot tell the
+/// difference: it writes a queued message down when it enters the conversation, whether or not
+/// anything went out with it.
+#[test]
+fn everything_queued_into_one_gap_is_asked_and_not_just_the_last_of_it() {
+    let sb = Sandbox::new("steerboth");
+    install_parrot(&sb);
+    sb.write_config("[options]\n\"agent.model\" = \"parrot/parrot\"\n");
+    let mut s = sb.start_letting_config_choose();
+    s.wait_for("parrot ready");
+
+    s.type_text("go");
+    s.enter();
+    assert!(s.pump(|s| s.chat_now().iter().any(|l| l.contains("esc to interrupt"))), "working");
+
+    s.type_text("also the tests");
+    s.enter();
+    s.type_text("and the docs");
+    s.enter();
+    assert!(s.pump(|s| s.chat_now().iter().any(|l| l.contains("2 queued"))), "both held");
+
+    assert!(
+        s.pump(|s| s
+            .chat_now()
+            .iter()
+            .any(|l| l.contains("asked: also the tests + and the docs"))),
+        "both reached the driver, in the order they were typed\n{:?}",
+        s.chat_now()
+    );
+}
+
 /// The queue is unsent conversation, so it reads with the conversation and not with the furniture.
 ///
 /// Under the field it sat below the shortcut row and one line above the status bar, in the strip

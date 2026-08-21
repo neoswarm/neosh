@@ -165,10 +165,10 @@ pub fn response(ask: &CanUseTool, answer: &PermissionAnswer) -> Value {
 }
 
 /// One user message, in the shape `--input-format stream-json` expects.
-pub fn user_message(text: &str) -> Value {
+pub fn user_message(content: Value) -> Value {
     json!({
         "type": "user",
-        "message": { "role": "user", "content": text },
+        "message": { "role": "user", "content": content },
         "parent_tool_use_id": null,
         "session_id": "",
     })
@@ -531,7 +531,7 @@ mod tests {
 
     #[test]
     fn the_prompt_goes_in_as_a_message() {
-        let m = user_message("what is in src");
+        let m = user_message("what is in src".into());
         assert_eq!(m["type"], "user");
         assert_eq!(m["message"]["role"], "user");
         assert_eq!(m["message"]["content"], "what is in src");

@@ -6,7 +6,7 @@
 
 use std::sync::{Arc, Mutex};
 
-use neosh_agent::{Agent, AgentEvent, PermissionLayer, PluginBridge, Session};
+use neosh_agent::{Agent, AgentEvent, PermissionLayer, PluginBridge, Prompt, Session};
 use neosh_proto::{
     AuthRef, DriverKind, HookName, HookOutcome, HookPayload, InstanceConfig, InstanceId, ModelId,
     ModelSelection, PluginEvent, PluginId, StopReason, ToolDef, ToolResult, ToolSource,
@@ -126,7 +126,7 @@ async fn a_plugin_registered_tool_is_called_over_the_bridge() {
     let (agent, mut rx) = agent_with_tool_turn();
     let bridge = TestBridge::default();
 
-    let outcome = agent.run_turn(&bridge, "say hello".into()).await;
+    let outcome = agent.run_turn(&bridge, "say hello").await;
 
     let calls = bridge.tool_calls.lock().unwrap().clone();
     assert_eq!(calls.len(), 1, "the plugin tool should have run exactly once");
@@ -152,7 +152,7 @@ async fn a_blocking_pre_hook_vetoes_the_call_and_the_tool_never_runs() {
     *bridge.hook_answer.lock().unwrap() =
         Some(HookOutcome::Veto { reason: "greeting is not allowed".into() });
 
-    agent.run_turn(&bridge, "say hello".into()).await;
+    agent.run_turn(&bridge, "say hello").await;
 
     assert!(
         bridge.tool_calls.lock().unwrap().is_empty(),
@@ -182,7 +182,7 @@ async fn an_observing_hook_sees_the_call_but_cannot_stop_it() {
     *bridge.hook_answer.lock().unwrap() =
         Some(HookOutcome::Veto { reason: "should be ignored".into() });
 
-    agent.run_turn(&bridge, "say hello".into()).await;
+    agent.run_turn(&bridge, "say hello").await;
 
     assert_eq!(bridge.tool_calls.lock().unwrap().len(), 1, "observers cannot veto");
     let observed = bridge.observed.lock().unwrap().clone();
@@ -211,7 +211,7 @@ async fn assistant_text_streams_as_separate_token_events() {
     let (agent, mut rx) =
         Agent::new(session, Arc::new(PermissionLayer::new(std::env::temp_dir())), providers);
 
-    agent.run_turn(&TestBridge::default(), "hi".into()).await;
+    agent.run_turn(&TestBridge::default(), "hi").await;
 
     let tokens: Vec<String> = drain(&mut rx)
         .into_iter()
@@ -234,7 +234,7 @@ async fn a_turn_can_be_vetoed_before_it_reaches_the_model() {
     *bridge.hook_answer.lock().unwrap() =
         Some(HookOutcome::Veto { reason: "rate limited locally".into() });
 
-    let outcome = agent.run_turn(&bridge, "do something".into()).await;
+    let outcome = agent.run_turn(&bridge, "do something").await;
     assert_eq!(outcome.stop_reason, StopReason::Cancelled);
     assert!(agent.session().messages.is_empty(), "nothing should be recorded");
     assert!(drain(&mut rx).iter().any(|e| matches!(e, AgentEvent::Notice { .. })));
@@ -248,7 +248,7 @@ async fn a_cancelled_token_ends_the_turn_as_cancelled_and_runs_no_tools() {
     token.cancel();
 
     let bridge = TestBridge::default();
-    let outcome = agent.run_turn_with(&bridge, "hi".into(), token).await;
+    let outcome = agent.run_turn_with(&bridge, "hi", token).await;
 
     assert_eq!(outcome.stop_reason, StopReason::Cancelled);
     assert!(bridge.tool_calls.lock().unwrap().is_empty(), "no work should have started");
@@ -273,7 +273,7 @@ async fn an_unknown_tool_returns_an_error_result_to_the_model() {
     let (agent, _rx) =
         Agent::new(session, Arc::new(PermissionLayer::new(std::env::temp_dir())), providers);
 
-    agent.run_turn(&TestBridge::default(), "go".into()).await;
+    agent.run_turn(&TestBridge::default(), "go").await;
 
     let told = agent.session().messages.iter().any(|m| {
         m.content.iter().any(|b| {
@@ -308,7 +308,7 @@ async fn usage_is_counted_once_per_turn_not_once_per_event() {
 
     let (agent, _rx) = agent_with_script(script);
     let bridge = TestBridge::default();
-    agent.run_turn(&bridge, "hi".into()).await;
+    agent.run_turn(&bridge, "hi").await;
 
     let usage = agent.session().usage;
     assert_eq!(usage.input_tokens, 1200, "counted once, not once per event");
@@ -338,8 +338,8 @@ async fn usage_accumulates_across_turns() {
 
     let (agent, _rx) = agent_with_script(vec![turn(), turn()]);
     let bridge = TestBridge::default();
-    agent.run_turn(&bridge, "one".into()).await;
-    agent.run_turn(&bridge, "two".into()).await;
+    agent.run_turn(&bridge, "one").await;
+    agent.run_turn(&bridge, "two").await;
 
     let usage = agent.session().usage;
     assert_eq!(usage.input_tokens, 200, "two turns, summed");
@@ -409,10 +409,10 @@ async fn steering_is_taken_by_the_conversation_it_was_typed_in() {
 
     assert_eq!(agent.steering_count(&here), 1);
     assert_eq!(agent.steering_count(&there), 1);
-    assert_eq!(agent.take_steering(&here), vec!["wait, not that file".to_string()]);
+    assert_eq!(agent.take_steering(&here), vec![Prompt::text("wait, not that file")]);
     assert_eq!(
-        agent.steering_texts(&there),
-        vec!["and rename it too".to_string()],
+        agent.steering_queue(&there),
+        vec![Prompt::text("and rename it too")],
         "taking one conversation's queue must not empty another's"
     );
 }

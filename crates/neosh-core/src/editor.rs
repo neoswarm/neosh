@@ -145,6 +145,10 @@ impl Editor {
                 | ApiCall::AgentListInstances
                 | ApiCall::AgentDriverCommands
                 | ApiCall::ChatSetDraft { .. }
+                | ApiCall::ChatAttach { .. }
+                | ApiCall::ChatAttachments
+                | ApiCall::ChatDetach { .. }
+                | ApiCall::ChatDetachAll
                 | ApiCall::ToolRegister { .. }
                 | ApiCall::ToolUnregister { .. }
                 | ApiCall::ToolList

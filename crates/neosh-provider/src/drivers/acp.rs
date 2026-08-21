@@ -112,27 +112,46 @@ fn prompt_blocks(messages: &[Message], only_latest: bool) -> Vec<Value> {
             .join("\n");
         (!text.trim().is_empty()).then_some(text)
     };
+    // ACP's own image block, which is MCP's: the bytes inline with what they are. The agent is not
+    // necessarily on this machine, so unlike codex there is no path to hand over.
+    let pictures = |m: &Message| -> Vec<Value> {
+        m.content
+            .iter()
+            .filter_map(|b| match b {
+                ContentBlock::Image { path, media_type } => Some(json!({
+                    "type": "image",
+                    "mimeType": media_type,
+                    "data": crate::image::base64_at(path)?,
+                })),
+                _ => None,
+            })
+            .collect()
+    };
 
     if only_latest {
-        return messages
-            .iter()
-            .rev()
-            .find(|m| m.role == Role::User)
-            .and_then(render)
-            .map(|text| vec![json!({ "type": "text", "text": text })])
-            .unwrap_or_default();
+        let Some(m) = messages.iter().rev().find(|m| m.role == Role::User) else {
+            return Vec::new();
+        };
+        let mut blocks = pictures(m);
+        blocks.extend(render(m).map(|text| json!({ "type": "text", "text": text })));
+        return blocks;
     }
 
     // Roles are spelled out, because a flattened transcript with no speakers reads as one very
     // confused person talking to themselves.
     messages
         .iter()
-        .filter_map(|m| {
+        // A picture belongs beside the message it came with. Gathered at one end instead they
+        // would be a row of images after the conversation that mentions them, answering nothing.
+        .flat_map(|m| {
             let who = match m.role {
                 Role::User => "User",
                 Role::Assistant => "Assistant",
             };
-            render(m).map(|text| json!({ "type": "text", "text": format!("{who}: {text}") }))
+            let mut blocks = pictures(m);
+            blocks
+                .extend(render(m).map(|text| json!({ "type": "text", "text": format!("{who}: {text}") })));
+            blocks
         })
         .collect()
 }

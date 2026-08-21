@@ -51,6 +51,12 @@ impl GoogleProvider {
                                 "response": {"content": content},
                             }
                         })),
+                        ContentBlock::Image { path, media_type } => Some(json!({
+                            "inlineData": {
+                                "mimeType": media_type,
+                                "data": crate::image::base64_at(path)?,
+                            }
+                        })),
                         // Reasoning is never replayed to Gemini.
                         ContentBlock::Thinking { .. } => None,
                     })

@@ -12,10 +12,11 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use neosh_agent::{Agent, AgentEvent, PluginBridge};
+use neosh_agent::{Agent, AgentEvent, PluginBridge, Prompt};
 use neosh_core::{CoreEffect, Editor};
 use neosh_proto::{
-    ApiCall, ApiError, ApiOk, ApiResponse, ApiResult, BufferId, CursorMotion, Dock, Gravity,
+    ApiCall, ApiError, ApiOk, ApiResponse, ApiResult, BufferId, ContentBlock, CursorMotion, Dock,
+    Gravity,
     InputEvent,
     KeyCode, MessageLevel, Mode, OptionSpec, OptionType, OptionValue, PluginEvent, PluginId,
     PluginInbound, PluginOutbound, PluginResponse, RequestId, TextEdit, UiEvent, VirtTextPos,
@@ -310,6 +311,12 @@ pub struct Host {
     model_cache: crate::services::ModelCache,
     /// Where conversations are saved. `None` under `--clean`, which reads and writes nothing.
     state_dir: Option<std::path::PathBuf>,
+    /// Pictures attached to a message that has not been sent yet, per conversation.
+    ///
+    /// Per conversation for the reason the draft is: `^T` away mid-sentence and back again has to
+    /// find what you were writing where you left it, and an image you pasted is part of what you
+    /// were writing. Emptied when the message goes.
+    attached: std::collections::HashMap<neosh_proto::SessionId, Vec<crate::images::Attachment>>,
     /// What plugins remember between runs: pinned projects, fold state, whatever a panel needs to
     /// still be arranged the way you left it.
     pstate: crate::pstate::PluginState,
@@ -678,6 +685,7 @@ impl Host {
             plugin_permissions: Default::default(),
             model_cache: Default::default(),
             state_dir: None,
+            attached: Default::default(),
             pstate: crate::pstate::PluginState::new(None),
             vars: crate::vars::Vars::new(None),
             swarm: Default::default(),
@@ -836,9 +844,51 @@ impl Host {
 
     async fn agent_call(&mut self, plugin: &PluginId, call: ApiCall) -> ApiResult {
         match call {
-            ApiCall::AgentSend { text } => {
+            ApiCall::AgentSend { text, images } => {
+                // A plugin's own images go on the row first, so they travel with whatever is
+                // already there and in the order they were added — the send is one message.
+                for path in &images {
+                    if let Err(e) = self.attach(Some(std::path::Path::new(path))) {
+                        return Err(ApiError::InvalidArgument { message: e });
+                    }
+                }
                 self.start_turn(text);
                 Ok(ApiOk::Unit)
+            }
+            ApiCall::ChatAttach { path } => {
+                let got = self
+                    .attach(path.as_deref().map(std::path::Path::new))
+                    .map_err(|message| ApiError::InvalidArgument { message })?;
+                Ok(ApiOk::Attachments { attachments: vec![info_of(&got)] })
+            }
+            ApiCall::ChatAttachments => Ok(ApiOk::Attachments {
+                attachments: self
+                    .attached
+                    .get(&self.active_session())
+                    .map(|v| v.iter().map(info_of).collect())
+                    .unwrap_or_default(),
+            }),
+            ApiCall::ChatDetach { index } => {
+                let here = self.active_session();
+                let row = self.attached.entry(here).or_default();
+                // The newest by default: it is the one you just added, and therefore the one you
+                // meant. Out of range is not an error — the row may have gone out with a send
+                // between asking and answering, and there is nothing to put right.
+                let gone = match index {
+                    Some(i) if (i as usize) < row.len() => Some(row.remove(i as usize)),
+                    Some(_) => None,
+                    None => row.pop(),
+                };
+                self.refresh_composer();
+                Ok(ApiOk::Attachments {
+                    attachments: gone.iter().map(info_of).collect(),
+                })
+            }
+            ApiCall::ChatDetachAll => {
+                let here = self.active_session();
+                let gone = self.attached.remove(&here).unwrap_or_default();
+                self.refresh_composer();
+                Ok(ApiOk::Attachments { attachments: gone.iter().map(info_of).collect() })
             }
             ApiCall::AgentCancel => {
                 self.cancel_turn_here();
@@ -1309,9 +1359,50 @@ impl Host {
         self.agent.sessions().active_id().clone()
     }
 
+    /// Send what is in the composer: the words, and whatever is on the attachment row.
+    ///
+    /// The row is emptied here rather than by whoever put something on it, because this is the
+    /// moment the attachment stops being a draft — steered into a running turn or starting a new
+    /// one, either way it has been said and is not yours to take back any more.
     fn start_turn(&mut self, text: String) {
         let here = self.active_session();
-        self.start_turn_in(here, text);
+        let images = self.take_attachments(&here);
+        self.start_turn_in(here, Prompt { text, images });
+    }
+
+    /// Take the attachment row for a conversation, as the blocks it becomes.
+    fn take_attachments(&mut self, session: &neosh_proto::SessionId) -> Vec<ContentBlock> {
+        self.attached.remove(session).unwrap_or_default().iter().map(|a| a.block()).collect()
+    }
+
+    /// Where attached images are kept. Beside the conversations they belong to, so clearing the
+    /// state directory clears both and neither outlives the other.
+    ///
+    /// Under `--clean` there is no state directory at all, and a temporary one is the honest
+    /// answer: nothing is being kept, which is what `--clean` means, and an image you paste still
+    /// has to survive as far as the request.
+    fn image_store(&self) -> std::path::PathBuf {
+        match &self.state_dir {
+            Some(dir) => dir.join("images"),
+            None => std::env::temp_dir().join(format!("neosh-images-{}", std::process::id())),
+        }
+    }
+
+    /// Put an image on the composer's attachment row.
+    ///
+    /// `path` names a file; `None` is the clipboard. Answers with what it attached, so the caller
+    /// can say so — a chip appearing at the bottom of the screen is not enough on its own when the
+    /// thing you pressed might equally have found nothing.
+    fn attach(&mut self, path: Option<&std::path::Path>) -> Result<crate::images::Attachment, String> {
+        let store = self.image_store();
+        let got = match path {
+            Some(p) => crate::images::from_path(&store, p),
+            None => crate::images::from_clipboard(&store),
+        }?;
+        let here = self.active_session();
+        self.attached.entry(here).or_default().push(got.clone());
+        self.refresh_composer();
+        Ok(got)
     }
 
     /// Start a turn in a named conversation, drawing it only if it is the one on screen.
@@ -1319,13 +1410,13 @@ impl Host {
     /// Named rather than implied, because the caller is not always the keyboard: a turn that ends
     /// with something still queued starts the next one, and by then you may be reading something
     /// else entirely.
-    fn start_turn_in(&mut self, session: neosh_proto::SessionId, text: String) {
+    fn start_turn_in(&mut self, session: neosh_proto::SessionId, prompt: Prompt) {
         let on_screen = self.active_session() == session;
         // Typing while it works is steering, not an error. The old behaviour — refuse, and make you
         // wait with the sentence already written — is the one moment in the program where you know
         // exactly what you want to say and cannot say it.
         if self.turns.contains_key(&session) {
-            self.agent.steer(&session, text);
+            self.agent.steer(&session, prompt);
             if on_screen {
                 self.draw_working();
                 self.refresh_composer();
@@ -1359,7 +1450,7 @@ impl Host {
             // Asking a question means you want to see the answer: scrolled-back state does not
             // survive sending, or the reply arrives somewhere off screen.
             self.scroll_chat(0);
-            self.chat_question(&text);
+            self.chat_question(&prompt);
             self.begin_working();
             // `\u{23ce}` steers from here until the turn is over, and the empty field is where that
             // has to be said — it is the one thing on screen you are looking at when you press it.
@@ -1369,7 +1460,7 @@ impl Host {
         let agent = self.agent.clone();
         let bridge = self.bridge.clone();
         tokio::spawn(async move {
-            agent.run_turn_in(&*bridge, session, text, token).await;
+            agent.run_turn_in(&*bridge, session, prompt, token).await;
         });
     }
 
@@ -1846,8 +1937,10 @@ impl Host {
                 }
             }
             _ if !known => Err(neosh_proto::Refusal::NoSuchAgent),
+            // Words only. A peer on another machine naming a path would be naming a file on
+            // *its* disk, and this side would read whatever happened to be at that path here.
             C::Send { text } => {
-                self.start_turn_in(session.clone(), text);
+                self.start_turn_in(session.clone(), Prompt::text(text));
                 Ok(None)
             }
             C::Interrupt => {
@@ -2264,9 +2357,33 @@ impl Host {
         //
         // Drawn after the rule so it lands under it: marks at the same position stack in the order
         // they were set.
-        let queued = self.agent.steering_texts(&self.active_session());
+        // What has been attached but not yet sent, between the rule and the queue. Above the
+        // field for the reason the queue is: it is part of the message you are writing, not
+        // chrome — and it is the one part of that message you cannot read off the field itself.
+        let attached: Vec<String> = self
+            .attached
+            .get(&self.active_session())
+            .map(|v| v.iter().map(|a| a.label()).collect())
+            .unwrap_or_default();
+        for (i, label) in attached.iter().enumerate() {
+            let mut v = vec![
+                chunk("  ", "Composer.Hint"),
+                // Labelled once, like the queue: a column of the same word is not the part you
+                // are reading.
+                chunk(if i == 0 { "attached " } else { "         " }, "Status.Pending"),
+                chunk(label.clone(), "Composer.Hint"),
+            ];
+            if i + 1 == attached.len() {
+                v.push(chunk("  ", "Composer.Hint"));
+                v.push(chunk("\u{2325}v", "Composer.HintKey"));
+                v.push(chunk(" take off", "Composer.Hint"));
+            }
+            self.composer_mark(0, VirtTextPos::Above, v);
+        }
+
+        let queued = self.agent.steering_queue(&self.active_session());
         let take = queued.len().min(3);
-        for (i, text) in queued.iter().take(take).enumerate() {
+        for (i, text) in queued.iter().map(|p| &p.text).take(take).enumerate() {
             let more = queued.len() - take;
             let mut v = vec![
                 chunk("  ", "Composer.Hint"),
@@ -4538,7 +4655,8 @@ impl Host {
     /// A bar down the left rather than a `>` prefix, because a multi-line question wrapped by the
     /// frontend loses a prefix on every line but the first, and the thing you scan for when
     /// scrolling back is *where the turns start*.
-    fn chat_question(&mut self, text: &str) {
+    fn chat_question(&mut self, prompt: &Prompt) {
+        let text = &prompt.text;
         let glyph = self.glyphs().bar;
         let mut rows = Vec::new();
         // A gap above, unless there already is one. Whatever came before was the end of the last
@@ -4561,17 +4679,24 @@ impl Host {
         if gap {
             rows.push(String::new());
         }
+        // The pictures first, on rows of their own, because that is the order they are in the
+        // message and a question is easier to read when what it is pointing at is above it.
+        for b in &prompt.images {
+            if let ContentBlock::Image { path, media_type } = b {
+                rows.push(format!("{glyph} {}", image_row(path, media_type)));
+            }
+        }
         for line in text.lines() {
             rows.push(format!("{glyph} {line}"));
         }
-        if rows.is_empty() {
+        if rows.is_empty() || rows.iter().all(|r| r.trim().is_empty()) {
             rows.push(glyph.to_string());
         }
         rows.push(String::new());
+        let body = rows.len() as u32 - 1 - u32::from(gap);
         let at = self.chat_push(rows);
-        let lines = text.lines().count().max(1) as u32;
         let first = at + u32::from(gap);
-        for i in 0..lines {
+        for i in 0..body {
             self.chat_mark(first + i, 0, glyph.len(), "Agent.User");
         }
     }
@@ -4971,7 +5096,14 @@ impl Host {
                     usage,
                 });
                 if !leftover.is_empty() {
-                    self.start_turn_in(session, leftover.join("\n"));
+                    self.start_turn_in(session, Prompt {
+                        text: leftover
+                            .iter()
+                            .map(|p| p.text.as_str())
+                            .collect::<Vec<_>>()
+                            .join("\n\n"),
+                        images: leftover.into_iter().flat_map(|p| p.images).collect(),
+                    });
                 }
                 // The field says what `\u{23ce}` does, and what it does just changed back.
                 self.refresh_composer();
@@ -4983,13 +5115,13 @@ impl Host {
                     r.said.clear();
                 }
             }
-            AgentEvent::Steered { text, .. } => {
+            AgentEvent::Steered { prompt, .. } => {
                 // Drawn now rather than when it was typed: until the model has been told, a
                 // transcript showing the question is a transcript that is lying about what was
                 // asked. Off screen it needs no drawing at all — it is in the conversation's
                 // messages, which is what a switch back rebuilds from.
                 if on_screen {
-                    self.chat_question(&text);
+                    self.chat_question(&prompt);
                     self.draw_working();
                     self.refresh_composer();
                 }
@@ -5301,6 +5433,23 @@ impl Host {
                 // because a paste that always lands at the end is not a paste.
                 if self.reading {
                     self.leave_reading();
+                }
+                // Unless it is a picture. Dragging a file onto a terminal window pastes its path,
+                // which is the only gesture a terminal has for "this file" — so a paste that is
+                // one line, is a path, exists, and turns out to hold an image becomes an
+                // attachment instead of a line of text nobody wanted typed out. Everything that
+                // is not all four of those is text, because swallowing something somebody meant
+                // to type is much worse than making them press a key.
+                if let Some(path) = crate::images::pasted_path(&text) {
+                    match self.attach(Some(&path)) {
+                        // Nothing said about it. The chip that just appeared above the field *is*
+                        // the report, and a line saying the same words in the same glance is the
+                        // kind of noise that teaches people not to read either one.
+                        Ok(_) => return true,
+                        // It looked like an image and was not one. Fall through: what was pasted
+                        // is a path, and a path is perfectly good text.
+                        Err(e) => tracing::debug!("not attaching {}: {e}", path.display()),
+                    }
                 }
                 self.compose(TextEdit::Insert { text });
             }
@@ -5743,6 +5892,9 @@ impl Host {
                 "chat.queue.edit",
                 "Take the last thing you queued back into the composer, to change it or drop it",
             ),
+            ("chat.image.paste", "Attach the image on the clipboard"),
+            ("chat.image.drop", "Take the last attached image back off"),
+            ("chat.image.clear", "Take every attached image off"),
             ("edit.copy", "Copy what is selected"),
             ("edit.cut", "Cut what is selected"),
             ("edit.select_all", "Select everything here"),
@@ -5809,6 +5961,15 @@ impl Host {
             // reach it at all. It also took `⇧↑` away from the composer, where it is how you select
             // upward through a pasted snippet — the field handles it and never saw it.
             ("<C-y>", "chat.queue.edit", "Take the last queued message back"),
+            // The key a terminal cannot deliver an image with, bound to the only thing that can.
+            // Bracketed paste is a *text* protocol — `⌘V` on a screenshot arrives as nothing at
+            // all — so pasting a picture has to be a key that goes and asks the clipboard, and
+            // `^V` is the one every hand is already on. It stays free for that: nothing else in
+            // chat wants it, and the composer has never had a use for it.
+            ("<C-v>", "chat.image.paste", "Attach the image on the clipboard"),
+            // Beside it rather than somewhere else, because "that was the wrong screenshot" is
+            // one keystroke away from having taken it.
+            ("<M-v>", "chat.image.drop", "Take the last attached image off"),
         ] {
             let _ = self.editor.apply(&plugin, ApiCall::KeymapSet {
                 mode: Mode::Chat,
@@ -5976,17 +6137,65 @@ impl Host {
                 let here = self.active_session();
                 match self.agent.unqueue_last(&here) {
                     None => self.editor_message(MessageLevel::Info, "nothing queued"),
-                    Some(text) => {
+                    Some(prompt) => {
                         let draft = self.composer_text();
                         let joined = match draft.trim().is_empty() {
-                            true => text,
-                            false => format!("{text}\n{draft}"),
+                            true => prompt.text,
+                            false => format!("{}\n{draft}", prompt.text),
                         };
+                        // What was attached to it comes back too, on the row it came off. A
+                        // sentence you can edit and a picture you cannot put back would be half
+                        // an undo.
+                        if !prompt.images.is_empty() {
+                            let store = self.image_store();
+                            let row = self.attached.entry(here).or_default();
+                            for b in &prompt.images {
+                                if let ContentBlock::Image { path, .. } = b
+                                    && let Ok(a) =
+                                        crate::images::from_path(&store, std::path::Path::new(path))
+                                {
+                                    row.push(a);
+                                }
+                            }
+                        }
                         self.set_composer(&joined);
                         self.draw_working();
                         self.refresh_composer();
                     }
                 }
+            }
+            // Nothing on the clipboard is the common case rather than a failure, so it is said the
+            // same way "nothing queued" is: a line, not an error.
+            // Only the failure is worth a line: a chip appearing above the composer says the
+            // other thing better than a sentence could. "Nothing on the clipboard" has nothing to
+            // show for itself, and is the answer people actually need explaining.
+            "chat.image.paste" => {
+                if let Err(e) = self.attach(None) {
+                    self.editor_message(MessageLevel::Warn, e);
+                }
+            }
+            "chat.image.drop" => {
+                let here = self.active_session();
+                match self.attached.entry(here).or_default().pop() {
+                    None => self.editor_message(MessageLevel::Info, "nothing attached"),
+                    Some(a) => {
+                        self.editor_message(MessageLevel::Info, format!("took off {}", a.label()));
+                        self.refresh_composer();
+                    }
+                }
+            }
+            "chat.image.clear" => {
+                let here = self.active_session();
+                let n = self.attached.remove(&here).unwrap_or_default().len();
+                self.editor_message(
+                    MessageLevel::Info,
+                    match n {
+                        0 => "nothing attached".to_string(),
+                        1 => "took off 1 image".to_string(),
+                        n => format!("took off {n} images"),
+                    },
+                );
+                self.refresh_composer();
             }
             "chat.toggle_card" => {
                 if self.reading {
@@ -6923,6 +7132,7 @@ fn transcript(
     }
     // A gap, unless there already is one: what came before was often a tool card, which has no
     // trailing blank of its own, and the next thing butted against it reads as part of it.
+    #[allow(clippy::items_after_statements)]
     fn gap(lines: &mut Vec<String>) {
         if lines.last().is_some_and(|l| !l.trim().is_empty()) {
             lines.push(String::new());
@@ -6942,13 +7152,30 @@ fn transcript(
         }
     };
 
+    // Whether the row just written was an attached image, which is the one case where the text
+    // under it must *not* get a blank line of its own: the picture and the sentence are one
+    // question, and a gap between them reads as two.
+    let mut after_image = false;
     for message in &session.messages {
         for block in &message.content {
+            let was_image = std::mem::take(&mut after_image);
             match block {
+                ContentBlock::Image { path, media_type } if message.role == Role::User => {
+                    // Images come first in a user message, so this is where the turn boundary is.
+                    if !was_image {
+                        summarise(&mut lines, &mut marks, &mut changes);
+                        gap(&mut lines);
+                    }
+                    marks.push(Mark::at(lines.len() as u32, 0, g.bar.len(), "Agent.User"));
+                    lines.push(format!("{} {}", g.bar, image_row(path, media_type)));
+                    after_image = true;
+                }
                 ContentBlock::Text { text } if message.role == Role::User => {
                     // A question starts a turn, so the one before it is over.
-                    summarise(&mut lines, &mut marks, &mut changes);
-                    gap(&mut lines);
+                    if !was_image {
+                        summarise(&mut lines, &mut marks, &mut changes);
+                        gap(&mut lines);
+                    }
                     for line in text.lines() {
                         marks.push(Mark::at(lines.len() as u32, 0, g.bar.len(), "Agent.User"));
                         lines.push(format!("{} {line}", g.bar));
@@ -7073,6 +7300,10 @@ fn transcript(
                     }
                 }
                 ContentBlock::ToolResult { .. } => {}
+                // An image on an *assistant* message, which nothing produces today. Silently
+                // dropped rather than drawn: a row saying "[png]" under an answer nobody attached
+                // one to would be the transcript inventing something.
+                ContentBlock::Image { .. } => {}
                 // Reasoning is not replayed: it is shown live when `chat.show_thinking` is on, and
                 // reprinting it on every switch would bury the answer under the working out.
                 ContentBlock::Thinking { .. } => {}
@@ -7165,6 +7396,34 @@ fn project_name(
         // A detached head has no name of its own; the directory somebody chose is the next best
         // thing, and better than showing a bare hash.
         None => format!("{repo} \u{b7} {}", leaf(dir)),
+    }
+}
+
+/// The one row an attached image gets in a transcript.
+///
+/// A terminal cannot show you the picture, so what it shows instead has to be the two things you
+/// would use to tell one attachment from another: what kind it is, and what it was called. The
+/// name is the file's, which for an image that came off the clipboard is a uuid nobody chose —
+/// so it is only worth saying when somebody did choose it.
+fn image_row(path: &str, media_type: &str) -> String {
+    let kind = media_type.strip_prefix("image/").unwrap_or(media_type);
+    let stem = std::path::Path::new(path).file_stem().and_then(|s| s.to_str()).unwrap_or("");
+    // A uuid is 36 characters of nothing. Anything else is a name somebody gave the file.
+    let named = stem.len() != 36 || !stem.chars().all(|c| c.is_ascii_hexdigit() || c == '-');
+    match named && !stem.is_empty() {
+        true => format!("[{kind} \u{b7} {stem}]"),
+        false => format!("[{kind}]"),
+    }
+}
+
+/// What the API says about an attachment.
+fn info_of(a: &crate::images::Attachment) -> neosh_proto::AttachmentInfo {
+    neosh_proto::AttachmentInfo {
+        path: a.path.display().to_string(),
+        media_type: a.media_type.clone(),
+        width: a.width,
+        height: a.height,
+        bytes: a.bytes.min(u32::MAX as usize) as u32,
     }
 }
 

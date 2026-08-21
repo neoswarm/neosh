@@ -23,6 +23,7 @@ pub mod approval;
 pub mod catalog;
 pub mod credentials;
 pub mod drivers;
+pub mod image;
 pub mod registry;
 pub mod sse;
 
