@@ -376,6 +376,50 @@ export async function activate({ neosh }: PluginContext) {
 }
 
 #[test]
+fn a_held_option_reaches_the_plugin_that_declared_it_however_many_are_loading() {
+    // The bug this pins is an ordering one, and it hid for as long as it did because it needed a
+    // crowd. `activate` registers a plugin's listeners; the host is told it finished some
+    // milliseconds later; and several plugins are in that gap at once. A held `[options]` value is
+    // applied the moment somebody declares the option — which lands in that gap — so whether the
+    // declaring plugin was told about its own setting depended on whether its `Loaded` had been
+    // processed yet, which depended on how many plugins were installed.
+    //
+    // One more bundled plugin was enough to flip it. So: a declarer that activates early, and
+    // company to keep the confirmations coming after it.
+    let s = Sandbox::new("crowd");
+    s.write_plugin(
+        "config/plugins",
+        "aa-greeter",
+        r#"import type { PluginContext } from "@neosh/api";
+export async function activate({ neosh }: PluginContext) {
+  const buf = await neosh.buf.create({ name: "[greeter]", scratch: true });
+  neosh.opt.onChange((e) => {
+    if (e.name === "greeter.greeting") {
+      void neosh.buf.setLines(buf, 0, -1, [`greeting=${e.value}`]);
+    }
+  });
+  await neosh.opt.declare({
+    name: "greeter.greeting",
+    type: { type: "str" },
+    default: "hello",
+  });
+}
+"#,
+    );
+    for n in ["zz-one", "zz-two", "zz-three", "zz-four"] {
+        s.write_plugin(
+            "config/plugins",
+            n,
+            "export async function activate() {}\n",
+        );
+    }
+    s.write("config/config.toml", "[options]\n\"greeter.greeting\" = \"bonjour\"\n");
+
+    let mut sess = s.start();
+    sess.wait_for("greeting=bonjour");
+}
+
+#[test]
 fn a_broken_init_ts_does_not_stop_neosh_from_starting() {
     // Locking someone out of their editor because of a typo in their config is unforgivable: the
     // editor is how they would fix it.

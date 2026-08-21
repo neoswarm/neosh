@@ -441,16 +441,19 @@ fn you_can_move_into_the_transcript_and_copy_a_line_out_of_it() {
     s.press(json!({"kind": "char", "c": "s"}), &["ctrl"]);
     assert!(s.pump(|s| s.copied().is_empty()), "nothing copied yet");
 
-    // Top of the transcript, down onto the greeting, select to the end of it, yank.
+    // Top of the transcript, down past the word — six rows of it, under a blank — onto the
+    // tagline, select to the end of it, yank.
     s.ch("g");
     s.ch("g");
-    s.ch("j");
+    for _ in 0..7 {
+        s.ch("j");
+    }
     s.ch("v");
     s.ch("$");
     s.ch("y");
 
     assert!(
-        s.pump(|s| s.copied().iter().any(|t| t.contains("neosh"))),
+        s.pump(|s| s.copied().iter().any(|t| t.contains("terminal-first"))),
         "the greeting line came out: {:?}",
         s.copied()
     );

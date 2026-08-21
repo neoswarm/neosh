@@ -17,7 +17,8 @@
 use std::collections::BTreeMap;
 
 use neosh_proto::{
-    BlockStartKind, ContentBlock, Message, ProviderEvent, Role, StopReason, ToolCallId, Usage,
+    Activity, BlockStartKind, ContentBlock, Message, ProviderEvent, Role, StopReason, ToolCallId,
+    Usage,
 };
 
 #[derive(Debug, Clone, PartialEq)]
@@ -42,6 +43,9 @@ pub enum TurnUpdate {
     ToolMalformed { id: ToolCallId, name: String, raw: String, error: String },
     /// A tool call a delegating driver ran for itself has come back.
     ToolResult { id: ToolCallId, content: String, is_error: bool },
+    /// The driver's own loop said something about itself. Passed straight through: none of it is
+    /// part of the message, so the assembler has nothing to fold it into and nothing to decide.
+    Activity { activity: Activity },
     Error { message: String, retryable: bool },
 }
 
@@ -199,6 +203,7 @@ impl TurnAssembler {
                 vec![]
             }
             ProviderEvent::MessageStop => vec![],
+            ProviderEvent::Activity { activity } => vec![TurnUpdate::Activity { activity }],
             ProviderEvent::Error { message, retryable } => {
                 self.stop_reason = Some(StopReason::Error { message: message.clone() });
                 vec![TurnUpdate::Error { message, retryable }]

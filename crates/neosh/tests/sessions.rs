@@ -570,6 +570,44 @@ fn conversations_survive_a_restart() {
 }
 
 #[test]
+fn a_restored_conversation_still_has_its_tool_cards() {
+    // Conversations are restored, and therefore drawn, before the configuration is resolved. Every
+    // option read during that draw used to answer with the zero of its type, so `chat.show_tools`
+    // was false and a restart brought the transcript back with the answers and not one of the
+    // calls that produced them — errors survived, because those are gated on `is_error` too.
+    let sb = Sandbox::new("restart-cards");
+    install_driver(&sb);
+    install_finishing_agent(&sb);
+    {
+        let mut s = sb.start();
+        s.wait_for("driver ready");
+        s.wait_for("finisher ready");
+        s.command("t.useFinisher");
+        s.wait_for("using finisher");
+        s.type_text("what is in src");
+        s.enter();
+        s.wait_for("and that is that");
+        s.command("quit");
+        assert!(s.exits_within(Duration::from_secs(10)), "clean exit");
+    }
+
+    let mut s = sb.start();
+    s.wait_for("driver ready");
+    assert!(
+        s.pump(|s| s.chat_now().iter().any(|l| l.contains("and that is that"))),
+        "the conversation came back at all\n{:?}",
+        s.chat_now()
+    );
+    s.drain_for(Duration::from_millis(300));
+    let now = s.chat_now();
+    assert_eq!(
+        now.iter().filter(|l| l.contains("list_dir")).count(),
+        1,
+        "the tool it called came back with it\n{now:?}"
+    );
+}
+
+#[test]
 fn clean_neither_reads_nor_writes_conversations() {
     let sb = Sandbox::new("clean");
     install_driver(&sb);
@@ -696,6 +734,451 @@ fn switching_away_from_a_running_turn_leaves_it_running_where_it_belongs() {
         s.chat_now().iter().any(|l| l.contains("hang please")),
         "with the question that started it\n{:?}",
         s.chat_now()
+    );
+}
+
+/// A conversation with a driver that runs its own agent loop and never finishes.
+///
+/// The distinction is the whole point of the test below it: such a driver streams its entire loop
+/// — text, tool calls, tool results — down one connection, and neosh records none of it in the
+/// conversation until that connection closes. Everything it has done so far exists only in the
+/// host's record of the running turn, which is exactly what a switch has to preserve.
+fn install_agent_driver(sb: &Sandbox) {
+    let dir = sb.root.join("config/plugins/agentish");
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    std::fs::write(
+        dir.join("plugin.toml"),
+        "name = \"agentish\"\nversion = \"0.1.0\"\nentry = \"main.ts\"\npermissions = [\"providers\"]\n",
+    )
+    .expect("manifest");
+    std::fs::write(
+        dir.join("main.ts"),
+        r#"
+import type { PluginContext } from "@neosh/api";
+export async function activate({ neosh }: PluginContext) {
+  await neosh.provider.register("agentish", [{
+    id: "agentish", driver: "agentish", display_name: "Agentish",
+    models: [{ id: "agentish", display_name: "Agentish" }],
+  }], async (_req, emit) => {
+    emit({ type: "message_start", model: "agentish", usage: {} });
+    emit({ type: "block_start", index: 0, block: { kind: "text" } });
+    emit({ type: "text_delta", index: 0, text: "looking at the tree" });
+    emit({ type: "block_stop", index: 0 });
+    emit({ type: "block_start", index: 1, block: { kind: "tool_use", id: "t1", name: "list_dir" } });
+    emit({ type: "tool_input_delta", index: 1, partial_json: '{"path":"src"}' });
+    emit({ type: "block_stop", index: 1 });
+    emit({ type: "tool_result", id: "t1", content: "main.rs", is_error: false });
+    // And then never finishes, so the turn is reliably still in flight.
+  }, { agentLoop: true });
+  await neosh.cmd.register("t.useAgentish", async () => {
+    await neosh.agent.setSelection({ instance: "agentish", model: "agentish", options: [] });
+    neosh.notify("using agentish");
+  });
+  neosh.notify("agentish ready");
+}
+"#,
+    )
+    .expect("plugin");
+}
+
+#[test]
+fn coming_back_to_a_running_agent_turn_shows_what_it_has_done() {
+    // The bug: an agent driver commits nothing to the conversation until its turn is over, so
+    // rebuilding the transcript from messages on a switch rebuilt the question and nothing else.
+    // You came back to your own sentence and a spinner, with an agent visibly working on something
+    // you could no longer see.
+    let sb = Sandbox::new("switch-agent");
+    install_driver(&sb);
+    install_agent_driver(&sb);
+
+    let mut s = sb.start();
+    s.wait_for("driver ready");
+    s.wait_for("agentish ready");
+    s.command("t.new");
+    s.wait_for("created");
+    s.command("t.useAgentish");
+    s.wait_for("using agentish");
+
+    s.type_text("what is in src");
+    s.enter();
+    s.wait_for("main.rs");
+
+    s.command("t.other");
+    s.wait_for("switched to");
+    assert!(
+        s.pump(|s| !s.chat_now().iter().any(|l| l.contains("looking at the tree"))),
+        "the other conversation gets none of it\n{:?}",
+        s.chat_now()
+    );
+
+    s.command("t.other");
+    assert!(
+        s.pump(|s| s.chat_now().iter().any(|l| l.contains("looking at the tree"))),
+        "coming back puts the answer back\n{:?}",
+        s.chat_now()
+    );
+    s.drain_for(Duration::from_millis(300));
+    let now = s.chat_now();
+    assert!(
+        now.iter().any(|l| l.contains("list_dir")),
+        "and the tool it called\n{now:?}"
+    );
+    assert!(
+        now.iter().any(|l| l.contains("main.rs")),
+        "and what that tool came back with\n{now:?}"
+    );
+    assert!(
+        now.iter().any(|l| l.contains("what is in src")),
+        "with the question that started it\n{now:?}"
+    );
+    assert_eq!(
+        now.iter().filter(|l| l.contains("looking at the tree")).count(),
+        1,
+        "and says none of it twice\n{now:?}"
+    );
+}
+
+#[test]
+fn a_finished_agent_turn_is_drawn_from_the_conversation_and_not_twice() {
+    // The other side of the record: once the turn's messages land, the record has to stop being
+    // the truth. Drawn from both, every switch would say the whole answer a second time.
+    let sb = Sandbox::new("switch-agent-done");
+    install_driver(&sb);
+    install_finishing_agent(&sb);
+
+    let mut s = sb.start();
+    s.wait_for("driver ready");
+    s.wait_for("finisher ready");
+    s.command("t.new");
+    s.wait_for("created");
+    s.command("t.useFinisher");
+    s.wait_for("using finisher");
+
+    s.type_text("go on then");
+    s.enter();
+    s.wait_for("and that is that");
+
+    s.command("t.other");
+    s.wait_for("switched to");
+    s.command("t.other");
+    assert!(
+        s.pump(|s| s.chat_now().iter().any(|l| l.contains("and that is that"))),
+        "the finished answer came back\n{:?}",
+        s.chat_now()
+    );
+    s.drain_for(Duration::from_millis(300));
+    let now = s.chat_now();
+    for said in ["having a look", "and that is that"] {
+        assert_eq!(
+            now.iter().filter(|l| l.contains(said)).count(),
+            1,
+            "{said:?} appears once, not once per source\n{now:?}"
+        );
+    }
+    assert_eq!(
+        now.iter().filter(|l| l.contains("list_dir")).count(),
+        1,
+        "and so does the tool it called\n{now:?}"
+    );
+}
+
+/// The same agent driver as [`install_agent_driver`], except that it finishes.
+fn install_finishing_agent(sb: &Sandbox) {
+    let dir = sb.root.join("config/plugins/finisher");
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    std::fs::write(
+        dir.join("plugin.toml"),
+        "name = \"finisher\"\nversion = \"0.1.0\"\nentry = \"main.ts\"\npermissions = [\"providers\"]\n",
+    )
+    .expect("manifest");
+    std::fs::write(
+        dir.join("main.ts"),
+        r#"
+import type { PluginContext } from "@neosh/api";
+export async function activate({ neosh }: PluginContext) {
+  await neosh.provider.register("finisher", [{
+    id: "finisher", driver: "finisher", display_name: "Finisher",
+    models: [{ id: "finisher", display_name: "Finisher" }],
+  }], async (_req, emit) => {
+    emit({ type: "message_start", model: "finisher", usage: {} });
+    emit({ type: "block_start", index: 0, block: { kind: "text" } });
+    emit({ type: "text_delta", index: 0, text: "having a look" });
+    emit({ type: "block_stop", index: 0 });
+    emit({ type: "block_start", index: 1, block: { kind: "tool_use", id: "t1", name: "list_dir" } });
+    emit({ type: "tool_input_delta", index: 1, partial_json: '{"path":"src"}' });
+    emit({ type: "block_stop", index: 1 });
+    emit({ type: "tool_result", id: "t1", content: "main.rs", is_error: false });
+    emit({ type: "block_start", index: 2, block: { kind: "text" } });
+    emit({ type: "text_delta", index: 2, text: "and that is that" });
+    emit({ type: "block_stop", index: 2 });
+    emit({ type: "message_delta", stop_reason: { kind: "end_turn" }, usage: {} });
+    emit({ type: "message_stop" });
+  }, { agentLoop: true });
+  await neosh.cmd.register("t.useFinisher", async () => {
+    await neosh.agent.setSelection({ instance: "finisher", model: "finisher", options: [] });
+    neosh.notify("using finisher");
+  });
+  neosh.notify("finisher ready");
+}
+"#,
+    )
+    .expect("plugin");
+}
+
+/// A *model* driver that says something and then calls a tool which never comes back.
+///
+/// The other order from an agent driver, and the reason the record cannot simply be replayed: here
+/// the answer and the tool call are both in the conversation before the tool has even started, so
+/// a replay that drew them again would draw them twice.
+fn install_hanging_tool(sb: &Sandbox) {
+    let dir = sb.root.join("config/plugins/hanger");
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    std::fs::write(
+        dir.join("plugin.toml"),
+        "name = \"hanger\"\nversion = \"0.1.0\"\nentry = \"main.ts\"\npermissions = [\"providers\", \"tools\"]\n",
+    )
+    .expect("manifest");
+    std::fs::write(
+        dir.join("main.ts"),
+        r#"
+import type { PluginContext } from "@neosh/api";
+export async function activate({ neosh }: PluginContext) {
+  await neosh.tool.register(
+    { name: "wait_forever", description: "Never comes back", inputSchema: { type: "object", properties: {} } },
+    () => new Promise(() => {}),
+  );
+  await neosh.provider.register("hanger", [{
+    id: "hanger", driver: "hanger", display_name: "Hanger",
+    models: [{ id: "hanger", display_name: "Hanger" }],
+  }], async (_req, emit) => {
+    emit({ type: "message_start", model: "hanger", usage: {} });
+    emit({ type: "block_start", index: 0, block: { kind: "text" } });
+    emit({ type: "text_delta", index: 0, text: "one moment" });
+    emit({ type: "block_stop", index: 0 });
+    emit({ type: "block_start", index: 1, block: { kind: "tool_use", id: "w1", name: "wait_forever" } });
+    emit({ type: "tool_input_delta", index: 1, partial_json: "{}" });
+    emit({ type: "block_stop", index: 1 });
+    emit({ type: "message_delta", stop_reason: { kind: "tool_use" }, usage: {} });
+    emit({ type: "message_stop" });
+  });
+  await neosh.cmd.register("t.useHanger", async () => {
+    await neosh.agent.setSelection({ instance: "hanger", model: "hanger", options: [] });
+    neosh.notify("using hanger");
+  });
+  neosh.notify("hanger ready");
+}
+"#,
+    )
+    .expect("plugin");
+}
+
+/// A driver that keeps a plan and runs a sub-agent, which is what an agent driver does and what
+/// none of the fixtures above could say.
+///
+/// Everything it emits arrives on the same stream as its text — that is the point of the
+/// [`neosh_proto::Activity`] family: none of it is a content block, and before there was somewhere
+/// to put it the driver's whole account of its own loop was dropped on the floor.
+fn install_planning_driver(sb: &Sandbox) {
+    let dir = sb.root.join("config/plugins/planner");
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    std::fs::write(
+        dir.join("plugin.toml"),
+        "name = \"planner\"\nversion = \"0.1.0\"\nentry = \"main.ts\"\npermissions = [\"providers\"]\n",
+    )
+    .expect("manifest");
+    std::fs::write(
+        dir.join("main.ts"),
+        r#"
+import type { PluginContext } from "@neosh/api";
+const nap = (ms: number) => new Promise((r) => setTimeout(r, ms));
+export async function activate({ neosh }: PluginContext) {
+  await neosh.provider.register("planner", [{
+    id: "planner", driver: "planner", display_name: "Planner",
+    models: [{ id: "planner", display_name: "Planner" }],
+  }], async (_req, emit) => {
+    emit({ type: "message_start", model: "planner", usage: {} });
+    emit({ type: "activity", activity: { kind: "commands", commands: [
+      { name: "compact" }, { name: "context" },
+    ] } });
+    emit({ type: "activity", activity: { kind: "plan", steps: [
+      { text: "Clear the desk", state: "done" },
+      { text: "Sort the pile", state: "active" },
+      { text: "Wipe it down", state: "pending" },
+    ] } });
+    emit({ type: "activity", activity: {
+      kind: "task_started", task: "task-1", title: "Say hello", role: "general-purpose",
+    } });
+    emit({ type: "block_start", index: 0, block: { kind: "text" } });
+    emit({ type: "text_delta", index: 0, text: "delegating" });
+    emit({ type: "block_stop", index: 0 });
+    await nap(1200);
+    emit({ type: "activity", activity: {
+      kind: "task_ended", task: "task-1", status: "done", summary: "hello",
+    } });
+    emit({ type: "activity", activity: { kind: "plan", steps: [
+      { text: "Clear the desk", state: "done" },
+      { text: "Sort the pile", state: "done" },
+      { text: "Wipe it down", state: "active" },
+    ] } });
+    await nap(400);
+    emit({ type: "message_delta", stop_reason: { kind: "end_turn" }, usage: {} });
+    emit({ type: "message_stop" });
+  }, { agentLoop: true });
+  await neosh.cmd.register("t.usePlanner", async () => {
+    await neosh.agent.setSelection({ instance: "planner", model: "planner", options: [] });
+    neosh.notify("using planner");
+  });
+  neosh.notify("planner ready");
+}
+"#,
+    )
+    .expect("plugin");
+}
+
+#[test]
+fn a_plan_and_a_sub_agent_are_visible_while_the_turn_is_still_running() {
+    // The gap this closes: an agent driver spends minutes doing things it says nothing about, and
+    // a transcript of text and tool cards has no room for either "here is what I intend to do" or
+    // "something else is running for me right now". Both are state rather than history, so both
+    // live above the working line and are thrown away with it — except the plan, which is
+    // committed once at the end, where it stops being state.
+    let sb = Sandbox::new("plan-footer");
+    install_driver(&sb);
+    install_planning_driver(&sb);
+
+    let mut s = sb.start();
+    s.wait_for("driver ready");
+    s.wait_for("planner ready");
+    s.command("t.usePlanner");
+    s.wait_for("using planner");
+    s.type_text("go");
+    s.enter();
+
+    assert!(
+        s.pump(|s| s.chat_now().iter().any(|l| l.contains("Sort the pile"))),
+        "the checklist is up while the turn runs\n{:?}",
+        s.chat_now()
+    );
+    let mid = s.chat_now();
+    let step = |text: &str| mid.iter().find(|l| l.contains(text)).cloned().unwrap_or_default();
+    assert!(step("Clear the desk").contains('\u{2714}'), "a finished step is ticked\n{mid:?}");
+    assert!(step("Sort the pile").contains('\u{25b8}'), "the one in hand is marked\n{mid:?}");
+    assert!(step("Wipe it down").contains('\u{25a1}'), "and the rest are not\n{mid:?}");
+    assert!(
+        mid.iter().any(|l| l.contains("Say hello") && l.contains("general-purpose")),
+        "and the sub-agent that is out says so\n{mid:?}"
+    );
+    // Below the answer, not above it: the footer says what is true now, so it belongs at the
+    // bottom next to the line that says the turn is still going.
+    let row = |text: &str| mid.iter().position(|l| l.contains(text)).unwrap_or(usize::MAX);
+    assert!(row("delegating") < row("Sort the pile"), "under what has been said\n{mid:?}");
+    assert!(row("Say hello") < row("esc to interrupt"), "and above the working line\n{mid:?}");
+
+    // It came back. Its findings are the result of the call that spawned it — this line was only
+    // ever answering "is it still going", and it is not.
+    assert!(
+        s.pump(|s| !s.chat_now().iter().any(|l| l.contains("esc to interrupt"))),
+        "the turn ended\n{:?}",
+        s.chat_now()
+    );
+    s.drain_for(Duration::from_millis(300));
+    let after = s.chat_now();
+    assert!(
+        !after.iter().any(|l| l.contains("Say hello")),
+        "nothing is out any more, so nothing says it is\n{after:?}"
+    );
+    assert!(
+        after.iter().filter(|l| l.contains("Wipe it down")).count() == 1,
+        "and the plan it finished with stays, exactly once\n{after:?}"
+    );
+    assert!(
+        after.iter().find(|l| l.contains("Wipe it down")).is_some_and(|l| l.contains('\u{25b8}')),
+        "in the state it was last reported in\n{after:?}"
+    );
+}
+
+#[test]
+fn a_call_that_has_not_come_back_says_how_long_it_has_been() {
+    // The one question a card with no body can answer. A clock that only appears when the call
+    // finishes tells you how long you waited *after* you have stopped waiting, which is the wrong
+    // half of the problem: the reason to look is that you are not sure it is still going.
+    //
+    // Ticked in place — one row for one row — so this also pins the thing that would go wrong if
+    // it were not: a header rewritten at the wrong index overwrites whatever moved into its place.
+    let sb = Sandbox::new("running-clock");
+    install_driver(&sb);
+    install_hanging_tool(&sb);
+
+    let mut s = sb.start();
+    s.wait_for("driver ready");
+    s.wait_for("hanger ready");
+    s.command("t.useHanger");
+    s.wait_for("using hanger");
+    s.type_text("go");
+    s.enter();
+    assert!(
+        s.pump(|s| s.chat_now().iter().any(|l| l.contains("wait_forever"))),
+        "the card is up\n{:?}",
+        s.chat_now()
+    );
+    // Two ticks of the one-second clock, so the number has moved at least once.
+    s.drain_for(Duration::from_millis(2400));
+    let rows = s.chat_now();
+    // The card, not the working line under it, which names the tool too.
+    let cards: Vec<&String> =
+        rows.iter().filter(|l| l.starts_with('\u{23fa}') && l.contains("wait_forever")).collect();
+    assert_eq!(cards.len(), 1, "still one card, not one per tick\n{rows:?}");
+    let clock = cards[0].rsplit("  ").next().unwrap_or_default();
+    assert!(
+        clock.ends_with('s') && clock.trim_end_matches(['s', '.']).parse::<f64>().is_ok(),
+        "with a clock on it, and {clock:?} is not one\n{rows:?}"
+    );
+    assert!(
+        rows.iter().any(|l| l.contains("one moment")),
+        "and what it said before the call is still there\n{rows:?}"
+    );
+}
+
+#[test]
+fn a_round_the_conversation_already_holds_is_not_replayed_on_top_of_itself() {
+    let sb = Sandbox::new("switch-midround");
+    install_driver(&sb);
+    install_hanging_tool(&sb);
+
+    let mut s = sb.start();
+    s.wait_for("driver ready");
+    s.wait_for("hanger ready");
+    s.command("t.new");
+    s.wait_for("created");
+    s.command("t.useHanger");
+    s.wait_for("using hanger");
+
+    s.type_text("go");
+    s.enter();
+    s.wait_for("wait_forever");
+
+    s.command("t.other");
+    s.wait_for("switched to");
+    s.command("t.other");
+    assert!(
+        s.pump(|s| s.chat_now().iter().any(|l| l.contains("one moment"))),
+        "the round came back\n{:?}",
+        s.chat_now()
+    );
+    // The redraw is coalesced into a frame, so the last of it can still be in flight when the
+    // predicate above first holds.
+    s.drain_for(Duration::from_millis(300));
+    let now = s.chat_now();
+    assert_eq!(
+        now.iter().filter(|l| l.contains("one moment")).count(),
+        1,
+        "the answer is in the conversation already; saying it again says it twice\n{now:?}"
+    );
+    assert_eq!(
+        // The card, not the working line, which says the same words for as long as the tool runs.
+        now.iter().filter(|l| l.starts_with('\u{23fa}')).count(),
+        1,
+        "and so is the call it ended on\n{now:?}"
     );
 }
 

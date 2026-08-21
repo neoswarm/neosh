@@ -4,6 +4,7 @@ import type { BufferId } from "./BufferId";
 import type { CommandEntry } from "./CommandEntry";
 import type { CommitInfo } from "./CommitInfo";
 import type { CredentialInfo } from "./CredentialInfo";
+import type { DriverCommand } from "./DriverCommand";
 import type { ExtmarkId } from "./ExtmarkId";
 import type { ExtmarkInfo } from "./ExtmarkInfo";
 import type { InstanceConfig } from "./InstanceConfig";
@@ -46,6 +47,7 @@ export type ApiOk =
   | { "ok": "tools"; tools: Array<ToolDef> }
   | { "ok": "names"; names: Array<string> }
   | { "ok": "commands"; commands: Array<CommandEntry> }
+  | { "ok": "driver_commands"; commands: Array<DriverCommand> }
   | { "ok": "keymaps"; keymaps: Array<KeymapEntry> }
   | { "ok": "permission"; decision: PermissionDecision }
   | { "ok": "permission_mode"; mode: PermissionMode }

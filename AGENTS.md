@@ -37,6 +37,17 @@ per decision, and records the *reasoning*, not the choice.
   trailing partial block. See ADR 0026.
 - `Editor::handles` is a **deny-list**. A new API call that is not added to it silently routes to
   the core.
+- **A driver's account of its own loop is not a content block.** Sub-agents, plans, compaction and
+  the commands a driver accepts go in `ProviderEvent::Activity`; `TurnAssembler` never reads it. If
+  something new has to be squeezed into `TextDelta` to be seen, the family is what to extend. See
+  ADR 0034.
+- **An agent driver keeps one process per conversation, keyed by `TurnRequest::conversation`.** Not
+  per turn, and never one per driver — several conversations run at once, and a driver holding a
+  single session id resumes the second into the first one's history. (ACP is the exception and says
+  why: its session lives on the agent's side.)
+- **Take the transport that can do the most.** `claude` in stream-json mode with the control
+  protocol; `codex app-server`, not `codex exec`. The cheaper one is not simpler for long — it is
+  the one where streaming, approvals and interrupts turn out to be impossible rather than missing.
 
 ## Verification
 
@@ -78,15 +89,16 @@ registry — this table is what ships.
 |---|---|
 | `⏎` | Send. While a turn is running, **steer** it: the message is held and taken in at the next gap. |
 | `⇧⏎` | Newline, so a pasted snippet stays one message |
-| `^P` | Pick a model |
+| `^P` | Pick a model. Mid-turn too — the running agent is told, and thinks the rest with it |
 | `^E` | Reasoning effort and the other per-model options |
 | `⌥↑` `⌥↓` | One rung up or down the capability ladder, same provider |
-| `⇧⇥` | Permission mode — ask, allow-listed, full access, deny |
+| `⇧⇥` | Permission mode — ask, allow-listed, full access, deny. Takes effect on the turn that is running |
 | `^T` | Projects and conversations. Switching is never refused — turns keep running where they are |
 | `^N` | New conversation. In a repository it asks where: here, a new worktree, an existing one, elsewhere |
 | `^O` | Add a project |
 | `^B` | Toggle the sidebar |
 | `^K` | Command palette |
+| `/` | On an empty line: every command by name — neosh's, and whatever the agent says it accepts |
 | `^G` | Git status |
 | `^D` | Show what changed |
 | `^S` | Read the transcript — see below |
@@ -96,7 +108,7 @@ registry — this table is what ships.
 | `^R` | Reload configuration |
 | `^Q` | Quit |
 | `F1` | Every binding, live |
-| `Esc` | Interrupt the turn in this conversation |
+| `Esc` | Interrupt the turn in this conversation. The agent is asked to stop, so the conversation survives it |
 
 Composer editing is a text field: `←`/`→` by character and `^←`/`^→` by word, `Home`/`End` and
 `^Home`/`^End` for the ends, shift with any of them to select, `^W` and `^U` to delete a word or
@@ -117,6 +129,7 @@ The answer is the artefact; this is how you get a piece of it out. See ADR 0028.
 | `zz` `zt` `zb` | Put the cursor's line in the middle, at the top, at the bottom |
 | `[` `]` | Previous / next **turn** |
 | `{` `}` | Previous / next **block** |
+| `⇥` `za` | Open or fold the **tool card** under the cursor — the whole diff, the whole output |
 | `/` `?` then `n` `N` | Search, and step through the matches |
 | `v` | Start a selection that motions extend |
 | `V` | Select this whole line |

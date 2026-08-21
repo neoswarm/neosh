@@ -289,6 +289,41 @@ pub enum Capability {
     Network { host: String },
 }
 
+/// One answer a permission request offers.
+///
+/// Agent drivers word their own options — "Yes, and don't ask again for `cargo test`" is a
+/// sentence only the agent that ran it can write. neosh's own tools offer none, and the prompt
+/// falls back to yes and no.
+#[derive(TS, Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
+#[ts(export)]
+pub struct PermissionOption {
+    /// Opaque, and handed straight back to whoever asked. Never parsed.
+    pub id: String,
+    /// What the option says, in the asker's own words.
+    pub label: String,
+    pub kind: PermissionOptionKind,
+}
+
+/// What taking an option would mean, independent of how it is worded.
+///
+/// The wording is the agent's and is shown; this is what lets a UI sort the safe answer to the top,
+/// colour the dangerous one, and pick a default without reading English.
+#[derive(TS, Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
+#[serde(rename_all = "snake_case")]
+#[ts(export)]
+pub enum PermissionOptionKind {
+    AllowOnce,
+    AllowAlways,
+    RejectOnce,
+    RejectAlways,
+}
+
+impl PermissionOptionKind {
+    pub fn allows(self) -> bool {
+        matches!(self, Self::AllowOnce | Self::AllowAlways)
+    }
+}
+
 #[derive(TS, Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 #[ts(export)]
@@ -349,6 +384,21 @@ pub enum HookPayload {
     PermissionPre {
         capability: Capability,
         turn: Option<TurnId>,
+        /// What the asker said it was about to do, in its own words, when that is more than the
+        /// capability can carry. An agent driver's `Run cargo test --workspace` is one line the
+        /// user can act on; `Exec` plus a truncated command is not.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        title: Option<String>,
+        /// The answers the asker offers. Empty when the only answers are yes and no, which is the
+        /// case for every built-in tool.
+        #[serde(default)]
+        options: Vec<PermissionOption>,
+        /// Which of `options` was taken, by `id`. Set by the hook, in a [`HookOutcome::Modify`]
+        /// carrying this payload back — that is how an answer richer than yes-or-no gets home.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        chosen: Option<String>,
     },
 }
 

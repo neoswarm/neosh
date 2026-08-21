@@ -121,6 +121,15 @@ string_id!(
     StreamId
 );
 string_id!(
+    /// One sub-agent, from the moment it is spawned to the moment it reports.
+    ///
+    /// Distinct from the [`ToolCallId`] of the call that started it: a driver may run a task
+    /// nobody asked for by name — a background job, a workflow member — and those have no call to
+    /// borrow an id from. When there *is* one, it is carried alongside rather than reused, so the
+    /// tree can be rebuilt without either id having to mean two things.
+    TaskId
+);
+string_id!(
     /// Correlates a request across the plugin boundary in either direction.
     RequestId
 );

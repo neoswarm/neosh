@@ -10,6 +10,7 @@
  * `ApiCall`, which means an out-of-process plugin in another language has exactly this surface.
  */
 
+import type { Activity } from "./generated/Activity";
 import type { ApiCall } from "./generated/ApiCall";
 import type { ApiError } from "./generated/ApiError";
 import type { ApiOk } from "./generated/ApiOk";
@@ -58,9 +59,16 @@ import type { OptionType } from "./generated/OptionType";
 import type { OptionValue } from "./generated/OptionValue";
 import type { PermissionDecision } from "./generated/PermissionDecision";
 import type { PermissionMode } from "./generated/PermissionMode";
+import type { PermissionOption } from "./generated/PermissionOption";
+import type { PermissionOptionKind } from "./generated/PermissionOptionKind";
 import type { PluginEvent } from "./generated/PluginEvent";
 import type { Pricing } from "./generated/Pricing";
+import type { DriverCommand } from "./generated/DriverCommand";
+import type { PlanState } from "./generated/PlanState";
+import type { PlanStep } from "./generated/PlanStep";
 import type { ProviderEvent } from "./generated/ProviderEvent";
+import type { TaskId } from "./generated/TaskId";
+import type { TaskStatus } from "./generated/TaskStatus";
 import type { ProviderOptionDescriptor } from "./generated/ProviderOptionDescriptor";
 import type { Message } from "./generated/Message";
 import type { Rect } from "./generated/Rect";
@@ -85,12 +93,13 @@ import type { WindowLayout } from "./generated/WindowLayout";
 import type { WorktreeInfo } from "./generated/WorktreeInfo";
 
 export type {
-  AccountKind, ApiError, BranchInfo, Brand, BufferId, Capability, CommandEntry, CommitInfo,
+  AccountKind, Activity, ApiError, BranchInfo, Brand, BufferId, Capability, CommandEntry, CommitInfo,
   CredentialInfo, CredentialSource, DiffTarget, Dock, CursorMotion, ExtmarkId, ExtmarkInfo, ExtmarkOpts, FileChange, FileState, FloatConfig,
   Gravity, HighlightDef, HighlightSpec, Hint, HookName, HookOutcome, HookPayload, InstanceConfig, KeyContext,
   KeymapEntry, KeymapScope, MessageLevel, Mode, ModelEntry, ModelInfo, ModelSelection, ModelTier, NamespaceId,
   OptionChoice, OptionEntry, OptionSelection, OptionSpec, OptionType, OptionValue,
-  Message, PermissionDecision, PermissionMode, PluginEvent, Pricing, ProviderEvent, ProviderOptionDescriptor,
+  DriverCommand, PlanState, PlanStep, TaskId, TaskStatus,
+  Message, PermissionDecision, PermissionMode, PermissionOption, PermissionOptionKind, PluginEvent, Pricing, ProviderEvent, ProviderOptionDescriptor,
   Rect, RepoInfo, RepoStatus, SessionId, SessionInfo, StatusAlign, StatusSegment, StopReason,
   SurfaceCell, SurfaceId, TextEdit, ToolCall, ToolDef, ToolResult, TurnRequest, Usage, Viewport,
   WindowId, WindowLayout,
@@ -491,6 +500,22 @@ export interface AgentApi {
   listModels(instance?: string, opts?: { refresh?: boolean }): Promise<ModelEntry[]>;
   listInstances(): Promise<InstanceConfig[]>;
   /**
+   * What the driver behind this conversation accepts as a slash command.
+   *
+   * Reported by the driver at its handshake, not configured. Which commands exist depends on the
+   * install — `claude` counts project `.claude/commands/`, plugin commands and MCP prompts among
+   * its own — so any list written down in a plugin would be wrong on the first machine that had
+   * one of its own. Empty until the conversation has run a turn: there has been nothing to ask.
+   */
+  driverCommands(): Promise<DriverCommand[]>;
+  /**
+   * Replace what is in the composer, caret at the end.
+   *
+   * For completion: a `/` menu, an `@file` menu, a path menu. Pair with the `composerChanged`
+   * event, which is the other half — one says what has been typed, this puts the answer back.
+   */
+  setDraft(text: string): Promise<void>;
+  /**
    * Where each configured provider's key comes from — and never what it is.
    *
    * There is deliberately no call that returns a secret. A plugin can find out that `anthropic` is
@@ -521,6 +546,13 @@ export interface AgentApi {
    * its window — wants this one.
    */
   onSelectionChange(cb: (e: { selection: ModelSelection }) => void): Disposable;
+  /**
+   * The composer's text changed — a keystroke, a paste, a conversation switch, a send.
+   *
+   * The other half of {@link AgentApi.setDraft}. Completion of any kind is these two: watch what
+   * has been typed, offer something, put the answer back.
+   */
+  onComposerChange(cb: (e: { text: string }) => void): Disposable;
   /**
    * A turn has begun.
    *
@@ -585,6 +617,16 @@ export interface ProviderApi {
     driver: string,
     instances: InstanceConfig[],
     handler: (req: TurnRequest, emit: (e: ProviderEvent) => void, signal: { cancelled: boolean }) => void | Promise<void>,
+    opts?: {
+      /**
+       * This driver runs its own agent loop — it has its own tools, and calls them itself.
+       *
+       * neosh then sends it no tool list, does not execute the calls in its stream, and records the
+       * conversation in the shape that actually happened. Leaving it off for such a driver makes
+       * the host run every tool call a second time.
+       */
+      agentLoop?: boolean;
+    },
   ): Promise<Disposable>;
 }
 
@@ -863,6 +905,7 @@ interface Registered {
   optionListeners: Array<(e: { name: string; value: OptionValue }) => void>;
   sessionListeners: Array<(e: { session: SessionId }) => void>;
   selectionListeners: Array<(e: { selection: ModelSelection }) => void>;
+  composerListeners: Array<(e: { text: string }) => void>;
   options: Set<string>;
   /// Timer handles this plugin armed, cleared on unload.
   timers: Set<number>;
@@ -885,6 +928,7 @@ function reg(plugin: string): Registered {
       optionListeners: [],
       sessionListeners: [],
       selectionListeners: [],
+      composerListeners: [],
       options: new Set(),
       timers: new Set(),
       agentListeners: { turnStart: [], token: [], thinking: [], turnEnd: [], toolStart: [], toolEnd: [] },
@@ -1246,6 +1290,12 @@ export function __createContext(plugin: string, config: unknown, version: number
       async listInstances() {
         return expect(await c({ call: "agent_list_instances" }), "instances").instances;
       },
+      async driverCommands() {
+        return expect(await c({ call: "agent_driver_commands" }), "driver_commands").commands;
+      },
+      async setDraft(text) {
+        await c({ call: "chat_set_draft", text });
+      },
       async credentials() {
         return expect(await c({ call: "provider_credentials" }), "credentials").credentials;
       },
@@ -1262,6 +1312,7 @@ export function __createContext(plugin: string, config: unknown, version: number
         await c({ call: "provider_forget_credential", instance });
       },
       onSelectionChange: (cb) => listener(r.selectionListeners, cb),
+      onComposerChange: (cb) => listener(r.composerListeners, cb),
       onTurnStart: (cb) =>
         listener(r.agentListeners.turnStart as Array<(e: { session: string; turn: string }) => void>, cb),
       onToken: (cb) =>
@@ -1470,8 +1521,13 @@ export function __createContext(plugin: string, config: unknown, version: number
       },
     },
     provider: {
-      async register(driver, instances, handler) {
-        await c({ call: "provider_register_driver", driver, instances });
+      async register(driver, instances, handler, opts) {
+        await c({
+          call: "provider_register_driver",
+          driver,
+          instances,
+          agent_loop: opts?.agentLoop ?? false,
+        });
         r.providers.set(driver, handler);
         return { dispose: () => r.providers.delete(driver) };
       },
@@ -1604,6 +1660,9 @@ export async function __dispatch(plugin: string, msg: Record<string, unknown>): 
         break;
       case "selection_changed":
         for (const cb of r.selectionListeners) cb({ selection: ev.selection });
+        break;
+      case "composer_changed":
+        for (const cb of r.composerListeners) cb({ text: ev.text });
         break;
       case "focus_changed":
       case "shutdown":

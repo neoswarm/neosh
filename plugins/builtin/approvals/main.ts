@@ -13,13 +13,27 @@
  * is how a policy quietly becomes permanent, and the file to edit for that is `config.toml`.
  */
 
-import type { Capability, HookOutcome, Neosh, PermissionMode, PluginContext } from "@neosh/api";
+import type {
+  Capability,
+  HookOutcome,
+  HookPayload,
+  Neosh,
+  PermissionMode,
+  PermissionOption,
+  PluginContext,
+} from "@neosh/api";
 import { picker } from "@neosh/api/ui";
 
 /** How long the user has. Past this the hook times out, which the host reads as a refusal. */
 const ASK_TIMEOUT_MS = 120_000;
 
-type Answer = "once" | "session" | "no";
+/** One row of the prompt: what it says, and what answering it means. */
+type Choice = {
+  label: string;
+  detail?: string;
+  /** An option the asker itself offered, handed back by id. */
+  value: { kind: "option"; id: string } | { kind: "once" } | { kind: "session" } | { kind: "no" };
+};
 
 export async function activate({ neosh, subscriptions }: PluginContext) {
   await neosh.opt.declare({
@@ -71,36 +85,90 @@ export async function activate({ neosh, subscriptions }: PluginContext) {
       "permission_pre",
       async (payload): Promise<HookOutcome> => {
         if (payload.hook !== "permission_pre") return { action: "continue" };
-        const key = describe(payload.capability);
+        // The asker's own sentence when there is one. An agent driver writes a better line than
+        // anything reconstructible from the capability — it knows what it is doing and why.
+        const key = payload.title ?? describe(payload.capability);
 
         if (allowed.has(key)) return { action: "continue" };
 
         const remember = (await neosh.opt.get<boolean>("approvals.remember")) ?? true;
-        const options: Array<{ label: string; detail?: string; value: Answer }> = [
-          { label: "Allow once", value: "once" },
-          ...(remember
-            ? [{ label: "Allow for this session", detail: "forgotten when you switch conversation", value: "session" as Answer }]
-            : []),
-          { label: "Deny", value: "no" },
-        ];
+        const choices = offered(payload.options, remember);
 
-        const answer = await picker(neosh, options, {
+        const answer = await picker(neosh, choices, {
           title: key,
           width: Math.max(40, Math.min(88, key.length + 8)),
-          height: options.length,
+          height: choices.length,
         });
 
-        if (answer === "session") {
-          allowed.add(key);
-          return { action: "continue" };
-        }
-        if (answer === "once") return { action: "continue" };
         // Dismissing is a no. A prompt you can escape into an allow is not a prompt.
-        return { action: "veto", reason: answer === null ? "not approved" : "denied" };
+        if (answer === null) return { action: "veto", reason: "not approved" };
+        switch (answer.kind) {
+          case "session":
+            allowed.add(key);
+            return { action: "continue" };
+          case "once":
+            return { action: "continue" };
+          case "no":
+            return { action: "veto", reason: "denied" };
+          case "option": {
+            // Back through the payload, because "allow, and stop asking about `cargo`" is a thing
+            // only the agent that offered it can act on — a bare yes would throw that away.
+            const chosen: HookPayload = { ...payload, chosen: answer.id };
+            const taken = payload.options.find((o) => o.id === answer.id);
+            return taken && !allows(taken)
+              ? { action: "veto", reason: taken.label }
+              : { action: "modify", payload: chosen };
+          }
+        }
       },
       { blocking: true, timeoutMs: ASK_TIMEOUT_MS },
     ),
   );
+}
+
+/** Whether an option is one of the ways of saying yes. */
+function allows(o: PermissionOption): boolean {
+  return o.kind === "allow_once" || o.kind === "allow_always";
+}
+
+/**
+ * The rows to show, given what the asker offered.
+ *
+ * When it offered nothing — every built-in tool — the question is yes or no and these are neosh's
+ * own three answers. When it offered something, those are the rows: an agent that can say "allow,
+ * and don't ask again for this command" is offering something neosh cannot reproduce from a yes,
+ * and replacing its wording with a generic one would be answering a different question.
+ *
+ * "Allow for this session" rides along either way. It is neosh's, not the agent's, and it is the
+ * one answer that holds across a driver that forgets everything between turns.
+ */
+function offered(options: PermissionOption[], remember: boolean): Choice[] {
+  const session: Choice[] = remember
+    ? [{
+      label: "Allow for this session",
+      detail: "forgotten when you switch conversation",
+      value: { kind: "session" },
+    }]
+    : [];
+  if (options.length === 0) {
+    return [
+      { label: "Allow once", value: { kind: "once" } },
+      ...session,
+      { label: "Deny", value: { kind: "no" } },
+    ];
+  }
+  // The agent's order, with the allows first: a list that opens on "reject always" is a list where
+  // the fast answer is the destructive one.
+  const rows = [...options].sort((a, b) => Number(allows(b)) - Number(allows(a)));
+  const yes = rows.findIndex(allows);
+  const out: Choice[] = rows.map((o) => ({
+    label: o.label,
+    value: { kind: "option", id: o.id },
+  }));
+  // After the last "allow", so the session answer sits with the other ways of saying yes.
+  const at = yes < 0 ? out.length : rows.filter(allows).length;
+  out.splice(at, 0, ...session);
+  return out;
 }
 
 /** The word for a mode, as it reads in the footer. */

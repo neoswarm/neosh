@@ -179,6 +179,16 @@ pub enum PluginEvent {
     SelectionChanged {
         selection: ModelSelection,
     },
+    /// What is in the composer now, after a keystroke, a paste, or a conversation switch.
+    ///
+    /// Every change, including the empty one that follows sending. Completion is the reason it
+    /// exists: a `/` menu, a path menu, an `@file` menu are all the same shape — watch the draft,
+    /// offer something, put the answer back with [`crate::ApiCall::ChatSetDraft`] — and none of
+    /// them can be written without knowing what has been typed. Frequent, but no more so than
+    /// [`Self::Token`], which is already sent per chunk of a streaming answer.
+    ComposerChanged {
+        text: String,
+    },
     /// Stop producing events for this stream and release its resources.
     ProviderCancel {
         stream: StreamId,

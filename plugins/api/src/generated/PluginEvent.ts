@@ -51,5 +51,6 @@ export type PluginEvent =
   | { "type": "option_changed"; name: string; value: OptionValue }
   | { "type": "session_changed"; session: SessionId }
   | { "type": "selection_changed"; selection: ModelSelection }
+  | { "type": "composer_changed"; text: string }
   | { "type": "provider_cancel"; stream: StreamId }
   | { "type": "shutdown" };

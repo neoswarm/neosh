@@ -2747,6 +2747,59 @@ export async function activate({ neosh }: PluginContext) {
 }
 "#;
 
+/// A tool whose call is an edit — `old_string`/`new_string` at a path — and a model that makes one.
+///
+/// What the card shows for an edit is read off those arguments, so this is the shape that proves
+/// the diff, the `+N -N`, and the summary at the end of the turn.
+const EDITOR: &str = r#"
+import type { PluginContext } from "@neosh/api";
+
+export async function activate({ neosh }: PluginContext) {
+  await neosh.tool.register(
+    { name: "edit", description: "Edit", inputSchema: { type: "object" } },
+    async () => ({ content: "edited" }),
+  );
+  let asked = false;
+  await neosh.provider.register("editor", [{
+    id: "editor", driver: "editor", display_name: "Editor",
+    models: [{ id: "editor", display_name: "Editor" }],
+  }], async (_req, emit) => {
+    emit({ type: "message_start", model: "editor", usage: {} });
+    if (!asked) {
+      asked = true;
+      const input = {
+        file_path: "/work/src/main.rs",
+        old_string: "a\nb\nc\nd\ne\nf\ng\nh",
+        new_string: "a\nb\nc\nd\nE\nf\ng\nh\ni",
+      };
+      emit({ type: "block_start", index: 0, block: { kind: "tool_use", id: "e1", name: "edit" } });
+      emit({ type: "tool_input_delta", index: 0, partial_json: JSON.stringify(input) });
+      emit({ type: "block_stop", index: 0 });
+      emit({ type: "message_delta", stop_reason: { kind: "tool_use" }, usage: {} });
+      emit({ type: "message_stop" });
+      return;
+    }
+    emit({ type: "block_start", index: 0, block: { kind: "text" } });
+    emit({ type: "text_delta", index: 0, text: "Edited." });
+    emit({ type: "block_stop", index: 0 });
+    emit({ type: "message_delta", stop_reason: { kind: "end_turn" }, usage: {} });
+    emit({ type: "message_stop" });
+  });
+  neosh.notify("editor ready");
+}
+"#;
+
+fn install_editor(sb: &Sandbox) {
+    let dir = sb.root.join("config/plugins/editor");
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    std::fs::write(
+        dir.join("plugin.toml"),
+        "name = \"editor\"\nversion = \"0.1.0\"\nentry = \"main.ts\"\npermissions = [\"providers\", \"tools\"]\n",
+    )
+    .expect("manifest");
+    std::fs::write(dir.join("main.ts"), EDITOR).expect("plugin");
+}
+
 fn install_chatty(sb: &Sandbox) {
     let dir = sb.root.join("config/plugins/chatty");
     std::fs::create_dir_all(&dir).expect("mkdir");
@@ -3772,6 +3825,120 @@ fn a_tool_call_says_what_came_back_not_only_that_it_ran() {
             && l.contains("could not read"))),
         "and what it came back with, under it\n{:?}",
         s.chat_now()
+    );
+}
+
+#[test]
+fn an_edit_card_shows_the_change_and_how_much_of_it() {
+    // `⏺ edit(main.rs)` and "edited" underneath says that something happened. The diff says what,
+    // the `+2 -1` says how much, and the row at the end of the turn adds it up — which is the
+    // difference between a transcript you can review and one you have to take on trust.
+    let sb = Sandbox::new("editcard");
+    install_editor(&sb);
+    sb.write_config("[options]\n\"agent.model\" = \"editor/editor\"\n");
+    let mut s = sb.start_letting_config_choose();
+    s.wait_for("editor ready");
+    s.type_text("go");
+    s.enter();
+    assert!(
+        s.pump(|s| s.chat_now().iter().any(|l| l.contains("changed 1 file"))),
+        "the turn finished and was summed up\n{:?}",
+        s.chat_now()
+    );
+    let rows = s.chat_now();
+    let header = rows
+        .iter()
+        .position(|l| l.starts_with('\u{23fa}') && l.contains("edit(") && l.contains("main.rs"))
+        .expect("the card's header");
+    assert!(
+        rows[header].ends_with("+2 -1"),
+        "the stats are on the header, and a call this fast is not timed\n{rows:?}"
+    );
+    let del = rows.iter().position(|l| l.ends_with("- e")).expect("the removed line");
+    let add = rows.iter().position(|l| l.ends_with("+ E")).expect("the added line");
+    assert!(header < del && del < add, "the diff is under its header, in order\n{rows:?}");
+    assert!(rows.iter().any(|l| l.ends_with("+ i")), "{rows:?}");
+    assert!(
+        !rows.iter().any(|l| l.trim() == "a" || l.trim() == "b"),
+        "not every unchanged line: two either side of a change is context, eight is a file\n{rows:?}"
+    );
+    assert!(
+        !rows.iter().any(|l| l.contains("more lines")),
+        "every change is on screen, so there is no 'more'\n{rows:?}"
+    );
+    let total = rows.iter().position(|l| l.contains("changed 1 file  +2 -1")).expect("the total");
+    assert!(rows[total + 1].contains("main.rs") && rows[total + 1].ends_with("+2 -1"), "{rows:?}");
+    let answer = rows.iter().position(|l| l.contains("Edited.")).expect("the answer");
+    assert!(answer < total, "the summary closes the turn, under the answer\n{rows:?}");
+}
+
+#[test]
+fn a_folded_card_opens_with_tab_while_reading_and_folds_again() {
+    // A card shows enough to know what happened. The whole of it is one key away, in the place
+    // you go to read — and the trailer says which key.
+    let sb = Sandbox::new("cardfold");
+    install_editor(&sb);
+    sb.write_config("[options]\n\"agent.model\" = \"editor/editor\"\n\"chat.diff_lines\" = 2\n");
+    let mut s = sb.start_letting_config_choose();
+    s.wait_for("editor ready");
+    s.type_text("go");
+    s.enter();
+    assert!(
+        s.pump(|s| s.chat_now().iter().any(|l| l.contains("changed 1 file"))),
+        "the turn finished\n{:?}",
+        s.chat_now()
+    );
+    let rows = s.chat_now();
+    let trailer = rows.iter().find(|l| l.contains("more lines")).expect("a trailer");
+    assert!(trailer.contains("+6 more lines"), "{trailer}");
+    assert!(trailer.contains("^S \u{21e5} to expand"), "it says how: {trailer}");
+    assert!(!rows.iter().any(|l| l.ends_with("+ i")), "the end of the diff is folded away\n{rows:?}");
+    let header = rows.iter().position(|l| l.starts_with('\u{23fa}')).expect("the header");
+
+    // Into the transcript, to the top, and down onto the card.
+    s.ctrl("s");
+    s.key("g");
+    s.key("g");
+    for _ in 0..header {
+        s.key("j");
+    }
+    s.special("tab");
+    assert!(
+        s.pump(|s| s.chat_now().iter().any(|l| l.ends_with("+ i"))),
+        "open, the whole diff is there\n{:?}",
+        s.chat_now()
+    );
+    let rows = s.chat_now();
+    assert!(!rows.iter().any(|l| l.contains("more lines")), "and nothing is held back\n{rows:?}");
+    assert!(
+        rows.iter().position(|l| l.contains("changed 1 file")).unwrap() > header,
+        "what was below the card is still below it\n{rows:?}"
+    );
+
+    s.special("tab");
+    assert!(
+        s.pump(|s| s.chat_now().iter().any(|l| l.contains("+6 more lines"))),
+        "and it folds again\n{:?}",
+        s.chat_now()
+    );
+}
+
+#[test]
+fn the_welcome_says_how_to_read_the_transcript() {
+    // `^S` existed for a long time before anything on screen mentioned it. The welcome is the one
+    // place everybody looks once.
+    let sb = Sandbox::new("welcomekeys");
+    let mut s = sb.start();
+    assert!(
+        s.pump(|s| s.chat_now().iter().any(|l| l.contains("^S browse & copy"))),
+        "the key row\n{:?}",
+        s.chat_now()
+    );
+    let rows = s.chat_now();
+    // The frontend in these tests is 100 columns wide, which is room for the word.
+    assert!(
+        rows.iter().any(|l| l.contains("\u{2588}\u{2588}\u{2588}\u{2557}")),
+        "and the word above it\n{rows:?}"
     );
 }
 

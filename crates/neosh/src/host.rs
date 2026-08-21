@@ -29,6 +29,7 @@ use tokio_util::sync::CancellationToken;
 use unicode_segmentation::UnicodeSegmentation;
 
 use crate::bridge::{PluginProvider, ScriptBridge};
+use crate::cards::{self, Glyphs, ToolState};
 use crate::config::{Config, Resolved};
 use crate::frontend::Frontend;
 use crate::services::Services;
@@ -162,8 +163,9 @@ pub struct Host {
     /// Whether `agent.model` chose the current selection. A chosen model is never silently
     /// replaced; a remembered one is.
     selection_pinned: bool,
-    /// ACP drivers, kept so the permission mode can be mirrored into them.
-    acp_drivers: Vec<Arc<neosh_provider::drivers::AcpProvider>>,
+    /// Drivers that run their own agent loop, kept so the permission mode can be mirrored into
+    /// them and a request they cannot answer alone can reach a person. See ADR 0032.
+    agent_drivers: Vec<Arc<dyn neosh_provider::drivers::AgentDriver>>,
     status: BufferId,
     status_ns: neosh_proto::NamespaceId,
     /// Where the transcript's own highlights live.
@@ -197,6 +199,34 @@ pub struct Host {
     /// `session.messages` when its stream closes, so a transcript rebuilt from messages alone would
     /// show a conversation that is visibly working and has said nothing.
     rounds: std::collections::HashMap<neosh_proto::SessionId, Round>,
+    /// What was in the composer when a change was last announced.
+    ///
+    /// Kept so [`neosh_proto::PluginEvent::ComposerChanged`] is about the draft rather than about
+    /// the redraw.
+    draft: String,
+    /// How many rows of footer — the plan, and what is out — sit above the working line.
+    ///
+    /// Part of the working line and not of the transcript, because both are *state*: they say what
+    /// is true now, not what happened. Torn down and rebuilt together by
+    /// [`Self::below_working`], which is what keeps "the footer is the last rows of the buffer"
+    /// true without anything having to remember where it is.
+    plan_rows: u32,
+    /// What each driver said it accepts as a slash command, by conversation.
+    ///
+    /// Learned at the driver's handshake, not configured: which commands exist depends on the
+    /// install — project commands, plugin commands and MCP prompts all count — so any list written
+    /// down here would be wrong on the first machine that had one of its own. Outlives the turn
+    /// that learned it, because the menu is opened between turns.
+    driver_commands:
+        std::collections::HashMap<neosh_proto::SessionId, Vec<neosh_proto::DriverCommand>>,
+    /// Every tool card in the transcript on screen, in row order.
+    ///
+    /// A body goes *under its own header*, not at the end of the transcript: an agent driver runs
+    /// calls in parallel, so the result of the first can arrive after the header of the third, and
+    /// appended it would sit under the wrong card. Inserting it moves every row below, which is
+    /// why each card's row lives here rather than with whoever drew it. Rebuilt on every switch,
+    /// because the transcript is redrawn from scratch and every row moves.
+    cards: Vec<Card>,
     /// Set while a multi-key sequence is half typed, so the loop knows to arm the timeout that
     /// eventually gives up on it.
     keys_pending: bool,
@@ -274,170 +304,6 @@ pub struct Host {
     secret: Option<SecretPrompt>,
 }
 
-/// What a tool call is about, in a few words, for the row that announces it.
-///
-/// Best-effort by design: tool inputs are whatever schema the tool declared, and guessing wrongly
-/// costs nothing because the name is already there. The keys tried are the ones every file and
-/// shell tool in practice uses.
-/// How a tool call is going, which is the only thing the dot beside it says.
-#[derive(Clone, Copy, PartialEq)]
-enum ToolState {
-    Running,
-    Done,
-    Failed,
-}
-
-impl ToolState {
-    fn hl(self) -> &'static str {
-        match self {
-            Self::Running => "Agent.ToolRunning",
-            Self::Done => "Agent.ToolDone",
-            Self::Failed => "Agent.ToolFailed",
-        }
-    }
-}
-
-/// The header line of a tool card: a state dot, the tool's name, and what it is about.
-///
-/// `⏺ Read(src/main.rs)`. One line however large the arguments are — a card that grows with its
-/// input buries the answer it was gathered for, and the arguments are in the conversation anyway.
-///
-/// The name is whatever the tool calls itself. Mapping `Read` to something friendlier would be
-/// inventing a second vocabulary for the one the model is already using, and the moment they
-/// disagree the transcript is describing a tool that does not exist.
-fn tool_card(
-    g: &Glyphs,
-    name: &str,
-    input: &serde_json::Value,
-    root: &std::path::Path,
-    state: ToolState,
-    width: usize,
-) -> (String, Vec<(usize, usize, &'static str)>) {
-    // What is left for the subject once the dot, the name and the brackets have had their share.
-    let room = width.saturating_sub(g.dot.chars().count() + 1 + name.chars().count() + 2).max(8);
-    let subject = subject_of(name, input, root, room);
-    let text = if subject.is_empty() {
-        format!("{} {name}", g.dot)
-    } else {
-        format!("{} {name}({subject})", g.dot)
-    };
-    let after_dot = g.dot.len();
-    let name_end = after_dot + 1 + name.len();
-    let mut marks = vec![(0, after_dot, state.hl()), (after_dot, name_end, "Agent.Tool")];
-    if name_end < text.len() {
-        marks.push((name_end, text.len(), "Agent.Usage"));
-    }
-    (text, marks)
-}
-
-/// What a tool came back with, under a gutter.
-///
-/// ```text
-///   ⎿  1  hello
-///      2  world
-///      … +2 lines
-/// ```
-///
-/// `limit` lines of it, because the point is to see that something happened and roughly what —
-/// not to reprint a file into the middle of the conversation that asked about it. An error ignores
-/// the limit being zero: a failure nobody can see is a debugging session, and the setting is about
-/// noise rather than about hiding failures.
-fn tool_result_lines(
-    g: &Glyphs,
-    result: &neosh_proto::ToolResult,
-    limit: usize,
-    width: usize,
-) -> Vec<(String, &'static str)> {
-    let hl = if result.is_error { "Agent.ToolError" } else { "Agent.Usage" };
-    let indent = " ".repeat(2 + g.gutter.len() + 2);
-    let head = format!("  {}  ", g.gutter);
-
-    let body = result.content.trim_end();
-    if body.trim().is_empty() {
-        let word = if result.is_error { "failed" } else { "done" };
-        return vec![(format!("{head}{word}"), hl)];
-    }
-
-    let limit = if result.is_error { limit.max(1) } else { limit };
-    if limit == 0 {
-        let n = body.lines().count();
-        let word = if n == 1 { "line" } else { "lines" };
-        return vec![(format!("{head}{n} {word}"), hl)];
-    }
-
-    let mut out = Vec::new();
-    let mut left = limit;
-    for line in body.lines() {
-        if left == 0 {
-            break;
-        }
-        // By character, not byte: slicing a multi-byte boundary panics, and the frontend measures
-        // display width anyway.
-        let prefix = if out.is_empty() { head.as_str() } else { indent.as_str() };
-        let room = width.saturating_sub(prefix.chars().count()).max(8);
-        let text = if line.chars().count() <= room {
-            line.to_string()
-        } else {
-            let clipped: String = line.chars().take(room.saturating_sub(1)).collect();
-            format!("{clipped}\u{2026}")
-        };
-        out.push((format!("{prefix}{text}"), hl));
-        left -= 1;
-    }
-    let rest = body.lines().count().saturating_sub(limit);
-    if rest > 0 {
-        let word = if rest == 1 { "line" } else { "lines" };
-        out.push((format!("{indent}\u{2026} +{rest} more {word}"), "Agent.Usage"));
-    }
-    out
-}
-
-/// What a tool call is *about*, from whichever of its arguments says so.
-///
-/// A path is shown relative to the conversation's directory. An absolute path is mostly the part
-/// you already know, and once it is clipped to fit, the part you already know is *all* you can
-/// see — which is how a card ends up saying `/home/you/projects/thing/crates/neosh/src/…`.
-fn subject_of(
-    _name: &str,
-    input: &serde_json::Value,
-    root: &std::path::Path,
-    room: usize,
-) -> String {
-    const KEYS: &[&str] =
-        &["path", "file_path", "file", "pattern", "query", "command", "url", "prompt"];
-    let Some(map) = input.as_object() else { return String::new() };
-    for key in KEYS {
-        if let Some(v) = map.get(*key).and_then(|v| v.as_str()) {
-            let one = v.lines().next().unwrap_or(v).trim();
-            if one.is_empty() {
-                continue;
-            }
-            let shown = relative_to(one, root);
-            if shown.chars().count() <= room {
-                return shown;
-            }
-            // By character, not byte: slicing a multi-byte boundary panics, and the frontend
-            // measures display width anyway.
-            let clipped: String = shown.chars().take(room.saturating_sub(1)).collect();
-            return format!("{clipped}\u{2026}");
-        }
-    }
-    String::new()
-}
-
-/// A path inside the conversation's directory, said the short way.
-fn relative_to(value: &str, root: &std::path::Path) -> String {
-    if root.as_os_str().is_empty() {
-        return value.to_string();
-    }
-    std::path::Path::new(value)
-        .strip_prefix(root)
-        .ok()
-        .filter(|r| !r.as_os_str().is_empty())
-        .map(|r| r.display().to_string())
-        .unwrap_or_else(|| value.to_string())
-}
-
 /// A turn in flight, in whichever conversation it belongs to.
 ///
 /// The working line exists because the gap between pressing Enter and the first token is the
@@ -454,18 +320,95 @@ struct Round {
     started: std::time::Instant,
     /// What it is waiting on, when that is something other than the model.
     note: Option<String>,
-    /// Text streamed in the round now in progress.
+    /// Everything this turn has produced that the conversation does not hold yet.
     ///
-    /// Cleared the moment that round's assistant message lands in the conversation, because from
-    /// then on the messages are the truth and this would be a second copy of them.
-    text: String,
-    /// Which row each unfinished tool call's card is on, so the dot beside it can change when the
-    /// call comes back.
+    /// Cleared the moment the turn's messages land in the conversation, because from then on the
+    /// messages are the truth and this would be a second copy of them. How long that takes is the
+    /// whole reason this exists: for a model driver it is the end of each round, but an agent
+    /// driver runs its entire loop inside one stream and commits nothing until the turn is over.
+    /// Without a record of its own, switching away from such a turn and back left you looking at
+    /// your own question and nothing else.
+    said: Vec<Said>,
+    /// What this turn has changed so far, per file, for the summary under its answer.
     ///
-    /// Rows only ever grow downwards from here — everything appends at the end — so a row recorded
-    /// once stays the row it was. Dropped on a switch, because the transcript is rebuilt from
-    /// scratch and every row moves.
-    cards: std::collections::HashMap<neosh_proto::ToolCallId, u32>,
+    /// Apart from `said`, which is cleared every time the conversation takes the round's messages
+    /// — a model driver does that at the end of every round, and the summary is about the turn.
+    changes: Vec<cards::FileStat>,
+    /// The agent's own checklist, as of its last report.
+    ///
+    /// Whole, not patched: the driver sends the whole list every time it changes, and a plan
+    /// assembled from increments is only right if every one of them arrived.
+    plan: Vec<neosh_proto::PlanStep>,
+    /// The sub-agents this turn has out, in the order they started.
+    ///
+    /// Kept after they finish rather than removed, so a late report about one that already ended
+    /// lands somewhere instead of resurrecting it.
+    tasks: Vec<Task>,
+}
+
+/// One sub-agent, from the turn's point of view.
+///
+/// What it *found* is not here: that comes back as the result of the call that spawned it, on that
+/// call's own card, which is where a reader is already looking. This is the part the card cannot
+/// answer while it is still out — whether it is still going, and how long it has been.
+struct Task {
+    id: neosh_proto::TaskId,
+    title: String,
+    role: Option<String>,
+    /// When this turn heard about it. Not when it started: a conversation resumed with a task
+    /// already running hears about it at the first report, and a clock from then is honest about
+    /// what it is measuring in a way one counting from an invented start would not be.
+    since: std::time::Instant,
+    status: neosh_proto::TaskStatus,
+}
+
+impl Task {
+    /// Whether it belongs in the footer. Running, obviously — and backgrounded, because
+    /// "something is still going that nothing is waiting for" is the one people ask about.
+    fn listed(&self) -> bool {
+        matches!(
+            self.status,
+            neosh_proto::TaskStatus::Running | neosh_proto::TaskStatus::Backgrounded
+        )
+    }
+}
+
+/// A tool card on screen: where it is, and what it shows.
+///
+/// What it shows is kept so it can be drawn again — folded or opened from the transcript, or
+/// finished when the call comes back — without going looking for the call in the conversation,
+/// which for a running agent turn does not hold it yet.
+struct Card {
+    id: neosh_proto::ToolCallId,
+    name: String,
+    input: serde_json::Value,
+    result: Option<neosh_proto::ToolResult>,
+    /// When the call started, for a card that was here to see it start.
+    ///
+    /// `None` for one rebuilt from the conversation: the messages say what happened and not when,
+    /// so a restored transcript has no clock on it. Inventing one from the moment the buffer was
+    /// drawn would put a number that means "how long ago you pressed `^T`" where a duration goes.
+    started: Option<std::time::Instant>,
+    /// How long it took, once it came back.
+    took: Option<std::time::Duration>,
+    /// What a failed call exited with, when its output said.
+    exit: Option<i64>,
+    /// The header's row.
+    row: u32,
+    /// How many rows the body takes under it.
+    body: u32,
+    /// Whether the body is the whole of it or the first few rows.
+    expanded: bool,
+}
+
+/// One thing a running turn has produced, in the order it produced it.
+///
+/// The same three shapes [`transcript`] draws from a finished conversation, which is the point:
+/// a round replayed from here and the same round replayed from messages a second later have to
+/// look identical, or switching conversations would rewrite what you had already read.
+enum Said {
+    Text(String),
+    Tool { call: neosh_proto::ToolCall, result: Option<neosh_proto::ToolResult> },
 }
 
 // Deliberately no row index. The working line is *always the last line of the transcript* and
@@ -568,7 +511,7 @@ impl Host {
         let composer_ns = namespace("neosh.composer");
         let search_ns = namespace("neosh.search");
 
-        Self {
+        let mut host = Self {
             editor,
             agent,
             bridge,
@@ -587,9 +530,13 @@ impl Host {
             hints: Default::default(),
             welcome_rows: 0,
             selection_pinned: false,
-            acp_drivers: Vec::new(),
+            agent_drivers: Vec::new(),
             turns: std::collections::HashMap::new(),
             rounds: std::collections::HashMap::new(),
+            draft: String::new(),
+            plan_rows: 0,
+            driver_commands: std::collections::HashMap::new(),
+            cards: Vec::new(),
             keys_pending: false,
             keys_touched: false,
             reading: false,
@@ -611,7 +558,15 @@ impl Host {
             cwd: std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
             projects: Default::default(),
             secret: None,
-        }
+        };
+        // Before anything reads one. Conversations are restored — and therefore drawn — before the
+        // configuration is resolved, and an option that has not been declared yet reads as the
+        // zero of its type: `chat.show_tools` came back false, so a restart showed a transcript
+        // with every tool card missing and only the errors left, which is the one thing that
+        // setting is documented not to do. `apply_config` declares them again on every reload,
+        // which is what keeps a rebound default from surviving the config that replaced it.
+        host.declare_builtin_options();
+        host
     }
 
     /// Everything a spawned call needs, snapshotted at the moment of the call.
@@ -765,6 +720,16 @@ impl Host {
                 self.select_model(selection);
                 Ok(ApiOk::Unit)
             }
+            ApiCall::AgentDriverCommands => {
+                let commands =
+                    self.driver_commands.get(&self.active_session()).cloned().unwrap_or_default();
+                Ok(ApiOk::DriverCommands { commands })
+            }
+            ApiCall::ChatSetDraft { text } => {
+                self.set_composer(&text);
+                self.refresh_composer();
+                Ok(ApiOk::Unit)
+            }
             ApiCall::AgentListInstances => Ok(ApiOk::Instances {
                 instances: self.agent.providers().usable_instances().cloned().collect(),
             }),
@@ -866,6 +831,13 @@ impl Host {
                     t.cancel();
                 }
                 self.rounds.remove(&session);
+                self.driver_commands.remove(&session);
+                // A vendor CLI held open for this conversation has nothing left to answer. Left
+                // alone it would sit there for the rest of the program, holding a conversation
+                // whose transcript is about to be deleted from disk.
+                for d in &self.agent_drivers {
+                    d.close_conversation(&session);
+                }
                 self.agent.sessions().remove(&session).map_err(|e| match e {
                     neosh_agent::store::StoreError::LastSession => {
                         ApiError::InvalidArgument { message: e.to_string() }
@@ -949,7 +921,7 @@ impl Host {
                 // still be on next week, and writing it to a file is how that happens.
                 let layer = (*self.agent.permissions()).clone().with_mode(mode);
                 self.agent.set_permissions(layer);
-                self.sync_acp_mode();
+                self.sync_agent_drivers();
                 self.refresh_status();
                 Ok(ApiOk::PermissionMode { mode })
             }
@@ -994,9 +966,13 @@ impl Host {
                 self.agent.hooks_mut().unregister(hook, plugin);
                 Ok(ApiOk::Unit)
             }
-            ApiCall::ProviderRegisterDriver { driver, instances } => {
-                let provider =
-                    Arc::new(PluginProvider::new(driver.clone(), plugin.clone(), self.bridge.clone()));
+            ApiCall::ProviderRegisterDriver { driver, instances, agent_loop } => {
+                let provider = Arc::new(PluginProvider::new(
+                    driver.clone(),
+                    plugin.clone(),
+                    self.bridge.clone(),
+                    agent_loop,
+                ));
                 {
                     let mut reg = self.agent.providers_mut();
                     reg.register_driver(provider);
@@ -1087,8 +1063,10 @@ impl Host {
             verb,
             started: std::time::Instant::now(),
             note: None,
-            text: String::new(),
-            cards: std::collections::HashMap::new(),
+            said: Vec::new(),
+            changes: Vec::new(),
+            plan: Vec::new(),
+            tasks: Vec::new(),
         });
         // Stamped here rather than inside the agent so `Session` stays clock-free and testable.
         // The turn id itself is set by the agent a moment later; a list only reads this while the
@@ -1455,6 +1433,14 @@ impl Host {
         });
         let ascii = self.option_bool("ui.ascii_only");
         let text = self.composer_text();
+        // Every path that changes the draft comes through here, which is what makes this the one
+        // place to say so. Compared rather than fired blind: this also runs on a resize and on a
+        // redraw, and a completion menu that reopened every time the window changed width would be
+        // unusable.
+        if self.draft != text {
+            self.draft.clone_from(&text);
+            self.bridge.broadcast(PluginEvent::ComposerChanged { text: text.clone() });
+        }
         let lines = self.editor.buffer(self.composer).map(|b| b.line_count()).unwrap_or(1).max(1);
         let width = self
             .editor
@@ -1545,20 +1531,27 @@ impl Host {
     /// know is what the second key can be, and leaving the general list up would be answering a
     /// question nobody is asking any more.
     fn reading_hints(&self, width: usize) -> Vec<neosh_proto::VirtChunk> {
-        let pairs: &[(&str, &str)] = match self.reading_pending {
-            Some('y') => &[
+        // The card under the cursor, if it is one that has something to open.
+        let card = self
+            .card_at(self.chat_cursor().0)
+            .map(|i| &self.cards[i])
+            .filter(|c| c.result.is_some())
+            .map(|c| c.expanded);
+        let tab = self.glyphs().tab;
+        let mut pairs: Vec<(&str, &str)> = match self.reading_pending {
+            Some('y') => vec![
                 ("y", "line"),
                 ("c", "code block"),
                 ("m", "this turn"),
                 ("a", "everything"),
             ],
-            Some('g') => &[("g", "top")],
-            Some('z') => &[("z", "centre"), ("t", "top"), ("b", "bottom")],
-            Some(_) => &[],
+            Some('g') => vec![("g", "top")],
+            Some('z') => vec![("z", "centre"), ("t", "top"), ("b", "bottom"), ("a", "card")],
+            Some(_) => vec![],
             None if self.chat_anchored() => {
-                &[("y", "copy"), ("v", "drop"), ("hjkl", "extend"), ("esc", "leave")]
+                vec![("y", "copy"), ("v", "drop"), ("hjkl", "extend"), ("esc", "leave")]
             }
-            None => &[
+            None => vec![
                 ("y", "copy"),
                 ("v", "select"),
                 ("[ ]", "turn"),
@@ -1568,6 +1561,13 @@ impl Host {
                 ("esc", "leave"),
             ],
         };
+        // First, because it is about the row you are on and the others are about everywhere.
+        if self.reading_pending.is_none()
+            && !self.chat_anchored()
+            && let Some(open) = card
+        {
+            pairs.insert(0, (tab, if open { "fold" } else { "expand" }));
+        }
         let mut out: Vec<neosh_proto::VirtChunk> = Vec::new();
         let mut used = 0usize;
         if self.reading_pending.is_some() {
@@ -1584,7 +1584,7 @@ impl Host {
             if gap > 0 {
                 out.push(chunk("  ", "Composer.Hint"));
             }
-            out.push(chunk((*keys).to_string(), "Composer.HintKey"));
+            out.push(chunk(keys.to_string(), "Composer.HintKey"));
             out.push(chunk(format!(" {label}"), "Composer.Hint"));
             used += cost;
         }
@@ -1674,24 +1674,77 @@ impl Host {
             None => "nothing configured \u{2014} run `neosh --list-models`".to_string(),
         };
 
-        let mut rows = vec![
-            String::new(),
-            "  neosh \u{2014} a terminal-first agent workspace".to_string(),
-            String::new(),
-            format!("  model      {model}"),
-            format!("  directory  {}", tilde(&self.cwd)),
-            String::new(),
-        ];
-        // Only when there is something to say. On a working setup the welcome should be four short
-        // lines and then out of the way.
+        let ascii = self.option_bool("ui.ascii_only");
+        let width = self.chat_width();
+        let mut rows: Vec<String> = vec![String::new()];
+        let mut marks: Vec<Mark> = Vec::new();
+        let mut say = |rows: &mut Vec<String>, text: String, spans: Vec<(usize, usize, &'static str)>| {
+            let at = rows.len() as u32;
+            marks.extend(spans.into_iter().map(|(a, b, g)| (at, a, b, g)));
+            rows.push(text);
+        };
+        // The word, where there is room for it and a terminal that can draw it. Narrower than
+        // the word and it wraps into noise; in ASCII, half its glyphs would be boxes.
+        if !ascii && width >= crate::logo::WIDTH + 2 {
+            for i in 0..crate::logo::ROWS.len() {
+                let (text, spans) = crate::logo::row(i, 2);
+                say(&mut rows, text, spans);
+            }
+            let tag = "  a terminal-first agent workspace".to_string();
+            let len = tag.len();
+            say(&mut rows, tag, vec![(0, len, "Comment")]);
+        } else {
+            let tag = "  neosh \u{2014} a terminal-first agent workspace".to_string();
+            let len = tag.len();
+            say(&mut rows, tag, vec![(2, 2 + "neosh".len(), "Accent"), (2 + "neosh".len(), len, "Comment")]);
+        }
+        rows.push(String::new());
+        say(&mut rows, format!("  model      {model}"), vec![(0, 13, "Comment")]);
+        say(&mut rows, format!("  directory  {}", tilde(&self.cwd)), vec![(0, 13, "Comment")]);
+        rows.push(String::new());
+        // Only when there is something to say. On a working setup the welcome should be the word,
+        // a few short lines, and then out of the way.
         if selection.as_ref().is_some_and(|s| !self.selection_is_usable(s)) {
-            rows.push("  This model cannot authenticate yet. Press ^P to pick another, or add a \
-                       key there."
-                .to_string());
+            let warn = "  This model cannot authenticate yet. Press ^P to pick another, or add a \
+                        key there."
+                .to_string();
+            let len = warn.len();
+            say(&mut rows, warn, vec![(0, len, "Diagnostic.Warn")]);
             rows.push(String::new());
         }
+        // The keys worth knowing before the first question — and the one most people never find,
+        // which is that the transcript is a place you can go. The rest of the table is on F1.
+        let keys: [(&str, &str); 5] = [
+            (if ascii { "Enter" } else { "\u{23ce}" }, "send"),
+            ("^S", "browse & copy"),
+            ("^P", "model"),
+            ("^T", "projects"),
+            ("F1", "every key"),
+        ];
+        let mut line = String::from("  ");
+        let mut spans = Vec::new();
+        for (i, (key, label)) in keys.iter().enumerate() {
+            if i > 0 {
+                line.push_str("   ");
+            }
+            let from = line.len();
+            line.push_str(key);
+            spans.push((from, line.len(), "Key"));
+            let from = line.len();
+            line.push(' ');
+            line.push_str(label);
+            spans.push((from, line.len(), "Comment"));
+        }
+        say(&mut rows, line, spans);
+        rows.push(String::new());
 
         let plugin = PluginId::from(BUILTIN);
+        let _ = self.editor.apply(&plugin, ApiCall::MarkClear {
+            ns: self.chat_ns,
+            buf: self.chat,
+            start: Some(0),
+            end: Some(replacing.max(0) as u32),
+        });
         let _ = self.editor.apply(&plugin, ApiCall::BufSetLines {
             buf: self.chat,
             start: 0,
@@ -1699,28 +1752,36 @@ impl Host {
             lines: rows.clone(),
         });
         self.welcome_rows = rows.len();
-        self.chat_mark(1, 2, 2 + "neosh".len(), "Accent");
-        self.chat_mark(1, 2 + "neosh".len(), rows[1].len(), "Comment");
-        for row in [3u32, 4] {
-            self.chat_mark(row, 0, 13, "Comment");
-        }
-        if rows.len() > 6 {
-            self.chat_mark(6, 0, rows[6].len(), "Diagnostic.Warn");
+        for (row, from, to, hl) in marks {
+            self.chat_mark(row, from, to, hl);
         }
     }
 
-    /// Drivers that answer their own permission prompts need to know what the mode is.
-    fn sync_acp_mode(&self) {
+    /// Push the permission mode out to every driver that runs its own agent loop.
+    ///
+    /// Called from everywhere the mode can change, which now includes a config reload. It used to
+    /// be only the API call, so `permissions.mode` in `config.toml` reached the built-in tools and
+    /// no further, and the drivers stayed on whatever they were told at startup.
+    fn sync_agent_drivers(&self) {
         let mode = self.agent.permissions().mode();
-        for d in &self.acp_drivers {
-            d.set_mode(mode);
+        for d in &self.agent_drivers {
+            d.set_permission_mode(mode);
         }
     }
 
-    /// Take ownership of the ACP drivers, so the mode can be mirrored into them later.
-    pub fn adopt_acp_drivers(&mut self, drivers: Vec<Arc<neosh_provider::drivers::AcpProvider>>) {
-        self.acp_drivers = drivers;
-        self.sync_acp_mode();
+    /// Take ownership of the agent drivers, so the mode can be mirrored into them later and a
+    /// request one of them cannot answer alone can reach a person.
+    pub fn adopt_agent_drivers(
+        &mut self,
+        drivers: Vec<Arc<dyn neosh_provider::drivers::AgentDriver>>,
+    ) {
+        let asker: Arc<dyn neosh_provider::approval::PermissionAsker> =
+            Arc::new(neosh_agent::DriverAsker::new(&self.agent, self.bridge.clone()));
+        for d in &drivers {
+            d.set_permission_asker(asker.clone());
+        }
+        self.agent_drivers = drivers;
+        self.sync_agent_drivers();
     }
 
     /// The characters this terminal gets to draw the transcript with.
@@ -1805,6 +1866,13 @@ impl Host {
     /// a context meter measuring against the wrong window.
     fn select_model(&mut self, selection: neosh_proto::ModelSelection) {
         self.agent.set_selection(selection.clone());
+        // Into a turn that is already running, where the driver can say so. Picking a model
+        // mid-turn is something you do *because* of how the turn is going, and one that waited for
+        // the next turn would arrive after you had already given up on this one.
+        let here = self.active_session();
+        for d in &self.agent_drivers {
+            d.set_model(&here, &selection);
+        }
         self.bridge.broadcast(PluginEvent::SelectionChanged { selection });
     }
 
@@ -2231,6 +2299,8 @@ impl Host {
                 select,
             });
             self.follow_cursor();
+            // The hint row says what the row under the cursor can do, so it moves with it.
+            self.refresh_composer();
             return;
         }
 
@@ -2269,6 +2339,10 @@ impl Host {
             // Not a linewise mode — there is no such thing here — but the thing people press `V`
             // for, which is "this whole line, and then let me extend it".
             (_, "V") => self.select_line(),
+
+            // A folded card opens; an open one folds. `Tab` because it is the key that toggles a
+            // fold in every file tree and outliner; `za` for the Vim hands. See ADR 0033.
+            (KeyCode::Tab, _) => self.toggle_card_here(),
 
             (_, "/") => self.begin_search(false),
             (_, "?") => self.begin_search(true),
@@ -2312,6 +2386,7 @@ impl Host {
             ('z', "z") => self.place_cursor_line(self.chat_height() / 2),
             ('z', "t") => self.place_cursor_line(0),
             ('z', "b") => self.place_cursor_line(self.chat_height().saturating_sub(1)),
+            ('z', "a") => self.toggle_card_here(),
 
             ('y', "y") => self.yank_line(),
             ('y', "c") => self.yank_code(),
@@ -2378,6 +2453,7 @@ impl Host {
             col: at.1,
         });
         self.follow_cursor();
+        self.refresh_composer();
     }
 
     /// Move `delta` rows, clamped to the transcript.
@@ -2836,16 +2912,23 @@ impl Host {
         // that are on their way out would write into the conversation being left behind.
         self.answer = None;
         self.streaming = None;
+        // Both together: the footer is part of the working line, and a row count left behind from
+        // the conversation being left would tell the next `chat_end` to insert inside a buffer
+        // that no longer has those rows.
         self.working = false;
+        self.plan_rows = 0;
         self.chat_top = 0;
         let ascii = self.option_bool("ui.ascii_only");
-        let limit = self.option_usize("chat.tool_output_lines");
+        let limits = self.limits();
         let width = self.chat_width();
-        let (lines, marks, label) = {
+        let show_tools = self.option_bool("chat.show_tools");
+        let here = self.active_session();
+        let running = self.turns.contains_key(&here);
+        let (lines, marks, cards, label) = {
             let store = self.agent.sessions();
             let s = store.active();
-            let (lines, marks) = transcript(s, ascii, limit, width);
-            (lines, marks, s.label())
+            let (lines, marks, cards) = transcript(s, ascii, limits, width, show_tools, running);
+            (lines, marks, cards, s.label())
         };
         let plugin = PluginId::from(BUILTIN);
         let _ = self.editor.apply(&plugin, ApiCall::MarkClear {
@@ -2870,6 +2953,9 @@ impl Host {
         // Nothing of the previous conversation's welcome survives into this one: the buffer was
         // just replaced wholesale, so what `welcome_rows` remembered is about text that is gone.
         self.welcome_rows = 0;
+        // The rows the redraw just put the cards on. Everything recorded before the switch
+        // addressed a buffer that no longer exists.
+        self.cards = cards;
         self.ensure_usable_selection();
         self.draw_welcome();
         self.replay_round();
@@ -2880,12 +2966,307 @@ impl Host {
         });
     }
 
+    /// The settings that say how much of a body to show.
+    fn limits(&self) -> cards::Limits {
+        cards::Limits {
+            diff_lines: self.option_usize("chat.diff_lines"),
+            output_lines: self.option_usize("chat.tool_output_lines"),
+        }
+    }
+
+    /// The directory paths in the transcript are shown relative to: the conversation's.
+    fn root(&self) -> std::path::PathBuf {
+        let store = self.agent.sessions();
+        store.active().cwd.clone()
+    }
+
+    /// Draw one tool call's card — the header, with nothing under it yet — and remember where it
+    /// went.
+    ///
+    /// `None` when tool cards are switched off, which is also the answer to "which card do I
+    /// finish when it comes back": there is none.
+    ///
+    /// One function for the live path and the replay, because the two have to agree. They used to
+    /// be two pieces of near-identical code, and near-identical is how a card acquires a blank line
+    /// in one of them and not the other.
+    fn draw_tool_card(&mut self, call: &neosh_proto::ToolCall, state: ToolState) -> Option<u32> {
+        if !self.option_bool("chat.show_tools") {
+            return None;
+        }
+        let g = self.glyphs();
+        let root = self.root();
+        let width = self.chat_width();
+        let head = cards::Head {
+            name: &call.name,
+            input: &call.input,
+            state,
+            took: None,
+            exit: None,
+        };
+        let (text, spans) = cards::header(&g, &head, &root, width);
+        let row = self.chat_push(vec![text]);
+        for (from, to, hl) in spans {
+            self.chat_mark(row, from, to, hl);
+        }
+        self.cards.push(Card {
+            id: call.id.clone(),
+            name: call.name.clone(),
+            input: call.input.clone(),
+            result: None,
+            started: Some(std::time::Instant::now()),
+            took: None,
+            exit: None,
+            row,
+            body: 0,
+            expanded: false,
+        });
+        Some(row)
+    }
+
+    /// The call came back: settle the dot, put the stats on the header and the body under it.
+    ///
+    /// Every call gets an answer under it, not just the failures. A card that says what ran and
+    /// nothing about what came back is a card you have to take on trust, and "it ran" is not the
+    /// thing you wanted to know.
+    ///
+    /// Errors show even with tool cards off — at the end of the transcript, there being no card
+    /// to put them under: a tool that failed silently is a debugging session, and the setting is
+    /// about noise, not about hiding failures.
+    fn finish_card(&mut self, id: &neosh_proto::ToolCallId, result: &neosh_proto::ToolResult) {
+        let Some(i) = self.cards.iter().rposition(|c| c.id == *id) else {
+            if result.is_error || self.option_bool("chat.show_tools") {
+                let g = self.glyphs();
+                let limits = self.limits();
+                let width = self.chat_width();
+                let rows = cards::body(&g, &serde_json::Value::Null, result, limits, false, width);
+                for (text, spans) in rows {
+                    let row = self.chat_push(vec![text]);
+                    for (from, to, hl) in spans {
+                        self.chat_mark(row, from, to, hl);
+                    }
+                }
+            }
+            return;
+        };
+        // Already answered. A replay can meet the same result twice — once in the messages and
+        // once in the round's own record — and a second body would say it happened twice.
+        if self.cards[i].result.is_some() {
+            return;
+        }
+        self.cards[i].took = self.cards[i].started.map(|s| s.elapsed());
+        self.cards[i].exit = result.is_error.then(|| cards::exit_code(&result.content)).flatten();
+        self.cards[i].result = Some(result.clone());
+        self.redraw_card(i);
+    }
+
+    /// How a card's call is going, which is what its dot says. Derived rather than stored: a call
+    /// with a result is finished and one without is running, and there is no third source of truth
+    /// to fall out of step with.
+    fn card_state(card: &Card) -> ToolState {
+        match &card.result {
+            Some(r) if r.is_error => ToolState::Failed,
+            Some(_) => ToolState::Done,
+            None => ToolState::Running,
+        }
+    }
+
+    /// Card `i`'s header line, as it should read now.
+    fn card_header(&self, i: usize) -> cards::Row {
+        let card = &self.cards[i];
+        let head = cards::Head {
+            name: &card.name,
+            input: &card.input,
+            state: Self::card_state(card),
+            // A running call is timed from its start, so the number on screen is the one you would
+            // get by looking at a clock — which is the whole question being asked of it.
+            // A finished call keeps whatever it took; a running one is timed from its start, so
+            // the number on screen is the one a clock on the wall would give. Whether either is
+            // worth printing is the renderer's decision, in one place, for both.
+            took: card.took.or_else(|| card.started.map(|s| s.elapsed())),
+            exit: card.exit,
+        };
+        cards::header(&self.glyphs(), &head, &self.root(), self.chat_width())
+    }
+
+    /// Advance the clock on every call that has not come back.
+    ///
+    /// One row replaced by one row, so nothing below moves. [`Self::redraw_card`] cannot be used
+    /// for this: it settles the open answer, because a body appearing shifts every row after it —
+    /// and doing that once a second would end the answer a dozen times while it was still
+    /// arriving.
+    fn tick_cards(&mut self) {
+        let live: Vec<usize> = self
+            .cards
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| c.result.is_none() && c.started.is_some())
+            .map(|(i, _)| i)
+            .collect();
+        let plugin = PluginId::from(BUILTIN);
+        for i in live {
+            let (text, spans) = self.card_header(i);
+            let row = self.cards[i].row;
+            let _ = self.editor.apply(&plugin, ApiCall::MarkClear {
+                ns: self.chat_ns,
+                buf: self.chat,
+                start: Some(row),
+                end: Some(row + 1),
+            });
+            let _ = self.editor.apply(&plugin, ApiCall::BufSetLines {
+                buf: self.chat,
+                start: row as i64,
+                end: row as i64 + 1,
+                lines: vec![text],
+            });
+            for (from, to, hl) in spans {
+                self.chat_mark(row, from, to, hl);
+            }
+        }
+    }
+
+    /// Draw card `i` again from what it knows: the header in its final state, the body folded or
+    /// open as the card says. Rows below move to make room, and the registry moves with them.
+    fn redraw_card(&mut self, i: usize) {
+        let g = self.glyphs();
+        let width = self.chat_width();
+        let limits = self.limits();
+        let (row, old_body) = (self.cards[i].row, self.cards[i].body);
+        let header = self.card_header(i);
+        let card = &self.cards[i];
+        let body = match &card.result {
+            Some(r) => cards::body(&g, &card.input, r, limits, card.expanded, width),
+            None => Vec::new(),
+        };
+        // Anything else writing into the transcript ends the answer: its rows are addressed by
+        // range, and rows moving underneath it would make "the end of the answer" ambiguous. An
+        // open answer is always below every card — it was opened after them — so settling it
+        // moves nothing recorded here.
+        self.close_answer();
+        self.streaming = None;
+        let plugin = PluginId::from(BUILTIN);
+        let _ = self.editor.apply(&plugin, ApiCall::MarkClear {
+            ns: self.chat_ns,
+            buf: self.chat,
+            start: Some(row),
+            end: Some(row + 1 + old_body),
+        });
+        let mut lines = vec![header.0];
+        lines.extend(body.iter().map(|(t, _)| t.clone()));
+        let _ = self.editor.apply(&plugin, ApiCall::BufSetLines {
+            buf: self.chat,
+            start: row as i64,
+            end: (row + 1 + old_body) as i64,
+            lines,
+        });
+        for (from, to, hl) in header.1 {
+            self.chat_mark(row, from, to, hl);
+        }
+        for (k, (_, spans)) in body.iter().enumerate() {
+            for (from, to, hl) in spans {
+                self.chat_mark(row + 1 + k as u32, *from, *to, hl);
+            }
+        }
+        let new_body = body.len() as u32;
+        self.cards[i].body = new_body;
+        let delta = i64::from(new_body) - i64::from(old_body);
+        if delta != 0 {
+            for c in self.cards.iter_mut().filter(|c| c.row > row) {
+                c.row = (i64::from(c.row) + delta).max(0) as u32;
+            }
+        }
+    }
+
+    /// The card whose header or body is on `row`.
+    fn card_at(&self, row: u32) -> Option<usize> {
+        self.cards.iter().position(|c| row >= c.row && row <= c.row + c.body)
+    }
+
+    /// Open or fold the card under the cursor, while reading the transcript.
+    ///
+    /// The cursor goes back to the header either way: it is the one row of the card that is still
+    /// where it was, and folding from the middle of a body would otherwise leave the cursor on
+    /// whatever moved up into its place.
+    fn toggle_card_here(&mut self) {
+        let here = self.chat_cursor().0;
+        let Some(i) = self.card_at(here) else {
+            self.editor_message(MessageLevel::Info, "the cursor is not on a tool call");
+            return;
+        };
+        if self.cards[i].result.is_none() {
+            self.editor_message(MessageLevel::Info, "still running \u{2014} nothing to show yet");
+            return;
+        }
+        self.cards[i].expanded = !self.cards[i].expanded;
+        self.redraw_card(i);
+        let row = self.cards[i].row;
+        self.reading_jump((row, 0), false);
+        self.refresh_composer();
+    }
+
+    /// What the turn changed, under its answer.
+    ///
+    /// From the turn's own tool calls rather than from `git diff`, which would count work done
+    /// outside this turn — by you, or by a turn in another conversation on the same checkout.
+    fn draw_plan(&mut self, steps: &[neosh_proto::PlanStep]) {
+        if steps.is_empty() || !self.option_bool("chat.show_plan") {
+            return;
+        }
+        let rows = cards::plan(&self.glyphs(), steps, self.chat_width());
+        self.push_block(&rows);
+    }
+
+    /// What the turn changed, under its answer.
+    ///
+    /// From the turn's own tool calls rather than from `git diff`, which would count work done
+    /// outside this turn — by you, or by a turn in another conversation on the same checkout.
+    fn draw_summary(&mut self, files: &[cards::FileStat]) {
+        if files.is_empty() {
+            return;
+        }
+        let root = self.root();
+        let width = self.chat_width();
+        let rows = cards::summary(files, &root, width);
+        self.push_block(&rows);
+    }
+
+    /// Put a block of already-rendered rows at the end of the transcript, with their highlights.
+    ///
+    /// A blank line above unless there already is one, for the same reason a question gets one: two
+    /// blank lines reads as a gap somebody forgot to fill, and none reads as one paragraph.
+    fn push_block(&mut self, rows: &[cards::Row]) {
+        if rows.is_empty() {
+            return;
+        }
+        let end = self.chat_end();
+        let gap = end > 0
+            && self
+                .editor
+                .buffer(self.chat)
+                .map(|b| {
+                    b.get_lines((end - 1) as u32, end as u32).iter().any(|l| !l.trim().is_empty())
+                })
+                .unwrap_or(false);
+        let mut lines: Vec<String> = Vec::new();
+        if gap {
+            lines.push(String::new());
+        }
+        lines.extend(rows.iter().map(|(t, _)| t.clone()));
+        let at = self.chat_push(lines) + u32::from(gap);
+        for (k, (_, spans)) in rows.iter().enumerate() {
+            for (from, to, hl) in spans {
+                self.chat_mark(at + k as u32, *from, *to, hl);
+            }
+        }
+    }
+
     /// Put back what a turn already said, for a conversation that is still mid-turn.
     ///
-    /// The transcript is rebuilt from messages, and the round in progress is not in them yet — its
-    /// assistant message only lands when the stream closes. Without this, switching into a
-    /// conversation that is halfway through an answer shows the answer's first half missing and
-    /// the second half arriving out of nowhere.
+    /// The transcript is rebuilt from messages, and what the running turn has produced is not in
+    /// them yet. For a model driver that gap is one round; for an agent driver — `claude`, `codex`,
+    /// anything speaking ACP — it is the *entire turn*, because such a driver streams its whole
+    /// loop down one connection and neosh records none of it until that connection closes. So this
+    /// is not a nicety for the last paragraph. Without it, switching away from a running agent turn
+    /// and back showed the question and a spinner, and nothing the agent had done in between.
     ///
     /// The working line goes back too, because a turn that is still running should look like one
     /// wherever you are reading it.
@@ -2894,9 +3275,35 @@ impl Host {
         if !self.turns.contains_key(&here) {
             return;
         }
-        let said = self.rounds.get(&here).map(|r| r.text.clone()).unwrap_or_default();
-        if !said.is_empty() {
-            self.answer_text(&said);
+        let Some(said) = self.rounds.get_mut(&here).map(|r| std::mem::take(&mut r.said)) else {
+            return;
+        };
+        for item in &said {
+            match item {
+                Said::Text(text) if text.is_empty() => {}
+                // Left open on purpose when it is the last thing: the turn may still be writing
+                // this very paragraph, and the next token has to continue it rather than start a
+                // second answer underneath.
+                Said::Text(text) => self.answer_text(text),
+                Said::Tool { call, result } => {
+                    // A call the conversation already holds was drawn by `transcript`, which left
+                    // it in `cards`. Drawing a second card would say it happened twice — and for a
+                    // model driver it always does, because the call lands in the messages the
+                    // moment the stream closes and the tool starts running after that.
+                    if !self.cards.iter().any(|c| c.id == call.id) {
+                        self.draw_tool_card(call, ToolState::Running);
+                    }
+                    // Whether the card came from the messages or was just drawn, a result the
+                    // messages do not hold yet goes under it here. One they do hold was drawn with
+                    // it, and `finish_card` leaves an answered card alone.
+                    if let Some(r) = result {
+                        self.finish_card(&call.id, r);
+                    }
+                }
+            }
+        }
+        if let Some(r) = self.rounds.get_mut(&here) {
+            r.said = said;
         }
         self.begin_working();
     }
@@ -2928,7 +3335,7 @@ impl Host {
     /// Where new content goes: the end, or the line above the working line when there is one.
     fn chat_end(&self) -> i64 {
         let n = self.editor.buffer(self.chat).map(|b| b.line_count() as i64).unwrap_or(0);
-        if self.working { (n - 1).max(0) } else { n }
+        if self.working { (n - 1 - i64::from(self.plan_rows)).max(0) } else { n }
     }
 
     /// Highlight a span of one transcript row.
@@ -3130,15 +3537,110 @@ impl Host {
         if self.working {
             return;
         }
+        let rows = self.footer();
         let at = self.chat_end();
+        let mut lines: Vec<String> = rows.iter().map(|(t, _)| t.clone()).collect();
+        lines.push(String::new());
         let _ = self.editor.apply(&PluginId::from(BUILTIN), ApiCall::BufSetLines {
             buf: self.chat,
             start: at,
             end: at,
-            lines: vec![String::new()],
+            lines,
         });
+        self.plan_rows = rows.len() as u32;
         self.working = true;
+        for (k, (_, spans)) in rows.iter().enumerate() {
+            for (from, to, hl) in spans {
+                self.chat_mark(at as u32 + k as u32, *from, *to, hl);
+            }
+        }
         self.draw_working();
+    }
+
+    /// The rows between the transcript and the working line: the plan, then what is still out.
+    ///
+    /// A pure function of the round, drawn from scratch every time. There is no incremental path
+    /// on purpose — it is at most a dozen rows at the very bottom of the buffer, and a diff
+    /// against the previous version would be a second place for "where is the footer" to be wrong.
+    fn footer(&self) -> Vec<cards::Row> {
+        let Some(r) = self.rounds.get(&self.active_session()) else { return Vec::new() };
+        let g = self.glyphs();
+        let width = self.chat_width();
+        let mut rows = if self.option_bool("chat.show_plan") {
+            cards::plan(&g, &r.plan, width)
+        } else {
+            Vec::new()
+        };
+        let out: Vec<cards::TaskRow> = r
+            .tasks
+            .iter()
+            .filter(|t| t.listed())
+            .map(|t| cards::TaskRow {
+                title: &t.title,
+                role: t.role.as_deref(),
+                since: Some(t.since.elapsed()),
+                live: t.status == neosh_proto::TaskStatus::Running,
+            })
+            .collect();
+        if !out.is_empty() {
+            rows.extend(cards::tasks(&g, &out, width));
+        }
+        // A blank line between what has been said and what is true now, for the same reason a
+        // question gets one: butted up against the last tool card, the checklist reads as part of
+        // its output.
+        if !rows.is_empty() {
+            rows.insert(0, (String::new(), Vec::new()));
+        }
+        rows
+    }
+
+    /// What is still out when the turn stops waiting for it, as rows to leave behind.
+    fn tasks_left_running(&self, session: &neosh_proto::SessionId) -> Vec<cards::Row> {
+        let Some(r) = self.rounds.get(session) else { return Vec::new() };
+        let left: Vec<cards::TaskRow> = r
+            .tasks
+            .iter()
+            .filter(|t| t.listed())
+            .map(|t| cards::TaskRow {
+                title: &t.title,
+                role: t.role.as_deref(),
+                // No clock. It is still running and this row is not: a frozen number beside
+                // something that is still going is worse than no number.
+                since: None,
+                live: false,
+            })
+            .collect();
+        if left.is_empty() {
+            return Vec::new();
+        }
+        cards::tasks(&self.glyphs(), &left, self.chat_width())
+    }
+
+    /// Move the clock on anything in the footer that has one.
+    ///
+    /// Only sub-agents do — a plan step has no duration — so this is skipped entirely when nothing
+    /// is out, which is almost always. Unlike [`Self::tick_cards`] the whole footer is laid out
+    /// again rather than one row replaced: it is the last few rows of the buffer, and there is
+    /// nothing below it to disturb.
+    fn tick_footer(&mut self) {
+        let ticking = self
+            .rounds
+            .get(&self.active_session())
+            .is_some_and(|r| r.tasks.iter().any(Task::listed));
+        if ticking {
+            self.redraw_footer();
+        }
+    }
+
+    /// The plan or the list of what is out has changed, so the footer has to be laid out again.
+    ///
+    /// Torn down and rebuilt rather than patched, which is what [`Self::below_working`] already
+    /// does for anything that writes into the transcript while a turn runs.
+    fn redraw_footer(&mut self) {
+        if !self.working {
+            return;
+        }
+        self.below_working(|_| {});
     }
 
     /// Redraw the working line in place.
@@ -3195,19 +3697,21 @@ impl Host {
         if !self.working {
             return;
         }
-        let row = self.working_row();
+        let last = self.working_row();
+        let first = last.saturating_sub(self.plan_rows);
         self.working = false;
+        self.plan_rows = 0;
         let plugin = PluginId::from(BUILTIN);
         let _ = self.editor.apply(&plugin, ApiCall::MarkClear {
             ns: self.chat_ns,
             buf: self.chat,
-            start: Some(row),
-            end: Some(row + 1),
+            start: Some(first),
+            end: Some(last + 1),
         });
         let _ = self.editor.apply(&plugin, ApiCall::BufSetLines {
             buf: self.chat,
-            start: row as i64,
-            end: row as i64 + 1,
+            start: first as i64,
+            end: last as i64 + 1,
             lines: vec![],
         });
     }
@@ -3261,7 +3765,10 @@ impl Host {
             }
             AgentEvent::Token { session, turn, text } => {
                 if let Some(r) = self.rounds.get_mut(&session) {
-                    r.text.push_str(&text);
+                    match r.said.last_mut() {
+                        Some(Said::Text(t)) => t.push_str(&text),
+                        _ => r.said.push(Said::Text(text.clone())),
+                    }
                 }
                 if on_screen {
                     self.answer_text(&text);
@@ -3278,25 +3785,12 @@ impl Host {
                 self.bridge.broadcast(PluginEvent::ThinkingToken { session, turn, text });
             }
             AgentEvent::ToolStarted { session, turn, call } => {
-                // The round's assistant message has landed in the conversation by now, so what was
-                // streamed is on record and this copy of it would only go stale.
                 if let Some(r) = self.rounds.get_mut(&session) {
-                    r.text.clear();
                     r.note = Some(format!("Running {}", call.name));
+                    r.said.push(Said::Tool { call: call.clone(), result: None });
                 }
-                if on_screen && self.option_bool("chat.show_tools") {
-                    let g = self.glyphs();
-                    let root = self.cwd.clone();
-                    let width = self.chat_width();
-                    let (text, marks) =
-                        tool_card(&g, &call.name, &call.input, &root, ToolState::Running, width);
-                    let row = self.chat_push(vec![text]);
-                    for (from, to, hl) in marks {
-                        self.chat_mark(row, from, to, hl);
-                    }
-                    if let Some(r) = self.rounds.get_mut(&session) {
-                        r.cards.insert(call.id.clone(), row);
-                    }
+                if on_screen {
+                    self.draw_tool_card(&call, ToolState::Running);
                     // The tool is what the turn is doing now, so the working line should say so
                     // rather than keep claiming the model is thinking.
                     self.draw_working();
@@ -3304,33 +3798,28 @@ impl Host {
                 self.bridge.broadcast(PluginEvent::ToolStarted { session, turn, call });
             }
             AgentEvent::ToolFinished { session, turn, call, result } => {
-                // Every call gets an answer under it, not just the failures. A card that says what
-                // ran and nothing about what came back is a card you have to take on trust, and
-                // "it ran" is not the thing you wanted to know.
-                //
-                // Errors show even with tool cards off: a tool that failed silently is a debugging
-                // session, and the setting is about noise, not about hiding failures.
                 if let Some(r) = self.rounds.get_mut(&session) {
                     r.note = None;
+                    // The call this answers, so a replay of the round draws the pair rather than a
+                    // dot that is still pulsing over a tool that came back minutes ago.
+                    for said in r.said.iter_mut().rev() {
+                        if let Said::Tool { call: c, result: slot } = said
+                            && c.id == call.id
+                        {
+                            *slot = Some(result.clone());
+                            break;
+                        }
+                    }
                 }
-                if on_screen && (result.is_error || self.option_bool("chat.show_tools")) {
-                    let g = self.glyphs();
-                    // The dot beside the call it answers stops pulsing and says how it went. The
-                    // card may be off the top of the buffer by now; the row is still the row.
-                    let card = self.rounds.get_mut(&session).and_then(|r| r.cards.remove(&call.id));
-                    if let Some(row) = card {
-                        let state =
-                            if result.is_error { ToolState::Failed } else { ToolState::Done };
-                        self.chat_mark(row, 0, g.dot.len(), state.hl());
-                    }
-                    let limit = self.option_usize("chat.tool_output_lines");
-                    let width = self.chat_width();
-                    for (text, hl) in tool_result_lines(&g, &result, limit, width) {
-                        let row = self.chat_push(vec![text.clone()]);
-                        self.chat_mark(row, 0, text.len(), hl);
-                    }
+                // Counted whether or not anyone is looking: the summary is drawn when the turn
+                // ends, wherever you are by then.
+                if !result.is_error
+                    && let Some(r) = self.rounds.get_mut(&session)
+                {
+                    cards::tally(&mut r.changes, &cards::edits_of(&call.input));
                 }
                 if on_screen {
+                    self.finish_card(&call.id, &result);
                     self.draw_working();
                 }
                 self.bridge.broadcast(PluginEvent::ToolFinished { session, turn, call, result });
@@ -3338,8 +3827,24 @@ impl Host {
             AgentEvent::TurnEnded { session, turn, stop_reason, usage } => {
                 if on_screen {
                     self.close_answer();
+                    // Read before the footer goes away with the working line, and drawn again
+                    // after: the footer is state, and this is the copy that stays. What the turn
+                    // set out to do and how much of it it got through is the one thing a finished
+                    // turn leaves behind that its answer usually does not say.
+                    let plan =
+                        self.rounds.get(&session).map(|r| r.plan.clone()).unwrap_or_default();
+                    // Anything the turn is walking away from. A backgrounded sub-agent is still
+                    // running when the answer arrives, and the footer it was listed in goes away
+                    // with the working line — so without this the one case people actually ask
+                    // about, "is something still going?", is the one that leaves no trace.
+                    let left = self.tasks_left_running(&session);
                     self.end_working();
                     self.streaming = None;
+                    self.draw_plan(&plan);
+                    self.push_block(&left);
+                    let changes =
+                        self.rounds.get(&session).map(|r| r.changes.clone()).unwrap_or_default();
+                    self.draw_summary(&changes);
                 }
                 // Queued after the last gap this turn had. It is a question that was asked and not
                 // yet answered, so it becomes the next turn rather than being quietly dropped.
@@ -3360,6 +3865,13 @@ impl Host {
                     self.start_turn_in(session, leftover.join("\n"));
                 }
             }
+            // What the turn produced is in the conversation now, so the round's copy of it would
+            // only go stale — and drawing both on a switch would say everything twice.
+            AgentEvent::Committed { session, .. } => {
+                if let Some(r) = self.rounds.get_mut(&session) {
+                    r.said.clear();
+                }
+            }
             AgentEvent::Steered { text, .. } => {
                 // Drawn now rather than when it was typed: until the model has been told, a
                 // transcript showing the question is a transcript that is lying about what was
@@ -3371,7 +3883,122 @@ impl Host {
                     self.refresh_composer();
                 }
             }
+            AgentEvent::Activity { session, activity, .. } => {
+                self.handle_activity(session, activity, on_screen);
+            }
             AgentEvent::Notice { level, text, .. } => self.editor_message(level, text),
+        }
+    }
+
+    /// Route one thing the driver's own loop said about itself.
+    ///
+    /// Split from [`Self::handle_agent_event`] for the same reason it exists at all: none of this
+    /// is part of the message being produced, and folding it in would mean every arm of that match
+    /// having to decide whether it was looking at content or at commentary.
+    ///
+    /// The same bookkeeping-versus-drawing split applies. A conversation off screen still learns
+    /// which sub-agents it has out and what its plan is, because switching to it should show what
+    /// is true — not what was true when you last looked.
+    fn handle_activity(
+        &mut self,
+        session: neosh_proto::SessionId,
+        activity: neosh_proto::Activity,
+        on_screen: bool,
+    ) {
+        use neosh_proto::{Activity, TaskStatus};
+        match activity {
+            Activity::Plan { steps } => {
+                let Some(r) = self.rounds.get_mut(&session) else { return };
+                if r.plan == steps {
+                    return;
+                }
+                r.plan = steps;
+                if on_screen {
+                    self.redraw_footer();
+                }
+            }
+            // Announced twice on purpose by the driver — once as a snapshot of what is running,
+            // once when this turn's own call starts one — so this is written to be idempotent.
+            // The second telling knows more (which call it belongs to, which kind of agent it is)
+            // and is allowed to fill in what the first could not.
+            Activity::TaskStarted { task, title, role, .. } => {
+                let Some(r) = self.rounds.get_mut(&session) else { return };
+                match r.tasks.iter_mut().find(|t| t.id == task) {
+                    Some(t) => {
+                        t.title = title;
+                        if role.is_some() {
+                            t.role = role;
+                        }
+                    }
+                    None => r.tasks.push(Task {
+                        id: task,
+                        title,
+                        role,
+                        since: std::time::Instant::now(),
+                        status: TaskStatus::Running,
+                    }),
+                }
+                if on_screen {
+                    self.redraw_footer();
+                }
+            }
+            // What it is up to, in the line that is already on screen for it. Nothing is inserted:
+            // a sub-agent that reports every few seconds would otherwise push the answer it is
+            // helping to write off the top of the screen.
+            Activity::TaskProgress { task, summary, last_tool, .. } => {
+                let Some(r) = self.rounds.get_mut(&session) else { return };
+                let Some(t) = r.tasks.iter_mut().find(|t| t.id == task) else { return };
+                if let Some(text) = summary.or(last_tool) {
+                    t.title = text;
+                }
+                if on_screen {
+                    self.redraw_footer();
+                }
+            }
+            Activity::TaskEnded { task, status, .. } => {
+                let Some(r) = self.rounds.get_mut(&session) else { return };
+                let Some(t) = r.tasks.iter_mut().find(|t| t.id == task) else { return };
+                if t.status == status {
+                    return;
+                }
+                t.status = status;
+                if on_screen {
+                    self.redraw_footer();
+                }
+            }
+            // The several seconds where the driver answers nothing at all. Without this it is
+            // indistinguishable from a hang, which is exactly what `/compact` looked like.
+            Activity::Compacting => {
+                if let Some(r) = self.rounds.get_mut(&session) {
+                    r.note = Some("Compacting the conversation".into());
+                }
+                if on_screen {
+                    self.draw_working();
+                }
+            }
+            Activity::Compacted { before, after } => {
+                if let Some(r) = self.rounds.get_mut(&session) {
+                    r.note = None;
+                    // The plan was built from calls the driver can no longer see. Keeping it would
+                    // be a checklist for work nothing is going to pick up.
+                    r.plan.clear();
+                }
+                if on_screen {
+                    let (text, spans) = cards::compaction(&self.glyphs(), before, after);
+                    let row = self.chat_push(vec![text]);
+                    for (from, to, hl) in spans {
+                        self.chat_mark(row, from, to, hl);
+                    }
+                    self.redraw_footer();
+                    self.draw_working();
+                }
+            }
+            Activity::Commands { commands } => {
+                self.driver_commands.insert(session, commands);
+            }
+            // Nothing draws a context meter yet. Kept rather than dropped so the driver that
+            // reports one is not the thing that has to change when something does.
+            Activity::Context { .. } => {}
         }
     }
 
@@ -3379,17 +4006,15 @@ impl Host {
         match out {
             ScriptOutbound::Loaded { plugin, error } => {
                 match error {
-                    None => {
-                        self.bridge.register_loaded(plugin.clone());
-                        tracing::info!(%plugin, "plugin loaded");
-                    }
+                    None => tracing::info!(%plugin, "plugin loaded"),
                     Some(e) => {
                         tracing::error!(%plugin, "failed to activate: {e}");
                         self.editor_message(MessageLevel::Error, format!("{plugin}: {e}"));
                         // It threw *during* activation, which means it may already have armed
-                        // timers and registered commands, tools and hooks. Nothing else will ever
-                        // clean those up: a plugin that failed to load never enters the loaded
-                        // list, so reload would skip it and every reload would stack another copy.
+                        // timers and registered commands, tools and hooks — and is on the
+                        // broadcast list, having been put there when its load was asked for.
+                        // Nothing else will ever clean those up: reload skips a plugin that is not
+                        // loaded, so every reload would stack another copy.
                         self.tear_down_plugin(&plugin);
                     }
                 }
@@ -3523,6 +4148,9 @@ impl Host {
                     win: self.composer_win,
                     top_line: 0,
                 });
+                // Except the welcome, which is drawn to a width: the word at the top of it has to
+                // fit or not be there.
+                self.draw_welcome();
             }
             InputEvent::Command { name, args } => {
                 // Through the core's registry, so an unknown name reports "no such command" in the
@@ -3600,6 +4228,8 @@ impl Host {
                 () = &mut clock, if ticking => {
                     ticking = false;
                     self.draw_working();
+                    self.tick_cards();
+                    self.tick_footer();
                 }
                 () = &mut keys, if waiting => {
                     waiting = false;
@@ -3847,6 +4477,7 @@ impl Host {
                 "chat.read",
                 "Read the transcript: hjkl move, [ ] turns, { } blocks, / finds, yc takes the code",
             ),
+            ("chat.toggle_card", "Open or fold the tool card under the cursor, while reading"),
             ("edit.copy", "Copy what is selected"),
             ("edit.cut", "Cut what is selected"),
             ("edit.select_all", "Select everything here"),
@@ -3925,6 +4556,9 @@ impl Host {
             layer = layer.allow_root(r);
         }
         self.agent.set_permissions(layer);
+        // A mode that only reached the built-in tools would leave an agent driver enforcing the
+        // one it was told at startup, under a footer saying otherwise.
+        self.sync_agent_drivers();
     }
 
     /// Everything that has to happen when a plugin stops being loaded, whether it is being
@@ -4033,6 +4667,13 @@ impl Host {
             "chat.scroll_down" => self.scroll_chat(1),
             "chat.scroll_end" => self.scroll_chat(0),
             "chat.read" => self.enter_reading(),
+            "chat.toggle_card" => {
+                if self.reading {
+                    self.toggle_card_here();
+                } else {
+                    self.editor_message(MessageLevel::Info, "^S first: cards open while reading");
+                }
+            }
             "edit.copy" => {
                 if !self.copy_selection(false) {
                     self.editor_message(MessageLevel::Warn, "nothing selected");
@@ -4171,12 +4812,32 @@ impl Host {
                 description: Some("Show a line in chat when a tool runs. Errors always show.".into()),
             },
             OptionSpec {
+                name: "chat.show_plan".into(),
+                ty: OptionType::Bool,
+                default: OptionValue::Bool(true),
+                description: Some(
+                    "Show the agent's own checklist above the working line while it works, and \
+                     leave the final one under its answer. Only drivers that keep a plan have one."
+                        .into(),
+                ),
+            },
+            OptionSpec {
                 name: "chat.tool_output_lines".into(),
                 ty: OptionType::Int { min: Some(0), max: Some(200) },
                 default: OptionValue::Int(3),
                 description: Some(
                     "How much of what a tool came back with to show under it. `0` shows only how \
                      many lines there were. An error always shows at least its first line."
+                        .into(),
+                ),
+            },
+            OptionSpec {
+                name: "chat.diff_lines".into(),
+                ty: OptionType::Int { min: Some(0), max: Some(500) },
+                default: OptionValue::Int(12),
+                description: Some(
+                    "How many rows of an edit's diff to show under its card before it folds. `0` \
+                     leaves only the +N -N on the header. Any card opens with Tab while reading."
                         .into(),
                 ),
             },
@@ -4623,6 +5284,14 @@ impl Host {
     ///
     /// A failure here is reported and skipped: one broken plugin — or one broken config script —
     /// must not stop the editor from starting.
+    ///
+    /// The plugin joins the broadcast list *here*, when its load is asked for, rather than when
+    /// its `Loaded` comes back. Those are not the same moment: `activate` runs — and registers
+    /// listeners — before the host is told it finished, and several plugins activate in the gap.
+    /// Anything broadcast in that window used to be delivered to whoever happened to have been
+    /// confirmed already, which made the answer depend on how many plugins were installed and in
+    /// what order they finished. It cost a held `[options]` value its `option_changed`, and the
+    /// only reason it had never been seen is that the plugin declaring one was usually last.
     fn load_script(&mut self, id: &PluginId, entry: &std::path::Path) -> bool {
         let Ok(mut url) = url::Url::from_file_path(entry) else {
             self.editor_message(
@@ -4653,7 +5322,11 @@ impl Host {
             config: serde_json::Value::Object(Default::default()),
             version: neosh_proto::PROTOCOL_VERSION,
         }) {
-            Ok(()) => true,
+            Ok(()) => {
+                // Reachable from here, not from its `Loaded`. See [`Self::load_script`].
+                self.bridge.register_loaded(id.clone());
+                true
+            }
             Err(e) => {
                 tracing::error!(plugin = %id, "{e}");
                 false
@@ -4682,8 +5355,10 @@ fn describe_api_error(name: &str, e: &ApiError) -> String {
 /// the permission layer from inside a spawned turn. Mirroring the mode into the driver is the
 /// narrowest thing that works — see [`neosh_provider::drivers::acp`] for why that is a stated
 /// limitation rather than a design.
-pub fn install_builtin_providers(agent: &Agent) -> Vec<Arc<neosh_provider::drivers::AcpProvider>> {
-    let mut out = Vec::new();
+pub fn install_builtin_providers(
+    agent: &Agent,
+) -> Vec<Arc<dyn neosh_provider::drivers::AgentDriver>> {
+    let mut out: Vec<Arc<dyn neosh_provider::drivers::AgentDriver>> = Vec::new();
     {
         let mut reg = agent.providers_mut();
         reg.register_driver(Arc::new(neosh_provider::drivers::AnthropicProvider));
@@ -4694,13 +5369,15 @@ pub fn install_builtin_providers(agent: &Agent) -> Vec<Arc<neosh_provider::drive
         // "no such file", on the one path that is supposed to work with no setup at all. The
         // instance stays configured either way, so a settings list can say the driver is missing
         // rather than the provider simply not existing.
-        let claude = neosh_provider::drivers::ClaudeCliProvider::default();
+        let claude = Arc::new(neosh_provider::drivers::ClaudeCliProvider::default());
         if claude.available() {
-            reg.register_driver(Arc::new(claude));
+            reg.register_driver(claude.clone());
+            out.push(claude);
         }
-        let codex = neosh_provider::drivers::CodexCliProvider::default();
+        let codex = Arc::new(neosh_provider::drivers::CodexCliProvider::default());
         if codex.available() {
-            reg.register_driver(Arc::new(codex));
+            reg.register_driver(codex.clone());
+            out.push(codex);
         }
         // One driver, three programs: they all speak the Agent Client Protocol. Registered only
         // where the program exists, for the same reason as the other two — a provider whose every
@@ -4776,33 +5453,93 @@ pub fn now_secs() -> i64 {
 fn transcript(
     session: &neosh_agent::Session,
     ascii: bool,
-    limit: usize,
+    limits: cards::Limits,
     width: usize,
-) -> (Vec<String>, Vec<Mark>) {
+    show_tools: bool,
+    running: bool,
+) -> (Vec<String>, Vec<Mark>, Vec<Card>) {
     use neosh_proto::{ContentBlock, Role};
 
     let g = Glyphs::new(ascii);
     let root = session.cwd.as_path();
-    // Which calls have an answer, and whether it was a failure. Gathered first because a result
-    // always comes *after* the call it answers, and a dot that only turns green on the second pass
-    // over the buffer is a dot that flickers on every switch.
-    let answered: std::collections::HashMap<&neosh_proto::ToolCallId, bool> = session
+    // Which calls have an answer, whether it was a failure, and what it exited with. Gathered
+    // first because a result always comes *after* the call it answers, and a dot that only turns
+    // green on the second pass over the buffer is a dot that flickers on every switch. The status
+    // is here for the same reason: it belongs on the header, which is written before the result
+    // that carries it has been reached.
+    type Answer = (bool, Option<i64>);
+    let answered: std::collections::HashMap<&neosh_proto::ToolCallId, Answer> = session
         .messages
         .iter()
         .flat_map(|m| &m.content)
         .filter_map(|b| match b {
-            ContentBlock::ToolResult { tool_use_id, is_error, .. } => {
-                Some((tool_use_id, *is_error))
-            }
+            ContentBlock::ToolResult { tool_use_id, is_error, content } => Some((
+                tool_use_id,
+                (*is_error, is_error.then(|| cards::exit_code(content)).flatten()),
+            )),
             _ => None,
         })
         .collect();
     let mut lines: Vec<String> = Vec::new();
     let mut marks: Vec<Mark> = Vec::new();
+    let mut cards: Vec<Card> = Vec::new();
+    // What the turn being read has changed, for the summary that closes it.
+    let mut changes: Vec<cards::FileStat> = Vec::new();
+
+    // Rows go in at `at` — under a card's header, usually — and everything below moves down, the
+    // marks and the cards with it. The same shape the live path has, for the same reason: an agent
+    // runs calls in parallel, and a result appended at the end lands under the wrong card.
+    fn insert(
+        lines: &mut Vec<String>,
+        marks: &mut Vec<Mark>,
+        cards: &mut [Card],
+        at: u32,
+        rows: Vec<cards::Row>,
+    ) {
+        let n = rows.len() as u32;
+        if n == 0 {
+            return;
+        }
+        for m in marks.iter_mut().filter(|m| m.0 >= at) {
+            m.0 += n;
+        }
+        for c in cards.iter_mut().filter(|c| c.row >= at) {
+            c.row += n;
+        }
+        for (k, (text, spans)) in rows.into_iter().enumerate() {
+            let row = at + k as u32;
+            marks.extend(spans.into_iter().map(|(a, b, h)| (row, a, b, h)));
+            lines.insert(row as usize, text);
+        }
+    }
+    // A gap, unless there already is one: what came before was often a tool card, which has no
+    // trailing blank of its own, and the next thing butted against it reads as part of it.
+    fn gap(lines: &mut Vec<String>) {
+        if lines.last().is_some_and(|l| !l.trim().is_empty()) {
+            lines.push(String::new());
+        }
+    }
+    let summarise = |lines: &mut Vec<String>, marks: &mut Vec<Mark>, changes: &mut Vec<cards::FileStat>| {
+        let rows = cards::summary(changes, root, width);
+        changes.clear();
+        if rows.is_empty() {
+            return;
+        }
+        gap(lines);
+        for (text, spans) in rows {
+            let row = lines.len() as u32;
+            marks.extend(spans.into_iter().map(|(a, b, h)| (row, a, b, h)));
+            lines.push(text);
+        }
+    };
+
     for message in &session.messages {
         for block in &message.content {
             match block {
                 ContentBlock::Text { text } if message.role == Role::User => {
+                    // A question starts a turn, so the one before it is over.
+                    summarise(&mut lines, &mut marks, &mut changes);
+                    gap(&mut lines);
                     for line in text.lines() {
                         marks.push((lines.len() as u32, 0, g.bar.len(), "Agent.User"));
                         lines.push(format!("{} {line}", g.bar));
@@ -4818,73 +5555,98 @@ fn transcript(
                     lines.extend(rendered);
                     lines.push(String::new());
                 }
-                ContentBlock::ToolUse { id, name, input } => {
+                // Gated on the same setting the live path uses. Drawn unconditionally, switching
+                // conversations with tool cards off made them all appear.
+                ContentBlock::ToolUse { id, name, input } if show_tools => {
                     // The dot says how it went, which the conversation already records: a call
                     // with a result somewhere after it is finished, and one without is still
                     // running. Nothing here has to remember anything.
-                    let state = match answered.get(id) {
-                        Some(true) => ToolState::Failed,
-                        Some(false) => ToolState::Done,
-                        None => ToolState::Running,
+                    let (state, exit) = match answered.get(id) {
+                        Some((true, exit)) => (ToolState::Failed, *exit),
+                        Some((false, _)) => (ToolState::Done, None),
+                        None => (ToolState::Running, None),
                     };
-                    let (text, spans) = tool_card(&g, name, input, root, state, width);
+                    let head = cards::Head { name, input, state, took: None, exit };
+                    let (text, spans) = cards::header(&g, &head, root, width);
                     let at = lines.len() as u32;
+                    cards.push(Card {
+                        id: id.clone(),
+                        name: name.clone(),
+                        input: input.clone(),
+                        result: None,
+                        // Nothing here watched the call happen, so nothing here can say how long it
+                        // took. A restored transcript is a record, not a replay.
+                        started: None,
+                        took: None,
+                        exit,
+                        row: at,
+                        body: 0,
+                        expanded: false,
+                    });
                     marks.extend(spans.into_iter().map(|(a, b, h)| (at, a, b, h)));
                     lines.push(text);
                 }
-                ContentBlock::ToolResult { is_error, content, .. } => {
+                ContentBlock::ToolUse { .. } => {}
+                // Errors show even with tool cards off, exactly as they do live: the setting is
+                // about noise, not about hiding failures.
+                ContentBlock::ToolResult { tool_use_id, is_error, content }
+                    if *is_error || show_tools =>
+                {
                     let result = neosh_proto::ToolResult {
                         content: content.clone(),
                         is_error: *is_error,
                     };
-                    for (text, hl) in tool_result_lines(&g, &result, limit, width) {
-                        marks.push((lines.len() as u32, 0, text.len(), hl));
-                        lines.push(text);
+                    match cards.iter().rposition(|c| c.id == *tool_use_id) {
+                        // Under its own header, however many other calls came between.
+                        Some(i) => {
+                            if !*is_error {
+                                cards::tally(&mut changes, &cards::edits_of(&cards[i].input));
+                            }
+                            let rows =
+                                cards::body(&g, &cards[i].input, &result, limits, false, width);
+                            let n = rows.len() as u32;
+                            let at = cards[i].row + 1;
+                            insert(&mut lines, &mut marks, &mut cards, at, rows);
+                            cards[i].result = Some(result);
+                            cards[i].body = n;
+                        }
+                        // No card to go under — cards are off and this is an error — so at the
+                        // end, which is where the live path puts it too.
+                        None => {
+                            let rows = cards::body(
+                                &g,
+                                &serde_json::Value::Null,
+                                &result,
+                                limits,
+                                false,
+                                width,
+                            );
+                            for (text, spans) in rows {
+                                let row = lines.len() as u32;
+                                marks.extend(spans.into_iter().map(|(a, b, h)| (row, a, b, h)));
+                                lines.push(text);
+                            }
+                        }
                     }
                 }
+                ContentBlock::ToolResult { .. } => {}
                 // Reasoning is not replayed: it is shown live when `chat.show_thinking` is on, and
                 // reprinting it on every switch would bury the answer under the working out.
                 ContentBlock::Thinking { .. } => {}
             }
         }
     }
-    (lines, marks)
+    // The last turn is over too — unless it is still going, in which case its summary is drawn
+    // when it ends, by whoever is looking then.
+    if !running {
+        summarise(&mut lines, &mut marks, &mut changes);
+    }
+    (lines, marks, cards)
 }
 
 /// One highlighted span of the transcript: row, byte range, group.
 type Mark = (u32, usize, usize, &'static str);
 
-/// The characters the transcript is drawn with, at whatever fidelity the terminal has.
-///
-/// One place, because the live stream and the replay have to agree: a conversation that changes
-/// shape when you switch away and back reads as two different programs having written it.
-struct Glyphs {
-    /// The bar down the left of a question.
-    bar: &'static str,
-    /// The state of a tool call: one dot, which changes colour rather than shape. Shape says
-    /// *what*, colour says *how it went* — a glyph that changes to mean "finished" makes the
-    /// column impossible to scan.
-    dot: &'static str,
-    /// The elbow that introduces what a tool came back with.
-    gutter: &'static str,
-    /// The working line's mark.
-    work: &'static str,
-}
-
-impl Glyphs {
-    fn new(ascii: bool) -> Self {
-        if ascii {
-            Self { bar: "|", dot: "*", gutter: "`-", work: "*" }
-        } else {
-            Self {
-                bar: "\u{258c}",
-                dot: "\u{23fa}",
-                gutter: "\u{23bf}",
-                work: "\u{2733}",
-            }
-        }
-    }
-}
 
 /// A virtual-text chunk, which is three words of ceremony often enough to be worth a name.
 fn chunk(text: impl Into<String>, hl: &str) -> neosh_proto::VirtChunk {
