@@ -351,6 +351,8 @@ impl Agent {
             // has nothing to keep.
             conversation: SessionId::from(""),
             cwd: self.session().cwd.clone(),
+            // Nobody's conversation, so there is nothing to pick up and nothing to leave behind.
+            resume: None,
             system,
             messages: vec![Message {
                 role: Role::User,
@@ -546,9 +548,9 @@ impl Agent {
 
             // One guard, not two: temporaries in a struct literal live to the end of the
             // statement, so taking the session lock twice here would deadlock against itself.
-            let Some((cwd, system, messages)) =
-                self.with(&session, |s| (s.cwd.clone(), s.system.clone(), s.messages.clone()))
-            else {
+            let Some((cwd, system, messages, resume)) = self.with(&session, |s| {
+                (s.cwd.clone(), s.system.clone(), s.messages.clone(), s.resume.clone())
+            }) else {
                 // Closed while its own turn was running. There is nowhere to put the answer, so
                 // this is a cancellation rather than an error to report into a transcript that no
                 // longer exists.
@@ -559,6 +561,9 @@ impl Agent {
                 selection: selection.clone(),
                 conversation: session.clone(),
                 cwd: cwd.clone(),
+                // What this driver called the conversation last time it ran one, which is the only
+                // thing standing between reopening it and an agent that has forgotten it.
+                resume,
                 system,
                 messages,
                 // An agent driver brings its own tools; advertising ours would list tools it

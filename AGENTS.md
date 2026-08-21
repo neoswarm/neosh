@@ -76,6 +76,12 @@ per decision, and records the *reasoning*, not the choice.
   per turn, and never one per driver — several conversations run at once, and a driver holding a
   single session id resumes the second into the first one's history. (ACP is the exception and says
   why: its session lives on the agent's side.)
+- **What a driver calls a conversation is the conversation's, not the process's.** A vendor CLI
+  keeps the history and hands back a handle; a driver that only remembers it in memory remembers it
+  until the workspace stops, and then reopening a conversation starts an agent that has never heard
+  of it — full transcript, empty model, and nothing on either side that reports it. It travels as
+  `Activity::Resume`, is kept in `Session::resume`, and comes back as `TurnRequest::resume`. See ADR
+  0039.
 - **The workspace is a process; the terminal is a viewer of it.** `neosh` attaches to the workspace
   for your config directory, starting one if there is none. Closing a terminal detaches — turns keep
   running. `neosh stop` is what ends a workspace, and `^Q` must never be able to. `UiEvent` is a
@@ -108,8 +114,18 @@ per decision, and records the *reasoning*, not the choice.
   you can filter — because a flat list of dim rows is not a way to find anything. See ADR 0039.
 - **A card is a row until you ask for more.** A call that only *looked* at something folds to its
   header with the size of what came back on the end of it; a command keeps its output, an edit keeps
-  its diff, and a failure always shows. A turn that read six files should read as six rows. See ADR
-  0033.
+  its diff, and a failure always shows. See ADR 0033.
+- **A run of calls that only looked at things is one row**, naming as many of them as fit and
+  counting the rest — a turn that read six files reads as one. A run is calls with *nothing drawn
+  between them*, asked the same way by the live path and the replay, or switching away and back
+  re-folds the conversation. Only a mark that is news gets drawn: `▸` while a call is out, `✗` if it
+  failed, and nothing at all when it worked. See ADR 0040.
+- **A card says what happened, not which tool did it.** `Ran cargo test`, not `Bash cargo test` —
+  read off the arguments, like the colour. A call nothing here classifies keeps the name its author
+  gave it, so a plugin's tool is never renamed. **A command's output folds from the middle**: the
+  head is how it started and the tail is what it decided, and it is the second one you were waiting
+  for. And **one row of air between actions**, which is the cheapest structure there is. See ADR
+  0040.
 - **Redrawing a row means clearing its marks first.** A mark clamps rather than dies when the line
   under it is replaced, and at equal priority the *narrower* one wins — so a row rewritten every
   tick accumulates marks and ends up painted by the shortest one from several seconds ago.
@@ -167,7 +183,7 @@ registry — this table is what ships.
 |---|---|
 | `⏎` | Send. While a turn is running, **steer** it: the message is held and taken in at the next gap. |
 | `⇧⏎` | Newline, so a pasted snippet stays one message |
-| `⇧↑` | Take the last thing you queued back into the composer, to change it or drop it |
+| `^Y` | Take the last thing you queued back into the composer, to change it or drop it. Readline's yank: `^U`/`^W` kill, `^Y` brings it back |
 | `^P` | Pick a model. Mid-turn too — the running agent is told, and thinks the rest with it |
 | `^E` | Reasoning effort and the other per-model options |
 | `⌥↑` `⌥↓` | One rung up or down the capability ladder, same provider |
@@ -197,6 +213,20 @@ back to the start of the line.
 ## Reading the transcript — `^S`
 
 The answer is the artefact; this is how you get a piece of it out. See ADR 0028.
+
+**A mode's keys are the mode's keys.** `^S` puts the editor in `Normal`, so `chat`'s bindings —
+the ones that compose a message — stop firing and these get their keys back. Only four things are
+bound in every mode, and they are the escape hatches: `^C`, `^Q`, `^R`, `^S`. Everything that acts
+on the composer or scrolls without the cursor is `Chat` alone. A plugin that wants a key here binds
+it in `normal`.
+
+Two corollaries, both of which were bugs:
+
+- **A chord is not the letter it is made of.** Chords are matched before the plain keys, and a
+  chord this mode does not define does nothing at all. `^B` used to move a word left, `^A` used to
+  put you back in the composer.
+- **A key another mode claimed never arrives.** Reading's keys come through the *unbound* path,
+  which is the last thing consulted — so `^D` was whatever the git plugin bound it to.
 
 | Key | Does |
 |---|---|

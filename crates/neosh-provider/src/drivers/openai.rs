@@ -360,6 +360,7 @@ mod tests {
     #[test]
     fn usage_reporting_is_requested_explicitly() {
         let r = TurnRequest {
+            resume: None,
             conversation: neosh_proto::SessionId::from("test"),
             cwd: std::path::PathBuf::new(),
             selection: ModelSelection {

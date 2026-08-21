@@ -429,9 +429,19 @@ impl Provider for ClaudeCliProvider {
             // Held for the whole turn. Two turns in one conversation share one process and one
             // stdin, so running them at once would interleave two answers down one pipe.
             let mut guard = slot.live.lock().await;
-            let turn = Turn { request, mode, asker };
-            if let Err(message) =
-                run_turn(&program, &slot, &mut guard, turn, cancel, &tx).await
+            let mut turn = Turn { request, mode, asker };
+            // Retried exactly once, and only for the one failure a retry can fix: the conversation
+            // this driver was told to pick up is not there any more — the CLI's own history was
+            // cleared, or the project directory moved out from under it. Starting fresh loses what
+            // the agent remembered, which is already lost; reporting it instead would fail a turn
+            // over a stale value neither side can do anything about.
+            let mut result = run_turn(&program, &slot, &mut guard, turn.clone(), cancel.clone(), &tx).await;
+            if matches!(result, Ok(Outcome::Stale)) {
+                *guard = None;
+                turn.request.resume = None;
+                result = run_turn(&program, &slot, &mut guard, turn, cancel, &tx).await;
+            }
+            if let Err(message) = result
             {
                 // A turn that failed for a reason the process cannot recover from leaves nothing
                 // worth keeping: the next one starts a fresh CLI rather than writing into a pipe
@@ -449,10 +459,20 @@ impl Provider for ClaudeCliProvider {
 ///
 /// A struct rather than three more arguments: they are the parts of one question and they travel
 /// together everywhere.
+#[derive(Clone)]
 struct Turn {
     request: TurnRequest,
     mode: PermissionMode,
     asker: Option<Arc<dyn PermissionAsker>>,
+}
+
+/// How a turn ended, for the one caller that can do something about it.
+enum Outcome {
+    /// The turn ran. Whatever the CLI made of it is already in the stream.
+    Done,
+    /// It never started: the conversation this driver was asked to resume is gone. Nothing has
+    /// been forwarded, so the caller may simply try again without it.
+    Stale,
 }
 
 /// One turn, on a CLI that is either already running or about to be.
@@ -466,7 +486,7 @@ async fn run_turn(
     turn: Turn,
     cancel: CancellationToken,
     tx: &mpsc::Sender<ProviderEvent>,
-) -> Result<(), String> {
+) -> Result<Outcome, String> {
     let Turn { request, mode, asker } = turn;
     // Only offered when somebody can answer it. Passing the flag with nobody behind it would route
     // every decision to a pipe nothing ever writes to, and the turn would hang instead of being
@@ -477,6 +497,10 @@ async fn run_turn(
 
     // The one thing a running session cannot be talked out of. Everything else below is a control
     // request on the process that is already there.
+    // Whether this process is being started on a handle that outlived a workspace, which is the
+    // only kind that can be stale: one taken from a process this one is replacing was valid a
+    // moment ago.
+    let mut borrowed = false;
     if slot.as_ref().is_none_or(|live| live.launched != launch) {
         let resume = match slot.take() {
             Some(live) => {
@@ -484,7 +508,12 @@ async fn run_turn(
                 live.close().await;
                 id
             }
-            None => None,
+            // Nothing is running for this conversation, which after a restart is every
+            // conversation. What the driver called it last time is the whole of its memory.
+            None => {
+                borrowed = request.resume.is_some();
+                request.resume.clone()
+            }
         };
         *slot = Some(Live::spawn(program, &launch, &model, resume.as_deref()).await?);
     }
@@ -569,7 +598,7 @@ async fn run_turn(
                 if interrupted {
                     let _ = live.child.start_kill();
                     *slot = None;
-                    return Ok(());
+                    return Ok(Outcome::Done);
                 }
                 break;
             }
@@ -584,17 +613,32 @@ async fn run_turn(
                             retryable: false,
                         }).await;
                         *slot = None;
-                        return Ok(());
+                        return Ok(Outcome::Done);
                     }
                 };
                 let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) else {
                     continue; // non-JSON chatter on stdout is not fatal
                 };
-                // Every line carries it, and it is what a replacement process resumes into.
-                if live.session.is_none()
-                    && let Some(id) = v.get("session_id").and_then(|s| s.as_str())
+                // The CLI declined to pick up where it left off. Nothing has been forwarded and
+                // the turn has not begun, so this is not a failure to report — it is a token to
+                // throw away, said to the caller who is holding it.
+                if borrowed && stale_resume(&v) {
+                    return Ok(Outcome::Stale);
+                }
+                // Every line carries it, and it is what a replacement process resumes into — this
+                // one, and, once it has been said out loud, one started a week from now. Compared
+                // rather than set once: resuming does not always keep the id it was given, and a
+                // conversation stored under the id the CLI has stopped using is one that resumes
+                // into a history missing everything since.
+                if let Some(id) = v.get("session_id").and_then(|s| s.as_str()).filter(|s| !s.is_empty())
+                    && live.session.as_deref() != Some(id)
                 {
                     live.session = Some(id.to_string());
+                    let _ = tx
+                        .send(ProviderEvent::Activity {
+                            activity: Activity::Resume { token: id.to_string() },
+                        })
+                        .await;
                 }
                 // A question, which the CLI is now blocked on. Answered inline: the turn genuinely
                 // is waiting on a person, and the transcript's spinner says so.
@@ -636,7 +680,7 @@ async fn run_turn(
                         // The receiver is gone: the turn was abandoned. The process is not — it
                         // holds the conversation, and there is every chance the next turn is about
                         // to ask it something.
-                        return Ok(());
+                        return Ok(Outcome::Done);
                     }
                 }
                 // The turn is over, and the process is not. Before letting it go back to waiting,
@@ -692,7 +736,26 @@ async fn run_turn(
             })
             .await;
     }
-    Ok(())
+    Ok(Outcome::Done)
+}
+
+/// The CLI refusing to resume a conversation it no longer has.
+///
+/// It says so in the ordinary way — a `result` line with `is_error` — which is also how it reports
+/// every other failure, so the sentence is what tells them apart. Matched loosely on purpose: this
+/// only decides whether to try once more without the handle, and being wrong in either direction
+/// costs a turn that starts fresh instead of one that fails.
+fn stale_resume(v: &Value) -> bool {
+    if v.get("type").and_then(Value::as_str) != Some("result")
+        || v.get("is_error").and_then(Value::as_bool) != Some(true)
+    {
+        return false;
+    }
+    let gone = |s: &str| s.contains("No conversation found");
+    v.get("errors")
+        .and_then(Value::as_array)
+        .is_some_and(|e| e.iter().filter_map(Value::as_str).any(gone))
+        || v.get("result").and_then(Value::as_str).is_some_and(gone)
 }
 
 /// How full the CLI says its context is.
@@ -907,6 +970,7 @@ mod tests {
 
     fn req(model: &str) -> TurnRequest {
         TurnRequest {
+            resume: None,
             conversation: neosh_proto::SessionId::from("test"),
             cwd: std::path::PathBuf::new(),
             selection: ModelSelection {

@@ -32,6 +32,23 @@ export type TurnRequest = {
    * before this field existed.
    */
   cwd: string;
+  /**
+   * What the driver called this conversation last time, if it named it.
+   *
+   * A vendor CLI keeps the history on its side and hands back a handle — `claude`'s session id,
+   * ACP's session, `codex`'s conversation. A driver that only remembers that handle in its own
+   * process remembers it exactly as long as the workspace lives: restart, reopen a conversation
+   * with a hundred messages in it, and the agent is started fresh and told only the newest one.
+   * The transcript looks full and the model has never heard of any of it, which is not a thing
+   * either side reports as an error — it is simply an agent that has forgotten, and the first
+   * visible sign of it is `/compact` finishing instantly with nothing to compact.
+   *
+   * So the handle belongs to the conversation, which is the thing that outlives the process.
+   * The driver hands it over with [`Activity::Resume`] and is given it back here. `None` means
+   * this conversation has never been run by this driver, which is the only case where starting
+   * fresh is right.
+   */
+  resume?: string | null;
   system?: string | null;
   messages: Array<Message>;
   tools?: Array<ToolDef>;

@@ -1264,6 +1264,7 @@ mod tests {
             extra_headers: vec![],
         };
         let req = TurnRequest {
+            resume: None,
             conversation: neosh_proto::SessionId::from("test"),
             cwd: std::path::PathBuf::new(),
             selection: ModelSelection {

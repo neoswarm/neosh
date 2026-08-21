@@ -58,6 +58,14 @@ struct Stored {
     /// still reaches every conversation that never overrode it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     permission_mode: Option<neosh_proto::PermissionMode>,
+    /// What the driver calls this conversation on its own side.
+    ///
+    /// The one field here that is *only* useful once this process is gone. A vendor CLI keeps the
+    /// history and hands back a handle; without this, reopening a conversation after a restart
+    /// starts an agent that has never heard of it, and the transcript on screen is the only place
+    /// any of it still exists. See [`neosh_proto::TurnRequest::resume`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    resume: Option<String>,
     /// The system prompt is *not* stored. It comes from configuration, and a stale copy pinned into
     /// a saved session would silently outrank the one the user edited.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -108,6 +116,7 @@ impl From<&Session> for Stored {
             archived: s.archived,
             archived_at: s.archived_at,
             permission_mode: s.permission_mode,
+            resume: s.resume.clone(),
             _reserved: None,
         }
     }
@@ -128,6 +137,7 @@ impl Stored {
         s.archived = self.archived;
         s.archived_at = self.archived_at;
         s.permission_mode = self.permission_mode;
+        s.resume = self.resume;
         s
     }
 }
@@ -270,6 +280,33 @@ mod tests {
         assert_eq!(loaded[0].messages.len(), 1);
         assert_eq!(loaded[0].usage.input_tokens, 7);
         assert_eq!(loaded[0].cwd, original.cwd);
+    }
+
+    /// The one value here whose whole purpose is to outlive the process that learned it.
+    ///
+    /// A vendor CLI keeps the conversation on its side and hands back a handle. Lose the handle and
+    /// reopening a conversation starts an agent that has never heard of it: the transcript is full,
+    /// the model knows nothing, and the first thing that visibly breaks is `/compact` finishing at
+    /// once with nothing to compact.
+    #[test]
+    fn what_the_driver_calls_a_conversation_survives_the_workspace() {
+        let t = tmp("resume");
+        let mut known = session("carry on");
+        known.resume = Some("4db87a5d-8bc3-41ec-a044-ea6d2d683503".into());
+        let fresh = session("never run");
+        save(&t.0, &known).expect("save");
+        save(&t.0, &fresh).expect("save");
+
+        let (loaded, _) = load(&t.0);
+        let of = |id: &neosh_proto::SessionId| {
+            loaded.iter().find(|s| &s.id == id).expect("saved").resume.clone()
+        };
+        assert_eq!(of(&known.id).as_deref(), Some("4db87a5d-8bc3-41ec-a044-ea6d2d683503"));
+        assert_eq!(
+            of(&fresh.id),
+            None,
+            "a conversation no driver has run yet has nothing to pick up, and starting fresh is right"
+        );
     }
 
     /// A mode you chose for one conversation is a decision, not a mood.

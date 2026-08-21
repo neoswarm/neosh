@@ -256,6 +256,7 @@ mod tests {
 
     fn req(msgs: Vec<Message>) -> TurnRequest {
         TurnRequest {
+            resume: None,
             conversation: neosh_proto::SessionId::from("test"),
             cwd: std::path::PathBuf::new(),
             selection: ModelSelection {

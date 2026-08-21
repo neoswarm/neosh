@@ -68,14 +68,18 @@ export async function activate({ neosh, subscriptions }: PluginContext) {
   // command name is already half-typed. Marked open for the same reason the draft path is: the menu
   // writes the composer back, and a second one opening on its own echo would take the keyboard from
   // the first.
-  const start = async (query: string) => {
+  // The query is asked for rather than passed: this takes several round-trips to open, and
+  // everything typed in that window lands in the composer. Read at the start, the menu comes up
+  // unfiltered with a row nobody aimed at under `↵` — which is how typing `/compact` at speed ran
+  // the first command in the list instead. Read at the end, what you typed is the filter.
+  const start = async () => {
     if (open) return;
     open = true;
-    await show(neosh, query, () => (open = false));
+    await show(neosh, () => TOKEN.exec(draft)?.[1] ?? "", () => (open = false));
   };
 
   subscriptions.push(
-    await neosh.cmd.register("slash.open", () => start(TOKEN.exec(draft)?.[1] ?? ""), {
+    await neosh.cmd.register("slash.open", () => start(), {
       desc: "Run a command by name, neosh's or the agent's",
     }),
   );
@@ -90,12 +94,12 @@ export async function activate({ neosh, subscriptions }: PluginContext) {
   subscriptions.push(
     neosh.agent.onComposerChange(({ text }) => {
       draft = text;
-      if (text === "/") void start("");
+      if (text === "/") void start();
     }),
   );
 }
 
-async function show(neosh: Neosh, query: string, done: () => void): Promise<void> {
+async function show(neosh: Neosh, query: () => string, done: () => void): Promise<void> {
   const [commands, keymaps, driver] = await Promise.all([
     neosh.cmd.list(),
     neosh.keymap.list("chat"),

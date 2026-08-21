@@ -199,6 +199,10 @@ pub struct Host {
     /// `session.messages` when its stream closes, so a transcript rebuilt from messages alone would
     /// show a conversation that is visibly working and has said nothing.
     rounds: std::collections::HashMap<neosh_proto::SessionId, Round>,
+    /// What the mode was before `^S`, to be put back on the way out. Stored rather than assumed to
+    /// be `Chat`: the door into reading is bound in every mode, so it is reachable from any of
+    /// them, and a mode restored to a guess is a keyboard that quietly changed under you.
+    mode_before_reading: Mode,
     /// What was in the composer when a change was last announced.
     ///
     /// Kept so [`neosh_proto::PluginEvent::ComposerChanged`] is about the draft rather than about
@@ -216,7 +220,11 @@ pub struct Host {
     /// Learned at the driver's handshake, not configured: which commands exist depends on the
     /// install — project commands, plugin commands and MCP prompts all count — so any list written
     /// down here would be wrong on the first machine that had one of its own. Outlives the turn
-    /// that learned it, because the menu is opened between turns.
+    /// that learned it, because the menu is opened between turns — and outlives the *workspace*
+    /// through [`Host::remembered_commands`], because it is also opened before them. A driver only
+    /// says this once its process is up, which is on the first turn; a conversation you have just
+    /// opened has not had one, and every command the agent accepts would be missing from the menu
+    /// at exactly the moment somebody typed `/` looking for it.
     driver_commands:
         std::collections::HashMap<neosh_proto::SessionId, Vec<neosh_proto::DriverCommand>>,
     /// Every tool card in the transcript on screen, in row order.
@@ -409,12 +417,8 @@ impl Task {
     }
 }
 
-/// A tool card on screen: where it is, and what it shows.
-///
-/// What it shows is kept so it can be drawn again — folded or opened from the transcript, or
-/// finished when the call comes back — without going looking for the call in the conversation,
-/// which for a running agent turn does not hold it yet.
-struct Card {
+/// One call a card is holding: what was asked, and what came back.
+struct Leg {
     id: neosh_proto::ToolCallId,
     name: String,
     input: serde_json::Value,
@@ -429,12 +433,54 @@ struct Card {
     took: Option<std::time::Duration>,
     /// What a failed call exited with, when its output said.
     exit: Option<i64>,
+}
+
+/// A tool card on screen: where it is, and what it shows.
+///
+/// What it shows is kept so it can be drawn again — folded or opened from the transcript, or
+/// finished when the call comes back — without going looking for the call in the conversation,
+/// which for a running agent turn does not hold it yet.
+///
+/// Usually one call. A *run* of calls that only looked at things — reads, greps, listings, one
+/// after another with nothing drawn between them — shares a card, and the card is one row saying
+/// what they all looked at. See [`cards::group_header`]. Nothing else ever shares: a command's
+/// output and an edit's diff are the answer, and there is no summarising them into a list of
+/// names.
+struct Card {
+    /// One, or a run of read-only calls, in the order they were made.
+    legs: Vec<Leg>,
     /// The header's row.
     row: u32,
     /// How many rows the body takes under it.
     body: u32,
     /// Whether the body is the whole of it or the first few rows.
     expanded: bool,
+}
+
+impl Card {
+    fn new(leg: Leg, row: u32) -> Self {
+        Self { legs: vec![leg], row, body: 0, expanded: false }
+    }
+
+    /// Whether this card holds a call answering to `id`, and which one.
+    fn leg_of(&self, id: &neosh_proto::ToolCallId) -> Option<usize> {
+        self.legs.iter().rposition(|l| l.id == *id)
+    }
+
+    /// Whether every call on this card has come back.
+    fn settled(&self) -> bool {
+        self.legs.iter().all(|l| l.result.is_some())
+    }
+
+    /// Whether a call `input` could join this card.
+    ///
+    /// Both sides have to be calls that only looked at something, and the card has to have room
+    /// for the idea — a card whose body is already on screen is a card the reader has opened, and
+    /// growing it under them would move what they were reading.
+    fn takes(&self, input: &serde_json::Value) -> bool {
+        !self.expanded
+            && self.legs.last().is_some_and(|l| cards::groups_with(&l.input, input))
+    }
 }
 
 /// One thing a running turn has produced, in the order it produced it.
@@ -569,6 +615,7 @@ impl Host {
             agent_drivers: Vec::new(),
             turns: std::collections::HashMap::new(),
             rounds: std::collections::HashMap::new(),
+            mode_before_reading: Mode::Chat,
             draft: String::new(),
             plan_rows: 0,
             driver_commands: std::collections::HashMap::new(),
@@ -763,8 +810,16 @@ impl Host {
                 Ok(ApiOk::Unit)
             }
             ApiCall::AgentDriverCommands => {
-                let commands =
-                    self.driver_commands.get(&self.active_session()).cloned().unwrap_or_default();
+                let here = self.active_session();
+                let commands = match self.driver_commands.get(&here) {
+                    Some(c) => c.clone(),
+                    // Not this conversation's own answer, but the last one given for the same
+                    // driver in the same project — which is what its handshake is about to say
+                    // again. Being one install-change out of date is the cost; the alternative is a
+                    // menu that knows none of the agent's commands until you have already sent
+                    // something, which is the state the menu is least useful in.
+                    None => self.remembered_commands(),
+                };
                 Ok(ApiOk::DriverCommands { commands })
             }
             ApiCall::ChatSetDraft { text } => {
@@ -1158,6 +1213,9 @@ impl Host {
             self.scroll_chat(0);
             self.chat_question(&text);
             self.begin_working();
+            // `\u{23ce}` steers from here until the turn is over, and the empty field is where that
+            // has to be said — it is the one thing on screen you are looking at when you press it.
+            self.refresh_composer();
         }
 
         let agent = self.agent.clone();
@@ -1572,10 +1630,15 @@ impl Host {
             ];
             let one = text.lines().next().unwrap_or("").trim();
             let tail = if i + 1 == take && more > 0 { format!("  (+{more} more)") } else { String::new() };
-            let key = if ascii { "S-Up" } else { "\u{21e7}\u{2191}" };
-            // The label, the gap either side of it, and the word after it, so a long message is
+            let key = "^Y";
+            // *What happens*, not what you do. `edit` is the operation and "I want that sentence
+            // back" is the thought, and the two only look the same to somebody who already knew
+            // the key was there.
+            let undo = " take back";
+            // The label, the gap either side of it, and the words after it, so a long message is
             // clipped rather than pushing the key that undoes it off the edge.
-            let room = width.saturating_sub(9 + tail.chars().count() + display_width(key) + 7);
+            let room = width
+                .saturating_sub(9 + tail.chars().count() + display_width(key) + 2 + undo.len());
             let body: String = one.chars().take(room).collect();
             v.push(chunk(format!("{body}{tail}"), "Composer.Hint"));
             // On the last row, so it is next to the message it would take back rather than
@@ -1583,7 +1646,7 @@ impl Host {
             if i + 1 == take {
                 v.push(chunk("  ", "Composer.Hint"));
                 v.push(chunk(key, "Composer.HintKey"));
-                v.push(chunk(" edit", "Composer.Hint"));
+                v.push(chunk(undo, "Composer.Hint"));
             }
             self.composer_mark(0, VirtTextPos::Above, v);
         }
@@ -1606,10 +1669,20 @@ impl Host {
         self.composer_mark(0, VirtTextPos::Inline, vec![chunk(caret, "Composer.Prompt")]);
 
         if text.is_empty() {
+            // While a turn is running, `\u{23ce}` does something else, and an empty field is the one
+            // place you are looking when you are about to press it. "Ask anything" there invites
+            // you to do the thing you cannot do and says nothing about the thing you can — which
+            // is how somebody presses it, watches the sentence vanish into a queue they did not
+            // know existed, and has no idea what just happened to it.
+            let words = if self.turns.contains_key(&self.active_session()) {
+                "Steer it \u{2014} taken in at the next gap"
+            } else {
+                "Ask anything, or run a command"
+            };
             self.composer_mark(
                 0,
                 VirtTextPos::Eol,
-                vec![chunk("Ask anything, or run a command", "Composer.Placeholder")],
+                vec![chunk(words, "Composer.Placeholder")],
             );
         }
 
@@ -1649,7 +1722,7 @@ impl Host {
         let card = self
             .card_at(self.chat_cursor().0)
             .map(|i| &self.cards[i])
-            .filter(|c| c.result.is_some())
+            .filter(|c| c.settled())
             .map(|c| c.expanded);
         let tab = self.glyphs().tab;
         let mut pairs: Vec<(&str, &str)> = match self.reading_pending {
@@ -2410,6 +2483,20 @@ impl Host {
         }
         self.reading = true;
         self.reading_pending = None;
+        // And the keymap has to be told, or the sentence above is only true of the keys nobody
+        // else wanted. Reading's keys arrive through [`Self::handle_unbound_key`], which is the
+        // *last* thing consulted — so `^D` scrolled half a screen only until the git plugin bound
+        // it in `chat` mode, after which it opened a diff, and `^B` toggled the sidebar instead of
+        // going back a page, and `^E` opened the effort picker instead of moving a line. Half of a
+        // documented vim vocabulary, quietly taken by whatever loaded first.
+        //
+        // `Normal` rather than a `Reading` mode of its own: the keys `chat` carries are the ones
+        // that compose a message, and none of them means anything here. What stays bound is the
+        // set the host puts in *every* mode — `^C`, `^Q`, `^R`, `^S` — which is exactly the set you
+        // want to keep working somewhere you did not intend to be. A plugin that wants a key while
+        // reading binds it in `normal`, which needs nothing new.
+        self.mode_before_reading = self.editor.mode();
+        self.editor.set_mode(Mode::Normal);
         let plugin = PluginId::from(BUILTIN);
         let _ = self.editor.apply(&plugin, ApiCall::FocusPush { win: self.chat_win });
         let _ = self.editor.apply(&plugin, ApiCall::WinSelect { win: self.chat_win, on: false });
@@ -2427,6 +2514,7 @@ impl Host {
         }
         self.reading = false;
         self.reading_pending = None;
+        self.editor.set_mode(self.mode_before_reading);
         self.clear_matches();
         let plugin = PluginId::from(BUILTIN);
         let _ = self.editor.apply(&plugin, ApiCall::WinSelect { win: self.chat_win, on: false });
@@ -2448,6 +2536,35 @@ impl Host {
             KeyCode::Char { c } => c.as_str(),
             _ => "",
         };
+        let select = self.chat_anchored() || key.mods.shift;
+
+        // Chords first — before the pending pair and before the plain motions, because a chord is
+        // a different key and not a modified one. Read after them, `^B` was matched by the `b` arm
+        // of the motion table and moved a word left, `^Y` opened a pending yank, and `^E` moved a
+        // word right: three of the six scroll keys taken by the unmodified letters they happen to
+        // share. `<C-d>`/`<C-u>` are half a screen because that is what they are everywhere; a full
+        // screen with no overlap loses the line you were reading.
+        let page = self.chat_height().max(2);
+        if key.mods.ctrl {
+            match ch {
+                "d" => return self.reading_by(page as i64 / 2, select),
+                "u" => return self.reading_by(-(page as i64 / 2), select),
+                "f" => return self.reading_by(page as i64, select),
+                "b" => return self.reading_by(-(page as i64), select),
+                "e" => return self.reading_by(1, select),
+                "y" => return self.reading_by(-1, select),
+                _ => {}
+            }
+        }
+        // A chord this mode does not define does *nothing*. Falling through, `^A` was read as `a`
+        // and put you back in the composer, `^W` as `w` and moved a word — a key that means
+        // something else here quietly meaning the letter it is made of. Alt as well as ctrl, and
+        // deliberately not shift: shift *is* a modifier on a motion here, and holding it is how a
+        // selection is extended.
+        if key.mods.ctrl || key.mods.alt {
+            return;
+        }
+
         // A pending first key consumes exactly one more press, whatever it is. Anything else and a
         // mistyped `y` would sit there waiting to eat an unrelated keystroke later.
         if let Some(first) = self.reading_pending.take() {
@@ -2461,7 +2578,6 @@ impl Host {
             return;
         }
 
-        let select = self.chat_anchored() || key.mods.shift;
         let motion = match (&key.code, ch) {
             (KeyCode::Left, _) | (_, "h") => Some(CursorMotion::Left),
             (KeyCode::Right, _) | (_, "l") => Some(CursorMotion::Right),
@@ -2486,20 +2602,6 @@ impl Host {
             return;
         }
 
-        // Whole-screen movement. `<C-d>`/`<C-u>` are half a screen because that is what they are
-        // everywhere; a full screen with no overlap loses the line you were reading.
-        let page = self.chat_height().max(2);
-        if key.mods.ctrl {
-            match ch {
-                "d" => return self.reading_by(page as i64 / 2, select),
-                "u" => return self.reading_by(-(page as i64 / 2), select),
-                "f" => return self.reading_by(page as i64, select),
-                "b" => return self.reading_by(-(page as i64), select),
-                "e" => return self.reading_by(1, select),
-                "y" => return self.reading_by(-1, select),
-                _ => {}
-            }
-        }
         match (&key.code, ch) {
             (KeyCode::PageDown, _) => self.reading_by(page as i64, select),
             (KeyCode::PageUp, _) => self.reading_by(-(page as i64), select),
@@ -3175,25 +3277,11 @@ impl Host {
     /// One function for the live path and the replay, because the two have to agree. They used to
     /// be two pieces of near-identical code, and near-identical is how a card acquires a blank line
     /// in one of them and not the other.
-    fn draw_tool_card(&mut self, call: &neosh_proto::ToolCall, state: ToolState) -> Option<u32> {
+    fn draw_tool_card(&mut self, call: &neosh_proto::ToolCall, _state: ToolState) -> Option<u32> {
         if !self.option_bool("chat.show_tools") {
             return None;
         }
-        let g = self.glyphs();
-        let root = self.root();
-        let width = self.chat_width();
-        let head = cards::Head {
-            name: &call.name,
-            input: &call.input,
-            state,
-            took: None,
-            exit: None,
-            output: None,
-        };
-        let card = cards::header(&g, &head, &root, width);
-        let row = self.chat_push(vec![card.text.clone()]);
-        self.chat_row(row, &card);
-        self.cards.push(Card {
+        let leg = Leg {
             id: call.id.clone(),
             name: call.name.clone(),
             input: call.input.clone(),
@@ -3201,11 +3289,70 @@ impl Host {
             started: Some(std::time::Instant::now()),
             took: None,
             exit: None,
-            row,
-            body: 0,
-            expanded: false,
-        });
+        };
+        // Onto the card above, when there is one and it is still the last thing in the transcript.
+        // *Still the last thing* is the whole condition: a run is calls with nothing between them,
+        // and anything at all having been drawn since — a sentence, a body, another kind of call —
+        // means the reader has been told something else and the run is over.
+        if let Some(i) = self.open_run()
+            && self.cards[i].takes(&call.input)
+        {
+            self.cards[i].legs.push(leg);
+            let row = self.cards[i].row;
+            let header = self.card_header(i);
+            self.replace_row(row, &header);
+            return Some(row);
+        }
+        let g = self.glyphs();
+        let root = self.root();
+        let width = self.chat_width();
+        let head = cards::Head {
+            name: &leg.name,
+            input: &leg.input,
+            state: ToolState::Running,
+            took: None,
+            exit: None,
+            output: None,
+        };
+        let card = cards::header(&g, &head, &root, width);
+        // A blank row between one action and the next. Butted together, a header, four rows of
+        // output and the next header are one block of text with no edges in it, and finding where
+        // an action starts means reading for it. A row of air is what turns the transcript into a
+        // list of things that happened — it is the cheapest structure there is, and every program
+        // that reads well spends it.
+        self.chat_gap();
+        let row = self.chat_push(vec![card.text.clone()]);
+        self.chat_row(row, &card);
+        self.cards.push(Card::new(leg, row));
         Some(row)
+    }
+
+    /// The card a new call could join: the last one drawn, if nothing has been drawn since.
+    fn open_run(&self) -> Option<usize> {
+        let i = self.cards.len().checked_sub(1)?;
+        let c = &self.cards[i];
+        (i64::from(c.row + c.body + 1) == self.chat_end()).then_some(i)
+    }
+
+    /// Put one row back where it was, marks and all. Nothing below moves.
+    fn replace_row(&mut self, row: u32, r: &cards::Row) {
+        let plugin = PluginId::from(BUILTIN);
+        // Cleared first: a mark clamps rather than dies when the line under it is replaced, and at
+        // equal priority the narrower one wins — so a row rewritten every tick ends up painted by
+        // the shortest label it ever had.
+        let _ = self.editor.apply(&plugin, ApiCall::MarkClear {
+            ns: self.chat_ns,
+            buf: self.chat,
+            start: Some(row),
+            end: Some(row + 1),
+        });
+        let _ = self.editor.apply(&plugin, ApiCall::BufSetLines {
+            buf: self.chat,
+            start: row as i64,
+            end: row as i64 + 1,
+            lines: vec![r.text.clone()],
+        });
+        self.chat_row(row, r);
     }
 
     /// The call came back: settle the dot, put the stats on the header and the body under it.
@@ -3218,7 +3365,13 @@ impl Host {
     /// to put them under: a tool that failed silently is a debugging session, and the setting is
     /// about noise, not about hiding failures.
     fn finish_card(&mut self, id: &neosh_proto::ToolCallId, result: &neosh_proto::ToolResult) {
-        let Some(i) = self.cards.iter().rposition(|c| c.id == *id) else {
+        let found = self
+            .cards
+            .iter()
+            .enumerate()
+            .rev()
+            .find_map(|(i, c)| c.leg_of(id).map(|k| (i, k)));
+        let Some((i, k)) = found else {
             if result.is_error || self.option_bool("chat.show_tools") {
                 let g = self.glyphs();
                 let limits = self.limits();
@@ -3233,43 +3386,55 @@ impl Host {
         };
         // Already answered. A replay can meet the same result twice — once in the messages and
         // once in the round's own record — and a second body would say it happened twice.
-        if self.cards[i].result.is_some() {
+        if self.cards[i].legs[k].result.is_some() {
             return;
         }
-        self.cards[i].took = self.cards[i].started.map(|s| s.elapsed());
-        self.cards[i].exit = result.is_error.then(|| cards::exit_code(&result.content)).flatten();
-        self.cards[i].result = Some(result.clone());
+        let leg = &mut self.cards[i].legs[k];
+        leg.took = leg.started.map(|s| s.elapsed());
+        leg.exit = result.is_error.then(|| cards::exit_code(&result.content)).flatten();
+        leg.result = Some(result.clone());
         self.redraw_card(i);
     }
 
-    /// How a card's call is going, which is what its dot says. Derived rather than stored: a call
+    /// How one call is going, which is what a card's mark says. Derived rather than stored: a call
     /// with a result is finished and one without is running, and there is no third source of truth
     /// to fall out of step with.
-    fn card_state(card: &Card) -> ToolState {
-        match &card.result {
+    fn leg_state(leg: &Leg) -> ToolState {
+        match &leg.result {
             Some(r) if r.is_error => ToolState::Failed,
             Some(_) => ToolState::Done,
             None => ToolState::Running,
         }
     }
 
+    /// Every call on card `i`, as the renderer wants them.
+    fn card_heads(card: &Card) -> Vec<cards::Head<'_>> {
+        card.legs
+            .iter()
+            .map(|leg| cards::Head {
+                name: &leg.name,
+                input: &leg.input,
+                state: Self::leg_state(leg),
+                // A finished call keeps whatever it took; a running one is timed from its start,
+                // so the number on screen is the one a clock on the wall would give. Whether
+                // either is worth printing is the renderer's decision, in one place, for both.
+                took: leg.took.or_else(|| leg.started.map(|s| s.elapsed())),
+                exit: leg.exit,
+                output: leg.result.as_ref().map(|r| lines_in(&r.content)),
+            })
+            .collect()
+    }
+
     /// Card `i`'s header line, as it should read now.
     fn card_header(&self, i: usize) -> cards::Row {
-        let card = &self.cards[i];
-        let head = cards::Head {
-            name: &card.name,
-            input: &card.input,
-            state: Self::card_state(card),
-            // A running call is timed from its start, so the number on screen is the one you would
-            // get by looking at a clock — which is the whole question being asked of it.
-            // A finished call keeps whatever it took; a running one is timed from its start, so
-            // the number on screen is the one a clock on the wall would give. Whether either is
-            // worth printing is the renderer's decision, in one place, for both.
-            took: card.took.or_else(|| card.started.map(|s| s.elapsed())),
-            exit: card.exit,
-            output: card.result.as_ref().map(|r| lines_in(&r.content)),
-        };
-        cards::header(&self.glyphs(), &head, &self.root(), self.chat_width())
+        let g = self.glyphs();
+        let root = self.root();
+        let width = self.chat_width();
+        let heads = Self::card_heads(&self.cards[i]);
+        match heads.as_slice() {
+            [one] => cards::header(&g, one, &root, width),
+            many => cards::group_header(&g, many, &root, width),
+        }
     }
 
     /// Advance the clock on every call that has not come back.
@@ -3283,26 +3448,15 @@ impl Host {
             .cards
             .iter()
             .enumerate()
-            .filter(|(_, c)| c.result.is_none() && c.started.is_some())
+            .filter(|(_, c)| {
+                c.legs.iter().any(|l| l.result.is_none() && l.started.is_some())
+            })
             .map(|(i, _)| i)
             .collect();
-        let plugin = PluginId::from(BUILTIN);
         for i in live {
             let card = self.card_header(i);
             let row = self.cards[i].row;
-            let _ = self.editor.apply(&plugin, ApiCall::MarkClear {
-                ns: self.chat_ns,
-                buf: self.chat,
-                start: Some(row),
-                end: Some(row + 1),
-            });
-            let _ = self.editor.apply(&plugin, ApiCall::BufSetLines {
-                buf: self.chat,
-                start: row as i64,
-                end: row as i64 + 1,
-                lines: vec![card.text.clone()],
-            });
-            self.chat_row(row, &card);
+            self.replace_row(row, &card);
         }
     }
 
@@ -3314,10 +3468,18 @@ impl Host {
         let limits = self.limits();
         let (row, old_body) = (self.cards[i].row, self.cards[i].body);
         let header = self.card_header(i);
+        let root = self.root();
         let card = &self.cards[i];
-        let body = match &card.result {
-            Some(r) => cards::body(&g, &card.input, r, limits, card.expanded, width),
-            None => Vec::new(),
+        let body = match card.legs.as_slice() {
+            // One call: whatever it came back with, folded or opened.
+            [leg] => match &leg.result {
+                Some(r) => cards::body(&g, &leg.input, r, limits, card.expanded, width),
+                None => Vec::new(),
+            },
+            // A run: nothing until it is opened, and then a row per call. What the fold exists to
+            // keep out of the transcript is the *contents* of the six files, so opening a run
+            // gives back the six names in full and stops there.
+            _ => cards::group_body(&g, &Self::card_heads(card), &root, card.expanded, width),
         };
         // Anything else writing into the transcript ends the answer: its rows are addressed by
         // range, and rows moving underneath it would make "the end of the answer" ambiguous. An
@@ -3370,7 +3532,7 @@ impl Host {
             self.editor_message(MessageLevel::Info, "the cursor is not on a tool call");
             return;
         };
-        if self.cards[i].result.is_none() {
+        if !self.cards[i].settled() {
             self.editor_message(MessageLevel::Info, "still running \u{2014} nothing to show yet");
             return;
         }
@@ -3466,7 +3628,7 @@ impl Host {
                     // it in `cards`. Drawing a second card would say it happened twice — and for a
                     // model driver it always does, because the call lands in the messages the
                     // moment the stream closes and the tool starts running after that.
-                    if !self.cards.iter().any(|c| c.id == call.id) {
+                    if !self.cards.iter().any(|c| c.leg_of(&call.id).is_some()) {
                         self.draw_tool_card(call, ToolState::Running);
                     }
                     // Whether the card came from the messages or was just drawn, a result the
@@ -3506,6 +3668,20 @@ impl Host {
         });
         self.streaming = None;
         at.max(0) as u32
+    }
+
+    /// A blank row at the end of the transcript, unless there already is one.
+    fn chat_gap(&mut self) {
+        let at = self.chat_end();
+        let blank = at <= 0
+            || self
+                .editor
+                .buffer(self.chat)
+                .map(|b| b.get_lines((at - 1) as u32, at as u32).iter().all(|l| l.trim().is_empty()))
+                .unwrap_or(true);
+        if !blank {
+            self.chat_push(vec![String::new()]);
+        }
     }
 
     /// Where new content goes: the end, or the line above the working line when there is one.
@@ -4098,6 +4274,8 @@ impl Host {
                 if !leftover.is_empty() {
                     self.start_turn_in(session, leftover.join("\n"));
                 }
+                // The field says what `\u{23ce}` does, and what it does just changed back.
+                self.refresh_composer();
             }
             // What the turn produced is in the conversation now, so the round's copy of it would
             // only go stale — and drawing both on a switch would say everything twice.
@@ -4235,7 +4413,23 @@ impl Host {
                 }
             }
             Activity::Commands { commands } => {
+                self.remember_commands(&session, &commands);
                 self.driver_commands.insert(session, commands);
+            }
+            // What the driver calls this conversation, written down where it will still be after
+            // the process that said it has gone. Persisted rather than held: the value is only
+            // worth anything on a run that is not this one.
+            Activity::Resume { token } => {
+                let changed = match self.agent.sessions().get_mut(&session) {
+                    Some(s) if s.resume.as_deref() != Some(token.as_str()) => {
+                        s.resume = Some(token);
+                        true
+                    }
+                    _ => false,
+                };
+                if changed {
+                    self.persist_sessions();
+                }
             }
             // The driver's own answer to "how full is it", which beats anything derived. A prompt
             // size counts one request; this counts the conversation the agent is holding, and it
@@ -4613,6 +4807,50 @@ impl Host {
     }
 
     /// Persist every conversation. Cheap enough to call after each turn; a no-op under `--clean`.
+    /// Where the last-known command list for a conversation's driver and project is filed.
+    ///
+    /// By instance and directory rather than by conversation, because that is what the answer
+    /// actually depends on: `claude` in one repository accepts that repository's project commands
+    /// and its MCP prompts, and every conversation in it gets the same list. Keyed by conversation
+    /// it would be learned again from scratch for each new one, which is precisely the case this
+    /// exists for.
+    fn commands_key(&self, session: &neosh_proto::SessionId) -> Option<String> {
+        let store = self.agent.sessions();
+        let s = store.get(session)?;
+        let instance = s
+            .selection
+            .as_ref()
+            .map(|sel| sel.instance.clone())
+            .or_else(|| self.agent.selection().map(|sel| sel.instance))?;
+        Some(format!("commands:{instance}:{}", s.cwd.display()))
+    }
+
+    /// Keep what a driver said it accepts, for the conversations that have not asked it yet.
+    fn remember_commands(
+        &mut self,
+        session: &neosh_proto::SessionId,
+        commands: &[neosh_proto::DriverCommand],
+    ) {
+        // An empty list is a driver that answered nothing, not a driver that accepts nothing.
+        // Writing it down would replace a good list with a blank one.
+        if commands.is_empty() {
+            return;
+        }
+        let Some(key) = self.commands_key(session) else { return };
+        let Ok(value) = serde_json::to_value(commands) else { return };
+        if self.pstate.get(BUILTIN, &key) == value {
+            return;
+        }
+        self.pstate.set(BUILTIN, key, value);
+    }
+
+    /// What this driver accepted last time it ran here, for a conversation that has not run yet.
+    fn remembered_commands(&mut self) -> Vec<neosh_proto::DriverCommand> {
+        let here = self.active_session();
+        let Some(key) = self.commands_key(&here) else { return Vec::new() };
+        serde_json::from_value(self.pstate.get(BUILTIN, &key)).unwrap_or_default()
+    }
+
     fn persist_sessions(&self) {
         let Some(dir) = &self.state_dir else { return };
         if let Err(e) = crate::sessions::save_all(dir, &self.agent.sessions()) {
@@ -4777,30 +5015,27 @@ impl Host {
                 desc: Some(desc.to_string()),
             });
         }
-        // In every mode: a config that fails to load can leave you somewhere unexpected, and that
-        // is precisely when you need to be able to reload.
-        for mode in [Mode::Normal, Mode::Insert, Mode::Visual, Mode::Chat] {
-            for (lhs, command, desc) in [
-                ("<C-r>", "config.reload", "Reload configuration"),
-                ("<C-q>", "quit", "Close neosh"),
-                // Bound because it is the first thing anyone tries. In raw mode the terminal does
-                // not turn this into SIGINT, so without a binding it does nothing at all — and a
-                // program you cannot get out of is not one people give a second chance.
-                ("<C-c>", "interrupt", "Cancel, clear, or quit"),
-                ("<PageUp>", "chat.scroll_up", "Scroll up"),
-                ("<PageDown>", "chat.scroll_down", "Scroll down"),
-                ("<C-End>", "chat.scroll_end", "Back to the newest message"),
-                // Reading the transcript is a separate place, and this is the door to it. Bound in
-                // every mode for the same reason reload is: you want it most when you are somewhere
-                // you did not intend to be.
-                ("<C-s>", "chat.read", "Read, select and copy the transcript"),
-                ("<C-x>", "edit.cut", "Cut the selection"),
-                ("<C-a>", "edit.select_all", "Select everything"),
-                // `⌥↑` is the model ladder and `⌥↓` its other half, so the queue takes the shift
-                // pair. Both are "up, to the thing before this one", which is what makes them
-                // rememberable — and neither is a chord anybody's `init.ts` has taken.
-                ("<S-Up>", "chat.queue.edit", "Edit the last queued message"),
-            ] {
+        // Two lists, and the split is the point. **A mode's keys are the mode's keys**: while you
+        // are reading the transcript, `^X` cutting a composer you cannot see and `^Y` pulling a
+        // queued message into it are not things you asked for — they are the previous mode still
+        // holding the keyboard. Everything that acts on the composer or scrolls the transcript
+        // *without* the cursor is therefore bound in `Chat` alone, and reading answers those keys
+        // itself, in the way this mode means them.
+        //
+        // What is left is the escape hatches, and only those. A config that fails to load can put
+        // you somewhere unexpected, which is exactly when you need to reload, quit, interrupt, or
+        // get into the transcript — so those four are bound everywhere and nothing else is.
+        for (lhs, command, desc) in [
+            ("<C-r>", "config.reload", "Reload configuration"),
+            ("<C-q>", "quit", "Close neosh"),
+            // Bound because it is the first thing anyone tries. In raw mode the terminal does
+            // not turn this into SIGINT, so without a binding it does nothing at all — and a
+            // program you cannot get out of is not one people give a second chance.
+            ("<C-c>", "interrupt", "Cancel, clear, or quit"),
+            // Reading the transcript is a separate place, and this is the door to it.
+            ("<C-s>", "chat.read", "Read, select and copy the transcript"),
+        ] {
+            for mode in [Mode::Normal, Mode::Insert, Mode::Visual, Mode::Chat] {
                 let _ = self.editor.apply(&plugin, ApiCall::KeymapSet {
                     mode,
                     lhs: lhs.to_string(),
@@ -4809,6 +5044,33 @@ impl Host {
                     desc: Some(desc.to_string()),
                 });
             }
+        }
+        for (lhs, command, desc) in [
+            // Scrolling that leaves the cursor behind, which is what you want when the composer
+            // has it. Reading binds the same two keys to a screen of *motion*, because there the
+            // cursor is the thing you are moving.
+            ("<PageUp>", "chat.scroll_up", "Scroll up"),
+            ("<PageDown>", "chat.scroll_down", "Scroll down"),
+            ("<C-End>", "chat.scroll_end", "Back to the newest message"),
+            ("<C-x>", "edit.cut", "Cut the selection"),
+            ("<C-a>", "edit.select_all", "Select everything"),
+            // `^Y`, because it is readline's: `^U` and `^W` kill, `^Y` brings back what was
+            // killed, and those two are already the composer's. Sending while a turn runs is a
+            // kill of the same kind — the sentence leaves the field — so the key that undoes it is
+            // the one a terminal's fingers already know.
+            //
+            // It used to be `⇧↑`, which needs an arrow, and a keyboard without arrows could not
+            // reach it at all. It also took `⇧↑` away from the composer, where it is how you select
+            // upward through a pasted snippet — the field handles it and never saw it.
+            ("<C-y>", "chat.queue.edit", "Take the last queued message back"),
+        ] {
+            let _ = self.editor.apply(&plugin, ApiCall::KeymapSet {
+                mode: Mode::Chat,
+                lhs: lhs.to_string(),
+                command: command.to_string(),
+                scope: None,
+                desc: Some(desc.to_string()),
+            });
         }
     }
 
@@ -5840,6 +6102,42 @@ fn transcript(
             lines.insert(row as usize, r.text);
         }
     }
+    // A card's header, from what the conversation says about every call on it.
+    //
+    // The results are read out of `answered` rather than off the legs: a result block always comes
+    // *after* the call it answers, and a header that only settled on the second pass would show
+    // every finished call as running for one frame of every switch.
+    fn header_of(
+        g: &Glyphs,
+        card: &Card,
+        answered: &std::collections::HashMap<&neosh_proto::ToolCallId, (bool, Option<i64>, usize)>,
+        root: &std::path::Path,
+        width: usize,
+    ) -> cards::Row {
+        let heads: Vec<cards::Head> = card
+            .legs
+            .iter()
+            .map(|leg| {
+                let (state, exit, output) = match answered.get(&leg.id) {
+                    Some((true, exit, n)) => (ToolState::Failed, *exit, Some(*n)),
+                    Some((false, _, n)) => (ToolState::Done, None, Some(*n)),
+                    None => (ToolState::Running, None, None),
+                };
+                cards::Head {
+                    name: &leg.name,
+                    input: &leg.input,
+                    state,
+                    took: None,
+                    exit,
+                    output,
+                }
+            })
+            .collect();
+        match heads.as_slice() {
+            [one] => cards::header(g, one, root, width),
+            many => cards::group_header(g, many, root, width),
+        }
+    }
     // A gap, unless there already is one: what came before was often a tool card, which has no
     // trailing blank of its own, and the next thing butted against it reads as part of it.
     fn gap(lines: &mut Vec<String>) {
@@ -5876,7 +6174,11 @@ fn transcript(
                 }
                 ContentBlock::Text { text } => {
                     // Through the same renderer the live stream uses, so switching away and back
-                    // does not change what an answer looks like.
+                    // does not change what an answer looks like — and behind the same blank row,
+                    // which `open_answer_row` puts there live and this used to leave out. Nothing
+                    // showed while a card had no air of its own; the moment one did, a sentence
+                    // after a card was the only thing on the screen still butted against it.
+                    gap(&mut lines);
                     let at = lines.len() as u32;
                     let (rendered, styled) = crate::markdown::render(text);
                     marks.extend(
@@ -5888,33 +6190,51 @@ fn transcript(
                 // Gated on the same setting the live path uses. Drawn unconditionally, switching
                 // conversations with tool cards off made them all appear.
                 ContentBlock::ToolUse { id, name, input } if show_tools => {
-                    // The dot says how it went, which the conversation already records: a call
+                    // The mark says how it went, which the conversation already records: a call
                     // with a result somewhere after it is finished, and one without is still
                     // running. Nothing here has to remember anything.
-                    let (state, exit, output) = match answered.get(id) {
-                        Some((true, exit, n)) => (ToolState::Failed, *exit, Some(*n)),
-                        Some((false, _, n)) => (ToolState::Done, None, Some(*n)),
-                        None => (ToolState::Running, None, None),
+                    let exit = match answered.get(id) {
+                        Some((true, exit, _)) => *exit,
+                        _ => None,
                     };
-                    let head = cards::Head { name, input, state, took: None, exit, output };
-                    let card = cards::header(&g, &head, root, width);
-                    let at = lines.len() as u32;
-                    cards.push(Card {
+                    let leg = Leg {
                         id: id.clone(),
                         name: name.clone(),
                         input: input.clone(),
+                        // The result is filled in when its block is reached, which is what puts a
+                        // body under the right header. The *header* cannot wait for that — it is
+                        // written now, from `answered`, or a restored transcript would show every
+                        // call as running until the second pass.
                         result: None,
                         // Nothing here watched the call happen, so nothing here can say how long it
                         // took. A restored transcript is a record, not a replay.
                         started: None,
                         took: None,
                         exit,
-                        row: at,
-                        body: 0,
-                        expanded: false,
-                    });
-                    marks.extend(Mark::of(at, &card));
-                    lines.push(card.text.clone());
+                    };
+                    // Onto the run above when there is one and nothing has been drawn since — the
+                    // same rule the live path uses, because the two have to produce the same rows.
+                    let open = cards
+                        .last()
+                        .filter(|c| c.row + c.body + 1 == lines.len() as u32)
+                        .is_some_and(|c| c.takes(input));
+                    let at = if open {
+                        let i = cards.len() - 1;
+                        cards[i].legs.push(leg);
+                        cards[i].row
+                    } else {
+                        // The row of air the live path puts between one action and the next.
+                        gap(&mut lines);
+                        let at = lines.len() as u32;
+                        cards.push(Card::new(leg, at));
+                        lines.push(String::new());
+                        at
+                    };
+                    let i = cards.len() - 1;
+                    let row = header_of(&g, &cards[i], &answered, root, width);
+                    marks.retain(|m| m.row != at);
+                    marks.extend(Mark::of(at, &row));
+                    lines[at as usize] = row.text;
                 }
                 ContentBlock::ToolUse { .. } => {}
                 // Errors show even with tool cards off, exactly as they do live: the setting is
@@ -5926,18 +6246,28 @@ fn transcript(
                         content: content.clone(),
                         is_error: *is_error,
                     };
-                    match cards.iter().rposition(|c| c.id == *tool_use_id) {
+                    let found = cards
+                        .iter()
+                        .enumerate()
+                        .rev()
+                        .find_map(|(i, c)| c.leg_of(tool_use_id).map(|k| (i, k)));
+                    match found {
                         // Under its own header, however many other calls came between.
-                        Some(i) => {
+                        Some((i, k)) => {
                             if !*is_error {
-                                cards::tally(&mut changes, &cards::edits_of(&cards[i].input));
+                                cards::tally(&mut changes, &cards::edits_of(&cards[i].legs[k].input));
                             }
-                            let rows =
-                                cards::body(&g, &cards[i].input, &result, limits, false, width);
+                            // A run holds its calls' answers and shows none of them: it is one row
+                            // until somebody opens it, exactly as it is live.
+                            let rows = if cards[i].legs.len() > 1 {
+                                Vec::new()
+                            } else {
+                                cards::body(&g, &cards[i].legs[k].input, &result, limits, false, width)
+                            };
                             let n = rows.len() as u32;
                             let at = cards[i].row + 1;
                             insert(&mut lines, &mut marks, &mut cards, at, rows);
-                            cards[i].result = Some(result);
+                            cards[i].legs[k].result = Some(result);
                             cards[i].body = n;
                         }
                         // No card to go under — cards are off and this is an error — so at the
