@@ -17,7 +17,7 @@ use crate::agent::{HookName, HookOutcome, HookPayload, StopReason, ToolCall, Too
 use crate::api::{ApiCall, ApiResponse, KeyContext};
 use crate::ids::{BufferId, RequestId, SessionId, StreamId, TurnId, WindowId};
 use crate::options::OptionValue;
-use crate::provider::{ModelSelection, TurnRequest};
+use crate::provider::{Activity, ModelSelection, TurnRequest};
 
 // ---------------------------------------------------------------------------
 // plugin -> host
@@ -97,6 +97,12 @@ pub enum PluginEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         key: Option<KeyContext>,
     },
+    /// A viewer connected to a workspace that was already running.
+    ///
+    /// Only matters to a plugin that draws a [`crate::SurfaceId`]: the core forwards a surface's
+    /// cells and does not keep a copy, so the claim can be re-announced to a new client and the
+    /// contents cannot. Anything drawn into a buffer is republished without the plugin's help.
+    ViewAttached,
     /// A buffer the plugin attached to changed. Mirrors the splice the core performed.
     BufferChanged {
         buf: BufferId,
@@ -178,6 +184,18 @@ pub enum PluginEvent {
     /// naming the wrong model and a context meter measuring against the wrong window.
     SelectionChanged {
         selection: ModelSelection,
+    },
+    /// What a driver's own loop said about itself — a sub-agent, a plan, a compaction, how full
+    /// its context is. See [`crate::Activity`].
+    ///
+    /// Broadcast for the same reason the turn events are: a status line, a plan view and a usage
+    /// meter all want it and none of them caused it. It is also the only signal that moves *during*
+    /// a turn — everything else a plugin can hear about usage arrives when the turn ends, which for
+    /// an agent driver can be twenty minutes after the number changed.
+    Activity {
+        session: SessionId,
+        turn: TurnId,
+        activity: Activity,
     },
     /// What is in the composer now, after a keystroke, a paste, or a conversation switch.
     ///

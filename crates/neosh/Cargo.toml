@@ -14,6 +14,7 @@ neosh-agent = { workspace = true }
 neosh-script = { workspace = true }
 neosh-vcs = { workspace = true }
 neosh-tui = { workspace = true }
+neosh-syntax = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 toml = { workspace = true }

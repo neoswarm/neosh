@@ -1,10 +1,14 @@
 #!/usr/bin/env python3
 """Drive neosh in a pty and print what the screen looks like.
 
-Usage: shot.py [--cols N] [--rows N] [--wait MS] [--after MS] key [key ...]
+Usage: shot.py [--cols N] [--rows N] [--wait MS] [--after MS] [--color] key [key ...]
 
 Keys are literal text, or a name in angle brackets: <cr> <esc> <tab> <c-p> <up> ...
 A key of the form <wait:400> sleeps that many milliseconds.
+
+--color prints what colour every run of every row is, instead of the plain screen. A band behind a
+diff line and a syntax colour on top of it are both invisible to the plain dump, and "it looked
+right" is not a thing you can check by reading the renderer.
 """
 import os, pty, sys, time, select, signal, argparse
 
@@ -12,6 +16,10 @@ NAMED = {
     "cr": "\r", "esc": "\x1b", "tab": "\t", "bs": "\x7f", "space": " ",
     "up": "\x1b[A", "down": "\x1b[B", "right": "\x1b[C", "left": "\x1b[D",
     "s-tab": "\x1b[Z",
+    # Shifted arrows, in the modifier form every terminal this runs under emits. Named here
+    # because a binding on one is a binding no screenshot could otherwise reach.
+    "s-up": "\x1b[1;2A", "s-down": "\x1b[1;2B",
+    "s-right": "\x1b[1;2C", "s-left": "\x1b[1;2D",
     "f1": "\x1bOP", "f2": "\x1bOQ", "f3": "\x1bOR", "f4": "\x1bOS",
 }
 
@@ -28,6 +36,37 @@ def encode(tok: str) -> str:
         return "\x1b" + (NAMED.get(rest, rest))
     raise SystemExit(f"unknown key {tok}")
 
+def desc(key):
+    fg, bg, bold, italics, reverse = key
+    bits = []
+    if fg != "default":
+        bits.append(fg)
+    if bg != "default":
+        bits.append("on " + bg)
+    for on, name in ((bold, "bold"), (italics, "italic"), (reverse, "reverse")):
+        if on:
+            bits.append(name)
+    return "[" + ",".join(bits) + "]" if bits else "[-]"
+
+
+def runs(screen, y, cols):
+    """One row as (style, text) runs, with the untouched tail of the terminal dropped."""
+    row = screen.buffer[y]
+    out, cur, key = [], "", None
+    for x in range(cols):
+        c = row[x]
+        k = (c.fg, c.bg, c.bold, c.italics, c.reverse)
+        if k != key and cur:
+            out.append((key, cur))
+            cur = ""
+        key, cur = k, cur + c.data
+    if cur:
+        out.append((key, cur))
+    while out and out[-1][0][:2] == ("default", "default") and not out[-1][1].strip():
+        out.pop()
+    return out
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--cols", type=int, default=100)
@@ -36,6 +75,8 @@ def main():
     ap.add_argument("--after", type=int, default=700, help="ms to settle after the last key")
     ap.add_argument("--cmd", default="./target/debug/neosh")
     ap.add_argument("--arg", action="append", default=[], nargs="?", const="")
+    ap.add_argument("--color", action="store_true", help="print colour runs instead of plain text")
+    ap.add_argument("--grep", default=None, help="with --color, only rows containing this")
     ap.add_argument("keys", nargs="*")
     a = ap.parse_args()
 
@@ -76,10 +117,17 @@ def main():
         drain(120)
     drain(a.after)
 
-    print("┌" + "─" * a.cols + "┐")
-    for line in screen.display:
-        print("│" + line + "│")
-    print("└" + "─" * a.cols + "┘")
+    if a.color:
+        for y in range(a.rows):
+            text = screen.display[y]
+            if not text.strip() or (a.grep and a.grep not in text):
+                continue
+            print(f"{y:3} " + "  ".join(f"{desc(k)}{v!r}" for k, v in runs(screen, y, a.cols)))
+    else:
+        print("┌" + "─" * a.cols + "┐")
+        for line in screen.display:
+            print("│" + line + "│")
+        print("└" + "─" * a.cols + "┘")
 
     try:
         os.kill(pid, signal.SIGKILL)

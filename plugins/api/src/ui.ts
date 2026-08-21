@@ -13,7 +13,16 @@
  */
 
 import { byteLength, byteOffsets, clipToWidth, padToWidth, width } from "@neosh/api";
-import type { BufferId, Disposable, FileChange, FileState, KeyContext, Neosh, WindowId } from "@neosh/api";
+import type {
+  BufferId,
+  Disposable,
+  FileChange,
+  FileState,
+  FloatOptions,
+  KeyContext,
+  Neosh,
+  WindowId,
+} from "@neosh/api";
 
 // ---------------------------------------------------------------------------
 // Fuzzy matching
@@ -351,6 +360,38 @@ export interface PickerOptions<T> {
    * question is not helped by being told that `↵` chooses.
    */
   hints?: string;
+  /**
+   * Where the float goes. The middle of the screen unless you say otherwise.
+   *
+   * `{ kind: "dock", dock: "bottom" }` with a negative row offset is how a *completion* is placed:
+   * against the message field, above it, rather than over the transcript it has nothing to do with.
+   */
+  anchor?: FloatOptions["anchor"];
+  /** Shifted from the anchor. Negative rows go up. */
+  offset?: { row: number; col: number };
+  /**
+   * How the filter matches.
+   *
+   * `"fuzzy"` — the default — scores a subsequence match over the label *and* `keywords`, which is
+   * what you want in a search box: you are looking for something and half-remember a word from its
+   * description.
+   *
+   * `"name"` matches the start of the label first, then anywhere in it, and never looks at
+   * `keywords` at all. That is what a **command menu** needs, and the difference is not cosmetic.
+   * Typing `compact` into a fuzzy list of every command matches half of them — `c`…`o`…`m`…`p`…
+   * are letters that occur in that order in almost any English sentence, and descriptions are
+   * sentences — so the top row is something unrelated and `↵` runs it. A menu whose accept key
+   * does an arbitrary thing is worse than one with no matching at all.
+   */
+  match?: "fuzzy" | "name";
+  /**
+   * The filter changed.
+   *
+   * The hook that lets a picker stay in step with something outside itself — a completion that
+   * mirrors what is typed back into the composer, so the field says what you typed and dismissing
+   * the list leaves it there.
+   */
+  onQuery?(query: string): void;
 }
 
 const NS = "neosh.ui.picker";
@@ -395,7 +436,8 @@ export async function picker<T>(
   const hints = opts.hints ?? defaultHints(keys, filtering);
 
   const win = await neosh.float.open(buf, {
-    anchor: { kind: "screen" },
+    anchor: opts.anchor ?? { kind: "screen" },
+    offset: opts.offset,
     width: { kind: "fixed", n: width },
     // Exactly the rows that get drawn: the list, plus a filter line when there is one, a title
     // when there is one, and the key strip unless it was waived.
@@ -417,6 +459,7 @@ export async function picker<T>(
   const rank = (pool: PickerItem<T>[], q: string) => {
     const scored = pool
       .map((item, index) => {
+        if (opts.match === "name") return byName(item, index, q);
         const hay = item.keywords ? `${item.label} ${item.keywords}` : item.label;
         const m = fuzzy(hay, q);
         return m ? { item, index, positions: m.positions, score: m.score } : null;
@@ -432,6 +475,24 @@ export async function picker<T>(
     visible = rank(items, query);
     cursor = Math.min(cursor, Math.max(0, visible.length - 1));
   };
+
+  /**
+   * A row matched by the start of its name, then by any part of it.
+   *
+   * Two tiers and nothing else, because the whole point of this mode is that it is *predictable*:
+   * you can tell from what you have typed which row you are about to accept. Longer names score
+   * lower within a tier so an exact `git.diff` outranks `git.diff.staged`, and the highlighted
+   * positions are the run that matched, which is where the eye is already looking.
+   */
+  function byName(item: PickerItem<T>, index: number, q: string) {
+    if (!q) return { item, index, positions: [] as number[], score: 0 };
+    const label = item.label.toLowerCase();
+    const needle = q.toLowerCase();
+    const at = label.indexOf(needle);
+    if (at < 0) return null;
+    const positions = Array.from({ length: needle.length }, (_, k) => at + k);
+    return { item, index, positions, score: (at === 0 ? 1000 : 500) - label.length };
+  }
 
   // Which fetch is current. A slow source answering after you have typed again would replace a
   // newer list with an older one, and the row under your finger would change out from under it.
@@ -459,6 +520,11 @@ export async function picker<T>(
   };
 
   const render = async () => {
+    // A burst of keys — anyone typing at speed, or a paste — arrives as several invocations of the
+    // key command at once, and any of them may be the one that accepts and closes. Whichever runs
+    // next would then be drawing into a window that is gone, which is not an error worth reporting
+    // to the user: it is this widget racing itself.
+    if (closed) return;
     // Keep the cursor on screen without recentring on every keystroke.
     if (cursor < top) top = cursor;
     if (cursor >= top + height) top = cursor - height + 1;
@@ -478,7 +544,14 @@ export async function picker<T>(
     }
     // Pushed onto the last row rather than floated: the float is sized for it, and a strip that
     // moved up as the list shortened would be a strip you have to look for.
-    const hintLine = hints === "" ? -1 : lines.length + Math.max(0, height - window.length);
+    //
+    // The placeholder takes a row of the list's own space, so an empty list has used one of the
+    // `height` rows and not none. Counting it as none put the strip one row past the bottom of a
+    // float sized for exactly `height`, where it was silently clipped — leaving the empty state,
+    // the one state where you most want to be told what the keys do, as the only one with no keys
+    // on it.
+    const listRows = Math.max(1, window.length);
+    const hintLine = hints === "" ? -1 : lines.length + Math.max(0, height - listRows);
     if (hintLine >= 0) {
       while (lines.length < hintLine) lines.push("");
       lines.push(` ${hints}`);
@@ -557,9 +630,22 @@ export async function picker<T>(
 
   const last = () => Math.max(0, visible.length - 1);
 
+  /**
+   * Change the filter, and tell whoever is watching.
+   *
+   * One place, because four separate cases used to do it themselves and each one had to remember
+   * the refetch. A completion also has to say so outwards, so the composer it is completing keeps
+   * showing what has been typed.
+   */
+  const retype = async (next: string) => {
+    query = next;
+    await refetch();
+    opts.onQuery?.(query);
+  };
+
   disposers.push(
     await neosh.cmd.register(command, async (_args, key) => {
-      if (!key) return;
+      if (!key || closed) return;
       const before = cursor;
       // Settings first, so a rebound key wins over what the widget would otherwise do with it.
       const action = actionFor(keys, key.key);
@@ -598,12 +684,10 @@ export async function picker<T>(
           cursor = last();
           break;
         case "clear":
-          query = "";
-          await refetch();
+          await retype("");
           break;
         case "delete_word":
-          query = dropSegment(query);
-          await refetch();
+          await retype(dropSegment(query));
           break;
         case "complete": {
           // Take the highlighted row into the field without accepting it — how you walk into a
@@ -611,22 +695,26 @@ export async function picker<T>(
           await inflight;
           const chosen = visible[cursor];
           if (!chosen || !opts.freeform) return;
-          query = chosen.item.label;
           cursor = 0;
-          await refetch();
+          await retype(chosen.item.label);
           break;
         }
         default: {
           if (!filtering) return;
           if (key.key.code.kind === "backspace") {
-            query = query.slice(0, -1);
-            await refetch();
+            // Backspacing off the end of an empty filter dismisses, so a completion feels like
+            // part of the field rather than a window in front of it. Only where there is something
+            // outside to fall back to — a picker with nowhere to put the keystroke keeps it.
+            if (!query && opts.onQuery) {
+              await close(null);
+              return;
+            }
+            await retype(query.slice(0, -1));
             break;
           }
           if (key.key.code.kind !== "char" || key.key.mods.ctrl || key.key.mods.alt) return;
-          query += key.key.code.c;
           cursor = 0;
-          await refetch();
+          await retype(query + key.key.code.c);
           break;
         }
       }

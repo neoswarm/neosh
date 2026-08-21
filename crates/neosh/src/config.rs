@@ -89,7 +89,12 @@ pub struct PermissionsConfig {
 impl Default for PermissionsConfig {
     fn default() -> Self {
         Self {
-            mode: PermissionMode::Ask,
+            // Full access, and said out loud. Every other setting here is an allow-list, and an
+            // allow-list is only worth writing once you have found out what you keep allowing —
+            // which you cannot do from behind a prompt you dismiss without reading. A mode you can
+            // see in the footer and change with one key is a better guard than one that trains you
+            // to say yes.
+            mode: PermissionMode::Allow,
             allow_commands: Vec::new(),
             allow_hosts: Vec::new(),
             allow_roots: Vec::new(),
@@ -404,7 +409,7 @@ mod tests {
     fn an_absent_config_yields_working_defaults() {
         let t = tmp("absent");
         let r = resolve(&paths(&t), &t.0.join("work"), Status::NoProjectConfig).unwrap();
-        assert_eq!(r.permissions.mode, PermissionMode::Ask);
+        assert_eq!(r.permissions.mode, PermissionMode::Allow);
         assert!(r.providers.is_empty());
         assert!(r.init_scripts.is_empty());
     }
@@ -570,7 +575,7 @@ mod tests {
         p.clean = true;
         let r = resolve(&p, &t.0.join("work"), Status::Trusted).unwrap();
         assert!(r.init_scripts.is_empty() && r.plugin_dirs.is_empty());
-        assert_eq!(r.permissions.mode, PermissionMode::Ask, "defaults, not the file");
+        assert_eq!(r.permissions.mode, PermissionMode::Allow, "defaults, not the file");
     }
 
     #[test]

@@ -54,6 +54,27 @@ impl Paths {
         Self { config, data, state, cache, clean }
     }
 
+    /// The socket a running workspace listens on.
+    ///
+    /// Keyed by the *config* directory and not by the working directory, because one workspace
+    /// holds every project: `^T` already lists conversations across checkouts, and a socket per
+    /// directory would mean a window in one repository could not see an agent running in another.
+    /// Keying on config rather than on the user is what keeps a `--config-dir` sandbox — every
+    /// integration test, and `--clean` — out of the workspace you are actually using.
+    ///
+    /// Under `$XDG_RUNTIME_DIR` where there is one: it is the directory the operating system
+    /// promises to clear when the session ends, which is exactly the lifetime of a socket. State
+    /// is the fallback, and a stale socket file there is handled by connecting to it before
+    /// binding — a file nobody answers is a workspace that died, not one that is busy.
+    pub fn socket(&self) -> PathBuf {
+        let dir = std::env::var_os("XDG_RUNTIME_DIR")
+            .map(PathBuf::from)
+            .filter(|p| p.is_absolute())
+            .map(|p| p.join("neosh"))
+            .unwrap_or_else(|| self.state.join("run"));
+        dir.join(format!("{}.sock", key_for(&self.config)))
+    }
+
     /// The user's config script. This is neosh's `init.lua`.
     pub fn init_script(&self) -> PathBuf {
         self.config.join("init.ts")
@@ -152,4 +173,18 @@ mod tests {
         assert_eq!(env_dir("NEOSH_TEST_EMPTY_DIR"), None);
         unsafe { std::env::remove_var("NEOSH_TEST_EMPTY_DIR") };
     }
+}
+
+/// A short, stable, filesystem-safe name for a path.
+///
+/// FNV-1a rather than anything cryptographic: this names a socket, and the only property required
+/// of it is that two different config directories do not collide. Written by hand because a hash
+/// crate for sixteen characters of output is a dependency for the sake of sixteen characters.
+fn key_for(path: &Path) -> String {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in path.as_os_str().as_encoded_bytes() {
+        h ^= u64::from(*b);
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    format!("{h:016x}")
 }

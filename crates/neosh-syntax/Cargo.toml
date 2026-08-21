@@ -1,0 +1,18 @@
+[package]
+name = "neosh-syntax"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+# Used as a *parser* and nothing else: the scope stack it produces is mapped onto neosh's own
+# `Syntax.*` groups, and its themes are never loaded. `fancy-regex` rather than `onig`, so the
+# tree stays pure Rust and cross-compiles like the rest of it.
+syntect = { version = "5", default-features = false, features = [
+    "parsing",
+    "regex-fancy",
+    "default-syntaxes",
+] }
+two-face = { version = "0.5", default-features = false, features = ["syntect-fancy"] }

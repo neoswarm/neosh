@@ -12,11 +12,34 @@
  * accepts depends on its project directory, its plugins and its MCP servers, and a list written
  * down here would be wrong on the first machine that had one of its own.
  *
- * What happens on accept differs, and that is the whole of the difference:
+ * # It is a completion, not a dialogue
+ *
+ * The first version of this was an ordinary picker: a modal list in the middle of the screen, its
+ * own filter box, fuzzy-matched over every command's *description*. Three things were wrong with
+ * that, and they compounded.
+ *
+ * The composer kept the `/` that opened it and nothing else, so what you typed went somewhere you
+ * could not see. The filter matched descriptions, so `compact` — six letters that occur in that
+ * order in a great many English sentences — matched a dozen unrelated commands and put one of them
+ * under the cursor. And `↵` *ran* whatever was under the cursor. Typing `/compact` and pressing
+ * enter therefore ran something else entirely, silently, while `/compact` itself was not in the
+ * list at all: a driver only reports its commands after the conversation has run a turn, and a
+ * fresh conversation has not.
+ *
+ * What replaces it holds to one rule: **the composer is the field, and this is a suggestion about
+ * what is in it.** What you type goes into the composer and the menu follows. Matching is on the
+ * *name*, anchored at the start, never on descriptions. Backspacing past the `/` dismisses it. And
+ * when nothing matches, `↵` sends what you typed, verbatim — because a name this list has never
+ * heard of is not a mistake, it is a command the driver knows about and neosh has not been told
+ * about yet. A conversation that has not run a turn knows *none* of the driver's commands, so on a
+ * fresh conversation that is the only way `/compact` can work at all.
+ *
+ * What happens on accept differs by which vocabulary the row came from, and that is the whole of
+ * the difference:
  *
  * * a neosh command runs, and the draft is cleared, because it was never a message;
- * * a driver command is *written into the composer*, because it is a message — one the driver will
- *   recognise when it arrives — and because it may still want an argument.
+ * * a driver command with no argument is *sent*, because it is a message and it is finished;
+ * * one that takes an argument is written into the composer, because it is not.
  */
 
 import type { Neosh, PluginContext } from "@neosh/api";
@@ -24,29 +47,55 @@ import { picker } from "@neosh/api/ui";
 
 type Entry =
   | { kind: "command"; name: string }
-  | { kind: "driver"; name: string; takesArgument: boolean };
+  | { kind: "driver"; name: string; takesArgument: boolean }
+  | { kind: "verbatim"; text: string };
 
 /** Commands that are plumbing rather than something to invoke. */
 const HIDDEN = /\.key$|^slash\./;
 
+/**
+ * What the composer has to look like for the menu to be about it: a slash, then a command name,
+ * and nothing else. A space ends it — by then you are typing an argument, and the menu has no
+ * opinion about arguments — and so does a second line.
+ */
+const TOKEN = /^\/([\w.:-]*)$/;
+
 export async function activate({ neosh, subscriptions }: PluginContext) {
+  let draft = "";
+  let open = false;
+
+  // Opened deliberately — from `^K`, from a binding, from another plugin — starting from whatever
+  // command name is already half-typed. Marked open for the same reason the draft path is: the menu
+  // writes the composer back, and a second one opening on its own echo would take the keyboard from
+  // the first.
+  const start = async (query: string) => {
+    if (open) return;
+    open = true;
+    await show(neosh, query, () => (open = false));
+  };
+
   subscriptions.push(
-    await neosh.cmd.register("slash.open", () => open(neosh), {
+    await neosh.cmd.register("slash.open", () => start(TOKEN.exec(draft)?.[1] ?? ""), {
       desc: "Run a command by name, neosh's or the agent's",
     }),
   );
 
-  // Opened by the draft rather than by a key. `/` has to stay a character you can type — a
-  // binding on it would mean no message could ever begin with one — so the menu follows what is
-  // in the composer: a lone slash, and nothing else yet.
+  // Opened by the draft rather than by a key. `/` has to stay a character you can type — a binding
+  // on it would mean no message could ever begin with one — so the menu follows what is in the
+  // composer.
+  //
+  // Only on the *bare* slash, and not again while it is up. Once it is open it is the menu that
+  // owns the keyboard and the menu that writes the composer back, so every keystroke from then on
+  // arrives here as an echo of something this plugin just did. Re-opening on those is a loop.
   subscriptions.push(
     neosh.agent.onComposerChange(({ text }) => {
-      if (text === "/") void open(neosh);
+      draft = text;
+      if (text === "/") void start("");
     }),
   );
 }
 
-async function open(neosh: Neosh): Promise<void> {
+async function show(neosh: Neosh, query: string, done: () => void): Promise<void> {
   const [commands, keymaps, driver] = await Promise.all([
     neosh.cmd.list(),
     neosh.keymap.list("chat"),
@@ -62,9 +111,8 @@ async function open(neosh: Neosh): Promise<void> {
     // The agent's first. They are the ones you cannot find any other way — every neosh command is
     // also in `^K`, and none of the agent's is.
     ...driver.map((d) => ({
-      label: `/${d.name}`,
+      label: d.name,
       detail: [d.description, d.argument_hint].filter(Boolean).join("   ") || "the agent's",
-      keywords: "agent driver",
       value: {
         kind: "driver",
         name: d.name,
@@ -76,32 +124,62 @@ async function open(neosh: Neosh): Promise<void> {
       .map((c) => ({
         label: c.name,
         detail: [keyFor.get(c.name), c.desc].filter(Boolean).join("   "),
-        keywords: `${c.desc ?? ""} ${c.plugin}`,
         value: { kind: "command", name: c.name } as Entry,
       })),
   ];
 
   const chosen = await picker(neosh, items, {
     title: "Run",
-    placeholder: "nothing matches",
+    // Anchored to the field it is completing and lifted clear of it, the way every completion
+    // menu in every editor is placed. In the middle of the screen it covered the answer you were
+    // reading and pointed at nothing.
+    anchor: { kind: "dock", dock: "bottom" },
+    match: "name",
+    query,
+    // The composer is the field. Everything typed here goes back into it, so the message says what
+    // you typed and escaping the menu leaves it exactly there — mid-word, ready to keep going.
+    onQuery: (q) => void neosh.agent.setDraft(`/${q}`),
+    // What `↵` does when nothing is highlighted, which here means nothing matched. Without it the
+    // accept key would do nothing at all on exactly the input that most needs it to work.
+    freeform: (q) => (q ? ({ kind: "verbatim", text: `/${q}` } as Entry) : null),
+    placeholder: "not one of ours \u2014 \u21b5 sends it to the agent as typed",
     width: 78,
-    height: 14,
+    // Short. It is a hint about a word you are half-way through typing, not a catalogue — `^K` is
+    // the catalogue — and a menu that eats a third of the transcript to say so is one you close
+    // before reading.
+    height: 8,
+    hints: "↵ run   ↑/↓ move   type to filter   esc keep typing",
   });
+  done();
 
-  // Escaped. The slash that opened this is still in the composer and stays there: it may have been
-  // the first character of an ordinary sentence.
+  // Escaped, or filtered down to nothing. Either way what was typed is in the composer, where it
+  // was being typed, and it stays there: it may have been the first word of an ordinary sentence.
   if (!chosen) return;
 
   try {
-    if (chosen.kind === "command") {
-      await neosh.agent.setDraft("");
-      await neosh.cmd.exec(chosen.name);
-      return;
+    switch (chosen.kind) {
+      case "command":
+        await neosh.agent.setDraft("");
+        await neosh.cmd.exec(chosen.name);
+        return;
+      // Finished being typed, so it goes. Leaving a complete command sitting in the composer for a
+      // second confirmation is a keystroke that asks nothing: you chose it from a list. One that
+      // takes an argument is *not* finished, and stays where you can add it.
+      case "driver":
+        if (chosen.takesArgument) {
+          await neosh.agent.setDraft(`/${chosen.name} `);
+          return;
+        }
+        await neosh.agent.setDraft("");
+        await neosh.agent.send(`/${chosen.name}`);
+        return;
+      // Not in the list, which is not the same as wrong: the driver is the one that gets to say
+      // whether it knows this name, and it will say so in its own words.
+      case "verbatim":
+        await neosh.agent.setDraft("");
+        await neosh.agent.send(chosen.text);
+        return;
     }
-    // Left in the composer rather than sent. One that takes an argument is not finished being
-    // typed, and even one that does not deserves the half-second in which you can see what you are
-    // about to run.
-    await neosh.agent.setDraft(`/${chosen.name}${chosen.takesArgument ? " " : ""}`);
   } catch (e) {
     neosh.notify(String(e), "warn");
   }

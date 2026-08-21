@@ -21,12 +21,29 @@ pub struct MockProvider {
     scripts: Mutex<Vec<Vec<ProviderEvent>>>,
     /// Every request the host made, for assertions.
     pub seen: Arc<Mutex<Vec<TurnRequest>>>,
+    /// How long to wait before each event.
+    ///
+    /// Zero, and a mock turn is over before the host has drawn it — which is what almost every
+    /// test wants and is useless to the ones that need a turn to still be running while something
+    /// else happens to it: closing the terminal, asking what is going on, switching away. Pacing
+    /// the mock is the only way to write those without a real model and a real wait.
+    pace: Option<std::time::Duration>,
 }
 
 impl MockProvider {
     pub fn new(scripts: Vec<Vec<ProviderEvent>>) -> Self {
         // Reversed so `pop` yields them in the order given.
-        Self { scripts: Mutex::new(scripts.into_iter().rev().collect()), seen: Arc::default() }
+        Self {
+            scripts: Mutex::new(scripts.into_iter().rev().collect()),
+            seen: Arc::default(),
+            pace: None,
+        }
+    }
+
+    /// Wait this long before each event, so a turn takes long enough to be interrupted.
+    pub fn paced(mut self, per_event: std::time::Duration) -> Self {
+        self.pace = Some(per_event);
+        self
     }
 
     /// A single assistant turn that streams `chunks` as text and ends cleanly.
@@ -100,9 +117,15 @@ impl Provider for MockProvider {
             .unwrap_or_else(|| Self::text_turn(&["(mock provider has no script left)"]));
 
         // Honour cancellation the same way a real driver does, so tests exercise the real path.
+        let pace = self.pace;
         Box::pin(futures::stream::iter(script).take_while(move |_| {
             let cancelled = cancel.is_cancelled();
             async move { !cancelled }
+        }).then(move |ev| async move {
+            if let Some(d) = pace {
+                tokio::time::sleep(d).await;
+            }
+            ev
         }))
     }
 }

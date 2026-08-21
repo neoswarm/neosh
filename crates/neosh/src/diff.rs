@@ -18,6 +18,20 @@ pub enum Op {
 pub struct Line {
     pub op: Op,
     pub text: String,
+    /// Where this line sits in the file, when whoever produced the diff said so.
+    ///
+    /// `None` is the common case and an honest one. An `old_string`/`new_string` edit describes a
+    /// fragment and never says where in the file the fragment was found, so a number here would
+    /// have to be invented — by searching the file for the fragment, which is a different answer
+    /// the moment the file has moved on, and no answer at all for a conversation reopened on
+    /// another machine. A unified patch, on the other hand, carries `@@ -142,7 +142,9 @@` and
+    /// therefore knows exactly; so does a whole file written from scratch, where the content *is*
+    /// the file.
+    ///
+    /// A removed line is numbered in the old file and an added one in the new, which is the pair of
+    /// numbers a single column can show without lying: those are the only two files each of them
+    /// ever existed in.
+    pub at: Option<usize>,
 }
 
 #[derive(Default, Clone, PartialEq, Eq, Debug)]
@@ -56,9 +70,11 @@ const MAX_CELLS: usize = 4_000_000;
 pub fn unified(patch: &str) -> Diff {
     let mut out = Diff::default();
     let mut in_hunk = false;
+    let (mut old_at, mut new_at) = (0usize, 0usize);
     for line in patch.lines() {
         if line.starts_with("@@") {
             in_hunk = true;
+            (old_at, new_at) = hunk_starts(line);
             continue;
         }
         if !in_hunk || line.starts_with('\\') {
@@ -78,17 +94,54 @@ pub fn unified(patch: &str) -> Diff {
                 continue;
             }
         };
-        match op {
-            Op::Add => out.added += 1,
-            Op::Del => out.removed += 1,
-            Op::Keep => {}
-        }
-        out.lines.push(Line { op, text: text.to_string() });
+        let at = match op {
+            Op::Add => {
+                out.added += 1;
+                new_at += 1;
+                new_at - 1
+            }
+            Op::Del => {
+                out.removed += 1;
+                old_at += 1;
+                old_at - 1
+            }
+            Op::Keep => {
+                old_at += 1;
+                new_at += 1;
+                new_at - 1
+            }
+        };
+        // A patch with no `@@` at all — or one whose header did not parse — counts from zero, and
+        // a line numbered zero is a line about which nothing is known.
+        out.lines.push(Line { op, text: text.to_string(), at: (at > 0).then_some(at) });
     }
     out
 }
 
+/// The two starting line numbers a hunk header declares: `@@ -142,7 +150,9 @@`.
+///
+/// Both default to zero, which [`unified`] reads as "this patch did not say", so a malformed header
+/// costs the numbers and not the diff.
+fn hunk_starts(header: &str) -> (usize, usize) {
+    let mut old = 0;
+    let mut new = 0;
+    for field in header.split_whitespace() {
+        let (sign, rest) = field.split_at(field.chars().next().map_or(0, char::len_utf8));
+        let n: usize = rest.split(',').next().unwrap_or("").parse().unwrap_or(0);
+        match sign {
+            "-" => old = n,
+            "+" => new = n,
+            _ => {}
+        }
+    }
+    (old, new)
+}
+
 /// Diff two texts line by line.
+///
+/// The result carries no line numbers: these two strings are the *arguments to an edit*, not the
+/// file, and line one of an `old_string` is line one of nothing. Use [`whole_file`] for the case
+/// where the text genuinely is the file.
 pub fn lines(old: &str, new: &str) -> Diff {
     let a = split(old);
     let b = split(new);
@@ -157,7 +210,22 @@ fn split(text: &str) -> Vec<&str> {
 }
 
 fn keep(text: &str) -> Line {
-    Line { op: Op::Keep, text: text.to_string() }
+    Line { op: Op::Keep, text: text.to_string(), at: None }
+}
+
+/// A whole file, written from nothing: every line added, and numbered, because here the text under
+/// the diff *is* the file and line one is line one.
+///
+/// The distinction [`lines`] cannot make for itself. A write and an edit produce the same shape and
+/// only the caller knows which it handed over.
+pub fn whole_file(content: &str) -> Diff {
+    let lines: Vec<Line> = split(content)
+        .iter()
+        .enumerate()
+        .map(|(i, t)| Line { op: Op::Add, text: t.to_string(), at: Some(i + 1) })
+        .collect();
+    let added = lines.len();
+    Diff { lines, added, removed: 0 }
 }
 
 /// LCS alignment of the two middles. Falls back to "all of one, then all of the other" when the
@@ -166,8 +234,8 @@ fn align(a: &[&str], b: &[&str]) -> Vec<Line> {
     let (n, m) = (a.len(), b.len());
     let mut out = Vec::with_capacity(n + m);
     if n == 0 || m == 0 || (n + 1).saturating_mul(m + 1) > MAX_CELLS {
-        out.extend(a.iter().map(|t| Line { op: Op::Del, text: t.to_string() }));
-        out.extend(b.iter().map(|t| Line { op: Op::Add, text: t.to_string() }));
+        out.extend(a.iter().map(|t| Line { op: Op::Del, text: t.to_string(), at: None }));
+        out.extend(b.iter().map(|t| Line { op: Op::Add, text: t.to_string(), at: None }));
         return out;
     }
     let w = m + 1;
@@ -188,15 +256,15 @@ fn align(a: &[&str], b: &[&str]) -> Vec<Line> {
             i += 1;
             j += 1;
         } else if t[(i + 1) * w + j] >= t[i * w + j + 1] {
-            out.push(Line { op: Op::Del, text: a[i].to_string() });
+            out.push(Line { op: Op::Del, text: a[i].to_string(), at: None });
             i += 1;
         } else {
-            out.push(Line { op: Op::Add, text: b[j].to_string() });
+            out.push(Line { op: Op::Add, text: b[j].to_string(), at: None });
             j += 1;
         }
     }
-    out.extend(a[i..].iter().map(|t| Line { op: Op::Del, text: t.to_string() }));
-    out.extend(b[j..].iter().map(|t| Line { op: Op::Add, text: t.to_string() }));
+    out.extend(a[i..].iter().map(|t| Line { op: Op::Del, text: t.to_string(), at: None }));
+    out.extend(b[j..].iter().map(|t| Line { op: Op::Add, text: t.to_string(), at: None }));
     out
 }
 
@@ -214,7 +282,7 @@ mod tests {
         assert_eq!(d.added, 2, "the `+++` header is not an added line");
         assert_eq!(d.removed, 1);
         assert_eq!(d.lines.first().map(|l| l.op), Some(Op::Keep));
-        assert_eq!(d.lines[1], Line { op: Op::Del, text: "    println!(\"hi\");".into() });
+        assert_eq!(d.lines[1], Line { op: Op::Del, text: "    println!(\"hi\");".into(), at: Some(2) });
     }
 
     #[test]

@@ -19,10 +19,14 @@
 //! a terminal can show bold, so showing the asterisks *and* the bold is showing the same thing
 //! twice.
 //!
-//! There is deliberately no syntax highlighting inside code fences. Doing it properly means a
-//! grammar per language, and doing it improperly — a regex over keywords — colours the wrong words
-//! in exactly the code you are reading closely. A fenced block gets one colour and its language in
-//! the corner, which is honest about what is known.
+//! Code inside a fence is syntax-highlighted, by `neosh-syntax`, which is a real grammar per
+//! language and not a regex over keywords — the objection this file used to record was to
+//! *guessing*, and it stands. A fence whose language nobody has a grammar for is unchanged: one
+//! colour and the language in the corner, which is honest about what is known.
+//!
+//! The whole-row `Markdown.Code` mark stays under the token colours rather than being replaced by
+//! them. It is what `yc` finds when it goes looking for the block to copy, and it is the colour
+//! plain code is drawn in between the tokens that have one.
 //!
 //! Tables are not rendered as tables. Column widths depend on the terminal, the content and the
 //! wrap policy, and a table that reflows badly is harder to read than the pipes it came from.
@@ -159,6 +163,11 @@ fn render_into(text: &str, in_fence: &mut bool, lines: &mut Vec<String>, marks: 
     if text.is_empty() {
         return;
     }
+    // The highlighter for the fence currently open, if its language resolved. Local to this call
+    // and not carried on [`Md`], because a fence is only ever *settled* by its closing marker —
+    // so an open one is re-rendered whole on every tick, from its opening marker, and the state to
+    // carry across ticks is exactly none.
+    let mut code: Option<neosh_syntax::Incremental> = None;
     // `split_inclusive` keeps a trailing partial line, which is exactly what a streaming tail is.
     let raw: Vec<&str> = text.split_inclusive('\n').collect();
     let mut at = 0;
@@ -183,10 +192,12 @@ fn render_into(text: &str, in_fence: &mut bool, lines: &mut Vec<String>, marks: 
             let language = line.trim_start().trim_start_matches(['`', '~']).trim();
             if *in_fence {
                 *in_fence = false;
+                code = None;
                 // The closing marker is not drawn: it was punctuation for the parser.
                 continue;
             }
             *in_fence = true;
+            code = neosh_syntax::of_token(language).map(neosh_syntax::Incremental::new);
             if language.is_empty() {
                 continue;
             }
@@ -198,7 +209,13 @@ fn render_into(text: &str, in_fence: &mut bool, lines: &mut Vec<String>, marks: 
 
         if *in_fence {
             let text = format!("  {line}");
+            // The whole row first, then the tokens over the top of it. Both are wanted: the row
+            // mark is how a block is recognised, and at equal priority the frontend lets the
+            // narrower mark win, so the tokens are what you see.
             marks.push((row, 0, text.len(), "Markdown.Code"));
+            if let Some(h) = code.as_mut() {
+                marks.extend(h.line(line).into_iter().map(|(a, b, g)| (row, 2 + a, 2 + b, g)));
+            }
             lines.push(text);
             continue;
         }
@@ -611,6 +628,41 @@ mod tests {
         // The number is information; the bullet character is not. Renumbering silently would make
         // an answer that says "see step 3" wrong.
         assert_eq!(lines("1. first\n7. seventh\n"), vec!["  1. first", "  7. seventh"]);
+    }
+
+    #[test]
+    fn code_in_a_fence_is_coloured_by_its_grammar_and_still_copies_as_a_block() {
+        let (lines, marks) = render("```rust\nlet s = \"hi\"; // note\n```\n");
+        let groups: Vec<&str> = marks.iter().map(|m| m.3).collect();
+        assert!(groups.contains(&"Syntax.Keyword"), "{groups:?}");
+        assert!(groups.contains(&"Syntax.String"), "{groups:?}");
+        assert!(groups.contains(&"Syntax.Comment"), "{groups:?}");
+        // And the row is still marked whole, which is what `yc` looks for when it goes to copy
+        // the block. Losing this is losing the feature, silently and only for languages we know.
+        let code = lines.iter().position(|l| l.contains("let s")).expect("the code row");
+        assert!(
+            marks.iter().any(|m| m.0 == code && m.1 == 0 && m.2 == lines[code].len()
+                && m.3 == "Markdown.Code"),
+            "{marks:?}"
+        );
+    }
+
+    #[test]
+    fn a_fence_in_a_language_nobody_has_a_grammar_for_is_left_alone() {
+        let (_, marks) = render("```qqzz\nlet s = 1;\n```\n");
+        assert!(marks.iter().all(|m| !m.3.starts_with("Syntax.")), "{marks:?}");
+    }
+
+    #[test]
+    fn a_construct_open_across_a_fences_lines_stays_open() {
+        // The reason the highlighter is kept between lines rather than restarted per row: line two
+        // is only a comment because line one opened one.
+        let (lines, marks) = render("```rust\n/* one\n   two */\nfn f() {}\n```\n");
+        let two = lines.iter().position(|l| l.contains("two */")).expect("the second row");
+        assert!(
+            marks.iter().any(|m| m.0 == two && m.3 == "Syntax.Comment"),
+            "line two of a block comment is still a comment: {marks:?}"
+        );
     }
 
     #[test]

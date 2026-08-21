@@ -84,6 +84,10 @@ pub fn wrap_line(line: &Line<'static>, width_cols: usize) -> Vec<Line<'static>> 
     if total <= limit {
         return vec![line.clone()];
     }
+    // Whatever the row as a whole is styled with — the band under a changed diff line — belongs to
+    // every screen row it wraps onto. A green line that goes back to the terminal background
+    // halfway down reads as two lines, one of which changed.
+    let base = line.style;
 
     let mut out: Vec<Line<'static>> = Vec::new();
     let mut current: Vec<Span<'static>> = Vec::new();
@@ -95,7 +99,7 @@ pub fn wrap_line(line: &Line<'static>, width_cols: usize) -> Vec<Line<'static>> 
         while !text.is_empty() {
             let room = limit - used;
             if room == 0 {
-                out.push(Line::from(std::mem::take(&mut current)));
+                out.push(Line::from(std::mem::take(&mut current)).style(base));
                 used = 0;
                 continue;
             }
@@ -104,7 +108,7 @@ pub fn wrap_line(line: &Line<'static>, width_cols: usize) -> Vec<Line<'static>> 
                 if used > 0 {
                     // Something is on this line already — break, then retry the cluster against
                     // a full-width line. `used` drops to 0, so the next pass has more room.
-                    out.push(Line::from(std::mem::take(&mut current)));
+                    out.push(Line::from(std::mem::take(&mut current)).style(base));
                     used = 0;
                     continue;
                 }
@@ -113,7 +117,7 @@ pub fn wrap_line(line: &Line<'static>, width_cols: usize) -> Vec<Line<'static>> 
                 // line of its own and advance past it: flushing again would leave `text`, `used`
                 // and `current` exactly as they are, and the loop would never terminate.
                 let cluster = text.graphemes(true).next().unwrap_or(text);
-                out.push(Line::from(Span::styled(cluster.to_string(), style)));
+                out.push(Line::from(Span::styled(cluster.to_string(), style)).style(base));
                 text = &text[cluster.len()..];
                 continue;
             }
@@ -121,13 +125,13 @@ pub fn wrap_line(line: &Line<'static>, width_cols: usize) -> Vec<Line<'static>> 
             used += width(head);
             text = &text[head.len()..];
             if used >= limit && !text.is_empty() {
-                out.push(Line::from(std::mem::take(&mut current)));
+                out.push(Line::from(std::mem::take(&mut current)).style(base));
                 used = 0;
             }
         }
     }
     if !current.is_empty() || out.is_empty() {
-        out.push(Line::from(current));
+        out.push(Line::from(current).style(base));
     }
     out
 }
@@ -199,6 +203,17 @@ pub fn render_line_in(
     cuts.sort_unstable();
     cuts.dedup();
 
+    // The row's own background, under everything else on it. Highest priority wins the *base*,
+    // and every ranged group is then patched over it — so a syntax colour keeps its foreground and
+    // inherits the band, which is the one place in this vocabulary where two marks have to
+    // describe the same character at once.
+    let base = visible
+        .iter()
+        .filter(|m| m.opts.line_hl_group.is_some())
+        .max_by_key(|m| m.opts.priority)
+        .and_then(|m| m.opts.line_hl_group.as_deref())
+        .map(|g| theme.style(g));
+
     let mut spans: Vec<Span<'static>> = Vec::new();
     // Over cut *positions* rather than windows between them, because an empty line has exactly one
     // position and no windows at all — and dropping its inline text there would mean the prompt
@@ -222,17 +237,27 @@ pub fn render_line_in(
         if a == b {
             continue;
         }
+        // Highest priority wins, and on a tie the *narrower* mark does. Two marks at the same
+        // priority covering the same character are a general statement and a specific one — a
+        // fenced block is code and this word in it is a keyword — and the specific one is the one
+        // that was worth saying. Without the tie-break it comes down to which was set last, which
+        // is not something a caller should have to know.
         let group = visible
             .iter()
             .filter(|m| m.opts.hl_group.is_some())
-            .filter(|m| {
+            .filter_map(|m| {
                 let s = (m.col as usize).min(text.len());
                 let e = m.opts.end_col.map(|e| (e as usize).min(text.len())).unwrap_or(s);
-                s <= a && b <= e && e > s
+                (s <= a && b <= e && e > s).then(|| (m, e - s))
             })
-            .max_by_key(|m| m.opts.priority)
-            .and_then(|m| m.opts.hl_group.as_deref());
-        let style = group.map(|g| theme.style(g)).unwrap_or_else(Style::default);
+            .max_by_key(|(m, span)| (m.opts.priority, std::cmp::Reverse(*span)))
+            .and_then(|(m, _)| m.opts.hl_group.as_deref());
+        let style = match (base, group.map(|g| theme.style(g))) {
+            (Some(b), Some(g)) => b.patch(g),
+            (Some(b), None) => b,
+            (None, Some(g)) => g,
+            (None, None) => Style::default(),
+        };
         // A group that moves becomes one span per grapheme; everything else stays one span, because
         // splitting text that does not need splitting multiplies the span count of every line for
         // no visible difference.
@@ -290,9 +315,35 @@ pub fn render_line_in(
         spans.extend(right);
     }
 
-    out.push(Line::from(spans));
+    out.push(match base {
+        Some(b) => Line::from(spans).style(b),
+        None => Line::from(spans),
+    });
     out.extend(virt_lines(VirtTextPos::Below));
     out
+}
+
+/// Run a row's own background out to the right edge of the window.
+///
+/// `Paragraph` styles the cells a line's spans occupy and leaves the rest of the row at whatever the
+/// terminal already was, which for a diff means a green band that stops where the code stops. The
+/// band is the thing that says "this line changed", and one that ends in a ragged edge halfway
+/// across says it about the first forty columns.
+///
+/// Padding here rather than where the row was written is what makes it survive a resize: the width
+/// is the window's, now, and these rows are rebuilt from the mirror on every draw.
+fn fill_to_edge(line: Line<'static>, cols: usize) -> Line<'static> {
+    if line.style == Style::default() {
+        return line;
+    }
+    let used: usize = line.spans.iter().map(|s| width(&s.content)).sum();
+    if used >= cols {
+        return line;
+    }
+    let pad = Span::raw(" ".repeat(cols - used));
+    let mut spans = line.spans;
+    spans.push(pad);
+    Line::from(spans).style(line.style)
 }
 
 // ---------------------------------------------------------------------------
@@ -472,6 +523,20 @@ pub fn resolve_layout_with_rules(
             Anchor::Window { win: target } => {
                 out.iter().find(|(id, _)| *id == target).map(|(_, r)| (r.x, r.y)).unwrap_or((area.x, area.y))
             }
+            // Flush against the dock, on the main region's side of it — the float's near edge
+            // touching the dock's, not its far corner landing on it.
+            //
+            // Which is the whole point: a completion is placed by saying "against the message
+            // field" and nothing else. Anchoring the float's *top-left* to the strip would make
+            // every caller subtract its own height first, and the day one of them subtracts a
+            // number that is one out, the menu sits over the field it is completing. `main` is
+            // what the docks left behind, so each of these is the edge that dock was carved from.
+            Anchor::Dock { dock } => match dock {
+                Dock::Bottom => (main.x, (main.y + main.height).saturating_sub(ch)),
+                Dock::Left => (main.x, main.y),
+                Dock::Right => ((main.x + main.width).saturating_sub(cw), main.y),
+                Dock::Main => (main.x, main.y),
+            },
         };
 
         let x = (base_x as i64 + config.offset.col as i64)
@@ -634,6 +699,7 @@ fn rendered_lines(
                 .skip(w.top_line as usize)
                 .flat_map(|l| render_line_in(l, theme, Some(width as usize)))
                 .flat_map(|l| if wraps { wrap_line(&l, width as usize) } else { vec![l] })
+                .map(|l| fill_to_edge(l, width as usize))
                 .collect()
         })
         .unwrap_or_default()

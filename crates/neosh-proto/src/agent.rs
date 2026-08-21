@@ -165,6 +165,17 @@ pub struct SessionInfo {
     #[serde(default)]
     #[ts(type = "number")]
     pub context_tokens: u64,
+    /// The window those tokens are a fraction of, **as the driver reports it**.
+    ///
+    /// `None` when nothing has said, and then a catalogue figure is the best available guess. It is
+    /// only a guess: a vendor CLI's window is whatever that CLI decided, which is not always what a
+    /// catalogue says the model has. `claude` running `claude-haiku-4-5` answers `maxTokens:
+    /// 200000` while neosh's own entry for the selected model said a million — so the meter was
+    /// dividing a number it half-knew by a denominator it had invented, and read `2%` where the
+    /// agent itself would have said `8%`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(type = "number | null")]
+    pub context_window: Option<u64>,
     #[serde(default)]
     pub is_active: bool,
     /// Put away rather than thrown away.
@@ -178,6 +189,18 @@ pub struct SessionInfo {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(type = "number | null")]
     pub archived_at: Option<i64>,
+    /// What this conversation lets the agent do without asking.
+    ///
+    /// A property of the conversation and not of the process, because that is how it is used: a
+    /// throwaway question in someone else's repository and the branch you have been on all week are
+    /// not the same risk, and a mode that followed whichever one you looked at last would be a
+    /// setting you could only trust by re-reading it. It is saved with the conversation for the
+    /// same reason — coming back to a conversation should mean coming back to how it was set up.
+    ///
+    /// `None` means the conversation has never been given one and takes whatever `config.toml`
+    /// says.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub permission_mode: Option<PermissionMode>,
 }
 
 // ---------------------------------------------------------------------------
@@ -253,11 +276,19 @@ pub enum PermissionMode {
     AllowListed,
     /// Allow everything, without asking.
     ///
-    /// Exists because people were going to get it one way or another — by approving reflexively,
-    /// which is worse: it looks like consent and is not. Named plainly, shown in the status line
-    /// while it is on, and never the default. Workspace containment still applies: a path outside
-    /// the workspace is refused in every mode, because "full access" is about not being asked, not
-    /// about reaching the rest of the disk.
+    /// What `config.toml` starts you on, and what a conversation inherits when nobody has said
+    /// otherwise — because the alternative people actually reached was approving reflexively, which
+    /// is worse: it looks like consent and is not. So it is named plainly, said in the status line
+    /// the whole time it is on, and one keystroke from being turned off.
+    ///
+    /// Workspace containment still applies, in this mode as in every other: a path outside the
+    /// workspace is refused whatever the mode says, because "full access" is about not being asked,
+    /// not about reaching the rest of the disk.
+    ///
+    /// It is deliberately **not** this enum's [`Default`]. That one answers "a field was missing
+    /// from a payload", and the safe answer to a question nobody asked is still [`Self::Ask`]. The
+    /// default a person means lives in [`crate::PermissionMode`]'s caller — `PermissionsConfig` —
+    /// where it is a decision rather than a gap.
     Allow,
     /// Refuse everything not explicitly allowed.
     Deny,

@@ -1,9 +1,13 @@
 /**
  * The approval prompt.
  *
- * `permissions.mode = "ask"` is the default, and without something answering, "ask" means "refuse":
- * every gated tool call comes back as an error the model cannot act on and the user never sees a
- * question. This is the half that asks.
+ * Without something answering, `ask` means "refuse": every gated tool call comes back as an error
+ * the model cannot act on and the user never sees a question. This is the half that asks.
+ *
+ * `permissions.mode` starts at `allow` — see `PermissionsConfig::default` for why — so on a fresh
+ * install this hook never fires. That is not a reason for it to be quieter: the mode is a *per
+ * conversation* setting, saved with the conversation, so any one of them may be back in `ask` and
+ * the footer is what says which.
  *
  * It is a **blocking** hook, so the rule from ADR 0009 applies — a blocking hook that does not
  * answer in time is a veto. A permission prompt that failed open would be worse than no prompt at
@@ -48,28 +52,39 @@ export async function activate({ neosh, subscriptions }: PluginContext) {
   // rendered description rather than the object so `read_file` of two different paths are two
   // different decisions.
   const allowed = new Set<string>();
-  subscriptions.push(neosh.session.onChange(() => allowed.clear()));
 
-  // What the agent may do without asking, in the footer, with the key that changes it. It belongs
-  // on screen the whole time it is anything other than the default: "full access" is a state you
-  // should never be in by accident, and the only way to guarantee that is to keep saying so.
+  // What the agent may do without asking, in the footer, with the key that changes it. On screen
+  // the whole time, in every mode: it is a per-conversation setting now, so "what am I in" is a
+  // question with a different answer in the next conversation along, and a row that only appeared
+  // for the unusual values would be a row you had to remember the absence of.
   const showMode = async () => {
     const mode = await neosh.permission.mode().catch(() => null);
     if (!mode) return;
     await neosh.status.set("mode", {
       text: label(mode),
       keys: "⇧⇥",
-      hl: mode === "allow" ? "Diagnostic.Warn" : mode === "deny" ? "Comment" : "Status.Line",
+      // Not a warning any more, because it is the state you are in by default and a footer that
+      // cries wolf on every conversation is a footer nobody reads. Still its own colour, so the
+      // row answers "what am I in" at a glance rather than by being read.
+      hl: mode === "allow" ? "Agent.ToolEdit" : mode === "deny" ? "Comment" : "Status.Line",
       priority: 5,
     });
   };
+  // Switching conversations changes the mode, because the mode belongs to the conversation. The
+  // footer has to be told, or it keeps saying what the conversation you just left was set to —
+  // which is the one kind of wrong this row must never be.
+  subscriptions.push(neosh.session.onChange(() => {
+    allowed.clear();
+    void showMode();
+  }));
+
   await neosh.cmd.register("permission.cycle", async () => {
     const order: PermissionMode[] = ["ask", "allow_listed", "allow", "deny"];
     const now = await neosh.permission.mode().catch(() => "ask" as PermissionMode);
     const next = order[(order.indexOf(now) + 1) % order.length] ?? "ask";
     await neosh.permission.setMode(next);
     await showMode();
-    neosh.notify(`permissions: ${label(next)}`, next === "allow" ? "warn" : "info");
+    neosh.notify(`permissions: ${label(next)}`, "info");
   }, { desc: "Cycle what the agent may do without asking" });
   await neosh.cmd.register("permission.pick", () => pickMode(neosh, showMode), {
     desc: "Choose what the agent may do without asking",
@@ -193,7 +208,11 @@ async function pickMode(neosh: Neosh, after: () => Promise<void>): Promise<void>
   const rows: Array<{ label: string; detail: string; value: PermissionMode }> = [
     { label: "Ask", detail: "prompt before writing, running or connecting", value: "ask" },
     { label: "Allow-listed", detail: "only what config.toml already permits", value: "allow_listed" },
-    { label: "Full access", detail: "no prompts — still confined to this workspace", value: "allow" },
+    {
+      label: "Full access",
+      detail: "no prompts — still confined to this workspace",
+      value: "allow",
+    },
     { label: "Deny", detail: "refuse everything; read-only", value: "deny" },
   ];
   const chosen = await picker(neosh, rows, {
@@ -205,7 +224,7 @@ async function pickMode(neosh: Neosh, after: () => Promise<void>): Promise<void>
   if (!chosen || chosen === now) return;
   await neosh.permission.setMode(chosen);
   await after();
-  neosh.notify(`permissions: ${label(chosen)}`, chosen === "allow" ? "warn" : "info");
+  neosh.notify(`permissions: ${label(chosen)}`, "info");
 }
 
 /** What the user is actually being asked, in one line. */

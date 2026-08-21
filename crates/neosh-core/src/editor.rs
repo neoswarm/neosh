@@ -15,7 +15,7 @@ use std::collections::{HashMap, HashSet};
 use neosh_proto::{
     ApiCall, ApiError, ApiOk, ApiResult, BufferId, ExtmarkId, ExtmarkOpts,
     FloatConfig, KeyContext, KeyPress, KeymapEntry, KeymapScope, MessageLevel, Mode, NamespaceId,
-    OnDelete, OptionValue, PluginId, SurfaceId, TextEdit, UiEvent, VirtTextPos, WindowId,
+    OnDelete, OptionValue, PluginId, Rect, SurfaceId, TextEdit, UiEvent, VirtTextPos, WindowId,
     WindowLayout,
 };
 
@@ -61,7 +61,10 @@ pub struct Editor {
     keymaps: KeymapTable,
     commands: HashMap<String, CommandReg>,
     options: OptionRegistry,
-    surfaces: HashMap<SurfaceId, WindowId>,
+    /// Claimed surfaces, and where each one sits. The rectangle is kept, not merely
+    /// forwarded, so a client attaching to a workspace that is already running can be told the
+    /// surfaces exist. Their *cells* are not kept — see [`Editor::republish`].
+    surfaces: HashMap<SurfaceId, (WindowId, Rect)>,
     /// Which plugins asked to hear about a buffer's changes.
     attached: HashMap<BufferId, HashSet<PluginId>>,
     /// Windows that want the keys nothing else claimed, and the command to send them to.
@@ -215,6 +218,59 @@ impl Editor {
         }
         self.republish_highlights();
         true
+    }
+
+    /// Say everything, to a frontend that has never heard any of it.
+    ///
+    /// The protocol is deltas, which is the right shape for a frontend that has been listening
+    /// since the process started and the wrong shape for one that attaches to a workspace already
+    /// half a day into its work. This is the other half of that bargain: the state is all here, so
+    /// it can be said again in full, and a client that folds this in has exactly the mirror a
+    /// client that had been there all along would have.
+    ///
+    /// Emitted in the order a frontend needs it — highlights before the buffers that reference
+    /// them, buffers before the windows that show them — and windows in id order, which is the
+    /// order they were opened in, because a frontend that lays out by arrival order would
+    /// otherwise get a different screen every time somebody reattached.
+    ///
+    /// **A surface's cells are not republished.** The editor forwards them and does not keep them:
+    /// they are a grid a plugin owns, and re-emitting a copy would mean holding a second one that
+    /// is wrong the moment the plugin draws again. The claim is republished, and
+    /// [`crate::CoreEffect::ViewAttached`] tells the plugin to paint.
+    pub fn republish(&mut self) {
+        self.push_ui(UiEvent::Init { protocol_version: neosh_proto::PROTOCOL_VERSION });
+        self.republish_highlights();
+
+        let mut buffers: Vec<BufferId> = self.buffers.keys().copied().collect();
+        buffers.sort_by_key(|b| b.0);
+        for buf in buffers {
+            let Some(b) = self.buffers.get(&buf) else { continue };
+            let (name, count) = (b.name.clone(), b.line_count());
+            self.push_ui(UiEvent::BufferOpened { buf, name });
+            // `old_end: 0` and not `count`: this is a splice into a mirror that has nothing, so it
+            // is an insertion at the top and not a replacement of rows that are not there.
+            let lines = self.buffers[&buf].render_range(0, count);
+            self.push_ui(UiEvent::BufferLines { buf, start: 0, old_end: 0, lines });
+        }
+
+        let mut windows: Vec<WindowId> = self.windows.keys().copied().collect();
+        windows.sort_by_key(|w| w.0);
+        for win in windows {
+            let Some(w) = self.windows.get(&win) else { continue };
+            let (buf, layout, cursor, top) = (w.buf, w.layout.clone(), w.cursor, w.top_line);
+            self.push_ui(UiEvent::WindowOpened { win, buf, layout });
+            self.push_ui(UiEvent::CursorMoved { win, row: cursor.0, col: cursor.1 });
+            self.push_ui(UiEvent::ScrollTo { win, top_line: top });
+        }
+
+        let mut surfaces: Vec<SurfaceId> = self.surfaces.keys().copied().collect();
+        surfaces.sort_by_key(|s| s.0);
+        for surface in surfaces {
+            let Some((win, rect)) = self.surfaces.get(&surface).copied() else { continue };
+            self.push_ui(UiEvent::SurfaceClaimed { surface, win, rect });
+        }
+
+        self.push_ui(UiEvent::FocusChanged { win: self.focus.current() });
     }
 
     fn republish_highlights(&mut self) {
@@ -549,7 +605,7 @@ impl Editor {
                 self.win(win)?;
                 self.windows.remove(&win);
                 self.focus.remove(win);
-                self.surfaces.retain(|_, w| *w != win);
+                self.surfaces.retain(|_, (w, _)| *w != win);
                 // A capture outliving its window would send every unbound key to a command whose
                 // picker is gone — the keyboard would appear to stop working.
                 self.captures.remove(&win);
@@ -635,6 +691,11 @@ impl Editor {
             }
             ApiCall::WinScrollTo { win, top_line } => {
                 self.win(win)?;
+                // Remembered, not merely forwarded: it is where the window *is*, and a client
+                // attaching later has no other way to be told.
+                if let Some(w) = self.windows.get_mut(&win) {
+                    w.top_line = top_line;
+                }
                 self.push_ui(UiEvent::ScrollTo { win, top_line });
                 Ok(ApiOk::Unit)
             }
@@ -688,7 +749,7 @@ impl Editor {
                 self.win(win)?;
                 let surface = SurfaceId(self.next_surface);
                 self.next_surface += 1;
-                self.surfaces.insert(surface, win);
+                self.surfaces.insert(surface, (win, rect));
                 self.push_ui(UiEvent::SurfaceClaimed { surface, win, rect });
                 Ok(ApiOk::Surface { surface })
             }
@@ -947,6 +1008,7 @@ impl Editor {
                 let _ = b.set_mark(ns, row, start, ExtmarkOpts {
                     end_col: Some(end.max(start)),
                     hl_group: Some("Visual".into()),
+                    line_hl_group: None,
                     virt_text: Vec::new(),
                     virt_text_pos: VirtTextPos::Eol,
                     on_delete: OnDelete::Invalidate,

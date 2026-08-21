@@ -34,7 +34,15 @@ export async function activate({ neosh, subscriptions }: PluginContext) {
   };
 
   await refresh();
-  // Turn end is when both numbers change, and the only time either can.
+  // Not only at turn end. An agent driver reports how full its context is while it works, and a
+  // meter that waited for the turn to finish would be answering "should I start a new
+  // conversation?" only once it was too late to matter for this one.
+  subscriptions.push(
+    neosh.agent.onActivity((e) => {
+      if (e.activity.kind === "context" || e.activity.kind === "compacted") void refresh();
+    }),
+  );
+  // Turn end is when the running total changes, and for a model driver the only time either can.
   subscriptions.push(neosh.agent.onTurnEnd(() => void refresh()));
   subscriptions.push(neosh.session.onChange(() => void refresh()));
   // The model is half of the meter: the same conversation is 40% of one window and 8% of another.
@@ -48,8 +56,20 @@ export async function activate({ neosh, subscriptions }: PluginContext) {
   );
 }
 
-/** The window this model has, or nothing if the catalogue does not say. */
-async function contextWindow(neosh: Neosh): Promise<number | undefined> {
+/**
+ * The window those tokens are a fraction of.
+ *
+ * The driver's own figure first, and it is not a close call. A catalogue says what a *model* has;
+ * a vendor CLI's window is whatever that CLI decided, and the two disagree — `claude` running
+ * `claude-haiku-4-5` reports 200k where the catalogue entry for the selected model said a million.
+ * Dividing by the wrong one is how a meter reads `2%` where the agent itself would say `8%`.
+ *
+ * The catalogue is the fallback, for a model driver and for a conversation that has not run a turn
+ * yet. Nothing at all is the third case, and then the number is shown without a percentage rather
+ * than against a denominator somebody made up.
+ */
+async function contextWindow(neosh: Neosh, session: SessionInfo): Promise<number | undefined> {
+  if (session.context_window) return session.context_window;
   const selection = await neosh.agent.selection().catch(() => null);
   if (!selection) return undefined;
   const entries = await neosh.agent
@@ -81,7 +101,7 @@ const CELLS = 8;
  */
 async function drawContext(neosh: Neosh, session: SessionInfo) {
   const used = session.context_tokens ?? 0;
-  const window = await contextWindow(neosh);
+  const window = await contextWindow(neosh, session);
   // Nothing to be a percentage of. Better to say the number than to invent a denominator.
   if (!window) {
     if (used > 0) {
@@ -137,7 +157,7 @@ async function report(neosh: Neosh): Promise<void> {
     return;
   }
   const u = session.usage;
-  const window = await contextWindow(neosh);
+  const window = await contextWindow(neosh, session);
   const used = session.context_tokens ?? 0;
   const lines = [
     `context   ${short(used)}${window ? ` of ${short(window)}  (${((used / window) * 100).toFixed(1)}%)` : ""}`,

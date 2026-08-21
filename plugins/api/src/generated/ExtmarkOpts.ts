@@ -9,6 +9,20 @@ export type ExtmarkOpts = {
    */
   end_col?: number | null;
   hl_group?: string | null;
+  /**
+   * A background for the whole rendered row, not just the bytes the mark covers.
+   *
+   * The distinction is the difference between a diff line that is green and a diff line whose
+   * *text* is green: the band has to reach the right edge of the window to read as one line, and
+   * how wide the window is is not known where the row is written. So the group is carried and
+   * the frontend fills to its own edge — which is also what makes the band survive a resize.
+   *
+   * It sits *under* every ranged `hl_group` on the row rather than competing with them, so a
+   * syntax colour on top keeps its foreground and inherits this background. Nothing else in the
+   * mark vocabulary composes; this one has to, because "which line changed" and "what does this
+   * word mean" are two facts about the same character.
+   */
+  line_hl_group?: string | null;
   virt_text?: Array<VirtChunk>;
   virt_text_pos: VirtTextPos;
   on_delete: OnDelete;
