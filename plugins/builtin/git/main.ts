@@ -18,7 +18,7 @@
  */
 
 import { byteLength } from "@neosh/api";
-import type { CommitInfo, Neosh, PluginContext, RepoStatus } from "@neosh/api";
+import type { CommitInfo, Neosh, PluginContext, RepoStatus, WorktreeInfo } from "@neosh/api";
 import {
   confirm,
   confirmDestructive,
@@ -109,8 +109,16 @@ export async function activate({ neosh, subscriptions }: PluginContext) {
     ["git.worktree.list", () => pickWorktree(neosh), "Open a conversation in another worktree"],
     [
       "git.worktree.new",
-      (args: string[]) => newWorktree(neosh, args),
-      "Create a worktree and start working in it — `git.worktree.new <branch> [path]`",
+      // Empty is absent. A caller filling a later slot has to pass something for the earlier ones,
+      // and `""` meaning "a branch called nothing" turns "ask me" into a silent no-op.
+      (args: string[]) =>
+        newWorktree(neosh, { branch: arg(args, 0), path: arg(args, 1), cwd: arg(args, 2) }),
+      "Create a worktree and start working in it — `git.worktree.new <branch> [path] [cwd]`",
+    ],
+    [
+      "git.worktree.new.auto",
+      (args: string[]) => newWorktree(neosh, { cwd: arg(args, 0), auto: true }),
+      "A worktree on a branch named for you, with nothing to answer — `git.worktree.new.auto [cwd]`",
     ],
     ["git.worktree.remove", () => removeWorktree(neosh), "Remove a worktree"],
   ];
@@ -559,34 +567,67 @@ async function pickWorktree(neosh: Neosh): Promise<void> {
   neosh.notify(`new conversation in ${chosen.branch ?? chosen.path}`);
 }
 
+/** One positional argument, with blank treated as not given. */
+function arg(args: string[], at: number): string | undefined {
+  const v = args[at]?.trim();
+  return v ? v : undefined;
+}
+
+/** What a worktree is being made of, and what to call it. */
+interface WorktreeSpec {
+  /** The branch. Asked for when absent — unless `auto`, which invents one. */
+  branch?: string;
+  /** Where it lands. Follows from `worktree.root` when absent. */
+  path?: string;
+  /** Which repository. The conversation's own when absent. */
+  cwd?: string;
+  /** Name it rather than ask. See {@link scratchName}. */
+  auto?: boolean;
+}
+
 /**
  * Make a worktree and start working in it.
  *
- * **One question.** It used to ask twice — the branch, then the path, prefilled with the answer it
- * had already worked out. That second prompt was the whole point of `worktree.root` being a
- * setting, asked again: somebody who has configured where their worktrees go has said where their
- * worktrees go. The path is still reachable — `git.worktree.new <branch> <path>` takes it — but
- * from the palette or a key, the location follows from the configuration and the message says
- * where it landed.
+ * **One question at most, and `auto` makes it none.** It used to ask twice — the branch, then the
+ * path, prefilled with the answer it had already worked out. That second prompt was the whole point
+ * of `worktree.root` being a setting, asked again: somebody who has configured where their
+ * worktrees go has said where their worktrees go. The path is still reachable —
+ * `git.worktree.new <branch> <path>` takes it — but from the palette or a key, the location follows
+ * from the configuration and the message says where it landed.
+ *
+ * `auto` drops the last question too. Naming a branch before you know what the work is is a
+ * decision you are not yet equipped to make, and every one of those is a reason not to start —
+ * which is the opposite of what a key for "somewhere clean to try this" is for. The name is
+ * generated, the branch is real, and renaming it later is `git branch -m` like any other.
  *
  * Landing in it is the point. Creating a directory you then have to go and find is not a feature,
  * it is a chore with extra steps.
  */
-async function newWorktree(neosh: Neosh, args: string[] = []): Promise<void> {
-  const status = await repoStatus(neosh);
-  if (!status) return;
+async function newWorktree(neosh: Neosh, spec: WorktreeSpec = {}): Promise<void> {
+  const root = await repoRoot(neosh, spec.cwd);
+  if (root === null) return;
 
-  const asked = args[0] ?? (await prompt(neosh, "Branch for the new worktree", { width: 70 }));
+  // Remote names count. `origin/fix-thing` with no local branch means `git worktree add` should
+  // check the existing one out rather than fail trying to create it, and for a generated name it
+  // means one that is free here but taken upstream is not offered.
+  const taken = new Set(
+    (await neosh.git.branches({ includeRemote: true, cwd: spec.cwd }).catch(() => []))
+      .flatMap((b) => [b.name, b.name.replace(/^[^/]+\//, "")]),
+  );
+
+  const asked = spec.branch ??
+    (spec.auto
+      ? scratchName(taken)
+      : await prompt(neosh, "Branch for the new worktree", { width: 70 }));
   if (!asked || !asked.trim()) return;
   const name = slug(asked);
-  const where = (args[1] ?? (await worktreePath(neosh, status.repo.root, name))).trim();
+  const where = (spec.path ?? (await worktreePath(neosh, root, name))).trim();
   if (where === "") return;
 
-  const taken = new Set((await neosh.git.branches({ includeRemote: true })).map((b) => b.name));
   const create = !taken.has(name);
 
   try {
-    await neosh.git.addWorktree(where, name, { create });
+    await neosh.git.addWorktree(where, name, { create, cwd: spec.cwd });
   } catch (e) {
     neosh.notify(String(e), "error");
     return;
@@ -594,6 +635,58 @@ async function newWorktree(neosh: Neosh, args: string[] = []): Promise<void> {
   await neosh.session.create({ cwd: where });
   neosh.notify(`${create ? "branched" : "checked out"} ${name} in ${where}`);
 }
+
+/**
+ * The original checkout of the repository at `cwd`.
+ *
+ * Not `git status`, which is a subprocess that stats every file in the tree to answer a question
+ * about the *repository* — and not `status.repo.root`, which in a linked worktree is that
+ * worktree. A new worktree of `feat-thing` belongs beside the others under the repository's name,
+ * not under `feat-thing`'s, and `is_main` is what says which one that is.
+ */
+async function repoRoot(neosh: Neosh, cwd?: string): Promise<string | null> {
+  const trees = await neosh.git.worktrees(cwd ? { cwd } : undefined).catch((e: unknown) => {
+    neosh.notify(String(e), "warn");
+    return [] as WorktreeInfo[];
+  });
+  return trees.find((t) => t.is_main)?.path ?? trees[0]?.path ?? null;
+}
+
+/**
+ * Two words that are not a branch yet.
+ *
+ * An adjective and a noun, because a name you can say out loud is a name you can find again in a
+ * list of eight of them — `brisk-otter` is a thing you remember starting, `wt-3` is not, and a
+ * timestamp is neither. Both lists are short, concrete and unambiguous when spoken.
+ *
+ * Collisions are checked rather than hoped away: with a few dozen worktrees the birthday problem
+ * is real, and the caller has the branch list in its hand already. The counter suffix is the floor
+ * — it never loops forever, and `brisk-otter-2` is still a name.
+ */
+function scratchName(taken: ReadonlySet<string>): string {
+  const pick = <T>(xs: readonly T[]): T => xs[Math.floor(Math.random() * xs.length)]!;
+  for (let i = 0; i < 50; i++) {
+    const name = `${pick(SCRATCH_ADJECTIVES)}-${pick(SCRATCH_NOUNS)}`;
+    if (!taken.has(name)) return name;
+  }
+  const base = `${pick(SCRATCH_ADJECTIVES)}-${pick(SCRATCH_NOUNS)}`;
+  for (let n = 2; ; n++) if (!taken.has(`${base}-${n}`)) return `${base}-${n}`;
+}
+
+const SCRATCH_ADJECTIVES = [
+  "amber", "brisk", "calm", "clever", "coral", "crisp", "dapper", "eager", "fleet", "gentle",
+  "glad", "golden", "hardy", "keen", "lively", "lucid", "mellow", "merry", "nimble", "noble",
+  "placid", "plucky", "quiet", "rapid", "ruby", "sage", "sleek", "solar", "spry", "stout",
+  "sunny", "swift", "tidy", "vivid", "warm", "wily", "witty", "zesty",
+] as const;
+
+const SCRATCH_NOUNS = [
+  "alder", "anchor", "badger", "beacon", "birch", "brook", "cedar", "comet", "coral", "crane",
+  "delta", "ember", "falcon", "fern", "finch", "garnet", "harbor", "heron", "ibis", "juniper",
+  "kestrel", "lantern", "lark", "linden", "marlin", "meadow", "mesa", "nimbus", "otter", "pike",
+  "quartz", "raven", "reef", "ridge", "sable", "sparrow", "summit", "thistle", "tundra", "vale",
+  "walrus", "willow", "yarrow", "zephyr",
+] as const;
 
 /**
  * Where a worktree for `branch` goes.

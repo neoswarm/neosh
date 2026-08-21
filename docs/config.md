@@ -320,11 +320,34 @@ Several machines, one workspace: every one knows what the others are running, an
 do something. Off unless you say otherwise — a workspace does not open a port because it was
 upgraded.
 
-```sh
-neosh swarm-id      # this machine's identity, and the lines to paste elsewhere
+#### Adding a computer
+
+`^J` on either machine. Pick **Add a computer…**, type its address, and you are shown what is
+actually there:
+
+```
+Add linux-box?
+
+127.0.0.1:7739 · macos · neosh 0.1.0
+1ca3 c856 8f4c 6584
+Check that fingerprint matches what that computer shows under `This computer`.
 ```
 
-A node is named by its public key, so joining two machines means each having the other's:
+The name and the fingerprint are read off the far machine rather than typed by you, which is the
+point: a public key typed from memory is a public key typed wrong, and a fingerprint is only worth
+showing if it came from the other end.
+
+Then the other machine says `mac-studio wants to join this workspace — ^J to allow it`, and somebody
+there says yes. Two confirmations, one per machine, because authorising a computer to steer your
+agents is a decision each side gets to make.
+
+Nothing is restarted and nothing is written to your `config.toml` — paired machines live in the
+state directory. `^X` in that list removes one.
+
+#### Or by hand
+
+`neosh swarm-id` prints this machine's identity and the lines to paste elsewhere. A node is named by
+its public key, so joining two machines this way means each having the other's:
 
 ```toml
 [swarm]
@@ -357,9 +380,14 @@ Steering an agent is a message. Approving one is a **write to this machine's dis
 it is separate and off by default. A build machine that should be watched and not touched sets
 `accepts_commands = false` and is visible, read-only, to everyone.
 
-Changing any of this takes a restart rather than `^R`: the allow-list and the listening socket are
-decided at boot, and re-reading them would mean tearing down live connections whenever you reloaded
-your config.
+Changing `listen`, `name` or the settings above takes a restart rather than `^R`: the listening
+socket is decided at boot, and re-reading it would mean tearing down live connections whenever you
+reloaded your config. *Pairing* is the exception and takes effect immediately — a swarm you have to
+restart to add a computer to is a swarm you add one computer to.
+
+A `[[swarm.peers]]` entry you wrote by hand cannot be removed with `^X`: that line would come back on
+the next reload, and a removal that silently undoes itself is worse than one that says why it
+cannot.
 
 #### What you see
 
@@ -372,7 +400,13 @@ the other over HTTPS. A directory with no remote falls back to its name, which i
 as one.
 
 `^N` offers the other machines' checkouts alongside your worktrees, so "start something over there"
-is one key. `swarm.nodes` in the palette lists every computer and what it is holding.
+is one key.
+
+`↵` on a remote conversation **opens it**: its history, then everything as it happens. `i` says
+something to it and `^C` asks its turn to stop — because "it feels like it is on this computer" is a
+claim about what you can do, not only about what you can see. It is a window rather than the chat
+pane, deliberately: the chat pane is *your* conversation, and putting somebody else's there would
+make "where does my composer send" a question with two answers.
 
 The protocol is specified in [ascp/SPEC.md](ascp/SPEC.md).
 

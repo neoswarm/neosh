@@ -138,6 +138,22 @@ pub struct SwarmAgent {
     pub agent: AgentSummary,
 }
 
+/// A machine that proved who it is and has not been paired with.
+#[derive(TS, Serialize, Deserialize, Clone, PartialEq, Debug)]
+#[ts(export)]
+pub struct SwarmStranger {
+    pub info: NodeInfo,
+    /// `true` when we found it by dialling an address, `false` when it dialled us.
+    ///
+    /// Decides what to ask. One is "this is what is at that address — add it?", the other is
+    /// "this machine wants to join — allow it?", and they are different questions even though the
+    /// button does the same thing.
+    pub dialled: bool,
+    /// Where it was reached, when we were the one dialling.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub addr: Option<String>,
+}
+
 /// A window as somebody else sees it.
 #[derive(TS, Serialize, Deserialize, Clone, PartialEq, Debug)]
 #[ts(export)]
@@ -761,6 +777,31 @@ pub enum ApiCall {
         node: NodeId,
         session: SessionId,
     },
+    /// Dial an address and report what machine is there, without joining it.
+    ///
+    /// The first half of pairing. A node presents its identity to anyone who asks, as an SSH server
+    /// presents a host key, so this answers with a *proven* name and fingerprint — which is what a
+    /// person needs to be shown before deciding.
+    SwarmProbe {
+        addr: String,
+    },
+    /// Authorise a machine, and dial it from now on.
+    ///
+    /// Takes effect immediately: no restart, and nothing written to the user's config file. Paired
+    /// machines live in the state directory, because an editor that edits your `config.toml`
+    /// because you pressed a key is one you stop trusting with the file.
+    SwarmPair {
+        node: NodeId,
+        name: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        addr: Option<String>,
+    },
+    /// Withdraw authorisation, and stop dialling.
+    SwarmUnpair {
+        node: NodeId,
+    },
+    /// Machines that have asked to join, or that we found and have not added.
+    SwarmStrangers,
 
     // ---- runtime path --------------------------------------------------
     /// Add a directory to search for plugins.
@@ -790,8 +831,22 @@ pub enum ApiCall {
     GitBranches {
         #[serde(default)]
         include_remote: bool,
+        /// Which checkout to ask. `None` is the one this conversation is in, which is what almost
+        /// every caller means. See [`ApiCall::GitWorktrees`] for why the others exist.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cwd: Option<String>,
     },
-    GitWorktrees,
+    /// Every checkout of the repository containing `cwd`.
+    ///
+    /// `cwd` is `None` for "the repository this conversation is in", which is what a status bar or
+    /// a branch picker wants. A *panel* wants the other answer: the sidebar lists several projects
+    /// at once and offers a new conversation in whichever one the cursor is on, and asking about
+    /// the active conversation's repository there would offer somebody the worktrees of a
+    /// repository they are not looking at. A row that names the wrong branch is worse than no row.
+    GitWorktrees {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cwd: Option<String>,
+    },
     GitLog {
         #[serde(default = "default_log_limit")]
         limit: u32,
@@ -830,6 +885,10 @@ pub enum ApiCall {
         branch: String,
         #[serde(default)]
         create: bool,
+        /// The repository to add it to. `git worktree add` runs *inside* a checkout, so a caller
+        /// making a worktree of a project other than the active one has to say which.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cwd: Option<String>,
     },
     GitRemoveWorktree {
         path: String,
@@ -957,6 +1016,7 @@ pub enum ApiOk {
     SwarmSelf { node: Option<NodeInfo> },
     SwarmNodes { nodes: Vec<SwarmNode> },
     SwarmAgents { agents: Vec<SwarmAgent> },
+    SwarmStrangers { strangers: Vec<SwarmStranger> },
 }
 
 /// One piece of the status line.

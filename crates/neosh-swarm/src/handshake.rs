@@ -20,6 +20,7 @@
 use neosh_proto::{AscpMessage, NodeCapabilities, NodeId, NodeInfo, ASCP_VERSION};
 use tokio::io::{AsyncRead, AsyncWrite};
 
+use crate::allow::Allowed;
 use crate::identity::{challenge, nonce, verify, Identity};
 use crate::wire::{read_message, write_message};
 use crate::SwarmError;
@@ -31,10 +32,22 @@ pub struct Peer {
     pub capabilities: NodeCapabilities,
 }
 
+/// A machine that proved who it is and turned out not to be on the list.
+///
+/// Distinct from an error because it is the beginning of pairing rather than the end of a
+/// connection: this is the machine you are about to be asked whether to add, and the id here has
+/// been *proven* rather than claimed.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Stranger {
+    pub node: NodeInfo,
+    pub capabilities: NodeCapabilities,
+}
+
 /// Dial: we opened the connection, so we challenge first.
 pub async fn dial<S>(
     stream: &mut S,
     me: &Identity,
+    allowed: &Allowed,
     my_info: &NodeInfo,
     my_caps: &NodeCapabilities,
 ) -> Result<Peer, SwarmError>
@@ -61,16 +74,20 @@ where
         return Err(SwarmError::Protocol("expected a welcome".into()));
     };
     check_version(version)?;
-    if !me.accepts(&node.id) {
-        return Err(SwarmError::Unauthorised(node.id));
-    }
-    // The listener signs a challenge naming the dialler first, which is the order the dialler
-    // built it in. Getting this backwards is the classic way a mutual handshake ends up verifying
-    // a string neither side agreed on, and it fails closed rather than loudly, so it is pinned by
-    // a test rather than by care.
+    // Signature first, *then* the list. The order matters for pairing: a machine we have not been
+    // told about should be reported by name and fingerprint so the user can decide, and reporting
+    // an id we have not verified would be reporting whatever it felt like claiming.
+    //
+    // The listener signs a challenge naming the dialler first, which is the order the dialler built
+    // it in. Getting this backwards is the classic way a mutual handshake ends up verifying a string
+    // neither side agreed on, and it fails closed rather than loudly, so it is pinned by a test
+    // rather than by care.
     let expected = challenge(ASCP_VERSION, &my_nonce, me.id(), &node.id);
     if !verify(&node.id, &expected, &signature) {
         return Err(SwarmError::BadSignature(node.id));
+    }
+    if !allowed.accepts(&node.id) {
+        return Err(SwarmError::Stranger(Box::new(Stranger { node, capabilities })));
     }
 
     let proof = me.sign(&challenge(ASCP_VERSION, &their_nonce, &node.id, me.id()));
@@ -82,6 +99,7 @@ where
 pub async fn accept<S>(
     stream: &mut S,
     me: &Identity,
+    allowed: &Allowed,
     my_info: &NodeInfo,
     my_caps: &NodeCapabilities,
 ) -> Result<Peer, SwarmError>
@@ -95,11 +113,20 @@ where
         return Err(SwarmError::Protocol("expected a hello".into()));
     };
     check_version(version)?;
-    // Before spending a signature verification on somebody we would refuse anyway.
-    if !me.accepts(&node.id) {
-        return Err(SwarmError::Unauthorised(node.id));
-    }
 
+    // The welcome goes out *before* the authorisation check, which is a deliberate change of
+    // order and the thing that makes pairing possible at all.
+    //
+    // An SSH server presents its host key to anyone who connects; authorisation is a question about
+    // the *client*. Doing the same here means a machine you have not paired with yet can still learn
+    // what machine is at an address — which is the whole of "add a computer": you dial it, you are
+    // shown its name and fingerprint, and you decide. Refusing before saying anything, as this did
+    // first, meant the only way to learn a node's id was to run a command on it and copy hex.
+    //
+    // What is given away is a public key, a hostname and a capability list, to anything that can
+    // reach the port — which on the LAN or overlay network ASCP expects is not a meaningful
+    // disclosure. What is *not* given away is any ability to act: the connection still ends here
+    // unless the peer is on the list.
     let my_nonce = nonce();
     let signature = me.sign(&challenge(ASCP_VERSION, &their_nonce, &node.id, me.id()));
     write_message(
@@ -115,7 +142,9 @@ where
     .await?;
 
     let Some(reply) = read_message(stream).await? else {
-        return Err(SwarmError::Protocol("peer closed before proving itself".into()));
+        // A stranger that dialled us to find out who we are and then hung up. That is the first
+        // half of pairing seen from this side, and it is not a failure.
+        return Err(unauthorised_or_gone(allowed, node, capabilities));
     };
     let AscpMessage::Proof { signature } = reply else {
         return Err(SwarmError::Protocol("expected a proof".into()));
@@ -124,7 +153,24 @@ where
     if !verify(&node.id, &expected, &signature) {
         return Err(SwarmError::BadSignature(node.id));
     }
+    // Now, and only now, is the claimed id a proven one worth checking against the list.
+    if !allowed.accepts(&node.id) {
+        return Err(SwarmError::Stranger(Box::new(Stranger { node, capabilities })));
+    }
     Ok(Peer { node, capabilities })
+}
+
+/// A peer that went away mid-handshake: a stranger if it was one, an ordinary disconnect otherwise.
+fn unauthorised_or_gone(
+    allowed: &Allowed,
+    node: NodeInfo,
+    capabilities: NodeCapabilities,
+) -> SwarmError {
+    if allowed.accepts(&node.id) {
+        SwarmError::Protocol("peer closed before proving itself".into())
+    } else {
+        SwarmError::Stranger(Box::new(Stranger { node, capabilities }))
+    }
 }
 
 /// The node info to put on the wire: the caller's, with the id replaced by the one we can sign for.

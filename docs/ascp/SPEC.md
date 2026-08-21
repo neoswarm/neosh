@@ -77,12 +77,12 @@ Mutual challenge–response, the shape SSH uses. The dialler goes first.
 ```
 dialler                                   listener
    |  Hello    { version, node, caps, nonce_d }   ->  |
-   |                                                   |  reject unless node.id is authorised
-   |  <-  Welcome { version, node, caps, sig_l, nonce_l }
+   |  <-  Welcome { version, node, caps, sig_l, nonce_l }   (unconditional)
    |  verify sig_l over challenge(nonce_d)            |
-   |  reject unless node.id is authorised             |
+   |  → not authorised?  it is a *stranger*, not an error
    |  Proof    { sig_d }                          ->  |
    |                                                   |  verify sig_d over challenge(nonce_l)
+   |                                                   |  → not authorised? likewise a stranger
    |            ...symmetric from here...              |
 ```
 
@@ -101,17 +101,36 @@ Three properties, each of which is a thing that goes wrong when it is missing:
 - **Both ends prove.** A one-sided handshake authenticates the caller to the callee and leaves the
   caller talking to whoever answered the port.
 - **The challenge names both nodes and the version**, per above.
-- **Authorisation is checked twice** — before a signature is requested, to avoid spending
-  verification on a peer that would be refused anyway, and after it verifies, which is the check
-  that counts, because until then the claimed id is only a claim.
+- **A node presents its identity to anyone who connects**, and checks authorisation only *after*
+  the peer's signature verifies. This is what an SSH server does with its host key, and it is what
+  makes pairing possible: a machine you have not added yet can still learn what machine is at an
+  address, so "add a computer" is typing an address and being shown a name and a fingerprint —
+  rather than running a command on the other machine and copying hex.
+
+  What is disclosed to anything that can reach the port is a public key, a hostname and a
+  capability list, which on the LAN or overlay network ASCP expects is not a meaningful disclosure.
+  What is **not** disclosed is any ability to act: the connection still ends unless the peer is on
+  the list. Implementations that expect hostile traffic on that port should rate-limit the
+  signature, which is the only work an unauthenticated peer can make them do.
+
+- **An unauthorised peer that proved itself is a `Stranger`, not an error.** The distinction is what
+  a caller does next: a stranger carries a *proven* name and fingerprint, which is exactly what has
+  to be shown before somebody decides whether to add it. Reporting an id that had not been verified
+  would be reporting whatever the peer felt like claiming.
 
 **Version mismatch is refused, not negotiated.** A protocol that silently degrades is one where a
 feature the other machine lacks looks like a bug in the other machine.
 
-Two refusals are deliberately distinct. `Unauthorised` is the ordinary answer to a stranger.
-`BadSignature` means an id *on your list* could not answer its own challenge — somebody is
-impersonating a machine you trust, which deserves to be said out loud rather than filed under
-"unknown peer".
+`BadSignature` — an id *on your list* that could not answer its own challenge — is its own outcome,
+and much more serious than an unknown peer: somebody is impersonating a machine you trust.
+
+**A dialler is connected when the listener has accepted it, not when its own half finishes.** The
+dialler sends the last message of the handshake, so it has no way to know whether the far end
+approved of it — and announcing a connection there produces "joined" immediately followed by "lost"
+every time pairing is half-done, which is exactly when a person most needs to be told something
+true. The reference implementation waits for one message from the peer before reporting a
+connection; the listener sends a full inventory the instant it accepts, so a real connection
+announces itself within a round trip and a refused one never announces at all.
 
 ---
 

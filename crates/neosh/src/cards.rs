@@ -751,22 +751,50 @@ pub fn groups_with(a: &serde_json::Value, b: &serde_json::Value) -> bool {
 /// Three marks and three weights. Which line is in hand should be answerable without reading all
 /// of them — so the finished ones recede, the next ones are quiet, and the one being worked on
 /// sweeps, because from the plan's point of view that is what a running call looks like.
-pub fn plan(g: &Glyphs, steps: &[PlanStep], width: usize) -> Vec<Row> {
-    steps
-        .iter()
-        .map(|step| {
-            let (mark, hl) = match step.state {
-                PlanState::Done => (g.done, "Agent.PlanDone"),
-                PlanState::Active => (g.doing, "Agent.PlanActive"),
-                PlanState::Pending => (g.todo, "Agent.PlanTodo"),
-            };
-            let room = width.saturating_sub(mark.chars().count() + 3).max(8);
-            let text = format!("  {mark} {}", clip(step.text.trim(), room));
-            let from = 2 + mark.len() + 1;
-            let end = text.len();
-            Row::new(text, vec![(2, from - 1, hl), (from, end, hl)])
-        })
-        .collect()
+///
+/// `limit` is how many rows it may take while it is state. A checklist is drawn every time it
+/// changes and it only ever grows, so an agent that wrote twenty steps owns the bottom of the
+/// screen for the rest of the turn — and nineteen of those rows answer a question nobody asked. So
+/// past the limit it says the same thing in fewer rows: what is finished becomes a count, because
+/// "what is left" is the question and done work is not part of the answer; what is in hand and the
+/// few after it are drawn in full, because they are; and the tail becomes a count too. `None` is
+/// the plan as history — the copy committed under the answer when the turn ends — which is
+/// scrollback rather than screen and is never abridged.
+pub fn plan(g: &Glyphs, steps: &[PlanStep], width: usize, limit: Option<usize>) -> Vec<Row> {
+    let step_row = |mark: &str, hl: &'static str, text: &str| {
+        let room = width.saturating_sub(mark.chars().count() + 3).max(8);
+        let text = format!("  {mark} {}", clip(text.trim(), room));
+        let from = 2 + mark.len() + 1;
+        let end = text.len();
+        Row::new(text, vec![(2, from - 1, hl), (from, end, hl)])
+    };
+    let draw = |step: &PlanStep| {
+        let (mark, hl) = match step.state {
+            PlanState::Done => (g.done, "Agent.PlanDone"),
+            PlanState::Active => (g.doing, "Agent.PlanActive"),
+            PlanState::Pending => (g.todo, "Agent.PlanTodo"),
+        };
+        step_row(mark, hl, &step.text)
+    };
+    let Some(limit) = limit.filter(|n| *n > 0 && steps.len() > *n) else {
+        return steps.iter().map(draw).collect();
+    };
+    let done = steps.iter().filter(|s| s.state == PlanState::Done).count();
+    let rest: Vec<&PlanStep> = steps.iter().filter(|s| s.state != PlanState::Done).collect();
+    let mut rows = Vec::new();
+    if done > 0 {
+        rows.push(step_row(g.done, "Agent.PlanDone", &format!("{done} done")));
+    }
+    // What is left of the budget once the count above has taken its row, and one more for the
+    // count below when there is going to be one.
+    let room = limit.saturating_sub(rows.len());
+    let shown = if rest.len() > room { room.saturating_sub(1) } else { rest.len() };
+    rows.extend(rest.iter().take(shown).map(|s| draw(s)));
+    if rest.len() > shown {
+        let left = rest.len() - shown;
+        rows.push(step_row(g.elision, "Agent.PlanTodo", &format!("{left} more")));
+    }
+    rows
 }
 
 /// One sub-agent, as the footer lists it.
@@ -1995,6 +2023,62 @@ mod tests {
         assert!(summary(&[], &root(), 80).is_empty(), "nothing changed, nothing to say");
         let one = summary(&files[..1], &root(), 80);
         assert_eq!(one[0].text, "  changed 1 file  +1 -3");
+    }
+
+    fn steps(done: usize, active: usize, pending: usize) -> Vec<PlanStep> {
+        let one = |state, n| PlanStep { text: format!("step {n}"), state };
+        (0..done)
+            .map(|n| one(PlanState::Done, n))
+            .chain((0..active).map(|n| one(PlanState::Active, done + n)))
+            .chain((0..pending).map(|n| one(PlanState::Pending, done + active + n)))
+            .collect()
+    }
+
+    #[test]
+    fn a_checklist_that_fits_is_drawn_whole() {
+        let rows = plan(&g(), &steps(2, 1, 1), 80, Some(5));
+        assert_eq!(texts(&rows), vec![
+            "  \u{2714} step 0",
+            "  \u{2714} step 1",
+            "  \u{25b8} step 2",
+            "  \u{25a1} step 3",
+        ]);
+    }
+
+    #[test]
+    fn a_long_one_keeps_what_is_in_hand_and_counts_the_rest() {
+        // Twelve steps into five rows: what is finished is a number, the step being worked on is
+        // still a step, and the tail says how much of it there is.
+        let rows = plan(&g(), &steps(4, 1, 7), 80, Some(5));
+        assert_eq!(texts(&rows), vec![
+            "  \u{2714} 4 done",
+            "  \u{25b8} step 4",
+            "  \u{25a1} step 5",
+            "  \u{25a1} step 6",
+            "  \u{2026} 5 more",
+        ]);
+        assert!(rows[0].spans.iter().any(|s| s.2 == "Agent.PlanDone"));
+        assert!(rows[1].spans.iter().any(|s| s.2 == "Agent.PlanActive"), "the one in hand sweeps");
+    }
+
+    #[test]
+    fn nothing_started_yet_still_shows_the_next_few() {
+        let rows = plan(&g(), &steps(0, 0, 9), 80, Some(4));
+        assert_eq!(texts(&rows), vec![
+            "  \u{25a1} step 0",
+            "  \u{25a1} step 1",
+            "  \u{25a1} step 2",
+            "  \u{2026} 6 more",
+        ]);
+    }
+
+    #[test]
+    fn the_copy_left_behind_is_never_abridged() {
+        // `None` is the plan as history, committed under the answer when the turn ends. A count
+        // there would be a hole in the transcript that nothing can open.
+        assert_eq!(plan(&g(), &steps(9, 0, 3), 80, None).len(), 12);
+        // And `0` is the setting that says so for the live one too.
+        assert_eq!(plan(&g(), &steps(9, 0, 3), 80, Some(0)).len(), 12);
     }
 
     #[test]
