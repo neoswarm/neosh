@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 use ts_rs::TS;
 
 use crate::agent::{HookName, HookOutcome, HookPayload, StopReason, ToolCall, ToolResult, Usage};
-use crate::api::{ApiCall, ApiResponse, KeyContext};
+use crate::api::{ApiCall, ApiResponse, KeyContext, VarScope};
 use crate::ids::{BufferId, RequestId, SessionId, StreamId, TurnId, WindowId};
 use crate::options::OptionValue;
 use crate::provider::{Activity, ModelSelection, TurnRequest};
@@ -206,6 +206,38 @@ pub enum PluginEvent {
     /// [`Self::Token`], which is already sent per chunk of a streaming answer.
     ComposerChanged {
         text: String,
+    },
+    /// Something a plugin said happened. See [`crate::ApiCall::EventEmit`].
+    ///
+    /// Broadcast to everyone, including the emitter — filtering by name is the listener's job and
+    /// doing it here would mean the core keeping a subscription table it can only ever guess is
+    /// current. `from` is stamped by the host, so "who said this" is not something a plugin can lie
+    /// about.
+    Event {
+        name: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(type = "unknown")]
+        data: Option<serde_json::Value>,
+        from: String,
+    },
+    /// A shared variable changed, whoever changed it. `value` is absent when it was deleted.
+    ///
+    /// Broadcast for the reason every var exists: the plugin that writes `favorite` on a project is
+    /// hardly ever the only one drawing it.
+    VarChanged {
+        scope: VarScope,
+        key: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(type = "unknown")]
+        value: Option<serde_json::Value>,
+    },
+    /// Somebody added to or withdrew from a contribution point.
+    ///
+    /// The signal a panel redraws on. Without it, a plugin that loads after the sidebar has drawn
+    /// contributes rows nobody will look at until the next unrelated refresh — which on a quiet
+    /// workspace is four seconds of a panel that is missing half of itself.
+    ContributionsChanged {
+        point: String,
     },
     /// Stop producing events for this stream and release its resources.
     ProviderCancel {

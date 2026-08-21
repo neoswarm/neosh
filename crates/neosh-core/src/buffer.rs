@@ -95,6 +95,13 @@ pub struct LineEdit {
 pub struct Buffer {
     pub id: BufferId,
     pub name: String,
+    /// What this buffer *is* — `neosh.sidebar`, `neosh.transcript`, somebody else's `acme.tasks`.
+    ///
+    /// A name rather than a flag because its whole purpose is to be said by one plugin and heard by
+    /// another: it is what `KeymapScope::BufKind` binds against and what `win.list` reports, and so
+    /// it is the difference between a panel a third party can extend and one they can only replace.
+    /// Neovim calls this a filetype and hangs half its ecosystem off it.
+    pub kind: Option<String>,
     /// A buffer always has at least one line, mirroring how every real editor models an empty file.
     lines: Vec<Line>,
     next_mark: u32,
@@ -102,7 +109,7 @@ pub struct Buffer {
 
 impl Buffer {
     pub fn new(id: BufferId, name: impl Into<String>) -> Self {
-        Self { id, name: name.into(), lines: vec![Line::default()], next_mark: 1 }
+        Self { id, name: name.into(), kind: None, lines: vec![Line::default()], next_mark: 1 }
     }
 
     pub fn line_count(&self) -> u32 {

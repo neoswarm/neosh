@@ -13,7 +13,7 @@
 use std::collections::{HashMap, HashSet};
 
 use neosh_proto::{
-    ApiCall, ApiError, ApiOk, ApiResult, BufferId, ExtmarkId, ExtmarkOpts,
+    ApiCall, ApiError, ApiOk, ApiResult, BufferId, Contribution, ExtmarkId, ExtmarkOpts,
     FloatConfig, KeyContext, KeyPress, KeymapEntry, KeymapScope, MessageLevel, Mode, NamespaceId,
     OnDelete, OptionValue, PluginId, Rect, SurfaceId, TextEdit, UiEvent, VirtTextPos, WindowId,
     WindowLayout,
@@ -43,6 +43,9 @@ pub enum CoreEffect {
     /// A declared option was set or reset. The host acts on the ones it owns and broadcasts all of
     /// them, so a plugin reacting to a setting uses the same mechanism the core does.
     OptionChanged { name: String, value: OptionValue },
+    /// A contribution point gained or lost an item. Broadcast by the host so whoever renders the
+    /// point redraws, including for a plugin that loaded long after the panel first drew.
+    ContributionsChanged { point: String },
 }
 
 #[derive(Debug, Clone)]
@@ -69,6 +72,13 @@ pub struct Editor {
     attached: HashMap<BufferId, HashSet<PluginId>>,
     /// Windows that want the keys nothing else claimed, and the command to send them to.
     captures: HashMap<WindowId, String>,
+    /// What plugins have put on each other's contribution points, by point name.
+    ///
+    /// Lives beside commands and keymaps rather than in the host because it is the same kind of
+    /// thing: a registration owned by a plugin, that has to disappear when the plugin does. A
+    /// contribution the sidebar still renders after its author was unloaded is a row that invokes a
+    /// command which no longer exists.
+    contributions: HashMap<String, Vec<Contribution>>,
     /// Plugins that ship with neosh. Their keymaps are *defaults*, and a default that overwrites a
     /// choice is not a default — `init.ts` runs before plugin discovery, so without this every
     /// bundled plugin would silently take a key the user's configuration had just bound.
@@ -180,6 +190,15 @@ impl Editor {
                 | ApiCall::StateGet { .. }
                 | ApiCall::StateSet { .. }
                 | ApiCall::StateDelete { .. }
+                // Vars are persisted and scoped to conversations and projects, neither of which
+                // the core knows about. Contributions are *not* here: they are a registration
+                // owned by a plugin, which is core work, the same as a command or a keymap.
+                | ApiCall::VarGet { .. }
+                | ApiCall::VarSet { .. }
+                | ApiCall::VarDelete { .. }
+                | ApiCall::VarAll { .. }
+                // Emitting is a broadcast to every plugin, and the bridge is what holds them.
+                | ApiCall::EventEmit { .. }
         )
     }
 
@@ -400,12 +419,20 @@ impl Editor {
     // ---- key input -------------------------------------------------------
 
     /// Scopes to consult, most specific first.
+    ///
+    /// Kind sits between buffer and global, and that ordering is the point of it. A binding on
+    /// *this* buffer is a statement about one thing on screen and has to beat one about every
+    /// sidebar there will ever be; a binding on every sidebar has to beat one about the whole
+    /// workspace, or a panel could never take a key back from a global default.
     fn active_scopes(&self) -> Vec<KeymapScope> {
         let mut scopes = Vec::new();
         if let Some(win) = self.focus.current() {
             scopes.push(KeymapScope::Window { win });
             if let Some(w) = self.windows.get(&win) {
                 scopes.push(KeymapScope::Buffer { buf: w.buf });
+                if let Some(kind) = self.buffers.get(&w.buf).and_then(|b| b.kind.clone()) {
+                    scopes.push(KeymapScope::BufKind { name: kind });
+                }
             }
         }
         scopes.push(KeymapScope::Global);
@@ -527,6 +554,20 @@ impl Editor {
         self.commands.retain(|_, r| &r.plugin != plugin);
         self.keymaps.remove_owner(&plugin.0);
         self.options.remove_owner(&plugin.0);
+        // Its rows go with it. A contribution outliving its author is a row in somebody's panel
+        // pointing at a command that no longer exists — which is also what makes
+        // `plugins.disabled` mean what it says for a plugin that only ever contributed.
+        let mut emptied = Vec::new();
+        for (point, list) in self.contributions.iter_mut() {
+            let before = list.len();
+            list.retain(|c| c.plugin != plugin.0);
+            if list.len() != before {
+                emptied.push(point.clone());
+            }
+        }
+        for point in emptied {
+            self.effects.push(CoreEffect::ContributionsChanged { point });
+        }
         for set in self.attached.values_mut() {
             set.remove(plugin);
         }
@@ -537,9 +578,20 @@ impl Editor {
     pub fn apply(&mut self, plugin: &PluginId, call: ApiCall) -> ApiResult {
         match call {
             // ---- buffers ---------------------------------------------
-            ApiCall::BufCreate { name, .. } => {
+            ApiCall::BufCreate { name, kind, .. } => {
                 let name = name.unwrap_or_else(|| format!("[scratch {}]", self.next_buf));
-                Ok(ApiOk::Buf { buf: self.create_buffer(&name) })
+                let buf = self.create_buffer(&name);
+                if kind.is_some() {
+                    self.buf_mut(buf)?.kind = kind;
+                }
+                Ok(ApiOk::Buf { buf })
+            }
+            ApiCall::BufSetKind { buf, kind } => {
+                self.buf_mut(buf)?.kind = kind;
+                Ok(ApiOk::Unit)
+            }
+            ApiCall::BufGetKind { buf } => {
+                Ok(ApiOk::MaybeText { text: self.buf(buf)?.kind.clone() })
             }
             ApiCall::BufLineCount { buf } => {
                 Ok(ApiOk::Count { n: self.buf(buf)?.line_count() })
@@ -698,6 +750,30 @@ impl Editor {
                 }
                 self.push_ui(UiEvent::ScrollTo { win, top_line });
                 Ok(ApiOk::Unit)
+            }
+            ApiCall::WinList => {
+                let focused = self.focus.current();
+                let mut windows: Vec<neosh_proto::WindowInfo> = self
+                    .windows
+                    .values()
+                    .map(|w| neosh_proto::WindowInfo {
+                        win: w.id,
+                        buf: w.buf,
+                        kind: self.buffers.get(&w.buf).and_then(|b| b.kind.clone()),
+                        name: self
+                            .buffers
+                            .get(&w.buf)
+                            .map(|b| b.name.clone())
+                            .unwrap_or_default(),
+                        layout: w.layout.clone(),
+                        focused: focused == Some(w.id),
+                    })
+                    .collect();
+                // By id, so "the sidebar" is the same row on two consecutive calls. A `HashMap`
+                // iteration order would make a caller that takes the first match of a kind pick a
+                // different window each time there are two.
+                windows.sort_by_key(|w| w.win.0);
+                Ok(ApiOk::Windows { windows })
             }
 
             // ---- extmarks --------------------------------------------
@@ -897,6 +973,43 @@ impl Editor {
             ApiCall::OptGet { name } => Ok(ApiOk::Option { entry: self.options.entry(&name) }),
             ApiCall::OptAll => Ok(ApiOk::Options { options: self.options.all() }),
 
+            // ---- contributions -----------------------------------------
+            ApiCall::ExtContribute { point, id, item, priority } => {
+                let entry = Contribution {
+                    point: point.clone(),
+                    id,
+                    plugin: plugin.0.clone(),
+                    item,
+                    priority,
+                };
+                let list = self.contributions.entry(point.clone()).or_default();
+                // Keyed by (plugin, id), so re-contributing under the same id is an update rather
+                // than a duplicate row — the same rule `status.set` follows, and for the same
+                // reason: a panel refreshing what it offers must not have to withdraw first.
+                match list.iter_mut().find(|c| c.plugin == entry.plugin && c.id == entry.id) {
+                    Some(existing) => *existing = entry,
+                    None => list.push(entry),
+                }
+                Self::sort_contributions(list);
+                self.effects.push(CoreEffect::ContributionsChanged { point });
+                Ok(ApiOk::Unit)
+            }
+            ApiCall::ExtRemove { point, id } => {
+                let mut changed = false;
+                if let Some(list) = self.contributions.get_mut(&point) {
+                    let before = list.len();
+                    list.retain(|c| !(c.plugin == plugin.0 && c.id == id));
+                    changed = list.len() != before;
+                }
+                if changed {
+                    self.effects.push(CoreEffect::ContributionsChanged { point });
+                }
+                Ok(ApiOk::Unit)
+            }
+            ApiCall::ExtList { point } => Ok(ApiOk::Contributions {
+                contributions: self.contributions.get(&point).cloned().unwrap_or_default(),
+            }),
+
             // ---- misc --------------------------------------------------
             ApiCall::Log { level, message } => {
                 match level {
@@ -918,6 +1031,17 @@ impl Editor {
                 ),
             }),
         }
+    }
+
+    /// Highest priority first, then by plugin and id.
+    ///
+    /// The tiebreak is what stops a panel's rows shuffling between restarts: without it the order
+    /// of two equal-priority contributions is the order their plugins happened to activate in,
+    /// which changes with a directory listing.
+    fn sort_contributions(list: &mut [Contribution]) {
+        list.sort_by(|a, b| {
+            b.priority.cmp(&a.priority).then_with(|| a.plugin.cmp(&b.plugin)).then_with(|| a.id.cmp(&b.id))
+        });
     }
 
     // ---- lookup helpers --------------------------------------------------

@@ -37,3 +37,12 @@ implementation — and in two cases (0005, 0008) it did not, which is itself rec
 | [0029](0029-a-conversation-carries-its-directory.md) | A conversation carries its directory, and everything follows it | Accepted |
 | [0030](0030-a-turn-belongs-to-a-conversation.md) | A turn belongs to a conversation, not to the program | Accepted |
 | [0031](0031-a-turn-says-what-it-is-doing.md) | A turn says what it is doing, including when somebody else is doing it | Accepted |
+| [0032](0032-an-agent-driver-asks-the-same-question-everything-else-does.md) | An agent driver asks the same question everything else does | Accepted |
+| [0033](0033-a-card-shows-what-happened.md) | A card shows what happened | Accepted |
+| [0034](0034-a-driver-loop-has-something-to-say.md) | A driver's loop has something to say, and somewhere to say it | Accepted |
+| [0035](0035-a-diff-is-code-that-changed.md) | A diff is code that changed | Accepted |
+| [0036](0036-the-workspace-outlives-the-terminal.md) | The workspace outlives the terminal | Accepted |
+| [0037](0037-the-composer-is-the-field.md) | The composer is the field | Accepted |
+| [0038](0038-a-conversation-owns-its-permissions.md) | A conversation owns its permissions, and starts with all of them | Accepted |
+| [0039](0039-the-archive-is-a-place-you-go.md) | The archive is a place you go, and the question is worth asking | Accepted |
+| [0040](0040-a-panel-is-a-surface-not-a-program.md) | A panel is a surface, not a program | Accepted |

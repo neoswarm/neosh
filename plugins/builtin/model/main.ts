@@ -562,6 +562,18 @@ async function addModel(neosh: Neosh, c: CredentialInfo): Promise<boolean> {
  * the refusal says which of the two this row is rather than silently doing nothing.
  */
 async function removeModel(neosh: Neosh, instance: string, id: string): Promise<boolean> {
+  const current = await neosh.agent.selection().catch(() => null);
+  const inUse = current?.instance === instance && current.model === id;
+  const ok = await confirmDestructive(neosh, `Remove ${id} from ${instance}?`, {
+    yes: "Remove",
+    no: "Keep",
+    detail: [
+      "You added this one by hand, so nothing else will offer it back.",
+      ...(inUse ? ["It is the model in use — you will have to pick another before sending."] : []),
+    ],
+  });
+  if (!ok) return false;
+
   const all =
     (await neosh.state.get<Record<string, ModelInfo[]>>("custom").catch(() => null)) ?? {};
   const mine = (all[instance] ?? []).filter((m) => m.id !== id);
@@ -570,10 +582,9 @@ async function removeModel(neosh: Neosh, instance: string, id: string): Promise<
   await neosh.state.set("custom", all);
   neosh.notify(`removed ${instance}/${id}`);
 
-  // If it was the one in use, the conversation is now pointed at a model nothing lists. Say so
-  // rather than letting the next turn be the thing that finds out.
-  const current = await neosh.agent.selection().catch(() => null);
-  if (current?.instance === instance && current.model === id) {
+  // If it was the one in use, the conversation is now pointed at a model nothing lists. Said again
+  // here rather than only in the dialog: the dialog is gone by the time it matters.
+  if (inUse) {
     neosh.notify(`${id} was the model in use — pick another before sending`, "warn");
   }
   return true;
@@ -687,6 +698,10 @@ async function pickProvider(neosh: Neosh): Promise<void> {
   const ok = await confirmDestructive(neosh, `Forget the key for ${chosen.display_name}?`, {
     yes: "Forget",
     no: "Keep",
+    detail: [
+      "It goes from the keychain too, so this machine will not have it again until you paste it.",
+      `${chosen.display_name} will stop offering models until you sign in.`,
+    ],
   });
   if (!ok) return;
   await neosh.agent.forgetCredential(chosen.instance);

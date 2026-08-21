@@ -3,6 +3,7 @@ import type { BranchInfo } from "./BranchInfo";
 import type { BufferId } from "./BufferId";
 import type { CommandEntry } from "./CommandEntry";
 import type { CommitInfo } from "./CommitInfo";
+import type { Contribution } from "./Contribution";
 import type { CredentialInfo } from "./CredentialInfo";
 import type { DriverCommand } from "./DriverCommand";
 import type { ExtmarkId } from "./ExtmarkId";
@@ -22,6 +23,7 @@ import type { SurfaceId } from "./SurfaceId";
 import type { ToolDef } from "./ToolDef";
 import type { Viewport } from "./Viewport";
 import type { WindowId } from "./WindowId";
+import type { WindowInfo } from "./WindowInfo";
 import type { WorktreeInfo } from "./WorktreeInfo";
 
 /**
@@ -67,4 +69,7 @@ export type ApiOk =
   | { "ok": "commit"; commit: CommitInfo }
   | { "ok": "text"; text: string }
   | { "ok": "maybe_text"; text: string | null }
-  | { "ok": "json"; value: unknown };
+  | { "ok": "json"; value: unknown }
+  | { "ok": "vars"; vars: Record<string, unknown> }
+  | { "ok": "contributions"; contributions: Array<Contribution> }
+  | { "ok": "windows"; windows: Array<WindowInfo> };

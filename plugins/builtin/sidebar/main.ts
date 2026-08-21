@@ -17,11 +17,36 @@
  * and only the working row animates. Continuous repaint costs power for no information.
  *
  * It is a plugin. Everything here is on the public API, `plugins.disabled = ["sidebar"]` turns it
- * off, and a sidebar of your own loads after this one and wins.
+ * off, and a sidebar of your own loads after this one and wins. But replacing it is the *last*
+ * resort rather than the first, and three things are here so that it usually is not necessary:
+ *
+ * - **Every key in this panel is an ordinary binding**, on the buffer kind `neosh.sidebar`, pointed
+ *   at a command with a name. `F1` lists them, the palette runs them, and one line in your
+ *   `init.ts` moves any of them. There is no private switch statement any more — there was, and
+ *   what it meant was that adding one key to this panel meant forking all twelve hundred lines of
+ *   it.
+ * - **`sidebar.section` is a contribution point.** Anything you can describe as rows appears in the
+ *   column, in the position you ask for, invoking your commands.
+ * - **`sidebar.action` is a verb on a row.** Say the key, the label and the command; this panel
+ *   binds it, shows it in the hint strip when it applies, and invokes your command with the row
+ *   under the cursor as arguments.
+ *
+ * What a project *is* — pinned, ordered, folded — lives in shared project vars rather than in this
+ * plugin's private state, so a panel of your own, a status segment or a picker all read the same
+ * favourites rather than each starting empty. See ADR 0040.
  */
 
-import { byteLength } from "@neosh/api";
-import type { Disposable, Neosh, PluginContext, SessionInfo, WindowId, WorktreeInfo } from "@neosh/api";
+import { byteLength, projectScope } from "@neosh/api";
+import type {
+  Contribution,
+  Disposable,
+  Neosh,
+  PluginContext,
+  SessionInfo,
+  VarScope,
+  WindowId,
+  WorktreeInfo,
+} from "@neosh/api";
 import {
   confirmDestructive,
   configureMotion,
@@ -32,6 +57,7 @@ import {
   onTick,
   pathPicker,
   picker,
+  type PickerItem,
   prompt,
   pulseBright,
   spinnerFrame,
@@ -40,12 +66,59 @@ import {
 /** What a row points at, so the cursor survives the list being rebuilt underneath it. */
 type Target =
   | { kind: "project"; cwd: string }
-  | { kind: "session"; id: string; cwd: string; archived: boolean }
+  | { kind: "session"; id: string; cwd: string }
   /** The row that opens another directory. A row rather than only a key, because a verb nobody
    * can see is a verb nobody uses. */
   | { kind: "add" }
-  /** The heading of the archived section, which folds. Only present when there is one. */
-  | { kind: "archive" };
+  /** The way into what you have put away. Only present when there is something in it. */
+  | { kind: "browse"; count: number }
+  /** A row somebody else contributed. `command` runs on `↵`, with `args` as given. */
+  | { kind: "custom"; command?: string; args?: string[] };
+
+/**
+ * What the sidebar reads to find out what is not its own.
+ *
+ * Two points rather than one because they are answers to different questions. A *section* is
+ * content — rows in the column, which the contributor owns and re-contributes when its data
+ * changes. An *action* is a verb — a key on a row this panel already draws, which this panel binds
+ * and invokes on the contributor's behalf so that the row under the cursor can be passed along.
+ */
+const POINT_SECTION = "sidebar.section";
+const POINT_ACTION = "sidebar.action";
+
+/** A block of rows somebody else owns. Contributed as data, so it survives being listed and disabled. */
+interface SectionItem {
+  /** Drawn as a heading with a rule under it, matching `PROJECTS`. Omit for rows with no heading. */
+  title?: string;
+  /** Where it goes relative to the project list. Defaults to `below`. */
+  at?: "above" | "below";
+  rows?: Array<{
+    text: string;
+    hl?: string;
+    right?: { text: string; hl?: string };
+    /** Run on `↵`. Without one the row is inert — a label rather than a verb. */
+    command?: string;
+    args?: string[];
+  }>;
+}
+
+/**
+ * A verb on a row, contributed by somebody else.
+ *
+ * The command is invoked with the row under the cursor as arguments — `[kind, cwd]` for a project,
+ * `[kind, cwd, sessionId]` for a conversation — because a key press carries no arguments of its
+ * own and a plugin that had to track the cursor separately would be one race away from acting on
+ * the wrong row.
+ */
+interface ActionItem {
+  /** Key notation, as `keymap.set` takes it: `d`, `<C-y>`, `gd`. */
+  key: string;
+  /** What it does, for the hint strip and for `F1`. */
+  label: string;
+  command: string;
+  /** Which rows it applies to. Defaults to `any`. */
+  on?: "project" | "session" | "any";
+}
 
 /** A project as the panel thinks of it: a directory, and what is going on in it. */
 interface Project {
@@ -56,12 +129,30 @@ interface Project {
 }
 
 const NS = "neosh.sidebar";
+/** What this panel's buffer says it is. Everything a third party binds or finds hangs off this. */
+const KIND = "neosh.sidebar";
 
-/** Persisted arrangement. Small enough that all three are read once and written on a keystroke. */
-const KEY_FAVORITES = "favorites";
-const KEY_ORDER = "order";
-const KEY_FOLDED = "folded";
-const KEY_ARCHIVE_OPEN = "archiveOpen";
+/**
+ * Project vars, which are shared rather than ours.
+ *
+ * These used to be three arrays in this plugin's private state, which worked exactly as long as
+ * this was the only panel: a sidebar of your own started with no favourites, and pinning a project
+ * here was invisible to a status segment that wanted to say so. They are namespaced `sidebar.*`
+ * because that is what a var key is expected to look like, not because they belong to us — anybody
+ * may set them, and this panel redraws when they do.
+ */
+const VAR_FAVORITE = "sidebar.favorite";
+const VAR_RANK = "sidebar.rank";
+const VAR_FOLDED = "sidebar.folded";
+/**
+ * The directories this panel knows about, in workspace scope.
+ *
+ * An index rather than a second source of truth: a project with no conversation in it has nothing
+ * to derive its existence from, so pinning one has to be written down somewhere. Kept current from
+ * both ends — every conversation's directory goes in, and so does any directory somebody sets a
+ * project var on, which is how a project this panel has never seen becomes a row in it.
+ */
+const VAR_KNOWN = "sidebar.projects";
 
 export async function activate({ neosh, subscriptions }: PluginContext) {
   await declareOptions(neosh);
@@ -74,12 +165,18 @@ export async function activate({ neosh, subscriptions }: PluginContext) {
   };
   await applyMotion();
 
-  // How you left it. Read once; every later write goes to memory and to disk together, so a redraw
-  // never waits on the filesystem.
+  // How you left it. Read once into memory; every later write goes to the cache and to the shared
+  // var store together, so a redraw never waits on a round trip.
   const arrangement = new Arrangement(neosh);
-  await arrangement.load();
+  await arrangement.load(
+    (await neosh.session.list({ includeArchived: true }).catch(() => [] as SessionInfo[]))
+      .map((s) => s.cwd),
+  );
 
-  const buf = await neosh.buf.create({ name: "[sidebar]", scratch: true });
+  // The kind is what makes this panel something other plugins can act on: it is the scope their
+  // keymaps bind at and the handle `win.ofKind` finds it by. One argument, and the difference
+  // between a panel you can extend and one you can only replace.
+  const buf = await neosh.buf.create({ name: "[sidebar]", scratch: true, kind: KIND });
   const ns = await neosh.ns.create(NS);
   const list = new CursoredList<Target>(neosh, buf, ns);
   let win: WindowId | null = null;
@@ -116,6 +213,7 @@ export async function activate({ neosh, subscriptions }: PluginContext) {
           hints: hints ?? true,
           focused,
           selected: list.value,
+          actions: actions(),
         });
         running = built.running;
         list.setRows(built.rows, same);
@@ -168,6 +266,12 @@ export async function activate({ neosh, subscriptions }: PluginContext) {
     await draw();
   };
 
+  // The verbs other plugins put on our rows. Bound here rather than by them so the row under the
+  // cursor can be handed along; see `installActions`.
+  const installed = installActions(neosh, list, () => void draw());
+  const actions = installed.actions;
+  subscriptions.push(installed.dispose);
+
   await registerCommands({
     neosh,
     subscriptions,
@@ -186,6 +290,20 @@ export async function activate({ neosh, subscriptions }: PluginContext) {
   subscriptions.push(neosh.agent.onTurnEnd(() => void draw()));
   subscriptions.push(neosh.agent.onToolStart(() => void draw()));
   subscriptions.push(neosh.session.onChange(() => void draw()));
+  // Somebody pinned, folded or tagged a project — possibly us, possibly a plugin that has never
+  // heard of this one. Both arrive here, and the arrangement takes them in the same way.
+  subscriptions.push(
+    neosh.vars.onChange((e) => {
+      if (arrangement.observe(e.scope, e.key, e.value)) void draw();
+    }),
+  );
+  // Rows somebody contributed came or went. Redrawing on this is what stops a plugin that loads
+  // after us contributing rows nobody sees until the next unrelated refresh.
+  subscriptions.push(
+    neosh.ext.onChange((e) => {
+      if (e.point === POINT_SECTION) void draw();
+    }),
+  );
   subscriptions.push(
     neosh.opt.onChange((e) => {
       if (e.name === "ui.motion" || e.name === "ui.ascii_only") {
@@ -256,92 +374,149 @@ async function declareOptions(neosh: Neosh): Promise<void> {
 /**
  * Which projects are pinned, what order you put them in, and which ones are folded.
  *
- * Kept in plugin state rather than in options on purpose: an option is configuration *you* write,
+ * All of it in **project vars**, which is the difference between an arrangement and a private
+ * arrangement: a var is scoped to the project it describes and anybody may read or write it, so a
+ * second panel sees the same favourites and setting `sidebar.favorite` from your own plugin is a
+ * one-line way to pin something.
+ *
+ * Cached in memory and kept current from `vars.onChange`, because a panel redraws several times a
+ * second while a turn is running and a round trip per project per frame is not a thing to pay for.
+ * The cache is safe precisely *because* the change event is broadcast: every write, ours or
+ * anybody's, comes back through the same door.
+ *
+ * Not options, for the reason it has never been options: an option is configuration *you* write,
  * and an editor that rewrites your config file because you pressed `f` is one you stop trusting
  * with the file.
  */
 class Arrangement {
-  private favorites: string[] = [];
-  private order: string[] = [];
-  private folded = new Set<string>();
-  /** The archive starts shut. It is where things go to stop being in your way. */
-  private archiveOpen = false;
+  /** Every project we know of, and its vars. The cache is the read path; vars are the truth. */
+  private cache = new Map<string, Record<string, unknown>>();
+  private known: string[] = [];
 
   constructor(private readonly neosh: Neosh) {}
 
-  async load(): Promise<void> {
-    const [favorites, order, folded, archiveOpen] = await Promise.all([
-      this.neosh.state.get<string[]>(KEY_FAVORITES),
-      this.neosh.state.get<string[]>(KEY_ORDER),
-      this.neosh.state.get<string[]>(KEY_FOLDED),
-      this.neosh.state.get<boolean>(KEY_ARCHIVE_OPEN),
+  async load(cwds: string[]): Promise<void> {
+    const stored = await this.neosh.vars
+      .get<string[]>({ scope: "global" }, VAR_KNOWN)
+      .catch(() => null);
+    this.known = unique([...strings(stored), ...cwds]);
+    const all = await Promise.all(
+      this.known.map((cwd) =>
+        this.neosh.vars.all(projectScope(cwd)).catch(() => ({} as Record<string, unknown>))
+      ),
+    );
+    this.known.forEach((cwd, i) => this.cache.set(cwd, all[i] ?? {}));
+    if (stored === null) await this.migrate();
+  }
+
+  /**
+   * Bring across an arrangement made before any of this was shared.
+   *
+   * These three lived in this plugin's private state until project vars existed. Losing somebody's
+   * pins because the store moved underneath them is not an acceptable way to ship an improvement,
+   * so the old keys are read once — on the one startup where the index does not exist yet — and
+   * written into vars. The old state is left where it is rather than deleted: it costs a few bytes,
+   * and a downgrade that finds it still there is a downgrade that still works.
+   */
+  private async migrate(): Promise<void> {
+    const [favorites, order, folded] = await Promise.all([
+      this.neosh.state.get<string[]>("favorites").catch(() => null),
+      this.neosh.state.get<string[]>("order").catch(() => null),
+      this.neosh.state.get<string[]>("folded").catch(() => null),
     ]);
-    this.favorites = strings(favorites);
-    this.order = strings(order);
-    this.folded = new Set(strings(folded));
-    this.archiveOpen = archiveOpen === true;
+    const pins = strings(favorites);
+    const ranks = strings(order);
+    const shut = strings(folded);
+    if (pins.length === 0 && ranks.length === 0 && shut.length === 0) return;
+
+    await this.note(unique([...pins, ...ranks, ...shut]));
+    await Promise.all([
+      ...pins.map((cwd) => this.set(cwd, VAR_FAVORITE, true)),
+      ...ranks.map((cwd, i) => this.set(cwd, VAR_RANK, i)),
+      ...shut.map((cwd) => this.set(cwd, VAR_FOLDED, true)),
+    ]);
+    this.neosh.log.info(`brought ${this.known.length} project arrangements across to shared vars`);
   }
 
-  isArchiveOpen(): boolean {
-    return this.archiveOpen;
+  /**
+   * Take in a change somebody made — including our own writes, which arrive by the same route.
+   *
+   * Answers whether it was about a project at all, so a caller can skip a redraw for a var that has
+   * nothing to do with this panel.
+   */
+  observe(scope: VarScope, key: string, value: unknown): boolean {
+    if (scope.scope !== "project") return false;
+    const entry = this.cache.get(scope.cwd) ?? {};
+    if (value === null || value === undefined) delete entry[key];
+    else entry[key] = value;
+    this.cache.set(scope.cwd, entry);
+    // A project somebody else has just said something about is a project this panel should be
+    // showing. Without this, pinning a directory from another plugin sets a var nothing ever reads.
+    if (!this.known.includes(scope.cwd)) {
+      this.known.push(scope.cwd);
+      void this.neosh.vars.set({ scope: "global" }, VAR_KNOWN, this.known);
+    }
+    return true;
   }
 
-  async toggleArchive(): Promise<void> {
-    this.archiveOpen = !this.archiveOpen;
-    await this.neosh.state.set(KEY_ARCHIVE_OPEN, this.archiveOpen);
+  /** Remember directories that turned up in the conversation list. */
+  async note(cwds: string[]): Promise<void> {
+    const fresh = cwds.filter((c) => !this.known.includes(c));
+    if (fresh.length === 0) return;
+    this.known.push(...fresh);
+    await Promise.all(
+      fresh.map(async (cwd) => {
+        this.cache.set(
+          cwd,
+          await this.neosh.vars.all(projectScope(cwd)).catch(() => ({})),
+        );
+      }),
+    );
+    await this.neosh.vars.set({ scope: "global" }, VAR_KNOWN, this.known);
   }
 
-  /** Open the archive without a keystroke, so unarchiving from elsewhere is visible. */
-  openArchive(): void {
-    if (this.archiveOpen) return;
-    this.archiveOpen = true;
-    void this.neosh.state.set(KEY_ARCHIVE_OPEN, true);
-  }
-
-  /** Pinned directories, in the order they should appear. Also the seed for projects with no conversations. */
+  /** Pinned directories. Also the seed for projects with no conversations. */
   pinned(): string[] {
-    return [...this.favorites];
+    return this.known.filter((cwd) => this.isFavorite(cwd));
   }
 
   isFavorite(cwd: string): boolean {
-    return this.favorites.includes(cwd);
+    return this.cache.get(cwd)?.[VAR_FAVORITE] === true;
   }
 
   isFolded(cwd: string): boolean {
-    return this.folded.has(cwd);
+    return this.cache.get(cwd)?.[VAR_FOLDED] === true;
   }
 
   /** Where a project sorts. Anything you have never moved sorts after everything you have. */
   rank(cwd: string): number {
-    const i = this.order.indexOf(cwd);
-    return i < 0 ? Number.MAX_SAFE_INTEGER : i;
+    const v = this.cache.get(cwd)?.[VAR_RANK];
+    return typeof v === "number" && Number.isFinite(v) ? v : Number.MAX_SAFE_INTEGER;
   }
 
   async toggleFavorite(cwd: string): Promise<boolean> {
-    const now = this.favorites.includes(cwd);
-    this.favorites = now ? this.favorites.filter((p) => p !== cwd) : [...this.favorites, cwd];
-    await this.neosh.state.set(KEY_FAVORITES, this.favorites);
-    return !now;
+    const next = !this.isFavorite(cwd);
+    await this.set(cwd, VAR_FAVORITE, next ? true : null);
+    return next;
   }
 
   async toggleFold(cwd: string): Promise<void> {
-    if (this.folded.has(cwd)) this.folded.delete(cwd);
-    else this.folded.add(cwd);
-    await this.neosh.state.set(KEY_FOLDED, [...this.folded]);
+    await this.set(cwd, VAR_FOLDED, this.isFolded(cwd) ? null : true);
   }
 
   /** Open a project without a keystroke — used when jumping to the conversation you are in. */
   unfold(cwd: string): void {
-    if (!this.folded.delete(cwd)) return;
-    void this.neosh.state.set(KEY_FOLDED, [...this.folded]);
+    if (!this.isFolded(cwd)) return;
+    void this.set(cwd, VAR_FOLDED, null);
   }
 
   /**
    * Move a project one place within its own group.
    *
-   * The displayed order is written back wholesale first. Without that, the first `K` on a project
-   * you have never moved would reorder against an empty list and jump somewhere you did not ask
-   * for — the list has to mean what is on screen before it can be rearranged.
+   * Every rank in the group is written back, not just the two that swapped. Without that, the first
+   * `K` on a project you have never moved would reorder against ranks that do not exist and jump
+   * somewhere you did not ask for — the list has to mean what is on screen before it can be
+   * rearranged.
    *
    * No wrapping: a reorder that teleports the thing you are dragging to the far end is a reorder
    * you undo.
@@ -356,15 +531,31 @@ class Arrangement {
     const moved = group.map((p) => p.cwd);
     const [held] = moved.splice(from, 1);
     moved.splice(to, 0, held!);
-
-    this.order = groups.flatMap((g) => (g === group ? moved : g.map((p) => p.cwd)));
-    await this.neosh.state.set(KEY_ORDER, this.order);
+    await Promise.all(moved.map((c, i) => this.set(c, VAR_RANK, i)));
     return true;
+  }
+
+  /** One write, straight through the cache so the next frame is right without waiting for the event. */
+  private async set(cwd: string, key: string, value: unknown): Promise<void> {
+    const entry = this.cache.get(cwd) ?? {};
+    if (value === null) {
+      delete entry[key];
+      this.cache.set(cwd, entry);
+      await this.neosh.vars.remove(projectScope(cwd), key);
+      return;
+    }
+    entry[key] = value;
+    this.cache.set(cwd, entry);
+    await this.neosh.vars.set(projectScope(cwd), key, value);
   }
 }
 
 function strings(v: unknown): string[] {
   return Array.isArray(v) ? v.filter((x): x is string => typeof x === "string") : [];
+}
+
+function unique(v: string[]): string[] {
+  return [...new Set(v)];
 }
 
 // ---------------------------------------------------------------------------
@@ -393,116 +584,132 @@ async function registerCommands(w: Wiring): Promise<void> {
     return group(sessions, arrangement);
   };
 
-  w.subscriptions.push(
-    await neosh.cmd.register(`${NS}.key`, async (_args, k) => {
-      if (!k) return;
-      const code = k.key.code;
-      const target = list.value;
+  /**
+   * Register one verb, and bind it inside this panel.
+   *
+   * Every key in this list goes through here, which is the point: there is no private key handler
+   * any more, so `F1` lists the panel's keys with the rest, `^K` runs them, and
+   * `keymap.set("chat", "d", "…", { scope: { kind: "buf_kind", name: "neosh.sidebar" } })` from
+   * anybody's `init.ts` replaces one. The scope is the buffer kind rather than the window, because
+   * the window is opened and closed as you toggle the panel and a binding on it would go with it.
+   *
+   * `redraw` defaults to true because most verbs change what the column says. The ones that leave
+   * the panel — or open a picker that redraws on the way back — pass false, since drawing into a
+   * window that is losing focus is a frame of the wrong thing.
+   */
+  const verb = async (
+    name: string,
+    key: string | null,
+    desc: string,
+    fn: (target: Target | undefined, args: string[]) => Promise<void> | void,
+    opts: { redraw?: boolean } = {},
+  ): Promise<void> => {
+    w.subscriptions.push(
+      await neosh.cmd.register(name, async (args) => {
+        await fn(list.value, args);
+        if (opts.redraw !== false) await w.draw();
+      }, { desc }),
+    );
+    if (key !== null) {
+      await neosh.keymap.set("chat", key, name, {
+        scope: { kind: "buf_kind", name: KIND },
+        desc,
+      });
+    }
+  };
 
-      switch (code.kind) {
-        case "esc":
-          await w.leave();
-          return;
-        case "up":
-          list.move(-1);
-          break;
-        case "down":
-          list.move(1);
-          break;
-        case "enter":
-          await activateTarget(neosh, arrangement, target, w);
-          return;
-        case "char": {
-          const c = code.c;
-          if (k.key.mods.ctrl) {
-            if (c === "n") list.move(1);
-            else if (c === "p") list.move(-1);
-            else if (c === "c") await w.leave();
-            else return;
-            break;
-          }
-          switch (c) {
-            case " ":
-              if (target?.kind === "archive") {
-                await arrangement.toggleArchive();
-                break;
-              }
-              if (target?.kind !== "project") return;
-              await arrangement.toggleFold(target.cwd);
-              break;
-            case "j":
-              list.move(1);
-              break;
-            case "k":
-              list.move(-1);
-              break;
-            // Shift moves the thing rather than the cursor — the one convention every list that
-            // can be rearranged already shares.
-            //
-            // From a conversation row it moves the project that conversation is in. Requiring the
-            // cursor to be on the heading first made the feature invisible: you are looking at the
-            // project when you are looking at what is inside it.
-            case "J":
-            case "K": {
-              const cwd = owningProject(target);
-              if (cwd === null) return;
-              if (!(await arrangement.move(await groups(), cwd, c === "J" ? 1 : -1))) return;
-              break;
-            }
-            case "f": {
-              if (!target || target.kind === "add" || target.kind === "archive") return;
-              const cwd = target.cwd;
-              const now = await arrangement.toggleFavorite(cwd);
-              neosh.notify(now ? `favourited ${short(cwd)}` : `unfavourited ${short(cwd)}`, "info");
-              break;
-            }
-            case "q":
-              await w.leave();
-              return;
-            case "n": {
-              // In the project you are looking at, which is the whole reason the cursor is there.
-              const cwd = owningProject(target) ?? undefined;
-              await neosh.session.create(cwd ? { cwd } : undefined);
-              await w.leave();
-              return;
-            }
-            // The everyday verb, and it is reversible. Archiving takes a conversation out of the
-            // list without taking anything away, which is what people were reaching for `x` to do
-            // before `x` deleted things.
-            case "x":
-            case "u": {
-              if (target?.kind !== "session") return;
-              if (target.archived) arrangement.openArchive();
-              await setArchived(neosh, target.id, !target.archived);
-              break;
-            }
-            // Shifted, because this is the one that cannot be undone.
-            case "X": {
-              if (target?.kind !== "session") return;
-              await deleteSession(neosh, target.id);
-              break;
-            }
-            case "r":
-              if (target?.kind !== "session") return;
-              await renameSession(neosh, target.id);
-              break;
-            case "o":
-              await w.leave();
-              await neosh.cmd.exec("project.open").catch(() => {});
-              return;
-            case "?":
-              await neosh.cmd.exec("help.keys").catch(() => {});
-              return;
-            default:
-              return;
-          }
-          break;
-        }
-        default:
-          return;
-      }
-      await w.draw();
-    }, { desc: "Sidebar key" }),
+  // ---- moving ----
+  await verb(`${NS}.down`, "j", "Next row", () => void list.move(1));
+  await verb(`${NS}.up`, "k", "Previous row", () => void list.move(-1));
+  await neosh.keymap.set("chat", "<Down>", `${NS}.down`, { scope: { kind: "buf_kind", name: KIND } });
+  await neosh.keymap.set("chat", "<Up>", `${NS}.up`, { scope: { kind: "buf_kind", name: KIND } });
+  await neosh.keymap.set("chat", "<C-n>", `${NS}.down`, { scope: { kind: "buf_kind", name: KIND } });
+  await neosh.keymap.set("chat", "<C-p>", `${NS}.up`, { scope: { kind: "buf_kind", name: KIND } });
+
+  // ---- leaving ----
+  await verb(`${NS}.leave`, "<Esc>", "Back to the composer", () => w.leave(), { redraw: false });
+  await neosh.keymap.set("chat", "q", `${NS}.leave`, { scope: { kind: "buf_kind", name: KIND } });
+  await neosh.keymap.set("chat", "<C-c>", `${NS}.leave`, { scope: { kind: "buf_kind", name: KIND } });
+
+  // ---- the row under the cursor ----
+  await verb(
+    `${NS}.select`,
+    "<CR>",
+    "Open a conversation, fold a project, or run the row",
+    (target) => activateTarget(neosh, arrangement, target, w),
+    { redraw: false },
+  );
+  await verb(`${NS}.fold`, "<Space>", "Fold or unfold this project", async (target) => {
+    if (target?.kind !== "project") return;
+    await arrangement.toggleFold(target.cwd);
+  });
+  await verb(`${NS}.favorite`, "f", "Pin this project to the top", async (target) => {
+    const cwd = owningProject(target);
+    if (cwd === null) return;
+    const now = await arrangement.toggleFavorite(cwd);
+    neosh.notify(now ? `favourited ${short(cwd)}` : `unfavourited ${short(cwd)}`, "info");
+  });
+
+  // Shift moves the thing rather than the cursor — the one convention every list that can be
+  // rearranged already shares.
+  //
+  // From a conversation row it moves the project that conversation is in. Requiring the cursor to
+  // be on the heading first made the feature invisible: you are looking at the project when you are
+  // looking at what is inside it.
+  const reorder = (delta: number) => async (target: Target | undefined) => {
+    const cwd = owningProject(target);
+    if (cwd === null) return;
+    await arrangement.move(await groups(), cwd, delta);
+  };
+  await verb(`${NS}.move.down`, "J", "Move this project down", reorder(1));
+  await verb(`${NS}.move.up`, "K", "Move this project up", reorder(-1));
+
+  await verb(`${NS}.rename`, "r", "Rename this conversation", async (target) => {
+    if (target?.kind !== "session") return;
+    await renameSession(neosh, target.id);
+  });
+  // The everyday verb, and it is reversible. Archiving takes a conversation out of the list without
+  // taking anything away, which is what people were reaching for `x` to do before `x` deleted
+  // things. Where it goes is `a`, not four dim rows at the foot of this panel.
+  await verb(`${NS}.archive`, "x", "Archive this conversation", async (target) => {
+    if (target?.kind !== "session") return;
+    await setArchived(neosh, target.id, true);
+  });
+  // Shifted, because this is the one that cannot be undone.
+  await verb(`${NS}.delete`, "X", "Delete this conversation permanently", async (target) => {
+    if (target?.kind !== "session") return;
+    await deleteSession(neosh, target.id);
+  });
+  await verb(`${NS}.new`, "n", "New conversation in this project", async (target) => {
+    // In the project you are looking at, which is the whole reason the cursor is there.
+    const cwd = owningProject(target) ?? undefined;
+    await neosh.session.create(cwd ? { cwd } : undefined);
+    await w.leave();
+  }, { redraw: false });
+
+  // ---- doors out of the panel ----
+  await verb(`${NS}.browse`, "a", "What you have archived", async () => {
+    await browseArchive(neosh);
+    await w.draw();
+  }, { redraw: false });
+  await verb(`${NS}.add`, "o", "Add a project", async () => {
+    await w.leave();
+    await neosh.cmd.exec("project.open").catch(() => {});
+  }, { redraw: false });
+  await verb(`${NS}.help`, "?", "The keys for this row", async () => {
+    await neosh.cmd.exec("help.keys").catch(() => {});
+  }, { redraw: false });
+
+  /**
+   * Where the keys nothing claimed go: nowhere.
+   *
+   * Not a handler — a sink. Without it an unbound letter in this panel falls through as unhandled
+   * and the chat frontend types it into the composer, so pressing `z` here would silently start
+   * writing a message. Every key that *does* something is a binding above; this is only what stops
+   * the rest from doing something somewhere else.
+   */
+  w.subscriptions.push(
+    await neosh.cmd.register(`${NS}.key`, () => {}, { desc: "Swallow an unbound key in the panel" }),
   );
 
   w.subscriptions.push(
@@ -548,9 +755,14 @@ async function registerCommands(w: Wiring): Promise<void> {
         neosh.notify("session.unarchive needs a conversation id", "warn");
         return;
       }
-      arrangement.openArchive();
       await setArchived(neosh, id, false);
     }, { desc: "Bring an archived conversation back" }),
+  );
+  w.subscriptions.push(
+    await neosh.cmd.register("session.archived", async () => {
+      await browseArchive(neosh);
+      await w.draw();
+    }, { desc: "Browse what you have archived" }),
   );
   w.subscriptions.push(
     await neosh.cmd.register("project.open", async (args) => {
@@ -572,9 +784,116 @@ async function registerCommands(w: Wiring): Promise<void> {
   await neosh.keymap.set("chat", "<C-t>", "sidebar.focus", { desc: "Projects and conversations" });
   await neosh.keymap.set("chat", "<C-n>", "session.new", { desc: "New conversation" });
   await neosh.keymap.set("chat", "<C-o>", "project.open", { desc: "Add a project" });
+  // The archive is a place you go, not a section you scroll past. It has a key of its own so that
+  // taking it out of the panel does not make it something you have to remember a command for.
+  await neosh.keymap.set("chat", "<C-f>", "session.archived", {
+    desc: "Archived conversations",
+  });
 
   await neosh.hint.set("sessions", { keys: "^T", label: "conversations", priority: 20 });
   await neosh.hint.set("new", { keys: "^N", label: "new", priority: 21 });
+}
+
+/**
+ * Bind the verbs other plugins contributed, and rebind them when the set changes.
+ *
+ * The panel binds these rather than the contributor doing it, and that is deliberate: a key press
+ * carries no arguments, so a plugin that bound `d` itself would have no way to learn which row the
+ * cursor was on except by tracking every move — one race away from acting on the wrong
+ * conversation. Going through here, the command is invoked with the row as arguments and the
+ * contributor never has to know the panel has a cursor at all.
+ *
+ * They are real bindings all the same. `F1` lists them with the contributed label, `^K` runs the
+ * command, and a user who dislikes the key rebinds it exactly as they would one of ours.
+ */
+function installActions(
+  neosh: Neosh,
+  list: CursoredList<Target>,
+  onChange: () => void,
+): { actions: () => ActionItem[]; dispose: Disposable } {
+  const scope = { kind: "buf_kind", name: KIND } as const;
+  let current: Array<Contribution & { item: ActionItem }> = [];
+  let bound: Array<{ key: string; command: string }> = [];
+  let registered: Disposable[] = [];
+
+  const sync = async () => {
+    const got = await neosh.ext.list<ActionItem>(POINT_ACTION).catch(() => []);
+    const valid = got.filter((c) =>
+      typeof c.item?.key === "string" && typeof c.item?.command === "string"
+    );
+
+    // Everything from the previous round goes first. An action that was withdrawn must take its key
+    // *and* its command with it, or the panel keeps a binding pointing at a wrapper around a
+    // command whose plugin has gone.
+    for (const b of bound) await neosh.keymap.del("chat", b.key, scope).catch(() => {});
+    for (const d of registered) d.dispose();
+    bound = [];
+    registered = [];
+
+    for (const c of valid) {
+      const name = `${NS}.action.${c.plugin}.${c.id}`;
+      const command = await neosh.cmd.register(name, async () => {
+        const target = list.value;
+        if (!applies(c.item.on ?? "any", target)) return;
+        await neosh.cmd.exec(c.item.command, argsFor(target)).catch((e: unknown) => {
+          neosh.notify(String(e), "warn");
+        });
+        onChange();
+      }, { desc: c.item.label }).catch(() => null);
+      if (command) registered.push(command);
+      // A contributed key does not get to take one of ours. `keymap.set` already refuses to let a
+      // *bundled* default overwrite somebody's choice, but here the bundled plugin is the one doing
+      // the binding on a third party's behalf, so that rule points the wrong way and the check is
+      // ours to make. The command stays registered either way — `^K` still runs it, and the
+      // contributor is told which key it did not get.
+      if (RESERVED.has(c.item.key)) {
+        neosh.log.warn(
+          `${c.plugin} asked for '${c.item.key}' in the sidebar, which is already a panel key`,
+        );
+        continue;
+      }
+      await neosh.keymap.set("chat", c.item.key, name, { scope, desc: c.item.label })
+        .catch(() => {});
+      bound.push({ key: c.item.key, command: name });
+    }
+    current = valid;
+    onChange();
+  };
+
+  void sync();
+  const sub = neosh.ext.onChange((e) => {
+    if (e.point === POINT_ACTION) void sync();
+  });
+
+  return {
+    actions: () => current.map((c) => c.item),
+    dispose: {
+      dispose() {
+        sub.dispose();
+        for (const b of bound) void neosh.keymap.del("chat", b.key, scope).catch(() => {});
+        for (const d of registered) d.dispose();
+      },
+    },
+  };
+}
+
+/** The keys this panel has already spoken for. A contribution asking for one of these is a bug in it. */
+const RESERVED = new Set([
+  "j", "k", "q", "f", "J", "K", "r", "x", "X", "n", "a", "o", "?", " ",
+  "<Esc>", "<CR>", "<Up>", "<Down>", "<Space>", "<C-n>", "<C-p>", "<C-c>",
+]);
+
+function applies(on: "project" | "session" | "any", target: Target | undefined): boolean {
+  if (on === "any") return target !== undefined;
+  return target?.kind === on;
+}
+
+/** The row under the cursor, as arguments a command can act on. */
+function argsFor(target: Target | undefined): string[] {
+  if (!target) return [];
+  if (target.kind === "session") return ["session", target.cwd, target.id];
+  if (target.kind === "project") return ["project", target.cwd];
+  return [target.kind];
 }
 
 /**
@@ -665,13 +984,23 @@ async function activateTarget(
   w: Wiring,
 ): Promise<void> {
   if (!target) return;
+  // Somebody else's row. Nothing here knows what it does, which is the point — the contribution
+  // named a command and this invokes it.
+  if (target.kind === "custom") {
+    if (!target.command) return;
+    await neosh.cmd.exec(target.command, target.args).catch((e: unknown) => {
+      neosh.notify(String(e), "warn");
+    });
+    await w.draw();
+    return;
+  }
   if (target.kind === "add") {
     await w.leave();
     await neosh.cmd.exec("project.open").catch(() => {});
     return;
   }
-  if (target.kind === "archive") {
-    await arrangement.toggleArchive();
+  if (target.kind === "browse") {
+    await browseArchive(neosh);
     await w.draw();
     return;
   }
@@ -688,10 +1017,6 @@ async function activateTarget(
     return;
   }
   try {
-    // Opening something you put away is a statement that you want it back. Leaving it archived
-    // while you work in it would mean the list you are looking at does not contain the
-    // conversation you are in.
-    if (target.archived) await neosh.session.archive(target.id, false);
     await neosh.session.switch(target.id);
   } catch (e) {
     neosh.notify(String(e), "warn");
@@ -745,39 +1070,144 @@ async function chooseDirectory(neosh: Neosh): Promise<string | null> {
  * Put a conversation away, or bring it back.
  *
  * Asks nothing, on purpose. A confirmation is the price of an irreversible action, and this one is
- * reversible by pressing the same key again — charging for it would teach you to dismiss dialogs,
+ * reversible by one key from the archive — charging for it would teach you to dismiss dialogs,
  * which is exactly the habit that makes the delete dialog useless.
  */
 async function setArchived(neosh: Neosh, session: string, archived: boolean): Promise<void> {
   try {
     await neosh.session.archive(session, archived);
-    neosh.notify(archived ? "archived — `u` brings it back" : "unarchived");
+    neosh.notify(archived ? "archived — `a` in the panel finds it" : "unarchived");
   } catch (e) {
     neosh.notify(String(e), "warn");
   }
 }
 
 /**
- * Delete a conversation, asking first when there is something to lose.
+ * Delete a conversation, having asked. Answers whether it went.
  *
- * The file goes from disk and there is no undo, so this is the one verb in the panel that asks. It
- * asks *conditionally*: a conversation you have not said anything in yet has nothing to lose, and
- * a dialog for it is friction that teaches you to dismiss dialogs.
+ * The file goes from disk and there is no undo, so this always stops and asks — including for a
+ * conversation with nothing in it yet. It used to skip the question there, on the grounds that a
+ * dialog for something with nothing to lose is friction; what that actually bought was a key whose
+ * behaviour depended on state you cannot see from the row, so the one time it did ask was the one
+ * time your fingers were already through it.
+ *
+ * `ui.confirm_destructive = false` is still the way out, and it is a setting rather than a guess.
  */
-async function deleteSession(neosh: Neosh, session: string): Promise<void> {
+async function deleteSession(neosh: Neosh, session: string): Promise<boolean> {
   const info = (await neosh.session.list({ includeArchived: true }).catch(() => [] as SessionInfo[]))
     .find((s) => s.id === session);
-  if (info && info.message_count > 0) {
-    const what = info.message_count === 1 ? "message" : "messages";
-    const ok = await confirmDestructive(
-      neosh,
-      `Delete "${clip(info.label, 40)}" and its ${info.message_count} ${what}? Archiving keeps it.`,
-      { yes: "Delete", no: "Keep" },
-    );
-    if (!ok) return;
-  }
+  const count = info?.message_count ?? 0;
+  const detail = [
+    count === 0
+      ? "Nothing has been said in it yet."
+      : `${count} ${count === 1 ? "message" : "messages"}, in ${info?.project || basename(info?.cwd ?? "")}.`,
+    info?.archived
+      ? "It is archived, so leaving it here costs nothing."
+      : "Archiving keeps every word of it and takes it out of your list.",
+  ];
+  const ok = await confirmDestructive(
+    neosh,
+    `Delete "${clip(info?.label ?? "this conversation", 48)}"?`,
+    { yes: "Delete", no: "Keep", detail },
+  );
+  if (!ok) return false;
   try {
     await neosh.session.close(session);
+    return true;
+  } catch (e) {
+    neosh.notify(String(e), "warn");
+    return false;
+  }
+}
+
+/**
+ * What you have put away.
+ *
+ * A place you go rather than a section you scroll past. The archive used to be four dim rows at the
+ * foot of the panel, which is the worst of both: in the way of the list you work in, and too small
+ * to actually find anything in once there were twenty of them. As a picker it filters, it says which
+ * project each one came from, and the verbs that only make sense here — put it back, or finally
+ * throw it away — live on keys here instead of on the everyday list.
+ *
+ * `↵` restores *and* opens, because opening something you put away is a statement that you want it
+ * back: leaving it archived while you work in it would mean the list you look at does not contain
+ * the conversation you are in.
+ */
+async function browseArchive(neosh: Neosh): Promise<void> {
+  const rows = async (): Promise<PickerItem<SessionInfo>[]> => {
+    const all = await neosh.session
+      .list({ includeArchived: true })
+      .catch(() => [] as SessionInfo[]);
+    const now = Date.now() / 1000;
+    return all
+      .filter((s) => s.archived)
+      // Most recently put away first: the one you want back is usually the one you last regretted.
+      .sort((a, b) => (b.archived_at ?? b.updated_at) - (a.archived_at ?? a.updated_at))
+      .map((s) => {
+        const count = s.message_count;
+        const when = ago(now - (s.archived_at ?? s.updated_at));
+        return {
+          label: clip(s.label, 44),
+          detail: [
+            s.project || basename(s.cwd),
+            `${count} ${count === 1 ? "message" : "messages"}`,
+            when === "" ? "" : `archived ${when}`,
+          ].filter((p) => p !== "").join("  ·  "),
+          // Filtered on but not shown: you look for a conversation by what it was about or which
+          // checkout it was in, and the path is the half of that the label never carries.
+          keywords: s.cwd,
+          value: s,
+        };
+      });
+  };
+
+  const items = await rows();
+  if (items.length === 0) {
+    neosh.notify("nothing is archived — `x` on a conversation puts it here", "info");
+    return;
+  }
+  // Mutated in place rather than rebuilt, because the picker ranks the array it was handed: acting
+  // on a row and saying `reload` is how the list catches up without losing your place in it.
+  const refill = async () => {
+    items.splice(0, items.length, ...(await rows()));
+  };
+
+  const chosen = await picker(neosh, items, {
+    title: "Archived conversations",
+    width: 82,
+    height: 12,
+    placeholder: "nothing archived matches that",
+    hints: "↵ restore   ^U put back   ^X delete   esc close",
+    // Chords, because every bare letter this takes is a letter its filter can never contain — and
+    // both of these are bound elsewhere, so they have to be claimed to arrive at all.
+    ownKeys: ["<C-u>", "<C-x>"],
+    async onKey(key, ctx) {
+      if (key.key.code.kind !== "char" || !key.key.mods.ctrl || key.key.mods.alt) return;
+      const s = ctx.item;
+      if (!s) return "handled";
+      switch (key.key.code.c.toLowerCase()) {
+        // Back in the list, without going there. The difference from `↵`: you are tidying, not
+        // switching, and being thrown into a conversation per row you restore is not tidying.
+        case "u":
+          await setArchived(neosh, s.id, false);
+          await refill();
+          return items.length === 0 ? "close" : "reload";
+        case "x": {
+          if (!(await deleteSession(neosh, s.id))) return "handled";
+          await refill();
+          return items.length === 0 ? "close" : "reload";
+        }
+        default:
+          return;
+      }
+    },
+  });
+  if (chosen === null) return;
+
+  try {
+    await neosh.session.archive(chosen.id, false);
+    await neosh.session.switch(chosen.id);
+    neosh.notify(`restored "${clip(chosen.label, 40)}"`);
   } catch (e) {
     neosh.notify(String(e), "warn");
   }
@@ -853,6 +1283,8 @@ interface DrawOptions {
   hints: boolean;
   focused: boolean;
   selected: Target | undefined;
+  /** The verbs other plugins put on our rows, for the hint strip. */
+  actions: ActionItem[];
 }
 
 async function collect(
@@ -876,6 +1308,15 @@ async function collect(
   // costing a heading, a rule and a blank line.
   const projects = group(sessions, arrangement).flat();
 
+  // A directory that turned up in the conversation list and we had not seen before. Noted rather
+  // than fetched inline: the draw runs on a tick and must not wait on a round trip per project.
+  void arrangement.note(all.map((s) => s.cwd));
+
+  // Rows other plugins own. Read every frame rather than cached, because a contribution is replaced
+  // in place when its author's data changes and re-reading is one call.
+  const sections = await neosh.ext.list<SectionItem>(POINT_SECTION).catch(() => []);
+  rows.push(...sectionRows(sections, "above", opts));
+
   rows.push(...heading("PROJECTS", opts.width));
   for (const p of projects) {
     rows.push(projectRow(p, arrangement, opts, now));
@@ -893,26 +1334,67 @@ async function collect(
     value: { kind: "add" },
   });
 
-  // Only when there is one. An empty section is a permanent reminder of a feature you are not
-  // using, which is the cost of putting every feature on screen forever.
+  // One row, and only while there is something in it. What used to be here was a foldable section
+  // with every archived conversation under it — which put the things you have finished with in the
+  // same column as the things you are working on, and grew without limit. The point of archiving is
+  // that it goes away; a door is the most this panel should spend on saying where.
   if (archived.length > 0) {
-    const open = arrangement.isArchiveOpen();
-    const arrow = opts.ascii ? (open ? "v" : ">") : open ? "▾" : "▸";
-    rows.push(blank());
     rows.push({
-      text: ` ${arrow} ARCHIVED`,
-      hl: "Sidebar.Heading",
+      text: `   ${opts.ascii ? "-" : "┈"} Archived`,
+      hl: "Sidebar.Dim",
       right: { text: `${archived.length} `, hl: "Sidebar.Dim" },
-      value: { kind: "archive" },
+      value: { kind: "browse", count: archived.length },
     });
-    if (open) {
-      for (const s of archived) rows.push(archivedRow(s, opts));
-    }
   }
+
+  rows.push(...sectionRows(sections, "below", opts));
 
   if (opts.hints) rows.push(...hints(opts));
 
   return { rows, running };
+}
+
+/**
+ * Rows somebody else contributed, in the half of the column they asked for.
+ *
+ * Every field is checked rather than trusted. A contribution is JSON from a plugin this one has
+ * never heard of, and a panel that throws on a missing `text` is a panel a third party can break by
+ * getting one row wrong — which would make contributing feel like a risk rather than the ordinary
+ * way to add something.
+ */
+function sectionRows(
+  sections: Array<Contribution & { item: SectionItem }>,
+  at: "above" | "below",
+  opts: DrawOptions,
+): ListRow<Target>[] {
+  const rows: ListRow<Target>[] = [];
+  for (const c of sections) {
+    if ((c.item?.at ?? "below") !== at) continue;
+    const contributed = Array.isArray(c.item?.rows) ? c.item.rows : [];
+    if (contributed.length === 0 && !c.item?.title) continue;
+
+    rows.push(blank());
+    if (typeof c.item.title === "string" && c.item.title !== "") {
+      rows.push(...heading(clip(c.item.title, opts.width - 2), opts.width));
+    }
+    for (const r of contributed) {
+      if (typeof r?.text !== "string") continue;
+      rows.push({
+        text: `   ${clip(r.text, Math.max(4, opts.width - 6))}`,
+        hl: typeof r.hl === "string" ? r.hl : undefined,
+        right: typeof r.right?.text === "string"
+          ? { text: `${r.right.text} `, hl: r.right.hl }
+          : undefined,
+        // No command means a label. A row you can land on that does nothing when you press `↵` is
+        // worse than one the cursor skips.
+        inert: typeof r.command !== "string",
+        value: typeof r.command === "string"
+          ? { kind: "custom", command: r.command, args: strings(r.args) }
+          : undefined,
+      });
+    }
+  }
+  return rows;
 }
 
 /**
@@ -991,24 +1473,7 @@ function sessionRow(s: SessionInfo, now: number, opts: DrawOptions): ListRow<Tar
       text: right === "" ? "" : `${right} `,
       hl: working ? "Status.Working" : "Sidebar.Dim",
     },
-    value: { kind: "session", id: s.id, cwd: s.cwd, archived: false },
-  };
-}
-
-/**
- * An archived conversation: dim, with the project it came from instead of a clock.
- *
- * The project is what you need here and nowhere else — the archive is one flat list, so a name on
- * its own does not say which checkout it belongs to.
- */
-function archivedRow(s: SessionInfo, opts: DrawOptions): ListRow<Target> {
-  const project = s.project || basename(s.cwd);
-  const width = Math.max(8, opts.width - 10 - project.length);
-  return {
-    text: `     ${opts.ascii ? "-" : "┈"} ${clip(s.label, width)}`,
-    hl: "Sidebar.Dim",
-    right: { text: `${project} `, hl: "Comment" },
-    value: { kind: "session", id: s.id, cwd: s.cwd, archived: true },
+    value: { kind: "session", id: s.id, cwd: s.cwd },
   };
 }
 
@@ -1034,26 +1499,40 @@ function turnFor(s: SessionInfo, now: number): string {
  * here is also reachable from `?`, which is the escape hatch when the panel is too narrow.
  */
 function hints(opts: DrawOptions): ListRow<Target>[] {
-  const target = opts.selected;
-  const kind = target?.kind;
-  const archived = target?.kind === "session" && target.archived;
+  const kind = opts.selected?.kind;
   const lines = !opts.focused
-    ? ["^T projects  ^N new   ^O add", "^K palette   ^B hide  F1 keys"]
+    // `^O` is not here and `+ Add project` is a row you can see: a key strip has two lines, and the
+    // verb with a row of its own is the one that can afford to give up its place on them.
+    ? ["^T projects  ^N new   ^F archive", "^K palette   ^B hide  F1 keys"]
     : kind === "project"
-      ? ["↵ fold   f ♥      JK move", "n new    o add    ? keys"]
-      : archived
-        ? ["↵ open    u unarchive", "X delete  ? keys"]
-        : kind === "session"
-          ? ["↵ open   r rename   x archive", "JK move  X delete   ? keys"]
-          : kind === "archive"
-            ? ["↵ show what is put away", "? keys"]
-            : ["↵ add project    ? keys", "esc back"];
+      ? ["↵ fold   f ♥       JK move", "n new    a archive  ? keys"]
+      : kind === "session"
+        ? ["↵ open   r rename   x archive", "X delete a archive   ? keys"]
+        : kind === "browse"
+          ? ["↵ what you have put away", "? keys"]
+          : ["↵ add project    a archive", "esc back         ? keys"];
+
+  // Contributed verbs get their own line rather than being squeezed onto ours, because ours are
+  // laid out in columns that a third party's label of unknown length would break — and because a
+  // key nobody can see is a key nobody presses, which is the whole argument for this strip.
+  const mine = opts.focused ? contributedHint(opts) : "";
 
   return [
     blank(),
     { text: "─".repeat(Math.max(1, opts.width)), hl: "Separator", inert: true },
     ...lines.map((text) => ({ text: ` ${text}`, hl: "Sidebar.Dim", inert: true })),
+    ...(mine === "" ? [] : [{ text: ` ${mine}`, hl: "Sidebar.Dim", inert: true }]),
   ];
+}
+
+/** The contributed verbs that apply to the row under the cursor, clipped to the column. */
+function contributedHint(opts: DrawOptions): string {
+  const applicable = opts.actions.filter((a) => applies(a.on ?? "any", opts.selected));
+  if (applicable.length === 0) return "";
+  return clip(
+    applicable.map((a) => `${a.key} ${a.label}`).join("   "),
+    Math.max(4, opts.width - 2),
+  );
 }
 
 /**

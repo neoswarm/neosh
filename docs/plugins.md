@@ -92,6 +92,28 @@ takes the row for what you actually typed.
 
 `pathPicker` is that, pre-wired for directories.
 
+A picker can also carry *verbs*. `onKey` is checked before the widget's own handling, and `ownKeys`
+claims keys a binding elsewhere would otherwise take — the archive browser puts "put it back" and
+"delete it" on rows this way, rather than opening a second modal to ask which you meant:
+
+```ts
+const chosen = await picker(neosh, items, {
+  hints: "↵ restore   ^U put back   ^X delete   esc close",
+  ownKeys: ["<C-u>", "<C-x>"],           // both are bound elsewhere; claim them or they never arrive
+  async onKey(key, ctx) {
+    if (key.key.code.kind !== "char" || !key.key.mods.ctrl) return;
+    if (key.key.code.c === "u") {
+      await putBack(ctx.item);
+      items.splice(0, items.length, ...(await rows()));   // mutate the array you passed in
+      return "reload";                                     // …and the list catches up in place
+    }
+  },
+});
+```
+
+Return `"close"`, `"reload"`, `"handled"`, or nothing at all to let the widget have the key. Chords
+only in a picker that filters: every bare letter you take is a letter the filter can never contain.
+
 Widget keys come from `ui.keys.*` and are claimed window-scoped while the widget is open, so they
 outrank global bindings and are released with the window. You get that for free by using these
 widgets; there is nothing to declare.
@@ -102,14 +124,26 @@ widgets; there is nothing to declare.
 const name = await prompt(neosh, "Branch name", { initial: suggested });
 const ok = await confirm(neosh, "Stage everything?");
 
-// For anything that cannot be undone. Reads `ui.confirm_destructive`, and starts the cursor on the
-// answer that changes nothing — so use this rather than `confirm` and the setting means one thing
-// everywhere without your plugin knowing it exists.
-if (!(await confirmDestructive(neosh, `Delete ${name}?`, { yes: "Delete", no: "Keep" }))) return;
+// For anything that cannot be undone. Reads `ui.confirm_destructive`, starts the cursor on the
+// answer that changes nothing, and draws the other one in the theme's error colour — so use this
+// rather than `confirm` and the setting means one thing everywhere without your plugin knowing it
+// exists.
+if (!(await confirmDestructive(neosh, `Delete ${name}?`, {
+  yes: "Delete",
+  no: "Keep",
+  detail: [`${count} messages, in ${project}.`, "Archiving keeps every word of it."],
+}))) return;
 ```
 
 The bar is *irreversible*, not merely significant. Closing a panel or switching a model asks
-nothing, because you can put those back.
+nothing, because you can put those back. On the other side of that line there are no exceptions:
+ask every time, including for the cheap case, because a dialog that appears only sometimes is one
+the user's fingers are already through by the time it matters.
+
+`detail` is what makes it worth stopping for. "Are you sure?" is a speed bump; the number of
+messages, the project they are in and what the alternative is can be answered without leaving the
+dialog to go and check. `y`/`n` answer it outright, and the question wraps rather than being clipped
+to one line.
 
 ### `railPicker`
 
@@ -297,10 +331,108 @@ Keyed by your plugin id — which the host knows and you cannot forge — so no 
 clobber it. `get` returns `null` when nothing was stored. Written atomically, one JSON object per
 plugin under `$STATE/plugin-state/`.
 
-Use it for arrangement, not configuration. Which projects the user pinned and what order they
-dragged them into belongs here; a *setting* belongs in `neosh.opt`, because an option is something
-the user wrote in `config.toml` and a plugin that rewrites that file because someone pressed a key
-is one they stop trusting with it. And nothing secret belongs here: it is plain JSON on disk.
+Use it for arrangement, not configuration. Which sections a panel of yours has folded belongs here;
+a *setting* belongs in `neosh.opt`, because an option is something the user wrote in `config.toml`
+and a plugin that rewrites that file because someone pressed a key is one they stop trusting with
+it. And nothing secret belongs here: it is plain JSON on disk.
+
+## What everybody remembers — `neosh.vars`
+
+The same thing, minus the privacy, plus a scope. A var describes the workspace, a conversation or a
+project, and anyone may read or write it.
+
+```ts
+import { projectScope, sessionScope } from "@neosh/api";
+
+await neosh.vars.set(projectScope(cwd), "sidebar.favorite", true);
+const pinned = await neosh.vars.get<boolean>(projectScope(cwd), "sidebar.favorite");
+const all = await neosh.vars.all(projectScope(cwd));   // one round trip, the whole project
+
+neosh.vars.onChange((e) => {                            // whoever changed it, including you
+  if (e.scope.scope === "project") redraw();
+});
+```
+
+The line between this and `state` is who has a reason to look. A fold set is yours; "this project is
+a favourite" is not, and while it was, a second panel started with no favourites and there was no
+way to tell it about them. Pinning a project from your own plugin is now the three lines above.
+
+Namespace your keys — `sidebar.favorite`, `acme.colour` — for the reason options are namespaced.
+Nothing stops two plugins choosing `colour`; a prefix is what makes them not want to.
+
+Default to `state` and reach for `vars` when somebody else genuinely needs the value. A workspace
+where every plugin writes its scratch into a shared table is one where nobody can rename anything.
+And note that a var write is a *file* write: right for a keystroke like `f`, wrong for anything that
+happens on every cursor move — publish that as an event instead.
+
+---
+
+## Putting something in somebody else's panel
+
+Three mechanisms, and between them you should not have to fork a bundled plugin to change it. See
+[ADR 0040](adr/0040-a-panel-is-a-surface-not-a-program.md).
+
+### Bind a key inside a panel you did not open
+
+A panel declares what it is with a buffer *kind*, and you bind against the kind rather than against
+a window whose id is private to whoever opened it and changes every time it is toggled.
+
+```ts
+// In your init.ts. `x` archives a conversation by default; this replaces it.
+await neosh.keymap.set("chat", "x", "acme.mine", {
+  scope: { kind: "buf_kind", name: "neosh.sidebar" },
+  desc: "Do it my way",
+});
+```
+
+Resolution is window → buffer → kind → global, first match winning. Your binding is an ordinary one:
+`F1` lists it under the panel's section, `^K` runs the command, and the panel's own default loses to
+it because a default that overwrites a choice is not a default.
+
+Publish a kind for anything of yours that is more than a scratch buffer — it is one argument, and it
+is the difference between a panel somebody can extend and one they can only replace:
+
+```ts
+const buf = await neosh.buf.create({ name: "[tasks]", scratch: true, kind: "acme.tasks" });
+const open = await neosh.win.ofKind("neosh.sidebar");   // find somebody else's, too
+```
+
+### Contribute rows and verbs
+
+A contribution point is a name a plugin agrees to read. The sidebar reads two:
+
+```ts
+// Rows in the column. Re-contributing under the same id replaces, so this is also how you update.
+await neosh.ext.contribute("sidebar.section", "todo", {
+  title: "ACME",
+  at: "below",                                    // or "above" the project list
+  rows: [{ text: "Ship the thing", command: "acme.open", args: ["thing"] }],
+});
+
+// A verb on a row. The panel binds the key and invokes your command with the row under the cursor:
+// ["session", cwd, id] or ["project", cwd].
+await neosh.ext.contribute("sidebar.action", "touch", {
+  key: "t",
+  label: "touch",
+  command: "acme.touch",
+  on: "session",                                   // or "project", or "any"
+});
+```
+
+Your contributions go when your plugin does, so `plugins.disabled` takes your rows with it. A point
+is just a string: reading one in a panel of your own is `ext.list(point)` plus a redraw on
+`ext.onChange`, and that is the whole protocol.
+
+### Say that something happened
+
+```ts
+await neosh.event.emit("acme.indexed", { files: 412 });
+neosh.event.on("acme.indexed", (e) => { /* e.data, e.from */ });
+```
+
+Broadcast, plugin-defined, and with no reply by construction — an emitter that could be blocked is an
+emitter with every listener on its critical path. When you need an answer, register a command or read
+a contribution point. `from` is stamped by the host and cannot be forged.
 
 ---
 
@@ -345,6 +477,10 @@ await neosh.session.close(id);                       // deletes the file. No und
 `archive` and `close` are different verbs on purpose. If you are writing the thing a user presses
 when they are done with a conversation, it is `archive`; `close` is for when they have said they
 mean it. Gate `close` behind `confirmDestructive` and say that archiving keeps it.
+
+Nothing archived appears in the sidebar — `session.archived` is the command that opens it, and
+`list({ includeArchived: true })` is how you find them yourself. A panel of your own should do the
+same: the list someone works in is the list of things they might switch to now.
 
 ---
 

@@ -29,11 +29,20 @@ import type { SurfaceCell } from "./SurfaceCell";
 import type { SurfaceId } from "./SurfaceId";
 import type { TextEdit } from "./TextEdit";
 import type { ToolDef } from "./ToolDef";
+import type { VarScope } from "./VarScope";
 import type { WindowId } from "./WindowId";
 import type { WindowLayout } from "./WindowLayout";
 
 export type ApiCall =
-  | { "call": "buf_create"; name?: string | null; scratch: boolean }
+  | {
+    "call": "buf_create";
+    name?: string | null;
+    scratch: boolean;
+    /**
+     * What this buffer *is*, so that somebody else can say something about it.
+     */
+    kind?: string | null;
+  }
   | { "call": "buf_line_count"; buf: BufferId }
   | {
     "call": "buf_get_lines";
@@ -54,6 +63,8 @@ export type ApiCall =
   }
   | { "call": "buf_append_text"; buf: BufferId; text: string }
   | { "call": "buf_set_name"; buf: BufferId; name: string }
+  | { "call": "buf_set_kind"; buf: BufferId; kind?: string | null }
+  | { "call": "buf_get_kind"; buf: BufferId }
   | { "call": "buf_attach"; buf: BufferId }
   | { "call": "buf_detach"; buf: BufferId }
   | { "call": "win_open"; buf: BufferId; layout: WindowLayout }
@@ -63,6 +74,7 @@ export type ApiCall =
   | { "call": "win_set_cursor"; win: WindowId; row: number; col: number }
   | { "call": "win_get_viewport"; win: WindowId }
   | { "call": "win_scroll_to"; win: WindowId; top_line: number }
+  | { "call": "win_list" }
   | {
     "call": "win_motion";
     win: WindowId;
@@ -228,6 +240,24 @@ export type ApiCall =
   | { "call": "state_get"; key: string }
   | { "call": "state_set"; key: string; value: unknown }
   | { "call": "state_delete"; key: string }
+  | {
+    "call": "ext_contribute";
+    point: string;
+    id: string;
+    item: unknown;
+    /**
+     * Where it sorts among the contributions on this point. Ties break on plugin id, so the
+     * order is stable across restarts rather than being load order.
+     */
+    priority: number;
+  }
+  | { "call": "ext_remove"; point: string; id: string }
+  | { "call": "ext_list"; point: string }
+  | { "call": "event_emit"; name: string; data?: unknown }
+  | { "call": "var_get"; scope: VarScope; key: string }
+  | { "call": "var_set"; scope: VarScope; key: string; value: unknown }
+  | { "call": "var_delete"; scope: VarScope; key: string }
+  | { "call": "var_all"; scope: VarScope }
   | { "call": "rtp_add"; path: string }
   | { "call": "rtp_list" }
   | { "call": "path_complete"; prefix: string }

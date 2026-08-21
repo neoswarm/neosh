@@ -20,6 +20,7 @@ import type { BufferId } from "./generated/BufferId";
 import type { Capability } from "./generated/Capability";
 import type { CommitInfo } from "./generated/CommitInfo";
 import type { CommandEntry } from "./generated/CommandEntry";
+import type { Contribution } from "./generated/Contribution";
 import type { AccountKind } from "./generated/AccountKind";
 import type { Brand } from "./generated/Brand";
 import type { CredentialInfo } from "./generated/CredentialInfo";
@@ -87,22 +88,25 @@ import type { ToolDef } from "./generated/ToolDef";
 import type { ToolResult } from "./generated/ToolResult";
 import type { TurnRequest } from "./generated/TurnRequest";
 import type { Usage } from "./generated/Usage";
+import type { VarScope } from "./generated/VarScope";
 import type { Viewport } from "./generated/Viewport";
 import type { WindowId } from "./generated/WindowId";
+import type { WindowInfo } from "./generated/WindowInfo";
 import type { WindowLayout } from "./generated/WindowLayout";
 import type { WorktreeInfo } from "./generated/WorktreeInfo";
 
 export type {
   AccountKind, Activity, ApiError, BranchInfo, Brand, BufferId, Capability, CommandEntry, CommitInfo,
-  CredentialInfo, CredentialSource, DiffTarget, Dock, CursorMotion, ExtmarkId, ExtmarkInfo, ExtmarkOpts, FileChange, FileState, FloatConfig,
+  Contribution, CredentialInfo, CredentialSource, DiffTarget, Dock, CursorMotion, ExtmarkId, ExtmarkInfo, ExtmarkOpts, FileChange, FileState, FloatConfig,
   Gravity, HighlightDef, HighlightSpec, Hint, HookName, HookOutcome, HookPayload, InstanceConfig, KeyContext,
   KeymapEntry, KeymapScope, MessageLevel, Mode, ModelEntry, ModelInfo, ModelSelection, ModelTier, NamespaceId,
   OptionChoice, OptionEntry, OptionSelection, OptionSpec, OptionType, OptionValue,
   DriverCommand, PlanState, PlanStep, TaskId, TaskStatus,
   Message, PermissionDecision, PermissionMode, PermissionOption, PermissionOptionKind, PluginEvent, Pricing, ProviderEvent, ProviderOptionDescriptor,
   Rect, RepoInfo, RepoStatus, SessionId, SessionInfo, StatusAlign, StatusSegment, StopReason,
-  SurfaceCell, SurfaceId, TextEdit, ToolCall, ToolDef, ToolResult, TurnRequest, Usage, Viewport,
-  WindowId, WindowLayout,
+  SurfaceCell, SurfaceId, TextEdit, ToolCall, ToolDef, ToolResult, TurnRequest, Usage,
+  VarScope, Viewport,
+  WindowId, WindowInfo, WindowLayout,
   WorktreeInfo,
 };
 
@@ -272,6 +276,15 @@ export interface VirtText {
 export interface MarkOptions {
   endCol?: number;
   hlGroup?: string;
+  /**
+   * A background for the whole rendered row, not just the bytes the mark covers.
+   *
+   * It sits *under* every ranged `hlGroup` on the row rather than competing with them, so a row can
+   * be banded — selected, changed, at fault — and the text on it keeps whatever colour said what it
+   * was. `hlGroup` across the same span would replace that colour instead, which is how a selected
+   * row ends up the only one that has stopped saying anything.
+   */
+  lineHlGroup?: string;
   virtText?: VirtText[];
   virtTextPos?: ExtmarkOpts["virt_text_pos"];
   onDelete?: ExtmarkOpts["on_delete"];
@@ -314,6 +327,9 @@ export interface Neosh {
   readonly hint: HintApi;
   readonly opt: OptionApi;
   readonly state: StateApi;
+  readonly vars: VarApi;
+  readonly ext: ExtensionApi;
+  readonly event: EventApi;
   readonly rtp: RuntimePathApi;
   readonly path: PathApi;
   readonly timer: TimerApi;
@@ -333,7 +349,13 @@ export interface Neosh {
 }
 
 export interface BufferApi {
-  create(opts?: { name?: string; scratch?: boolean }): Promise<BufferId>;
+  /**
+   * `kind` is what this buffer *is* — `neosh.sidebar`, `acme.tasks`. Say it if anything you draw is
+   * a panel somebody else might want to extend: it is what `keymap.set(..., { scope: { kind } })`
+   * binds against and what `win.list()` reports, and it costs one argument. Reverse domain by
+   * convention.
+   */
+  create(opts?: { name?: string; scratch?: boolean; kind?: string }): Promise<BufferId>;
   lineCount(buf: BufferId): Promise<number>;
   /**
    * `end` is exclusive. Negative indices are `len + 1 + i`, as in Neovim's `nvim_buf_set_lines`:
@@ -351,6 +373,9 @@ export interface BufferApi {
   /** Append to the final line without resending it. The streaming fast path. */
   appendText(buf: BufferId, text: string): Promise<void>;
   setName(buf: BufferId, name: string): Promise<void>;
+  /** Declare — or with `null`, withdraw — what this buffer is. See `create`. */
+  setKind(buf: BufferId, kind: string | null): Promise<void>;
+  kind(buf: BufferId): Promise<string | null>;
   onChange(
     buf: BufferId,
     cb: (e: { buf: BufferId; start: number; oldEnd: number; newEnd: number }) => void,
@@ -388,6 +413,17 @@ export interface WindowApi {
    * correctly.
    */
   viewport(win: WindowId): Promise<Viewport | null>;
+  /**
+   * Every window that is open, and what is in it.
+   *
+   * How you find somebody else's panel. A window id belongs to whoever opened it and changes every
+   * time the panel is reopened, so this plus a buffer `kind` is the only way to say "the sidebar,
+   * whichever window that is right now" — and therefore the only way to act on one you did not
+   * open.
+   */
+  list(): Promise<WindowInfo[]>;
+  /** The open windows showing a buffer of this kind. Sugar over `list()`, which is the common case. */
+  ofKind(kind: string): Promise<WindowInfo[]>;
 }
 
 /**
@@ -458,6 +494,12 @@ export interface KeymapApi {
    *
    * That indirection is what makes every binding listable and remappable by the user, and it lets
    * the host resolve routing without calling into a plugin.
+   *
+   * Scope resolves window → buffer → buffer kind → global, first match winning. `{ kind: "buf_kind",
+   * name: "neosh.sidebar" }` is the one to reach for when the thing you are binding into is
+   * somebody else's panel: a window id is private to whoever opened it and dies with the window,
+   * whereas a kind is a name the panel publishes and every window of that kind — including ones
+   * opened tomorrow — is covered by one call.
    */
   set(mode: Mode, lhs: string, command: string, opts?: { scope?: KeymapScope; desc?: string }): Promise<void>;
   del(mode: Mode, lhs: string, scope?: KeymapScope): Promise<void>;
@@ -847,6 +889,111 @@ export interface StateApi {
   remove(key: string): Promise<void>;
 }
 
+/**
+ * What *everybody* remembers about a project or a conversation.
+ *
+ * The counterpart to `state`, and the difference is who may look. State is keyed by your plugin and
+ * private, which is right for your fold set and wrong for "this project is a favourite" — with
+ * state, a sidebar of somebody's own starts with no favourites and pinning one in ours is invisible
+ * to it. A var is scoped to the thing it describes, and anyone may read or write it.
+ *
+ * Namespace your keys (`sidebar.favorite`, `acme.colour`) for the reason options are namespaced:
+ * nothing stops two plugins choosing `colour`, and a prefix is what makes them not want to.
+ *
+ * Persisted, shared, and plain JSON on disk: **nothing secret belongs here.** A conversation's vars
+ * are deleted with it; a project's outlive every conversation in it, because a project is a
+ * directory and the directory is still there.
+ */
+export interface VarApi {
+  get<T = unknown>(scope: VarScope, key: string): Promise<T | null>;
+  set(scope: VarScope, key: string, value: unknown): Promise<void>;
+  remove(scope: VarScope, key: string): Promise<void>;
+  /** Everything on one scope, in one round trip. What a panel reads per project rather than per key. */
+  all(scope: VarScope): Promise<Record<string, unknown>>;
+  /**
+   * A var changed, whoever changed it — including you. The signal to redraw on.
+   *
+   * `value` is `undefined` when it was removed.
+   */
+  onChange(
+    cb: (e: { scope: VarScope; key: string; value: unknown }) => void,
+  ): Disposable;
+}
+
+/** Sugar for the two scopes anything with a panel spends its time in. */
+export function projectScope(cwd: string): VarScope {
+  return { scope: "project", cwd };
+}
+
+export function sessionScope(session: SessionId): VarScope {
+  return { scope: "session", session };
+}
+
+/**
+ * How your plugin puts something in somebody else's panel.
+ *
+ * A *point* is a name a plugin agrees to read — `sidebar.section`, `project.action`, `palette.entry`
+ * — and a contribution is a JSON item on it, conventionally carrying the name of a command to run.
+ * The indirection is the whole trick: the sidebar renders rows it did not write and invokes commands
+ * it has never heard of, and neither side imports the other.
+ *
+ * Data rather than a callback on purpose. A contribution can be listed by the palette, described in
+ * `F1` and disabled by the user, none of which is possible for a function held inside your closure.
+ *
+ * Your contributions are withdrawn when your plugin unloads, so `plugins.disabled` takes your rows
+ * with it and there is no way to leave a row behind pointing at a command that no longer exists.
+ */
+export interface ExtensionApi {
+  /**
+   * Put an item on a point, replacing whatever you had there under the same `id`.
+   *
+   * Higher `priority` sorts first; ties break on plugin and id, so the order is stable across
+   * restarts rather than being whatever order plugins happened to activate in.
+   */
+  contribute(
+    point: string,
+    id: string,
+    item: unknown,
+    opts?: { priority?: number },
+  ): Promise<Disposable>;
+  remove(point: string, id: string): Promise<void>;
+  /** Everything on a point, in order, whoever contributed it. What a panel calls when it draws. */
+  list<T = unknown>(point: string): Promise<Array<Contribution & { item: T }>>;
+  /**
+   * Somebody added to or withdrew from a point. Redraw.
+   *
+   * Without this a plugin that loads after your panel has drawn contributes rows nobody sees until
+   * the next unrelated refresh — which on a quiet workspace is several seconds of a panel missing
+   * half of itself.
+   */
+  onChange(cb: (e: { point: string }) => void): Disposable;
+}
+
+/**
+ * Saying that something happened, to whoever cares.
+ *
+ * Plugin-defined and broadcast — Neovim's `User` autocmd. Nothing validates the names; namespace
+ * them like everything else.
+ *
+ * Fire and forget by construction. There is no reply and no way to be blocked, because an emitter
+ * that could be is an emitter every listener is on the critical path of, which is how one slow
+ * plugin wedges a panel. When you need an answer, register a command or read a contribution point.
+ */
+export interface EventApi {
+  emit(name: string, data?: unknown): Promise<void>;
+  /**
+   * Listen. `from` is the plugin that emitted it, stamped by the host — one of the few things in a
+   * plugin message nobody can forge.
+   *
+   * You hear your own events too. Filtering on `from === ctx.plugin` is how you skip them, and it
+   * is deliberately your choice: a panel that reacts to its own writes uniformly has one code path
+   * instead of two.
+   */
+  on(name: string, cb: (e: { data: unknown; from: string }) => void): Disposable;
+  /** Every event, whatever it is called. For a logger or a debugger, rarely for a feature. */
+  onAny(cb: (e: { name: string; data: unknown; from: string }) => void): Disposable;
+}
+
 export interface RuntimePathApi {
   /**
    * Add a directory to search for plugins.
@@ -915,6 +1062,16 @@ interface Registered {
   selectionListeners: Array<(e: { selection: ModelSelection }) => void>;
   composerListeners: Array<(e: { text: string }) => void>;
   activityListeners: Array<(e: { session: SessionId; turn: string; activity: Activity }) => void>;
+  varListeners: Array<(e: { scope: VarScope; key: string; value: unknown }) => void>;
+  contributionListeners: Array<(e: { point: string }) => void>;
+  /**
+   * Listeners by event name, plus `null` for the ones that asked for everything.
+   *
+   * Filtered here rather than in the host on purpose: a subscription table on the far side of the
+   * boundary is one the host can only ever guess is current, and getting it wrong means a plugin
+   * silently stops hearing things. Broadcasting everything and matching a string is cheap.
+   */
+  eventListeners: Map<string | null, Array<(e: { name: string; data: unknown; from: string }) => void>>;
   options: Set<string>;
   /// Timer handles this plugin armed, cleared on unload.
   timers: Set<number>;
@@ -939,6 +1096,9 @@ function reg(plugin: string): Registered {
       selectionListeners: [],
       composerListeners: [],
       activityListeners: [],
+      varListeners: [],
+      contributionListeners: [],
+      eventListeners: new Map(),
       options: new Set(),
       timers: new Set(),
       agentListeners: { turnStart: [], token: [], thinking: [], turnEnd: [], toolStart: [], toolEnd: [] },
@@ -948,6 +1108,17 @@ function reg(plugin: string): Registered {
     plugins.set(plugin, r);
   }
   return r;
+}
+
+/** A listener on one event name, or on all of them when `name` is `null`. */
+function eventListener(
+  r: Registered,
+  name: string | null,
+  cb: (e: { name: string; data: unknown; from: string }) => void,
+): Disposable {
+  const list = r.eventListeners.get(name) ?? [];
+  r.eventListeners.set(name, list);
+  return listener(list, cb);
 }
 
 function listener<T>(list: Array<(e: T) => void>, cb: (e: T) => void): Disposable {
@@ -979,6 +1150,7 @@ function markOpts(o: MarkOptions = {}): ExtmarkOpts {
   return {
     end_col: o.endCol ?? null,
     hl_group: o.hlGroup ?? null,
+    line_hl_group: o.lineHlGroup ?? null,
     virt_text: (o.virtText ?? []).map((v) => ({ text: v.text, hl_group: v.hlGroup ?? null })),
     virt_text_pos: o.virtTextPos ?? "eol",
     on_delete: o.onDelete ?? "clamp",
@@ -1061,6 +1233,55 @@ export function __createContext(plugin: string, config: unknown, version: number
         await c({ call: "state_delete", key });
       },
     },
+    vars: {
+      async get<T = unknown>(scope: VarScope, key: string): Promise<T | null> {
+        const value = expect(await c({ call: "var_get", scope, key }), "json").value;
+        return (value ?? null) as T | null;
+      },
+      async set(scope, key, value) {
+        await c({ call: "var_set", scope, key, value });
+      },
+      async remove(scope, key) {
+        await c({ call: "var_delete", scope, key });
+      },
+      async all(scope) {
+        return expect(await c({ call: "var_all", scope }), "vars").vars;
+      },
+      onChange(cb) {
+        return listener(r.varListeners, cb);
+      },
+    },
+    ext: {
+      async contribute(point, id, item, opts) {
+        await c({ call: "ext_contribute", point, id, item, priority: opts?.priority ?? 0 });
+        return {
+          dispose() {
+            void c({ call: "ext_remove", point, id });
+          },
+        };
+      },
+      async remove(point, id) {
+        await c({ call: "ext_remove", point, id });
+      },
+      async list<T = unknown>(point: string) {
+        const got = expect(await c({ call: "ext_list", point }), "contributions").contributions;
+        return got as Array<Contribution & { item: T }>;
+      },
+      onChange(cb) {
+        return listener(r.contributionListeners, cb);
+      },
+    },
+    event: {
+      async emit(name, data) {
+        await c({ call: "event_emit", name, data: data ?? null });
+      },
+      on(name, cb) {
+        return eventListener(r, name, (e) => cb({ data: e.data, from: e.from }));
+      },
+      onAny(cb) {
+        return eventListener(r, null, cb);
+      },
+    },
     timer: {
       after(ms, fn) {
         const id = setTimeout(() => {
@@ -1128,7 +1349,12 @@ export function __createContext(plugin: string, config: unknown, version: number
     },
     buf: {
       async create(opts) {
-        return expect(await c({ call: "buf_create", name: opts?.name ?? null, scratch: opts?.scratch ?? false }), "buf").buf;
+        return expect(await c({
+          call: "buf_create",
+          name: opts?.name ?? null,
+          scratch: opts?.scratch ?? false,
+          kind: opts?.kind ?? null,
+        }), "buf").buf;
       },
       async lineCount(buf) {
         return expect(await c({ call: "buf_line_count", buf }), "count").n;
@@ -1144,6 +1370,12 @@ export function __createContext(plugin: string, config: unknown, version: number
       },
       async setName(buf, name) {
         await c({ call: "buf_set_name", buf, name });
+      },
+      async setKind(buf, kind) {
+        await c({ call: "buf_set_kind", buf, kind });
+      },
+      async kind(buf) {
+        return expect(await c({ call: "buf_get_kind", buf }), "maybe_text").text ?? null;
       },
       async onChange(buf, cb) {
         await c({ call: "buf_attach", buf });
@@ -1181,6 +1413,13 @@ export function __createContext(plugin: string, config: unknown, version: number
       },
       async viewport(win) {
         return expect(await c({ call: "win_get_viewport", win }), "viewport").viewport ?? null;
+      },
+      async list() {
+        return expect(await c({ call: "win_list" }), "windows").windows;
+      },
+      async ofKind(kind) {
+        const windows = expect(await c({ call: "win_list" }), "windows").windows;
+        return windows.filter((w) => w.kind === kind);
       },
     },
     float: {
@@ -1679,6 +1918,24 @@ export async function __dispatch(plugin: string, msg: Record<string, unknown>): 
         for (const cb of r.activityListeners)
           cb({ session: ev.session, turn: ev.turn, activity: ev.activity });
         break;
+      case "var_changed":
+        for (const cb of r.varListeners)
+          cb({ scope: ev.scope, key: ev.key, value: ev.value });
+        break;
+      case "contributions_changed":
+        for (const cb of r.contributionListeners) cb({ point: ev.point });
+        break;
+      case "event": {
+        // Copied before iterating: a listener that unsubscribes itself — the ordinary shape of
+        // "wait for the thing to happen once" — would otherwise shorten the array underneath the
+        // loop and skip whoever was next.
+        const named = [...(r.eventListeners.get(ev.name) ?? [])];
+        const all = [...(r.eventListeners.get(null) ?? [])];
+        const e = { name: ev.name, data: ev.data ?? null, from: ev.from };
+        for (const cb of named) cb(e);
+        for (const cb of all) cb(e);
+        break;
+      }
       case "focus_changed":
       case "shutdown":
         break;

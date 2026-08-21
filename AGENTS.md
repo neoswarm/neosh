@@ -7,6 +7,12 @@ The thesis is that **extensibility is the product**. Every capability ships on t
 third-party plugin author would use. If a feature needs a private escape hatch, the API is wrong and
 the API is what to fix.
 
+Which means the user owns the workspace, not us: every part of it is theirs to replace, and a plugin
+of their own is how they do it. New windows, panels and floats; new commands and keys on any of
+them; different colours, different layout, a sidebar that is nothing like ours — none of that is a
+feature we grant, it is what the API is for. Ours are the defaults, and a default is something you
+turn off.
+
 ## Layout
 
 | Crate | Owns |
@@ -26,6 +32,15 @@ per decision, and records the *reasoning*, not the choice.
 
 ## Rules that are not negotiable
 
+- **Anything neosh can put on screen, a plugin can put on screen — and take off it.** Windows,
+  splits, floats, docked panels, extmarks, highlight groups, status segments, commands, keymaps and
+  options are all public API, and every bundled plugin is written against exactly that: the sidebar,
+  the model switcher, the palette, git, approvals. The test for a new feature is "could a third
+  party have written this, and can they replace it?" — if the answer needs an op nobody else may
+  call, the op is what to fix, not the feature. In practice that means a new capability lands as
+  `ApiCall` + generated TS + a plugin that uses it, in that order; anything the binary draws for
+  itself must also be disable-able (`plugins.disabled`) and overridable by a plugin that loads
+  after it and wins.
 - **Unicode width is not optional.** `unicode-width` + `unicode-segmentation`. Column maths on
   `char` counts corrupts layout on day one. Columns on the wire are UTF-8 byte offsets; motion steps
   by grapheme cluster; every display-width question is answered in `neosh-tui`.
@@ -41,6 +56,16 @@ per decision, and records the *reasoning*, not the choice.
   `Diff.*Line` group that sets a foreground silently un-highlights the code on it. Colours for code
   come from `neosh-syntax`, which maps grammar scopes onto `Syntax.*` and never loads a theme of its
   own — the palette owns colour, here as everywhere. See ADR 0035.
+- **A panel is a surface, not a program.** Anything a bundled plugin draws, a third party must be
+  able to add to and take keys in without forking it. Three mechanisms, and a new panel of ours uses
+  all three or it is not finished: a buffer **kind** (`buf.create({ kind })`), which is what
+  `KeymapScope::BufKind` binds against and what `win.list` finds it by; **contribution points**
+  (`ext.contribute`/`ext.list`), which is how rows and verbs arrive from plugins we have never heard
+  of; and **shared vars** (`vars`, scoped to the workspace, a conversation or a project) for anything
+  about a thing rather than about us — `state` stays private and a favourite is not private. Every
+  key in a panel is an ordinary binding pointed at a named command, so `F1` lists it and `init.ts`
+  can move it; a `switch` on `KeyContext` inside a plugin is the thing this replaced. Keep the
+  capture, but only as a sink for keys nothing claimed. See ADR 0040.
 - `Editor::handles` is a **deny-list**. A new API call that is not added to it silently routes to
   the core.
 - **A driver's account of its own loop is not a content block.** Sub-agents, plans, compaction and
@@ -70,6 +95,17 @@ per decision, and records the *reasoning*, not the choice.
   *configured* mode and is never written by `⇧⇥` — the moment it follows the active conversation,
   every conversation without a mode inherits the last one you touched. The configured default is
   full access. See ADR 0038.
+- **Everything irreversible asks, and nothing reversible does.** No exceptions on either side: a
+  dialog that appears for some deletes and not others is a key whose behaviour you cannot predict
+  from the row it is pointed at, and one charged for an action you can undo is what teaches people
+  to clear dialogs without reading them. The question says what is at stake — how much, where, and
+  what the alternative is — the destructive answer wears `Diagnostic.Error`, and the cursor starts
+  on the one that changes nothing. `ui.confirm_destructive = false` is the way out, and it is the
+  user's setting rather than the program's guess. See ADR 0039.
+- **What you have archived is not in the sidebar.** The panel is the list you work in; a section of
+  things you are finished with is the only part of that column that is never the answer, and it
+  grows forever. One row with a count, `a` in the panel or `^F` anywhere, and it opens as a picker
+  you can filter — because a flat list of dim rows is not a way to find anything. See ADR 0039.
 - **A card is a row until you ask for more.** A call that only *looked* at something folds to its
   header with the size of what came back on the end of it; a command keeps its output, an edit keeps
   its diff, and a failure always shows. A turn that read six files should read as six rows. See ADR
@@ -137,6 +173,7 @@ registry — this table is what ships.
 | `⌥↑` `⌥↓` | One rung up or down the capability ladder, same provider |
 | `⇧⇥` | Permission mode — full access to start with, then ask, allow-listed, deny. Belongs to this conversation, saved with it, and takes effect on the turn that is running |
 | `^T` | Projects and conversations. Switching is never refused — turns keep running where they are |
+| `^F` | What you have archived. Filter it, put one back, or finally throw it away |
 | `^N` | New conversation. In a repository it asks where: here, a new worktree, an existing one, elsewhere |
 | `^O` | Add a project |
 | `^B` | Toggle the sidebar |
@@ -196,7 +233,7 @@ The answer is the artefact; this is how you get a piece of it out. See ADR 0028.
 | `J` `K` | Reorder within a group |
 | `r` | Rename a conversation |
 | `x` `X` | Archive, delete |
-| `u` | Bring an archived one back |
+| `a` | The archive. Nothing archived is ever a row in this panel — `↵` restores one, `^U` puts it back without going there, `^X` deletes |
 | `?` | The keys for whatever row you are on |
 | `Esc` | Back to the composer |
 

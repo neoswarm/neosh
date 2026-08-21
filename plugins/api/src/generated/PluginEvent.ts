@@ -13,6 +13,7 @@ import type { ToolCall } from "./ToolCall";
 import type { ToolResult } from "./ToolResult";
 import type { TurnId } from "./TurnId";
 import type { Usage } from "./Usage";
+import type { VarScope } from "./VarScope";
 import type { WindowId } from "./WindowId";
 
 export type PluginEvent =
@@ -55,5 +56,8 @@ export type PluginEvent =
   | { "type": "selection_changed"; selection: ModelSelection }
   | { "type": "activity"; session: SessionId; turn: TurnId; activity: Activity }
   | { "type": "composer_changed"; text: string }
+  | { "type": "event"; name: string; data?: unknown; from: string }
+  | { "type": "var_changed"; scope: VarScope; key: string; value?: unknown }
+  | { "type": "contributions_changed"; point: string }
   | { "type": "provider_cancel"; stream: StreamId }
   | { "type": "shutdown" };
