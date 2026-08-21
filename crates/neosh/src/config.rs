@@ -48,6 +48,66 @@ pub struct Config {
     pub options: BTreeMap<String, OptionValue>,
     pub permissions: PermissionsConfig,
     pub agent: AgentConfig,
+    /// The other computers this one works with. See [`SwarmConfig`].
+    pub swarm: SwarmConfig,
+}
+
+/// `[swarm]` — ASCP, the other machines in your workspace.
+///
+/// Off unless `peers` names somebody or `listen` is set, so a workspace does not open a port
+/// because it was upgraded. Everything here is about *reachability and consent*; who is allowed is
+/// `peers`, and a machine not on that list gets nowhere regardless of what it can reach.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default, deny_unknown_fields)]
+pub struct SwarmConfig {
+    /// What to call this machine on other people's screens. The hostname if unset.
+    pub name: Option<String>,
+    /// Where to accept connections — `"0.0.0.0:7717"`, or `"100.71.4.9:7717"` to bind only the
+    /// overlay's address.
+    ///
+    /// Unset means dial-only, which is the right setting for a laptop: it joins the machines it
+    /// knows about without being joinable from whatever café network it is on. There is no default
+    /// port here on purpose — a config that opens a socket has to say so in words.
+    pub listen: Option<String>,
+    /// The machines this one connects to, and the keys they must prove.
+    pub peers: Vec<SwarmPeer>,
+    /// Whether peers may steer agents here at all. A build machine that should be watched and not
+    /// touched sets this false.
+    #[serde(default = "yes")]
+    pub accepts_commands: bool,
+    /// Whether peers may answer *permission prompts* here.
+    ///
+    /// Separate from `accepts_commands`, and off by default, because it is a different kind of
+    /// trust: steering an agent is a message, approving one is a write to this machine's disk.
+    pub accepts_approvals: bool,
+    /// Seconds between heartbeats, and how long a reconnect waits.
+    #[serde(default = "default_heartbeat")]
+    pub heartbeat_secs: u64,
+}
+
+/// One machine in the swarm.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default, deny_unknown_fields)]
+pub struct SwarmPeer {
+    /// `host:port`. Whatever your overlay network calls the machine.
+    pub addr: String,
+    /// The node id — the peer's public key — that must be found there.
+    ///
+    /// This is the authorisation. An address says where to look; the key says who it is, and a
+    /// machine that cannot prove this key is refused however it reached you. Missing means the peer
+    /// is *not* authorised: an entry with an address and no key can dial out and will be turned
+    /// away, which is a louder failure than silently trusting whoever answers.
+    pub id: Option<String>,
+    /// What to call it before it has told you its own name.
+    pub name: Option<String>,
+}
+
+fn yes() -> bool {
+    true
+}
+
+fn default_heartbeat() -> u64 {
+    10
 }
 
 /// `.neosh/config.toml`, project scope.
@@ -146,6 +206,9 @@ pub struct Resolved {
     /// Set only by `--clean`, which is the flag someone uses to answer "is this neosh or is it my
     /// setup". A `--clean` that still loaded the sidebar and the switchers would not answer it.
     pub no_builtin_plugins: bool,
+    /// The other machines. Global scope only: a repository you cloned does not get to say which
+    /// computers your workspace connects to, trusted or otherwise.
+    pub swarm: SwarmConfig,
     pub notes: Vec<Note>,
 }
 
@@ -202,6 +265,7 @@ pub fn resolve(paths: &Paths, cwd: &Path, trust: Status) -> anyhow::Result<Resol
     out.permissions = global.permissions;
     out.model = global.agent.model;
     out.system_prompt = global.agent.system_prompt;
+    out.swarm = global.swarm;
     out.options = global.options.into_iter().collect();
 
     out.plugin_dirs.push(paths.plugin_dir());

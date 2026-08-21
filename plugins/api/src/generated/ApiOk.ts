@@ -14,12 +14,15 @@ import type { Message } from "./Message";
 import type { ModelEntry } from "./ModelEntry";
 import type { ModelSelection } from "./ModelSelection";
 import type { NamespaceId } from "./NamespaceId";
+import type { NodeInfo } from "./NodeInfo";
 import type { OptionEntry } from "./OptionEntry";
 import type { PermissionDecision } from "./PermissionDecision";
 import type { PermissionMode } from "./PermissionMode";
 import type { RepoStatus } from "./RepoStatus";
 import type { SessionInfo } from "./SessionInfo";
 import type { SurfaceId } from "./SurfaceId";
+import type { SwarmAgent } from "./SwarmAgent";
+import type { SwarmNode } from "./SwarmNode";
 import type { ToolDef } from "./ToolDef";
 import type { Viewport } from "./Viewport";
 import type { WindowId } from "./WindowId";
@@ -72,4 +75,7 @@ export type ApiOk =
   | { "ok": "json"; value: unknown }
   | { "ok": "vars"; vars: Record<string, unknown> }
   | { "ok": "contributions"; contributions: Array<Contribution> }
-  | { "ok": "windows"; windows: Array<WindowInfo> };
+  | { "ok": "windows"; windows: Array<WindowInfo> }
+  | { "ok": "swarm_self"; node: NodeInfo | null }
+  | { "ok": "swarm_nodes"; nodes: Array<SwarmNode> }
+  | { "ok": "swarm_agents"; agents: Array<SwarmAgent> };

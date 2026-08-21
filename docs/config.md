@@ -314,6 +314,68 @@ option because the terminal has to be in the right mode before the first keystro
 there is any config — and because the symptom of a terminal that answers this question wrongly is
 one you cannot fix from inside a program you can no longer type into.
 
+### The other computers — `[swarm]`
+
+Several machines, one workspace: every one knows what the others are running, and can ask them to
+do something. Off unless you say otherwise — a workspace does not open a port because it was
+upgraded.
+
+```sh
+neosh swarm-id      # this machine's identity, and the lines to paste elsewhere
+```
+
+A node is named by its public key, so joining two machines means each having the other's:
+
+```toml
+[swarm]
+name = "mac-studio"           # what the others call you; the hostname if unset
+listen = "100.71.4.9:7717"    # omit to be dial-only
+
+[[swarm.peers]]
+addr = "linux-box:7717"
+id   = "453ff38823de6515…"    # from `neosh swarm-id` over there
+name = "linux-box"
+```
+
+`id` is the authorisation. An address says where to look; the key says who it is, and a machine
+that cannot prove that key is refused however it reached you. A peer entry without one can dial and
+will be turned away — a louder failure than trusting whoever answers.
+
+**Networking is not ASCP's job.** On a LAN it needs nothing. Across the internet, run
+[Tailscale](https://tailscale.com), Nebula, NetBird or ZeroTier underneath and use whatever address
+that gives you. Hole-punching is a hard problem those projects have solved properly, and an agent
+protocol having its own go at it would be doing their job instead of its own.
+
+Two more settings, and they are different kinds of trust:
+
+```toml
+accepts_commands = true    # may peers steer agents here at all
+accepts_approvals = false  # may peers answer permission prompts here
+```
+
+Steering an agent is a message. Approving one is a **write to this machine's disk**, which is why
+it is separate and off by default. A build machine that should be watched and not touched sets
+`accepts_commands = false` and is visible, read-only, to everyone.
+
+Changing any of this takes a restart rather than `^R`: the allow-list and the listening socket are
+decided at boot, and re-reading them would mean tearing down live connections whenever you reloaded
+your config.
+
+#### What you see
+
+Conversations on other machines appear in the sidebar **under the same project as yours**, dimmed,
+with the host they run on at the end of the row. A project row says which other computers have it.
+
+Projects are matched by normalised git remote, not by path — `/Users/me/dev/neosh` here and
+`/home/me/src/neosh` there are one project, and it does not matter that one was cloned over SSH and
+the other over HTTPS. A directory with no remote falls back to its name, which is a guess and shown
+as one.
+
+`^N` offers the other machines' checkouts alongside your worktrees, so "start something over there"
+is one key. `swarm.nodes` in the palette lists every computer and what it is holding.
+
+The protocol is specified in [ascp/SPEC.md](ascp/SPEC.md).
+
 ### Adding a project
 
 `^O` anywhere, `o` in the project panel, or `Enter` on the `+ Add project` row. It offers the

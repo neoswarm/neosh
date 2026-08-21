@@ -38,11 +38,14 @@
 
 import { byteLength, projectScope } from "@neosh/api";
 import type {
+  AgentSummary,
   Contribution,
   Disposable,
   Neosh,
   PluginContext,
+  NodeInfo,
   SessionInfo,
+  SwarmAgent,
   VarScope,
   WindowId,
   WorktreeInfo,
@@ -73,7 +76,10 @@ type Target =
   /** The way into what you have put away. Only present when there is something in it. */
   | { kind: "browse"; count: number }
   /** A row somebody else contributed. `command` runs on `↵`, with `args` as given. */
-  | { kind: "custom"; command?: string; args?: string[] };
+  | { kind: "custom"; command?: string; args?: string[] }
+  /** A conversation on another computer. Addressed as `(node, session)`; the session id alone is
+   * unique only on its own machine. */
+  | { kind: "remote"; node: string; session: string; cwd: string; host: string };
 
 /**
  * What the sidebar reads to find out what is not its own.
@@ -126,6 +132,8 @@ interface Project {
   name: string;
   favorite: boolean;
   sessions: SessionInfo[];
+  /** The cross-machine identity, for matching against what other computers have. */
+  key: string;
 }
 
 const NS = "neosh.sidebar";
@@ -214,6 +222,9 @@ export async function activate({ neosh, subscriptions }: PluginContext) {
           focused,
           selected: list.value,
           actions: actions(),
+          // Filled in by `collect`, which is what reads the swarm.
+          remote: new Map(),
+          hosts: new Map(),
         });
         running = built.running;
         list.setRows(built.rows, same);
@@ -334,6 +345,9 @@ export async function activate({ neosh, subscriptions }: PluginContext) {
 }
 
 function same(a: Target, b: Target): boolean {
+  if (a.kind === "remote") {
+    return b.kind === "remote" && a.node === b.node && a.session === b.session;
+  }
   if (a.kind === "session") return b.kind === "session" && a.id === b.id;
   if (a.kind === "project") return b.kind === "project" && a.cwd === b.cwd;
   return a.kind === b.kind;
@@ -581,7 +595,7 @@ async function registerCommands(w: Wiring): Promise<void> {
   /** Rebuild the grouping the arrangement reorders against, without redrawing. */
   const groups = async (): Promise<Project[][]> => {
     const sessions = await neosh.session.list().catch(() => [] as SessionInfo[]);
-    return group(sessions, arrangement);
+    return group(sessions, arrangement, new Map());
   };
 
   /**
@@ -790,6 +804,37 @@ async function registerCommands(w: Wiring): Promise<void> {
     desc: "Archived conversations",
   });
 
+  // Watching a conversation on another machine.
+  //
+  // Not "switching" — there is nothing here to switch to, because the agent belongs to the computer
+  // it was started on and always will. Subscribing is what makes it read like a local one: history
+  // first, then everything as it happens.
+  w.subscriptions.push(
+    await neosh.cmd.register("swarm.open", async (args) => {
+      const [node, session] = args;
+      if (!node || !session) {
+        neosh.notify("swarm.open needs a node and a conversation", "warn");
+        return;
+      }
+      try {
+        await neosh.swarm.subscribe(node, session);
+        const who = (await neosh.swarm.nodes().catch(() => []))
+          .find((n) => n.info.id === node)?.info.name ?? node.slice(0, 8);
+        neosh.notify(`watching a conversation on ${who}`);
+      } catch (e) {
+        neosh.notify(String(e), "warn");
+      }
+    }, { desc: "Watch a conversation on another computer" }),
+  );
+  w.subscriptions.push(
+    await neosh.cmd.register("swarm.nodes", () => showNodes(neosh), {
+      desc: "The computers in this workspace",
+    }),
+  );
+  // Any change over there is a redraw here. Without it the panel is right only as often as its
+  // four-second refresh, which is a long time to watch a spinner that has already stopped.
+  w.subscriptions.push(neosh.swarm.onChange(() => void w.draw()));
+
   await neosh.hint.set("sessions", { keys: "^T", label: "conversations", priority: 20 });
   await neosh.hint.set("new", { keys: "^N", label: "new", priority: 21 });
 }
@@ -931,7 +976,9 @@ async function newConversation(neosh: Neosh): Promise<void> {
     | { kind: "here" }
     | { kind: "new" }
     | { kind: "elsewhere" }
-    | { kind: "tree"; path: string; label: string };
+    | { kind: "tree"; path: string; label: string }
+    /** On another computer, in a checkout that machine told us it has. */
+    | { kind: "host"; node: string; cwd: string; label: string };
   const rows: Array<{ label: string; detail?: string; keywords?: string; value: Where }> = [
     { label: "Here", detail: here ?? "this project", value: { kind: "here" } },
   ];
@@ -952,6 +999,26 @@ async function newConversation(neosh: Neosh): Promise<void> {
       value: { kind: "tree", path: t.path, label },
     });
   }
+  // The other computers, and the checkouts each of them offered in its handshake. A machine that
+  // does not accept commands is left out rather than shown and refused — a row that cannot work is
+  // worse than no row.
+  for (const n of await neosh.swarm.nodes().catch(() => [])) {
+    if (!n.up || !n.capabilities.accepts_commands) continue;
+    for (const project of n.capabilities.projects) {
+      rows.push({
+        label: `${project.name}`,
+        detail: `on ${n.info.name}  ·  ${project.cwd}`,
+        keywords: `${n.info.name} ${project.cwd} remote host computer`,
+        value: {
+          kind: "host",
+          node: n.info.id,
+          cwd: project.cwd,
+          label: `${project.name} on ${n.info.name}`,
+        },
+      });
+    }
+  }
+
   rows.push({
     label: "Another directory…",
     detail: "somewhere else entirely",
@@ -971,6 +1038,20 @@ async function newConversation(neosh: Neosh): Promise<void> {
     case "tree":
       await neosh.session.create({ cwd: chosen.path });
       neosh.notify(`new conversation in ${chosen.label}`);
+      return;
+    case "host":
+      // Started *there*. The agent will run on that machine, against that machine's files, which
+      // is the point — this is not a way to work on a remote directory from here.
+      try {
+        await neosh.swarm.command(chosen.node, "", {
+          command: "new_session",
+          cwd: chosen.cwd,
+          title: null,
+        });
+        neosh.notify(`started ${chosen.label}`);
+      } catch (e) {
+        neosh.notify(String(e), "warn");
+      }
       return;
     case "elsewhere":
       await neosh.cmd.exec("project.open").catch(() => {});
@@ -992,6 +1073,14 @@ async function activateTarget(
       neosh.notify(String(e), "warn");
     });
     await w.draw();
+    return;
+  }
+  // A conversation on another computer. There is nothing to switch to here — it belongs to that
+  // machine — so opening it means watching it, which is what `swarm.open` does.
+  if (target.kind === "remote") {
+    await neosh.cmd.exec("swarm.open", [target.node, target.session]).catch((e: unknown) => {
+      neosh.notify(String(e), "warn");
+    });
     return;
   }
   if (target.kind === "add") {
@@ -1213,6 +1302,52 @@ async function browseArchive(neosh: Neosh): Promise<void> {
   }
 }
 
+/**
+ * The computers in this workspace, and what each is running.
+ *
+ * A picker rather than a panel section, for the reason the archive is: it is a thing you look at
+ * when you want it, and rows that are only occasionally the answer do not belong in the column you
+ * work in. `↵` on a machine watches its most recent conversation.
+ */
+async function showNodes(neosh: Neosh): Promise<void> {
+  const nodes = await neosh.swarm.nodes().catch(() => []);
+  const me = await neosh.swarm.self().catch(() => null);
+  if (nodes.length === 0) {
+    neosh.notify(
+      me ? "no other computers have joined yet" : "the swarm is off — see `[swarm]` in your config",
+      "info",
+    );
+    return;
+  }
+
+  const chosen = await picker(
+    neosh,
+    nodes.map((n) => {
+      const running = n.agents.filter((a) => a.state === "running").length;
+      return {
+        label: n.info.name,
+        detail: [
+          n.up ? `${n.agents.length} conversations` : `unreachable — ${n.reason ?? "no answer"}`,
+          running > 0 ? `${running} working` : "",
+          n.info.os,
+          // The short id, so two machines with the same hostname are still tellable apart.
+          n.info.id.slice(0, 8),
+        ].filter(Boolean).join("  ·  "),
+        keywords: `${n.info.os} ${n.info.id}`,
+        value: n,
+      };
+    }),
+    { title: "Computers", width: 76 },
+  );
+  if (chosen === null) return;
+  const newest = [...chosen.agents].sort((a, b) => b.updated_at - a.updated_at)[0];
+  if (!newest) {
+    neosh.notify(`${chosen.info.name} has nothing running`, "info");
+    return;
+  }
+  await neosh.cmd.exec("swarm.open", [chosen.info.id, newest.session]).catch(() => {});
+}
+
 async function renameSession(neosh: Neosh, session: string): Promise<void> {
   const current = (await neosh.session.list()).find((s) => s.id === session);
   const next = await prompt(neosh, "Rename conversation", {
@@ -1235,7 +1370,11 @@ async function renameSession(neosh: Neosh, session: string): Promise<void> {
  * directories are seeded even with nothing in them, so unpinning is the only way a favourite
  * disappears.
  */
-function group(sessions: SessionInfo[], arrangement: Arrangement): Project[][] {
+function group(
+  sessions: SessionInfo[],
+  arrangement: Arrangement,
+  keys: Map<string, string>,
+): Project[][] {
   const by = new Map<string, SessionInfo[]>();
   for (const cwd of arrangement.pinned()) by.set(cwd, []);
   for (const s of sessions) {
@@ -1260,6 +1399,7 @@ function group(sessions: SessionInfo[], arrangement: Arrangement): Project[][] {
     name: list[0]?.project || basename(cwd),
     favorite: arrangement.isFavorite(cwd),
     sessions: list,
+    key: keys.get(cwd) ?? `dir:${basename(cwd)}`,
   }));
 
   const sort = (a: Project, b: Project) => {
@@ -1285,6 +1425,10 @@ interface DrawOptions {
   selected: Target | undefined;
   /** The verbs other plugins put on our rows, for the hint strip. */
   actions: ActionItem[];
+  /** Conversations on other computers, grouped by the project key they share with ours. */
+  remote: Map<string, SwarmAgent[]>;
+  /** Which other machines have each project, by key. */
+  hosts: Map<string, string[]>;
 }
 
 async function collect(
@@ -1306,7 +1450,26 @@ async function collect(
   // One list, favourites first. A separate `FAVORITES` section splits a short list in half and
   // makes you check two places for the same kind of thing; the heart says which is which without
   // costing a heading, a rule and a blank line.
-  const projects = group(sessions, arrangement).flat();
+  // What the other computers are running. One call; empty and harmless on a single machine.
+  const swarm = await neosh.swarm.agents().catch(() => [] as SwarmAgent[]);
+  const remote = new Map<string, SwarmAgent[]>();
+  const hosts = new Map<string, string[]>();
+  for (const r of swarm) {
+    const list = remote.get(r.agent.project) ?? [];
+    list.push(r);
+    remote.set(r.agent.project, list);
+    const names = hosts.get(r.agent.project) ?? [];
+    if (!names.includes(r.node.name)) names.push(r.node.name);
+    hosts.set(r.agent.project, names.sort());
+  }
+  // A local conversation tells us its project key indirectly: the host stamps the same key on both
+  // sides, so a cwd here and a cwd there meet on the key rather than on the path.
+  const keys = new Map<string, string>();
+  for (const r of swarm) {
+    if (!keys.has(r.agent.cwd)) keys.set(r.agent.cwd, r.agent.project);
+  }
+  opts = { ...opts, remote, hosts };
+  const projects = group(sessions, arrangement, keys).flat();
 
   // A directory that turned up in the conversation list and we had not seen before. Noted rather
   // than fetched inline: the draw runs on a tick and must not wait on a round trip per project.
@@ -1322,9 +1485,28 @@ async function collect(
     rows.push(projectRow(p, arrangement, opts, now));
     if (arrangement.isFolded(p.cwd)) continue;
     for (const s of p.sessions) rows.push(sessionRow(s, now, opts));
-    if (p.sessions.length === 0) {
+    // The same project, being worked on elsewhere. Under the same heading rather than in a section
+    // of their own: they are not a different kind of thing, they are the same work on a different
+    // computer, and a separate `REMOTE` block would make you check two places for one project.
+    for (const r of remote.get(p.key) ?? []) rows.push(remoteRow(r, opts, now));
+    if (p.sessions.length === 0 && (remote.get(p.key) ?? []).length === 0) {
       rows.push({ text: "       nothing here yet", hl: "Sidebar.Dim", inert: true });
     }
+  }
+
+  // Projects that exist only on other machines. Without these, a repository you have not cloned
+  // here is invisible — and "which computers is this on" cannot answer "not this one".
+  for (const [key, list] of remote) {
+    if (projects.some((p) => p.key === key)) continue;
+    const first = list[0];
+    if (!first) continue;
+    rows.push({
+      text: `   ${opts.ascii ? "~" : "▹"} ${clip(first.agent.project_name, opts.width - 12)}`,
+      hl: "Sidebar.Remote",
+      right: { text: `${clip((hosts.get(key) ?? []).join(" "), 12)} `, hl: "Sidebar.Remote" },
+      inert: true,
+    });
+    for (const r of list) rows.push(remoteRow(r, opts, now));
   }
 
   rows.push(blank());
@@ -1439,13 +1621,47 @@ function projectRow(
   // because a heart is red — a grey one reads as a heart that has stopped.
   const heart = p.favorite ? (opts.ascii ? "*" : "♥") : " ";
 
+  // Which other computers have this project. The whole reason a project key is a normalised git
+  // remote rather than a path: on two machines the path is different and this is the same.
+  const elsewhere = opts.hosts.get(p.key) ?? [];
+  const name = clip(p.name, Math.max(6, opts.width - 8 - (elsewhere.length ? 8 : 0)));
   return {
-    text: ` ${heart} ${arrow} ${clip(p.name, opts.width - 8)}`,
+    text: ` ${heart} ${arrow} ${name}`,
     hl: here ? "Directory" : "Sidebar.Dim",
     spans: p.favorite ? [{ from: 1, to: 1 + byteLength(heart), hl: "Sidebar.Favorite" }] : undefined,
-    right,
+    right: elsewhere.length > 0
+      // The machines take the column the count would have used. A project that is in two places is
+      // a more useful thing to know than how many conversations are in it here.
+      ? { text: `${clip(elsewhere.join(" "), 14)} `, hl: "Sidebar.Remote" }
+      : right,
     value: { kind: "project", cwd: p.cwd },
   };
+}
+
+/**
+ * A conversation on another computer.
+ *
+ * Indented with its project's own, because that is the claim: it is the same project, being worked
+ * on somewhere else. The host name is what makes it honest — it reads as one list and says, per
+ * row, which machine the work is actually happening on.
+ */
+function remoteRow(r: SwarmAgent, opts: DrawOptions, now: number): ListRow<Target> {
+    const working = r.agent.state === "running";
+    const glyph = working ? (opts.ascii ? "*" : "◍") : opts.ascii ? "." : "·";
+    const host = clip(r.node.name, 12);
+    const width = Math.max(8, opts.width - 11 - host.length);
+    return {
+      text: `     ${glyph} ${clip(r.agent.label, width)}`,
+      hl: working ? "Status.Monitoring" : "Sidebar.Remote",
+      right: { text: `${host} `, hl: "Sidebar.Remote" },
+      value: {
+        kind: "remote",
+        node: r.node.id,
+        session: r.agent.session,
+        cwd: r.agent.cwd,
+        host: r.node.name,
+      },
+    };
 }
 
 function sessionRow(s: SessionInfo, now: number, opts: DrawOptions): ListRow<Target> {

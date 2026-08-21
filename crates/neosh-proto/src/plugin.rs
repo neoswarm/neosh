@@ -15,6 +15,7 @@ use ts_rs::TS;
 
 use crate::agent::{HookName, HookOutcome, HookPayload, StopReason, ToolCall, ToolResult, Usage};
 use crate::api::{ApiCall, ApiResponse, KeyContext, VarScope};
+use crate::ascp::{NodeId, StreamEvent};
 use crate::ids::{BufferId, RequestId, SessionId, StreamId, TurnId, WindowId};
 use crate::options::OptionValue;
 use crate::provider::{Activity, ModelSelection, TurnRequest};
@@ -238,6 +239,20 @@ pub enum PluginEvent {
     /// workspace is four seconds of a panel that is missing half of itself.
     ContributionsChanged {
         point: String,
+    },
+    /// A machine in the swarm came up, went away, or changed what it is running.
+    ///
+    /// One event for all three because a board redraws the same way for each, and a plugin that
+    /// wanted to distinguish them can look at what it was given.
+    SwarmChanged,
+    /// Something happened in a remote conversation this node subscribed to.
+    ///
+    /// Only for sessions asked for with [`crate::ApiCall::SwarmSubscribe`] — a workspace that
+    /// received every token from every machine would be one you could hear from the fan.
+    SwarmStream {
+        node: NodeId,
+        session: SessionId,
+        event: StreamEvent,
     },
     /// Stop producing events for this stream and release its resources.
     ProviderCancel {

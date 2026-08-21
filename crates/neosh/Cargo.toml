@@ -13,6 +13,7 @@ neosh-provider = { workspace = true }
 neosh-agent = { workspace = true }
 neosh-script = { workspace = true }
 neosh-vcs = { workspace = true }
+neosh-swarm = { workspace = true }
 neosh-tui = { workspace = true }
 neosh-syntax = { workspace = true }
 serde = { workspace = true }

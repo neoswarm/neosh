@@ -24,6 +24,7 @@ mod pstate;
 mod scaffold;
 mod services;
 mod sessions;
+mod swarm;
 mod trust;
 mod vars;
 
@@ -115,6 +116,12 @@ enum Cmd {
     Trust(TrustArgs),
     /// Print where neosh reads and writes, and whether each of those exists.
     Paths,
+    /// Print this machine's swarm identity, and the line to paste on the other computers.
+    ///
+    /// A node is named by its public key, so joining two machines means each one having the
+    /// other's. There is no way to read a public key out of the private one by looking at it, and
+    /// a swarm you cannot join without writing a script is a swarm nobody joins.
+    SwarmId,
 }
 
 #[derive(Args, Debug)]
@@ -204,6 +211,7 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
         Some(Cmd::Init(args)) => return run_init(&paths, &cwd, args),
         Some(Cmd::Trust(args)) => return run_trust(&paths, &cwd, args),
         Some(Cmd::Paths) => return run_paths(&paths, &cwd),
+        Some(Cmd::SwarmId) => return run_swarm_id(&paths),
         Some(Cmd::Status) => return run_status(&paths).await,
         Some(Cmd::Stop) => return run_stop(&paths).await,
         None => {}
@@ -485,6 +493,36 @@ async fn run_stop(paths: &Paths) -> anyhow::Result<()> {
     }
     Ok(())
 }
+
+/// Show this node's id, and the config a peer needs.
+///
+/// Creates the key if there is not one yet, so the first thing a person does when setting up a
+/// swarm produces the thing they have to send to the other machine — rather than telling them to
+/// start neosh first and then come back.
+fn run_swarm_id(paths: &Paths) -> anyhow::Result<()> {
+    let path = neosh_swarm::identity::key_path(&paths.state);
+    let identity = neosh_swarm::Identity::load_or_create(&path)?;
+    say!("{}", identity.id());
+    say!("");
+    say!("On every other computer, put this in `[swarm]`:");
+    say!("");
+    say!("  [[swarm.peers]]");
+    say!("  addr = \"{}:7717\"   # whatever your network calls this machine", machine_name());
+    say!("  id   = \"{}\"", identity.id());
+    say!("  name = \"{}\"", machine_name());
+    Ok(())
+}
+
+/// What this computer is called, for the sample config above.
+fn machine_name() -> String {
+    std::env::var("HOSTNAME")
+        .or_else(|_| std::env::var("COMPUTERNAME"))
+        .ok()
+        .map(|h| h.split('.').next().unwrap_or(&h).to_string())
+        .filter(|h| !h.is_empty())
+        .unwrap_or_else(|| "this-machine".to_string())
+}
+
 
 fn run_init(paths: &Paths, cwd: &std::path::Path, args: &InitArgs) -> anyhow::Result<()> {
     let report = if args.project {
