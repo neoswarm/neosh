@@ -45,12 +45,16 @@ import type {
   PluginContext,
   NodeInfo,
   SessionInfo,
+  Message,
   SwarmAgent,
+  SwarmNode,
+  SwarmStranger,
   VarScope,
   WindowId,
   WorktreeInfo,
 } from "@neosh/api";
 import {
+  confirm,
   confirmDestructive,
   configureMotion,
   CursoredList,
@@ -695,10 +699,14 @@ async function registerCommands(w: Wiring): Promise<void> {
     await deleteSession(neosh, target.id);
   });
   await verb(`${NS}.new`, "n", "New conversation in this project", async (target) => {
-    // In the project you are looking at, which is the whole reason the cursor is there.
+    // The same question `^N` asks, about the project you are looking at — which is the whole reason
+    // the cursor is there. It used to create one outright, and that was the bug: `n` and `^N` were
+    // one letter and a modifier apart and did visibly different things, so the only way to know
+    // which one you wanted was to have already learned that they differ. Here is still the first
+    // row, so `n ⏎` is what `n` always did.
     const cwd = owningProject(target) ?? undefined;
-    await neosh.session.create(cwd ? { cwd } : undefined);
     await w.leave();
+    await newConversation(neosh, cwd);
   }, { redraw: false });
 
   // ---- doors out of the panel ----
@@ -740,7 +748,7 @@ async function registerCommands(w: Wiring): Promise<void> {
     await neosh.cmd.register("sidebar.refresh", w.draw, { desc: "Redraw the sidebar now" }),
   );
   w.subscriptions.push(
-    await neosh.cmd.register("session.new", () => newConversation(neosh), {
+    await neosh.cmd.register("session.new", (args) => newConversation(neosh, args[0]), {
       desc: "Start a new conversation — here, or in a worktree of its own",
     }),
   );
@@ -816,14 +824,7 @@ async function registerCommands(w: Wiring): Promise<void> {
         neosh.notify("swarm.open needs a node and a conversation", "warn");
         return;
       }
-      try {
-        await neosh.swarm.subscribe(node, session);
-        const who = (await neosh.swarm.nodes().catch(() => []))
-          .find((n) => n.info.id === node)?.info.name ?? node.slice(0, 8);
-        neosh.notify(`watching a conversation on ${who}`);
-      } catch (e) {
-        neosh.notify(String(e), "warn");
-      }
+      await openRemote(neosh, w.subscriptions, node, session);
     }, { desc: "Watch a conversation on another computer" }),
   );
   w.subscriptions.push(
@@ -831,6 +832,14 @@ async function registerCommands(w: Wiring): Promise<void> {
       desc: "The computers in this workspace",
     }),
   );
+  w.subscriptions.push(
+    await neosh.cmd.register("swarm.add", () => addComputer(neosh), {
+      desc: "Add a computer by its address",
+    }),
+  );
+  // `^J` rather than a letter, because everything in chat mode has to be a chord — the composer is
+  // the field, and a bare key would be a character you can no longer type.
+  await neosh.keymap.set("chat", "<C-j>", "swarm.nodes", { desc: "Computers" });
   // Any change over there is a redraw here. Without it the panel is right only as often as its
   // four-second refresh, which is a long time to watch a spinner that has already stopped.
   w.subscriptions.push(neosh.swarm.onChange(() => void w.draw()));
@@ -950,43 +959,73 @@ function argsFor(target: Target | undefined): string[] {
  * having to create one, find it, and then open a conversation in it is three steps for one
  * intention.
  *
+ * **`base` is which project is being asked about**, and it is the whole reason this takes an
+ * argument: `^N` means the conversation you are in, and `n` in the panel means the row the cursor
+ * is on, which is very often a different repository with different branches. Asking about the
+ * active conversation's checkout from a row pointing somewhere else would offer worktrees that
+ * have nothing to do with what was aimed at.
+ *
  * Outside a repository the question has one answer, so it is not asked: `^N` stays a single key
  * everywhere the choice would be theatre. Inside one, `Here` is selected, so `^N ⏎` is what `^N`
  * always did.
  */
-async function newConversation(neosh: Neosh): Promise<void> {
+async function newConversation(neosh: Neosh, base?: string): Promise<void> {
   const current = await neosh.session.current().catch(() => null);
-  const here = current?.cwd;
+  const here = base ?? current?.cwd;
   // Empty outside a repository, which is also how this knows there is nothing to ask about: a
   // worktree is a git idea, and a directory that is not a checkout has exactly one answer to
   // "where does this conversation go".
-  const trees = await neosh.git.worktrees().catch(() => [] as WorktreeInfo[]);
+  const trees = await neosh.git.worktrees(here ? { cwd: here } : undefined)
+    .catch(() => [] as WorktreeInfo[]);
   // The git plugin may also be switched off, in which case the rows that lead into it would lead
   // nowhere. Offering an action that cannot happen is worse than not offering it.
   const commands = new Set((await neosh.cmd.list().catch(() => [])).map((c) => c.name));
-  const canBranch = trees.length > 0 && commands.has("git.worktree.new");
+  const canBranch = trees.length > 0 && commands.has("git.worktree.new.auto");
+  const canName = trees.length > 0 && commands.has("git.worktree.new");
   const others = trees.filter((t) => t.path !== here);
 
-  if (!canBranch && others.length === 0) {
-    await neosh.session.create();
+  if (!canBranch && !canName && others.length === 0) {
+    await neosh.session.create(here ? { cwd: here } : undefined);
     return;
   }
 
   type Where =
     | { kind: "here" }
+    | { kind: "scratch" }
     | { kind: "new" }
     | { kind: "elsewhere" }
     | { kind: "tree"; path: string; label: string }
     /** On another computer, in a checkout that machine told us it has. */
     | { kind: "host"; node: string; cwd: string; label: string };
-  const rows: Array<{ label: string; detail?: string; keywords?: string; value: Where }> = [
-    { label: "Here", detail: here ?? "this project", value: { kind: "here" } },
+  const rows: Array<PickerItem<Where>> = [
+    {
+      label: "Here",
+      detail: here ?? "this project",
+      icon: "●",
+      hl: "Diagnostic.Info",
+      value: { kind: "here" },
+    },
   ];
+  // First, and above the one that asks for a name, because it is the answer more often: a branch
+  // named before the work is a decision made at the worst possible moment, and the whole reason
+  // this row exists is that having to make it is what stops people starting.
   if (canBranch) {
     rows.push({
-      label: "In a new worktree…",
+      label: "In a new worktree",
+      detail: "a clean branch, named for you, nothing to answer",
+      keywords: "branch worktree scratch new fresh",
+      icon: "+",
+      hl: "Diagnostic.Ok",
+      value: { kind: "scratch" },
+    });
+  }
+  if (canName) {
+    rows.push({
+      label: "In a new worktree, named…",
       detail: "a branch of its own, checked out somewhere else",
-      keywords: "branch worktree",
+      keywords: "branch worktree name",
+      icon: "+",
+      hl: "Sidebar.Dim",
       value: { kind: "new" },
     });
   }
@@ -996,6 +1035,8 @@ async function newConversation(neosh: Neosh): Promise<void> {
       label,
       detail: `worktree  ·  ${t.path}`,
       keywords: `${t.path} worktree`,
+      icon: "⎇",
+      hl: "Git.Branch",
       value: { kind: "tree", path: t.path, label },
     });
   }
@@ -1009,6 +1050,8 @@ async function newConversation(neosh: Neosh): Promise<void> {
         label: `${project.name}`,
         detail: `on ${n.info.name}  ·  ${project.cwd}`,
         keywords: `${n.info.name} ${project.cwd} remote host computer`,
+        icon: "→",
+        hl: "Sidebar.Remote",
         value: {
           kind: "host",
           node: n.info.id,
@@ -1023,17 +1066,30 @@ async function newConversation(neosh: Neosh): Promise<void> {
     label: "Another directory…",
     detail: "somewhere else entirely",
     keywords: "project folder",
+    icon: "…",
+    hl: "Sidebar.Dim",
     value: { kind: "elsewhere" },
   });
 
   const chosen = await picker(neosh, rows, { title: "New conversation", width: 76 });
   if (chosen === null) return;
+  // Every row below that reaches for git names the repository it is about. `^N` from a
+  // conversation and `n` from a row on a different project are the same code path, and the only
+  // thing that tells them apart is this argument.
+  const at = here ? [here] : [];
   switch (chosen.kind) {
     case "here":
-      await neosh.session.create();
+      await neosh.session.create(here ? { cwd: here } : undefined);
+      return;
+    case "scratch":
+      await neosh.cmd.exec("git.worktree.new.auto", at)
+        .catch((e: unknown) => neosh.notify(String(e), "warn"));
       return;
     case "new":
-      await neosh.cmd.exec("git.worktree.new").catch((e: unknown) => neosh.notify(String(e), "warn"));
+      // Positionally: branch, path, cwd. The first two are what the command asks for when they are
+      // missing, which is exactly what this row means.
+      await neosh.cmd.exec("git.worktree.new", here ? ["", "", here] : [])
+        .catch((e: unknown) => neosh.notify(String(e), "warn"));
       return;
     case "tree":
       await neosh.session.create({ cwd: chosen.path });
@@ -1303,49 +1359,438 @@ async function browseArchive(neosh: Neosh): Promise<void> {
 }
 
 /**
- * The computers in this workspace, and what each is running.
+ * The computers in this workspace: yours, theirs, and the ones asking to join.
  *
  * A picker rather than a panel section, for the reason the archive is: it is a thing you look at
  * when you want it, and rows that are only occasionally the answer do not belong in the column you
- * work in. `↵` on a machine watches its most recent conversation.
+ * work in.
+ *
+ * Machines asking to join sit at the top, because they are the only rows that are waiting on you.
+ * Your own identity is at the foot, where it is out of the way but always somewhere you can point
+ * at when the other machine asks who you are.
  */
 async function showNodes(neosh: Neosh): Promise<void> {
-  const nodes = await neosh.swarm.nodes().catch(() => []);
   const me = await neosh.swarm.self().catch(() => null);
-  if (nodes.length === 0) {
-    neosh.notify(
-      me ? "no other computers have joined yet" : "the swarm is off — see `[swarm]` in your config",
-      "info",
-    );
+  if (!me) {
+    neosh.notify("the swarm is off — `[swarm]` in your config turns it on", "info");
     return;
   }
 
-  const chosen = await picker(
-    neosh,
-    nodes.map((n) => {
+  type Row =
+    | { kind: "node"; node: SwarmNode }
+    | { kind: "stranger"; stranger: SwarmStranger }
+    | { kind: "add" }
+    | { kind: "self" };
+
+  const build = async (): Promise<PickerItem<Row>[]> => {
+    const [nodes, strangers] = await Promise.all([
+      neosh.swarm.nodes().catch(() => []),
+      neosh.swarm.strangers().catch(() => []),
+    ]);
+    const rows: PickerItem<Row>[] = [];
+
+    for (const s of strangers) {
+      rows.push({
+        label: `${s.info.name}`,
+        detail: s.dialled
+          ? `found at ${s.addr ?? "an address you gave"}  ·  ${fingerprint(s.info.id)}  ·  ↵ to add`
+          : `wants to join  ·  ${fingerprint(s.info.id)}  ·  ↵ to allow`,
+        keywords: `${s.info.id} pending join pair new`,
+        value: { kind: "stranger", stranger: s },
+      });
+    }
+
+    for (const n of nodes) {
       const running = n.agents.filter((a) => a.state === "running").length;
-      return {
+      rows.push({
         label: n.info.name,
         detail: [
-          n.up ? `${n.agents.length} conversations` : `unreachable — ${n.reason ?? "no answer"}`,
+          n.up
+            ? `${n.agents.length} ${n.agents.length === 1 ? "conversation" : "conversations"}`
+            : `unreachable — ${n.reason ?? "no answer"}`,
           running > 0 ? `${running} working` : "",
+          !n.capabilities.accepts_commands ? "read-only" : "",
           n.info.os,
-          // The short id, so two machines with the same hostname are still tellable apart.
-          n.info.id.slice(0, 8),
+          fingerprint(n.info.id),
         ].filter(Boolean).join("  ·  "),
         keywords: `${n.info.os} ${n.info.id}`,
-        value: n,
-      };
-    }),
-    { title: "Computers", width: 76 },
-  );
+        value: { kind: "node", node: n },
+      });
+    }
+
+    rows.push({
+      label: "+ Add a computer…",
+      detail: "its address on your network, or through Tailscale",
+      keywords: "pair join new machine host",
+      value: { kind: "add" },
+    });
+    rows.push({
+      label: `This computer  ·  ${me.name}`,
+      // The fingerprint is what somebody at the other machine compares against. Shown here so
+      // "what is my id" never means leaving the program to run a command.
+      detail: `${fingerprint(me.id)}  ·  ^Y copies the full id`,
+      keywords: `self me ${me.id}`,
+      value: { kind: "self" },
+    });
+    return rows;
+  };
+
+  const items = await build();
+  const refill = async () => {
+    items.splice(0, items.length, ...(await build()));
+  };
+
+  const chosen = await picker(neosh, items, {
+    title: "Computers",
+    width: 84,
+    height: 14,
+    hints: "↵ choose   ^Y copy my id   ^X remove   esc close",
+    // Chords, because every bare letter a picker takes is a letter its filter can never contain.
+    ownKeys: ["<C-y>", "<C-x>"],
+    async onKey(key, ctx) {
+      if (key.key.code.kind !== "char" || !key.key.mods.ctrl) return;
+      switch (key.key.code.c.toLowerCase()) {
+        case "y":
+          await neosh.edit.copy(me.id);
+          neosh.notify("copied this computer's id");
+          return "handled";
+        case "x": {
+          const row = ctx.item;
+          if (row?.kind !== "node") return "handled";
+          try {
+            await neosh.swarm.unpair(row.node.info.id);
+            neosh.notify(`removed ${row.node.info.name}`);
+            await refill();
+            return "reload";
+          } catch (e) {
+            // Almost always "that one is in your config file", which names the fix.
+            neosh.notify(String(e), "warn");
+            return "handled";
+          }
+        }
+        default:
+          return;
+      }
+    },
+  });
   if (chosen === null) return;
-  const newest = [...chosen.agents].sort((a, b) => b.updated_at - a.updated_at)[0];
-  if (!newest) {
-    neosh.notify(`${chosen.info.name} has nothing running`, "info");
+
+  switch (chosen.kind) {
+    case "self":
+      await neosh.edit.copy(me.id);
+      neosh.notify("copied this computer's id");
+      return;
+    case "add":
+      await addComputer(neosh);
+      return;
+    case "stranger": {
+      const s = chosen.stranger;
+      // Asked even though we already know who it is, because knowing who it is *is* the question:
+      // the fingerprint on screen has to be the one the person at the other machine is reading out.
+      const ok = await confirm(neosh, `Add ${s.info.name}?`, {
+        yes: "Add",
+        no: "Not now",
+        detail: [
+          `${s.info.os}  ·  neosh ${s.info.version}`,
+          fingerprint(s.info.id),
+          "Check that fingerprint matches what the other computer shows under `This computer`.",
+        ],
+      });
+      if (!ok) return;
+      await neosh.swarm.pair(s.info.id, { name: s.info.name, addr: s.addr ?? undefined });
+      return;
+    }
+    case "node": {
+      const newest = [...chosen.node.agents].sort((a, b) => b.updated_at - a.updated_at)[0];
+      if (!newest) {
+        neosh.notify(`${chosen.node.info.name} has nothing running`, "info");
+        return;
+      }
+      await neosh.cmd.exec("swarm.open", [chosen.node.info.id, newest.session]).catch(() => {});
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Watching a conversation on another computer
+// ---------------------------------------------------------------------------
+
+/** The buffer kind the remote view publishes, so its keys are ordinary bindings. */
+const VIEW_KIND = "neosh.swarm.view";
+
+/** At most one open at a time, because there is one screen. */
+let openView: { close: () => Promise<void>; node: string; session: string } | null = null;
+
+/**
+ * Watch a conversation on another machine.
+ *
+ * A float rather than the chat pane, and that is a decision rather than a shortcut. The chat pane
+ * is *your* conversation: it is where your composer sends, what `^S` reads, and what the permission
+ * mode belongs to. Putting somebody else's conversation there would mean every one of those
+ * questions has two answers, and the one you get depends on what you last pressed. A window that is
+ * plainly a window onto another machine cannot be confused for the thing you are working in.
+ *
+ * What it is *not* is read-only. `i` steers it, `^C` interrupts it — because "feels like it is on
+ * this computer" is a claim about what you can do, not only about what you can see.
+ */
+async function openRemote(
+  neosh: Neosh,
+  subscriptions: PluginContext["subscriptions"],
+  node: string,
+  session: string,
+): Promise<void> {
+  // Switching from one remote conversation to another drops the first subscription. Otherwise a
+  // morning of looking at machines leaves every one of them streaming every token here.
+  if (openView) await openView.close();
+
+  const who = (await neosh.swarm.nodes().catch(() => []))
+    .find((n) => n.info.id === node);
+  const agent = who?.agents.find((a) => a.session === session);
+  const name = who?.info.name ?? node.slice(0, 8);
+
+  const buf = await neosh.buf.create({
+    name: `[${name}] ${agent?.label ?? "conversation"}`,
+    scratch: true,
+    kind: VIEW_KIND,
+  });
+  const ns = await neosh.ns.create("neosh.swarm.view");
+  const lines: string[] = [
+    `  watching ${name}${agent ? `  ·  ${agent.project_name}` : ""}`,
+    `  ${agent?.cwd ?? ""}`,
+    "",
+    "  waiting for this machine to say what has happened so far…",
+  ];
+  await neosh.buf.setLines(buf, 0, -1, lines);
+
+  const win = await neosh.float.open(buf, {
+    anchor: { kind: "screen" },
+    width: { kind: "max", n: 96 },
+    height: { kind: "max", n: 28 },
+    border: "rounded",
+    title: ` ${name} `,
+    focusable: true,
+  });
+  await neosh.focus.push(win);
+
+  const header = lines.slice(0, 3);
+  let body: string[] = [];
+  /** Whether the last thing appended is an assistant turn still being written into. */
+  let streaming = false;
+
+  const redraw = async () => {
+    const all = [...header, ...body];
+    await neosh.buf.setLines(buf, 0, -1, all);
+    await neosh.ns.clear(ns, buf);
+    await neosh.ns.mark(ns, buf, 0, 0, {
+      hlGroup: "Title",
+      endCol: byteLength(all[0] ?? ""),
+    });
+    if (all[1]) {
+      await neosh.ns.mark(ns, buf, 1, 0, { hlGroup: "Comment", endCol: byteLength(all[1]) });
+    }
+    for (let i = header.length; i < all.length; i++) {
+      const text = all[i] ?? "";
+      if (text.startsWith("  › ")) {
+        await neosh.ns.mark(ns, buf, i, 0, { hlGroup: "Accent", endCol: byteLength(text) });
+      } else if (text.startsWith("  · ")) {
+        await neosh.ns.mark(ns, buf, i, 0, { hlGroup: "Comment", endCol: byteLength(text) });
+      }
+    }
+    // The newest line, not the oldest: a transcript you have just opened should be showing the end
+    // of the conversation, which is the part that is still happening.
+    await neosh.win.scrollTo(win, Math.max(0, all.length - 24));
+  };
+
+  const sub = neosh.swarm.onStream(async (e) => {
+    if (e.node !== node || e.session !== session) return;
+    const ev = e.event;
+    switch (ev.event) {
+      case "history":
+        body = renderMessages(ev.messages);
+        streaming = false;
+        break;
+      case "turn_started":
+        streaming = false;
+        break;
+      case "token": {
+        if (!streaming) {
+          body.push("");
+          streaming = true;
+        }
+        // Appended to the last row, and split on newlines, because tokens are provider-sized rather
+        // than line-sized and a naive push makes one row per chunk.
+        const last = body.pop() ?? "";
+        const merged = (last + ev.text).split("\n");
+        body.push(...merged);
+        break;
+      }
+      case "thinking":
+        break;
+      case "activity":
+        break;
+      case "turn_ended":
+        streaming = false;
+        body.push("");
+        break;
+      case "blocked":
+        body.push(`  · waiting for somebody at ${name}: ${ev.prompt}`);
+        break;
+    }
+    await redraw();
+  });
+
+  const close = async () => {
+    if (openView?.session !== session) return;
+    openView = null;
+    sub.dispose();
+    await neosh.swarm.unsubscribe(node, session).catch(() => {});
+    await neosh.focus.pop().catch(() => {});
+    await neosh.win.close(win).catch(() => {});
+  };
+  openView = { close, node, session };
+  subscriptions.push({ dispose: () => void close() });
+
+  await installViewKeys(neosh, subscriptions, () => openView);
+  try {
+    await neosh.swarm.subscribe(node, session);
+  } catch (e) {
+    neosh.notify(String(e), "warn");
+    await close();
+  }
+}
+
+/**
+ * The keys inside a remote view.
+ *
+ * Registered once and bound at buffer-kind scope, so `F1` lists them and `init.ts` can move them —
+ * the same deal every other panel key gets. Registered lazily rather than at activation because
+ * most workspaces never open one.
+ */
+let viewKeysInstalled = false;
+async function installViewKeys(
+  neosh: Neosh,
+  subscriptions: PluginContext["subscriptions"],
+  current: () => { node: string; session: string; close: () => Promise<void> } | null,
+): Promise<void> {
+  if (viewKeysInstalled) return;
+  viewKeysInstalled = true;
+  const scope = { kind: "buf_kind", name: VIEW_KIND } as const;
+
+  const bind = async (name: string, key: string, desc: string, fn: () => Promise<void>) => {
+    subscriptions.push(await neosh.cmd.register(name, fn, { desc }));
+    await neosh.keymap.set("chat", key, name, { scope, desc });
+  };
+
+  await bind("swarm.view.close", "<Esc>", "Stop watching", async () => {
+    await current()?.close();
+  });
+  await neosh.keymap.set("chat", "q", "swarm.view.close", { scope });
+
+  await bind("swarm.view.steer", "i", "Say something to this agent", async () => {
+    const view = current();
+    if (!view) return;
+    const text = await prompt(neosh, "Say something", { width: 72 });
+    if (text === null || text.trim() === "") return;
+    try {
+      await neosh.swarm.command(view.node, view.session, { command: "send", text });
+    } catch (e) {
+      // The owner refused — read-only, or the conversation went away. Its words, not ours.
+      neosh.notify(String(e), "warn");
+    }
+  });
+
+  await bind("swarm.view.interrupt", "<C-c>", "Ask this turn to stop", async () => {
+    const view = current();
+    if (!view) return;
+    try {
+      await neosh.swarm.command(view.node, view.session, { command: "interrupt" });
+      neosh.notify("asked it to stop");
+    } catch (e) {
+      neosh.notify(String(e), "warn");
+    }
+  });
+}
+
+/** Messages as rows. Deliberately plain: this is a window onto somewhere else, not a transcript. */
+function renderMessages(messages: Message[]): string[] {
+  const out: string[] = [];
+  for (const m of messages) {
+    for (const block of m.content) {
+      if (block.type === "text") {
+        if (m.role === "user") {
+          out.push(`  › ${block.text.split("\n")[0] ?? ""}`);
+          for (const rest of block.text.split("\n").slice(1)) out.push(`    ${rest}`);
+        } else {
+          for (const line of block.text.split("\n")) out.push(`  ${line}`);
+        }
+      } else if (block.type === "tool_use") {
+        out.push(`  · ${block.name}`);
+      }
+    }
+    out.push("");
+  }
+  return out;
+}
+
+/**
+ * Add a machine by dialling it.
+ *
+ * The address is all you type. Everything else — its name, its fingerprint, whether it is even a
+ * neosh — is read off the machine itself, because a public key typed from memory is a public key
+ * typed wrong, and because the point of showing a fingerprint is that it came from the far end
+ * rather than from the same person who typed the address.
+ */
+async function addComputer(neosh: Neosh): Promise<void> {
+  const addr = await prompt(neosh, "Add a computer — hostname:7717", { width: 60 });
+  if (addr === null || addr.trim() === "") return;
+  // A port is easy to forget and there is only one sensible default.
+  const target = addr.includes(":") ? addr.trim() : `${addr.trim()}:7717`;
+
+  let found;
+  try {
+    neosh.notify(`asking ${target}…`);
+    found = await neosh.swarm.probe(target);
+  } catch (e) {
+    // `String(e)` here would read `NeoshError: not found: …: swarm i/o: Connection refused (os
+    // error 61)`, which names three layers of plumbing before it gets to the part a person can act
+    // on. What went wrong is that nothing answered, and what to check is spelling and whether the
+    // other neosh is running.
+    neosh.notify(
+      `nothing answered at ${target} — is neosh running there, with `
+        + "`listen` set in its `[swarm]`?",
+      "warn",
+    );
+    neosh.log.warn(`swarm probe of ${target} failed: ${String(e)}`);
     return;
   }
-  await neosh.cmd.exec("swarm.open", [chosen.info.id, newest.session]).catch(() => {});
+
+  const ok = await confirm(neosh, `Add ${found.name}?`, {
+    yes: "Add",
+    no: "Cancel",
+    detail: [
+      `${target}  ·  ${found.os}  ·  neosh ${found.version}`,
+      fingerprint(found.id),
+      "Check that fingerprint matches what that computer shows under `This computer`.",
+    ],
+  });
+  if (!ok) return;
+
+  await neosh.swarm.pair(found.id, { name: found.name, addr: target });
+  // Both halves have to happen, and only one of them is ours. Saying so now saves the ten minutes
+  // otherwise spent wondering why the machine is listed and permanently unreachable.
+  neosh.notify(`${found.name} added — now allow this computer over there, with ^J`);
+}
+
+/**
+ * A node id, in groups, for reading aloud.
+ *
+ * Sixty-four hex characters is not something a person can compare. Four groups of four from the
+ * front is — and it is the *front* rather than a hash of the whole because that is what both
+ * machines display, so the two are comparable by eye.
+ */
+function fingerprint(id: string): string {
+  const head = id.slice(0, 16);
+  return (head.match(/.{1,4}/g) ?? [head]).join(" ");
 }
 
 async function renameSession(neosh: Neosh, session: string): Promise<void> {

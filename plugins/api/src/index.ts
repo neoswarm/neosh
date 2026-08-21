@@ -99,6 +99,7 @@ import type { RemoteProject } from "./generated/RemoteProject";
 import type { StreamEvent } from "./generated/StreamEvent";
 import type { SwarmAgent } from "./generated/SwarmAgent";
 import type { SwarmNode } from "./generated/SwarmNode";
+import type { SwarmStranger } from "./generated/SwarmStranger";
 import type { VarScope } from "./generated/VarScope";
 import type { Viewport } from "./generated/Viewport";
 import type { WindowId } from "./generated/WindowId";
@@ -118,7 +119,7 @@ export type {
   Rect, RepoInfo, RepoStatus, SessionId, SessionInfo, StatusAlign, StatusSegment, StopReason,
   SurfaceCell, SurfaceId, TextEdit, ToolCall, ToolDef, ToolResult, TurnRequest, Usage,
   NodeCapabilities, NodeId, NodeInfo, ProjectKey, RemoteProject, StreamEvent,
-  SwarmAgent, SwarmNode,
+  SwarmAgent, SwarmNode, SwarmStranger,
   VarScope, Viewport,
   WindowId, WindowInfo, WindowLayout,
   WorktreeInfo,
@@ -711,8 +712,16 @@ export interface ProviderApi {
 export interface GitApi {
   status(): Promise<RepoStatus>;
   /** Local branches, most recently committed first. */
-  branches(opts?: { includeRemote?: boolean }): Promise<BranchInfo[]>;
-  worktrees(): Promise<WorktreeInfo[]>;
+  branches(opts?: { includeRemote?: boolean; cwd?: string }): Promise<BranchInfo[]>;
+  /**
+   * Every checkout of the repository.
+   *
+   * `cwd` picks which repository to ask about; without it the answer is the one this conversation
+   * is in, which is what a status bar or a branch picker means. A panel means the other thing —
+   * it lists several projects at once, and the row under the cursor is not always the conversation
+   * you are in.
+   */
+  worktrees(opts?: { cwd?: string }): Promise<WorktreeInfo[]>;
   log(limit?: number): Promise<CommitInfo[]>;
   /** The patch. Pass `stat` for `--stat`, which is what a prompt wants. */
   diff(target?: DiffTarget, opts?: { stat?: boolean }): Promise<string>;
@@ -724,7 +733,11 @@ export interface GitApi {
   stage(paths?: string[]): Promise<void>;
   unstage(paths?: string[]): Promise<void>;
   commit(message: string): Promise<CommitInfo>;
-  addWorktree(path: string, branch: string, opts?: { create?: boolean }): Promise<void>;
+  addWorktree(
+    path: string,
+    branch: string,
+    opts?: { create?: boolean; cwd?: string },
+  ): Promise<void>;
   removeWorktree(path: string, opts?: { force?: boolean }): Promise<void>;
 }
 
@@ -1052,7 +1065,32 @@ export interface SwarmApi {
    */
   subscribe(node: NodeId, session: string): Promise<void>;
   unsubscribe(node: NodeId, session: string): Promise<void>;
-  /** A node joined, left, or changed what it is running. Redraw. */
+  /**
+   * Ask what machine is at an address, without joining it.
+   *
+   * The first half of pairing. A node presents its identity to anything that connects — as an SSH
+   * server presents a host key — so what comes back was *proven*, not claimed, which is what makes
+   * it safe to show somebody and ask. Rejects, with the address in the message, when nothing
+   * answers.
+   */
+  probe(addr: string): Promise<NodeInfo>;
+  /**
+   * Authorise a machine and start connecting to it.
+   *
+   * Immediate: no restart. Written to the state directory rather than to `config.toml`, because an
+   * editor that edits your config file because you pressed a key is one you stop trusting with it.
+   */
+  pair(node: NodeId, opts?: { name?: string; addr?: string }): Promise<void>;
+  /** Withdraw authorisation and stop connecting. Refuses for a machine your config declared. */
+  unpair(node: NodeId): Promise<void>;
+  /**
+   * Machines that proved who they are and have not been paired with.
+   *
+   * `dialled` says which question to ask: `true` is "this is what is at that address — add it?",
+   * `false` is "this machine wants to join — allow it?". Same button, different question.
+   */
+  strangers(): Promise<SwarmStranger[]>;
+  /** A node joined, left, changed what it is running, or asked to join. Redraw. */
   onChange(cb: () => void): Disposable;
   onStream(
     cb: (e: { node: NodeId; session: string; event: StreamEvent }) => void,
@@ -1351,6 +1389,25 @@ export function __createContext(plugin: string, config: unknown, version: number
       },
       async agents() {
         return expect(await c({ call: "swarm_agents" }), "swarm_agents").agents;
+      },
+      async probe(addr) {
+        const found = expect(await c({ call: "swarm_probe", addr }), "swarm_self").node;
+        if (!found) throw new NeoshError({ kind: "not_found", what: addr });
+        return found;
+      },
+      async pair(node, opts) {
+        await c({
+          call: "swarm_pair",
+          node,
+          name: opts?.name ?? "",
+          addr: opts?.addr ?? null,
+        });
+      },
+      async unpair(node) {
+        await c({ call: "swarm_unpair", node });
+      },
+      async strangers() {
+        return expect(await c({ call: "swarm_strangers" }), "swarm_strangers").strangers;
       },
       async hostsOf(project) {
         return expect(await c({ call: "swarm_hosts_of", project }), "names").names;
@@ -1730,11 +1787,16 @@ export function __createContext(plugin: string, config: unknown, version: number
         return expect(await c({ call: "git_status" }), "status").status;
       },
       async branches(opts) {
-        const v = await c({ call: "git_branches", include_remote: opts?.includeRemote ?? false });
+        const v = await c({
+          call: "git_branches",
+          include_remote: opts?.includeRemote ?? false,
+          cwd: opts?.cwd ?? null,
+        });
         return expect(v, "branches").branches;
       },
-      async worktrees() {
-        return expect(await c({ call: "git_worktrees" }), "worktrees").worktrees;
+      async worktrees(opts) {
+        const v = await c({ call: "git_worktrees", cwd: opts?.cwd ?? null });
+        return expect(v, "worktrees").worktrees;
       },
       async log(limit) {
         return expect(await c({ call: "git_log", limit: limit ?? 20 }), "commits").commits;
@@ -1766,7 +1828,13 @@ export function __createContext(plugin: string, config: unknown, version: number
         return expect(await c({ call: "git_commit", message }), "commit").commit;
       },
       async addWorktree(path, branch, opts) {
-        await c({ call: "git_add_worktree", path, branch, create: opts?.create ?? false });
+        await c({
+          call: "git_add_worktree",
+          path,
+          branch,
+          create: opts?.create ?? false,
+          cwd: opts?.cwd ?? null,
+        });
       },
       async removeWorktree(path, opts) {
         await c({ call: "git_remove_worktree", path, force: opts?.force ?? false });

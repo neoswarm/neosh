@@ -273,12 +273,24 @@ export type ApiCall =
   }
   | { "call": "swarm_subscribe"; node: NodeId; session: SessionId }
   | { "call": "swarm_unsubscribe"; node: NodeId; session: SessionId }
+  | { "call": "swarm_probe"; addr: string }
+  | { "call": "swarm_pair"; node: NodeId; name: string; addr?: string | null }
+  | { "call": "swarm_unpair"; node: NodeId }
+  | { "call": "swarm_strangers" }
   | { "call": "rtp_add"; path: string }
   | { "call": "rtp_list" }
   | { "call": "path_complete"; prefix: string }
   | { "call": "git_status" }
-  | { "call": "git_branches"; include_remote: boolean }
-  | { "call": "git_worktrees" }
+  | {
+    "call": "git_branches";
+    include_remote: boolean;
+    /**
+     * Which checkout to ask. `None` is the one this conversation is in, which is what almost
+     * every caller means. See [`ApiCall::GitWorktrees`] for why the others exist.
+     */
+    cwd?: string | null;
+  }
+  | { "call": "git_worktrees"; cwd?: string | null }
   | { "call": "git_log"; limit: number }
   | {
     "call": "git_diff";
@@ -299,6 +311,11 @@ export type ApiCall =
     path: string;
     branch: string;
     create: boolean;
+    /**
+     * The repository to add it to. `git worktree add` runs *inside* a checkout, so a caller
+     * making a worktree of a project other than the active one has to say which.
+     */
+    cwd?: string | null;
   }
   | { "call": "git_remove_worktree"; path: string; force: boolean }
   | {

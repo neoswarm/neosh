@@ -5,6 +5,7 @@
 //! round-trip freezes it for seconds. Each of these becomes a spawned task that reports back
 //! through the same request id the plugin is already waiting on.
 
+use std::borrow::Cow;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -48,6 +49,21 @@ impl Services {
         self.git.as_ref().ok_or_else(|| ApiError::NotFound {
             what: format!("no git repository at {}", self.cwd.display()),
         })
+    }
+
+    /// The repository at `cwd`, or this conversation's when nobody asked for one in particular.
+    ///
+    /// Discovery is one `rev-parse`, which is why a caller may name a directory per call rather
+    /// than the host keeping a table of open repositories: the panel asks about a project the
+    /// cursor is on, and the answer is stale the moment the cursor moves.
+    async fn repo_at(&self, cwd: Option<String>) -> Result<Cow<'_, Git>, ApiError> {
+        let Some(path) = cwd else {
+            return Ok(Cow::Borrowed(self.repo()?));
+        };
+        Git::discover(&path)
+            .await
+            .map(Cow::Owned)
+            .ok_or_else(|| ApiError::NotFound { what: format!("no git repository at {path}") })
     }
 
     /// Refuse a repository write from a plugin that did not declare it.
@@ -147,14 +163,14 @@ impl Services {
         Ok(ApiOk::Status { status: self.repo()?.status().await.map_err(vcs_err)? })
     }
 
-    pub async fn git_branches(&self, include_remote: bool) -> ApiResult {
-        Ok(ApiOk::Branches {
-            branches: self.repo()?.branches(include_remote).await.map_err(vcs_err)?,
-        })
+    pub async fn git_branches(&self, include_remote: bool, cwd: Option<String>) -> ApiResult {
+        let repo = self.repo_at(cwd).await?;
+        Ok(ApiOk::Branches { branches: repo.branches(include_remote).await.map_err(vcs_err)? })
     }
 
-    pub async fn git_worktrees(&self) -> ApiResult {
-        Ok(ApiOk::Worktrees { worktrees: self.repo()?.worktrees().await.map_err(vcs_err)? })
+    pub async fn git_worktrees(&self, cwd: Option<String>) -> ApiResult {
+        let repo = self.repo_at(cwd).await?;
+        Ok(ApiOk::Worktrees { worktrees: repo.worktrees().await.map_err(vcs_err)? })
     }
 
     pub async fn git_log(&self, limit: u32) -> ApiResult {
@@ -209,12 +225,11 @@ impl Services {
         path: String,
         branch: String,
         create: bool,
+        cwd: Option<String>,
     ) -> ApiResult {
         self.permit_write("worktree add")?;
-        self.repo()?
-            .add_worktree(&PathBuf::from(path), &branch, create)
-            .await
-            .map_err(vcs_err)?;
+        let repo = self.repo_at(cwd).await?;
+        repo.add_worktree(&PathBuf::from(path), &branch, create).await.map_err(vcs_err)?;
         Ok(ApiOk::Unit)
     }
 

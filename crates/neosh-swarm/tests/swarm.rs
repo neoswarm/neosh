@@ -12,12 +12,17 @@ use std::time::Duration;
 use neosh_proto::{
     AgentCommand, AgentState, AgentSummary, ProjectKey, Refusal, SessionId, StreamEvent,
 };
+use neosh_swarm::allow::{Allowed, Peer as AllowedPeer, Source};
 use neosh_swarm::identity::Identity;
 use neosh_swarm::node::{PeerAddress, SwarmConfig, SwarmEvent, SwarmHandle, SwarmRequest};
 use tokio::sync::mpsc::UnboundedReceiver;
 
 /// Long enough that a wedge fails the test rather than hanging the suite.
 const PATIENCE: Duration = Duration::from_secs(10);
+
+fn known(name: &str) -> AllowedPeer {
+    AllowedPeer { name: name.into(), addr: None, source: Source::Paired }
+}
 
 fn summary(id: &str, project: &str) -> AgentSummary {
     AgentSummary {
@@ -69,10 +74,11 @@ async fn pair(b_accepts_commands: bool) -> Pair {
     let addr: SocketAddr = probe.local_addr().expect("addr");
     drop(probe);
 
-    let mut a_id = Identity::ephemeral();
-    let mut b_id = Identity::ephemeral();
-    a_id.allow(b_id.id().clone(), "b");
-    b_id.allow(a_id.id().clone(), "a");
+    let a_id = Identity::ephemeral();
+    let b_id = Identity::ephemeral();
+    let (aa, ba) = (Allowed::load(None), Allowed::load(None));
+    aa.add(b_id.id().clone(), known("b"));
+    ba.add(a_id.id().clone(), known("a"));
 
     let b_cfg = SwarmConfig {
         name: "linux-box".into(),
@@ -82,7 +88,7 @@ async fn pair(b_accepts_commands: bool) -> Pair {
         heartbeat: Duration::from_millis(200),
         ..Default::default()
     };
-    let (b, b_rx) = neosh_swarm::node::spawn(Arc::new(b_id), b_cfg, "0.1.0".into());
+    let (b, b_rx) = neosh_swarm::node::spawn(Arc::new(b_id), ba, b_cfg, "0.1.0".into());
 
     let a_cfg = SwarmConfig {
         name: "mac-studio".into(),
@@ -90,7 +96,7 @@ async fn pair(b_accepts_commands: bool) -> Pair {
         heartbeat: Duration::from_millis(200),
         ..Default::default()
     };
-    let (a, a_rx) = neosh_swarm::node::spawn(Arc::new(a_id), a_cfg, "0.1.0".into());
+    let (a, a_rx) = neosh_swarm::node::spawn(Arc::new(a_id), aa, a_cfg, "0.1.0".into());
 
     Pair { a, a_rx, b, b_rx }
 }
@@ -135,13 +141,15 @@ async fn a_peer_connecting_late_is_caught_up_rather_than_left_empty() {
     let addr: SocketAddr = probe.local_addr().expect("addr");
     drop(probe);
 
-    let mut a_id = Identity::ephemeral();
-    let mut b_id = Identity::ephemeral();
-    a_id.allow(b_id.id().clone(), "b");
-    b_id.allow(a_id.id().clone(), "a");
+    let a_id = Identity::ephemeral();
+    let b_id = Identity::ephemeral();
+    let (aa, ba) = (Allowed::load(None), Allowed::load(None));
+    aa.add(b_id.id().clone(), known("b"));
+    ba.add(a_id.id().clone(), known("a"));
 
     let (b, _b_rx) = neosh_swarm::node::spawn(
         Arc::new(b_id),
+        ba,
         SwarmConfig {
             name: "b".into(),
             listen: Some(addr),
@@ -160,6 +168,7 @@ async fn a_peer_connecting_late_is_caught_up_rather_than_left_empty() {
 
     let (_a, mut a_rx) = neosh_swarm::node::spawn(
         Arc::new(a_id),
+        aa,
         SwarmConfig {
             name: "a".into(),
             peers: vec![PeerAddress { addr: addr.to_string(), expect: None }],
@@ -367,15 +376,17 @@ async fn two_nodes_that_dial_each_other_settle_on_one_connection() {
     let (a_addr, b_addr) = (ports[0], ports[1]);
     drop(ports);
 
-    let mut a_id = Identity::ephemeral();
-    let mut b_id = Identity::ephemeral();
-    a_id.allow(b_id.id().clone(), "b");
-    b_id.allow(a_id.id().clone(), "a");
+    let a_id = Identity::ephemeral();
+    let b_id = Identity::ephemeral();
+    let (aa, ba) = (Allowed::load(None), Allowed::load(None));
+    aa.add(b_id.id().clone(), known("b"));
+    ba.add(a_id.id().clone(), known("a"));
 
     // Each listens *and* dials the other, which is what a real pair of machines does.
-    let mk = |id: Identity, listen, peer: SocketAddr, name: &str| {
+    let mk = |id: Identity, allowed: Allowed, listen, peer: SocketAddr, name: &str| {
         neosh_swarm::node::spawn(
             Arc::new(id),
+            allowed,
             SwarmConfig {
                 name: name.into(),
                 listen: Some(listen),
@@ -386,8 +397,8 @@ async fn two_nodes_that_dial_each_other_settle_on_one_connection() {
             "0.1.0".into(),
         )
     };
-    let (a, mut a_rx) = mk(a_id, a_addr, b_addr, "a");
-    let (_b, _b_rx) = mk(b_id, b_addr, a_addr, "b");
+    let (a, mut a_rx) = mk(a_id, aa, a_addr, b_addr, "a");
+    let (_b, _b_rx) = mk(b_id, ba, b_addr, a_addr, "b");
 
     wait_for(&mut a_rx, |e| matches!(e, SwarmEvent::PeerUp { .. }).then_some(())).await;
 
@@ -508,4 +519,127 @@ async fn unsubscribing_stops_the_stream() {
     })
     .await;
     assert!(after.is_err(), "nothing arrives after unsubscribing");
+}
+
+/// Pairing, from both ends, without a restart.
+///
+/// The flow a person actually goes through: you type an address on one machine, it tells you what
+/// is there, and the machine at the other end is told somebody is asking. Neither side had to be
+/// configured in advance and neither is restarted.
+#[tokio::test]
+async fn two_strangers_can_be_introduced_while_they_are_running() {
+    let probe = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("probe");
+    let addr: SocketAddr = probe.local_addr().expect("addr");
+    drop(probe);
+
+    let a_id = Identity::ephemeral();
+    let b_id = Identity::ephemeral();
+    let (a_key, b_key) = (a_id.id().clone(), b_id.id().clone());
+    // Nobody knows anybody.
+    let (aa, ba) = (Allowed::load(None), Allowed::load(None));
+
+    let (b, mut b_rx) = neosh_swarm::node::spawn(
+        Arc::new(b_id),
+        ba,
+        SwarmConfig {
+            name: "linux-box".into(),
+            listen: Some(addr),
+            heartbeat: Duration::from_millis(150),
+            ..Default::default()
+        },
+        "0.1.0".into(),
+    );
+    let (a, mut a_rx) = neosh_swarm::node::spawn(
+        Arc::new(a_id),
+        aa,
+        SwarmConfig {
+            name: "mac-studio".into(),
+            peers: vec![PeerAddress { addr: addr.to_string(), expect: None }],
+            heartbeat: Duration::from_millis(150),
+            ..Default::default()
+        },
+        "0.1.0".into(),
+    );
+
+    // A dialled an address it knows nothing about, and is told what is there — by name, with an id
+    // that was *proven* rather than claimed. That is what a confirmation dialog can show.
+    let found = wait_for(&mut a_rx, |e| match e {
+        SwarmEvent::Stranger { node, dialled: true } => Some(node.clone()),
+        _ => None,
+    })
+    .await;
+    assert_eq!(found.name, "linux-box");
+    assert_eq!(found.id, b_key, "and it is the machine that is actually there");
+
+    // B, meanwhile, is told somebody is asking.
+    let asking = wait_for(&mut b_rx, |e| match e {
+        SwarmEvent::Stranger { node, dialled: false } => Some(node.clone()),
+        _ => None,
+    })
+    .await;
+    assert_eq!(asking.id, a_key);
+    assert_eq!(asking.name, "mac-studio");
+
+    // Both people say yes. No restart, no config file.
+    a.send(SwarmRequest::Pair {
+        id: b_key.clone(),
+        name: "linux-box".into(),
+        addr: Some(addr.to_string()),
+    });
+    b.send(SwarmRequest::Pair { id: a_key, name: "mac-studio".into(), addr: None });
+
+    let up = wait_for(&mut a_rx, |e| match e {
+        SwarmEvent::PeerUp { node, .. } => Some(node.name.clone()),
+        _ => None,
+    })
+    .await;
+    assert_eq!(up, "linux-box", "and the next reconnect simply works");
+
+    // And it is a real connection, not merely an authorised one.
+    b.send(SwarmRequest::Publish {
+        full: true,
+        agents: vec![summary("s1", "neosh")],
+        gone: Vec::new(),
+    });
+    let seen = wait_for(&mut a_rx, |e| match e {
+        SwarmEvent::Inventory { agents, .. } if !agents.is_empty() => Some(agents.len()),
+        _ => None,
+    })
+    .await;
+    assert_eq!(seen, 1);
+}
+
+/// Unpairing stops the reconnecting, which is the half that is easy to forget.
+///
+/// A node that is unpaired but still dialled would knock on the door for ever and be turned away
+/// for ever — quietly, in a log nobody reads.
+#[tokio::test]
+async fn unpairing_disconnects_and_stops_dialling() {
+    let mut p = pair(true).await;
+    let b_id = wait_for(&mut p.a_rx, |e| match e {
+        SwarmEvent::PeerUp { node, .. } => Some(node.id.clone()),
+        _ => None,
+    })
+    .await;
+
+    p.a.send(SwarmRequest::Unpair { id: b_id.clone() });
+    let reason = wait_for(&mut p.a_rx, |e| match e {
+        SwarmEvent::PeerDown { node, reason } if node == &b_id => Some(reason.clone()),
+        _ => None,
+    })
+    .await;
+    assert_eq!(reason, "unpaired");
+
+    // It does not come back a moment later.
+    let returned = tokio::time::timeout(Duration::from_millis(800), async {
+        loop {
+            match p.a_rx.recv().await {
+                Some(SwarmEvent::PeerUp { .. }) => return true,
+                Some(_) => continue,
+                None => return false,
+            }
+        }
+    })
+    .await;
+    assert!(returned.is_err(), "an unpaired machine stays unpaired");
 }

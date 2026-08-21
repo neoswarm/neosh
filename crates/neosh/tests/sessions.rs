@@ -1035,6 +1035,96 @@ export async function activate({ neosh }: PluginContext) {
     .expect("plugin");
 }
 
+/// A driver whose checklist is longer than the bottom of the screen can spare.
+fn install_long_planning_driver(sb: &Sandbox) {
+    let dir = sb.root.join("config/plugins/longplanner");
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    std::fs::write(
+        dir.join("plugin.toml"),
+        "name = \"longplanner\"\nversion = \"0.1.0\"\nentry = \"main.ts\"\npermissions = [\"providers\"]\n",
+    )
+    .expect("manifest");
+    std::fs::write(
+        dir.join("main.ts"),
+        r#"
+import type { PluginContext } from "@neosh/api";
+const nap = (ms: number) => new Promise((r) => setTimeout(r, ms));
+export async function activate({ neosh }: PluginContext) {
+  const steps = [];
+  for (let i = 1; i <= 12; i++) {
+    steps.push({ text: `Step ${i}`, state: i <= 4 ? "done" : i === 5 ? "active" : "pending" });
+  }
+  await neosh.provider.register("longplanner", [{
+    id: "longplanner", driver: "longplanner", display_name: "Long planner",
+    models: [{ id: "longplanner", display_name: "Long planner" }],
+  }], async (_req, emit) => {
+    emit({ type: "message_start", model: "longplanner", usage: {} });
+    emit({ type: "activity", activity: { kind: "plan", steps } });
+    emit({ type: "block_start", index: 0, block: { kind: "text" } });
+    emit({ type: "text_delta", index: 0, text: "planning" });
+    emit({ type: "block_stop", index: 0 });
+    await nap(1500);
+    emit({ type: "message_delta", stop_reason: { kind: "end_turn" }, usage: {} });
+    emit({ type: "message_stop" });
+  }, { agentLoop: true });
+  await neosh.cmd.register("t.useLongPlanner", async () => {
+    await neosh.agent.setSelection({ instance: "longplanner", model: "longplanner", options: [] });
+    neosh.notify("using long planner");
+  });
+  neosh.notify("long planner ready");
+}
+"#,
+    )
+    .expect("plugin");
+}
+
+#[test]
+fn a_checklist_too_long_for_the_screen_keeps_the_step_in_hand_and_counts_the_rest() {
+    // A plan is redrawn every time it changes and only ever grows, so a twelve-step one owns the
+    // bottom of the screen for the whole turn — and eleven of those rows are not the answer to
+    // "what is it doing". So the finished ones become a number, the tail becomes a number, and
+    // what is in hand stays a step. The copy committed when the turn ends is whole, because that
+    // one is history and a count there is a hole nothing can open.
+    let sb = Sandbox::new("plan-abridged");
+    install_driver(&sb);
+    install_long_planning_driver(&sb);
+
+    let mut s = sb.start();
+    s.wait_for("driver ready");
+    s.wait_for("long planner ready");
+    s.command("t.useLongPlanner");
+    s.wait_for("using long planner");
+    s.type_text("go");
+    s.enter();
+
+    assert!(
+        s.pump(|s| s.chat_now().iter().any(|l| l.contains("Step 5"))),
+        "the checklist is up\n{:?}",
+        s.chat_now()
+    );
+    let mid = s.chat_now();
+    let has = |text: &str| mid.iter().any(|l| l.contains(text));
+    assert!(has("4 done"), "what is finished is a count\n{mid:?}");
+    assert!(
+        mid.iter().find(|l| l.contains("Step 5")).is_some_and(|l| l.contains('\u{25b8}')),
+        "the one in hand is still a step\n{mid:?}"
+    );
+    assert!(has("5 more"), "and the tail is a count too\n{mid:?}");
+    assert!(!has("Step 12"), "the far end is not drawn\n{mid:?}");
+    // Five rows, which is what `chat.plan_rows` says, and not twelve.
+    let first = mid.iter().position(|l| l.contains("4 done")).expect("the count");
+    let last = mid.iter().rposition(|l| l.contains("5 more")).expect("the tail");
+    assert_eq!(last - first + 1, 5, "the whole checklist fits its budget\n{mid:?}");
+
+    assert!(
+        s.pump(|s| s.chat_now().iter().any(|l| l.contains("Step 12"))),
+        "and the copy left behind is whole\n{:?}",
+        s.chat_now()
+    );
+    let after = s.chat_now();
+    assert!(!after.iter().any(|l| l.contains("5 more")), "with nothing counted\n{after:?}");
+}
+
 #[test]
 fn a_plan_and_a_sub_agent_are_visible_while_the_turn_is_still_running() {
     // The gap this closes: an agent driver spends minutes doing things it says nothing about, and
@@ -1069,10 +1159,13 @@ fn a_plan_and_a_sub_agent_are_visible_while_the_turn_is_still_running() {
         "and the sub-agent that is out says so\n{mid:?}"
     );
     // Below the answer, not above it: the footer says what is true now, so it belongs at the
-    // bottom next to the line that says the turn is still going.
+    // bottom next to the line that says the turn is still going. And the working line leads it:
+    // what it is doing *this second* is the row you are watching, and under a checklist that grows
+    // a step every so often it would be on a different row every time you looked.
     let row = |text: &str| mid.iter().position(|l| l.contains(text)).unwrap_or(usize::MAX);
-    assert!(row("delegating") < row("Sort the pile"), "under what has been said\n{mid:?}");
-    assert!(row("Say hello") < row("esc to interrupt"), "and above the working line\n{mid:?}");
+    assert!(row("delegating") < row("esc to interrupt"), "under what has been said\n{mid:?}");
+    assert!(row("esc to interrupt") < row("Sort the pile"), "the working line leads\n{mid:?}");
+    assert!(row("Sort the pile") < row("Say hello"), "then the plan, then what is out\n{mid:?}");
 
     // It came back. Its findings are the result of the call that spawned it — this line was only
     // ever answering "is it still going", and it is not.

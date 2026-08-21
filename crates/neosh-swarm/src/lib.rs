@@ -15,14 +15,42 @@
 //! Tailscale, Nebula or the like, which have already solved hole-punching properly and would not be
 //! improved by an agent workspace having a go at it.
 
+pub mod allow;
 pub mod handshake;
 pub mod identity;
 pub mod node;
 pub mod wire;
 
-pub use handshake::{accept, dial, Peer};
+pub use allow::{Allowed, Peer as AllowedPeer, Source};
+pub use handshake::{accept, dial, Peer, Stranger};
 pub use identity::Identity;
 pub use node::{spawn, PeerAddress, SwarmConfig, SwarmEvent, SwarmHandle, SwarmRequest};
+
+/// Ask what machine is at an address, without joining it.
+///
+/// The first half of pairing. A node presents its identity to anything that connects — as an SSH
+/// server presents a host key — so this comes back with a name and a fingerprint that were
+/// *proven*, not claimed, which is what makes it safe to put in front of somebody and ask.
+///
+/// Deliberately not `dial`: this hangs up immediately and never joins. The caller has learnt who is
+/// there and nothing has been authorised.
+pub async fn probe(
+    addr: &str,
+    me: &Identity,
+    my_info: &neosh_proto::NodeInfo,
+    my_caps: &neosh_proto::NodeCapabilities,
+) -> Result<neosh_proto::NodeInfo, SwarmError> {
+    let mut stream = tokio::net::TcpStream::connect(addr).await?;
+    // An empty list refuses everybody, which is exactly what makes the answer a `Stranger` — the
+    // only outcome this cares about, and the one carrying what we came for.
+    let empty = Allowed::load(None);
+    match dial(&mut stream, me, &empty, my_info, my_caps).await {
+        Err(SwarmError::Stranger(s)) => Ok(s.node),
+        // Only possible if the peer is somehow already on an empty list, which it cannot be.
+        Ok(peer) => Ok(peer.node),
+        Err(e) => Err(e),
+    }
+}
 
 use neosh_proto::NodeId;
 
@@ -36,9 +64,14 @@ pub enum SwarmError {
     Protocol(String),
     #[error("swarm identity: {0}")]
     BadIdentity(String),
-    /// The peer is not on this node's list. The ordinary answer to a stranger, not a failure.
-    #[error("node {} is not one this machine has been told to accept", handshake::claimed(.0))]
-    Unauthorised(NodeId),
+    /// A machine that proved who it is and is not on the list.
+    ///
+    /// Not `Unauthorised` with an id attached, because the difference is what a caller does next:
+    /// this carries the peer's *proven* name and fingerprint, which is exactly what a person needs
+    /// to be shown before deciding whether to add it. Boxed because it is much larger than the
+    /// other variants and this enum is returned by value from every handshake.
+    #[error("{} ({}) is not a machine this one has been paired with", .0.node.name, .0.node.id.short())]
+    Stranger(Box<handshake::Stranger>),
     /// The peer claimed an id it could not prove. Distinct from `Unauthorised`, and much more
     /// serious: an authorised id that fails its own challenge means somebody is impersonating a
     /// machine you trust.

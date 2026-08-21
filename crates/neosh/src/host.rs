@@ -208,7 +208,10 @@ pub struct Host {
     /// Kept so [`neosh_proto::PluginEvent::ComposerChanged`] is about the draft rather than about
     /// the redraw.
     draft: String,
-    /// How many rows of footer — the plan, and what is out — sit above the working line.
+    /// How many rows of footer — the plan, and what is out — sit *under* the working line.
+    ///
+    /// Non-zero also means there is a blank line above the working line, which is the only other
+    /// thing anyone needs to know to find either end of the block.
     ///
     /// Part of the working line and not of the transcript, because both are *state*: they say what
     /// is true now, not what happened. Torn down and rebuilt together by
@@ -329,6 +332,15 @@ pub struct Host {
     /// watching — which is most of them, most of the time — streaming costs one set lookup per
     /// token and nothing else.
     swarm_watched: std::collections::HashSet<neosh_proto::SessionId>,
+    /// Machines that proved who they are and are not paired with.
+    ///
+    /// Kept rather than only notified about: pairing is a decision a person makes at their own
+    /// pace, and a machine that asked while you were reading something else should still be
+    /// waiting in the list when you look. Reset on restart, because a request that old is one to
+    /// make again.
+    swarm_strangers: std::collections::HashMap<neosh_proto::NodeId, neosh_proto::SwarmStranger>,
+    /// The authorisation list, shared with the running node so pairing needs no restart.
+    swarm_allowed: neosh_swarm::Allowed,
     /// The node's events, held here between construction and the loop taking them.
     swarm_events: Option<tokio::sync::mpsc::UnboundedReceiver<neosh_swarm::SwarmEvent>>,
     /// Repositories by directory, discovered on demand.
@@ -673,6 +685,8 @@ impl Host {
             swarm_pending: Default::default(),
             swarm_next_command: 0,
             swarm_watched: Default::default(),
+            swarm_strangers: Default::default(),
+            swarm_allowed: neosh_swarm::Allowed::load(None),
             swarm_events: None,
             repos: Default::default(),
             cwd: std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
@@ -730,7 +744,7 @@ impl Host {
             call,
             ApiCall::GitStatus
                 | ApiCall::GitBranches { .. }
-                | ApiCall::GitWorktrees
+                | ApiCall::GitWorktrees { .. }
                 | ApiCall::GitLog { .. }
                 | ApiCall::GitDiff { .. }
                 | ApiCall::GitDefaultBranch
@@ -943,6 +957,60 @@ impl Host {
                 }
                 Ok(ApiOk::Unit)
             }
+            ApiCall::SwarmStrangers => Ok(ApiOk::SwarmStrangers {
+                strangers: self.swarm_strangers.values().cloned().collect(),
+            }),
+            ApiCall::SwarmPair { node, name, addr } => {
+                let Some(h) = &self.swarm_node else {
+                    return Err(ApiError::NotFound { what: "the swarm is not running".into() });
+                };
+                // Whatever it called itself wins over whatever we were told to call it: a machine
+                // knows its own name, and a label typed into a dialog is a guess made before
+                // anybody had asked.
+                let name = self
+                    .swarm_strangers
+                    .get(&node)
+                    .map(|s| s.info.name.clone())
+                    .filter(|n| !n.is_empty())
+                    .unwrap_or(name);
+                let addr = addr.or_else(|| {
+                    self.swarm_strangers.get(&node).and_then(|s| s.addr.clone())
+                });
+                h.send(neosh_swarm::SwarmRequest::Pair {
+                    id: node.clone(),
+                    name: name.clone(),
+                    addr,
+                });
+                self.swarm_strangers.remove(&node);
+                self.editor_message(MessageLevel::Info, format!("paired with {name}"));
+                self.bridge.broadcast(PluginEvent::SwarmChanged);
+                Ok(ApiOk::Unit)
+            }
+            ApiCall::SwarmUnpair { node } => {
+                let Some(h) = &self.swarm_node else {
+                    return Err(ApiError::NotFound { what: "the swarm is not running".into() });
+                };
+                // Refused rather than silently ignored for a machine the config declared: that
+                // line would come back on the next reload, and a removal that undoes itself is
+                // worse than one that says why it cannot.
+                if self
+                    .swarm_allowed
+                    .get(&node)
+                    .is_some_and(|p| p.source == neosh_swarm::Source::Config)
+                {
+                    return Err(ApiError::Denied {
+                        reason: "that machine is in your config file; remove its `[[swarm.peers]]` entry"
+                            .into(),
+                    });
+                }
+                h.send(neosh_swarm::SwarmRequest::Unpair { id: node });
+                self.bridge.broadcast(PluginEvent::SwarmChanged);
+                Ok(ApiOk::Unit)
+            }
+            // Answered off the loop: it opens a socket to somewhere that may not answer.
+            ApiCall::SwarmProbe { .. } => Err(ApiError::Internal {
+                message: "swarm.probe is answered asynchronously".into(),
+            }),
             // Taken over before dispatch, because its answer comes from another machine.
             ApiCall::SwarmCommand { .. } => {
                 Err(ApiError::Internal { message: "swarm.command is answered asynchronously".into() })
@@ -1386,7 +1454,7 @@ impl Host {
         };
 
         let path = neosh_swarm::identity::key_path(&state);
-        let mut identity = match neosh_swarm::Identity::load_or_create(&path) {
+        let identity = match neosh_swarm::Identity::load_or_create(&path) {
             Ok(i) => i,
             Err(e) => {
                 self.editor_message(MessageLevel::Error, format!("swarm identity: {e}"));
@@ -1394,26 +1462,44 @@ impl Host {
             }
         };
 
-        // The allow-list *is* the authorisation, so a peer without a key is not one: it can be
-        // dialled and will be turned away, which is a louder failure than trusting whoever answers
-        // that address.
+        // Whatever pairing has remembered, plus whatever the config declared. The two are kept
+        // apart by `Source`, so a machine added here can be removed from the UI and one written by
+        // hand cannot — that line would simply come back on the next reload.
+        let allowed = neosh_swarm::Allowed::load(Some(&state));
         let mut peers = Vec::new();
+        for (id, p) in allowed.list() {
+            if let Some(addr) = p.addr {
+                peers.push(neosh_swarm::PeerAddress { addr, expect: Some(id) });
+            }
+        }
         for p in &cfg.peers {
+            let name = p.name.clone().unwrap_or_else(|| p.addr.clone());
             match &p.id {
                 Some(id) => {
                     let id = neosh_proto::NodeId(id.clone());
-                    identity.allow(id.clone(), p.name.clone().unwrap_or_else(|| p.addr.clone()));
+                    allowed.add(id.clone(), neosh_swarm::AllowedPeer {
+                        name,
+                        addr: Some(p.addr.clone()),
+                        source: neosh_swarm::Source::Config,
+                    });
                     peers.push(neosh_swarm::PeerAddress {
                         addr: p.addr.clone(),
                         expect: Some(id),
                     });
                 }
-                None => self.editor_message(
-                    MessageLevel::Warn,
-                    format!("swarm peer {} has no id, so it cannot be authorised", p.addr),
-                ),
+                // An address with no key is not an authorisation. Dialled anyway, so the machine
+                // there shows up as somebody asking to pair — which is the useful thing to do with
+                // a half-written entry, rather than refusing to look at it.
+                None => {
+                    peers.push(neosh_swarm::PeerAddress { addr: p.addr.clone(), expect: None });
+                    self.editor_message(
+                        MessageLevel::Info,
+                        format!("swarm peer {} has no id yet — ^J to pair with it", p.addr),
+                    );
+                }
             }
         }
+        self.swarm_allowed = allowed.clone();
 
         let listen = match cfg.listen.as_deref().map(str::parse::<std::net::SocketAddr>) {
             Some(Ok(a)) => Some(a),
@@ -1440,6 +1526,7 @@ impl Host {
         };
         let (handle, events) = neosh_swarm::spawn(
             std::sync::Arc::new(identity),
+            allowed,
             node_cfg,
             env!("CARGO_PKG_VERSION").to_string(),
         );
@@ -1481,6 +1568,55 @@ impl Host {
         let id = format!("c{}", self.swarm_next_command);
         self.swarm_pending.insert(id.clone(), waiting);
         handle.send(neosh_swarm::SwarmRequest::Command { node, id, session, command });
+    }
+
+    /// Find out what machine is at an address, off the loop.
+    ///
+    /// Given a short deadline of its own: the address came from somebody typing, and a wrong one is
+    /// the ordinary case rather than the exceptional one. A dialog that hangs for the TCP default
+    /// on a typo is a dialog people learn to be afraid of.
+    fn begin_swarm_probe(&mut self, addr: String, waiting: (PluginId, RequestId)) {
+        let Some(info) = self.swarm_self() else {
+            self.answer_swarm(waiting, Err(ApiError::NotFound {
+                what: "the swarm is not running".into(),
+            }));
+            return;
+        };
+        let Some(state) = self.state_dir.clone() else {
+            self.answer_swarm(waiting, Err(ApiError::NotFound { what: "no state directory".into() }));
+            return;
+        };
+        let caps = neosh_proto::NodeCapabilities {
+            accepts_commands: false,
+            accepts_approvals: false,
+            streams: false,
+            projects: Vec::new(),
+        };
+        let bridge = self.bridge.clone();
+        let (plugin, id) = waiting;
+        tokio::spawn(async move {
+            let result = async {
+                let identity =
+                    neosh_swarm::Identity::load_or_create(&neosh_swarm::identity::key_path(&state))
+                        .map_err(|e| ApiError::Internal { message: e.to_string() })?;
+                let found = tokio::time::timeout(
+                    Duration::from_secs(5),
+                    neosh_swarm::probe(&addr, &identity, &info, &caps),
+                )
+                .await
+                .map_err(|_| ApiError::NotFound {
+                    what: format!("nothing answered at {addr}"),
+                })?
+                .map_err(|e| ApiError::NotFound { what: format!("{addr}: {e}") })?;
+                Ok(ApiOk::SwarmSelf { node: Some(found) })
+            }
+            .await;
+            let response: ApiResponse = result.into();
+            let _ = bridge.script().send(ScriptInbound::Plugin {
+                plugin,
+                msg: PluginInbound::Response { id, response },
+            });
+        });
     }
 
     fn answer_swarm(&self, waiting: (PluginId, RequestId), result: Result<ApiOk, ApiError>) {
@@ -1627,6 +1763,29 @@ impl Host {
             }
             E::Stream { node, session, event } => {
                 self.bridge.broadcast(PluginEvent::SwarmStream { node, session, event });
+            }
+            E::Stranger { node, dialled } => {
+                let first = !self.swarm_strangers.contains_key(&node.id);
+                // The address only means anything when we were the one dialling. For a machine
+                // that dialled us, where it happened to arrive from is not somewhere we could
+                // usefully dial back.
+                let addr = dialled
+                    .then(|| self.swarm_allowed.get(&node.id).and_then(|p| p.addr))
+                    .flatten();
+                let name = node.name.clone();
+                self.swarm_strangers.insert(
+                    node.id.clone(),
+                    neosh_proto::SwarmStranger { info: node, dialled, addr },
+                );
+                // Said once. A machine that is dialling us every ten seconds must not produce a
+                // notification every ten seconds.
+                if first && !dialled {
+                    self.editor_message(
+                        MessageLevel::Info,
+                        format!("{name} wants to join this workspace — ^J to allow it"),
+                    );
+                }
+                self.bridge.broadcast(PluginEvent::SwarmChanged);
             }
             E::Answer { id, result, .. } => {
                 let (ok, message) = match result {
@@ -4038,7 +4197,9 @@ impl Host {
         if steps.is_empty() || !self.option_bool("chat.show_plan") {
             return;
         }
-        let rows = cards::plan(&self.glyphs(), steps, self.chat_width());
+        // Whole. This copy is history — the answer to "what did it decide to do", read back later
+        // — and abridging that would leave a transcript with a hole nothing can open.
+        let rows = cards::plan(&self.glyphs(), steps, self.chat_width(), None);
         self.push_block(&rows);
     }
 
@@ -4174,7 +4335,16 @@ impl Host {
     /// Where new content goes: the end, or the line above the working line when there is one.
     fn chat_end(&self) -> i64 {
         let n = self.editor.buffer(self.chat).map(|b| b.line_count() as i64).unwrap_or(0);
-        if self.working { (n - 1 - i64::from(self.plan_rows)).max(0) } else { n }
+        if self.working { (n - i64::from(self.working_rows())).max(0) } else { n }
+    }
+
+    /// How many rows the working line and everything under it take, blank line included.
+    fn working_rows(&self) -> u32 {
+        if !self.working {
+            return 0;
+        }
+        // The gap above, the line itself, and the footer under it.
+        u32::from(self.plan_rows > 0) + 1 + self.plan_rows
     }
 
     /// Highlight a span of one transcript row.
@@ -4415,14 +4585,29 @@ impl Host {
     /// it. The working line is not content — it sits *after* an answer that is still being
     /// written, and closing that answer in order to say it is still going would be a strange thing
     /// to do.
+    ///
+    /// It goes *first* of the block, above the plan and above what is out. All three are state,
+    /// but only one of them changes every tick: what it is doing right now is what you are
+    /// watching, and putting it under a checklist means it lands on a different row every time the
+    /// checklist grows a step. The rows above it are the transcript, which is settled, so the
+    /// first row of the block is the one place in the buffer that stays put.
     fn begin_working(&mut self) {
         if self.working {
             return;
         }
         let rows = self.footer();
         let at = self.chat_end();
-        let mut lines: Vec<String> = rows.iter().map(|r| r.text.clone()).collect();
+        // A blank line between what has been said and what is true now, for the same reason a
+        // question gets one: butted up against the last tool card, the block reads as part of its
+        // output. Only when there is a block — a working line on its own is one row, and one row
+        // does not need announcing.
+        let gap = !rows.is_empty();
+        let mut lines: Vec<String> = Vec::new();
+        if gap {
+            lines.push(String::new());
+        }
         lines.push(String::new());
+        lines.extend(rows.iter().map(|r| r.text.clone()));
         let _ = self.editor.apply(&PluginId::from(BUILTIN), ApiCall::BufSetLines {
             buf: self.chat,
             start: at,
@@ -4431,23 +4616,25 @@ impl Host {
         });
         self.plan_rows = rows.len() as u32;
         self.working = true;
+        let first = at as u32 + u32::from(gap) + 1;
         for (k, r) in rows.iter().enumerate() {
-            self.chat_row(at as u32 + k as u32, r);
+            self.chat_row(first + k as u32, r);
         }
         self.draw_working();
     }
 
-    /// The rows between the transcript and the working line: the plan, then what is still out.
+    /// The rows under the working line: the plan, then what is still out.
     ///
     /// A pure function of the round, drawn from scratch every time. There is no incremental path
-    /// on purpose — it is at most a dozen rows at the very bottom of the buffer, and a diff
-    /// against the previous version would be a second place for "where is the footer" to be wrong.
+    /// on purpose — it is a few rows at the very bottom of the buffer, and a diff against the
+    /// previous version would be a second place for "where is the footer" to be wrong.
     fn footer(&self) -> Vec<cards::Row> {
         let Some(r) = self.rounds.get(&self.active_session()) else { return Vec::new() };
         let g = self.glyphs();
         let width = self.chat_width();
         let mut rows = if self.option_bool("chat.show_plan") {
-            cards::plan(&g, &r.plan, width)
+            let limit = self.option_usize("chat.plan_rows");
+            cards::plan(&g, &r.plan, width, Some(limit))
         } else {
             Vec::new()
         };
@@ -4464,12 +4651,6 @@ impl Host {
             .collect();
         if !out.is_empty() {
             rows.extend(cards::tasks(&g, &out, width));
-        }
-        // A blank line between what has been said and what is true now, for the same reason a
-        // question gets one: butted up against the last tool card, the checklist reads as part of
-        // its output.
-        if !rows.is_empty() {
-            rows.insert(0, cards::Row::default());
         }
         rows
     }
@@ -4594,8 +4775,9 @@ impl Host {
         if !self.working {
             return;
         }
-        let last = self.working_row();
-        let first = last.saturating_sub(self.plan_rows);
+        let row = self.working_row();
+        let first = row.saturating_sub(u32::from(self.plan_rows > 0));
+        let last = row + self.plan_rows;
         self.working = false;
         self.plan_rows = 0;
         let plugin = PluginId::from(BUILTIN);
@@ -4613,12 +4795,14 @@ impl Host {
         });
     }
 
-    /// The last line of the transcript, which is where the working line lives while there is one.
+    /// Which row the working line is on, while there is one.
+    ///
+    /// Counted back from the end rather than remembered, so it is right whatever else wrote to the
+    /// buffer: the block is always the last rows of it, and the working line is the first row of
+    /// the block that is not the blank above it.
     fn working_row(&self) -> u32 {
-        self.editor
-            .buffer(self.chat)
-            .map(|b| b.line_count().saturating_sub(1))
-            .unwrap_or(0)
+        let n = self.editor.buffer(self.chat).map(|b| b.line_count()).unwrap_or(0);
+        n.saturating_sub(1 + self.plan_rows)
     }
 
     fn stream_into_chat(&mut self, kind: Stream, text: &str) {
@@ -5012,6 +5196,11 @@ impl Host {
                     // Answered when the owning machine answers, not now. Every ASCP command is
                     // replied to exactly once, so this settles — unless the peer has gone, which
                     // the swarm reports as a disconnect and which settles it too.
+                    // Dials an address that may not answer, so it cannot run on the loop.
+                    if let ApiCall::SwarmProbe { addr } = &call {
+                        self.begin_swarm_probe(addr.clone(), (plugin.clone(), id.clone()));
+                        return;
+                    }
                     if let ApiCall::SwarmCommand { node, session, command } = &call {
                         self.begin_swarm_command(
                             node.clone(),
@@ -5954,6 +6143,17 @@ impl Host {
                 ),
             },
             OptionSpec {
+                name: "chat.plan_rows".into(),
+                ty: OptionType::Int { min: Some(0), max: Some(50) },
+                default: OptionValue::Int(5),
+                description: Some(
+                    "How many rows the checklist may take above the working line. Past it, what is \
+                     finished and what is not started yet each become a count and the step in hand \
+                     stays. `0` shows every step. The copy left under the answer is always whole."
+                        .into(),
+                ),
+            },
+            OptionSpec {
                 name: "chat.tool_output_lines".into(),
                 ty: OptionType::Int { min: Some(0), max: Some(200) },
                 default: OptionValue::Int(3),
@@ -6540,8 +6740,10 @@ async fn run_slow(svc: Services, call: ApiCall) -> ApiResult {
     match call {
         ApiCall::PathComplete { prefix } => svc.path_complete(prefix).await,
         ApiCall::GitStatus => svc.git_status().await,
-        ApiCall::GitBranches { include_remote } => svc.git_branches(include_remote).await,
-        ApiCall::GitWorktrees => svc.git_worktrees().await,
+        ApiCall::GitBranches { include_remote, cwd } => {
+            svc.git_branches(include_remote, cwd).await
+        }
+        ApiCall::GitWorktrees { cwd } => svc.git_worktrees(cwd).await,
         ApiCall::GitLog { limit } => svc.git_log(limit).await,
         ApiCall::GitDiff { target, stat } => svc.git_diff(target, stat).await,
         ApiCall::GitDefaultBranch => svc.git_default_branch().await,
@@ -6550,8 +6752,8 @@ async fn run_slow(svc: Services, call: ApiCall) -> ApiResult {
         ApiCall::GitStage { paths } => svc.git_stage(paths).await,
         ApiCall::GitUnstage { paths } => svc.git_unstage(paths).await,
         ApiCall::GitCommit { message } => svc.git_commit(message).await,
-        ApiCall::GitAddWorktree { path, branch, create } => {
-            svc.git_add_worktree(path, branch, create).await
+        ApiCall::GitAddWorktree { path, branch, create, cwd } => {
+            svc.git_add_worktree(path, branch, create, cwd).await
         }
         ApiCall::GitRemoveWorktree { path, force } => svc.git_remove_worktree(path, force).await,
         ApiCall::GenComplete { prompt, system, json, selection } => {

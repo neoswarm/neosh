@@ -101,9 +101,21 @@ rather than an invented one, which matters because `TaskUpdate` refers to steps 
 
 ### The plan and the swarm are state, so they live in the footer
 
-Both are drawn between the transcript and the working line, and both are torn down and rebuilt with
-it. That is not a layout preference: a plan is **state, not history**. The version from two tool
-calls ago is not something to scroll back to, it is a wrong answer to "what is left".
+Both are drawn under the working line, at the very bottom of the buffer, and all three are torn down
+and rebuilt together. That is not a layout preference: a plan is **state, not history**. The version
+from two tool calls ago is not something to scroll back to, it is a wrong answer to "what is left".
+
+The working line leads the block rather than following it. Everything in the block is state, but
+only one row of it changes every tick, and it is the one you are watching — so it goes where the
+transcript above it holds it still. Under a checklist it moved down a row every time the agent added
+a step, which is the one thing a line you are staring at must not do.
+
+And it is **abridged**. A checklist is redrawn whenever it changes and only ever grows, so a
+twelve-step plan takes twelve rows for the rest of the turn — eleven of which are not the answer to
+"what is it doing now". Past `chat.plan_rows` it says the same thing in fewer rows: what is finished
+becomes a count, because done work is not part of "what is left"; the step in hand and the few after
+it stay steps, because they are; and the tail becomes a count as well. The copy committed when the
+turn ends is never abridged — that one is history, and a count there is a hole nothing can open.
 
 Two things survive the turn, and each for a reason:
 

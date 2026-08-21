@@ -22,6 +22,7 @@ use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
 
+use crate::allow::Allowed;
 use crate::handshake::{accept, dial};
 use crate::identity::Identity;
 use crate::wire::{read_message, write_message};
@@ -34,7 +35,7 @@ pub struct SwarmConfig {
     /// Where to listen. `None` means dial-only — a laptop that joins other machines without
     /// being joinable, which is the right setting for anything that moves between networks.
     pub listen: Option<SocketAddr>,
-    /// Machines to keep a connection to.
+    /// Machines to keep a connection to. Added to by pairing while the node runs.
     pub peers: Vec<PeerAddress>,
     pub accepts_commands: bool,
     pub accepts_approvals: bool,
@@ -82,6 +83,13 @@ pub enum SwarmRequest {
     Unsubscribe { node: NodeId, session: SessionId },
     /// Something happened in a local session. Sent only to peers that subscribed to it.
     Stream { session: SessionId, event: StreamEvent },
+    /// Authorise a machine and start keeping a connection to it, without a restart.
+    ///
+    /// `addr` is absent for one that dialled us: it knows where we are, and the address it happened
+    /// to arrive from is not necessarily one we could dial back on.
+    Pair { id: NodeId, name: String, addr: Option<String> },
+    /// Withdraw authorisation. The connection, if there is one, goes with it.
+    Unpair { id: NodeId },
     Shutdown,
 }
 
@@ -97,6 +105,12 @@ pub enum SwarmEvent {
     Command { node: NodeId, id: String, session: SessionId, command: AgentCommand },
     /// A command we sent has been answered. Exactly one of these per command, ever.
     Answer { node: NodeId, id: String, result: Result<Option<SessionId>, Refusal> },
+    /// A machine proved who it is and is not one we have paired with.
+    ///
+    /// The beginning of pairing rather than the end of a connection. Reported for both directions:
+    /// a machine we dialled and did not recognise, and one that dialled us. Either way the id here
+    /// has been *proven*, which is what makes it safe to show somebody and ask.
+    Stranger { node: NodeInfo, dialled: bool },
     /// A peer wants to watch one of our sessions, so the host should start sending its events.
     Subscribed { node: NodeId, session: SessionId },
     Unsubscribed { node: NodeId, session: SessionId },
@@ -145,6 +159,7 @@ enum Wire {
     },
     Message { node: NodeId, message: AscpMessage },
     Down { node: Option<NodeId>, reason: String },
+    Stranger { node: NodeInfo, dialled: bool },
 }
 
 /// Start a node. Returns the handle the host keeps and the events it should read.
@@ -154,18 +169,20 @@ enum Wire {
 /// reload, which restarts this.
 pub fn spawn(
     identity: Arc<Identity>,
+    allowed: Allowed,
     config: SwarmConfig,
     version: String,
 ) -> (SwarmHandle, mpsc::UnboundedReceiver<SwarmEvent>) {
     let (req_tx, req_rx) = mpsc::unbounded_channel();
     let (evt_tx, evt_rx) = mpsc::unbounded_channel();
     let id = identity.id().clone();
-    tokio::spawn(run(identity, config, version, req_rx, evt_tx));
+    tokio::spawn(run(identity, allowed, config, version, req_rx, evt_tx));
     (SwarmHandle { tx: req_tx, id }, evt_rx)
 }
 
 async fn run(
     identity: Arc<Identity>,
+    allowed: Allowed,
     config: SwarmConfig,
     version: String,
     mut requests: mpsc::UnboundedReceiver<SwarmRequest>,
@@ -190,7 +207,14 @@ async fn run(
         match TcpListener::bind(addr).await {
             Ok(sock) => {
                 tracing::info!(%addr, node = %identity.id().short(), "swarm listening");
-                tokio::spawn(listen(sock, identity.clone(), info.clone(), caps.clone(), wire_tx.clone()));
+                tokio::spawn(listen(
+                    sock,
+                    identity.clone(),
+                    allowed.clone(),
+                    info.clone(),
+                    caps.clone(),
+                    wire_tx.clone(),
+                ));
             }
             // Not fatal. A machine that cannot listen can still dial, and refusing to start the
             // workspace because a port was taken would be a swarm feature breaking the editor.
@@ -198,15 +222,32 @@ async fn run(
         }
     }
 
-    for peer in &config.peers {
-        tokio::spawn(keep_dialled(
-            peer.clone(),
-            identity.clone(),
-            info.clone(),
-            caps.clone(),
-            wire_tx.clone(),
-            config.heartbeat,
-        ));
+    // One dialler task per address, and pairing adds more. Each is cancelled by its peer being
+    // unpaired, which is why the handles are kept rather than detached and forgotten.
+    let mut diallers: HashMap<String, tokio::task::JoinHandle<()>> = HashMap::new();
+    // A macro rather than a closure: a closure would have to borrow `caps`, which the loop below
+    // also assigns to when the host reports its projects, and the borrow checker is right to
+    // object. Everything here is cloned at spawn time anyway.
+    macro_rules! start_dialling {
+        ($peer:expr) => {{
+            let peer: PeerAddress = $peer;
+            if !diallers.contains_key(&peer.addr) {
+                let addr = peer.addr.clone();
+                let handle = tokio::spawn(keep_dialled(
+                    peer,
+                    identity.clone(),
+                    allowed.clone(),
+                    info.clone(),
+                    caps.clone(),
+                    wire_tx.clone(),
+                    config.heartbeat,
+                ));
+                diallers.insert(addr, handle);
+            }
+        }};
+    }
+    for peer in config.peers.clone() {
+        start_dialling!(peer);
     }
 
     let mut peers: HashMap<NodeId, Connected> = HashMap::new();
@@ -241,6 +282,39 @@ async fn run(
                         }
                     }
                     SwarmRequest::Projects { projects } => caps.projects = projects,
+                    SwarmRequest::Pair { id, name, addr } => {
+                        allowed.add(id.clone(), crate::allow::Peer {
+                            name,
+                            addr: addr.clone(),
+                            source: crate::allow::Source::Paired,
+                        });
+                        // Only dial if we were told where. A machine that dialled us will dial
+                        // again on its own schedule, and inventing an address for it would mean
+                        // connecting to whatever else is on that host and port.
+                        if let Some(addr) = addr {
+                            start_dialling!(PeerAddress { addr, expect: Some(id) });
+                        }
+                    }
+                    SwarmRequest::Unpair { id } => {
+                        let addr = allowed.get(&id).and_then(|p| p.addr);
+                        let _ = allowed.remove(&id);
+                        if let Some(addr) = addr
+                            && let Some(task) = diallers.remove(&addr)
+                        {
+                            // Stop reconnecting to a machine we have just stopped trusting.
+                            // Without this it would keep dialling and keep being refused, for ever.
+                            task.abort();
+                        }
+                        if let Some(p) = peers.remove(&id) {
+                            let _ = p.out.send(AscpMessage::Goodbye {
+                                message: Some("no longer paired".into()),
+                            });
+                            let _ = events.send(SwarmEvent::PeerDown {
+                                node: id,
+                                reason: "unpaired".into(),
+                            });
+                        }
+                    }
                     SwarmRequest::Command { node, id, session, command } => {
                         match peers.get(&node) {
                             Some(p) => {
@@ -332,6 +406,9 @@ async fn run(
                         watching: Default::default(),
                     });
                     let _ = events.send(SwarmEvent::PeerUp { node: peer_info, capabilities });
+                }
+                Wire::Stranger { node, dialled } => {
+                    let _ = events.send(SwarmEvent::Stranger { node, dialled });
                 }
                 Wire::Down { node, reason } => {
                     // Only if this *is* the connection we are using. The losing half of a
@@ -449,18 +526,24 @@ fn merge(mine: &mut Vec<AgentSummary>, agents: &[AgentSummary], gone: &[SessionI
 async fn listen(
     sock: TcpListener,
     identity: Arc<Identity>,
+    allowed: Allowed,
     info: NodeInfo,
     caps: NodeCapabilities,
     wire: mpsc::UnboundedSender<Wire>,
 ) {
     loop {
         let Ok((stream, addr)) = sock.accept().await else { continue };
-        let (identity, info, caps, wire) =
-            (identity.clone(), info.clone(), caps.clone(), wire.clone());
+        let (identity, allowed, info, caps, wire) =
+            (identity.clone(), allowed.clone(), info.clone(), caps.clone(), wire.clone());
         tokio::spawn(async move {
             let mut stream = stream;
-            match accept(&mut stream, &identity, &info, &caps).await {
+            match accept(&mut stream, &identity, &allowed, &info, &caps).await {
                 Ok(peer) => serve(stream, peer, wire, false).await,
+                // A machine that proved itself and is not on the list is somebody asking to pair,
+                // not an error. It reaches the host, which can offer to add it.
+                Err(crate::SwarmError::Stranger(s)) => {
+                    let _ = wire.send(Wire::Stranger { node: s.node, dialled: false });
+                }
                 // At `debug`, not `warn`: on a network anybody can reach, a refused handshake is
                 // the system working. A `warn` per port scan is a log nobody reads.
                 Err(e) => tracing::debug!(%addr, "swarm refused an inbound connection: {e}"),
@@ -473,6 +556,7 @@ async fn listen(
 async fn keep_dialled(
     peer: PeerAddress,
     identity: Arc<Identity>,
+    allowed: Allowed,
     info: NodeInfo,
     caps: NodeCapabilities,
     wire: mpsc::UnboundedSender<Wire>,
@@ -480,7 +564,7 @@ async fn keep_dialled(
 ) {
     loop {
         match TcpStream::connect(&peer.addr).await {
-            Ok(mut stream) => match dial(&mut stream, &identity, &info, &caps).await {
+            Ok(mut stream) => match dial(&mut stream, &identity, &allowed, &info, &caps).await {
                 Ok(found) => {
                     // The address said one machine and another answered. Worth refusing rather
                     // than accepting quietly: the allow-list would let it through, and "my laptop
@@ -498,6 +582,11 @@ async fn keep_dialled(
                     } else {
                         serve(stream, found, wire.clone(), true).await;
                     }
+                }
+                Err(crate::SwarmError::Stranger(s)) => {
+                    // We dialled an address and something genuine answered that we have not paired
+                    // with. This is what "add a computer" is waiting for.
+                    let _ = wire.send(Wire::Stranger { node: s.node, dialled: true });
                 }
                 Err(e) => tracing::debug!(addr = %peer.addr, "swarm handshake failed: {e}"),
             },
@@ -534,16 +623,41 @@ async fn serve(
         let _ = write.shutdown().await;
     });
 
-    let _ = wire.send(Wire::Up {
-        info: peer.node,
-        capabilities: peer.capabilities,
-        out: out_tx,
-        dialled,
-    });
+    // The listener has decided — it checked the list before returning — so it is connected now.
+    //
+    // The dialler has not. It finished *its* half: it verified the peer and found it on its own
+    // list, and sent a proof the peer has not yet judged. If the peer does not have *us* on its
+    // list, it hangs up a moment later. Announcing a connection at this point produces "linux-box
+    // joined the swarm" immediately followed by "lost linux-box" every time pairing is half done,
+    // which is exactly when a person most needs to be told something true.
+    //
+    // So a dialler waits for one message. The listener's node sends a full inventory the instant it
+    // accepts, so a real connection announces itself within a round trip, and a refused one never
+    // announces at all.
+    let mut announced = if dialled {
+        None
+    } else {
+        let _ = wire.send(Wire::Up {
+            info: peer.node.clone(),
+            capabilities: peer.capabilities.clone(),
+            out: out_tx.clone(),
+            dialled,
+        });
+        Some(())
+    };
 
     let reason = loop {
         match read_message(&mut read).await {
             Ok(Some(message)) => {
+                if announced.is_none() {
+                    let _ = wire.send(Wire::Up {
+                        info: peer.node.clone(),
+                        capabilities: peer.capabilities.clone(),
+                        out: out_tx.clone(),
+                        dialled,
+                    });
+                    announced = Some(());
+                }
                 if wire.send(Wire::Message { node: id.clone(), message }).is_err() {
                     break "the swarm stopped".to_string();
                 }
@@ -552,6 +666,12 @@ async fn serve(
             Err(e) => break format!("{e}"),
         }
     };
+    // Nothing to report down if nothing was ever reported up: a dialler the far end refused is a
+    // stranger, which was already said, not a peer that went away.
+    if announced.is_none() {
+        writer.abort();
+        return;
+    }
     writer.abort();
     let _ = wire.send(Wire::Down { node: Some(id), reason });
 }

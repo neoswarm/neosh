@@ -66,6 +66,14 @@ per decision, and records the *reasoning*, not the choice.
   key in a panel is an ordinary binding pointed at a named command, so `F1` lists it and `init.ts`
   can move it; a `switch` on `KeyContext` inside a plugin is the thing this replaced. Keep the
   capture, but only as a sink for keys nothing claimed. See ADR 0040.
+- **Pairing is a decision each machine makes, and neither of them restarts.** A node presents its
+  identity to anyone who connects — as an SSH server presents a host key — so adding a computer is
+  typing an address and being shown a name and a fingerprint that came from the far end. The other
+  machine is then told somebody is asking. Paired machines go in `$STATE`, never in the user's
+  `config.toml`, and a `[[swarm.peers]]` entry written by hand is not the UI's to remove. A dialler
+  does not announce a connection until the peer has sent it something: it sends the last message of
+  the handshake and cannot tell whether the far end approved, so announcing there says "joined" and
+  then "lost" every time pairing is half done.
 - **An agent belongs to the machine it was started on.** ASCP moves *descriptions* of agents and
   *requests* to their owners, never the agent: its files, shell and credentials are there, and a
   conversation that could migrate is one whose `cwd` means something else afterwards. The owner may
@@ -197,6 +205,7 @@ registry — this table is what ships.
 | `⌥↑` `⌥↓` | One rung up or down the capability ladder, same provider |
 | `⇧⇥` | Permission mode — full access to start with, then ask, allow-listed, deny. Belongs to this conversation, saved with it, and takes effect on the turn that is running |
 | `^T` | Projects and conversations. Switching is never refused — turns keep running where they are |
+| `^J` | The computers in this workspace. Add one by its address, allow one that is asking, or open what it is running |
 | `^F` | What you have archived. Filter it, put one back, or finally throw it away |
 | `^N` | New conversation. In a repository it asks where: here, a new worktree, an existing one, elsewhere |
 | `^O` | Add a project |

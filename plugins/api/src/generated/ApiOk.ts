@@ -23,6 +23,7 @@ import type { SessionInfo } from "./SessionInfo";
 import type { SurfaceId } from "./SurfaceId";
 import type { SwarmAgent } from "./SwarmAgent";
 import type { SwarmNode } from "./SwarmNode";
+import type { SwarmStranger } from "./SwarmStranger";
 import type { ToolDef } from "./ToolDef";
 import type { Viewport } from "./Viewport";
 import type { WindowId } from "./WindowId";
@@ -78,4 +79,5 @@ export type ApiOk =
   | { "ok": "windows"; windows: Array<WindowInfo> }
   | { "ok": "swarm_self"; node: NodeInfo | null }
   | { "ok": "swarm_nodes"; nodes: Array<SwarmNode> }
-  | { "ok": "swarm_agents"; agents: Array<SwarmAgent> };
+  | { "ok": "swarm_agents"; agents: Array<SwarmAgent> }
+  | { "ok": "swarm_strangers"; strangers: Array<SwarmStranger> };

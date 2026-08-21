@@ -308,6 +308,24 @@ export interface PickerItem<T> {
   detail?: string;
   /** Extra text the filter should match but that is not shown. */
   keywords?: string;
+  /**
+   * One column of glyph before the label, coloured by `hl`.
+   *
+   * What it is for is telling *kinds* of row apart at a glance — a branch from a machine from a
+   * directory — in a list where the labels alone read as one undifferentiated column. A picker
+   * where only some rows have one still aligns: the ones without get the same gutter, so the
+   * labels line up and the icons read as a column rather than as ragged punctuation.
+   *
+   * **One column.** The runtime cannot measure display width — only `neosh-tui` can — so a
+   * two-column emoji here shifts that row's label right by one. Highlighting stays correct
+   * regardless, because every offset is computed in bytes from the text actually written.
+   */
+  icon?: string;
+  /**
+   * The highlight group for `icon`. A palette name — `Git.Branch`, `Diagnostic.Ok`,
+   * `Sidebar.Remote` — never a colour, so a row follows the theme like everything else.
+   */
+  hl?: string;
   value: T;
 }
 
@@ -574,10 +592,16 @@ export async function picker<T>(
     if (window.length === 0) {
       lines.push(`  ${opts.placeholder ?? "no matches"}`);
     }
+    // One gutter for the whole list, or none at all. Giving it only to the rows that asked for an
+    // icon would step every other label one column left, which reads as a list that cannot decide
+    // where its left margin is.
+    const gutter = window.some((r) => r.item.icon) ? 2 : 0;
+    const iconFor = (item: PickerItem<T>) =>
+      gutter === 0 ? "" : item.icon ? `${item.icon} ` : "  ";
     for (const row of window) {
       const mark = row.index === visible[cursor]?.index ? "❯ " : "  ";
       const detail = row.item.detail ? `  ${row.item.detail}` : "";
-      lines.push(`${mark}${row.item.label}${detail}`);
+      lines.push(`${mark}${iconFor(row.item)}${row.item.label}${detail}`);
     }
     // Pushed onto the last row rather than floated: the float is sized for it, and a strip that
     // moved up as the list shortened would be a strip you have to look for.
@@ -613,7 +637,17 @@ export async function picker<T>(
       if (isCursor) {
         await neosh.ns.mark(ns, buf, line, 0, { hlGroup: "Picker.Selected", endCol: eol });
       }
-      const prefix = byteLength(isCursor ? CURSOR_MARKER : BLANK_MARKER);
+      const icon = iconFor(row.item);
+      const marker = byteLength(isCursor ? CURSOR_MARKER : BLANK_MARKER);
+      // The icon is painted before the match runs, and at no priority: a match highlight over the
+      // label is the thing the eye is looking for, and nothing here should be able to outrank it.
+      if (row.item.icon && row.item.hl) {
+        await neosh.ns.mark(ns, buf, line, marker, {
+          hlGroup: row.item.hl,
+          endCol: marker + byteLength(row.item.icon),
+        });
+      }
+      const prefix = marker + byteLength(icon);
       const offsets = byteOffsets(row.item.label);
       for (const at of row.positions) {
         const start = offsets[at];

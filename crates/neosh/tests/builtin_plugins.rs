@@ -1809,6 +1809,72 @@ fn a_worktree_is_listed_by_its_repository_and_branch() {
     );
 }
 
+/// No questions at all. A branch named before the work is a decision made at the worst possible
+/// moment, and needing to make it is what stops people reaching for a clean tree in the first
+/// place.
+///
+/// The generated name has to be a *name* — two words you can say out loud and find again in a list
+/// of eight of them — which is why this asserts the shape rather than merely that a directory
+/// appeared: `wt-3` and a timestamp would both pass "it exists".
+#[test]
+fn a_worktree_can_be_had_without_answering_anything() {
+    let sb = Sandbox::new("wtauto");
+    sb.git_init();
+    let root = sb.root.join("trees");
+    sb.write_config(&format!("[options]\n\"worktree.root\" = \"{}\"\n", root.display()));
+    let mut s = sb.start_letting_config_choose();
+    s.wait_for("PROJECTS");
+
+    s.send(&command("git.worktree.new.auto"));
+
+    let under = root.join("work");
+    assert!(
+        s.pump(|_| std::fs::read_dir(&under).is_ok_and(|d| d.count() > 0)),
+        "a worktree appeared under {} with nothing asked",
+        under.display()
+    );
+    assert!(s.prompt_now().is_empty(), "and no field was opened\n{:?}", s.prompt_now());
+
+    let made = std::fs::read_dir(&under)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .next()
+        .expect("one worktree");
+    let words: Vec<&str> = made.split('-').collect();
+    assert!(
+        words.len() >= 2 && words.iter().all(|w| w.len() > 2 && w.chars().all(|c| c.is_ascii_lowercase())),
+        "it is words rather than an identifier: {made}"
+    );
+    assert!(
+        s.pump(|s| s.chat_now().iter().any(|l| l.contains(&made))),
+        "and the conversation landed in it\n{:?}",
+        s.chat_now()
+    );
+}
+
+/// `n` in the panel asks the same question `^N` does.
+///
+/// They used to differ: `^N` opened the picker and `n` created one outright. One letter and a
+/// modifier apart, doing visibly different things, which makes "which one did I want" a thing you
+/// can only answer by having already been surprised once.
+#[test]
+fn the_panel_key_for_a_new_conversation_asks_what_the_chat_key_asks() {
+    let sb = Sandbox::new("panelnew");
+    sb.git_init();
+    let mut s = sb.start();
+    s.wait_for("PROJECTS");
+    s.enter_panel();
+    s.key("n");
+    assert!(
+        s.pump(|s| !s.picker_named("[New conversation]").is_empty()),
+        "the same picker\n{:?}",
+        s.sidebar_now()
+    );
+    let rows = s.picker_named("[New conversation]");
+    assert!(rows.iter().any(|l| l.contains("Here")), "with Here first\n{rows:?}");
+}
+
 /// One question. The location is a setting; asking again is asking somebody to repeat themselves.
 #[test]
 fn making_a_worktree_asks_only_for_the_branch() {

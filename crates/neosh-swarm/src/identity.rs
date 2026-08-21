@@ -5,12 +5,11 @@
 //! run, because for a workspace that is one person's several computers a CA is infrastructure in
 //! exchange for nothing.
 //!
-//! Authorisation is a list you wrote. A peer whose id is not in it is refused at the handshake,
-//! before it can say anything else. That is the whole of the access control, and it is deliberately
-//! the kind you can read: the file is a list of hex keys with names beside them, and taking a
-//! machine out of the swarm is deleting a line.
+//! Authorisation lives next door in [`crate::allow`], not here. The two have different lifetimes: a
+//! keypair is decided once and never changes, while the list of machines you work with changes
+//! while you are sitting there. Keeping them together meant the list was as immutable as the key,
+//! which is why adding a computer used to need a restart.
 
-use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
@@ -22,12 +21,6 @@ use crate::SwarmError;
 pub struct Identity {
     signing: SigningKey,
     id: NodeId,
-    /// Authorised peers, by id, with whatever the user called them.
-    ///
-    /// A `BTreeMap` so the file round-trips in a stable order — a list of machines that reshuffles
-    /// itself on every write is one you cannot usefully keep in version control, and people do keep
-    /// this sort of file in version control.
-    allowed: BTreeMap<NodeId, String>,
 }
 
 impl std::fmt::Debug for Identity {
@@ -37,10 +30,7 @@ impl std::fmt::Debug for Identity {
     /// `tracing::debug!` later the private key is in a log file. The type refusing to print it is
     /// the only version of this rule that survives contact with the rest of the program.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Identity")
-            .field("id", &self.id)
-            .field("allowed", &self.allowed.len())
-            .finish_non_exhaustive()
+        f.debug_struct("Identity").field("id", &self.id).finish_non_exhaustive()
     }
 }
 
@@ -88,32 +78,11 @@ impl Identity {
 
     fn from_signing(signing: SigningKey) -> Self {
         let id = NodeId(hex::encode(signing.verifying_key().to_bytes()));
-        Self { signing, id, allowed: BTreeMap::new() }
+        Self { signing, id }
     }
 
     pub fn id(&self) -> &NodeId {
         &self.id
-    }
-
-    /// Authorise a peer. Replaces the name if it was already there.
-    pub fn allow(&mut self, id: NodeId, name: impl Into<String>) {
-        self.allowed.insert(id, name.into());
-    }
-
-    pub fn revoke(&mut self, id: &NodeId) -> bool {
-        self.allowed.remove(id).is_some()
-    }
-
-    pub fn allowed(&self) -> impl Iterator<Item = (&NodeId, &str)> {
-        self.allowed.iter().map(|(k, v)| (k, v.as_str()))
-    }
-
-    /// Whether a peer may connect.
-    ///
-    /// A node always accepts itself, which is what makes "two neosh processes on one machine" a
-    /// thing you can test with rather than a special case in the transport.
-    pub fn accepts(&self, id: &NodeId) -> bool {
-        id == &self.id || self.allowed.contains_key(id)
     }
 
     pub fn sign(&self, message: &[u8]) -> String {
@@ -208,26 +177,6 @@ mod tests {
         let sig = them.sign(b"hello");
         assert!(!verify(me.id(), b"hello", &sig));
         assert!(verify(them.id(), b"hello", &sig));
-    }
-
-    /// The list is the whole of the access control, so "not on it" has to mean "no".
-    #[test]
-    fn a_peer_is_refused_until_it_is_on_the_list() {
-        let mut me = Identity::ephemeral();
-        let them = Identity::ephemeral();
-        assert!(!me.accepts(them.id()));
-        me.allow(them.id().clone(), "linux-box");
-        assert!(me.accepts(them.id()));
-        assert!(me.revoke(them.id()));
-        assert!(!me.accepts(them.id()));
-    }
-
-    /// Otherwise a second neosh on the same machine is a special case in the transport rather than
-    /// the obvious thing to test against.
-    #[test]
-    fn a_node_always_accepts_itself() {
-        let me = Identity::ephemeral();
-        assert!(me.accepts(me.id()));
     }
 
     /// Garbage in the id must be a "no", not a panic: the id arrives from the network.

@@ -160,7 +160,7 @@ impl Editor {
                 | ApiCall::PathComplete { .. }
                 | ApiCall::GitStatus
                 | ApiCall::GitBranches { .. }
-                | ApiCall::GitWorktrees
+                | ApiCall::GitWorktrees { .. }
                 | ApiCall::GitLog { .. }
                 | ApiCall::GitDiff { .. }
                 | ApiCall::GitDefaultBranch
@@ -207,6 +207,10 @@ impl Editor {
                 | ApiCall::SwarmCommand { .. }
                 | ApiCall::SwarmSubscribe { .. }
                 | ApiCall::SwarmUnsubscribe { .. }
+                | ApiCall::SwarmProbe { .. }
+                | ApiCall::SwarmPair { .. }
+                | ApiCall::SwarmUnpair { .. }
+                | ApiCall::SwarmStrangers
         )
     }
 
@@ -1199,7 +1203,7 @@ fn call_name(call: &ApiCall) -> &'static str {
         ApiCall::RtpList => "rtp.list",
         ApiCall::GitStatus => "git.status",
         ApiCall::GitBranches { .. } => "git.branches",
-        ApiCall::GitWorktrees => "git.worktrees",
+        ApiCall::GitWorktrees { .. } => "git.worktrees",
         ApiCall::GitLog { .. } => "git.log",
         ApiCall::GitDiff { .. } => "git.diff",
         ApiCall::GitDefaultBranch => "git.defaultBranch",
