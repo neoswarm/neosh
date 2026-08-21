@@ -322,6 +322,13 @@ pub struct Host {
     /// Commands sent to peers that have not been answered yet, and who to settle when they are.
     swarm_pending: std::collections::HashMap<String, (PluginId, RequestId)>,
     swarm_next_command: u64,
+    /// Local conversations somebody on another machine is watching.
+    ///
+    /// Kept so the turn path can ask "is anyone looking" with a hash lookup rather than building a
+    /// wire event per token and handing it to the swarm to throw away. On a workspace nobody is
+    /// watching — which is most of them, most of the time — streaming costs one set lookup per
+    /// token and nothing else.
+    swarm_watched: std::collections::HashSet<neosh_proto::SessionId>,
     /// The node's events, held here between construction and the loop taking them.
     swarm_events: Option<tokio::sync::mpsc::UnboundedReceiver<neosh_swarm::SwarmEvent>>,
     /// Repositories by directory, discovered on demand.
@@ -665,6 +672,7 @@ impl Host {
             swarm_node: None,
             swarm_pending: Default::default(),
             swarm_next_command: 0,
+            swarm_watched: Default::default(),
             swarm_events: None,
             repos: Default::default(),
             cwd: std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
@@ -1484,6 +1492,21 @@ impl Host {
         });
     }
 
+    /// Send one event to whoever is watching this conversation.
+    ///
+    /// The node drops it if nobody is; the set here is the cheaper half of the same question, asked
+    /// before the event is built.
+    fn stream_out(&self, session: &neosh_proto::SessionId, event: neosh_proto::StreamEvent) {
+        if let Some(h) = &self.swarm_node {
+            h.send(neosh_swarm::SwarmRequest::Stream { session: session.clone(), event });
+        }
+    }
+
+    /// Whether anything would come of streaming this conversation.
+    fn watched(&self, session: &neosh_proto::SessionId) -> bool {
+        self.swarm_node.is_some() && self.swarm_watched.contains(session)
+    }
+
     /// Everything this machine is running, as the wire describes it.
     ///
     /// Recomputed whole rather than tracked incrementally. A workspace has tens of conversations,
@@ -1612,7 +1635,27 @@ impl Host {
                 };
                 self.on_swarm_reply(&id, ok, message);
             }
-            E::Subscribed { .. } | E::Unsubscribed { .. } => {}
+            E::Subscribed { session, .. } => {
+                let fresh = self.swarm_watched.insert(session.clone());
+                // Everything said so far, once. A watcher that only received deltas would show an
+                // empty conversation until the next token — which for an idle agent is never.
+                if fresh {
+                    let messages = self
+                        .agent
+                        .sessions()
+                        .get(&session)
+                        .map(|s| s.messages.clone())
+                        .unwrap_or_default();
+                    self.stream_out(&session, neosh_proto::StreamEvent::History { messages });
+                }
+            }
+            E::Unsubscribed { session, .. } => {
+                // Not removed from the set: another peer may still be watching, and the node knows
+                // who wants what. Cleared when nobody does, which the node cannot tell us without a
+                // count — so this errs towards sending events nobody reads rather than towards a
+                // conversation that silently stops streaming.
+                let _ = session;
+            }
             E::Command { node, id, session, command } => {
                 self.run_swarm_command(node, id, session, command);
             }
@@ -1665,11 +1708,49 @@ impl Host {
                 self.publish_inventory();
                 Ok(None)
             }
-            // Declared in the protocol and not yet carried out here. Refusing by name is the
-            // honest answer: a silent success would be a remote machine believing it had changed
-            // a model or approved a call when it had not.
-            C::SetModel { .. } | C::Approve { .. } => Err(neosh_proto::Refusal::NotPermitted {
-                what: "not implemented on this node yet".into(),
+            C::SetModel { instance, model } => {
+                let selection = neosh_proto::ModelSelection {
+                    instance: neosh_proto::InstanceId(instance),
+                    model: neosh_proto::ModelId(model),
+                    // Not carried across. Reasoning effort and the rest are per-model settings the
+                    // far end chose against *its* catalogue, and applying them to a model this
+                    // machine resolved separately is how a remote switch quietly changes something
+                    // nobody asked it to.
+                    options: Default::default(),
+                };
+                // Checked here rather than taken on trust: the far end is naming a model from *its*
+                // catalogue, and this machine may not have that provider configured at all. A
+                // selection nothing can resolve would leave the conversation unable to take a turn,
+                // with nothing on screen to say why.
+                if self.agent.providers().resolve(&selection).is_none() {
+                    Err(neosh_proto::Refusal::Failed {
+                        message: format!(
+                            "{}/{} is not a model this machine has",
+                            selection.instance, selection.model
+                        ),
+                    })
+                } else {
+                    if let Some(s) = self.agent.sessions().get_mut(&session) {
+                        s.selection = Some(selection.clone());
+                    }
+                    // A running turn is told, the same as it would be for `^P` here: the agent
+                    // thinks the rest of it with the new model rather than finishing with the old.
+                    for d in &self.agent_drivers {
+                        d.set_model(&session, &selection);
+                    }
+                    self.publish_inventory();
+                    Ok(None)
+                }
+            }
+            // Declared in the protocol and refused by name, because on this host the prompt does
+            // not belong to the host. Approvals are a *blocking plugin hook* — the approvals plugin
+            // owns the question and the answer, and the host has nothing to say yes with. Answering
+            // this properly means a plugin registering as the swarm's approver, which is a surface
+            // that does not exist yet. A silent success would be a remote machine believing it had
+            // authorised a write to this filesystem when it had not, so it says no instead.
+            C::Approve { .. } => Err(neosh_proto::Refusal::NotPermitted {
+                what: "approvals are answered by a plugin on this machine, not over the swarm"
+                    .into(),
             }),
         };
         if let Some(h) = &self.swarm_node {
@@ -4577,6 +4658,15 @@ impl Host {
         let on_screen = &self.active_session() == ev.session();
         match ev {
             AgentEvent::TurnStarted { session, turn } => {
+                // Out to anybody watching from another machine, before the local broadcast: the
+                // two are independent, and a watcher waiting on a plugin round trip would see the
+                // turn start late for no reason.
+                if self.watched(&session) {
+                    self.stream_out(
+                        &session,
+                        neosh_proto::StreamEvent::TurnStarted { turn: turn.0.clone() },
+                    );
+                }
                 self.bridge.broadcast(PluginEvent::TurnStarted { session, turn });
             }
             AgentEvent::Token { session, turn, text } => {
@@ -4589,6 +4679,12 @@ impl Host {
                 if on_screen {
                     self.answer_text(&text);
                 }
+                if self.watched(&session) {
+                    self.stream_out(&session, neosh_proto::StreamEvent::Token {
+                        turn: turn.0.clone(),
+                        text: text.clone(),
+                    });
+                }
                 self.bridge.broadcast(PluginEvent::Token { session, turn, text });
             }
             AgentEvent::Thinking { session, turn, text } => {
@@ -4597,6 +4693,12 @@ impl Host {
                 // working out.
                 if on_screen && self.option_bool("chat.show_thinking") {
                     self.stream_into_chat(Stream::Thinking, &text);
+                }
+                if self.watched(&session) {
+                    self.stream_out(&session, neosh_proto::StreamEvent::Thinking {
+                        turn: turn.0.clone(),
+                        text: text.clone(),
+                    });
                 }
                 self.bridge.broadcast(PluginEvent::ThinkingToken { session, turn, text });
             }
@@ -4671,6 +4773,13 @@ impl Host {
                     s.updated_at = now_secs();
                 }
                 self.persist_sessions();
+                if self.watched(&session) {
+                    self.stream_out(&session, neosh_proto::StreamEvent::TurnEnded {
+                        turn: turn.0.clone(),
+                        stop_reason: stop_reason.clone(),
+                        usage: usage.clone(),
+                    });
+                }
                 self.bridge.broadcast(PluginEvent::TurnEnded {
                     session: session.clone(),
                     turn,
@@ -4702,6 +4811,14 @@ impl Host {
                 }
             }
             AgentEvent::Activity { session, turn, activity } => {
+                // A driver's account of its own loop, carried separately from `Token` here for the
+                // same reason it is locally: it is not a content block. See ADR 0034.
+                if self.watched(&session) {
+                    self.stream_out(&session, neosh_proto::StreamEvent::Activity {
+                        turn: turn.0.clone(),
+                        activity: activity.clone(),
+                    });
+                }
                 self.handle_activity(session, turn, activity, on_screen);
             }
             AgentEvent::Notice { level, text, .. } => self.editor_message(level, text),

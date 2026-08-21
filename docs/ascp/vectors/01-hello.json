@@ -1,0 +1,24 @@
+{
+  "capabilities": {
+    "accepts_approvals": false,
+    "accepts_commands": true,
+    "projects": [
+      {
+        "active": true,
+        "cwd": "/home/me/src/neosh",
+        "key": "git:github.com/neoswarm/neosh",
+        "name": "neosh"
+      }
+    ],
+    "streams": true
+  },
+  "node": {
+    "id": "1f8b7a3c",
+    "name": "mac-studio",
+    "os": "linux",
+    "version": "0.1.0"
+  },
+  "nonce": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "type": "hello",
+  "version": 0
+}

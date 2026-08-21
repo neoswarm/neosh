@@ -1,0 +1,8 @@
+{
+  "id": "c2",
+  "refusal": {
+    "reason": "not_permitted",
+    "what": "this node does not accept that"
+  },
+  "type": "refused"
+}

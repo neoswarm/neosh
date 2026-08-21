@@ -1,0 +1,12 @@
+# input -> ProjectKey
+git@github.com:neoswarm/neosh.git	git:github.com/neoswarm/neosh
+git@github.com:neoswarm/neosh	git:github.com/neoswarm/neosh
+https://github.com/neoswarm/neosh.git	git:github.com/neoswarm/neosh
+https://github.com/neoswarm/neosh	git:github.com/neoswarm/neosh
+https://github.com/neoswarm/neosh/	git:github.com/neoswarm/neosh
+ssh://git@github.com/neoswarm/neosh.git	git:github.com/neoswarm/neosh
+ssh://git@github.com:22/neoswarm/neosh.git	git:github.com/neoswarm/neosh
+https://someone:token@github.com/neoswarm/neosh.git	git:github.com/neoswarm/neosh
+https://example.com/Ann/Repo	git:example.com/Ann/Repo
+https://example.com/ann/repo	git:example.com/ann/repo
+(no remote, dir "neosh")	dir:neosh
