@@ -419,3 +419,93 @@ async fn two_nodes_that_dial_each_other_settle_on_one_connection() {
     .await;
     assert_eq!(seen, 1, "and inventory still flows over whichever half survived");
 }
+
+/// History first, then everything as it happens.
+///
+/// The order is the point: a watcher that received only deltas would show an empty conversation
+/// until the next token, which for an idle agent is never. Subscribing to something nobody is
+/// typing at has to still show you what it said.
+#[tokio::test]
+async fn a_subscriber_is_given_the_conversation_before_the_next_token() {
+    let mut p = pair(true).await;
+    let b_id = wait_for(&mut p.a_rx, |e| match e {
+        SwarmEvent::PeerUp { node, .. } => Some(node.id.clone()),
+        _ => None,
+    })
+    .await;
+
+    let s1 = SessionId("s1".into());
+    p.a.send(SwarmRequest::Subscribe { node: b_id, session: s1.clone() });
+    wait_for(&mut p.b_rx, |e| matches!(e, SwarmEvent::Subscribed { .. }).then_some(())).await;
+
+    // What a host does on being subscribed to: say what has been said.
+    p.b.send(SwarmRequest::Stream {
+        session: s1.clone(),
+        event: StreamEvent::History { messages: Vec::new() },
+    });
+    p.b.send(SwarmRequest::Stream {
+        session: s1.clone(),
+        event: StreamEvent::TurnStarted { turn: "t1".into() },
+    });
+    p.b.send(SwarmRequest::Stream {
+        session: s1.clone(),
+        event: StreamEvent::Token { turn: "t1".into(), text: "hello".into() },
+    });
+
+    let mut order = Vec::new();
+    tokio::time::timeout(PATIENCE, async {
+        while order.len() < 3 {
+            if let Some(SwarmEvent::Stream { event, .. }) = p.a_rx.recv().await {
+                order.push(match event {
+                    StreamEvent::History { .. } => "history",
+                    StreamEvent::TurnStarted { .. } => "started",
+                    StreamEvent::Token { .. } => "token",
+                    _ => "other",
+                });
+            }
+        }
+    })
+    .await
+    .expect("all three arrived");
+    assert_eq!(order, vec!["history", "started", "token"], "and in the order they were sent");
+}
+
+/// Unsubscribing stops it. Otherwise "close the conversation" leaves a machine sending tokens to
+/// somebody who walked away, which is the cost this whole subscription mechanism exists to avoid.
+#[tokio::test]
+async fn unsubscribing_stops_the_stream() {
+    let mut p = pair(true).await;
+    let b_id = wait_for(&mut p.a_rx, |e| match e {
+        SwarmEvent::PeerUp { node, .. } => Some(node.id.clone()),
+        _ => None,
+    })
+    .await;
+    let s1 = SessionId("s1".into());
+
+    p.a.send(SwarmRequest::Subscribe { node: b_id.clone(), session: s1.clone() });
+    wait_for(&mut p.b_rx, |e| matches!(e, SwarmEvent::Subscribed { .. }).then_some(())).await;
+    p.b.send(SwarmRequest::Stream {
+        session: s1.clone(),
+        event: StreamEvent::Token { turn: "t".into(), text: "one".into() },
+    });
+    wait_for(&mut p.a_rx, |e| matches!(e, SwarmEvent::Stream { .. }).then_some(())).await;
+
+    p.a.send(SwarmRequest::Unsubscribe { node: b_id, session: s1.clone() });
+    wait_for(&mut p.b_rx, |e| matches!(e, SwarmEvent::Unsubscribed { .. }).then_some(())).await;
+    p.b.send(SwarmRequest::Stream {
+        session: s1,
+        event: StreamEvent::Token { turn: "t".into(), text: "two".into() },
+    });
+
+    let after = tokio::time::timeout(Duration::from_millis(600), async {
+        loop {
+            match p.a_rx.recv().await {
+                Some(SwarmEvent::Stream { .. }) => return true,
+                Some(_) => continue,
+                None => return false,
+            }
+        }
+    })
+    .await;
+    assert!(after.is_err(), "nothing arrives after unsubscribing");
+}

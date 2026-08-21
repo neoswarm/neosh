@@ -1,0 +1,23 @@
+{
+  "capabilities": {
+    "accepts_approvals": false,
+    "accepts_commands": true,
+    "projects": [
+      {
+        "active": true,
+        "cwd": "/home/me/src/neosh",
+        "key": "git:github.com/neoswarm/neosh",
+        "name": "neosh"
+      }
+    ],
+    "streams": true
+  },
+  "node": {
+    "id": "9e2d4401",
+    "name": "linux-box",
+    "os": "linux",
+    "version": "0.1.0"
+  },
+  "seq": 7,
+  "type": "presence"
+}
