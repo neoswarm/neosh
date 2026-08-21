@@ -123,6 +123,7 @@ fn inst() -> InstanceConfig {
 
 fn req(dir: &std::path::Path) -> TurnRequest {
     TurnRequest {
+        resume: None,
         conversation: SessionId::from("c1"),
         cwd: dir.to_path_buf(),
         selection: ModelSelection {

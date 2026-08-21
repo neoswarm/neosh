@@ -601,7 +601,7 @@ fn a_restored_conversation_still_has_its_tool_cards() {
     s.drain_for(Duration::from_millis(300));
     let now = s.chat_now();
     assert_eq!(
-        now.iter().filter(|l| l.contains("list_dir")).count(),
+        now.iter().filter(|l| l.contains("Read  src")).count(),
         1,
         "the tool it called came back with it\n{now:?}"
     );
@@ -824,7 +824,7 @@ fn coming_back_to_a_running_agent_turn_shows_what_it_has_done() {
     // of that header is read off the result — so a card saying `1 line` is a card whose answer came
     // back with the replay, which is the whole point of this test.
     assert!(
-        now.iter().any(|l| l.contains("list_dir") && l.contains("1 line")),
+        now.iter().any(|l| l.contains("Read  src") && l.contains("1 line")),
         "and the tool it called, with what it came back with\n{now:?}"
     );
     assert!(
@@ -876,7 +876,7 @@ fn a_finished_agent_turn_is_drawn_from_the_conversation_and_not_twice() {
         );
     }
     assert_eq!(
-        now.iter().filter(|l| l.contains("list_dir")).count(),
+        now.iter().filter(|l| l.contains("Read  src")).count(),
         1,
         "and so does the tool it called\n{now:?}"
     );
@@ -1124,9 +1124,10 @@ fn a_call_that_has_not_come_back_says_how_long_it_has_been() {
     // Two ticks of the one-second clock, so the number has moved at least once.
     s.drain_for(Duration::from_millis(2400));
     let rows = s.chat_now();
-    // The card, not the working line under it, which names the tool too.
+    // The card, not the working line under it, which names the tool too. A call still out wears
+    // the one mark a card ever has, so this is also what proves the mark is there while it runs.
     let cards: Vec<&String> =
-        rows.iter().filter(|l| l.starts_with('\u{23fa}') && l.contains("wait_forever")).collect();
+        rows.iter().filter(|l| l.starts_with('\u{25b8}') && l.contains("wait_forever")).collect();
     assert_eq!(cards.len(), 1, "still one card, not one per tick\n{rows:?}");
     let clock = cards[0].rsplit("  ").next().unwrap_or_default();
     assert!(
@@ -1176,7 +1177,7 @@ fn a_round_the_conversation_already_holds_is_not_replayed_on_top_of_itself() {
     );
     assert_eq!(
         // The card, not the working line, which says the same words for as long as the tool runs.
-        now.iter().filter(|l| l.starts_with('\u{23fa}')).count(),
+        now.iter().filter(|l| l.starts_with('\u{25b8}')).count(),
         1,
         "and so is the call it ended on\n{now:?}"
     );

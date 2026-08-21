@@ -192,11 +192,24 @@ pub fn claude_cli_line(v: &Value, state: &mut ClaudeState) -> Vec<ProviderEvent>
             out
         }
         // Whole assistant messages, which `stream_event` has already said everything about — with
-        // one exception. A tool call arrives here with its arguments *complete*, where the stream
+        // two exceptions. A tool call arrives here with its arguments *complete*, where the stream
         // delivers them as JSON fragments that are only parsed at block close. The plan is read out
         // of ordinary tool calls, so this is the copy that can be read without reassembling
         // anything.
-        "assistant" => state.plan.saw_calls(v.get("message").unwrap_or(&Value::Null)),
+        //
+        // The other is a message the CLI wrote itself. `<synthetic>` is its own marker for a
+        // sentence no model produced — the answer to a slash command it handled locally, a refusal,
+        // an explanation of why it did nothing — and those never stream, because there was no
+        // request to stream. Dropping them is how `/compact` on a conversation with nothing to
+        // compact arrived as a question with a blank under it: the CLI said *Error: No messages to
+        // compact*, on this line and nowhere else, and the `result` line that usually rescues an
+        // unsaid turn carried an empty string.
+        "assistant" => {
+            let message = v.get("message").unwrap_or(&Value::Null);
+            let mut out = state.plan.saw_calls(message);
+            out.extend(synthetic_text(message, state));
+            out
+        }
         "system" => system_line(v, state),
         // A `result` with is_error signals the CLI itself failed (auth, spawn, quota).
         "result" if v.get("is_error").and_then(Value::as_bool) == Some(true) => {
@@ -232,6 +245,48 @@ pub fn claude_cli_line(v: &Value, state: &mut ClaudeState) -> Vec<ProviderEvent>
         }
         _ => Vec::new(),
     }
+}
+
+/// The text of a message the CLI wrote itself, as the message it never streamed.
+///
+/// Only for `<synthetic>`, which is the CLI's own word for it. Reading text off *every* whole
+/// assistant message would say each ordinary answer twice, once as it arrived and again when the
+/// message it was assembled from turned up.
+///
+/// `said` is set for the same reason the streamed path sets it: some of these are repeated on the
+/// `result` line, and the fallback there exists to rescue a turn that said nothing — not to say
+/// this one a second time.
+fn synthetic_text(message: &Value, state: &mut ClaudeState) -> Vec<ProviderEvent> {
+    if message.get("model").and_then(Value::as_str) != Some("<synthetic>") {
+        return Vec::new();
+    }
+    let text = message
+        .get("content")
+        .and_then(Value::as_array)
+        .map(|blocks| {
+            blocks
+                .iter()
+                .filter(|b| b.get("type").and_then(Value::as_str) == Some("text"))
+                .filter_map(|b| b.get("text").and_then(Value::as_str))
+                .collect::<Vec<_>>()
+                .join("")
+        })
+        .unwrap_or_default();
+    let text = text.trim();
+    if text.is_empty() {
+        return Vec::new();
+    }
+    state.said = true;
+    // A message of its own, for the reason the `result` fallback opens one: block indices are
+    // unique only within a message, so a bare block 0 lands on top of whatever block 0 the last
+    // message had.
+    vec![
+        ProviderEvent::MessageStart { model: None, usage: Usage::default() },
+        ProviderEvent::BlockStart { index: 0, block: BlockStartKind::Text },
+        ProviderEvent::TextDelta { index: 0, text: text.to_string() },
+        ProviderEvent::BlockStop { index: 0 },
+        ProviderEvent::MessageStop,
+    ]
 }
 
 /// What reading the CLI's stream needs to remember between lines.
@@ -974,6 +1029,63 @@ mod tests {
         assert_eq!(plans[0].len(), 3);
         assert_eq!(plans[0][1].state, PlanState::Active);
         assert_eq!(plans[1].len(), 1, "the newest call is the plan, not an addition to it");
+    }
+
+    /// Recorded from a real `claude --print --input-format stream-json` run: `/compact` on a
+    /// conversation with nothing in it yet. The sentence exists once, on the `assistant` line, and
+    /// the `result` that usually rescues a turn that said nothing carries an empty string.
+    #[test]
+    fn a_sentence_the_cli_wrote_itself_is_said_rather_than_dropped() {
+        let events = cli(&[
+            r#"{"type":"assistant","message":{"id":"6e7aacf5","model":"<synthetic>","role":"assistant","stop_reason":"end_turn","type":"message","content":[{"type":"text","text":"Error: No messages to compact"}]},"parent_tool_use_id":null,"session_id":"s"}"#,
+            r#"{"type":"result","subtype":"success","is_error":false,"num_turns":0,"result":"","session_id":"s"}"#,
+        ]);
+        let text: String = events
+            .iter()
+            .filter_map(|e| match e {
+                ProviderEvent::TextDelta { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            text, "Error: No messages to compact",
+            "without this the turn is a question with a blank under it"
+        );
+    }
+
+    /// The same sentence on both lines, which is the other way the CLI reports one of these.
+    #[test]
+    fn a_sentence_the_cli_repeats_on_the_result_line_is_still_said_once() {
+        let events = cli(&[
+            r#"{"type":"assistant","message":{"model":"<synthetic>","role":"assistant","type":"message","content":[{"type":"text","text":"Not enough messages to compact."}]},"session_id":"s"}"#,
+            r#"{"type":"result","subtype":"success","is_error":false,"result":"Not enough messages to compact.","session_id":"s"}"#,
+        ]);
+        let texts: Vec<&str> = events
+            .iter()
+            .filter_map(|e| match e {
+                ProviderEvent::TextDelta { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(texts, vec!["Not enough messages to compact."]);
+    }
+
+    /// The guard that keeps the above from saying every ordinary answer twice.
+    #[test]
+    fn a_streamed_answer_is_not_repeated_by_the_message_it_came_from() {
+        let events = cli(&[
+            r#"{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"1, 2, 3"}},"session_id":"s"}"#,
+            r#"{"type":"assistant","message":{"model":"claude-opus-5","role":"assistant","type":"message","content":[{"type":"text","text":"1, 2, 3"}]},"session_id":"s"}"#,
+            r#"{"type":"result","subtype":"success","is_error":false,"result":"1, 2, 3","session_id":"s"}"#,
+        ]);
+        let texts: Vec<&str> = events
+            .iter()
+            .filter_map(|e| match e {
+                ProviderEvent::TextDelta { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(texts, vec!["1, 2, 3"], "said as it arrived, and not again afterwards");
     }
 
     #[test]

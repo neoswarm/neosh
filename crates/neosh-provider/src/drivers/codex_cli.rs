@@ -1435,6 +1435,7 @@ mod tests {
         let p = CodexCliProvider::new("definitely-not-a-real-binary-xyzzy");
         assert!(!p.available());
         let req = TurnRequest {
+            resume: None,
             conversation: SessionId::from("test"),
             cwd: std::path::PathBuf::new(),
             selection: ModelSelection {

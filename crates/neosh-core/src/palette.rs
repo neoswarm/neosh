@@ -284,11 +284,11 @@ pub fn groups(variant: Variant) -> Vec<(&'static str, HighlightDef)> {
         ("Agent.Tool", spec(fg(r.active))),
         ("Agent.ToolError", spec(bold(fg(r.danger)))),
         ("Agent.Usage", spec(dim(fg(r.muted)))),
-        // The dot beside a tool call, which is the only place in the transcript that says whether
-        // something is still happening. Pulsing while it runs and settling into a colour when it is
-        // over: a call that stopped moving is a call you can stop watching.
+        // The mark beside a tool call, which appears only when the state is news: while the call
+        // is out, and if it failed. Pulsing while it runs, because a card that stopped moving is a
+        // card you can stop watching — and there is deliberately no group for one that finished,
+        // since a finished call is drawn with no mark at all.
         ("Agent.ToolRunning", spec(pulse(fg(r.attention), 2600))),
-        ("Agent.ToolDone", spec(fg(r.success))),
         ("Agent.ToolFailed", spec(bold(fg(r.danger)))),
         // The subject of a call that has not come back: the command, the path, the query. A sweep
         // rather than the dot's pulse, because this is a *run* of text — a band travelling along
@@ -443,7 +443,11 @@ pub fn groups(variant: Variant) -> Vec<(&'static str, HighlightDef)> {
         ("Composer.Prompt", spec(bold(fg(r.accent)))),
         ("Composer.Placeholder", link("NonText")),
         ("Composer.Hint", link("Comment")),
-        ("Composer.HintKey", spec(fg(r.muted))),
+        // The same group the welcome screen's keys wear, and for the same reason: `Composer.Hint`
+        // is `Comment`, so a key one dim-step brighter than the words around it is a key nobody
+        // sees. `\u{21e7}\u{2191} edit` sat at the end of a queued message and read as the end of the
+        // sentence.
+        ("Composer.HintKey", link("Key")),
         // ---- provider marks -----------------------------------------------
         // One group per vendor, so a provider rail is legible at a glance and a theme can restyle
         // the lot. These are the *only* groups tied to something outside neosh, which is why they
@@ -528,7 +532,6 @@ mod tests {
         let names: BTreeSet<_> = contract().into_iter().collect();
         for required in [
             "Agent.ToolRunning",
-            "Agent.ToolDone",
             "Agent.ToolFailed",
             "Agent.ToolLive",
             "Agent.ToolRead",

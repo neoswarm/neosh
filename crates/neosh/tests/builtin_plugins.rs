@@ -2864,6 +2864,65 @@ export async function activate({ neosh }: PluginContext) {
 }
 "#;
 
+const LOOKER: &str = r#"
+import type { PluginContext } from "@neosh/api";
+
+export async function activate({ neosh }: PluginContext) {
+  const lines = (n: number) => Array.from({ length: n }, (_, i) => `line ${i + 1}`).join("\n");
+  await neosh.tool.register(
+    { name: "look", description: "Read", inputSchema: { type: "object" } },
+    async () => ({ content: lines(9) }),
+  );
+  await neosh.tool.register(
+    { name: "hunt", description: "Grep", inputSchema: { type: "object" } },
+    async () => ({ content: lines(4) }),
+  );
+  await neosh.tool.register(
+    { name: "edit", description: "Edit", inputSchema: { type: "object" } },
+    async () => ({ content: "edited" }),
+  );
+  let turn = 0;
+  await neosh.provider.register("looker", [{
+    id: "looker", driver: "looker", display_name: "Looker",
+    models: [{ id: "looker", display_name: "Looker" }],
+  }], async (_req, emit) => {
+    emit({ type: "message_start", model: "looker", usage: {} });
+    const call = (i: number, name: string, input: unknown) => {
+      emit({ type: "block_start", index: i, block: { kind: "tool_use", id: `t${turn}_${i}`, name } });
+      emit({ type: "tool_input_delta", index: i, partial_json: JSON.stringify(input) });
+      emit({ type: "block_stop", index: i });
+    };
+    turn += 1;
+    if (turn === 1) {
+      call(0, "look", { file_path: "/work/src/one.rs" });
+      call(1, "look", { file_path: "/work/src/two.rs" });
+      call(2, "hunt", { pattern: "fn main", path: "/work/src" });
+      call(3, "edit", { file_path: "/work/src/one.rs", old_string: "a", new_string: "b" });
+      emit({ type: "message_delta", stop_reason: { kind: "tool_use" }, usage: {} });
+      emit({ type: "message_stop" });
+      return;
+    }
+    emit({ type: "block_start", index: 0, block: { kind: "text" } });
+    emit({ type: "text_delta", index: 0, text: "Looked." });
+    emit({ type: "block_stop", index: 0 });
+    emit({ type: "message_delta", stop_reason: { kind: "end_turn" }, usage: {} });
+    emit({ type: "message_stop" });
+  });
+  neosh.notify("looker ready");
+}
+"#;
+
+fn install_looker(sb: &Sandbox) {
+    let dir = sb.root.join("config/plugins/looker");
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    std::fs::write(
+        dir.join("plugin.toml"),
+        "name = \"looker\"\nversion = \"0.1.0\"\nentry = \"main.ts\"\npermissions = [\"providers\", \"tools\"]\n",
+    )
+    .expect("manifest");
+    std::fs::write(dir.join("main.ts"), LOOKER).expect("plugin");
+}
+
 fn install_editor(sb: &Sandbox) {
     let dir = sb.root.join("config/plugins/editor");
     std::fs::create_dir_all(&dir).expect("mkdir");
@@ -2929,16 +2988,16 @@ fn a_question_is_framed_so_you_can_find_where_a_turn_began() {
 
 #[test]
 fn a_tool_call_says_what_it_is_about_not_only_its_name() {
-    // `read_file` tells you nothing you did not already know. `read_file  .env` is the line you
-    // actually wanted, and it costs one lookup in the input the tool was given.
+    // The tool's name tells you nothing you did not already know. `Read  .env` is the line you
+    // actually wanted, and both halves of it cost one lookup in the input the tool was given.
     let sb = Sandbox::new("toolrow");
     let mut s = sb.start();
     s.wait_for("PROJECTS");
     s.key("h");
     s.enter();
     assert!(
-        s.pump(|s| s.chat_now().iter().any(|l| l.contains("read_file") && l.contains(".env"))),
-        "the subject is beside the name\n{:?}",
+        s.pump(|s| s.chat_now().iter().any(|l| l.contains("Read") && l.contains(".env"))),
+        "the subject is beside what was done\n{:?}",
         s.chat_now()
     );
 }
@@ -3935,8 +3994,16 @@ fn what_is_queued_sits_above_the_composer_and_says_how_to_take_it_back() {
         s.composer_chrome()
     );
     assert!(
-        s.composer_chrome().iter().any(|t| t.contains("edit")),
-        "with the key that undoes it\n{:?}",
+        s.composer_chrome().iter().any(|t| t.contains("take back")),
+        "with the key that undoes it, saying what it does rather than naming the operation\n{:?}",
+        s.composer_chrome()
+    );
+    // And the field itself says what `\u{23ce}` does now. "Ask anything" while a turn is running
+    // invites the one thing you cannot do and says nothing about the thing you can, which is how a
+    // sentence disappears into a queue nobody knew was there.
+    assert!(
+        s.composer_chrome().iter().any(|t| t.contains("Steer it")),
+        "and the empty field says what sending does now\n{:?}",
         s.composer_chrome()
     );
     assert!(
@@ -4088,7 +4155,7 @@ fn a_question_gets_a_gap_above_it_and_keeps_its_bar() {
     s.type_text("go");
     s.enter();
     assert!(
-        s.pump(|s| s.chat_now().iter().any(|l| l.contains("read_file"))),
+        s.pump(|s| s.chat_now().iter().any(|l| l.contains("Read  .env"))),
         "the turn ran\n{:?}",
         s.chat_now()
     );
@@ -4131,7 +4198,7 @@ fn a_tool_calls_dot_says_whether_it_is_still_going() {
     assert!(
         s.pump(|s| {
             let rows = s.chat_now();
-            let Some(at) = rows.iter().position(|l| l.contains("read_file  .env")) else {
+            let Some(at) = rows.iter().position(|l| l.contains("Read  .env")) else {
                 return false;
             };
             // Failed, because `.env` is not there — which is the point: the dot reports how it
@@ -4195,14 +4262,16 @@ fn how_much_of_a_tool_result_to_show_is_a_setting() {
         s.chat_now()
     );
     let rows = s.chat_now();
-    assert!(rows.iter().any(|l| l.contains("one")), "the first line is there\n{rows:?}");
-    assert!(rows.iter().any(|l| l.contains("two")), "and the second\n{rows:?}");
+    assert!(rows.iter().any(|l| l.contains("one")), "one line of head is there\n{rows:?}");
+    // Folded from the *middle*: what a command decided is at the end of what it printed, and a
+    // card that keeps the first two lines of `cargo test` keeps `Compiling` and `Finished`.
+    assert!(rows.iter().any(|l| l.contains("five")), "and the line it ended on\n{rows:?}");
     assert!(
         !rows.iter().any(|l| l.contains("three")),
         "and the setting stopped it there\n{rows:?}"
     );
     assert!(
-        rows.iter().any(|l| l.contains("+3 more lines")),
+        rows.iter().any(|l| l.contains("+3 lines")),
         "saying how much was left out, because a result that is silently cut is a result you \
          would believe\n{rows:?}"
     );
@@ -4218,7 +4287,7 @@ fn a_tool_call_says_what_came_back_not_only_that_it_ran() {
     s.type_text("go");
     s.enter();
     assert!(
-        s.pump(|s| s.chat_now().iter().any(|l| l.contains("read_file  .env"))),
+        s.pump(|s| s.chat_now().iter().any(|l| l.contains("Read  .env"))),
         "the call is shown with its subject\n{:?}",
         s.chat_now()
     );
@@ -4232,7 +4301,7 @@ fn a_tool_call_says_what_came_back_not_only_that_it_ran() {
 
 #[test]
 fn an_edit_card_shows_the_change_and_how_much_of_it() {
-    // `⏺ edit(main.rs)` and "edited" underneath says that something happened. The diff says what,
+    // `edit(main.rs)` and "edited" underneath says that something happened. The diff says what,
     // the `+2 -1` says how much, and the row at the end of the turn adds it up — which is the
     // difference between a transcript you can review and one you have to take on trust.
     let sb = Sandbox::new("editcard");
@@ -4250,7 +4319,7 @@ fn an_edit_card_shows_the_change_and_how_much_of_it() {
     let rows = s.chat_now();
     let header = rows
         .iter()
-        .position(|l| l.starts_with('\u{23fa}') && l.contains("edit  ") && l.contains("main.rs"))
+        .position(|l| l.starts_with("  Edited  ") && l.contains("main.rs"))
         .expect("the card's header");
     assert!(
         rows[header].ends_with("+2 -1"),
@@ -4275,6 +4344,90 @@ fn an_edit_card_shows_the_change_and_how_much_of_it() {
 }
 
 #[test]
+fn calls_that_only_looked_at_things_share_one_row_and_open_into_several() {
+    // A turn that reads three files used to be three cards, each with a mark down the left and a
+    // slice of the file under it. What you wanted was the *list of what it looked at*, which is
+    // exactly what those bodies were holding apart. So the run is one row — and the edit that
+    // follows is not part of it, because a diff is an answer and not a name.
+    let sb = Sandbox::new("looks");
+    install_looker(&sb);
+    sb.write_config("[options]\n\"agent.model\" = \"looker/looker\"\n");
+    let mut s = sb.start_letting_config_choose();
+    s.wait_for("looker ready");
+    s.type_text("go");
+    s.enter();
+    assert!(
+        s.pump(|s| {
+            let rows = s.chat_now();
+            rows.iter().any(|l| l.contains("Looked."))
+                && !rows.iter().any(|l| l.contains("esc to interrupt"))
+        }),
+        "the turn finished\n{:?}",
+        s.chat_now()
+    );
+    let rows = s.chat_now();
+    let run = rows
+        .iter()
+        .position(|l| l.starts_with("  Explored  "))
+        .unwrap_or_else(|| panic!("the run is one row\n{rows:?}"));
+    assert_eq!(
+        rows[run], "  Explored  one.rs, two.rs, fn main",
+        "named, shortest first-glance form\n{rows:?}"
+    );
+    assert!(
+        !rows.iter().any(|l| l.contains("line 1")),
+        "and nothing any of them came back with\n{rows:?}"
+    );
+    assert!(
+        !rows.iter().any(|l| l.starts_with('\u{23fa}')),
+        "no card carries the old dot\n{rows:?}"
+    );
+    // The edit is its own card, right under the run, with its diff.
+    assert!(rows[run + 2].starts_with("  Edited  "), "with a row of air between\n{rows:?}");
+    assert!(rows.iter().any(|l| l.ends_with("- a")), "the edit kept its diff\n{rows:?}");
+
+    // Opened, one row per call, with the whole subject and how much came back.
+    s.ctrl("s");
+    s.key("g");
+    s.key("g");
+    for _ in 0..run {
+        s.key("j");
+    }
+    s.special("tab");
+    assert!(
+        s.pump(|s| s.chat_now().iter().any(|l| l.contains("Read  /work/src/one.rs"))),
+        "open, every call is named in full\n{:?}",
+        s.chat_now()
+    );
+    let open = s.chat_now();
+    assert!(open.iter().any(|l| l.contains("Read  /work/src/two.rs  9 lines")), "{open:?}");
+    assert!(open.iter().any(|l| l.contains("Searched  fn main  4 lines")), "{open:?}");
+    assert_eq!(open[run], rows[run], "the header did not move or change\n{open:?}");
+
+    // And the same rows come back after switching away and back, which is the whole reason the
+    // live path and the replay go through one renderer.
+    s.special("esc");
+    let live: Vec<String> = s.chat_now().into_iter().filter(|l| !l.trim().is_empty()).collect();
+    s.send(&command("session.new"));
+    assert!(s.pump(|s| !s.chat_now().iter().any(|l| l.contains("Looked."))), "somewhere else");
+    s.send(&command("session.close"));
+    assert!(
+        s.pump(|s| s.chat_now().iter().any(|l| l.contains("Looked."))),
+        "and back\n{:?}",
+        s.chat_now()
+    );
+    let back = s.chat_now();
+    assert!(
+        back.iter().any(|l| l == "  Explored  one.rs, two.rs, fn main"),
+        "the replay folds the run exactly as the live stream did\nlive: {live:?}\nback: {back:?}"
+    );
+    assert!(
+        !back.iter().any(|l| l.contains("line 1")),
+        "and does not unfold it\n{back:?}"
+    );
+}
+
+#[test]
 fn a_folded_card_opens_with_tab_while_reading_and_folds_again() {
     // A card shows enough to know what happened. The whole of it is one key away, in the place
     // you go to read — and the trailer says which key.
@@ -4291,11 +4444,11 @@ fn a_folded_card_opens_with_tab_while_reading_and_folds_again() {
         s.chat_now()
     );
     let rows = s.chat_now();
-    let trailer = rows.iter().find(|l| l.contains("more lines")).expect("a trailer");
-    assert!(trailer.contains("+6 more lines"), "{trailer}");
+    let trailer = rows.iter().find(|l| l.contains(" lines (")).expect("a trailer");
+    assert!(trailer.contains("+6 lines"), "{trailer}");
     assert!(trailer.contains("^S \u{21e5} to expand"), "it says how: {trailer}");
     assert!(!rows.iter().any(|l| l.ends_with("+ i")), "the end of the diff is folded away\n{rows:?}");
-    let header = rows.iter().position(|l| l.starts_with('\u{23fa}')).expect("the header");
+    let header = rows.iter().position(|l| l.starts_with("  Edited  ")).expect("the header");
 
     // Into the transcript, to the top, and down onto the card.
     s.ctrl("s");
@@ -4311,7 +4464,7 @@ fn a_folded_card_opens_with_tab_while_reading_and_folds_again() {
         s.chat_now()
     );
     let rows = s.chat_now();
-    assert!(!rows.iter().any(|l| l.contains("more lines")), "and nothing is held back\n{rows:?}");
+    assert!(!rows.iter().any(|l| l.contains(" lines (")), "and nothing is held back\n{rows:?}");
     assert!(
         rows.iter().position(|l| l.contains("changed 1 file")).unwrap() > header,
         "what was below the card is still below it\n{rows:?}"
@@ -4319,7 +4472,7 @@ fn a_folded_card_opens_with_tab_while_reading_and_folds_again() {
 
     s.special("tab");
     assert!(
-        s.pump(|s| s.chat_now().iter().any(|l| l.contains("+6 more lines"))),
+        s.pump(|s| s.chat_now().iter().any(|l| l.contains("+6 lines"))),
         "and it folds again\n{:?}",
         s.chat_now()
     );

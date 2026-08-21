@@ -49,6 +49,11 @@ pub struct Session {
     /// has chosen one here and the configured default applies, which is what makes changing that
     /// default in `config.toml` reach every conversation that has not overridden it.
     pub permission_mode: Option<PermissionMode>,
+    /// What the driver calls this conversation, kept so a later process can pick it up.
+    ///
+    /// See [`neosh_proto::TurnRequest::resume`]. Held here rather than in the driver because the
+    /// driver is a process and this is not: the whole point of the value is that it survives one.
+    pub resume: Option<String>,
 }
 
 impl Session {
@@ -71,6 +76,7 @@ impl Session {
             archived: false,
             archived_at: None,
             permission_mode: None,
+            resume: None,
         }
     }
 

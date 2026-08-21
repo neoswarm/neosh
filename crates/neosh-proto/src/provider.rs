@@ -593,6 +593,22 @@ pub struct TurnRequest {
     #[serde(default)]
     #[ts(type = "string")]
     pub cwd: std::path::PathBuf,
+    /// What the driver called this conversation last time, if it named it.
+    ///
+    /// A vendor CLI keeps the history on its side and hands back a handle — `claude`'s session id,
+    /// ACP's session, `codex`'s conversation. A driver that only remembers that handle in its own
+    /// process remembers it exactly as long as the workspace lives: restart, reopen a conversation
+    /// with a hundred messages in it, and the agent is started fresh and told only the newest one.
+    /// The transcript looks full and the model has never heard of any of it, which is not a thing
+    /// either side reports as an error — it is simply an agent that has forgotten, and the first
+    /// visible sign of it is `/compact` finishing instantly with nothing to compact.
+    ///
+    /// So the handle belongs to the conversation, which is the thing that outlives the process.
+    /// The driver hands it over with [`Activity::Resume`] and is given it back here. `None` means
+    /// this conversation has never been run by this driver, which is the only case where starting
+    /// fresh is right.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resume: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub system: Option<String>,
     pub messages: Vec<Message>,
@@ -726,6 +742,13 @@ pub enum Activity {
     },
     /// What this driver accepts as a slash command, learned at handshake.
     Commands { commands: Vec<DriverCommand> },
+    /// The driver's own name for this conversation, which it wants back next time.
+    ///
+    /// Said whenever it changes, which for a vendor CLI is on the first line of the first turn a
+    /// process produces. The receiver's job is to *keep* it: see [`TurnRequest::resume`] for what
+    /// forgetting it costs. It is an account of the driver's loop rather than a content block, and
+    /// like everything else here `TurnAssembler` never reads it.
+    Resume { token: String },
     /// How full the context window is, as of now.
     Context {
         #[ts(type = "number")]

@@ -61,4 +61,5 @@ export type Activity =
   | { "kind": "compacting" }
   | { "kind": "compacted"; before?: number | null; after?: number | null }
   | { "kind": "commands"; commands: Array<DriverCommand> }
+  | { "kind": "resume"; token: string }
   | { "kind": "context"; used: number; total: number };

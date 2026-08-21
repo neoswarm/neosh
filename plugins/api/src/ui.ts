@@ -336,8 +336,17 @@ export interface PickerOptions<T> {
    * cannot make the list flicker backwards.
    */
   source?(query: string): Promise<PickerItem<T>[]>;
-  /** What the filter starts with. */
-  query?: string;
+  /**
+   * What the filter starts with.
+   *
+   * A function is asked at the last possible moment — once the picker is on screen and holds the
+   * keyboard — rather than when it was called. That matters for anything completing a field that
+   * is still being typed into: opening this takes several round-trips, every keystroke in that
+   * window goes to the field, and a picker seeded with what was there *before* them shows an
+   * unfiltered list with the wrong row under the accept key. Typing `/compact` quickly and
+   * pressing `↵` ran the first command in the list, which was not `compact`.
+   */
+  query?: string | (() => string);
   /**
    * Whether there is a filter line at all. On by default.
    *
@@ -479,7 +488,7 @@ export async function picker<T>(
     z: 200,
   });
 
-  let query = opts.query ?? "";
+  let query = typeof opts.query === "string" ? opts.query : "";
   let cursor = Math.min(Math.max(0, opts.selected ?? 0), Math.max(0, items.length - 1));
   let visible = items.map((item, index) => ({ item, index, positions: [] as number[] }));
   let top = 0;
@@ -777,6 +786,10 @@ export async function picker<T>(
   // is on screen — the one moment the user obviously meant "close this". A window-scoped binding
   // outranks the global one and is dropped with the window.
   await bindWidgetKeys(neosh, win, command, keys, opts.ownKeys ?? []);
+  // Now, and not before: everything typed while this was being built went somewhere, and if it
+  // went into the field this is completing then it is part of the query. Asked after the keyboard
+  // is ours, so there is no further keystroke to miss.
+  if (typeof opts.query === "function") query = opts.query();
   await refetch();
   await render();
   if (opts.onHighlight) {

@@ -524,6 +524,77 @@ fn a_capital_in_the_query_makes_the_search_case_sensitive() {
 /// under the composer says what they are — whatever `ui.hints` is set to, since that setting is
 /// about the *typing* shortcuts and this is not typing.
 #[test]
+fn a_chord_while_reading_is_not_the_letter_it_is_made_of() {
+    // Two ways a reading key was quietly taken. `^D` is bound to `git.diff` in `chat` mode, and
+    // reading's keys arrive only through the *unbound* path — so it opened a diff instead of
+    // moving half a screen. And `^B` did reach `reading_key`, but was matched by the `b` arm of
+    // the motion table on the way past, so it moved a word left. Half of a documented vim
+    // vocabulary, taken by a plugin and by a letter.
+    let sb = Sandbox::new("chords");
+    let mut s = sb.start();
+    s.answered_and_reading();
+    s.to_top();
+
+    // Down half a screen. The transcript is longer than the window, so the row has to change.
+    s.press(json!({"kind": "char", "c": "d"}), &["ctrl"]);
+    assert!(
+        s.pump(|s| s.chat_cursor().is_some_and(|r| r > 0)),
+        "^D moved rather than opening a diff\n{:?}",
+        s.messages()
+    );
+    let down = s.chat_cursor().unwrap_or(0);
+
+    // Back a screen — not a word left, which would leave the cursor on the same row.
+    s.press(json!({"kind": "char", "c": "b"}), &["ctrl"]);
+    assert!(
+        s.pump(|s| s.chat_cursor().is_some_and(|r| r < down)),
+        "^B went back a screen rather than a word\n{down} -> {:?}",
+        s.chat_cursor()
+    );
+
+    // And `^Y`, whose letter is the yank prefix, is a line up rather than a pending operator.
+    s.press(json!({"kind": "char", "c": "d"}), &["ctrl"]);
+    assert!(s.pump(|s| s.chat_cursor().is_some_and(|r| r > 0)), "somewhere with room above");
+    let at = s.chat_cursor().unwrap_or(0);
+    s.press(json!({"kind": "char", "c": "y"}), &["ctrl"]);
+    assert!(
+        s.pump(|s| s.chat_cursor() == Some(at - 1)),
+        "^Y moved one line up\n{at} -> {:?}",
+        s.chat_cursor()
+    );
+}
+
+#[test]
+fn a_mode_gets_its_own_keys_and_nobody_elses() {
+    // The rule, said plainly: while you are here, `^X` cutting a composer you cannot see and `^A`
+    // selecting it are not things you asked for — they are the mode you left still holding the
+    // keyboard. Only the escape hatches are bound everywhere.
+    let sb = Sandbox::new("modekeys");
+    let mut s = sb.start();
+    s.answered_and_reading();
+    s.to_top();
+    let before = s.chat();
+
+    // `^A`, `^X` and `^W` are the composer's, and `Chat`'s alone. `^Y` is *both* — the queue's
+    // there and a line up here — which is the whole point of a mode: the same key, asked of a
+    // different place, and only one answer arrives.
+    for c in ["a", "x", "w"] {
+        s.press(json!({"kind": "char", "c": c}), &["ctrl"]);
+    }
+    assert!(
+        s.pump(|s| s.chat_cursor() == Some(0)),
+        "none of them moved the cursor\n{:?}",
+        s.chat_cursor()
+    );
+    assert!(
+        s.buffer("[status]").iter().any(|l| l.contains("reading")),
+        "and none of them took the keyboard back\n{:?}",
+        s.buffer("[status]")
+    );
+    assert_eq!(s.chat(), before, "and none of them changed the transcript");
+}
+
+#[test]
 fn reading_says_what_its_keys_do() {
     let sb = Sandbox::new("readhints");
     let mut s = sb.start();

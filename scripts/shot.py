@@ -3,7 +3,7 @@
 
 Usage: shot.py [--cols N] [--rows N] [--wait MS] [--after MS] [--color] key [key ...]
 
-Keys are literal text, or a name in angle brackets: <cr> <esc> <tab> <c-p> <up> ...
+Keys are literal text, or a name in angle brackets: <cr> <esc> <tab> <c-p> <up> <pageup> ...
 A key of the form <wait:400> sleeps that many milliseconds.
 
 --color prints what colour every run of every row is, instead of the plain screen. A band behind a
@@ -21,6 +21,11 @@ NAMED = {
     "s-up": "\x1b[1;2A", "s-down": "\x1b[1;2B",
     "s-right": "\x1b[1;2C", "s-left": "\x1b[1;2D",
     "f1": "\x1bOP", "f2": "\x1bOQ", "f3": "\x1bOR", "f4": "\x1bOS",
+    # Bound keys, so a screenshot has to be able to press them. Paging is what a long transcript is
+    # read with, and `home`/`end` are what a composer's line ends are reached with.
+    "pageup": "\x1b[5~", "pagedown": "\x1b[6~",
+    "home": "\x1b[H", "end": "\x1b[F",
+    "delete": "\x1b[3~", "insert": "\x1b[2~",
 }
 
 def encode(tok: str) -> str:
