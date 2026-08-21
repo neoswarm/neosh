@@ -3830,6 +3830,9 @@ fn an_answer_is_rendered_as_markdown_while_it_streams() {
 fn a_rendered_answer_looks_the_same_after_switching_away_and_back() {
     // Two renderers is how a reopened conversation stops looking like the one you were just in.
     let sb = Sandbox::new("mdreplay");
+    // Not asked before closing: these use `session.close` as a way to *leave* a conversation and
+    // come back, and the confirmation is a different test's subject.
+    sb.write_config("[options]\n\"ui.confirm_destructive\" = false\n");
     let mut s = sb.spawn(&markdown_fixture(), Some("mock/mock"));
     s.wait_for("PROJECTS");
     s.type_text("tell me");
@@ -4351,7 +4354,11 @@ fn calls_that_only_looked_at_things_share_one_row_and_open_into_several() {
     // follows is not part of it, because a diff is an answer and not a name.
     let sb = Sandbox::new("looks");
     install_looker(&sb);
-    sb.write_config("[options]\n\"agent.model\" = \"looker/looker\"\n");
+    // Not asked before closing: these use `session.close` as a way to *leave* a conversation and
+    // come back, and the confirmation is a different test's subject.
+    sb.write_config(
+        "[options]\n\"agent.model\" = \"looker/looker\"\n\"ui.confirm_destructive\" = false\n",
+    );
     let mut s = sb.start_letting_config_choose();
     s.wait_for("looker ready");
     s.type_text("go");
@@ -4525,7 +4532,10 @@ fn the_footer_says_what_the_agent_may_do_and_which_key_changes_it() {
 #[test]
 fn a_permission_mode_belongs_to_the_conversation_it_was_chosen_in() {
     let sb = Sandbox::new("permsession");
-    let mut s = sb.start();
+    // Not asked before closing: these use `session.close` as a way to *leave* a conversation and
+    // come back, and the confirmation is a different test's subject.
+    sb.write_config("[options]\n\"ui.confirm_destructive\" = false\n");
+    let mut s = sb.start_letting_config_choose();
     assert!(
         s.pump(|s| s.status_now().iter().any(|l| l.contains("full access"))),
         "the configured default to start from\n{:?}",
