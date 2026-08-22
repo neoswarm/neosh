@@ -317,9 +317,83 @@ impl Services {
     /// Goes through the same decision point a built-in tool uses, so `ask` mode means the same
     /// thing on both sides of the plugin boundary. Off the host loop, because asking a human takes
     /// as long as it takes.
+    // ---- what the week went on ------------------------------------------
+
+    /// Scan the vendor CLIs' transcripts for a span and bucket what is there.
+    ///
+    /// On a blocking thread, not merely off the host loop: this is synchronous file I/O over
+    /// thousands of files somebody else wrote, and a `tokio` worker parked in `read_dir` is a
+    /// worker that is not driving anybody's stream.
+    ///
+    /// Prices come from whatever the model cache already holds, plus the configured catalogue for
+    /// anything never discovered. A model with no price still appears — its tokens are counted and
+    /// its cost is not — because dropping it would make the busiest week look like the quietest.
+    pub async fn usage_history(
+        &self,
+        since: i64,
+        until: i64,
+        resolution: neosh_proto::UsageResolution,
+        time_zone: Option<String>,
+    ) -> ApiResult {
+        if until <= since {
+            return Err(ApiError::InvalidArgument {
+                message: "the span ends before it starts".into(),
+            });
+        }
+        let mut models: Vec<neosh_proto::ModelInfo> = {
+            let reg = self.agent.providers();
+            reg.instances().flat_map(|i| i.models.iter().cloned()).collect()
+        };
+        // Discovered models last, so that a live answer's price wins the `HashMap` insert over the
+        // written catalogue's — the catalogue is the fallback for a model nobody has asked about.
+        {
+            let cache = self.model_cache.lock().expect("model cache poisoned");
+            models.extend(cache.values().flatten().cloned());
+        }
+        let prices = crate::usage::price_table(&models);
+        let offset = utc_offset(time_zone.as_deref());
+
+        tokio::task::spawn_blocking(move || {
+            ApiOk::UsageHistory { history: crate::usage::history(since, until, resolution, offset, &prices) }
+        })
+        .await
+        .map_err(|e| ApiError::Internal { message: format!("usage scan: {e}") })
+    }
+
     pub async fn permission_check(&self, capability: neosh_proto::Capability) -> ApiResult {
         let decision = self.agent.decide(&*self.bridge, capability, None).await;
         Ok(ApiOk::Permission { decision })
+    }
+
+    // ---- questions -------------------------------------------------------
+
+    /// Put a question to whoever draws them, and wait.
+    ///
+    /// Through [`neosh_agent::DriverQuestioner`] rather than a second path of its own, so a
+    /// plugin's question and an agent's arrive at the panel identically — which is the test for
+    /// whether the API is the real one or a private door beside it.
+    pub async fn ask_user(&self, questions: Vec<neosh_proto::UserQuestion>) -> ApiResult {
+        use neosh_provider::ask::{QuestionAnswers, QuestionAsker};
+
+        if questions.is_empty() {
+            return Err(ApiError::InvalidArgument {
+                message: "a question with nothing in it".into(),
+            });
+        }
+        let asker = neosh_agent::DriverQuestioner::new(&self.agent, self.bridge.clone());
+        // Read and dropped before the await. The store's guard is not `Send`, and holding one
+        // across a question that may sit unanswered for half an hour would lock the conversation
+        // list for exactly that long.
+        let conversation = self.agent.sessions().active_id().clone();
+        let answers = asker
+            .ask(neosh_provider::ask::QuestionRequest { questions, conversation, cwd: self.cwd.clone() })
+            .await;
+        Ok(ApiOk::Answers {
+            answers: match answers {
+                QuestionAnswers::Answered(a) => Some(a),
+                QuestionAnswers::Cancelled { .. } => None,
+            },
+        })
     }
 
     // ---- generation ------------------------------------------------------
