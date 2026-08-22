@@ -350,6 +350,18 @@ pub struct Host {
     swarm_allowed: neosh_swarm::Allowed,
     /// The node's events, held here between construction and the loop taking them.
     swarm_events: Option<tokio::sync::mpsc::UnboundedReceiver<neosh_swarm::SwarmEvent>>,
+    /// What each account has left on its plan, kept between the moments anything says so.
+    ///
+    /// In the host and not in a plugin for the reason every capability here is: it reads a
+    /// credential and it outlives every window that draws it. What a plugin gets is the numbers.
+    quota: crate::quota::QuotaStore,
+    /// Where a poll's answer comes back to. Polls are network round trips and process spawns, so
+    /// they cannot happen on the host loop — the single writer for the editor — and cannot be
+    /// awaited by whoever asked, because nobody asked: the interval did.
+    quota_tx: tokio::sync::mpsc::UnboundedSender<crate::quota::Polled>,
+    quota_rx: Option<tokio::sync::mpsc::UnboundedReceiver<crate::quota::Polled>>,
+    /// Set by a turn ending, cleared by the poll that follows it. See [`crate::quota::AFTER_TURN`].
+    quota_due: bool,
     /// Repositories by directory, discovered on demand.
     ///
     /// Keyed rather than singular because the *conversation* decides which repository is in play:
@@ -597,6 +609,7 @@ impl Host {
         frontend: Box<dyn Frontend>,
     ) -> Self {
         let mut editor = Editor::new();
+        let (quota_tx, quota_rx) = tokio::sync::mpsc::unbounded_channel();
 
         let chat = editor.create_buffer("[chat]");
         let chat_win =
@@ -696,6 +709,10 @@ impl Host {
             swarm_strangers: Default::default(),
             swarm_allowed: neosh_swarm::Allowed::load(None),
             swarm_events: None,
+            quota: crate::quota::QuotaStore::new(None),
+            quota_tx,
+            quota_rx: Some(quota_rx),
+            quota_due: false,
             repos: Default::default(),
             cwd: std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
             projects: Default::default(),
@@ -1010,6 +1027,43 @@ impl Host {
             ApiCall::SwarmStrangers => Ok(ApiOk::SwarmStrangers {
                 strangers: self.swarm_strangers.values().cloned().collect(),
             }),
+            // ---- the plan ------------------------------------------------
+            // Answered from what the store kept, which is what makes this safe to call on every
+            // redraw. Nothing here asks a vendor anything except `QuotaRefresh`, and that one
+            // answers before its own answer arrives.
+            ApiCall::QuotaList => Ok(ApiOk::Quotas { quotas: self.quota.list() }),
+            ApiCall::QuotaRefresh { instance } => {
+                self.refresh_quota(instance);
+                Ok(ApiOk::Unit)
+            }
+            // A plugin publishing for a provider it registered. Its own instances only: a plugin
+            // that could report for `claude-cli` could put any number it liked in the strip, and
+            // the strip is a thing people are going to trust before spending an afternoon.
+            ApiCall::QuotaReport { snapshot } => {
+                if !self.plugin_drivers_own(&plugin, &snapshot.instance) {
+                    return Err(ApiError::NotPermitted {
+                        capability: format!(
+                            "quota.report for {} (plugin {} did not register a driver serving it)",
+                            snapshot.instance, plugin.0
+                        ),
+                    });
+                }
+                self.take_quota(
+                    snapshot.instance.clone(),
+                    neosh_proto::QuotaSource::Plugin,
+                    neosh_provider::quota::Quota {
+                        plan: snapshot.plan,
+                        windows: snapshot.windows,
+                        credits: snapshot.credits,
+                    },
+                );
+                Ok(ApiOk::Unit)
+            }
+            ApiCall::QuotaHistory { instance, since, until } => Ok(ApiOk::QuotaHistory {
+                samples: self.quota.history(instance.as_ref(), since, until),
+            }),
+            // `UsageHistory` is not here: it reads thousands of files somebody else wrote, so it
+            // goes through `spawn_slow` with git and generation, for the same reason they do.
             ApiCall::SwarmPair { node, name, addr } => {
                 let Some(h) = &self.swarm_node else {
                     return Err(ApiError::NotFound { what: "the swarm is not running".into() });
@@ -5095,6 +5149,11 @@ impl Host {
                     stop_reason,
                     usage,
                 });
+                // The one moment these numbers definitely moved. Asked for rather than done here:
+                // the vendor's own accounting lags the end of the stream by a second or two, and a
+                // poll at zero reliably returns the figure from *before* the turn — which draws as
+                // a turn that cost nothing at all.
+                self.quota_due = true;
                 if !leftover.is_empty() {
                     self.start_turn_in(session, Prompt {
                         text: leftover
@@ -5280,7 +5339,117 @@ impl Host {
                 }
                 self.persist_sessions();
             }
+            // Attributed to the *conversation's* instance, not to whatever the picker is showing.
+            // A workspace runs several conversations at once and they need not be on the same
+            // provider, so reading the active selection here would file `codex`'s weekly figure
+            // under the account you happen to have open.
+            Activity::Quota { plan, windows, credits } => {
+                let Some(instance) = self.instance_of(&session) else { return };
+                self.take_quota(
+                    instance,
+                    neosh_proto::QuotaSource::Turn,
+                    neosh_provider::quota::Quota { plan, windows, credits },
+                );
+            }
         }
+    }
+
+    /// Which configured instance a conversation is talking to.
+    ///
+    /// The conversation's own selection first, and the workspace's only as the fallback for one
+    /// that has not chosen. Getting this the other way round attributes every driver's report to
+    /// whichever row the model picker was last left on.
+    fn instance_of(
+        &self,
+        session: &neosh_proto::SessionId,
+    ) -> Option<neosh_proto::InstanceId> {
+        let chosen = {
+            let store = self.agent.sessions();
+            store.get(session).and_then(|s| s.selection.as_ref().map(|sel| sel.instance.clone()))
+        };
+        chosen.or_else(|| self.agent.selection().map(|sel| sel.instance))
+    }
+
+    /// Put a snapshot in the store, and tell everyone if it changed anything.
+    ///
+    /// One door, whatever the source: a plugin's provider, a mid-turn line and a poll all arrive
+    /// here. That is what makes a third-party provider's plan appear in the sidebar strip without
+    /// the sidebar having heard of that provider — the strip listens for the event, not the vendor.
+    fn take_quota(
+        &mut self,
+        instance: neosh_proto::InstanceId,
+        source: neosh_proto::QuotaSource,
+        quota: neosh_provider::quota::Quota,
+    ) {
+        let Some(snapshot) = self.quota.apply(instance, source, quota, now_secs()) else { return };
+        self.bridge.broadcast(PluginEvent::Quota { snapshot });
+    }
+
+    /// Whether a plugin registered the driver serving this instance.
+    ///
+    /// The gate on [`ApiCall::QuotaReport`]. Without it any plugin could publish any number for
+    /// `claude-cli`, and this strip is a thing people are going to look at before deciding whether
+    /// to spend an afternoon on something — a figure it is possible to spoof is a figure that
+    /// should not be drawn as fact.
+    fn plugin_drivers_own(
+        &self,
+        plugin: &PluginId,
+        instance: &neosh_proto::InstanceId,
+    ) -> bool {
+        let Some(drivers) = self.plugin_drivers.get(plugin) else { return false };
+        self.agent
+            .providers()
+            .instances()
+            .any(|cfg| &cfg.id == instance && drivers.contains(&cfg.driver))
+    }
+
+    /// Every instance this machine could actually ask, right now.
+    ///
+    /// Built from the configured instances rather than from a written list of vendors, so an
+    /// instance the user named something else — a second `claude-cli` pointed at another account —
+    /// is polled too. Whether it *can* answer is decided in the poll itself, which is where the
+    /// filesystem and `PATH` checks belong.
+    fn quota_targets(&self) -> Vec<crate::quota::Target> {
+        self.agent
+            .providers()
+            .usable_instances()
+            .filter_map(|cfg| {
+                let which = neosh_provider::quota::pollable(cfg.driver.0.as_str())?;
+                // The program to run is the one the instance says it authenticates with, which is
+                // also the one that owns the login being read. A default here would poll the
+                // `codex` on `PATH` for an instance pointed at a different build of it.
+                let program = match &cfg.auth {
+                    neosh_proto::AuthRef::Cli { program, .. } => program.clone(),
+                    _ => return None,
+                };
+                Some(crate::quota::Target { instance: cfg.id.clone(), which, program })
+            })
+            .collect()
+    }
+
+    /// Ask, off the host loop.
+    ///
+    /// Nothing is awaited here. A poll is a network round trip and a process spawn, and the host
+    /// loop is the single writer for the editor — awaiting one inside it freezes typing for as long
+    /// as somebody else's server takes to answer.
+    fn refresh_quota(&self, only: Option<neosh_proto::InstanceId>) {
+        // A poll reads the vendor CLI's own login to ask about the vendor's own account. That is
+        // the same trade the CLI drivers already make — neosh is useful the minute it is installed
+        // because it reuses a login you have — but it is somebody else's credential store, so it is
+        // a setting rather than a decision made on their behalf. Off, the gauges show what the last
+        // turn reported and say how long ago that was.
+        if self.editor.options().bool("usage.poll") == Some(false) {
+            return;
+        }
+        let mut targets = self.quota_targets();
+        if let Some(id) = only {
+            targets.retain(|t| t.instance == id);
+        }
+        if targets.is_empty() {
+            return;
+        }
+        let tx = self.quota_tx.clone();
+        tokio::spawn(crate::quota::poll(targets, tx));
     }
 
     async fn handle_script_out(&mut self, out: ScriptOutbound) {
@@ -5541,6 +5710,17 @@ impl Host {
         // which case `recv` on it is never ready and this costs a branch that is never taken.
         let mut swarm_rx = self.swarm_events.take();
 
+        // What a plan has left. A fourth deadline rather than a share of any of the others, for the
+        // same reason they are all separate: it answers a different question, on a scale of minutes
+        // rather than frames, and the answer is a network round trip. Armed immediately so the
+        // first screen has real numbers on it — a gauge that only appears after five minutes of
+        // sitting there is one nobody knows exists.
+        let mut quota_rx = self.quota_rx.take();
+        let plan = tokio::time::sleep(crate::quota::AFTER_TURN);
+        tokio::pin!(plan);
+        // How many times in a row a poll has come back with nothing. Doubles the wait each time.
+        let mut quota_backoff: u32 = 0;
+
         loop {
             tokio::select! {
                 Some(out) = script_rx.recv() => self.handle_script_out(out).await,
@@ -5583,6 +5763,47 @@ impl Host {
                         self.drain_effects();
                     }
                 }
+                Some(polled) = async {
+                    match quota_rx.as_mut() {
+                        Some(rx) => rx.recv().await,
+                        // Never ready, rather than ready-with-nothing: the latter would spin.
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    match polled.quota {
+                        Some(quota) => {
+                            quota_backoff = 0;
+                            self.take_quota(
+                                polled.instance,
+                                neosh_proto::QuotaSource::Poll,
+                                quota,
+                            );
+                        }
+                        // Asked and not answered. Slow down, and slow down hard when the vendor was
+                        // explicit about it: the endpoint that reports rate limits has one of its
+                        // own, and a poller that keeps its cadence through a 429 is a gauge added
+                        // to avoid hitting limits that is itself hitting one.
+                        None => {
+                            quota_backoff = if polled.throttled {
+                                (quota_backoff + 1).max(3)
+                            } else {
+                                quota_backoff + 1
+                            };
+                            let wait = crate::quota::IDLE_INTERVAL
+                                .saturating_mul(1u32 << quota_backoff.min(6))
+                                .min(crate::quota::MAX_BACKOFF);
+                            plan.as_mut().reset(Instant::now() + wait);
+                        }
+                    }
+                }
+                () = &mut plan => {
+                    self.refresh_quota(None);
+                    // Reset unconditionally, and to the idle interval whichever branch armed it.
+                    // A turn ending shortens the *next* wait only; leaving it short afterwards
+                    // would poll every five seconds forever after the first turn.
+                    self.quota_due = false;
+                    plan.as_mut().reset(Instant::now() + crate::quota::IDLE_INTERVAL);
+                }
                 else => break,
             }
 
@@ -5607,6 +5828,11 @@ impl Host {
             if self.working && !ticking {
                 clock.as_mut().reset(Instant::now() + Duration::from_secs(1));
                 ticking = true;
+            }
+            // A turn is the only thing that moves these numbers by an amount worth redrawing for,
+            // so the poll that matters is the one just after one ends.
+            if std::mem::take(&mut self.quota_due) {
+                plan.as_mut().reset(Instant::now() + crate::quota::AFTER_TURN);
             }
             if self.editor.has_pending_ui() && !armed {
                 idle.as_mut().reset(Instant::now() + COALESCE);
@@ -5642,6 +5868,11 @@ impl Host {
         self.state_dir = Some(dir.clone());
         self.pstate = crate::pstate::PluginState::new(Some(dir.clone()));
         self.vars = crate::vars::Vars::new(Some(dir.clone()));
+        // The sampled percentages, which are the only record anywhere of what a plan looked like an
+        // hour ago. Loaded here rather than at construction because this is where the workspace
+        // finds out it has a state directory at all — under `--clean` it never does, and the
+        // history is then in memory for as long as the process lives and nowhere afterwards.
+        self.quota = crate::quota::QuotaStore::new(Some(&dir));
 
         let (saved, active) = crate::sessions::load(&dir);
         if saved.is_empty() {
