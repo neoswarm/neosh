@@ -110,10 +110,10 @@ published `@neosh/api`, so the moment one reaches for something not public, the 
 | `sidebar` | Projects, conversations, changes, model, usage | `<C-b>` hide, `<C-t>` thread list, `<C-n>` new |
 | `model` | Model and reasoning-effort switchers, and the footer | `<C-p>`, `<C-e>` |
 | `git` | Status, branches, commits, diffs, worktrees | `<C-g>`, `<C-d>` |
-| `palette` | Everything by name, with its binding | `<C-k>`, `<F1>` |
+| `palette` | Everything by name, with its binding | `<C-k>`, `<C-z>` |
 | `approvals` | Asks before the agent does something gated | — |
 
-Press `<F1>` for the complete list; it is read from the registry, so it is never out of date.
+Press `<C-z>` for the complete list; it is read from the registry, so it is never out of date.
 
 Turn one off:
 
@@ -315,36 +315,41 @@ mapleader = ","
 timeoutlen = 500   # how long to wait for the rest of a sequence
 ```
 
-`^K` searches every command by name, and `F1` lists every binding — both read the live registry, so
+`^K` searches every command by name, and `^Z` lists every binding — both read the live registry, so
 a plugin loaded five minutes ago is in them without anything having been written down. Every picker
 carries a strip along its foot saying what it answers to, written from the bindings rather than from
 a string, so rebinding `ui.keys.*` changes what the strip says rather than making it a lie.
 
 `AGENTS.md` at the root of the repository has the whole key table in one place.
 
-### Your terminal decides which keys it can send
+### Every default is a key your terminal already sends
 
-A key neosh never receives is a key no amount of rebinding will fix, and two of the defaults are in
-that position on a Mac out of the box. Neither is a neosh setting — both are your terminal's.
+A key neosh never receives is a key no amount of rebinding will fix, so nothing ships bound to one
+that depends on a setting you have to go and find. In practice that rules out three families:
 
-**`F1` needs `fn` on macOS.** Apple's top row controls brightness and volume by default, so `F1`
-dims the screen and `fn`+`F1` is what reaches an application. Either press `fn`+`F1`, or turn on
-*System Settings → Keyboard → Keyboard Shortcuts → Function Keys → Use F1, F2, etc. as standard
-function keys*. Everything `F1` shows is also in `^K`, which needs no such arrangement.
+- **Function keys.** Apple's top row is brightness and volume until somebody turns on *Use F1, F2,
+  etc. as standard function keys*, so `F1` — the key that listed every key — was the one key a new
+  Mac could not press. The key list is `^Z`.
+- **Option / Alt.** macOS treats Option as a compose key: `⌥p` is `π`, not `Alt+p`, unless the
+  terminal has been told otherwise. The model ladder was `⌥↑`/`⌥↓` and now has no default key at
+  all; taking an attached image back off was `⌥V` and is now `⌫` on an empty composer.
+- **Ctrl with punctuation.** In a plain terminal `Ctrl+/` and `Ctrl+7` are the same byte. Neither
+  is a key worth binding — see enhanced keys, below.
 
-**`⌥↑` / `⌥↓` need Option-as-Alt.** macOS treats Option as a compose key — `⌥p` is `π`, not
-`Alt+p` — so a terminal has to be told to send it as a modifier instead:
+What is left is Ctrl-with-a-letter, `⇧⇥`, `⏎`, `⌫` and `Esc`, which every terminal on every
+platform sends the same way, plus the keys a keyboard may or may not have — arrows, `PageUp`,
+`Home`, `End`. Those last ones are bound wherever they make sense and are never the *only* way to
+do anything: every list moves on `^N`/`^P` as well as the arrows, and the hint strip prints the
+chord, because a legend is a promise about a keyboard.
 
-| Terminal | Setting |
-|---|---|
-| Terminal.app | Settings → Profiles → Keyboard → *Use Option as Meta key* |
-| iTerm2 | Settings → Profiles → Keys → Left Option key → *Esc+* |
-| Ghostty | `macos-option-as-alt = left` |
-| Alacritty | `option_as_alt = "Left"` |
-| kitty | `macos_option_as_alt left` |
+If you have the keys, use them, and if you want the ones that were dropped, they are one line each:
 
-Setting the *left* Option key only, where that is offered, keeps the right one for typing `£` and
-`—`.
+```ts
+await neosh.keymap.set("chat", "<F1>", "help.keys");
+await neosh.keymap.set("chat", "<A-Up>", "model.upgrade");
+await neosh.keymap.set("chat", "<A-Down>", "model.downgrade");
+await neosh.keymap.set("chat", "<A-v>", "chat.image.drop");
+```
 
 **Enhanced keys, where the terminal has them.** On startup neosh asks the terminal for the
 [Kitty keyboard protocol](https://sw.kovidgoyal.net/kitty/keyboard-protocol/) — supported by kitty,
@@ -492,8 +497,8 @@ More than one key can mean the same thing:
 
 ```toml
 [options]
-"ui.keys.next" = "<Down> <C-n> <C-j>"
-"ui.keys.prev" = "<Up> <C-p> <C-k>"
+"ui.keys.next" = "<C-n> <Down> <C-j>"
+"ui.keys.prev" = "<C-p> <Up> <C-k>"
 "ui.keys.page_down" = "<PageDown>"
 "ui.keys.page_up" = "<PageUp>"
 "ui.keys.first" = "<C-Home>"
@@ -597,7 +602,7 @@ place to look for something that is already on screen. It also means those keys 
 on the shortcut row below — saying it twice costs a row and teaches nothing the first place did not.
 
 There is no shortcut row below by default, for the same reason. It carried `^T`, `^N` and `^K`,
-which are in the sidebar's own footer two rows away, and `F1`, which is on the row it points at.
+which are in the sidebar's own footer two rows away, and `^Z`, which is on the row it points at.
 What the duplication actually bought was one fewer line of transcript and a composer pressed
 against the status strip. `ui.hints = true` brings it back if you want it; the exception is reading
 mode, which draws its own row whatever the setting says, because those keys are live, different,
@@ -986,10 +991,14 @@ because every lineup worth switching between has three: Opus/Sonnet/Haiku, gpt-5
 Pro/Flash/Flash-Lite.
 
 ```
-<A-Up>      model.upgrade      one rung up, same provider
-<A-Down>    model.downgrade    one rung down
-            model.line opus    the current model in a line, wherever it is reachable
+model.upgrade      one rung up, same provider
+model.downgrade    one rung down
+model.line opus    the current model in a line, wherever it is reachable
 ```
+
+None of these has a default key. They had `⌥↑`/`⌥↓`, which is a key only on a terminal that has
+been told to send Option as Alt, and chat mode has no chord left to move them to — so they are
+commands you reach by name from `^K`, or put on a key of your own.
 
 `upgrade`/`downgrade` hold the provider fixed on purpose: "give me something cheaper" is a question
 about the model, and answering it by also changing your billing would answer a question nobody
