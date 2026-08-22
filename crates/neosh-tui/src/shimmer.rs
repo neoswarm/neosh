@@ -14,12 +14,15 @@
 //! right. The alternative, showing nothing, would make "is it working?" unanswerable on exactly the
 //! terminals where you are least sure.
 
-use std::time::Instant;
+use std::collections::HashMap;
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
-use neosh_proto::Animation;
+use neosh_proto::{Animation, ExtmarkId, FrameSet, NamespaceId};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::Span;
 use unicode_segmentation::UnicodeSegmentation;
+use unicode_width::UnicodeWidthStr;
 
 /// When this process started.
 ///
@@ -78,15 +81,181 @@ pub fn take_drew_animation() -> bool {
     DREW.swap(false, std::sync::atomic::Ordering::Relaxed)
 }
 
+fn moving() {
+    DREW.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+// ---------------------------------------------------------------------------
+// When a mark first appeared
+// ---------------------------------------------------------------------------
+
+/// How long after a mark first appears it may still be considered new.
+///
+/// Past this it is history, and history does not flash. Also what bounds the table below: an entry
+/// older than this cannot affect anything, so it is dropped rather than kept.
+const YOUNG: Duration = Duration::from_secs(5);
+
+/// How many marks may appear at once and still count as *events*.
+///
+/// A flash says "this just happened", and one row lighting up says it clearly. Twenty rows lighting
+/// up together says nothing at all — it is a redraw, which is what republishing a conversation on
+/// reattach looks like from here, and a transcript that strobes every time you switch to it is the
+/// worst version of this feature. So a burst is recognised and none of it flashes.
+const BURST: usize = 3;
+
+/// The window inside which arrivals count as one burst.
+const TOGETHER: Duration = Duration::from_millis(60);
+
+#[derive(Default)]
+struct Seen {
+    /// The highest id handed out per namespace. Ids only ever increase, so anything at or below
+    /// this that is not in `at` is a mark from before we started paying attention — which is how
+    /// scrolling an old row back into view is told apart from a new row arriving, without keeping
+    /// every id ever seen.
+    high: HashMap<u32, u32>,
+    /// When each young mark turned up, and whether it is allowed to flash.
+    at: HashMap<(u32, u32), (Instant, bool)>,
+    /// The most recent arrival, and how many came with it.
+    burst: Option<(Instant, usize)>,
+}
+
+fn seen() -> &'static Mutex<Seen> {
+    static SEEN: std::sync::OnceLock<Mutex<Seen>> = std::sync::OnceLock::new();
+    SEEN.get_or_init(Mutex::default)
+}
+
+/// When this mark first turned up, if it is new enough for that to mean anything.
+///
+/// `None` for a mark that was already here — which is the answer for almost every mark, almost
+/// always. Only the frontend calls this, once per animated row per frame.
+pub fn first_seen(ns: NamespaceId, id: ExtmarkId) -> Option<Instant> {
+    let now = Instant::now();
+    let mut s = seen().lock().ok()?;
+    let key = (ns.0, id.0);
+
+    if let Some(&(at, flashing)) = s.at.get(&key) {
+        return flashing.then_some(at);
+    }
+
+    let high = s.high.entry(ns.0).or_default();
+    if id.0 <= *high {
+        // Older than anything we have a record of: it was on screen before, and it has already had
+        // whatever moment it was going to get.
+        return None;
+    }
+    *high = id.0;
+
+    let count = match s.burst {
+        Some((at, n)) if now.duration_since(at) < TOGETHER => n + 1,
+        _ => 1,
+    };
+    s.burst = Some((now, count));
+    let flashing = count <= BURST;
+
+    s.at.retain(|_, (at, _)| now.duration_since(*at) < YOUNG);
+    s.at.insert(key, (now, flashing));
+    flashing.then_some(now)
+}
+
+/// Forget everything. For tests, which would otherwise share one table.
+#[cfg(test)]
+fn forget() {
+    if let Ok(mut s) = seen().lock() {
+        *s = Seen::default();
+    }
+}
+
+/// The glyphs a frame set is drawn with.
+///
+/// All one column wide, which is the only property this list has to have — [`fit`] enforces it
+/// anyway, but a set that needed enforcing would look wrong on the way past.
+fn frames_of(set: FrameSet) -> &'static [&'static str] {
+    match set {
+        FrameSet::Braille => &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"],
+        FrameSet::Dots => &["⠁", "⠂", "⠄", "⡀", "⢀", "⠠", "⠐", "⠈"],
+        FrameSet::Bars => &["▁", "▂", "▃", "▄", "▅", "▆", "▇", "▆", "▅", "▄", "▃", "▂"],
+        FrameSet::Arc => &["◐", "◓", "◑", "◒"],
+        FrameSet::Corners => &["▖", "▘", "▝", "▗"],
+    }
+}
+
+/// A frame, cut or padded to the width of what it is standing in for.
+///
+/// The whole safety property of [`Animation::Frames`]: whatever the frame is, the cell it occupies
+/// is the width of the text underneath it, so the columns to its right never move. A spinner that
+/// shifts the rest of the row by one every tenth of a second is worse than no spinner.
+fn fit(frame: &str, want: usize) -> String {
+    let mut out = String::new();
+    let mut have = 0usize;
+    for g in frame.graphemes(true) {
+        let w = UnicodeWidthStr::width(g);
+        if have + w > want {
+            break;
+        }
+        out.push_str(g);
+        have += w;
+    }
+    out.push_str(&" ".repeat(want.saturating_sub(have)));
+    out
+}
+
+/// How lit a flash is right now, or `None` if it is not one or is over.
+///
+/// Split out because the row's band and the runs on it need the same answer: the band is what
+/// carries a flash, and what it lights is every span on the row. Setting [`DREW`] is part of the
+/// answer — asking is what draws it.
+pub fn flash_amount(anim: Animation, since: Instant) -> Option<f32> {
+    let Animation::Flash { ms } = anim else { return None };
+    let e = since.elapsed().as_secs_f32() * 1000.0 / ms.max(1) as f32;
+    if e >= 1.0 {
+        return None;
+    }
+    moving();
+    // Out rather than in, and squared: a landing is bright immediately and then gets out of the
+    // way. Easing in would read as the row arriving twice.
+    Some((1.0 - e) * (1.0 - e))
+}
+
+/// Lift a style toward lit, for a caller that already knows how far.
+pub fn lift(style: Style, t: f32, truecolor: bool) -> Style {
+    brighten(style, t, truecolor)
+}
+
 /// Render one run of text with an animation applied.
 ///
 /// Returns one span per grapheme cluster for a sweep, and a single span for anything uniform —
 /// splitting text that does not need splitting would multiply the span count of every status line
 /// for no visible difference.
-pub fn animate(text: &str, base: Style, anim: Animation, truecolor: bool) -> Vec<Span<'static>> {
-    DREW.store(true, std::sync::atomic::Ordering::Relaxed);
+///
+/// `since` is when the mark carrying this animation first appeared, for the one animation that
+/// needs to know — see [`Animation::Flash`]. `None` from every caller that has no mark to ask
+/// about, and a flash with nothing to count from simply does not fire.
+pub fn animate(
+    text: &str,
+    base: Style,
+    anim: Animation,
+    truecolor: bool,
+    since: Option<Instant>,
+) -> Vec<Span<'static>> {
+    // Set per arm rather than here: a flash that has finished draws its run exactly as it would
+    // have been drawn anyway, and saying "something moved" about it would keep the frame ticker
+    // alive over a transcript that has been still for an hour.
     match anim {
+        Animation::Flash { .. } => {
+            match since.and_then(|at| flash_amount(anim, at)) {
+                Some(t) => vec![Span::styled(text.to_string(), brighten(base, t, truecolor))],
+                None => vec![Span::styled(text.to_string(), base)],
+            }
+        }
+        Animation::Frames { set, .. } => {
+            moving();
+            let frames = frames_of(set);
+            let at = (phase(anim.period_ms()) * frames.len() as f32) as usize;
+            let frame = frames[at.min(frames.len() - 1)];
+            vec![Span::styled(fit(frame, UnicodeWidthStr::width(text)), base)]
+        }
         Animation::Pulse { .. } => {
+            moving();
             let t = 0.5 * (1.0 - (std::f32::consts::TAU * phase(anim.period_ms())).cos());
             vec![Span::styled(text.to_string(), brighten(base, t, truecolor))]
         }
@@ -97,6 +266,7 @@ pub fn animate(text: &str, base: Style, anim: Animation, truecolor: bool) -> Vec
             if clusters.is_empty() {
                 return Vec::new();
             }
+            moving();
             // The band starts off the left edge and ends off the right, so the run spends part of
             // every cycle entirely unlit. Without the padding it would strobe: the moment the band
             // left one end it would already be entering the other.
@@ -147,7 +317,7 @@ mod tests {
         // The text must survive being cut up: a shimmer that splits a family emoji into its
         // component people is a shimmer nobody will turn on twice.
         let text = "ab\u{1f469}\u{200d}\u{1f467}cd";
-        let spans = animate(text, styled(), Animation::Shimmer { period_ms: 1000 }, true);
+        let spans = animate(text, styled(), Animation::Shimmer { period_ms: 1000 }, true, None);
         let rebuilt: String = spans.iter().map(|s| s.content.as_ref()).collect();
         assert_eq!(rebuilt, text);
         assert_eq!(spans.len(), text.graphemes(true).count());
@@ -156,7 +326,8 @@ mod tests {
     #[test]
     fn without_truecolor_it_is_an_attribute_rather_than_nothing() {
         // "Is it working?" has to be answerable on the terminals where you are least sure.
-        let spans = animate("working", styled(), Animation::Shimmer { period_ms: 1000 }, false);
+        let spans =
+            animate("working", styled(), Animation::Shimmer { period_ms: 1000 }, false, None);
         assert!(spans.iter().all(|s| s.style.fg == Some(Color::Rgb(100, 100, 100))));
         // Over a whole cycle some cluster is lit; at any instant most are not.
         assert!(spans.len() > 1);
@@ -175,14 +346,108 @@ mod tests {
         // `Color::Reset` is whatever the terminal decided, which this process cannot ask about.
         // Blending from a guess gets the direction wrong on half of all themes.
         let plain = Style::default();
-        let spans = animate("hi", plain, Animation::Pulse { period_ms: 1000 }, true);
+        let spans = animate("hi", plain, Animation::Pulse { period_ms: 1000 }, true, None);
         assert!(spans[0].style.fg.is_none(), "no colour was invented");
+    }
+
+    /// The tables `first_seen` keeps are global, because the clock behind every animation is — and
+    /// so is `DREW`. Two tests minting marks at once would each see the other's as part of their
+    /// burst, and a test asking "did anything move" would be answered about somebody else's frame.
+    fn alone() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let g = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        forget();
+        take_drew_animation();
+        g
+    }
+
+    #[test]
+    fn a_frame_is_the_width_of_what_it_stands_in_for() {
+        // The whole safety property: a spinner cannot move the column after it. Every set, every
+        // frame, against a one-column run — which is what the mark beside a card is.
+        for set in [
+            FrameSet::Braille,
+            FrameSet::Dots,
+            FrameSet::Bars,
+            FrameSet::Arc,
+            FrameSet::Corners,
+        ] {
+            for frame in frames_of(set) {
+                assert_eq!(
+                    UnicodeWidthStr::width(fit(frame, 1).as_str()),
+                    1,
+                    "{set:?} drew {frame:?} at the wrong width"
+                );
+            }
+        }
+        // And a frame too wide for its run is cut rather than allowed to push.
+        assert_eq!(UnicodeWidthStr::width(fit("⠋⠙", 1).as_str()), 1);
+        // A run with no room at all takes nothing, rather than one column of somebody else's.
+        assert_eq!(fit("⠋", 0), "");
+    }
+
+    #[test]
+    fn a_frame_replaces_the_text_without_touching_the_line() {
+        let _g = alone();
+        let spans = animate("\u{25b8}", styled(), Animation::Frames {
+            set: FrameSet::Braille,
+            period_ms: 800,
+        }, true, None);
+        let drawn: String = spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(frames_of(FrameSet::Braille).contains(&drawn.as_str()), "{drawn:?}");
+        assert!(take_drew_animation(), "a spinner is a reason to ask for another frame");
+    }
+
+    #[test]
+    fn a_flash_with_nothing_to_count_from_does_not_fire() {
+        let _g = alone();
+        let spans = animate("landed", styled(), Animation::Flash { ms: 300 }, true, None);
+        assert_eq!(spans.len(), 1);
+        assert_eq!(spans[0].style.fg, Some(Color::Rgb(100, 100, 100)), "unlit");
+        assert!(!take_drew_animation(), "and it does not ask for another frame");
+    }
+
+    #[test]
+    fn a_flash_is_over_when_it_is_over() {
+        let _g = alone();
+        let anim = Animation::Flash { ms: 40 };
+        let now = Instant::now();
+        assert!(flash_amount(anim, now).is_some_and(|t| t > 0.9), "brightest at the start");
+        assert!(take_drew_animation());
+
+        // Past its window it is not motion any more — which is what stops a transcript full of
+        // landed cards from keeping the frame ticker alive for ever.
+        let old = now - Duration::from_millis(80);
+        assert_eq!(flash_amount(anim, old), None);
+        assert!(!take_drew_animation());
+    }
+
+    #[test]
+    fn a_mark_flashes_once_and_a_mark_that_was_already_here_never_does() {
+        let _g = alone();
+        let (ns, id) = (NamespaceId(7), ExtmarkId(20));
+        let first = first_seen(ns, id).expect("a mark nobody has seen before is news");
+        assert_eq!(first_seen(ns, id), Some(first), "asking twice is the same moment, not a new one");
+
+        // Scrolling an older row back into view is not an arrival. Ids only ever increase, so an id
+        // below the high-water mark is one from before we were watching.
+        assert_eq!(first_seen(ns, ExtmarkId(3)), None);
+    }
+
+    #[test]
+    fn a_burst_of_marks_is_a_redraw_and_none_of_it_flashes() {
+        let _g = alone();
+        // Republishing a conversation on reattach mints every mark in it at once. One row lighting
+        // up is an event; twenty is a strobe, and it is the same feature that produced both.
+        let ns = NamespaceId(9);
+        let lit = (1..=20).filter(|i| first_seen(ns, ExtmarkId(*i)).is_some()).count();
+        assert_eq!(lit, BURST, "only the first few of a burst are treated as news");
     }
 
     #[test]
     fn a_period_of_zero_does_not_divide_by_zero() {
         // It arrives over a wire from a plugin, so it is input, not a constant.
-        let spans = animate("hi", styled(), Animation::Shimmer { period_ms: 0 }, true);
+        let spans = animate("hi", styled(), Animation::Shimmer { period_ms: 0 }, true, None);
         assert_eq!(spans.len(), 2);
     }
 }

@@ -207,12 +207,24 @@ pub fn render_line_in(
     // and every ranged group is then patched over it — so a syntax colour keeps its foreground and
     // inherits the band, which is the one place in this vocabulary where two marks have to
     // describe the same character at once.
-    let base = visible
+    let band = visible
         .iter()
         .filter(|m| m.opts.line_hl_group.is_some())
-        .max_by_key(|m| m.opts.priority)
-        .and_then(|m| m.opts.line_hl_group.as_deref())
-        .map(|g| theme.style(g));
+        .max_by_key(|m| m.opts.priority);
+    let base = band.and_then(|m| m.opts.line_hl_group.as_deref()).map(|g| theme.style(g));
+
+    // A one-shot the whole row shares.
+    //
+    // The row's band is the only annotation that is *about the row*, so it is the only one that can
+    // say "this row just happened" — a flash on a ranged group would light a quarter of a card and
+    // leave the rest, which reads as a highlight rather than as an arrival. The moment it counts
+    // from is the first time this mark was seen, which is why the mark and not the group carries
+    // the timing: an extmark is created once, so this fires once.
+    let flash = band.filter(|_| theme.motion()).and_then(|m| {
+        let anim = m.opts.line_hl_group.as_deref().and_then(|g| theme.animation(g))?;
+        let since = crate::shimmer::first_seen(m.ns, m.id)?;
+        crate::shimmer::flash_amount(anim, since)
+    });
 
     let mut spans: Vec<Span<'static>> = Vec::new();
     // Over cut *positions* rather than windows between them, because an empty line has exactly one
@@ -267,8 +279,21 @@ pub fn render_line_in(
                 style,
                 anim,
                 theme.truecolor(),
+                None,
             )),
             None => spans.push(Span::styled(text[a..b].to_string(), style)),
+        }
+    }
+
+    // The row's own one-shot, over everything the row says.
+    //
+    // Applied here rather than inside the loop so that it lands on the *result* of all the other
+    // decisions — a diff band, a syntax colour and a sweep are three things that already agreed
+    // what a character looks like, and a flash lifts whatever they settled on rather than arguing
+    // with them.
+    if let Some(t) = flash {
+        for span in &mut spans {
+            span.style = crate::shimmer::lift(span.style, t, theme.truecolor());
         }
     }
 

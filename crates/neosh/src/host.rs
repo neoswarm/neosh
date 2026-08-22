@@ -521,11 +521,18 @@ struct Card {
     body: u32,
     /// Whether the body is the whole of it or the first few rows.
     expanded: bool,
+    /// Whether this card has already had its moment.
+    ///
+    /// A landing is an event, and an event happens once. Without this the row would light up again
+    /// every time the card is redrawn for any other reason — opening it, folding it, the clock on
+    /// the row above it ticking — and a flash that fires on a redraw is a flash that means
+    /// "something was drawn", which is not news.
+    flashed: bool,
 }
 
 impl Card {
     fn new(leg: Leg, row: u32) -> Self {
-        Self { legs: vec![leg], row, body: 0, expanded: false }
+        Self { legs: vec![leg], row, body: 0, expanded: false, flashed: false }
     }
 
     /// Whether this card holds a call answering to `id`, and which one.
@@ -4341,6 +4348,16 @@ impl Host {
         self.chat_row(row, &header);
         for (k, r) in body.iter().enumerate() {
             self.chat_row(row + 1 + k as u32, r);
+        }
+        // The one redraw that is an arrival rather than a redraw.
+        //
+        // Every mark on this row was just cleared and re-set, so the band is a mark the frontend
+        // has never seen — which is exactly what it keys the one-shot from. Guarded by `flashed`
+        // rather than by "is this the first time we settled", because the two are the same fact and
+        // only one of them survives a card being opened and folded again.
+        if self.cards[i].settled() && !self.cards[i].flashed {
+            self.cards[i].flashed = true;
+            self.chat_band(row, "Agent.ToolLanded");
         }
         let new_body = body.len() as u32;
         self.cards[i].body = new_body;

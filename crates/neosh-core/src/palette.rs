@@ -80,9 +80,14 @@ struct Roles {
     plan: Color,
     /// The one hue used for emphasis that is not a state.
     accent: Color,
-    /// The favourite marker. Not a fourth state hue: the heart glyph carries the whole meaning,
-    /// and the world has already decided what colour a heart is — painting it anything else reads
-    /// as a decision the user has to decode.
+    /// The favourite marker. Not a fourth state hue: the star glyph carries the whole meaning,
+    /// and the world has already decided what colour a favourite star is — painting it anything
+    /// else reads as a decision the user has to decode.
+    ///
+    /// It sits in the same family as `attention` and is deliberately warmer, because the two are
+    /// told apart by shape rather than by hue: `attention` is only ever a word, a count or a
+    /// pulsing state, and this is only ever `★` in the sidebar's leftmost column. Nothing else in
+    /// the workspace draws a star, so there is no row on which the two can be confused.
     favorite: Color,
     /// The faces of the logo, top row first: bright at the lit edge, falling away downward.
     logo: [Color; 6],
@@ -131,7 +136,7 @@ const DARK: Roles = Roles {
     success: rgb(0x6e, 0xe7, 0xb7),
     plan: rgb(0xc4, 0xb5, 0xfd),
     accent: rgb(0xa5, 0xb4, 0xfc),
-    favorite: rgb(0xfb, 0x64, 0x7b),
+    favorite: rgb(0xf5, 0xa5, 0x24),
     logo: [
         rgb(0xf8, 0xfa, 0xfc),
         rgb(0xe2, 0xe8, 0xf0),
@@ -168,7 +173,7 @@ const LIGHT: Roles = Roles {
     success: rgb(0x05, 0x96, 0x69),
     plan: rgb(0x7c, 0x3a, 0xed),
     accent: rgb(0x4f, 0x46, 0xe5),
-    favorite: rgb(0xe1, 0x1d, 0x48),
+    favorite: rgb(0xa1, 0x62, 0x07),
     // Reversed against a light background: the lit edge is the dark one, as a steel letter on
     // paper is darkest where it stands up.
     logo: [
@@ -238,6 +243,16 @@ fn pulse(mut s: HighlightSpec, period_ms: u32) -> HighlightSpec {
     s
 }
 
+fn frames(mut s: HighlightSpec, set: neosh_proto::FrameSet, period_ms: u32) -> HighlightSpec {
+    s.animate = Some(neosh_proto::Animation::Frames { set, period_ms });
+    s
+}
+
+fn flash(mut s: HighlightSpec, ms: u32) -> HighlightSpec {
+    s.animate = Some(neosh_proto::Animation::Flash { ms });
+    s
+}
+
 /// Every group a plugin may link to, with a concrete spec.
 ///
 /// Kept as one list rather than scattered across the crates that use each group, because the whole
@@ -285,11 +300,24 @@ pub fn groups(variant: Variant) -> Vec<(&'static str, HighlightDef)> {
         ("Agent.ToolError", spec(bold(fg(r.danger)))),
         ("Agent.Usage", spec(dim(fg(r.muted)))),
         // The mark beside a tool call, which appears only when the state is news: while the call
-        // is out, and if it failed. Pulsing while it runs, because a card that stopped moving is a
-        // card you can stop watching — and there is deliberately no group for one that finished,
-        // since a finished call is drawn with no mark at all.
-        ("Agent.ToolRunning", spec(pulse(fg(r.attention), 2600))),
+        // is out, and if it failed. There is deliberately no group for one that finished, since a
+        // finished call is drawn with no mark at all.
+        //
+        // Frames rather than the pulse it used to be. A glyph brightening and dimming in place is
+        // motion you have to be looking at to notice; a glyph that *changes shape* is the thing
+        // every terminal program in the world uses to mean "still going", and it reads at the edge
+        // of vision. The run under it is one column wide and the frontend keeps it that way, so
+        // nothing to the right of the mark ever moves.
+        ("Agent.ToolRunning", spec(frames(fg(r.attention), neosh_proto::FrameSet::Braille, 800))),
         ("Agent.ToolFailed", spec(bold(fg(r.danger)))),
+        // The row of a card, for the moment it lands.
+        //
+        // A band with no colour of its own: what it carries is the timing, not an appearance. Every
+        // span on the row lifts together and falls back over a third of a second, which is the
+        // difference between a row that appeared and a row that *arrived* — and it is the only
+        // motion in this file that happens once. A card that finished quietly is a card you did not
+        // see finish, and half of watching an agent work is watching things land.
+        ("Agent.ToolLanded", spec(flash(HighlightSpec::default(), 340))),
         // The subject of a call that has not come back: the command, the path, the query. A sweep
         // rather than the dot's pulse, because this is a *run* of text — a band travelling along
         // the command you are waiting on is legible from across the room, and a single glyph
@@ -538,6 +566,7 @@ mod tests {
         for required in [
             "Agent.ToolRunning",
             "Agent.ToolFailed",
+            "Agent.ToolLanded",
             "Agent.ToolLive",
             "Agent.ToolRead",
             "Agent.ToolEdit",
