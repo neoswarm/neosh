@@ -31,7 +31,7 @@ export async function activate({ neosh, subscriptions }: PluginContext) {
     }),
   );
   // Registered once rather than per overlay: a command name is global, and re-registering it on
-  // every `<F1>` would leave the previous window's handler shadowed and its float on screen.
+  // every `<C-z>` would leave the previous window's handler shadowed and its float on screen.
   subscriptions.push(
     await neosh.cmd.register("help.keys.key", () => void dismissKeys?.(), {
       desc: "Dismiss the key list",
@@ -39,11 +39,16 @@ export async function activate({ neosh, subscriptions }: PluginContext) {
   );
 
   await neosh.keymap.set("chat", "<C-k>", "commandPalette.toggle", { desc: "Command palette" });
-  await neosh.keymap.set("chat", "<F1>", "help.keys", { desc: "Key bindings" });
+  // `^Z` rather than `<F1>`. A function key is not a key everybody has: Apple's top row is
+  // brightness and volume until somebody goes into the settings, so the key that lists every key
+  // was the one key a new Mac could not press — and a keyboard whose F-row lives on a layer is in
+  // the same position. `^Z` is the one chord chat mode had left, every terminal delivers it
+  // identically, and raw mode means it cannot suspend anything. Rebind it like any other default.
+  await neosh.keymap.set("chat", "<C-z>", "help.keys", { desc: "Key bindings" });
 
   // Last on the row, and the way out of it: whatever else got dropped for width is in here.
   await neosh.hint.set("commands", { keys: "^K", label: "commands", priority: 30 });
-  await neosh.hint.set("keys", { keys: "F1", label: "keys", priority: 31 });
+  await neosh.hint.set("keys", { keys: "^Z", label: "keys", priority: 31 });
 }
 
 async function open(neosh: Neosh): Promise<void> {
@@ -196,7 +201,7 @@ async function showKeys(neosh: Neosh): Promise<void> {
   rows.push({ text: "" });
   rows.push({ text: "  any key closes this", heading: false });
 
-  // A second `<F1>` replaces the first window rather than stacking one behind it.
+  // A second `<C-z>` replaces the first window rather than stacking one behind it.
   await dismissKeys?.();
 
   const buf = await neosh.buf.create({ name: "[keys]", scratch: true });

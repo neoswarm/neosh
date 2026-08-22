@@ -2756,13 +2756,13 @@ impl Host {
             rows.push(String::new());
         }
         // The keys worth knowing before the first question — and the one most people never find,
-        // which is that the transcript is a place you can go. The rest of the table is on F1.
+        // which is that the transcript is a place you can go. The rest of the table is on `^Z`.
         let keys: [(&str, &str); 5] = [
             (if ascii { "Enter" } else { "\u{23ce}" }, "send"),
             ("^S", "browse & copy"),
             ("^P", "model"),
             ("^T", "projects"),
-            ("F1", "every key"),
+            ("^Z", "every key"),
         ];
         let mut line = String::from("  ");
         let mut spans = Vec::new();
@@ -2771,7 +2771,7 @@ impl Host {
             // As many as fit, in the order they are worth knowing. A row of hints that wraps is
             // two rows of hints, the second of which starts mid-phrase — and the whole point of
             // this line is to be readable at a glance. `^S` is second because it is the one most
-            // people never find; the ones that get dropped first are the ones `F1` also names.
+            // people never find; the ones that get dropped first are the ones `^Z` also names.
             let would = sep.len() + key.chars().count() + 1 + label.chars().count();
             if i > 0 && line.chars().count() + would > width {
                 break;
@@ -6994,7 +6994,7 @@ impl Host {
                 default: OptionValue::Bool(false),
                 description: Some(
                     "Show a shortcut row under the composer. Off by default: the sidebar's footer \
-                     carries the same keys and `F1` carries all of them, so the row mostly cost \
+                     carries the same keys and `^Z` carries all of them, so the row mostly cost \
                      the transcript a line."
                         .into(),
                 ),

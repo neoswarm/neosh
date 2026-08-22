@@ -2699,7 +2699,7 @@ function hints(opts: DrawOptions): ListRow<Target>[] {
   const lines = !opts.focused
     // `^O` is not here and `+ Add project` is a row you can see: a key strip has two lines, and the
     // verb with a row of its own is the one that can afford to give up its place on them.
-    ? ["^T projects  ^N new   ^F archive", "^K palette   ^B hide  F1 keys"]
+    ? ["^T projects  ^N new   ^F archive", "^K palette   ^B hide  ^Z keys"]
     : kind === "project"
       // `X` is on the strip because a list you cannot shorten is a list that grows forever, and a
       // project that outlives its conversations — which is the point of it — has to have a way off.
