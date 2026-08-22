@@ -822,8 +822,9 @@ fn switching_conversation_puts_the_transcript_back_at_the_end() {
     let sb = Sandbox::new("switchscroll");
     let mut s = sb.start();
     s.answered_and_reading();
+    s.chat_viewport(100, 6);
     s.to_top();
-    assert!(s.pump(|s| s.chat_scrolls().last() == Some(&0)), "at the top");
+    assert!(s.pump(|s| s.chat_scrolls().last() == Some(&Some(0))), "at the top");
 
     // Somewhere that is not the end, and not the beginning either.
     s.ch("j");
@@ -831,8 +832,36 @@ fn switching_conversation_puts_the_transcript_back_at_the_end() {
     let before = s.chat_scrolls().len();
 
     s.run_command("session.new", move |s| {
-        s.chat_scrolls().len() > before && s.chat_scrolls().last() == Some(&0)
+        s.chat_scrolls().len() > before && s.chat_scrolls().last() == Some(&None)
     });
+}
+
+/// Reading upwards ends at the top of the transcript, and not at the bottom of it.
+///
+/// Following the newest was encoded as row zero, so the first row of a conversation was the one
+/// place in it nothing could ask for: `^U` up to the top asked for `0`, which was read as "follow
+/// the tail", and the window drew the last screenful instead — cursor off screen, and nothing on
+/// the way there to say what had happened. The two are separate states now, and only one of them
+/// is a row.
+#[test]
+fn paging_up_to_the_top_stays_at_the_top() {
+    let sb = Sandbox::new("readtotop");
+    let mut s = sb.start();
+    s.answered_and_reading();
+    s.chat_viewport(100, 6);
+
+    // Half a screen at a time, the way `^U` does it, until the cursor can go no further up.
+    for _ in 0..40 {
+        s.press(json!({"kind": "char", "c": "u"}), &["ctrl"]);
+    }
+    // Pumped on the scroll rather than on the cursor: the two are one batch and the cursor moves
+    // first, so stopping at it answers from the events read *before* the window was told anything.
+    assert!(
+        s.pump(|s| s.chat_scrolls().last() == Some(&Some(0))),
+        "the window was told to draw from the first row, not put back at the end: {:?}",
+        s.chat_scrolls()
+    );
+    assert_eq!(s.chat_cursor(), Some(0), "and the cursor is on it");
 }
 
 /// And it takes the reader out with it.
@@ -907,13 +936,32 @@ impl Session {
     }
 
     /// Every row the transcript window has been told to start drawing at, in order.
-    fn chat_scrolls(&self) -> Vec<u64> {
+    ///
+    /// `None` is unscrolled — the frontend's own answer, which for a transcript is its last
+    /// screenful. A row of `Some(0)` is the top and is a different place, which is the whole point:
+    /// they shared an encoding, and the first row of a long answer was unreachable.
+    fn chat_scrolls(&self) -> Vec<Option<u64>> {
         let Some(win) = self.chat_win() else { return Vec::new() };
         self.events
             .iter()
             .filter(|e| e["type"] == "scroll_to" && e["win"].as_u64() == Some(win))
-            .filter_map(|e| e["top_line"].as_u64())
+            .map(|e| e["top_line"].as_u64())
             .collect()
+    }
+
+    /// Tell the core how tall the transcript really is.
+    ///
+    /// A stdio frontend has no geometry of its own, so nothing reports this unless a test does —
+    /// and keeping the cursor on screen is the one thing the reader cannot do without it. Left
+    /// unsaid, every motion here scrolls nothing at all and the assertions are about a window that
+    /// was never laid out.
+    fn chat_viewport(&mut self, width: u16, height: u16) {
+        assert!(self.pump(|s| s.chat_win().is_some()), "the transcript window exists");
+        let win = self.chat_win().expect("the transcript window");
+        self.send(
+            &json!({"type": "viewport_changed", "win": win, "width": width, "height": height,
+                    "top_line": 0}),
+        );
     }
 
     /// Run a registered command by name — the way a menu entry, a palette row or another plugin

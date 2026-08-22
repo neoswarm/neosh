@@ -132,6 +132,31 @@ is not on screen waits, says so in the footer, and opens when you switch to it. 
 takes its unanswered question with it — the driver has already told the agent, and a panel with
 nothing behind it is one whose `↵` writes into a pipe that has moved on.
 
+**Which conversation is asking is a fact about the conversation.** The footer can only ever say
+*how many* — it is one line and it is shared — so on its own it turns "somebody is waiting on you"
+into a hunt through the conversations for the one that is. Worse, the row you are hunting for is the
+one that looks least like it needs you: a conversation blocked on a question still has its turn in
+flight, so `active_turn` is set and every list draws it as thinking, identically to the twenty above
+it that really are.
+
+So the panel writes `question.asking` — the session ids currently waiting — as a **workspace var**,
+and the sidebar reads it. A var rather than this plugin's state for the ordinary reason (ADR 0040):
+it is about the conversations, not about us, and a question panel of your own writes the same key and
+lights up the same rows without either plugin knowing the other exists. Three things follow.
+
+*It outranks working.* Anything drawing a conversation has to check this before `active_turn`, or the
+spinner wins and the mark is never seen — which is the whole bug.
+
+*It moves, and `unread` does not.* `Status.Pending`, the palette's group for waiting on something
+outside the program, which is what the footer's `Question.Waiting` already links to. ADR 0042 argues
+a mark for news must be still, because news does not stop being true if you ignore it; this is the
+other case. A question is a *block* — nothing in that conversation goes on until you answer — and it
+ends the moment you do.
+
+*It is on disk and the queue is not.* `vars.json` is written through, and the asks live in memory, so
+a workspace that stopped with a question on screen would come back claiming one is still open. The
+panel therefore announces once at startup, when the queue is empty, and that write is what clears it.
+
 **Layout is in columns and marks are in bytes**, and confusing the two is not theoretical: the first
 build padded rows with `byteLength`, so `❯` — one column, three bytes — made every row with the
 cursor on it two columns short, and the shortcut column zig-zagged. The screenshot showed it

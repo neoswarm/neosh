@@ -469,8 +469,9 @@ const BLANK_MARKER = "  ";
  * A filterable list in a float. Resolves to the chosen value, or `null` if dismissed.
  *
  * Keys: printable characters filter, `<BS>` deletes, `↑`/`↓` and `<C-p>`/`<C-n>` move, `<CR>`
- * accepts, `<Esc>` dismisses. Everything else falls through to your existing bindings, so `<C-q>`
- * still quits while a picker is open.
+ * accepts, `<Esc>` dismisses. The float is **modal**, so nothing else reaches the workspace while
+ * it is up — `^N` over an open picker used to start a new conversation behind it — bar the keys in
+ * `ui.modal_escape_keys`, which is `<C-q>` and `<C-r>` unless you have said otherwise.
  *
  * Only one picker may be open per plugin at a time; opening a second dismisses the first, because
  * two modal lists competing for the keyboard is never what was meant.
@@ -506,6 +507,13 @@ export async function picker<T>(
     border: "rounded",
     focusable: true,
     closeOnBlur: true,
+    // Modal: nothing global resolves while this is up. Shadowing the keys a widget wants — which
+    // is what `bindWidgetKeys` does and still does — only ever covered the keys it uses; `^T`,
+    // `^G`, `^L` and the rest fell straight through and opened a second panel behind this one,
+    // with focus somewhere neither of them expected. `^Q` and `^R` still work, so a widget that
+    // fails to bind a way out is never a terminal somebody has to kill: see
+    // `ui.modal_escape_keys`.
+    modal: true,
     z: 200,
   });
 
@@ -591,20 +599,65 @@ export async function picker<T>(
     if (opts.title) lines.push(opts.title);
     if (filtering) lines.push(`> ${query}`);
 
-    const window = visible.slice(top, top + height);
-    if (window.length === 0) {
-      lines.push(`  ${opts.placeholder ?? "no matches"}`);
-    }
+    // The width the float was asked for *is* the width of its text: a border is drawn outside it,
+    // which is why `columnWidth` subtracts one from each side before opening a panel as wide as the
+    // dock. Measuring against anything else puts the last visible character on both lines — the
+    // continuation says `/ finds` under a row that already ended in `/`.
+    const inner = Math.max(8, width);
+    let window = visible.slice(top, top + height);
     // One gutter for the whole list, or none at all. Giving it only to the rows that asked for an
     // icon would step every other label one column left, which reads as a list that cannot decide
     // where its left margin is.
     const gutter = window.some((r) => r.item.icon) ? 2 : 0;
     const iconFor = (item: PickerItem<T>) =>
       gutter === 0 ? "" : item.icon ? `${item.icon} ` : "  ";
+    const textOf = (row: typeof window[number], on: boolean) =>
+      `${on ? "❯ " : "  "}${iconFor(row.item)}${row.item.label}${row.item.detail ? `  ${row.item.detail}` : ""}`;
+
+    // The row under the cursor says all of itself. A picker is a list of things you are choosing
+    // between, and two rows whose difference is past the right edge are two rows you cannot choose
+    // between — which is exactly what a long model id, a path, or a description does here. The
+    // rest goes underneath, only while the cursor is on it, so the list is still a list.
+    const on = visible[cursor];
+    /** The cursor row's first line, which is re-broken at a word when the row has to continue. */
+    let firstLine = on ? textOf(on, true) : "";
+    let rest: string[] = [];
+    if (on && columnsOf(firstLine) > inner) {
+      const head = `❯ ${iconFor(on.item)}${on.item.label}`;
+      const detail = on.item.detail ? `  ${on.item.detail}` : "";
+      // Only the detail is re-broken. The label is what the filter matched and what the match
+      // highlight is measured against, so it stays exactly where it was written; a row whose label
+      // alone overflows falls back to continuing from wherever the edge cut it.
+      if (detail !== "" && columnsOf(head) + 8 < inner) {
+        const [take, remainder] = takeWords(detail, inner - columnsOf(head));
+        firstLine = `${head}${take}`;
+        rest = remainder.trim() === "" ? [] : wrapToWidth(remainder.trim(), inner - 4);
+      } else {
+        rest = overflowOf(clipToWidth(firstLine, inner), firstLine, inner - 4);
+      }
+    }
+    // The unfolded row pays for its own continuation out of the list's rows rather than out of the
+    // float's height: the window was sized for `height` lines and growing past it would push the
+    // key strip off the bottom, which is the row that says how to get out.
+    if (rest.length > 0) {
+      const room = Math.max(1, height - rest.length);
+      if (cursor < top) top = cursor;
+      if (cursor >= top + room) top = cursor - room + 1;
+      window = visible.slice(top, top + room);
+    }
+
+    if (window.length === 0) {
+      lines.push(`  ${opts.placeholder ?? "no matches"}`);
+    }
+    /** Which of `lines` each visible row starts on, relative to the first list row. */
+    const lineFor: number[] = [];
+    const firstListLine = lines.length;
     for (const row of window) {
-      const mark = row.index === visible[cursor]?.index ? "❯ " : "  ";
-      const detail = row.item.detail ? `  ${row.item.detail}` : "";
-      lines.push(`${mark}${iconFor(row.item)}${row.item.label}${detail}`);
+      const isCursor = row.index === visible[cursor]?.index;
+      lineFor.push(lines.length - firstListLine);
+      lines.push(isCursor ? firstLine : textOf(row, false));
+      if (!isCursor) continue;
+      for (const line of rest) lines.push(`    ${line}`);
     }
     // Pushed onto the last row rather than floated: the float is sized for it, and a strip that
     // moved up as the list shortened would be a strip you have to look for.
@@ -614,7 +667,10 @@ export async function picker<T>(
     // float sized for exactly `height`, where it was silently clipped — leaving the empty state,
     // the one state where you most want to be told what the keys do, as the only one with no keys
     // on it.
-    const listRows = Math.max(1, window.length);
+    // Lines, not rows: the row under the cursor is more than one of them when it has unfolded, and
+    // counting rows here would leave the strip that many lines low — off the bottom of a float
+    // sized for exactly `height`.
+    const listRows = Math.max(1, lines.length - firstListLine);
     const hintLine = hints === "" ? -1 : lines.length + Math.max(0, height - listRows);
     if (hintLine >= 0) {
       while (lines.length < hintLine) lines.push("");
@@ -634,11 +690,16 @@ export async function picker<T>(
     const listTop = (opts.title ? 1 : 0) + (filtering ? 1 : 0);
     for (let i = 0; i < window.length; i++) {
       const row = window[i]!;
-      const line = listTop + i;
+      const line = listTop + (lineFor[i] ?? i);
       const isCursor = row.index === visible[cursor]?.index;
       const eol = byteLength(lines[line] ?? "");
       if (isCursor) {
         mark(line, 0, { hlGroup: "Picker.Selected", endCol: eol });
+        // The band covers the continuation too, so an unfolded row reads as one row that is
+        // several lines tall rather than as a selected row with loose text under it.
+        for (let k = 1; k <= rest.length; k++) {
+          mark(line + k, 0, { hlGroup: "Picker.Selected", endCol: byteLength(lines[line + k] ?? "") });
+        }
       }
       const icon = iconFor(row.item);
       const marker = byteLength(isCursor ? CURSOR_MARKER : BLANK_MARKER);
@@ -682,7 +743,7 @@ export async function picker<T>(
     // it marks the row instead.
     await neosh.win.setCursor(
       win,
-      filtering ? (opts.title ? 1 : 0) : listTop + (cursor - top),
+      filtering ? (opts.title ? 1 : 0) : listTop + (lineFor[cursor - top] ?? cursor - top),
       filtering ? byteLength(`> ${query}`) : 0,
     );
   };
@@ -930,6 +991,13 @@ export async function confirm(
     border: "rounded",
     focusable: true,
     closeOnBlur: true,
+    // Modal: nothing global resolves while this is up. Shadowing the keys a widget wants — which
+    // is what `bindWidgetKeys` does and still does — only ever covered the keys it uses; `^T`,
+    // `^G`, `^L` and the rest fell straight through and opened a second panel behind this one,
+    // with focus somewhere neither of them expected. `^Q` and `^R` still work, so a widget that
+    // fails to bind a way out is never a terminal somebody has to kill: see
+    // `ui.modal_escape_keys`.
+    modal: true,
     // Above a picker: this is asked *from* one often enough that being drawn under it would make
     // the workspace look wedged.
     z: 260,
@@ -1101,6 +1169,127 @@ function clipTo(text: string, width: number): string {
   return chars.length <= width ? text : `${chars.slice(0, Math.max(1, width - 1)).join("")}…`;
 }
 
+// ---------------------------------------------------------------------------
+// Showing the rest of a row
+// ---------------------------------------------------------------------------
+
+/**
+ * Break `text` into lines of at most `columns` **display columns**, splitting words that are wider
+ * than the column rather than letting them overflow it.
+ *
+ * The difference from {@link wrapText} is the whole reason both exist. That one counts code points
+ * and leaves a long word long, because it feeds a float that is sized with a column to spare and
+ * the frontend clips the overhang. This one feeds a *column of a row* — a description beside a
+ * label, a continuation under a title — where an overhanging word does not get clipped, it pushes
+ * whatever is to its right off the edge and takes the alignment of every row below it with it. A
+ * URL, a path or a `--flag=value` is routinely wider than the column it lands in, so this is the
+ * common case and not the exotic one.
+ *
+ * Measured with {@link width}, which is the op the renderer itself uses — so a CJK label and an
+ * ASCII one wrap at the same visual place.
+ */
+export function wrapToWidth(text: string, columns: number): string[] {
+  const limit = Math.max(1, Math.floor(columns));
+  const out: string[] = [];
+  for (const paragraph of text.split("\n")) {
+    let line = "";
+    for (const word of paragraph.split(/\s+/).filter((w) => w !== "")) {
+      const next = line === "" ? word : `${line} ${word}`;
+      if (width(next) <= limit) {
+        line = next;
+        continue;
+      }
+      if (line !== "") {
+        out.push(line);
+        line = "";
+      }
+      // A word that cannot fit a line of its own is cut across as many as it needs. Cutting is
+      // right here and wrong in prose: this is an identifier, not a sentence, and the alternative
+      // is not a nicer break but a row that is silently wider than its column.
+      let rest = word;
+      while (width(rest) > limit) {
+        const head = clipToWidth(rest, limit);
+        if (head === "") break;
+        out.push(head);
+        rest = rest.slice(head.length);
+      }
+      line = rest;
+    }
+    out.push(line);
+  }
+  return out.length > 0 ? out : [""];
+}
+
+/**
+ * The part of `full` that `shown` did not get to say, as lines of `columns` columns.
+ *
+ * `shown` is the row as it was actually written — clipped, and ending in an ellipsis if it was.
+ * The ellipsis is dropped before comparing, so what comes back starts exactly where the visible
+ * text stopped, and the two read as one sentence broken across a line.
+ *
+ * Empty when nothing was lost, which is the common case and has to cost nothing: a list of short
+ * rows must not grow a blank line under the cursor.
+ */
+export function overflowOf(shown: string, full: string, columns: number): string[] {
+  if (full === "" || columns < 1) return [];
+  // Everything before the ellipsis is what actually reached the screen. What comes *after* it is
+  // decoration that survived the clip — an unread dot, a count, a state glyph pinned to the end of
+  // the row — and it is not part of the text, so it is neither compared against `full` nor said
+  // again underneath.
+  const cut = shown.lastIndexOf("…");
+  const visible = cut >= 0 ? shown.slice(0, cut) : shown;
+  // Nothing was lost. The common case, and it has to cost nothing: a list of short rows must not
+  // grow a blank line under the cursor.
+  if (visible.startsWith(full)) return [];
+  // A `full` that is not a continuation of what is on screen means the caller built the two
+  // differently rather than by clipping one from the other. The whole of it is then the honest
+  // thing to show, because there is no prefix to trust.
+  const rest = full.startsWith(visible) ? full.slice(visible.length) : full;
+  if (rest.trim() === "") return [];
+  return wrapToWidth(rest.replace(/^\s+/, ""), columns);
+}
+
+/**
+ * As much of `text` as fits `columns` **without breaking a word**, and the rest of it.
+ *
+ * What a row's first line needs. {@link overflowOf} continues from wherever the clip landed, which
+ * is right when the clip is somebody else's — the row is already drawn and ends in an ellipsis that
+ * says so. When the row is *ours* to lay out, breaking `work` into `wor` and `k` is a choice, and a
+ * bad one: the eye stops at the ragged edge and the reader spends a beat rejoining a word instead of
+ * reading the sentence.
+ *
+ * A single word wider than the column is cut anyway. There is nothing else to do with it, and the
+ * alternative — a first line left empty — is worse.
+ */
+export function takeWords(text: string, columns: number): [string, string] {
+  const limit = Math.max(1, Math.floor(columns));
+  if (width(text) <= limit) return [text, ""];
+  // Split keeping the separators, so what is left over is the exact remainder of the original
+  // rather than a rejoin of it: two spaces after a full stop stay two spaces.
+  const parts = text.split(/(\s+)/);
+  let head = "";
+  for (const part of parts) {
+    const next = head + part;
+    if (width(next.trimEnd()) > limit) break;
+    head = next;
+  }
+  if (head.trim() === "") head = clipToWidth(text, limit);
+  return [head.trimEnd(), text.slice(head.length)];
+}
+
+/**
+ * {@link width}, under a name nothing shadows.
+ *
+ * `picker` binds `width` to its own float's column count, which is a number — so calling the
+ * measuring function inside it is a type error at best and a silent wrong answer at worst.
+ */
+const columnsOf = width;
+
+/** How many columns of leading space `text` has. */
+function leading(text: string): number {
+  return text.length - text.replace(/^ +/, "").length;
+}
+
 /**
  * Type a directory path, with completion as you go.
  *
@@ -1155,6 +1344,13 @@ export async function prompt(
     border: "rounded",
     focusable: true,
     closeOnBlur: true,
+    // Modal: nothing global resolves while this is up. Shadowing the keys a widget wants — which
+    // is what `bindWidgetKeys` does and still does — only ever covered the keys it uses; `^T`,
+    // `^G`, `^L` and the rest fell straight through and opened a second panel behind this one,
+    // with focus somewhere neither of them expected. `^Q` and `^R` still work, so a widget that
+    // fails to bind a way out is never a terminal somebody has to kill: see
+    // `ui.modal_escape_keys`.
+    modal: true,
     z: 200,
   });
 
@@ -1225,14 +1421,18 @@ export async function prompt(
 /**
  * Route every widget key to the widget's own handler while its window is focused.
  *
- * A raw capture only receives what *no binding claimed*, which is the right default — it is what
- * stops a modal swallowing `<C-q>`. But it also means `<C-n>` never reaches a picker, because
- * `<C-n>` is bound globally to "new conversation": you would be typing a filter and suddenly find
- * yourself in a new conversation with the picker gone.
+ * A raw capture only receives what *no binding claimed*. That used to be the whole story, and it
+ * meant `<C-n>` never reached a picker: `<C-n>` is bound globally to "new conversation", so you
+ * would be typing a filter and suddenly find yourself in a new conversation with the picker gone.
  *
  * Window-scoped bindings outrank global ones and are dropped with the window, so a widget owns its
  * keys for exactly as long as it is on screen and not one keystroke longer. Modes are enumerated
  * because a binding is per mode and a picker can be opened from any of them.
+ *
+ * These floats are also `modal`, which is the other half and the half this could not be: a widget
+ * can name the keys it *wants* and never the ones it merely does not want to happen. Both are
+ * needed — modality stops `<C-t>` opening a panel behind the picker, and these bindings are what
+ * point `<C-n>` at "next" rather than at nothing.
  */
 async function bindWidgetKeys(
   neosh: Neosh,
@@ -1493,6 +1693,36 @@ export function money(usd: number): string {
  */
 export interface ListRow<T = unknown> {
   text: string;
+  /**
+   * The whole of what this row says, when `text` is a clipped version of it.
+   *
+   * A panel is a column of fixed width and a conversation title is not, so rows get cut — and a row
+   * cut at the edge is a row you cannot read, which in a list of conversations means you cannot
+   * tell two of them apart. Set this to the row as it *would* have been written with unlimited
+   * room, and the list shows the rest of it on continuation lines whenever the cursor is on that
+   * row, folding back to one line the moment the cursor leaves.
+   *
+   * The cursor is what asks. Only one row can be under it, so only one row is ever more than a line
+   * tall, and the column stays scannable — which is the thing a list is for and the thing that
+   * wrapping everything all the time takes away.
+   *
+   * Include the same prefix `text` has: the marker, the glyph, the indent. What comes back is the
+   * difference between the two, so `text: "  ▸ some long ti…"` with `full: "  ▸ some long title"`
+   * continues with `tle` and not with the glyph again. Leave out anything the clip *kept* — a
+   * trailing unread dot, a count — since that is already on screen and saying it twice under the
+   * row is how a marker stops meaning anything. Nothing happens without
+   * {@link CursoredListOptions.width}, because nothing here can measure a column it was not told
+   * about.
+   */
+  full?: string;
+  /**
+   * The column continuation lines line up under. Defaults to the row's own indent plus two.
+   *
+   * Set it where the default would be wrong — a row whose text starts with a marker and a glyph
+   * has its *content* several columns in from its indent, and continuations that ignore that read
+   * as a second row rather than as the rest of this one.
+   */
+  indent?: number;
   /** Highlight group for the whole row. Link to one the theme defines. */
   hl?: string;
   /**
@@ -1513,6 +1743,15 @@ export interface CursoredListOptions {
   cursorHl?: string;
   /** Called after every move, with the row landed on. */
   onMove?(index: number): void;
+  /**
+   * How many columns the panel has, asked at render time.
+   *
+   * Asked rather than passed once, because a panel is resized and a width captured at construction
+   * is a width that goes stale on the first drag. Without it {@link ListRow.full} does nothing:
+   * a plugin cannot measure the dock it was given, and guessing is how a continuation line ends up
+   * wrapping one column past the edge for the rest of the session.
+   */
+  width?(): number;
 }
 
 /**
@@ -1612,10 +1851,19 @@ export class CursoredList<T = unknown> {
    */
   async render(opts: { showCursor?: boolean; win?: WindowId } = {}): Promise<void> {
     const cursorHl = this.opts.cursorHl ?? "Sidebar.Selected";
-    const drawn: DrawnRow[] = this.rows.map((row, i) => {
+    const columns = this.opts.width?.() ?? 0;
+    const drawn: DrawnRow[] = [];
+    /** Which buffer line each row starts on. Not the row's index once anything has unfolded. */
+    const lineOf: number[] = [];
+    /** How tall the cursor's row turned out, so scrolling can keep all of it on screen. */
+    let block = 1;
+
+    this.rows.forEach((row, i) => {
+      lineOf[i] = drawn.length;
       const eol = byteLength(row.text);
+      const onCursor = opts.showCursor !== false && i === this.cursor;
       const marks: DrawnMark[] = [];
-      if (opts.showCursor !== false && i === this.cursor && eol > 0) {
+      if (onCursor && eol > 0) {
         marks.push({ col: 0, opts: { hlGroup: cursorHl, endCol: eol, priority: 200 } });
       }
       if (row.hl && eol > 0) {
@@ -1639,7 +1887,23 @@ export class CursoredList<T = unknown> {
           },
         });
       }
-      return { text: row.text, marks };
+      drawn.push({ text: row.text, marks });
+
+      // The rest of a row that did not fit, under the row and only while the cursor is on it.
+      if (!onCursor || row.full === undefined || columns < 1) return;
+      const indent = Math.max(0, Math.min(row.indent ?? leading(row.text) + 2, columns - 8));
+      const rest = overflowOf(row.text, row.full, columns - indent);
+      block = 1 + rest.length;
+      for (const line of rest) {
+        const text = `${" ".repeat(indent)}${line}`;
+        const end = byteLength(text);
+        const cont: DrawnMark[] = [];
+        // The band runs the whole block. A continuation drawn on the terminal background reads as
+        // a separate row that happens to be indented, which is the one thing it must not be.
+        cont.push({ col: 0, opts: { hlGroup: cursorHl, endCol: end, priority: 200 } });
+        if (row.hl) cont.push({ col: 0, opts: { hlGroup: row.hl, endCol: end } });
+        drawn.push({ text, marks: cont });
+      }
     });
 
     // One call, not one per mark. A panel that wrote its text, cleared its namespace and then set
@@ -1648,14 +1912,20 @@ export class CursoredList<T = unknown> {
     // full of running agents was flashing.
     await this.neosh.buf.render(this.buf, this.ns, 0, -1, drawn);
 
-    // Keep the cursor on screen without recentring on every keystroke.
+    // Keep the cursor on screen without recentring on every keystroke. In buffer lines, not row
+    // indices: an unfolded row is several lines tall and the two stopped agreeing the moment one
+    // was — which would scroll to the wrong place by however many rows above it had ever unfolded.
     if (opts.win !== undefined && opts.showCursor !== false) {
       const v = await this.neosh.win.viewport(opts.win).catch(() => null);
       if (v && v.height > 0) {
+        const at = lineOf[this.cursor] ?? this.cursor;
+        // The whole of the row, not only the line it starts on: scrolling until the *first* line
+        // is visible leaves the continuation you unfolded it for below the bottom edge.
+        const end = at + Math.min(block, v.height) - 1;
         const top = v.top_line;
-        if (this.cursor < top) await this.neosh.win.scrollTo(opts.win, this.cursor);
-        else if (this.cursor >= top + v.height) {
-          await this.neosh.win.scrollTo(opts.win, this.cursor - v.height + 1);
+        if (at < top) await this.neosh.win.scrollTo(opts.win, at);
+        else if (end >= top + v.height) {
+          await this.neosh.win.scrollTo(opts.win, end - v.height + 1);
         }
       }
     }
@@ -1794,6 +2064,13 @@ export async function railPicker<G, T>(
     border: "rounded",
     focusable: true,
     closeOnBlur: true,
+    // Modal: nothing global resolves while this is up. Shadowing the keys a widget wants — which
+    // is what `bindWidgetKeys` does and still does — only ever covered the keys it uses; `^T`,
+    // `^G`, `^L` and the rest fell straight through and opened a second panel behind this one,
+    // with focus somewhere neither of them expected. `^Q` and `^R` still work, so a widget that
+    // fails to bind a way out is never a terminal somebody has to kill: see
+    // `ui.modal_escape_keys`.
+    modal: true,
     z: 200,
   });
 
@@ -1934,13 +2211,26 @@ export async function railPicker<G, T>(
     return { text, marks };
   };
 
-  const paneCell = (row: PaneRow | undefined, on: boolean): { text: string; marks: Mark[] } => {
+  /**
+   * One row of the list, and — when the cursor is on it — the rest of what it had to say.
+   *
+   * `more` is what makes the three columns bearable. A model row is a name, a rung and a sentence
+   * about it inside 45% of half a float, so the sentence is the first thing cut and the sentence is
+   * the whole reason a catalogue of forty models is choosable at all. It goes under the row rather
+   * than beside it, because the columns are what let you read *down* the list and widening one for
+   * the row you are on would move the other two every time you pressed a key.
+   */
+  const paneCell = (
+    row: PaneRow | undefined,
+    on: boolean,
+  ): { text: string; marks: Mark[]; more: string[] } => {
     const marks: Mark[] = [];
-    if (!row) return { text: "", marks };
+    const more: string[] = [];
+    if (!row) return { text: "", marks, more };
     if (row.kind === "section") {
       const text = `   ${open.has(row.name) || query !== "" ? "▾" : "▸"} ${row.count} ${row.name}`;
       marks.push({ from: 0, to: byteLength(text), hl: on ? "Picker.Selected" : "Comment" });
-      return { text, marks };
+      return { text, marks, more };
     }
     const { item } = row;
     const badge = item.badge?.text ?? "";
@@ -1950,10 +2240,18 @@ export async function railPicker<G, T>(
     const badgeWidth = badge === "" ? 0 : 10;
     const labelWidth = Math.max(10, Math.floor((paneWidth - 3 - badgeWidth) * 0.45));
     const head = on ? " ❯ " : "   ";
-    const label = padToWidth(clipToWidth(item.label, labelWidth), labelWidth);
-    const badgeCell = badgeWidth === 0 ? "" : padToWidth(clipToWidth(badge, badgeWidth), badgeWidth);
     const room = paneWidth - width(head) - labelWidth - badgeWidth;
-    const text = `${head}${label}${badgeCell}${clipToWidth(detail, Math.max(0, room))}`;
+    // On the cursor's row the columns are broken at words and continued underneath; everywhere else
+    // they are clipped, because a list of forty models is read by running an eye down it.
+    const [labelHead, labelRest] = on
+      ? takeWords(item.label, labelWidth)
+      : [clipToWidth(item.label, labelWidth), ""];
+    const [detailHead, detailRest] = on
+      ? takeWords(detail, Math.max(0, room))
+      : [clipToWidth(detail, Math.max(0, room)), ""];
+    const label = padToWidth(labelHead, labelWidth);
+    const badgeCell = badgeWidth === 0 ? "" : padToWidth(clipToWidth(badge, badgeWidth), badgeWidth);
+    const text = `${head}${label}${badgeCell}${detailHead}`;
 
     const labelAt = byteLength(head);
     const offsets = byteOffsets(item.label);
@@ -1967,13 +2265,30 @@ export async function railPicker<G, T>(
       const at = labelAt + byteLength(label);
       marks.push({ from: at, to: at + byteLength(badgeCell), hl: item.badge?.hl ?? "Comment" });
     }
-    if (detail !== "") {
+    if (detailHead !== "") {
       const at = labelAt + byteLength(label) + byteLength(badgeCell);
       marks.push({ from: at, to: byteLength(text), hl: "Picker.Detail" });
     }
     if (item.disabled) marks.push({ from: 0, to: byteLength(text), hl: "Comment" });
     if (on) marks.push({ from: 0, to: byteLength(text), hl: "Picker.Selected", priority: 1 });
-    return { text, marks };
+
+    if (on) {
+      // The name first, if the name itself did not fit — an id is what you are choosing by, and
+      // half of one is not a thing you can choose by.
+      const nameCol = width(head);
+      if (labelRest.trim() !== "") {
+        for (const line of wrapToWidth(labelRest.trim(), Math.max(8, paneWidth - nameCol - 2))) {
+          more.push(`${" ".repeat(nameCol)}${line}`);
+        }
+      }
+      const detailCol = nameCol + labelWidth + badgeWidth;
+      if (detailRest.trim() !== "") {
+        for (const line of wrapToWidth(detailRest.trim(), Math.max(8, paneWidth - detailCol - 1))) {
+          more.push(`${" ".repeat(detailCol)}${line}`);
+        }
+      }
+    }
+    return { text, marks, more };
   };
 
   interface Mark {
@@ -1988,8 +2303,13 @@ export async function railPicker<G, T>(
     // from under the provider you are looking at.
     if (railAt < railTop) railTop = railAt;
     if (railAt >= railTop + height) railTop = railAt - height + 1;
+    // The unfolded row is paid for out of the list rather than out of the float: growing the float
+    // instead would move the key strip under the reader's eyes on every keystroke, and the strip
+    // is the row that says how to get out.
+    const unfolded = focus === "pane" ? paneCell(rows[cursor], true).more.length : 0;
+    const room = Math.max(1, height - unfolded);
     if (cursor < paneTop) paneTop = cursor;
-    if (cursor >= paneTop + height) paneTop = cursor - height + 1;
+    if (cursor >= paneTop + room) paneTop = cursor - room + 1;
 
     const lines: string[] = [];
     const marks: { line: number; mark: Mark }[] = [];
@@ -2017,11 +2337,32 @@ export async function railPicker<G, T>(
     const empty = rows.length === 0
       ? `   ${query === "" ? (opts.placeholder ?? "nothing here") : "no matches"}`
       : null;
+
+    // The two columns are filled independently and then zipped, because they no longer advance
+    // together: the pane's cursor row is several lines tall when it has unfolded, and the rail
+    // beside it must keep listing providers one per line rather than skipping the ones the
+    // unfolded row happened to sit across.
+    const paneLines: { text: string; marks: Mark[] }[] = [];
+    if (empty !== null) {
+      paneLines.push({ text: empty, marks: [{ from: 0, to: byteLength(empty), hl: "Comment" }] });
+    } else {
+      for (let i = paneTop; i < rows.length && paneLines.length < height; i++) {
+        const on = focus === "pane" && i === cursor;
+        const cell = paneCell(rows[i], on);
+        paneLines.push({ text: cell.text, marks: cell.marks });
+        if (!on) continue;
+        for (const text of cell.more) {
+          paneLines.push({
+            text,
+            marks: [{ from: 0, to: byteLength(text), hl: "Picker.Selected", priority: 1 }],
+          });
+        }
+      }
+    }
+
     for (let i = 0; i < height; i++) {
       const left = railCell(railRows[railTop + i], focus === "rail" && railTop + i === railAt);
-      const right = empty !== null && i === 0
-        ? { text: empty, marks: [{ from: 0, to: byteLength(empty), hl: "Comment" }] }
-        : paneCell(rows[paneTop + i], focus === "pane" && paneTop + i === cursor);
+      const right = paneLines[i] ?? { text: "", marks: [] as Mark[] };
       const line = lines.length;
       lines.push(`${left.text}${RULE_V}${right.text}`);
       for (const m of left.marks) marks.push({ line, mark: m });

@@ -21,14 +21,19 @@ pub struct Window {
     pub layout: WindowLayout,
     /// `(row, byte_col)` in the buffer.
     pub cursor: (u32, u32),
-    /// The first buffer row the window was last asked to show.
+    /// The first buffer row the window was last asked to show, or `None` for unscrolled.
     ///
     /// What was *asked for*, not what the frontend reported drawing — the two differ for exactly
     /// as long as it takes a frame to come back, and the frontend's report is the one that arrives
     /// too late to be scrolled from. Kept here rather than only in whoever did the scrolling
     /// because a client attaching to a workspace that is already running has to be told where the
     /// transcript sits, and "wherever the top is" would drop it back to the beginning.
-    pub top_line: u32,
+    ///
+    /// `None` is unscrolled and is the frontend's decision — the end of a transcript, the start of
+    /// everything else — which is why it is an `Option` rather than a row that happens to be zero.
+    /// Row zero is a place you can scroll to, and it stopped being reachable the moment it shared
+    /// an encoding with "wherever this window starts".
+    pub top_line: Option<u32>,
     /// Where a selection started, if one is running. The other end is always the cursor.
     ///
     /// Held per window rather than per buffer: the same buffer shown twice is two places you can
@@ -50,7 +55,7 @@ impl Window {
             buf,
             layout,
             cursor: (0, 0),
-            top_line: 0,
+            top_line: None,
             anchor: None,
             goal_col: None,
             viewport: None,
@@ -73,6 +78,14 @@ impl Window {
     pub fn close_on_blur(&self) -> bool {
         match &self.layout {
             WindowLayout::Float { config } => config.close_on_blur,
+            WindowLayout::Docked { .. } => false,
+        }
+    }
+
+    /// Whether this window takes the keyboard to itself. See [`FloatConfig::modal`].
+    pub fn modal(&self) -> bool {
+        match &self.layout {
+            WindowLayout::Float { config } => config.modal,
             WindowLayout::Docked { .. } => false,
         }
     }

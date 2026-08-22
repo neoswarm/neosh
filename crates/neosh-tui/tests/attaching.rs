@@ -98,7 +98,7 @@ fn a_workspace() -> (Editor, BufferId, neosh_proto::WindowId) {
         other => panic!("{other:?}"),
     };
 
-    e.apply(&p, ApiCall::WinScrollTo { win: main, top_line: 12 }).expect("scroll");
+    e.apply(&p, ApiCall::WinScrollTo { win: main, top_line: Some(12) }).expect("scroll");
     e.apply(&p, ApiCall::WinSetCursor { win: bottom, row: 0, col: 5 }).expect("cursor");
     e.apply(&p, ApiCall::FocusPush { win: bottom }).expect("focus");
     (e, chat, main)

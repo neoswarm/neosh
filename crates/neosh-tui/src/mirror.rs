@@ -23,7 +23,8 @@ pub struct MirrorWindow {
     pub buf: BufferId,
     pub layout: WindowLayout,
     pub cursor: (u32, u32),
-    pub top_line: u32,
+    /// `None` is unscrolled: the end of a window that follows its tail, the start of every other.
+    pub top_line: Option<u32>,
 }
 
 #[derive(Debug, Clone)]
@@ -90,7 +91,7 @@ impl Mirror {
                     buf,
                     layout,
                     cursor: (0, 0),
-                    top_line: 0,
+                    top_line: None,
                 });
                 if !self.window_order.contains(&win) {
                     self.window_order.push(win);

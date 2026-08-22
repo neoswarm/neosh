@@ -35,7 +35,7 @@ export type UiEvent =
   | { "type": "window_buffer"; win: WindowId; buf: BufferId }
   | { "type": "window_closed"; win: WindowId }
   | { "type": "cursor_moved"; win: WindowId; row: number; col: number }
-  | { "type": "scroll_to"; win: WindowId; top_line: number }
+  | { "type": "scroll_to"; win: WindowId; top_line: number | null }
   | { "type": "highlight_defined"; name: string; def: HighlightDef }
   | { "type": "surface_claimed"; surface: SurfaceId; win: WindowId; rect: Rect }
   | { "type": "surface_cells"; surface: SurfaceId; cells: Array<SurfaceCell> }

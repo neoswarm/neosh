@@ -31,4 +31,33 @@ export type FloatConfig = {
    * Whether the float can take focus at all. `false` for passive hints and hover cards.
    */
   focusable: boolean;
+  /**
+   * While this float has focus, global bindings stop resolving.
+   *
+   * # Why this is not "bind over the keys you care about"
+   *
+   * That is what every panel here did, and it only ever worked for the keys the panel itself
+   * used. A widget shadows `<C-n>` because *it* wants `<C-n>` for "next" — so `<C-t>`, `<C-g>`,
+   * `<C-l>` and the rest still fell through to the workspace, and pressing one over an open
+   * picker opened a second panel behind the first and left focus somewhere neither of them
+   * expected. A control that is on screen for two seconds cannot be asked to enumerate every
+   * key the program will ever bind; the question it can answer is "does anything else reach me",
+   * and the answer for a panel you are answering a question with is no.
+   *
+   * Window, buffer and kind scopes still resolve, so a modal is exactly as extensible as any
+   * other panel: a third party binds against its **kind** and that binding is nearer than a
+   * global one, which is the ordering [`KeymapScope`](crate::KeymapScope) already promises.
+   *
+   * # The escape hatches survive
+   *
+   * `ui.modal_escape_keys` — `<C-q>` and `<C-r>` by default — resolve globally anyway. A modal
+   * that failed to bind a way out would otherwise be a terminal you have to kill, and "the
+   * panel is buggy" must never be the same event as "the program is gone". It is an option
+   * rather than a constant because which keys those are is the user's, like every other key
+   * here.
+   *
+   * A key nothing claimed is *swallowed* rather than reported unhandled: a modal that let
+   * characters through to the composer would be typing into a field you cannot see.
+   */
+  modal: boolean;
 };

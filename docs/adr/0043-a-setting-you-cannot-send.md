@@ -36,9 +36,15 @@ So they travel in the message, and the plumbing is generic:
 * A select declares `prompt_injected_values`; **the value id is the word**. Nothing between the
   catalogue and the driver holds a table of magic strings.
 * A boolean declares `prompt_injected_word`, for the switches that are a yes/no rather than a rung.
-  Orchestration is not a point on a depth ladder: you can want a fleet of sub-agents on a shallow
-  turn, and asking for one by moving a slider marked "how hard should it think" is a control that
-  does two things and says one.
+  The mechanism stays; nothing on `claude-cli` uses it any more. `ultracode` shipped as one of these
+  on the reasoning that orchestration is not a point on a depth ladder — you can want a fleet of
+  sub-agents on a shallow turn, and asking for one by moving a slider marked "how hard should it
+  think" is a control that does two things and says one. True of the mechanism, wrong about the
+  choice. Nobody sets a reasoning level and then separately decides how hard the harness should
+  work: they pick one thing off one scale and get on with it, and a switch under the ladder drawn
+  `off / on` is a second question about the same decision. It is a rung now, past the top, beside
+  `ultrathink`. The cost is that the two are mutually exclusive, because one message carries one of
+  these words — "ultracode at max effort" was expressible and almost nobody meant it.
 * `neosh_provider::injection` takes the words out of the selection and puts them in the message.
 
 Three properties fall out of doing it in the agent rather than in a driver:

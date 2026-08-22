@@ -618,9 +618,10 @@ pub fn draw(frame: &mut Frame, mirror: &Mirror, theme: &Theme) -> Option<(u16, u
                         _ => BorderType::Rounded,
                     },
                 );
-                b = b.border_style(
-                    theme.style(config.border_hl.as_deref().unwrap_or("Float.Border")),
-                );
+                b = b.border_style(border_style(
+                    theme,
+                    config.border_hl.as_deref().unwrap_or("Float.Border"),
+                ));
                 if let Some(t) = &config.title {
                     b = b.title(Span::styled(t.clone(), theme.style("Float.Title")));
                 }
@@ -644,9 +645,12 @@ pub fn draw(frame: &mut Frame, mirror: &Mirror, theme: &Theme) -> Option<(u16, u
 
         // Follow the tail. Taking the *first* n lines shows a long conversation's opening and
         // never its answer, which is the wrong end of every transcript ever written. An explicit
-        // `top_line` still means "start here", so paging keeps working.
+        // `top_line` still means "start here", so paging keeps working — and `Some(0)` is one of
+        // those, not this. Read as "unscrolled" it was impossible to scroll to the first row of a
+        // transcript: asking put the window back at the last one.
         let height = inner.height as usize;
-        let lines: Vec<Line> = if w.follows_tail() && w.top_line == 0 && rendered.len() > height {
+        let unscrolled = w.follows_tail() && w.top_line.is_none();
+        let lines: Vec<Line> = if unscrolled && rendered.len() > height {
             rendered[rendered.len() - height..].to_vec()
         } else {
             rendered.into_iter().take(height).collect()
@@ -705,6 +709,27 @@ pub fn draw(frame: &mut Frame, mirror: &Mirror, theme: &Theme) -> Option<(u16, u
 /// Shared by drawing and by the caret, which is the point: gravity moves content down by however
 /// many rows it falls short, and the caret has to move by the *same* number. Two calculations of
 /// "how many lines is this" would agree until the first wrapped line, and then quietly stop.
+/// A float's border style, with whatever motion its group carries applied to the frame as a whole.
+///
+/// A `Block` draws its own glyphs and takes one style for all of them, so a border cannot carry a
+/// travelling gradient the way a run of text can. What it *can* carry is the colour that gradient
+/// is currently passing through: animate one cluster, keep the style it came back with, and the
+/// whole frame drifts together. Which is the better reading anyway — a rainbow chasing itself
+/// round a border is something you end up watching, and a border is the edge of the thing you are
+/// meant to be looking at.
+///
+/// Gated on `ui.motion` like every other animation here, and `Animation::Flash` never fires: it
+/// counts from the moment its *mark* first appeared and a border has no mark.
+fn border_style(theme: &Theme, name: &str) -> ratatui::style::Style {
+    let base = theme.style(name);
+    match theme.animation(name).filter(|_| theme.motion()) {
+        Some(anim) => crate::shimmer::animate("─", base, anim, theme.truecolor(), None)
+            .first()
+            .map_or(base, |span| span.style),
+        None => base,
+    }
+}
+
 fn rendered_lines(
     mirror: &Mirror,
     w: &crate::mirror::MirrorWindow,
@@ -721,7 +746,7 @@ fn rendered_lines(
         .map(|b| {
             b.lines
                 .iter()
-                .skip(w.top_line as usize)
+                .skip(w.top_line.unwrap_or(0) as usize)
                 .flat_map(|l| render_line_in(l, theme, Some(width as usize)))
                 .flat_map(|l| if wraps { wrap_line(&l, width as usize) } else { vec![l] })
                 .map(|l| fill_to_edge(l, width as usize))
@@ -792,8 +817,9 @@ fn caret_position(
 
     // Saturating throughout: a row far below `top_line` must clamp to "off-screen" rather than
     // wrap around into a plausible-looking coordinate.
-    let mut line = u16::try_from(row.saturating_sub(w.top_line)).unwrap_or(u16::MAX);
-    line = line.saturating_add(virt_rows_before(buffer, w.top_line, row));
+    let top = w.top_line.unwrap_or(0);
+    let mut line = u16::try_from(row.saturating_sub(top)).unwrap_or(u16::MAX);
+    line = line.saturating_add(virt_rows_before(buffer, top, row));
     // Content pushed down by gravity takes the caret with it.
     if let WindowLayout::Docked { gravity: neosh_proto::Gravity::End, .. } = &w.layout {
         let rows = rendered_lines(mirror, w, theme, inner.width).len();

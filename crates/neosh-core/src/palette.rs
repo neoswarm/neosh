@@ -552,6 +552,18 @@ pub fn groups(variant: Variant) -> Vec<(&'static str, HighlightDef)> {
         // what it has to say is "this is not one of the normal settings" — and that is a thing no
         // amount of amber can say. See `Animation::Spectrum`.
         ("Option.Beyond", spec(spectrum(bold(lit(r.accent)), 3200))),
+        // The value the arrow keys are on *right now*, as against the value in effect on a row
+        // they are not. Reverse, which the rules at the top of this file reserve for selection —
+        // and this is selection. It exists because a ladder with one rung lit looks exactly the
+        // same whether or not pressing `←` would move it: the panel was a live control that read
+        // as a summary, and the answer to "is this a thing I can change" has to be legible before
+        // anybody presses a key to find out. Rows the cursor is not on keep their rung on the
+        // ramp, because that is a statement about the setting rather than about the cursor.
+        ("Option.Cursor", spec(reverse(bold(fg(r.accent))))),
+        // The chevrons that say a row is a horizontal control. Drawn on every row so the shape is
+        // learnt once, lit only on the one the keys act on.
+        ("Option.Rail", spec(dim(fg(r.faint)))),
+        ("Option.RailLive", spec(bold(fg(r.accent)))),
         // The value you just settled on, for the moment before the panel closes. Reverse, which
         // the rules at the top of this file reserve for selection and for the one-shot "it moved
         // there" flash — this is the second of those, and it is the only acknowledgement a control

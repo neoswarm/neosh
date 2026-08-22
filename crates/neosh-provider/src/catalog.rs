@@ -108,16 +108,6 @@ fn boolean(id: &str, label: &str, desc: &str) -> ProviderOptionDescriptor {
     }
 }
 
-/// A switch that is a word in the message rather than a parameter. The id is the word.
-fn spoken(id: &str, label: &str, desc: &str) -> ProviderOptionDescriptor {
-    ProviderOptionDescriptor::Boolean {
-        id: id.into(),
-        label: label.into(),
-        description: Some(desc.into()),
-        current_value: false,
-        prompt_injected_word: Some(id.into()),
-    }
-}
 /// How a reasoning level reads in a list.
 ///
 /// Title case for almost all of them, and a lookup for the ones where it is wrong: `xhigh` is a
@@ -172,11 +162,31 @@ const EFFORT_46: &[&str] = &["low", "medium", "high", "max"];
 /// Advertising them where they do not work would be worse than not having them: the picker would
 /// offer a level that silently does nothing, on the one provider where the same word does something
 /// real — and "it worked yesterday" would be a difference of instance nobody can see.
-const CLAUDE_WORDS: &[Magic] = &[Magic {
-    id: "ultrathink",
-    label: "Ultrathink",
-    description: "Past the top of the ladder — said in the message, not sent as a level.",
-}];
+///
+/// # Why both of them are rungs
+///
+/// `ultracode` used to be a switch of its own, on the reasoning that orchestration is not depth and
+/// a control that does two things says one. Which is true of the *mechanism* and wrong about the
+/// choice: nobody sets a reasoning level and then separately decides how hard the harness should
+/// work, they pick one thing off one scale and get on with it — and a switch sitting under the
+/// ladder, drawn `off / on`, is a second question about the same decision. Every reference
+/// implementation that has shipped this puts it on the ladder for that reason.
+///
+/// The cost is real and is the point: these are mutually exclusive now, because one message
+/// carries one of these words. "Ultracode at max effort" is no longer expressible — it was, and
+/// almost nobody meant it.
+const CLAUDE_WORDS: &[Magic] = &[
+    Magic {
+        id: "ultracode",
+        label: "Ultracode",
+        description: "Let it orchestrate sub-agents by default. Slower, and thorough.",
+    },
+    Magic {
+        id: "ultrathink",
+        label: "Ultrathink",
+        description: "Past the top of the ladder — said in the message, not sent as a level.",
+    },
+];
 
 /// One entry in the Anthropic catalogue.
 ///
@@ -340,15 +350,6 @@ pub fn claude_cli_models() -> Vec<ModelInfo> {
             let mut descriptors = Vec::new();
             if let Some(levels) = efforts {
                 descriptors.push(effort_with(levels, "high", CLAUDE_WORDS));
-                // Orchestration rather than depth, so a switch of its own rather than a rung on the
-                // effort ladder: you can want a fleet of sub-agents on a shallow turn, and asking
-                // for one by moving a slider marked "how hard should it think" is a control that
-                // does two things and says one.
-                descriptors.push(spoken(
-                    "ultracode",
-                    "Ultracode",
-                    "Let it orchestrate sub-agents by default. Slower, and thorough.",
-                ));
             } else {
                 descriptors.push(boolean(
                     "thinking",
@@ -1035,14 +1036,22 @@ mod tests {
         else {
             panic!("expected an effort select");
         };
-        assert_eq!(prompt_injected_values, &["ultrathink".to_string()]);
-        assert_eq!(options.last().map(|o| o.id.as_str()), Some("ultrathink"), "past the top rung");
+        assert_eq!(
+            prompt_injected_values,
+            &["ultracode".to_string(), "ultrathink".to_string()],
+            "both words are rungs on the one ladder"
+        );
+        let tail: Vec<&str> = options.iter().rev().take(2).map(|o| o.id.as_str()).collect();
+        assert_eq!(tail, ["ultrathink", "ultracode"], "past the top rung, in order");
+        // And nowhere else. A switch left behind would be a second control for a choice the ladder
+        // now owns, and turning it on beside `max` would put a word in the message that the level
+        // beside it contradicts.
         assert!(
-            cli.capabilities.option_descriptors.iter().any(|d| matches!(
+            !cli.capabilities.option_descriptors.iter().any(|d| matches!(
                 d,
-                ProviderOptionDescriptor::Boolean { prompt_injected_word: Some(w), .. } if w == "ultracode"
+                ProviderOptionDescriptor::Boolean { prompt_injected_word: Some(_), .. }
             )),
-            "orchestration is a switch of its own, not a rung on the depth ladder"
+            "no spoken switch survives beside the ladder"
         );
 
         let api = find(&anthropic_models(), "claude-opus-5");
