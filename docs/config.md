@@ -154,19 +154,36 @@ footer.
 ```
 New conversation
 >
-❯ Here                  /home/you/work/project
-  In a new worktree…    a branch of its own, checked out somewhere else
-  fix/thing             worktree  ·  ~/.nsh/project/fix-thing
-  Another directory…    somewhere else entirely
+❯ ● Here                       /home/you/work/project
+  + In a new worktree          a clean branch, named for you, nothing to answer
+  + In a new worktree, named…  a branch of its own, checked out somewhere else
+  ⎇ fix/thing                  worktree  ·  ~/.nsh/project/fix-thing
+  → api                        on studio  ·  /home/you/work/api
+  … Another directory…         somewhere else entirely
 ```
 
 `Here` is selected, so `^N ⏎` is what `^N` always did. Outside a git repository the question has
 one answer and is not asked at all — `^N` stays a single key everywhere the choice would be
 theatre. `session.new.here` skips it unconditionally, for a key of your own.
 
-Choosing it asks one question — the branch. The location is a setting, and asking again would be
-asking somebody to repeat themselves; the message says where it landed. `git.worktree.new <branch>
-<path>` takes an explicit path for the times you want one.
+**`n` in the project panel asks the same question**, about the project the cursor is on rather than
+the conversation you are in. It used to create one outright, and that was the bug: one letter and a
+modifier apart, doing visibly different things. `Here` is still the first row, so `n ⏎` is what `n`
+always did — and because the question is about the row and not about you, the worktrees offered are
+that repository's.
+
+The second row is the one you want most days. **A worktree with nothing to answer**: the branch is
+named for you — two words, `brisk-otter`, a thing you can say out loud and find again in a list of
+eight of them — it lands under `worktree.root`, and you are in it. Naming a branch before you know
+what the work is is a decision made at the worst possible moment, and having to make it is what
+stops people reaching for a clean tree at all. Renaming it later is `git branch -m`, like any other
+branch. It is `git.worktree.new.auto` for a key or a script.
+
+The row below it is the same thing when you *do* know the name, and it asks exactly one question —
+the branch. The location is a setting, and asking again would be asking somebody to repeat
+themselves; the message says where it landed. `git.worktree.new <branch> [path] [cwd]` takes an
+explicit path for the times you want one, and a repository for the times it is not the one you are
+in.
 
 A worktree is listed by the repository it belongs to and the branch it is on — `neosh · fix/thing`
 — rather than by its directory name. The directory is named by whoever created it, and a panel of

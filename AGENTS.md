@@ -319,7 +319,7 @@ registry — this table is what ships.
 | `^T` | Projects and conversations. Switching is never refused — turns keep running where they are |
 | `^J` | The computers in this workspace. Add one by its address, allow one that is asking, or open what it is running |
 | `^F` | What you have archived. Filter it, put one back, or finally throw it away |
-| `^N` | New conversation. In a repository it asks where: here, a new worktree, an existing one, elsewhere |
+| `^N` | New conversation. In a repository it asks where: here, a worktree you need not name, one you do, an existing one, another machine, elsewhere |
 | `^O` | Add a project |
 | `^B` | Toggle the sidebar |
 | `^K` | Command palette |
@@ -412,7 +412,7 @@ says how many are asking, `^T` is where you go, and it opens when you get there.
 |---|---|
 | `↵` | Open a conversation, fold a project, or add one from the `+` row |
 | `j` `k` | Move |
-| `n` | New conversation here |
+| `n` | New conversation — the same question `^N` asks, about the project the cursor is on |
 | `o` | Add a project |
 | `f` | Pin a project to the top |
 | `J` `K` | Reorder within a group |
