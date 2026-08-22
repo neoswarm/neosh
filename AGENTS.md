@@ -165,6 +165,15 @@ per decision, and records the *reasoning*, not the choice.
   what the alternative is — the destructive answer wears `Diagnostic.Error`, and the cursor starts
   on the one that changes nothing. `ui.confirm_destructive = false` is the way out, and it is the
   user's setting rather than the program's guess. See ADR 0039.
+- **A worktree lives inside its project, and a display string is not a grouping key.** The sidebar
+  nests a worktree under the repository it is a tree of, named by its branch — four scratch trees
+  of one repository are not four projects — and it groups on `SessionInfo::repo_root`, never by
+  parsing `neosh · fix/thing` back apart. Each nested tree is an ordinary project row: its own
+  fold, rank and `n`; counts, unread marks and recency fold upward into the repository's row. A
+  *relative* `worktree.root` puts trees inside the repository as `<repo>/<configured>/<branch>` —
+  no `<repo>` level, nothing else's trees can land there — and `add_worktree` writes the directory
+  into `.git/info/exclude`, or every `git status` reads as one giant untracked directory. See ADR
+  0046.
 - **What you have archived is not in the sidebar.** The panel is the list you work in; a section of
   things you are finished with is the only part of that column that is never the answer, and it
   grows forever. One row with a count, `a` in the panel or `^F` anywhere, and it opens as a picker

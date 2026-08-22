@@ -250,6 +250,8 @@ impl Session {
                 .file_name()
                 .map(|n| n.to_string_lossy().into_owned())
                 .unwrap_or_else(|| self.cwd.display().to_string()),
+            repo_root: None,
+            branch: None,
             message_count: self.messages.len() as u32,
             active_turn: self.active_turn.clone(),
             turn_started_at: self.turn_started_at,
