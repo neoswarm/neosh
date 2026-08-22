@@ -64,7 +64,7 @@ struct View {
     ///
     /// Kept per view rather than merged on arrival because the merge has to be recomputed when a
     /// view *leaves*, and by then it is too late to ask the survivors what they think.
-    viewports: HashMap<WindowId, (u16, u16, u32)>,
+    viewports: HashMap<WindowId, (u16, u16, u32, u32)>,
 }
 
 /// Everyone looking at this workspace.
@@ -76,7 +76,7 @@ pub struct Views {
     /// re-sent. Re-sending is not merely wasteful: `ViewportChanged` arms a redraw, which resolves
     /// geometry, which reports it again — the feedback loop `TerminalUi::reported` exists to break,
     /// and merging is a second place it can be re-tied.
-    merged: HashMap<WindowId, (u16, u16, u32)>,
+    merged: HashMap<WindowId, (u16, u16, u32, u32)>,
 }
 
 impl Views {
@@ -145,7 +145,12 @@ impl Views {
     /// moved. Width and height are the smallest reported; `top_line` comes from the same view as
     /// the smallest height, because a scroll position paired with somebody else's viewport is a
     /// number about a screen that does not exist.
-    pub fn viewport(&mut self, id: ViewId, win: WindowId, wht: (u16, u16, u32)) -> Option<InputEvent> {
+    pub fn viewport(
+        &mut self,
+        id: ViewId,
+        win: WindowId,
+        wht: (u16, u16, u32, u32),
+    ) -> Option<InputEvent> {
         if let Some((_, v)) = self.views.iter_mut().find(|(v, _)| *v == id) {
             v.viewports.insert(win, wht);
         }
@@ -172,22 +177,28 @@ impl Views {
     }
 
     fn merge(&mut self, win: WindowId) -> Option<InputEvent> {
-        let mut best: Option<(u16, u16, u32)> = None;
+        let mut best: Option<(u16, u16, u32, u32)> = None;
         for (_, v) in &self.views {
-            let Some(&(w, h, top)) = v.viewports.get(&win) else { continue };
+            let Some(&(w, h, top, rows)) = v.viewports.get(&win) else { continue };
             best = Some(match best {
-                None => (w, h, top),
-                // The narrowest width, the shortest height, and the `top_line` belonging to
-                // whichever view is shortest — that is the one a row has to be visible in.
-                Some((bw, bh, btop)) => (bw.min(w), bh.min(h), if h < bh { top } else { btop }),
+                None => (w, h, top, rows),
+                // The narrowest width, the shortest height, and the `top_line` and row count
+                // belonging to whichever view is shortest — that is the one a row has to be
+                // visible in, and the two of them describe one screen and have to come from it.
+                Some((bw, bh, btop, brows)) => (
+                    bw.min(w),
+                    bh.min(h),
+                    if h < bh { top } else { btop },
+                    if h < bh { rows } else { brows },
+                ),
             });
         }
-        let (width, height, top_line) = best?;
-        if self.merged.get(&win) == Some(&(width, height, top_line)) {
+        let (width, height, top_line, rows) = best?;
+        if self.merged.get(&win) == Some(&(width, height, top_line, rows)) {
             return None;
         }
-        self.merged.insert(win, (width, height, top_line));
-        Some(InputEvent::ViewportChanged { win, width, height, top_line })
+        self.merged.insert(win, (width, height, top_line, rows));
+        Some(InputEvent::ViewportChanged { win, width, height, top_line, rows })
     }
 }
 
@@ -265,15 +276,15 @@ mod tests {
         let win = WindowId(1);
 
         assert_eq!(
-            views.viewport(a, win, (100, 38, 12)),
-            Some(InputEvent::ViewportChanged { win, width: 100, height: 38, top_line: 12 })
+            views.viewport(a, win, (100, 38, 12, 38)),
+            Some(InputEvent::ViewportChanged { win, width: 100, height: 38, top_line: 12, rows: 38 })
         );
         assert_eq!(
-            views.viewport(b, win, (80, 22, 5)),
-            Some(InputEvent::ViewportChanged { win, width: 80, height: 22, top_line: 5 }),
+            views.viewport(b, win, (80, 22, 5, 22)),
+            Some(InputEvent::ViewportChanged { win, width: 80, height: 22, top_line: 5, rows: 22 }),
             "the shortest view's own scroll position, not a mix of two"
         );
-        assert_eq!(views.viewport(b, win, (80, 22, 5)), None, "an unchanged merge is not re-sent");
+        assert_eq!(views.viewport(b, win, (80, 22, 5, 22)), None, "an unchanged merge is not re-sent");
     }
 
     #[test]
@@ -282,14 +293,14 @@ mod tests {
         let (a, _a) = view(&mut views, (100, 40));
         let (b, _b) = view(&mut views, (80, 24));
         let win = WindowId(1);
-        views.viewport(a, win, (100, 38, 12));
-        views.viewport(b, win, (80, 22, 5));
+        views.viewport(a, win, (100, 38, 12, 38));
+        views.viewport(b, win, (80, 22, 5, 22));
 
         assert!(views.detach(b));
 
         assert_eq!(
             views.remerge(),
-            vec![InputEvent::ViewportChanged { win, width: 100, height: 38, top_line: 12 }],
+            vec![InputEvent::ViewportChanged { win, width: 100, height: 38, top_line: 12, rows: 38 }],
             "the survivor's geometry, said again because nothing else will say it"
         );
         assert!(views.remerge().is_empty(), "and only once");

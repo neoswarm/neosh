@@ -980,7 +980,7 @@ fn the_caret_lands_where_typing_goes() {
     let mut terminal = Terminal::new(TestBackend::new(20, 4)).unwrap();
     let t = theme();
     let mut caret = None;
-    terminal.draw(|f| caret = neosh_tui::render::draw(f, &m, &t)).unwrap();
+    terminal.draw(|f| caret = neosh_tui::render::draw(f, &m, &t).caret).unwrap();
     assert_eq!(caret, Some((5, 3)), "after the fifth column of the bottom row");
 }
 
@@ -1007,7 +1007,7 @@ fn the_caret_measures_columns_not_bytes() {
     let mut terminal = Terminal::new(TestBackend::new(20, 3)).unwrap();
     let t = theme();
     let mut caret = None;
-    terminal.draw(|f| caret = neosh_tui::render::draw(f, &m, &t)).unwrap();
+    terminal.draw(|f| caret = neosh_tui::render::draw(f, &m, &t).caret).unwrap();
     assert_eq!(caret, Some((3, 2)));
 }
 
@@ -1052,7 +1052,7 @@ fn a_focused_float_takes_the_caret() {
     let mut terminal = Terminal::new(TestBackend::new(30, 10)).unwrap();
     let t = theme();
     let mut caret = None;
-    terminal.draw(|f| caret = neosh_tui::render::draw(f, &m, &t)).unwrap();
+    terminal.draw(|f| caret = neosh_tui::render::draw(f, &m, &t).caret).unwrap();
     let (x, _) = caret.expect("the focused float owns the caret");
     // Centred float of width 10 on a 30-wide screen starts at column 10; four columns in is 14.
     assert_eq!(x, 14, "the caret is inside the float, not in the composer");
@@ -1066,7 +1066,7 @@ fn a_caret_scrolled_out_of_view_is_hidden_rather_than_parked() {
     let mut terminal = Terminal::new(TestBackend::new(20, 4)).unwrap();
     let t = theme();
     let mut caret = Some((0, 0));
-    terminal.draw(|f| caret = neosh_tui::render::draw(f, &m, &t)).unwrap();
+    terminal.draw(|f| caret = neosh_tui::render::draw(f, &m, &t).caret).unwrap();
     assert_eq!(caret, None);
 }
 
@@ -1257,7 +1257,7 @@ fn the_caret_moves_past_chrome_drawn_in_front_of_it() {
     let mut terminal = Terminal::new(TestBackend::new(20, 3)).unwrap();
     let t = theme();
     let mut caret = None;
-    terminal.draw(|f| caret = neosh_tui::render::draw(f, &m, &t)).unwrap();
+    terminal.draw(|f| caret = neosh_tui::render::draw(f, &m, &t).caret).unwrap();
     assert_eq!(caret, Some((4, 2)), "two columns of prompt, then two of text");
 }
 
@@ -1281,7 +1281,7 @@ fn a_line_drawn_above_the_first_row_pushes_the_caret_down() {
     let mut terminal = Terminal::new(TestBackend::new(20, 4)).unwrap();
     let t = theme();
     let mut caret = None;
-    terminal.draw(|f| caret = neosh_tui::render::draw(f, &m, &t)).unwrap();
+    terminal.draw(|f| caret = neosh_tui::render::draw(f, &m, &t).caret).unwrap();
     assert_eq!(caret, Some((2, 3)), "the rule takes the first of the two rows");
 }
 
@@ -1335,4 +1335,109 @@ fn the_default_gravity_leaves_content_where_it_has_always_been() {
     terminal.draw(|f| { neosh_tui::render::draw(f, &m, &t); }).unwrap();
     let top: String = (0..10).map(|x| terminal.backend().buffer()[(x, 0)].symbol()).collect();
     assert_eq!(top.trim_end(), "first");
+}
+
+// ---------------------------------------------------------------------------
+// The caret on a window that wraps
+// ---------------------------------------------------------------------------
+
+/// A transcript of paragraphs, and a caret that has to be on the row it is on.
+///
+/// The bug this is here for: the caret worked its screen row out as `cursor_row - top_line`, in
+/// buffer rows, while the draw counted wrapped rows. The two agree until the first line long enough
+/// to wrap and then diverge by one row per wrap — so a few paragraphs into a transcript the caret
+/// was drawn above where the character it was on had been drawn, and a few more in it was outside
+/// the window and therefore hidden. Which reads, exactly, as a mode with no cursor in it.
+fn wrapped_transcript(cursor: (u32, u32)) -> Mirror {
+    let mut m = Mirror::new();
+    m.apply(UiEvent::BufferOpened { buf: BufferId(1), name: "[chat]".into() });
+    m.apply(UiEvent::BufferLines {
+        buf: BufferId(1),
+        start: 0,
+        old_end: 0,
+        // Three rows of twenty columns each, in a window ten wide: six screen rows.
+        lines: vec![
+            line("aaaaaaaaaabbbbbbbbbb", vec![]),
+            line("ccccccccccdddddddddd", vec![]),
+            line("eeeeeeeeeeffffffffff", vec![]),
+        ],
+    });
+    m.apply(UiEvent::WindowOpened {
+        win: WindowId(1),
+        buf: BufferId(1),
+        layout: WindowLayout::Docked { dock: Dock::Main, size: None, gravity: Gravity::Start, wrap: None },
+    });
+    m.apply(UiEvent::ScrollTo { win: WindowId(1), top_line: Some(0) });
+    m.apply(UiEvent::CursorMoved { win: WindowId(1), row: cursor.0, col: cursor.1 });
+    m.apply(UiEvent::FocusChanged { win: Some(WindowId(1)) });
+    m
+}
+
+fn drawn(m: &Mirror, w: u16, h: u16) -> neosh_tui::render::Drawn {
+    let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
+    let t = theme();
+    let mut out = neosh_tui::render::Drawn::default();
+    terminal.draw(|f| out = neosh_tui::render::draw(f, m, &t)).unwrap();
+    out
+}
+
+#[test]
+fn the_caret_counts_the_rows_the_screen_has_rather_than_the_ones_the_buffer_has() {
+    // Row 2 column 0 is the fifth *screen* row: two buffer rows of two segments each above it.
+    let m = wrapped_transcript((2, 0));
+    assert_eq!(drawn(&m, 10, 6).caret, Some((0, 4)), "row four, not row two");
+    // And halfway along it is the sixth, because the caret wraps with the text it is on.
+    let m = wrapped_transcript((2, 15));
+    assert_eq!(drawn(&m, 10, 6).caret, Some((5, 5)));
+}
+
+/// The cursor is never off the window it is in.
+///
+/// `top_line` counts buffer rows, so a scroll that put the cursor on screen by that arithmetic can
+/// still leave it below the bottom edge once anything wraps — and a caret the renderer cannot place
+/// is one it turns off. The frontend is the only thing that knows how tall a row turned out to be,
+/// so keeping the cursor visible is its job and not the core's.
+#[test]
+fn a_wrapping_window_bends_its_scroll_to_keep_the_cursor_on_screen() {
+    // Three rows asked for from the top, in a window three tall: only the first one and a half fit,
+    // and the cursor is on the last.
+    let m = wrapped_transcript((2, 0));
+    let d = drawn(&m, 10, 3);
+    assert!(d.caret.is_some(), "the caret is somewhere on the screen, not hidden");
+    assert_eq!(d.caret, Some((0, 2)), "on the bottom row of the window");
+    // And it says what it actually drew, which is not what it was asked for. Everything that pages
+    // by a screenful reads this: `top_line` of zero here would mean "half a screen" was six rows.
+    assert_eq!(d.tops, vec![(WindowId(1), (1, 2))], "from row one, and two buffer rows of it");
+}
+
+/// A caret that would land outside is hidden rather than parked in a corner — but only when the
+/// window genuinely cannot show it, which for a cursor is never.
+#[test]
+fn a_window_with_no_cursor_in_it_still_reports_what_it_drew() {
+    let mut m = wrapped_transcript((0, 0));
+    m.apply(UiEvent::FocusChanged { win: None });
+    let d = drawn(&m, 10, 6);
+    assert_eq!(d.tops, vec![(WindowId(1), (0, 3))], "all three rows, from the first");
+}
+
+/// The block caret is a cell the frontend paints, not something the terminal is trusted to draw.
+///
+/// A terminal's own caret is a thin bar in most of them, and the one thing this has to do is be
+/// findable in a screenful of prose. The terminal is still told where it is and what shape to be —
+/// this is what makes it *visible*.
+#[test]
+fn a_block_caret_is_painted_over_the_character_it_is_on() {
+    let mut m = wrapped_transcript((0, 3));
+    m.apply(UiEvent::CursorShapeChanged { win: WindowId(1), shape: neosh_proto::CursorShape::Block });
+    let mut terminal = Terminal::new(TestBackend::new(10, 6)).unwrap();
+    let t = theme();
+    let mut out = neosh_tui::render::Drawn::default();
+    terminal.draw(|f| out = neosh_tui::render::draw(f, &m, &t)).unwrap();
+    let (x, y) = out.caret.expect("a caret");
+    let cell = terminal.backend().buffer().cell((x, y)).expect("a cell").clone();
+    assert!(
+        cell.modifier.contains(ratatui::style::Modifier::REVERSED),
+        "the cell under the caret is turned inside out: {cell:?}"
+    );
+    assert_eq!(cell.symbol(), "a", "and it is still the character that was there");
 }

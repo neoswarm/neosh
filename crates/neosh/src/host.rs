@@ -19,8 +19,8 @@ use neosh_proto::{
     Gravity,
     InputEvent,
     KeyCode, MessageLevel, Mode, OptionSpec, OptionType, OptionValue, PluginEvent, PluginId,
-    PluginInbound, PluginOutbound, PluginResponse, RequestId, TextEdit, UiEvent, VirtTextPos,
-    WindowId, WindowLayout,
+    PluginInbound, PluginOutbound, PluginResponse, RequestId, SelectShape, TextEdit, UiEvent,
+    VirtTextPos, WindowId, WindowLayout,
 };
 use neosh_provider::catalog;
 use neosh_script::{ScriptInbound, ScriptOutbound};
@@ -34,6 +34,7 @@ use crate::cards::{self, Glyphs, ToolState};
 use crate::config::{Config, Resolved};
 use crate::frontend::Frontend;
 use crate::services::Services;
+use crate::vim;
 
 /// How long mutations accumulate before a frame is emitted.
 const COALESCE: Duration = Duration::from_millis(16);
@@ -135,6 +136,43 @@ pub struct Bootstrap {
     pub reload: Box<dyn Fn() -> anyhow::Result<Resolved>>,
     pub cli_model: Option<String>,
     pub cli_plugin_dirs: Vec<std::path::PathBuf>,
+}
+
+/// What the transcript reader is waiting for, after a key that cannot act on its own.
+///
+/// One press each, and the key that follows spends it whatever that key turns out to be — a
+/// mistyped second key ends the sequence rather than leaving the next unrelated press to be
+/// swallowed by it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Pending {
+    /// `g`, waiting for `g`, `e`, `E`, `_` or `v`.
+    G,
+    /// `z`, waiting for where on the screen to put the cursor's line.
+    Z,
+    /// `y`, waiting for what to copy — one of the transcript's own, or a motion.
+    Yank,
+    /// `f`, `F`, `t` or `T`, waiting for a character. Takes the next key *literally*, which is why
+    /// it is answered before the count and before every table: `f5` finds a five.
+    Find { till: bool, back: bool },
+    /// `i` or `a`, waiting for which text object. `yank` is the difference between `viw` and `yiw`.
+    Object { around: bool, yank: bool },
+}
+
+/// Which text object a key names.
+fn object_for(ch: &str) -> Option<vim::Object> {
+    Some(match ch {
+        "w" => vim::Object::Word { big: false },
+        "W" => vim::Object::Word { big: true },
+        "p" => vim::Object::Paragraph,
+        "\"" => vim::Object::Quote('"'),
+        "'" => vim::Object::Quote('\''),
+        "`" => vim::Object::Quote('`'),
+        "(" | ")" | "b" => vim::Object::Pair('(', ')'),
+        "[" | "]" => vim::Object::Pair('[', ']'),
+        "{" | "}" | "B" => vim::Object::Pair('{', '}'),
+        "<" | ">" => vim::Object::Pair('<', '>'),
+        _ => return None,
+    })
 }
 
 pub struct Host {
@@ -258,12 +296,11 @@ pub struct Host {
     /// A place, not a focus: `j` moves there and types here, and one flag is a great deal easier to
     /// reason about than inferring intent from which window happens to be focused.
     reading: bool,
-    /// The first key of a two-key sequence in the transcript — `y` waiting to hear what to yank,
-    /// `g` waiting for the second `g`, `z` waiting for where to put the line.
+    /// What the transcript is waiting for, when a key has been pressed that cannot act on its own.
     ///
     /// Cleared by the key that follows, whatever it is, so a mistyped second key ends the sequence
     /// instead of leaving the next unrelated press to be swallowed by it.
-    reading_pending: Option<char>,
+    reading_pending: Option<Pending>,
     /// A count typed before a motion in the transcript — `5j`, `12G`.
     ///
     /// Kept as the digits rather than a number so that it can be shown while it is half typed: a
@@ -271,16 +308,29 @@ pub struct Host {
     /// that appears to have done nothing at all. Ended by whatever motion spends it, and by any
     /// key that is not one.
     reading_count: String,
-    /// Whether the running selection takes whole lines — `V` rather than `v`.
+    /// What the running selection means. `Exclusive` when there is none.
     ///
-    /// A flag rather than a second kind of selection, because there is one selection model here and
-    /// it is a pair of positions. "The whole line" is therefore something to re-establish after
-    /// every motion, in whichever direction the selection now runs. See [`Host::resnap_linewise`].
-    reading_linewise: bool,
+    /// The core's, not a flag of our own: linewise used to be an invariant this end re-established
+    /// after every motion — three API calls to move an anchor that is only settable by standing on
+    /// it — and every path that moved the cursor without knowing to run it left the wrong rows lit.
+    reading_shape: SelectShape,
+    /// The column `j` and `k` are trying to get back to, as a grapheme-cluster index.
+    ///
+    /// Ours rather than the window's, because reading resolves its own motions: `$` then `j` then
+    /// `j` walks down the right-hand edge of the transcript in Vim, and a column recomputed from
+    /// wherever the cursor landed on a short row cannot do that.
+    reading_goal: Option<u32>,
+    /// The last `f`/`F`/`t`/`T`, so `;` and `,` have something to repeat.
+    reading_find: Option<(char, bool, bool)>,
+    /// The selection `gv` puts back: its two ends and its shape, kept when one is given up.
+    reading_last_select: Option<((u32, u32), (u32, u32), SelectShape)>,
     /// The search being typed in the transcript, if one is.
     search: Option<SearchPrompt>,
     /// The last thing searched for, so `n` still works after the prompt has closed.
     searched: String,
+    /// Which way it was going, because `n` means "onwards" rather than "forwards": after `?foo`,
+    /// `n` is up the transcript and `N` is down it.
+    searched_back: bool,
     /// Highlights for search hits. Its own namespace so clearing them cannot take the transcript's
     /// own colour with it.
     search_ns: neosh_proto::NamespaceId,
@@ -719,9 +769,13 @@ impl Host {
             reading: false,
             reading_pending: None,
             reading_count: String::new(),
-            reading_linewise: false,
+            reading_shape: SelectShape::Exclusive,
+            reading_goal: None,
+            reading_find: None,
+            reading_last_select: None,
             search: None,
             searched: String::new(),
+            searched_back: false,
             search_ns,
             streaming: None,
             answer: None,
@@ -2254,7 +2308,16 @@ impl Host {
             // what it usually does, and you should be able to see that before you press one.
             "key"
         } else if self.reading {
-            "reading"
+            // And which *kind* of reading. A selection is the one state here where the same key
+            // does a different thing — `y` copies rows rather than characters, `esc` gives the
+            // selection up rather than the mode — and Vim says so in the same place for the same
+            // reason. `reading` when there is none, because that is the mode, not the absence of
+            // a selection.
+            match (self.chat_anchored(), self.reading_shape) {
+                (true, SelectShape::Line) => "visual line",
+                (true, _) => "visual",
+                _ => "reading",
+            }
         } else {
             match self.editor.mode() {
                 Mode::Chat => "chat",
@@ -2606,19 +2669,33 @@ impl Host {
             .map(|c| c.expanded);
         let tab = self.glyphs().tab;
         let mut pairs: Vec<(&str, &str)> = match self.reading_pending {
-            Some('y') => vec![
+            Some(Pending::Yank) => vec![
                 ("y", "line"),
                 ("c", "code block"),
                 ("m", "this turn"),
                 ("a", "everything"),
+                ("i", "inside"),
+                ("w $ j", "motion"),
             ],
-            Some('g') => vec![("g", "top")],
-            Some('z') => vec![("z", "centre"), ("t", "top"), ("b", "bottom"), ("a", "card")],
-            Some(_) => vec![],
+            Some(Pending::G) => vec![("g", "top"), ("e", "word end back"), ("v", "reselect")],
+            Some(Pending::Z) => {
+                vec![("z", "centre"), ("t", "top"), ("b", "bottom"), ("a", "card")]
+            }
+            // Waiting for a literal character, so listing keys would be a lie about what the next
+            // press does. The word is the whole message.
+            Some(Pending::Find { .. }) => vec![("", "a character")],
+            Some(Pending::Object { .. }) => {
+                vec![("w", "word"), ("p", "paragraph"), ("\" ' `", "quotes"), ("( [ {", "brackets")]
+            }
             None if self.chat_anchored() => vec![
                 ("y", "copy"),
                 ("hjkl", "extend"),
-                if self.reading_linewise { ("v", "characters") } else { ("V", "whole lines") },
+                match self.reading_shape {
+                    SelectShape::Line => ("v", "characters"),
+                    _ => ("V", "whole lines"),
+                },
+                ("o", "other end"),
+                ("iw", "word"),
                 ("esc", "drop"),
             ],
             None => vec![
@@ -3394,7 +3471,8 @@ impl Host {
         }
         self.reading = true;
         self.reading_pending = None;
-        self.reading_linewise = false;
+        self.reading_shape = SelectShape::Exclusive;
+        self.reading_goal = None;
         // And the keymap has to be told, or the sentence above is only true of the keys nobody
         // else wanted. Reading's keys arrive through [`Self::handle_unbound_key`], which is the
         // *last* thing consulted — so `^D` scrolled half a screen only until the git plugin bound
@@ -3414,8 +3492,15 @@ impl Host {
         let _ = self.editor.apply(&plugin, ApiCall::WinSelect { win: self.chat_win, on: false });
         // Start at the newest thing said rather than at line one: you came here to take something
         // out of the answer you are looking at.
-        let last = self.chat_lines().len().saturating_sub(1) as u32;
-        self.reading_jump((last, 0), false);
+        let lines = self.chat_lines();
+        let last = lines.len().saturating_sub(1) as u32;
+        // A block, because the cursor is now *on* a character rather than between two and every
+        // key is a verb. It is also the only thing on screen that says so before you press one.
+        let _ = self.editor.apply(&plugin, ApiCall::WinCursorShape {
+            win: self.chat_win,
+            shape: neosh_proto::CursorShape::Block,
+        });
+        self.reading_jump((last, vim::first_non_blank(lines.last().map(String::as_str).unwrap_or(""))));
         self.refresh_status();
         self.refresh_composer();
     }
@@ -3427,10 +3512,15 @@ impl Host {
         self.reading = false;
         self.reading_pending = None;
         self.reading_count.clear();
-        self.reading_linewise = false;
+        self.reading_shape = SelectShape::Exclusive;
+        self.reading_goal = None;
         self.editor.set_mode(self.mode_before_reading);
         self.clear_matches();
         let plugin = PluginId::from(BUILTIN);
+        let _ = self.editor.apply(&plugin, ApiCall::WinCursorShape {
+            win: self.chat_win,
+            shape: neosh_proto::CursorShape::Bar,
+        });
         let _ = self.editor.apply(&plugin, ApiCall::WinSelect { win: self.chat_win, on: false });
         let _ = self.editor.apply(&plugin, ApiCall::FocusPop);
         self.refresh_status();
@@ -3439,8 +3529,11 @@ impl Host {
 
     /// Keys while reading the transcript.
     ///
-    /// Motion extends the selection whenever one is running, so `v` then `j j j` selects three
-    /// lines — the modal behaviour, rather than requiring shift to be held for the whole journey.
+    /// Vim's, and resolved by [`crate::vim`] rather than by the core's [`CursorMotion`]: those are
+    /// a text field's motions, and a mode where the cursor sits *on* a character rather than
+    /// between two needs the other set of answers to `h` at column zero, to `$`, and to what a
+    /// selection with one end on the cursor contains. Motion extends a running selection without
+    /// being told to, which is what makes `v` and then three `j`s three lines.
     fn reading_key(&mut self, key: neosh_proto::KeyPress) {
         if self.search.is_some() {
             self.search_key(key);
@@ -3450,14 +3543,26 @@ impl Host {
             KeyCode::Char { c } => c.as_str(),
             _ => "",
         };
-        let select = self.chat_anchored() || key.mods.shift;
+
+        // `f`, `F`, `t` and `T` take the next keystroke as a *character* rather than as a command:
+        // `f5` finds a five and `fj` finds a `j`. Before the count and before every table below,
+        // each of which would otherwise claim it first.
+        if let Some(Pending::Find { till, back }) = self.reading_pending {
+            self.reading_pending = None;
+            let count = self.take_reading_count().unwrap_or(1);
+            if let Some(c) = ch.chars().next() {
+                self.reading_find = Some((c, till, back));
+                self.reading_motion(vim::Motion::Find { ch: c, till, back }, count);
+            }
+            self.refresh_composer();
+            return;
+        }
 
         // A count, typed before the motion it belongs to. Digits first, because `0` is also a
         // motion: it is the start of the line when nothing is pending and part of the number when
         // something is, which is what it means everywhere else these keys come from.
         if !key.mods.ctrl
             && !key.mods.alt
-            && self.reading_pending.is_none()
             && let Some(d) = ch.chars().next().filter(char::is_ascii_digit)
             && !(d == '0' && self.reading_count.is_empty())
         {
@@ -3481,16 +3586,28 @@ impl Host {
         // word right: three of the six scroll keys taken by the unmodified letters they happen to
         // share. `<C-d>`/`<C-u>` are half a screen because that is what they are everywhere; a full
         // screen with no overlap loses the line you were reading.
-        let page = self.chat_height().max(2);
+        //
+        // A screen is counted in *buffer rows on the screen*, which the frontend reports and the
+        // window's height is not: a transcript of paragraphs draws six rows in thirty cells, and
+        // half a screen taken as half the height is four screenfuls of scrolling.
+        let page = self.reading_page();
         let n = count as i64;
         if key.mods.ctrl {
             match ch {
-                "d" => return self.reading_by(n * page as i64 / 2, select),
-                "u" => return self.reading_by(-(n * page as i64 / 2), select),
-                "f" => return self.reading_by(n * page as i64, select),
-                "b" => return self.reading_by(-(n * page as i64), select),
-                "e" => return self.reading_by(n, select),
-                "y" => return self.reading_by(-n, select),
+                "d" => return self.reading_by(n * ((page as i64) + 1) / 2),
+                "u" => return self.reading_by(-(n * ((page as i64) + 1) / 2)),
+                "f" => return self.reading_by(n * page as i64),
+                "b" => return self.reading_by(-(n * page as i64)),
+                "e" => return self.reading_scroll(n),
+                "y" => return self.reading_scroll(-n),
+                // The one Vim key that genuinely is not here. Said rather than swallowed, because
+                // a chord that does nothing at all reads as a broken keyboard.
+                "v" => {
+                    return self.editor_message(
+                        MessageLevel::Info,
+                        "no blockwise selection here — `v` takes characters and `V` whole lines",
+                    );
+                }
                 _ => {}
             }
         }
@@ -3507,16 +3624,33 @@ impl Host {
         // mistyped `y` would sit there waiting to eat an unrelated keystroke later.
         if let Some(first) = self.reading_pending.take() {
             self.refresh_composer();
-            self.reading_pair(first, &key, ch, typed);
+            self.reading_pair(first, ch, typed);
             return;
         }
-        // `y` is the only one of the three that is two keys in one: an operator when nothing is
-        // selected, and "copy this" when something is. `g` and `z` mean the same thing either way,
-        // and gating them alongside it made both dead — `v` then `gg` could not extend to the top
-        // of the transcript, and `zz` could not recentre a selection you were in the middle of
-        // making, with no message either way to say why.
-        if matches!(ch, "g" | "z") || (ch == "y" && !self.chat_anchored()) {
-            self.reading_pending = ch.chars().next();
+
+        // The keys that cannot act on their own.
+        //
+        // `y` is the only one of them that is two things: an operator when nothing is selected, and
+        // "copy this" when something is. `g` and `z` mean the same either way, and gating them
+        // alongside it made both dead — `v` then `gg` could not extend to the top of the transcript
+        // and `zz` could not recentre a selection you were in the middle of making. `i` and `a` are
+        // the other way round: outside a selection they are how you get back to the composer, and
+        // only inside one are they the front half of a text object.
+        let opener = match ch {
+            "g" => Some(Pending::G),
+            "z" => Some(Pending::Z),
+            "y" if !self.chat_anchored() => Some(Pending::Yank),
+            "f" => Some(Pending::Find { till: false, back: false }),
+            "F" => Some(Pending::Find { till: false, back: true }),
+            "t" => Some(Pending::Find { till: true, back: false }),
+            "T" => Some(Pending::Find { till: true, back: true }),
+            "i" | "a" if self.chat_anchored() => {
+                Some(Pending::Object { around: ch == "a", yank: false })
+            }
+            _ => None,
+        };
+        if let Some(p) = opener {
+            self.reading_pending = Some(p);
             // Put the count back for the key that finishes the pair. `5gg` is one motion with a
             // number in front of it, and the first `g` is not the thing that spends it.
             if let Some(n) = typed {
@@ -3532,58 +3666,62 @@ impl Host {
         if ch == "G"
             && let Some(n) = typed
         {
-            self.reading_by_row(n, select);
-            return;
+            return self.reading_motion(vim::Motion::Row(n.saturating_sub(1)), 1);
         }
+
+        use vim::Motion as M;
         let motion = match (&key.code, ch) {
-            (KeyCode::Left, _) | (_, "h") => Some(CursorMotion::Left),
-            (KeyCode::Right, _) | (_, "l") => Some(CursorMotion::Right),
-            (KeyCode::Up, _) | (_, "k") => Some(CursorMotion::Up),
-            (KeyCode::Down, _) | (_, "j") => Some(CursorMotion::Down),
-            (_, "b") | (_, "B") => Some(CursorMotion::WordLeft),
-            (_, "w") | (_, "W") => Some(CursorMotion::WordRight),
-            (KeyCode::Home, _) | (_, "0") | (_, "^") => Some(CursorMotion::LineStart),
-            (KeyCode::End, _) | (_, "$") => Some(CursorMotion::LineEnd),
-            (_, "G") => Some(CursorMotion::BufEnd),
+            (KeyCode::Left, _) | (_, "h") => Some(M::Left),
+            (KeyCode::Right, _) | (_, "l") | (_, " ") => Some(M::Right),
+            (KeyCode::Up, _) | (_, "k") => Some(M::Up),
+            (KeyCode::Down, _) | (_, "j") => Some(M::Down),
+            (_, "w") => Some(M::WordRight { big: false }),
+            (_, "W") => Some(M::WordRight { big: true }),
+            (_, "b") => Some(M::WordLeft { big: false }),
+            (_, "B") => Some(M::WordLeft { big: true }),
+            (_, "e") => Some(M::WordEnd { big: false }),
+            (_, "E") => Some(M::WordEnd { big: true }),
+            (KeyCode::Home, _) | (_, "0") => Some(M::LineStart),
+            (_, "^") => Some(M::FirstNonBlank),
+            (KeyCode::End, _) | (_, "$") => Some(M::LineEnd),
+            (_, "G") => Some(M::BufEnd),
+            (_, "%") => Some(M::MatchPair),
+            // `;` repeats the last `f`/`t` and `,` repeats it the other way. Nothing to repeat is
+            // not an error — it is a key pressed before the one it belongs to.
+            (_, ";") => self.reading_find.map(|(c, till, back)| M::Find { ch: c, till, back }),
+            (_, ",") => self.reading_find.map(|(c, till, back)| M::Find { ch: c, till, back: !back }),
             _ => None,
         };
-        if let Some(motion) = motion {
-            // Repeated rather than computed: `5j` is five of what `j` does, including what it does
-            // at the ends and to the column it remembers, and a version of it that worked out a row
-            // number would be a second answer to a question the core already answers. The ends of
-            // the transcript are the exception — there is only one of each, and going there five
-            // times is going there.
-            let times = if matches!(motion, CursorMotion::BufEnd | CursorMotion::BufStart) {
-                1
-            } else {
-                count
-            };
-            for _ in 0..times {
-                let _ = self.editor.apply(&PluginId::from(BUILTIN), ApiCall::WinMotion {
-                    win: self.chat_win,
-                    motion,
-                    select,
-                });
+        if let Some(m) = motion {
+            // Shift on an arrow starts a selection the way it does in a text field. Only ever the
+            // arrows and the ends: `h` and `H` are different keys, not one key and a modifier.
+            if key.mods.shift && !self.chat_anchored() {
+                self.begin_select(SelectShape::Inclusive);
             }
-            self.resnap_linewise();
-            self.follow_cursor();
-            // The hint row says what the row under the cursor can do, so it moves with it.
-            self.refresh_composer();
-            return;
+            return self.reading_motion(m, count);
         }
 
         match (&key.code, ch) {
-            (KeyCode::PageDown, _) => self.reading_by(page as i64, select),
-            (KeyCode::PageUp, _) => self.reading_by(-(page as i64), select),
+            (KeyCode::PageDown, _) => self.reading_by(n * page as i64),
+            (KeyCode::PageUp, _) => self.reading_by(-(n * page as i64)),
 
             // The two things a transcript has that a file does not.
-            (_, "]") => self.reading_to_turn(1, select),
-            (_, "[") => self.reading_to_turn(-1, select),
-            (_, "}") => self.reading_to_block(1, select),
-            (_, "{") => self.reading_to_block(-1, select),
+            (_, "]") => self.reading_to_turn(1),
+            (_, "[") => self.reading_to_turn(-1),
+            (_, "}") => self.reading_to_block(1),
+            (_, "{") => self.reading_to_block(-1),
 
-            (_, "v") => self.select_as(false),
-            (_, "V") => self.select_as(true),
+            // Where the window is, rather than where the text is.
+            (_, "H") => self.reading_screen_row(count.saturating_sub(1)),
+            (_, "M") => self.reading_screen_row(page / 2),
+            (_, "L") => self.reading_screen_row(page.saturating_sub(count.max(1))),
+
+            (_, "v") => self.select_as(SelectShape::Inclusive),
+            (_, "V") => self.select_as(SelectShape::Line),
+            // Vim's `o`: the anchor becomes the cursor and the cursor the anchor, so the end you
+            // are extending is the other one. Without it a selection begun in the wrong direction
+            // is a selection to start again.
+            (_, "o") if self.chat_anchored() => self.swap_ends(),
 
             // A folded card opens; an open one folds. `Tab` because it is the key that toggles a
             // fold in every file tree and outliner; `za` for the Vim hands. See ADR 0033.
@@ -3593,14 +3731,16 @@ impl Host {
             (_, "?") => self.begin_search(true),
             (_, "n") => self.search_step(true),
             (_, "N") => self.search_step(false),
+            // The word under the cursor, searched for without typing it.
+            (_, "*") => self.search_word(true),
+            (_, "#") => self.search_word(false),
 
             // Yank with a selection running takes the selection, and leaves — you came here to
             // take something, and staying would mean pressing Esc every single time. Without one,
             // `y` has already been held as a pending operator above.
             (_, "y") if self.copy_selection(false) => self.leave_reading(),
-            // Anchored, but with the two ends in the same place: `v` and then `y` straight away.
-            // Unanchored, `y` never reaches here — it was held as a pending operator above — so
-            // this is only ever the empty selection, and silence there reads as a broken key.
+            // Anchored, but over nothing at all — which an inclusive selection cannot be, since it
+            // always contains the character the cursor is on. Only a `V` on an empty row gets here.
             (_, "y") => {
                 self.editor_message(MessageLevel::Warn, "nothing to copy — the selection is empty")
             }
@@ -3615,14 +3755,7 @@ impl Host {
             // half way up a turn, having decided you wanted a different piece of it. Leaving
             // outright there is a keystroke that undoes the wrong amount: the transcript is the
             // thing you were still reading.
-            (KeyCode::Esc, _) if self.chat_anchored() => {
-                self.reading_linewise = false;
-                let _ = self.editor.apply(&PluginId::from(BUILTIN), ApiCall::WinSelect {
-                    win: self.chat_win,
-                    on: false,
-                });
-                self.refresh_composer();
-            }
+            (KeyCode::Esc, _) if self.chat_anchored() => self.drop_selection(),
             (KeyCode::Esc, _) if !self.searched.is_empty() => {
                 self.searched.clear();
                 self.clear_matches();
@@ -3633,47 +3766,106 @@ impl Host {
         }
     }
 
-    /// The second key of a pair: `gg`, `zz`/`zt`/`zb`, and the `y` operator.
+    /// The second key of a pair: `gg`, `ge`, `gv`, `zz`, the `y` operator and a text object.
     ///
     /// `typed` is the count the *first* key put back for this one — `5gg` is one motion with a
     /// number in front of it, and the `g` that opened the pair is not what spends it.
-    fn reading_pair(&mut self, first: char, key: &neosh_proto::KeyPress, ch: &str, typed: Option<u32>) {
+    fn reading_pair(&mut self, first: Pending, ch: &str, typed: Option<u32>) {
+        // A key with no character on it — `Esc`, an arrow, `PgDn` — ends the sequence and does
+        // nothing else. Quietly: pressing `Esc` because you have changed your mind about a yank
+        // should not be answered with a sentence about what `y` takes.
+        if ch.is_empty() {
+            return;
+        }
+        let count = typed.unwrap_or(1);
+        let page = self.reading_page();
+        use vim::Motion as M;
         match (first, ch) {
-            ('g', "g") if typed.is_some() => {
-                let select = key.mods.shift || self.chat_anchored();
-                self.reading_by_row(typed.unwrap_or(1), select);
-            }
-            ('g', "g") => {
-                // Extends whenever a selection is running, exactly as `k` does. Shift alone would
-                // mean `v` then `gg` threw away what you had selected and jumped, which is the one
-                // thing nobody presses it for.
-                let select = key.mods.shift || self.chat_anchored();
-                let _ = self.editor.apply(&PluginId::from(BUILTIN), ApiCall::WinMotion {
-                    win: self.chat_win,
-                    motion: CursorMotion::BufStart,
-                    select,
-                });
-                self.resnap_linewise();
-                self.follow_cursor();
-            }
+            (Pending::G, "g") => match typed {
+                Some(n) => self.reading_motion(M::Row(n.saturating_sub(1)), 1),
+                None => self.reading_motion(M::BufStart, 1),
+            },
+            (Pending::G, "e") => self.reading_motion(M::WordEndBack { big: false }, count),
+            (Pending::G, "E") => self.reading_motion(M::WordEndBack { big: true }, count),
+            (Pending::G, "_") => self.reading_motion(M::LastNonBlank, count),
+            // The selection you last gave up, back again. What makes `Esc` cheap: dropping one to
+            // look at something is otherwise dropping one you have to make again.
+            (Pending::G, "v") => self.reselect(),
+
             // Where the cursor's line sits on screen. `zz` is the one worth having: it is how you
             // read an answer that ends at the bottom edge.
-            ('z', "z") => self.place_cursor_line(self.chat_height() / 2),
-            ('z', "t") => self.place_cursor_line(0),
-            ('z', "b") => self.place_cursor_line(self.chat_height().saturating_sub(1)),
-            ('z', "a") => self.toggle_card_here(),
+            (Pending::Z, "z" | ".") => self.place_cursor_line(page / 2),
+            (Pending::Z, "t") => self.place_cursor_line(0),
+            (Pending::Z, "b" | "-") => self.place_cursor_line(page.saturating_sub(1)),
+            (Pending::Z, "a") => self.toggle_card_here(),
 
-            ('y', "y") => self.yank_line(),
-            ('y', "c") => self.yank_code(),
-            ('y', "m") | ('y', "t") => self.yank_turn(),
-            ('y', "a") => {
+            (Pending::Yank, "y") => self.yank_line(),
+            (Pending::Yank, "c") => self.yank_code(),
+            (Pending::Yank, "m" | "t") => self.yank_turn(),
+            (Pending::Yank, "a") => {
                 self.select_all(self.chat_win);
                 if self.copy_selection(false) {
                     self.leave_reading();
                 }
             }
+            // `yi"`, `yiw`. Only the `i` half: `ya` is already "copy the whole transcript", which
+            // is documented, bound and older than this — so `yaw` is the one shape of this that
+            // cannot be had, and `viwy` is how you get it.
+            (Pending::Yank, "i") => {
+                self.reading_pending = Some(Pending::Object { around: false, yank: true });
+                self.refresh_composer();
+            }
+            // `y` over a motion: `yw`, `y$`, `y5j`, `yG`. Whatever the motion covers, from where
+            // the cursor is to where it would have gone.
+            (Pending::Yank, _) => match self.yank_motion_for(ch) {
+                Some(m) => self.yank_over(m, count),
+                None => self.editor_message(
+                    MessageLevel::Info,
+                    "y then a motion, or one of y c m a — `?` lists them",
+                ),
+            },
+
+            (Pending::Object { around, yank }, _) => {
+                if let Some(obj) = object_for(ch) {
+                    self.apply_object(obj, around, yank);
+                }
+            }
+            // Answered above, before the count and before every table: it takes a literal
+            // character, so it can never reach here.
+            (Pending::Find { .. }, _) => {}
             _ => {}
         }
+    }
+
+    /// The motions `y` will take as its second key.
+    ///
+    /// Not every motion in the table: `yy` is the line and `yc`, `ym` and `ya` are the transcript's
+    /// own three, so the letters they use are theirs. Everything here is a key that means the same
+    /// after `y` as it does on its own.
+    fn yank_motion_for(&self, ch: &str) -> Option<vim::Motion> {
+        use vim::Motion as M;
+        Some(match ch {
+            "w" => M::WordRight { big: false },
+            "W" => M::WordRight { big: true },
+            "b" => M::WordLeft { big: false },
+            "B" => M::WordLeft { big: true },
+            "e" => M::WordEnd { big: false },
+            "E" => M::WordEnd { big: true },
+            "h" => M::Left,
+            "l" | " " => M::Right,
+            "j" => M::Down,
+            "k" => M::Up,
+            "0" => M::LineStart,
+            "^" => M::FirstNonBlank,
+            "$" => M::LineEnd,
+            "G" => M::BufEnd,
+            "%" => M::MatchPair,
+            ";" => {
+                let (c, till, back) = self.reading_find?;
+                M::Find { ch: c, till, back }
+            }
+            _ => return None,
+        })
     }
 
     /// How many rows of transcript are on screen.
@@ -3706,30 +3898,10 @@ impl Host {
             .unwrap_or_default()
     }
 
-    /// Put the cursor somewhere, extending a selection if one is anchored.
-    ///
-    /// `WinSetCursor` leaves the anchor alone, which is exactly right: a jump with a selection
-    /// running should take the text it jumped over, and one without should not start a selection.
-    fn reading_jump(&mut self, at: (u32, u32), select: bool) {
-        if select && !self.chat_anchored() {
-            let _ = self
-                .editor
-                .apply(&PluginId::from(BUILTIN), ApiCall::WinSelect { win: self.chat_win, on: true });
-        }
-        if !select && self.chat_anchored() {
-            let _ = self.editor.apply(&PluginId::from(BUILTIN), ApiCall::WinSelect {
-                win: self.chat_win,
-                on: false,
-            });
-        }
-        let _ = self.editor.apply(&PluginId::from(BUILTIN), ApiCall::WinSetCursor {
-            win: self.chat_win,
-            row: at.0,
-            col: at.1,
-        });
-        self.resnap_linewise();
-        self.follow_cursor();
-        self.refresh_composer();
+    /// Go to a place in the transcript, extending a running selection over what was jumped.
+    fn reading_jump(&mut self, at: (u32, u32)) {
+        self.reading_goal = None;
+        self.place_cursor(at);
     }
 
     /// The count typed before a motion, if one was, and forget it.
@@ -3741,21 +3913,143 @@ impl Host {
         typed.parse::<u32>().ok().filter(|n| *n > 0)
     }
 
-    /// Go to a row, counted from one, the way `12G` counts.
-    fn reading_by_row(&mut self, row: u32, select: bool) {
-        let last = self.chat_lines().len().saturating_sub(1) as u32;
-        self.reading_jump((row.saturating_sub(1).min(last), 0), select);
-    }
-
-    /// Move `delta` rows, clamped to the transcript.
-    fn reading_by(&mut self, delta: i64, select: bool) {
-        let last = self.chat_lines().len().saturating_sub(1) as i64;
-        let row = (self.chat_cursor().0 as i64 + delta).clamp(0, last.max(0)) as u32;
-        self.reading_jump((row, 0), select);
-    }
-
     fn chat_cursor(&self) -> (u32, u32) {
         self.editor.window(self.chat_win).map(|w| w.cursor).unwrap_or((0, 0))
+    }
+
+    /// Put the cursor somewhere, keeping everything that follows it in step.
+    ///
+    /// `WinSetCursor` rather than `WinMotion`: the anchor is the selection's other end and it has
+    /// to stay exactly where it is, which is what makes a jump take the text it jumped over. The
+    /// core repaints the highlight either way — it did not always, and every jump the reader makes
+    /// extended a selection that could not be seen until the next `hjkl`.
+    fn place_cursor(&mut self, at: (u32, u32)) {
+        let at = vim::clamp(&self.chat_lines(), at);
+        let _ = self.editor.apply(&PluginId::from(BUILTIN), ApiCall::WinSetCursor {
+            win: self.chat_win,
+            row: at.0,
+            col: at.1,
+        });
+        self.follow_cursor();
+        // The hint row says what the row under the cursor can do, so it moves with it.
+        self.refresh_composer();
+    }
+
+    /// One motion, `count` times.
+    ///
+    /// Repeated rather than computed: `5j` is five of what `j` does, including what it does at the
+    /// ends and to the column it remembers. A motion that stops moving stops the count with it, so
+    /// `50j` at the bottom of the transcript is one press that goes nowhere rather than fifty.
+    fn reading_motion(&mut self, m: vim::Motion, count: u32) {
+        let lines = self.chat_lines();
+        let mut at = self.chat_cursor();
+        let mut goal = self.reading_goal;
+        // `$` is the third motion that leaves a column behind: it remembers "the end of the row",
+        // so `$jj` walks down the right-hand edge of the text the way it does in Vim.
+        let vertical = matches!(m, vim::Motion::Up | vim::Motion::Down | vim::Motion::LineEnd);
+        // The ends of the transcript and an absolute row are destinations, and going to one five
+        // times is going to it.
+        let once = matches!(m, vim::Motion::BufStart | vim::Motion::BufEnd | vim::Motion::Row(_));
+        for _ in 0..if once { 1 } else { count.max(1) } {
+            let step = vim::resolve(&lines, at, m, goal);
+            at = step.at;
+            goal = step.goal;
+            if !step.moved {
+                break;
+            }
+        }
+        // Cleared by anything horizontal, kept by `j` and `k`. Without it, going down past a short
+        // row and back up leaves the cursor at that row's width and it never finds its place again.
+        self.reading_goal = vertical.then_some(goal).flatten();
+        self.place_cursor(at);
+    }
+
+    /// Move by whole rows, keeping the column — what `^D`, `^U` and the page keys do.
+    ///
+    /// Expressed as that many `j`s rather than as arithmetic on a row number, so paging clamps,
+    /// remembers a column and lands on a real position by exactly the same rules one keypress does.
+    fn reading_by(&mut self, delta: i64) {
+        if delta == 0 {
+            return;
+        }
+        let m = if delta > 0 { vim::Motion::Down } else { vim::Motion::Up };
+        self.reading_motion(m, delta.unsigned_abs().min(u32::MAX as u64) as u32);
+    }
+
+    /// `^E` and `^Y`: move the *window*, and take the cursor along only if it would fall off.
+    ///
+    /// The other five scroll keys move the cursor and let the view follow. These two are the pair
+    /// that does it the other way round, which is the whole reason to have them.
+    fn reading_scroll(&mut self, delta: i64) {
+        let last = self.chat_lines().len().saturating_sub(1) as i64;
+        let page = self.reading_page() as i64;
+        let next = (self.chat_showing() as i64 + delta).clamp(0, last.max(0));
+        self.chat_top = Some(next as u32);
+        let _ = self.editor.apply(&PluginId::from(BUILTIN), ApiCall::WinScrollTo {
+            win: self.chat_win,
+            top_line: Some(next as u32),
+        });
+        let row = self.chat_cursor().0 as i64;
+        let want = row.clamp(next, (next + page - 1).min(last).max(next));
+        if want != row {
+            self.reading_by(want - row);
+        } else {
+            self.refresh_composer();
+        }
+    }
+
+    /// `H`, `M` and `L`: a row counted from the top of the *window* rather than of the transcript.
+    fn reading_screen_row(&mut self, offset: u32) {
+        let lines = self.chat_lines();
+        let last = lines.len().saturating_sub(1) as u32;
+        let page = self.reading_page();
+        let row = self.chat_showing().saturating_add(offset.min(page.saturating_sub(1))).min(last);
+        let col = vim::first_non_blank(lines.get(row as usize).map(String::as_str).unwrap_or(""));
+        self.reading_goal = None;
+        self.place_cursor((row, col));
+    }
+
+    /// Buffer rows on the screen, which is what a page is here.
+    ///
+    /// Reported by the frontend, because it is the only thing that knows: one buffer row of a
+    /// wrapped transcript is several rows of screen, and the window's height counts the wrong one.
+    /// Falling back to the height is what an unmeasured window gets, and it is never worse than
+    /// what this used to do unconditionally.
+    fn reading_page(&self) -> u32 {
+        self.editor
+            .window(self.chat_win)
+            .and_then(|w| w.viewport)
+            .map(|v| v.rows)
+            .filter(|r| *r > 0)
+            .unwrap_or_else(|| self.chat_height())
+            .max(1)
+    }
+
+    /// The first buffer row on the screen right now.
+    fn chat_showing(&self) -> u32 {
+        self.chat_top.unwrap_or_else(|| {
+            self.editor
+                .window(self.chat_win)
+                .and_then(|w| w.viewport)
+                .map(|v| v.top_line)
+                .unwrap_or(0)
+        })
+    }
+
+    /// `*` and `#`: search for the word under the cursor without typing it.
+    fn search_word(&mut self, forward: bool) {
+        let lines = self.chat_lines();
+        let Some(word) = vim::word_under(&lines, self.chat_cursor()) else {
+            return self.editor_message(MessageLevel::Info, "no word under the cursor");
+        };
+        self.searched = word;
+        self.searched_back = !forward;
+        let query = self.searched.clone();
+        self.highlight_matches(&query);
+        match self.find_from(&query, self.chat_cursor(), forward, false) {
+            Some(at) => self.reading_jump(at),
+            None => self.editor_message(MessageLevel::Warn, format!("only match for {query:?}")),
+        }
     }
 
     /// Rows where a turn begins: the first line of a question, marked by the bar down its left.
@@ -3779,7 +4073,7 @@ impl Host {
         out
     }
 
-    fn reading_to_turn(&mut self, dir: i32, select: bool) {
+    fn reading_to_turn(&mut self, dir: i32) {
         let here = self.chat_cursor().0;
         let rows = self.turn_rows();
         let next = if dir > 0 {
@@ -3788,7 +4082,7 @@ impl Host {
             rows.into_iter().rev().find(|r| *r < here)
         };
         match next {
-            Some(row) => self.reading_jump((row, 0), select),
+            Some(row) => self.reading_jump((row, 0)),
             None => self.editor_message(
                 MessageLevel::Info,
                 if dir > 0 { "no later turn" } else { "no earlier turn" },
@@ -3801,7 +4095,7 @@ impl Host {
     /// Which in this buffer is a paragraph, a list, a table and a code block all at once, because
     /// the markdown renderer separates every block with one — so `}` steps through an answer the
     /// way its author wrote it rather than by a fixed number of rows.
-    fn reading_to_block(&mut self, dir: i32, select: bool) {
+    fn reading_to_block(&mut self, dir: i32) {
         let lines = self.chat_lines();
         let last = lines.len().saturating_sub(1) as i64;
         let blank = |i: i64| lines.get(i as usize).is_none_or(|l| l.trim().is_empty());
@@ -3816,7 +4110,7 @@ impl Host {
         while at + step >= 0 && at + step <= last && blank(at) {
             at += step;
         }
-        self.reading_jump((at.clamp(0, last.max(0)) as u32, 0), select);
+        self.reading_jump((at.clamp(0, last.max(0)) as u32, 0));
     }
 
     /// Scroll so the cursor's line lands `at` rows down the window.
@@ -3836,74 +4130,147 @@ impl Host {
     /// Vim's, and not out of nostalgia: a second `v` meaning "no longer selecting" is what every
     /// hand expects, and having `V` restart from one line instead would throw away the four you had
     /// just extended over.
-    fn select_as(&mut self, linewise: bool) {
-        let plugin = PluginId::from(BUILTIN);
-        match (self.chat_anchored(), self.reading_linewise == linewise) {
-            (true, true) => {
-                self.reading_linewise = false;
-                let _ = self
-                    .editor
-                    .apply(&plugin, ApiCall::WinSelect { win: self.chat_win, on: false });
-            }
+    fn select_as(&mut self, shape: SelectShape) {
+        match (self.chat_anchored(), self.reading_shape == shape) {
+            (true, true) => self.drop_selection(),
             // Between the two shapes, keeping both ends: `v` narrows a linewise selection back to
             // where the cursor actually is, and `V` widens the one you have to whole lines.
-            (true, false) => {
-                self.reading_linewise = linewise;
-                self.resnap_linewise();
-            }
-            (false, _) => {
-                self.reading_linewise = linewise;
-                let _ = self
-                    .editor
-                    .apply(&plugin, ApiCall::WinSelect { win: self.chat_win, on: true });
-                self.resnap_linewise();
-            }
+            (true, false) => self.set_shape(shape),
+            (false, _) => self.begin_select(shape),
         }
         self.refresh_composer();
     }
 
-    /// Put a `V` selection back onto whole lines, in whichever direction it now runs.
+    /// Anchor a selection of this shape where the cursor is.
+    fn begin_select(&mut self, shape: SelectShape) {
+        let plugin = PluginId::from(BUILTIN);
+        let _ = self.editor.apply(&plugin, ApiCall::WinSelect { win: self.chat_win, on: true });
+        self.set_shape(shape);
+    }
+
+    fn set_shape(&mut self, shape: SelectShape) {
+        self.reading_shape = shape;
+        let _ = self
+            .editor
+            .apply(&PluginId::from(BUILTIN), ApiCall::WinSelectShape { win: self.chat_win, shape });
+    }
+
+    /// Give up the selection, keeping it for `gv`.
     ///
-    /// There is one selection here and it is two positions, so linewise is not a mode the core
-    /// knows about — it is an invariant this end re-establishes after every motion. Downwards it
-    /// was already right by accident: the anchor sits at the start of the first line and the cursor
-    /// walks along the last. Extending *upwards* is what it was wrong for. The anchor stayed at the
-    /// start of the line `V` was pressed on and the cursor went above it, which makes that line the
-    /// *end* of a backwards range that stops at its first column — so the one line you definitely
-    /// meant is the one that dropped out, and the rows you moved over came in half-selected.
-    ///
-    /// Three calls because the anchor is only settable by standing on it, which is the whole of the
-    /// public API for a selection and exactly what a plugin doing this would have to write.
-    fn resnap_linewise(&mut self) {
-        if !self.reading_linewise {
-            return;
+    /// Kept rather than forgotten because `Esc` is the cheap key here: you drop a selection to look
+    /// at something and want it back, and one you have to make again is one you do not drop.
+    fn drop_selection(&mut self) {
+        if let Some(w) = self.editor.window(self.chat_win)
+            && let Some(anchor) = w.anchor
+        {
+            self.reading_last_select = Some((anchor, w.cursor, self.reading_shape));
         }
-        let Some(w) = self.editor.window(self.chat_win) else { return };
-        let cursor = w.cursor;
-        let Some(anchor) = w.anchor else { return };
-        let lines = self.chat_lines();
-        // Columns on the wire are UTF-8 byte offsets, so the end of a line is its byte length.
-        let end_of = |row: u32| lines.get(row as usize).map(|l| l.len() as u32).unwrap_or(0);
-        let (a, c) = if anchor.0 <= cursor.0 {
-            ((anchor.0, 0), (cursor.0, end_of(cursor.0)))
-        } else {
-            ((anchor.0, end_of(anchor.0)), (cursor.0, 0))
+        self.reading_shape = SelectShape::Exclusive;
+        let _ = self
+            .editor
+            .apply(&PluginId::from(BUILTIN), ApiCall::WinSelect { win: self.chat_win, on: false });
+        self.refresh_composer();
+    }
+
+    /// `gv`: the selection you last gave up, back where it was.
+    fn reselect(&mut self) {
+        let Some((anchor, cursor, shape)) = self.reading_last_select else {
+            return self.editor_message(MessageLevel::Info, "nothing selected here yet");
         };
-        if (a, c) == (anchor, cursor) {
-            return;
-        }
+        let lines = self.chat_lines();
+        // The transcript may be shorter than it was — a conversation switch, a card that folded.
+        // Clamping is what keeps `gv` from naming rows that are now somebody else's.
+        self.select_between(vim::clamp(&lines, anchor), vim::clamp(&lines, cursor), shape);
+    }
+
+    /// `o`: the anchor becomes the cursor and the cursor the anchor.
+    fn swap_ends(&mut self) {
+        let Some(w) = self.editor.window(self.chat_win) else { return };
+        let (Some(anchor), cursor) = (w.anchor, w.cursor) else { return };
+        self.select_between(cursor, anchor, self.reading_shape);
+    }
+
+    /// Put a selection of `shape` between two positions, cursor at the second.
+    ///
+    /// Three calls, because the anchor is only settable by standing on it — which is the whole of
+    /// the public API for a selection and exactly what a plugin doing this would have to write.
+    fn select_between(&mut self, anchor: (u32, u32), cursor: (u32, u32), shape: SelectShape) {
         let plugin = PluginId::from(BUILTIN);
         let _ = self.editor.apply(&plugin, ApiCall::WinSetCursor {
             win: self.chat_win,
-            row: a.0,
-            col: a.1,
+            row: anchor.0,
+            col: anchor.1,
         });
         let _ = self.editor.apply(&plugin, ApiCall::WinSelect { win: self.chat_win, on: true });
-        let _ = self.editor.apply(&plugin, ApiCall::WinSetCursor {
-            win: self.chat_win,
-            row: c.0,
-            col: c.1,
-        });
+        self.set_shape(shape);
+        self.reading_goal = None;
+        self.place_cursor(cursor);
+    }
+
+    /// `iw`, `a"`, `ip`: select what the object names, or copy it.
+    fn apply_object(&mut self, obj: vim::Object, around: bool, yank: bool) {
+        let lines = self.chat_lines();
+        let at = self.chat_cursor();
+        let Some((from, to)) = vim::object(&lines, at, obj, around) else {
+            return self.editor_message(MessageLevel::Info, "the cursor is not in one of those");
+        };
+        if yank {
+            self.yank_text(from, to, true, "it");
+        } else {
+            self.select_between(from, to, SelectShape::Inclusive);
+        }
+    }
+
+    /// `yw`, `y$`, `y5j`: copy what a motion covers.
+    fn yank_over(&mut self, m: vim::Motion, count: u32) {
+        let lines = self.chat_lines();
+        let from = self.chat_cursor();
+        let mut at = from;
+        let mut goal = None;
+        let mut inclusive = false;
+        let once = matches!(m, vim::Motion::BufStart | vim::Motion::BufEnd | vim::Motion::Row(_));
+        for _ in 0..if once { 1 } else { count.max(1) } {
+            let step = vim::resolve(&lines, at, m, goal);
+            at = step.at;
+            goal = step.goal;
+            inclusive = step.inclusive;
+            if !step.moved {
+                break;
+            }
+        }
+        // Vim's rule, and it is not a detail: a motion that spans rows takes whole ones. `yj` is
+        // two lines rather than two ragged halves of them, and `yG` is the rest of the transcript
+        // rather than the rest of this row and then all of the last one.
+        let linewise = matches!(
+            m,
+            vim::Motion::Up | vim::Motion::Down | vim::Motion::Row(_) | vim::Motion::BufStart | vim::Motion::BufEnd
+        );
+        if linewise {
+            let (a, b) = (from.0.min(at.0), from.0.max(at.0));
+            self.yank_rows(a..b + 1, if a == b { "the line" } else { "the lines" }, false);
+        } else {
+            self.yank_text(from, at, inclusive, "it");
+        }
+    }
+
+    /// Copy a range of the transcript, and say how much.
+    fn yank_text(&mut self, from: (u32, u32), to: (u32, u32), inclusive: bool, what: &str) {
+        let lines = self.chat_lines();
+        let (a, mut b) = if from <= to { (from, to) } else { (to, from) };
+        if inclusive {
+            let text = lines.get(b.0 as usize).map(String::as_str).unwrap_or("");
+            b.1 = neosh_core::text::after(text, b.1);
+        }
+        let text = vim::slice(&lines, a, b);
+        if text.is_empty() {
+            return self.editor_message(MessageLevel::Warn, "nothing to copy");
+        }
+        let n = text.lines().count().max(1);
+        let _ = self.editor.apply(&PluginId::from(BUILTIN), ApiCall::ClipboardWrite { text });
+        self.editor_message(
+            MessageLevel::Info,
+            format!("copied {what} — {n} line{}", if n == 1 { "" } else { "s" }),
+        );
     }
 
     /// Copy some rows of the transcript, and say how many.
@@ -4061,7 +4428,7 @@ impl Host {
         };
         self.highlight_matches(&query);
         if !query.is_empty() && let Some(at) = self.find_from(&query, from, !back, true) {
-            self.reading_jump(at, false);
+            self.reading_jump(at);
         }
     }
 
@@ -4070,14 +4437,15 @@ impl Host {
         self.set_composer(&p.draft);
         if submit && !p.query.is_empty() {
             self.searched = p.query.clone();
+            self.searched_back = p.back;
             self.highlight_matches(&p.query);
             match self.find_from(&p.query, p.from, !p.back, true) {
-                Some(at) => self.reading_jump(at, false),
+                Some(at) => self.reading_jump(at),
                 None => self.editor_message(MessageLevel::Warn, format!("no match for {:?}", p.query)),
             }
         } else {
             self.clear_matches();
-            self.reading_jump(p.from, false);
+            self.reading_jump(p.from);
         }
         self.refresh_status();
         self.refresh_composer();
@@ -4090,9 +4458,12 @@ impl Host {
             return;
         }
         let query = self.searched.clone();
-        let forward = same_direction;
+        // `n` is *onwards*, not forwards: after `?foo` it goes on up the transcript and `N` comes
+        // back down it. Fixed at `forward` either way, `?` found one match and then walked away
+        // from every other one.
+        let forward = same_direction != self.searched_back;
         match self.find_from(&query, self.chat_cursor(), forward, false) {
-            Some(at) => self.reading_jump(at, false),
+            Some(at) => self.reading_jump(at),
             None => self.editor_message(MessageLevel::Warn, format!("no more matches for {query:?}")),
         }
     }
@@ -4233,18 +4604,26 @@ impl Host {
         let Some(w) = self.editor.window(self.chat_win) else { return };
         let row = w.cursor.0;
         let Some(v) = w.viewport else { return };
-        let height = (v.height as u32).max(1);
+        // Buffer rows on the screen, which after wrapping is not the window's height — the
+        // frontend counts them and reports them back, and taking the height instead is what made
+        // this believe a cursor was visible while it was four rows below the bottom edge.
+        //
+        // A first approximation and not the last word: the frontend bends the scroll it is given
+        // so the caret is on screen whatever this says, and reports what it actually drew. What
+        // this is for is naming the right *region* — a cursor five hundred rows up is not
+        // something the drawing end should be asked to walk to.
+        let rows = if v.rows > 0 { v.rows } else { (v.height as u32).max(1) };
         let lines = self.editor.buffer(self.chat).map(|b| b.line_count()).unwrap_or(0);
         // `None` means "following the tail", which is a different place from line zero — and the
         // first row of the transcript is a place the reader arrives at, so it has to be sayable.
         // Sent as a bare `0` it was read as "follow" instead, and `^U` up to the top of a long
         // answer put the window back at the bottom of it, cursor off screen, with nothing on the
         // way there to say what had happened.
-        let showing = self.chat_top.unwrap_or_else(|| lines.saturating_sub(height));
+        let showing = self.chat_top.unwrap_or_else(|| lines.saturating_sub(rows));
         let next = if row < showing {
             row
-        } else if row >= showing + height {
-            row + 1 - height
+        } else if row >= showing + rows {
+            row + 1 - rows
         } else {
             return;
         };
@@ -4653,7 +5032,7 @@ impl Host {
         self.cards[i].expanded = !self.cards[i].expanded;
         self.redraw_card(i);
         let row = self.cards[i].row;
-        self.reading_jump((row, 0), false);
+        self.reading_jump((row, 0));
         self.refresh_composer();
     }
 
@@ -5898,7 +6277,7 @@ impl Host {
                     };
                     self.highlight_matches(&query);
                     if let Some(at) = self.find_from(&query, from, !back, true) {
-                        self.reading_jump(at, false);
+                        self.reading_jump(at);
                     }
                 }
                 other => return self.handle_input_uncaptured(other),
@@ -5943,9 +6322,16 @@ impl Host {
                 }
                 self.compose(TextEdit::Insert { text });
             }
-            InputEvent::ViewportChanged { win, width, height, top_line } => {
+            InputEvent::ViewportChanged { win, width, height, top_line, rows } => {
                 let was = self.chat_width();
-                self.editor.set_viewport(win, neosh_core::Viewport { width, height, top_line });
+                self.editor.set_viewport(win, neosh_core::Viewport { width, height, top_line, rows });
+                // What the frontend *drew*, which is not always what was asked for: a window whose
+                // scroll had to bend to keep its cursor on screen is showing a different first row.
+                // Taking it back means the next page starts from where the screen is rather than
+                // from where the core last guessed, which with wrapped rows are different places.
+                if win == self.chat_win && self.chat_top.is_some() {
+                    self.chat_top = Some(top_line);
+                }
                 // This is where the host *learns* a width — `Resize` is the terminal's outer size
                 // and the transcript is some part of it. So anything drawn to a width has to be
                 // drawn again here, or a narrow terminal joining a wide workspace keeps the wide

@@ -11,7 +11,9 @@
 //! cursor were always right; nothing said so.
 
 use neosh_core::Editor;
-use neosh_proto::{ApiCall, ApiOk, BufferId, Dock, Gravity, PluginId, UiEvent, WindowLayout};
+use neosh_proto::{
+    ApiCall, ApiOk, BufferId, Dock, Gravity, PluginId, SelectShape, UiEvent, WindowLayout,
+};
 
 const LINES: [&str; 4] = ["alpha", "beta", "gamma", "delta"];
 
@@ -77,6 +79,19 @@ impl Screen {
 
     fn select(&mut self, on: bool) {
         self.call(ApiCall::WinSelect { win: self.win, on });
+    }
+
+    fn shape(&mut self, shape: SelectShape) {
+        self.call(ApiCall::WinSelectShape { win: self.win, shape });
+    }
+
+    /// What `y` would copy.
+    fn selection(&mut self) -> String {
+        let win = self.win;
+        match self.editor.apply(&self.plugin.clone(), ApiCall::WinSelection { win }) {
+            Ok(ApiOk::Text { text }) => text,
+            other => panic!("selection: {other:?}"),
+        }
     }
 
     fn drain(&mut self) {
@@ -149,4 +164,71 @@ fn moving_the_cursor_without_a_selection_paints_nothing() {
     s.cursor(0, 0);
     s.cursor(3, 2);
     assert!(s.painted().is_empty(), "there is no selection to draw");
+}
+
+// ---------------------------------------------------------------------------
+// What the two ends mean
+// ---------------------------------------------------------------------------
+
+/// A selection is two positions, and the shape is the only thing that can say whether the character
+/// the cursor is on is in it.
+///
+/// A text field's is not: the cursor sits *between* characters there, and one that swallowed the
+/// character to its right would delete a letter nobody highlighted. A normal mode's is — and the
+/// two conventions differ by exactly the one character somebody pressing `v` then `y` was trying
+/// to copy, which is why it answered "nothing to copy" at them.
+#[test]
+fn an_inclusive_selection_contains_the_character_the_cursor_is_on() {
+    let mut s = Screen::new();
+    s.cursor(0, 0);
+    s.select(true);
+
+    assert_eq!(s.selection(), "", "exclusive, and both ends in the same place, is nothing");
+    s.shape(SelectShape::Inclusive);
+    assert_eq!(s.selection(), "a", "inclusive, it is the character under the cursor");
+    assert_eq!(s.painted(), vec![0], "and it is drawn as one");
+
+    s.cursor(0, 2);
+    assert_eq!(s.selection(), "alp", "and grows to include whichever one it lands on");
+}
+
+/// Linewise is state on the window, not an invariant the caller re-establishes after every motion.
+///
+/// It used to be the latter: three API calls to move an anchor that is only settable by standing on
+/// it, run again after every key. Extending *upwards* was what it was wrong for — the anchor stayed
+/// at the start of the row `V` was pressed on, which makes that row the end of a backwards range
+/// that stops at its first column, so the one row you definitely meant was the one that dropped out.
+#[test]
+fn linewise_takes_whole_rows_in_whichever_direction_it_runs() {
+    let mut s = Screen::new();
+    s.cursor(2, 3);
+    s.select(true);
+    s.shape(SelectShape::Line);
+
+    assert_eq!(s.selection(), "gamma", "the whole of the row it started on");
+    assert_eq!(s.painted(), vec![2]);
+
+    s.cursor(1, 2);
+    assert_eq!(s.selection(), "beta\ngamma", "upwards, and neither row is half in it");
+    assert_eq!(s.painted(), vec![1, 2]);
+
+    s.cursor(3, 1);
+    assert_eq!(s.selection(), "gamma\ndelta", "and downwards from where it was anchored");
+    assert_eq!(s.painted(), vec![2, 3]);
+}
+
+/// Dropping a selection drops its shape with it. A window left `Line` after the one linewise
+/// selection it ever had would draw the next `v` as whole rows.
+#[test]
+fn the_shape_goes_when_the_selection_does() {
+    let mut s = Screen::new();
+    s.cursor(1, 0);
+    s.select(true);
+    s.shape(SelectShape::Line);
+    assert_eq!(s.selection(), "beta");
+
+    s.select(false);
+    s.cursor(2, 0);
+    s.select(true);
+    assert_eq!(s.selection(), "", "back to a text field's answer until something says otherwise");
 }

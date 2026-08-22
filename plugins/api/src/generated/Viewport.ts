@@ -8,6 +8,10 @@ export type Viewport = {
   height: number;
   top_line: number;
   /**
+   * Buffer rows actually on the screen, which on a wrapping window is fewer than `height`.
+   */
+  rows: number;
+  /**
    * Lines in the buffer, so a caller can page without a second round trip.
    */
   line_count: number;

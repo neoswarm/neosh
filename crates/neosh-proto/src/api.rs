@@ -25,8 +25,8 @@ use crate::provider::{
 };
 use crate::quota::{QuotaSample, QuotaSnapshot, UsageHistory, UsageResolution};
 use crate::ui::{
-    CursorMotion, ExtmarkInfo, ExtmarkOpts, FloatConfig, HighlightDef, KeyPress, LineDraw,
-    MessageLevel, Rect, SurfaceCell, TextEdit, WindowLayout,
+    CursorMotion, CursorShape, ExtmarkInfo, ExtmarkOpts, FloatConfig, HighlightDef, KeyPress,
+    LineDraw, MessageLevel, Rect, SelectShape, SurfaceCell, TextEdit, WindowLayout,
 };
 use crate::vcs::{BranchInfo, CommitInfo, DiffTarget, RepoStatus, WorktreeInfo};
 
@@ -349,6 +349,30 @@ pub enum ApiCall {
         win: WindowId,
         /// `false` clears. `true` anchors here even if something was already selected.
         on: bool,
+    },
+    /// What the two ends of this window's selection *mean*.
+    ///
+    /// A selection is two positions and nothing else, so the shape is the only thing that can say
+    /// whether the character the cursor is on is in it. A text field's is not — the cursor sits
+    /// between characters there, and a selection that swallowed the one to its right would delete
+    /// a letter nobody highlighted. A normal-mode selection's is: the cursor is *on* a character,
+    /// and `v` followed immediately by `y` copies that character rather than nothing at all.
+    ///
+    /// Kept here rather than re-established by the caller after every motion, which is what a
+    /// linewise selection used to be: three API calls to move an anchor that is only settable by
+    /// standing on it, run again after every key, and wrong in between.
+    WinSelectShape {
+        win: WindowId,
+        shape: SelectShape,
+    },
+    /// What the caret looks like in this window.
+    ///
+    /// A bar sits between two characters and a block sits on one, which is the difference between
+    /// a field you are typing in and a mode where every key is a verb — so it is the one thing on
+    /// screen that says which of those you are in before you press anything.
+    WinCursorShape {
+        win: WindowId,
+        shape: CursorShape,
     },
     /// What is selected in this window. Empty when nothing is.
     WinSelection {
@@ -1269,6 +1293,8 @@ pub struct Viewport {
     pub width: u16,
     pub height: u16,
     pub top_line: u32,
+    /// Buffer rows actually on the screen, which on a wrapping window is fewer than `height`.
+    pub rows: u32,
     /// Lines in the buffer, so a caller can page without a second round trip.
     pub line_count: u32,
 }

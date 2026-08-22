@@ -595,16 +595,31 @@ fn a_chord_while_reading_is_not_the_letter_it_is_made_of() {
         s.chat_cursor()
     );
 
-    // And `^Y`, whose letter is the yank prefix, is a line up rather than a pending operator.
-    s.press(json!({"kind": "char", "c": "d"}), &["ctrl"]);
-    assert!(s.pump(|s| s.chat_cursor().is_some_and(|r| r > 0)), "somewhere with room above");
-    let at = s.chat_cursor().unwrap_or(0);
-    s.press(json!({"kind": "char", "c": "y"}), &["ctrl"]);
+    // And `^Y`, whose letter is the yank prefix, scrolls the window rather than opening one.
+    // Vim's pair with `^E`: the other five scroll keys move the cursor and let the view follow,
+    // and these two are the ones that do it the other way round.
+    s.chat_viewport(100, 6);
+    for _ in 0..3 {
+        s.press(json!({"kind": "char", "c": "d"}), &["ctrl"]);
+    }
     assert!(
-        s.pump(|s| s.chat_cursor() == Some(at - 1)),
-        "^Y moved one line up\n{at} -> {:?}",
-        s.chat_cursor()
+        s.pump(|s| s.chat_scrolls().last().copied().flatten().is_some_and(|t| t > 0)),
+        "the window is somewhere with room above it: {:?}",
+        s.chat_scrolls()
     );
+    s.press(json!({"kind": "char", "c": "y"}), &["ctrl"]);
+    // A one-row step *up*, which is the only thing here that produces one: every `^D` before it
+    // moved half a screen down. Read as the last two scrolls rather than against a number captured
+    // beforehand, because the events already read are the ones from before the key was pressed.
+    assert!(
+        s.pump(|s| matches!(s.chat_scrolls().as_slice(), [.., Some(a), Some(b)] if b + 1 == *a)),
+        "^Y drew from one row earlier: {:?}",
+        s.chat_scrolls()
+    );
+    // And it was not the front half of a yank: the `y` after it is still waiting to be told what
+    // to copy, which is exactly what it would not be if `^Y` had already opened one.
+    s.ch("y");
+    assert!(s.pump(|_| false) || s.copied().is_empty(), "nothing was copied: {:?}", s.copied());
 }
 
 #[test]
@@ -822,14 +837,45 @@ fn gg_extends_a_running_selection_to_the_top() {
     );
 }
 
-/// `v` on an empty selection says so. Silence there reads as a key that does not work.
+/// `v` and then `y` copies the character the cursor is on, because that is what is selected.
+///
+/// The cursor in a mode where every key is a verb sits *on* a character rather than between two, so
+/// a selection with both ends in the same place contains one. Answered exclusively — the text
+/// field's convention — the two keys that mean "copy this" printed "nothing to copy" at somebody
+/// who had just pressed them. See `SelectShape`.
 #[test]
-fn yanking_an_empty_selection_says_there_is_nothing_in_it() {
+fn a_selection_includes_the_character_the_cursor_is_on() {
     let sb = Sandbox::new("emptyyank");
     let mut s = sb.start();
     s.answered_and_reading();
 
+    // Somewhere with text on it, named rather than assumed: the transcript opens with a welcome
+    // block whose rows are nobody's business but the renderer's.
+    let (row, first) = s.first_row_with_text();
+    s.go_to_row(row);
+
     s.ch("v");
+    s.ch("y");
+    assert!(s.pump(|s| !s.copied().is_empty()), "it copied something: {:?}", s.messages());
+    assert_eq!(s.last_copy(), first, "the one character under the cursor");
+    assert!(
+        !s.messages().iter().any(|m| m.contains("nothing to copy")),
+        "and did not claim there was nothing there: {:?}",
+        s.messages()
+    );
+}
+
+/// A selection over nothing at all still says so — which linewise on a blank row is.
+#[test]
+fn yanking_an_empty_selection_says_there_is_nothing_in_it() {
+    let sb = Sandbox::new("emptyline");
+    let mut s = sb.start();
+    s.answered_and_reading();
+    // A row with nothing on it — the markdown renderer separates every block with one.
+    let row = s.first_blank_row();
+    s.go_to_row(row);
+
+    s.ch("V");
     s.ch("y");
     assert!(
         s.pump(|s| s.messages().iter().any(|m| m.contains("nothing to copy"))),
@@ -1002,8 +1048,10 @@ impl Session {
         assert!(self.pump(|s| s.chat_win().is_some()), "the transcript window exists");
         let win = self.chat_win().expect("the transcript window");
         self.send(
+            // `rows` is how many *buffer* rows are on the screen, which a real frontend counts
+            // after wrapping. These fixtures are narrow enough not to wrap, so it is the height.
             &json!({"type": "viewport_changed", "win": win, "width": width, "height": height,
-                    "top_line": 0}),
+                    "top_line": 0, "rows": height}),
         );
     }
 
@@ -1044,8 +1092,44 @@ impl Session {
         assert!(done(self), "{name} never took effect");
     }
 
+    /// Whether the keyboard is in the transcript at all.
+    ///
+    /// Either word: the strip says `visual` while a selection is running, which is a *kind* of
+    /// reading and not the absence of it. Matching only `reading` made "wait until the reader has
+    /// closed" true the moment somebody pressed `v`.
+    /// The first transcript row with something on it, and the first character of it.
+    ///
+    /// Named rather than assumed, because the transcript opens with a welcome block whose rows are
+    /// the renderer's business and change whenever it does.
+    fn first_row_with_text(&self) -> (u64, String) {
+        let lines = self.chat();
+        let (i, line) = lines
+            .iter()
+            .enumerate()
+            .find(|(_, l)| l.chars().next().is_some_and(|c| c.is_alphanumeric()))
+            .expect("the transcript has words in it");
+        (i as u64, line.chars().next().expect("checked").to_string())
+    }
+
+    fn first_blank_row(&self) -> u64 {
+        self.chat().iter().position(|l| l.is_empty()).expect("the transcript has a gap in it") as u64
+    }
+
+    /// `12G`, and wait until the cursor is actually on the twelfth row.
+    fn go_to_row(&mut self, row: u64) {
+        for d in (row + 1).to_string().chars() {
+            self.ch(&d.to_string());
+        }
+        self.ch("G");
+        assert!(
+            self.pump(|s| s.chat_cursor() == Some(row)),
+            "on row {row}: {:?}",
+            self.chat_cursor()
+        );
+    }
+
     fn is_reading(&self) -> bool {
-        self.buffer("[status]").iter().any(|l| l.contains("reading"))
+        self.buffer("[status]").iter().any(|l| l.contains("reading") || l.contains("visual"))
     }
 
     /// The virtual text under the composer — the shortcut row.
@@ -1072,5 +1156,240 @@ impl Session {
                     .collect()
             })
             .unwrap_or_default()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Visual mode
+// ---------------------------------------------------------------------------
+
+/// A selection is a place you are, and you can see where in it you are.
+///
+/// Two things at once, and both were missing. The strip says `visual` rather than `reading`, because
+/// a selection is the one state here where the same keys do different things — `y` copies rows
+/// rather than a message, `esc` gives the selection up rather than the mode. And the caret is a
+/// *block*: the cursor sits on a character now rather than between two, and a bar between two
+/// characters is a lie about what the next key will act on.
+#[test]
+fn a_running_selection_says_so_and_the_caret_is_a_block() {
+    let sb = Sandbox::new("visualsays");
+    let mut s = sb.start();
+    s.answered_and_reading();
+    assert!(
+        s.pump(|s| s.cursor_shape() == Some("block".into())),
+        "reading asks for a block caret: {:?}",
+        s.cursor_shape()
+    );
+
+    s.ch("v");
+    assert!(
+        s.pump(|s| s.buffer("[status]").iter().any(|l| l.contains("visual"))),
+        "the strip names it: {:?}",
+        s.buffer("[status]")
+    );
+    s.ch("V");
+    assert!(
+        s.pump(|s| s.buffer("[status]").iter().any(|l| l.contains("visual line"))),
+        "and names which kind: {:?}",
+        s.buffer("[status]")
+    );
+
+    s.special("esc");
+    s.special("esc");
+    s.press(json!({"kind": "char", "c": "s"}), &["ctrl"]);
+    assert!(
+        s.pump(|s| s.cursor_shape() == Some("bar".into())),
+        "and the composer gets its bar back: {:?}",
+        s.cursor_shape()
+    );
+}
+
+/// `V` takes whole rows in whichever direction it is extended, including upwards.
+///
+/// Not an invariant re-established after every motion — the shape belongs to the selection, so
+/// there is no frame in which the wrong rows are lit and no motion that can forget to run it.
+#[test]
+fn linewise_takes_whole_rows_in_either_direction() {
+    let sb = Sandbox::new("visualline");
+    let mut s = sb.start();
+    s.answered_and_reading();
+    let row = s.first_row_with_text();
+    s.go_to_row(row.0 + 2);
+
+    s.ch("V");
+    s.ch("k");
+    s.ch("k");
+    assert!(
+        s.pump(|s| s.chat_selected() == vec![row.0 as usize, row.0 as usize + 1, row.0 as usize + 2]),
+        "the row it started on and the two above it, whole: {:?}",
+        s.chat_selected()
+    );
+
+    s.ch("y");
+    assert!(s.pump(|s| !s.copied().is_empty()), "copied: {:?}", s.messages());
+    let copied = s.last_copy();
+    assert_eq!(copied.lines().count(), 3, "three whole lines: {copied:?}");
+    assert!(copied.starts_with(&row.1), "starting at the first of them: {copied:?}");
+}
+
+/// `o` puts you on the other end of what you have, which is the difference between fixing a
+/// selection and making it again.
+#[test]
+fn o_swaps_the_ends_of_a_selection() {
+    let sb = Sandbox::new("visualswap");
+    let mut s = sb.start();
+    s.answered_and_reading();
+    let (row, _) = s.first_row_with_text();
+    s.go_to_row(row + 3);
+
+    s.ch("V");
+    s.ch("k");
+    assert!(s.pump(|s| s.chat_cursor() == Some(row + 2)), "extended upwards");
+    s.ch("o");
+    assert!(
+        s.pump(|s| s.chat_cursor() == Some(row + 3)),
+        "and now on the end it started from: {:?}",
+        s.chat_cursor()
+    );
+    // Both rows are still in it — this moves which end you are on, not what is selected.
+    s.ch("j");
+    assert!(
+        s.pump(|s| s.chat_selected().len() == 3),
+        "extending the other way adds a row: {:?}",
+        s.chat_selected()
+    );
+}
+
+/// `iw` inside a selection is the word, not the letter `i` doing what it does outside one.
+#[test]
+fn a_text_object_selects_what_it_names() {
+    let sb = Sandbox::new("visualobj");
+    let mut s = sb.start();
+    s.answered_and_reading();
+    // The fenced block's opening line, which has words and brackets on one row.
+    s.search_for("fn main");
+    // `^` is the first non-blank, which on a fenced row is what `0` is not: the renderer indents
+    // code by two.
+    s.ch("^");
+    s.ch("w");
+
+    s.ch("v");
+    s.ch("i");
+    s.ch("w");
+    s.ch("y");
+    assert!(s.pump(|s| !s.copied().is_empty()), "it copied: {:?}", s.messages());
+    assert_eq!(s.last_copy(), "main", "the whole word under the cursor");
+}
+
+/// The bracket keys. `%` walks to the partner and back, which is how you find the end of a block
+/// in an answer you did not write.
+#[test]
+fn percent_goes_to_the_matching_bracket() {
+    let sb = Sandbox::new("visualpct");
+    let mut s = sb.start();
+    s.answered_and_reading();
+    s.search_for("fn main");
+    // The brace that opens the body, so the partner is two rows down rather than on this one.
+    s.ch("$");
+    let at = s.chat_cursor().expect("on the fence");
+
+    s.ch("%");
+    assert!(
+        s.pump(|s| s.chat_cursor().is_some_and(|r| r > at)),
+        "onto the brace that closes it: {at:?} -> {:?}",
+        s.chat_cursor()
+    );
+    let closed = s.chat_cursor().expect("moved");
+    s.ch("%");
+    assert!(s.pump(|s| s.chat_cursor() == Some(at)), "and back: {closed} -> {:?}", s.chat_cursor());
+}
+
+/// `f` takes the next keystroke as a character rather than as a command, including a digit.
+#[test]
+fn f_finds_a_character_and_semicolon_finds_the_next_one() {
+    let sb = Sandbox::new("visualfind");
+    let mut s = sb.start();
+    s.answered_and_reading();
+    s.search_for("fn main");
+    s.ch("0");
+    let row = s.chat_cursor().expect("on the row");
+
+    s.ch("f");
+    s.ch("(");
+    s.ch("v");
+    s.ch("y");
+    assert!(s.pump(|s| !s.copied().is_empty()), "copied: {:?}", s.messages());
+    assert_eq!(s.last_copy(), "(", "`f(` lands on the bracket");
+    assert_eq!(s.chat_cursor(), Some(row), "without leaving the row");
+}
+
+/// A count is spent by the motion after it, and `y` over a motion copies what the motion covers.
+#[test]
+fn yank_takes_a_motion_and_a_count() {
+    let sb = Sandbox::new("visualyw");
+    let mut s = sb.start();
+    s.answered_and_reading();
+    s.search_for("fn main");
+    s.ch("^");
+
+    // Two words from the first one. Exclusive, the way `w` is for an operator: `y2w` stops at the
+    // start of the third word rather than taking its first letter with it.
+    s.ch("y");
+    s.ch("2");
+    s.ch("w");
+    assert!(s.pump(|s| !s.copied().is_empty()), "copied: {:?}", s.messages());
+    let got = s.last_copy();
+    assert_eq!(got, "fn main", "the two words, and not a character of the third: {got:?}");
+}
+
+/// `gv` puts back what `Esc` gave up. Without it, dropping a selection to look at something is
+/// dropping one you have to make again.
+#[test]
+fn gv_brings_the_last_selection_back() {
+    let sb = Sandbox::new("visualgv");
+    let mut s = sb.start();
+    s.answered_and_reading();
+    let (row, _) = s.first_row_with_text();
+    s.go_to_row(row + 2);
+
+    s.ch("V");
+    s.ch("k");
+    assert!(s.pump(|s| s.chat_selected().len() == 2), "two rows: {:?}", s.chat_selected());
+    s.special("esc");
+    assert!(s.pump(|s| s.chat_selected().is_empty()), "given up: {:?}", s.chat_selected());
+
+    s.ch("g");
+    s.ch("v");
+    assert!(
+        s.pump(|s| s.chat_selected().len() == 2),
+        "and back, the same two rows: {:?}",
+        s.chat_selected()
+    );
+}
+
+impl Session {
+    /// What the frontend was last told the caret should look like.
+    fn cursor_shape(&self) -> Option<String> {
+        let win = self.chat_win()?;
+        self.events
+            .iter()
+            .rev()
+            .find(|e| e["type"] == "cursor_shape_changed" && e["win"].as_u64() == Some(win))
+            .and_then(|e| e["shape"].as_str().map(str::to_string))
+    }
+
+    /// `/text<cr>`, and wait until the cursor is on a row that contains it.
+    fn search_for(&mut self, text: &str) {
+        self.ch("/");
+        self.keys(text);
+        self.special("enter");
+        assert!(
+            self.pump(|s| {
+                let Some(row) = s.chat_cursor() else { return false };
+                s.chat().get(row as usize).is_some_and(|l| l.contains(text))
+            }),
+            "searched to a row containing {text:?}: {:?}",
+            self.chat_cursor()
+        );
     }
 }

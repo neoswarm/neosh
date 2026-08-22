@@ -4,7 +4,7 @@
 //! frontend resolves that and reports back via [`Window::viewport`], which the core needs solely to
 //! place cursor-anchored floats and to size a page scroll.
 
-use neosh_proto::{BufferId, WindowId, WindowLayout};
+use neosh_proto::{BufferId, CursorShape, SelectShape, WindowId, WindowLayout};
 
 /// What the frontend told us about a window's realized geometry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -12,6 +12,8 @@ pub struct Viewport {
     pub width: u16,
     pub height: u16,
     pub top_line: u32,
+    /// Buffer rows on the screen. Not `height` — one wrapped row is several of those.
+    pub rows: u32,
 }
 
 #[derive(Debug, Clone)]
@@ -39,6 +41,16 @@ pub struct Window {
     /// Held per window rather than per buffer: the same buffer shown twice is two places you can
     /// be, and a selection belongs to the place, not to the text.
     pub anchor: Option<(u32, u32)>,
+    /// What the two ends of the selection mean: whether the character the cursor is on is in it,
+    /// and whether the ends snap to whole rows.
+    ///
+    /// State rather than an invariant the caller re-establishes after every motion. Linewise used
+    /// to be the latter — three API calls to move an anchor that is only settable by standing on
+    /// it, run again after every key — and every path that moved a cursor without knowing to run
+    /// it left a selection of the wrong shape on screen for one frame.
+    pub select_shape: SelectShape,
+    /// What the caret looks like here. See [`neosh_proto::ApiCall::WinCursorShape`].
+    pub cursor_shape: CursorShape,
     /// The column vertical motion is trying to get back to, as a grapheme-cluster index.
     ///
     /// Cleared by anything horizontal. Without it, moving down past a short line and back up
@@ -57,6 +69,8 @@ impl Window {
             cursor: (0, 0),
             top_line: None,
             anchor: None,
+            select_shape: SelectShape::default(),
+            cursor_shape: CursorShape::default(),
             goal_col: None,
             viewport: None,
         }

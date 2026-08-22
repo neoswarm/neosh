@@ -336,8 +336,8 @@ impl Handle {
                                 None => None,
                             }
                         }
-                        InputEvent::ViewportChanged { win, width, height, top_line } => {
-                            self.views.lock().await.viewport(id, win, (width, height, top_line))
+                        InputEvent::ViewportChanged { win, width, height, top_line, rows } => {
+                            self.views.lock().await.viewport(id, win, (width, height, top_line, rows))
                         }
                         other => Some(other),
                     };

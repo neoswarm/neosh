@@ -23,6 +23,8 @@ pub struct MirrorWindow {
     pub buf: BufferId,
     pub layout: WindowLayout,
     pub cursor: (u32, u32),
+    /// What the caret looks like here — a bar between characters, or a block on one.
+    pub cursor_shape: neosh_proto::CursorShape,
     /// `None` is unscrolled: the end of a window that follows its tail, the start of every other.
     pub top_line: Option<u32>,
 }
@@ -91,6 +93,7 @@ impl Mirror {
                     buf,
                     layout,
                     cursor: (0, 0),
+                    cursor_shape: Default::default(),
                     top_line: None,
                 });
                 if !self.window_order.contains(&win) {
@@ -118,6 +121,11 @@ impl Mirror {
             UiEvent::CursorMoved { win, row, col } => {
                 if let Some(w) = self.windows.get_mut(&win) {
                     w.cursor = (row, col);
+                }
+            }
+            UiEvent::CursorShapeChanged { win, shape } => {
+                if let Some(w) = self.windows.get_mut(&win) {
+                    w.cursor_shape = shape;
                 }
             }
             UiEvent::ScrollTo { win, top_line } => {

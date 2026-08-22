@@ -133,6 +133,11 @@ def main():
         drain(120)
     drain(a.after)
 
+    # Where the terminal caret is, which the plain dump cannot show and which is the only way to
+    # check "is the cursor visible" at all. `hidden` is a real answer: a caret the renderer could
+    # not place is one it turned off, and that reads on screen as a mode with no cursor in it.
+    cur = screen.cursor
+    print(f"cursor: row {cur.y} col {cur.x}{' hidden' if cur.hidden else ''}")
     if a.color:
         for y in range(a.rows):
             text = screen.display[y]

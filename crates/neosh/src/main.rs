@@ -30,6 +30,7 @@ mod swarm;
 mod trust;
 mod usage;
 mod vars;
+mod vim;
 mod views;
 
 use bridge::ScriptBridge;

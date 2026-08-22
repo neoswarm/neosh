@@ -3,6 +3,7 @@ import type { AgentCommand } from "./AgentCommand";
 import type { BufferId } from "./BufferId";
 import type { Capability } from "./Capability";
 import type { CursorMotion } from "./CursorMotion";
+import type { CursorShape } from "./CursorShape";
 import type { DiffTarget } from "./DiffTarget";
 import type { DriverKind } from "./DriverKind";
 import type { ExtmarkId } from "./ExtmarkId";
@@ -27,6 +28,7 @@ import type { ProjectKey } from "./ProjectKey";
 import type { ProviderEvent } from "./ProviderEvent";
 import type { QuotaSnapshot } from "./QuotaSnapshot";
 import type { Rect } from "./Rect";
+import type { SelectShape } from "./SelectShape";
 import type { SessionId } from "./SessionId";
 import type { StatusSegment } from "./StatusSegment";
 import type { StreamId } from "./StreamId";
@@ -106,6 +108,8 @@ export type ApiCall =
      */
     on: boolean;
   }
+  | { "call": "win_select_shape"; win: WindowId; shape: SelectShape }
+  | { "call": "win_cursor_shape"; win: WindowId; shape: CursorShape }
   | { "call": "win_selection"; win: WindowId }
   | { "call": "clipboard_write"; text: string }
   | { "call": "float_open"; buf: BufferId; config: FloatConfig }
