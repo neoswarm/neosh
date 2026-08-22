@@ -84,6 +84,7 @@ export type ApiCall =
   | { "call": "buf_detach"; buf: BufferId }
   | { "call": "win_open"; buf: BufferId; layout: WindowLayout }
   | { "call": "win_close"; win: WindowId }
+  | { "call": "win_resize"; win: WindowId; size: number | null }
   | { "call": "win_set_buf"; win: WindowId; buf: BufferId }
   | { "call": "win_get_cursor"; win: WindowId }
   | { "call": "win_set_cursor"; win: WindowId; row: number; col: number }

@@ -115,6 +115,16 @@ interface SectionItem {
   rows?: Array<{
     text: string;
     hl?: string;
+    /**
+     * Highlights for pieces of the row, over the top of `hl`: a brand mark, a matched substring, a
+     * state glyph.
+     *
+     * `from`/`to` are UTF-8 byte offsets into *your* `text` — this panel adds its own indent and
+     * shifts them. One group per row is not enough for a row that is a measurement in one colour
+     * with somebody's mark on the front of it, and the alternative is a plugin drawing its own
+     * window beside ours.
+     */
+    spans?: Array<{ from: number; to: number; hl: string }>;
     right?: { text: string; hl?: string };
     /** Run on `↵`. Without one the row is inert — a label rather than a verb. */
     command?: string;
@@ -136,8 +146,15 @@ interface ActionItem {
   /** What it does, for the hint strip and for `^Z`. */
   label: string;
   command: string;
-  /** Which rows it applies to. Defaults to `any`. */
-  on?: "project" | "session" | "any";
+  /**
+   * Which rows it applies to. Defaults to `any`.
+   *
+   * `custom` is a row somebody contributed through `sidebar.section` — usually the contributor's
+   * own. Without it a plugin can put rows in this column and then has nowhere to put a key that
+   * belongs to them: `any` binds the key on every row in the panel and advertises it on all of
+   * them, which is a verb about the plan gauge appearing while the cursor is on a conversation.
+   */
+  on?: "project" | "session" | "custom" | "any";
 }
 
 /** A project as the panel thinks of it: a directory, and what is going on in it. */
@@ -265,6 +282,9 @@ export async function activate({ neosh, subscriptions }: PluginContext) {
   const list = new CursoredList<Target>(neosh, buf, ns, { width: () => panelWidth });
   let win: WindowId | null = null;
   let focused = false;
+  // Typed before a motion and consumed by it. Shared with the key table and with the draw, which
+  // is what puts it on screen while it is half typed.
+  const count = { pending: "" };
   let capture: Disposable | null = null;
   let running = false;
 
@@ -300,13 +320,18 @@ export async function activate({ neosh, subscriptions }: PluginContext) {
           selected: list.value,
           actions: actions(),
           asking,
+          count: count.pending,
           // Filled in by `collect`, which is what reads the swarm.
           remote: new Map(),
           hosts: new Map(),
         });
         running = built.running;
         list.setRows(built.rows, same);
-        await list.render({ showCursor: focused, win: win ?? undefined });
+        await list.render({
+          showCursor: focused,
+          win: win ?? undefined,
+          pinned: built.pinned,
+        });
       } while (again);
     } finally {
       drawing = false;
@@ -318,6 +343,13 @@ export async function activate({ neosh, subscriptions }: PluginContext) {
     const width = (await neosh.opt.get<number>("sidebar.width")) ?? 34;
     win = await neosh.win.open(buf, "left", { size: width });
     await draw();
+    // And again once the frontend has said how tall the panel turned out to be. The foot is held
+    // against the bottom edge, which is a measurement — and on the first frame there is nothing to
+    // measure yet, so without this the strip sits under the last project until something else
+    // happens to redraw.
+    // Not held in `subscriptions`: the panel is opened and closed as often as `^B` is pressed, and
+    // the runtime cancels a plugin's timers when it unloads anyway.
+    neosh.timer.after(120, () => void draw());
   };
 
   const close = async () => {
@@ -368,6 +400,12 @@ export async function activate({ neosh, subscriptions }: PluginContext) {
     subscriptions,
     list,
     arrangement,
+    count,
+    height: async () => {
+      if (win === null) return 20;
+      const v = await neosh.win.viewport(win).catch(() => null);
+      return v?.height ?? 20;
+    },
     draw,
     open,
     close,
@@ -406,8 +444,11 @@ export async function activate({ neosh, subscriptions }: PluginContext) {
       if (e.name === "ui.motion" || e.name === "ui.ascii_only") {
         void applyMotion().then(draw);
       } else if (e.name === "sidebar.width" && win !== null) {
-        // Reopening is the only way to change a docked size today.
-        void close().then(open);
+        // In place. Reopening was how this used to work, and it gave the panel a new window id and
+        // dropped whatever had the keyboard — so resizing from inside the panel threw the cursor
+        // back to the composer on every press.
+        panelWidth = (typeof e.value === "number" ? e.value : null) ?? panelWidth;
+        void neosh.win.resize(win, panelWidth).then(draw).catch(() => {});
       } else if (e.name.startsWith("sidebar.") || e.name === "ui.theme") {
         void draw();
       }
@@ -719,6 +760,16 @@ interface Wiring {
   subscriptions: PluginContext["subscriptions"];
   list: CursoredList<Target>;
   arrangement: Arrangement;
+  /**
+   * A count typed before a motion — `5j`, `12G`.
+   *
+   * State between two keystrokes, so it lives beside the panel rather than in the key table, and
+   * it is drawn in the hint strip: a count you cannot see is a keypress that appears to have done
+   * nothing at all.
+   */
+  count: { pending: string };
+  /** How many rows of panel there are, for the two keys that mean "a screen". */
+  height(): Promise<number>;
   draw(): Promise<void>;
   open(): Promise<void>;
   close(): Promise<void>;
@@ -759,6 +810,9 @@ async function registerCommands(w: Wiring): Promise<void> {
     w.subscriptions.push(
       await neosh.cmd.register(name, async (args) => {
         await fn(list.value, args);
+        // A count belongs to the motion typed straight after it. Anything else ends it — otherwise
+        // a `5` you thought better of sits there and turns the next `j` into five.
+        w.count.pending = "";
         if (opts.redraw !== false) await w.draw();
       }, { desc }),
     );
@@ -771,12 +825,108 @@ async function registerCommands(w: Wiring): Promise<void> {
   };
 
   // ---- moving ----
-  await verb(`${NS}.down`, "j", "Next row", () => void list.move(1));
-  await verb(`${NS}.up`, "k", "Previous row", () => void list.move(-1));
-  await neosh.keymap.set("chat", "<Down>", `${NS}.down`, { scope: { kind: "buf_kind", name: KIND } });
-  await neosh.keymap.set("chat", "<Up>", `${NS}.up`, { scope: { kind: "buf_kind", name: KIND } });
-  await neosh.keymap.set("chat", "<C-n>", `${NS}.down`, { scope: { kind: "buf_kind", name: KIND } });
-  await neosh.keymap.set("chat", "<C-p>", `${NS}.up`, { scope: { kind: "buf_kind", name: KIND } });
+  //
+  // Vim's motions, because this is a cursor in a column in a terminal and that is the vocabulary
+  // everybody's hands already have. A count works the way it does there — `5j` is five rows, `3G`
+  // is the third — and it counts *rows you can land on*, so the headings and rules the cursor
+  // already skips do not silently eat two of the five.
+  const scope = { kind: "buf_kind", name: KIND } as const;
+  const also = async (key: string, command: string, desc: string): Promise<void> => {
+    await neosh.keymap.set("chat", key, command, { scope, desc });
+  };
+
+  /** Take the count that was typed, if one was, and forget it. */
+  const take = (fallback = 1): number => {
+    const n = Number.parseInt(w.count.pending, 10);
+    w.count.pending = "";
+    // Bounded, because the count is typed and `999999j` is a keystroke that would walk the list a
+    // million times before drawing anything.
+    return Number.isFinite(n) && n > 0 ? Math.min(n, 999) : fallback;
+  };
+
+  await verb(`${NS}.down`, "j", "Next row", () => void list.move(take()));
+  await verb(`${NS}.up`, "k", "Previous row", () => void list.move(-take()));
+  await also("<Down>", `${NS}.down`, "Next row");
+  await also("<Up>", `${NS}.up`, "Previous row");
+  await also("<C-n>", `${NS}.down`, "Next row");
+  await also("<C-p>", `${NS}.up`, "Previous row");
+
+  // A screen is however tall the panel turned out to be, which only the frontend knows — asked for
+  // rather than assumed, the same way every other display measurement here is. Half a screen for
+  // `^D`/`^U` because that is what it is everywhere, and a whole one loses the row you were on.
+  const by = (fraction: number, sign: 1 | -1) => async (): Promise<void> => {
+    const rows = Math.max(2, await w.height());
+    const step = Math.max(1, Math.floor(rows * fraction)) * take();
+    // No wrapping on a page step: `^D` at the foot of the list means there is no more of it, and a
+    // cursor that reappears at the top has thrown away the place you were reading from.
+    list.move(sign * step, { wrap: false });
+  };
+  await verb(`${NS}.half.down`, "<C-d>", "Half a screen down", by(0.5, 1));
+  await verb(`${NS}.half.up`, "<C-u>", "Half a screen up", by(0.5, -1));
+  // A whole screen is `PgUp`/`PgDn` and deliberately *not* `^F`/`^B`. Those two are `^F` archive
+  // and `^B` hide the panel — both of which somebody in this panel is more likely to want than a
+  // page step in a column that is rarely taller than one screen, and a key that means something
+  // else only while the cursor happens to be here is the worst kind of key.
+  await verb(`${NS}.page.down`, "<PageDown>", "A screen down", by(1, 1));
+  await verb(`${NS}.page.up`, "<PageUp>", "A screen up", by(1, -1));
+
+  /** The count, when a verb wants the number itself rather than a repetition. */
+  const typed = (): number | null => {
+    const n = Number.parseInt(w.count.pending, 10);
+    w.count.pending = "";
+    return Number.isFinite(n) && n > 0 ? n : null;
+  };
+  // With a count these are a *row* — `5gg` and `5G` are both the fifth — and without one they are
+  // the two ends, exactly as in Vim.
+  await verb(`${NS}.top`, "gg", "The first row, or the n-th with a count", () => {
+    const n = typed();
+    if (n === null) list.toEnd("first");
+    else list.nth(n);
+  });
+  await verb(`${NS}.bottom`, "G", "The last row, or the n-th with a count", () => {
+    const n = typed();
+    if (n === null) list.toEnd("last");
+    else list.nth(n);
+  });
+
+  /**
+   * A digit, before a motion.
+   *
+   * One command for all ten, reading which digit it was off the key that ran it — so `^Z` lists it
+   * once and `init.ts` can move it, rather than ten near-identical verbs. A leading `0` is not a
+   * count anywhere and is left to whatever else might want the key.
+   */
+  w.subscriptions.push(
+    await neosh.cmd.register(`${NS}.count`, async (_args, key) => {
+      const code = key?.key.code;
+      if (code?.kind !== "char") return;
+      if (w.count.pending === "" && code.c === "0") return;
+      // Bounded while it is being typed, not only when it is read: three digits is more rows than
+      // this panel will ever have, and it stops a leant-on key growing a string forever.
+      if (w.count.pending.length < 3) w.count.pending += code.c;
+      // Drawn straight away — the strip is the only thing saying the digit landed anywhere.
+      await w.draw();
+    }, { desc: "Begin a count for the next motion" }),
+  );
+  for (const digit of "0123456789") {
+    await also(digit, `${NS}.count`, "Count for the next motion");
+  }
+
+  // ---- how wide the column is ----
+  //
+  // A resize rather than a reopen: reopening gives the window a new id and drops whatever had the
+  // keyboard, so the panel would throw you back to the composer on every press. The width is the
+  // *setting*, so it is the same number `config.toml` sets and one place decides it.
+  const resize = (delta: number) => async (): Promise<void> => {
+    const now = (await neosh.opt.get<number>("sidebar.width")) ?? 34;
+    const want = Math.max(16, Math.min(120, now + delta * take()));
+    if (want !== now) await neosh.opt.set("sidebar.width", want);
+  };
+  await verb(`${NS}.wider`, ">", "Widen the panel", resize(2), { redraw: false });
+  await verb(`${NS}.narrower`, "<lt>", "Narrow the panel", resize(-2), { redraw: false });
+  await verb(`${NS}.width.reset`, "=", "Back to the default width", async () => {
+    await neosh.opt.reset("sidebar.width");
+  }, { redraw: false });
 
   // ---- leaving ----
   await verb(`${NS}.leave`, "<Esc>", "Back to the composer", () => w.leave(), { redraw: false });
@@ -1125,7 +1275,10 @@ const RESERVED = new Set([
   "<Esc>", "<CR>", "<Up>", "<Down>", "<Space>", "<C-n>", "<C-p>", "<C-c>",
 ]);
 
-function applies(on: "project" | "session" | "any", target: Target | undefined): boolean {
+function applies(
+  on: "project" | "session" | "custom" | "any",
+  target: Target | undefined,
+): boolean {
   if (on === "any") return target !== undefined;
   return target?.kind === on;
 }
@@ -2204,6 +2357,8 @@ interface DrawOptions {
   actions: ActionItem[];
   /** Which conversations are waiting on an answer from you. See [`VAR_ASKING`]. */
   asking: Set<string>;
+  /** A count typed but not yet spent, drawn at the foot the way Vim draws it. */
+  count: string;
   /** Conversations on other computers, grouped by the project key they share with ours. */
   remote: Map<string, SwarmAgent[]>;
   /** Which other machines have each project, by key. */
@@ -2226,7 +2381,7 @@ async function collect(
   neosh: Neosh,
   arrangement: Arrangement,
   opts: DrawOptions,
-): Promise<{ rows: ListRow<Target>[]; running: boolean }> {
+): Promise<{ rows: ListRow<Target>[]; running: boolean; pinned: number }> {
   const rows: ListRow<Target>[] = [];
 
   // Failures absorbed: a panel that renders an exception instead of your conversations is worse
@@ -2339,11 +2494,16 @@ async function collect(
     });
   }
 
+  // Everything from here down is the panel's foot: rows somebody contributed below the list, and
+  // the key strip. Counted so the list can hold them against the bottom edge — a plan gauge that
+  // sits under the last project is in a different place every time a project is added or folded,
+  // which is the one thing a status strip must not be.
+  const body = rows.length;
   rows.push(...sectionRows(sections, "below", opts));
 
   if (opts.hints) rows.push(...hints(opts));
 
-  return { rows, running };
+  return { rows, running, pinned: rows.length - body };
 }
 
 /**
@@ -2374,13 +2534,18 @@ function sectionRows(
     }
     for (const r of contributed) {
       if (typeof r?.text !== "string") continue;
+      const text = `   ${clip(r.text, Math.max(4, opts.width - 6))}`;
       rows.push({
-        text: `   ${clip(r.text, Math.max(4, opts.width - 6))}`,
+        text,
         // A third party's row gets the same treatment ours do: we have no idea how long its text
         // is, and a plugin's row cut at our column is our bug rather than theirs.
         full: `   ${r.text}`,
         indent: 3,
         hl: typeof r.hl === "string" ? r.hl : undefined,
+        // Shifted by our indent and clamped to what survived the clip. Checked rather than
+        // trusted, like every other field here: a span running off the end of a row this panel
+        // shortened is a mark on a column that is not there.
+        spans: shift(r.spans, byteLength("   "), byteLength(text)),
         right: typeof r.right?.text === "string"
           ? { text: `${r.right.text} `, hl: r.right.hl }
           : undefined,
@@ -2403,6 +2568,24 @@ function sectionRows(
  * weight and the eye has to parse the words to find the structure — which is exactly the work a
  * layout is supposed to have already done.
  */
+/** Somebody else's spans, in this panel's coordinates. */
+function shift(
+  spans: unknown,
+  by: number,
+  eol: number,
+): Array<{ from: number; to: number; hl: string }> | undefined {
+  if (!Array.isArray(spans)) return undefined;
+  const out = spans.flatMap((s) => {
+    if (typeof s?.from !== "number" || typeof s?.to !== "number" || typeof s?.hl !== "string") {
+      return [];
+    }
+    const from = Math.max(0, Math.floor(s.from)) + by;
+    const to = Math.min(Math.max(0, Math.floor(s.to)) + by, eol);
+    return to > from ? [{ from, to, hl: s.hl }] : [];
+  });
+  return out.length > 0 ? out : undefined;
+}
+
 function heading(text: string, width: number, hint?: string): ListRow<Target>[] {
   return [
     {
@@ -2545,21 +2728,27 @@ function worktreeRow(
   // The branch glyph, in the branch colour — what says "this row is a checkout" at a glance, so
   // the name can be just the branch. No ASCII stand-in earns its column, so ASCII goes without.
   const glyph = opts.ascii ? "" : "⎇ ";
+  const pad = "    ";
   const name = clip(
     p.name,
-    Math.max(6, opts.width - 10 - byteLength(glyph) - byteLength(mark)),
+    Math.max(6, opts.width - 9 - byteLength(glyph) - byteLength(mark)),
   );
   const spans: Array<{ from: number; to: number; hl: string }> = [];
   if (glyph !== "") {
-    const at = byteLength(`     ${arrow} `);
+    const at = byteLength(`${pad}${arrow} `);
     spans.push({ from: at, to: at + byteLength(glyph), hl: "Git.Branch" });
   }
   if (mark !== "") {
-    const at = byteLength(`     ${arrow} ${glyph}${name}`);
+    const at = byteLength(`${pad}${arrow} ${glyph}${name}`);
     spans.push({ from: at, to: at + byteLength(mark), hl: "Status.Unread" });
   }
   return {
-    text: `     ${arrow} ${glyph}${name}${mark}`,
+    text: `${pad}${arrow} ${glyph}${name}${mark}`,
+    // A branch name is as long as somebody made it, and this row is two columns narrower than a
+    // project's. The unread mark is left off the unfolded form: it survived the clip and is
+    // already on the row.
+    full: `${pad}${arrow} ${glyph}${p.name}`,
+    indent: byteLength(`${pad}${arrow} `),
     hl: here ? "Directory" : "Sidebar.Dim",
     spans: spans.length > 0 ? spans : undefined,
     right,
@@ -2578,11 +2767,11 @@ function remoteRow(r: SwarmAgent, opts: DrawOptions, now: number): ListRow<Targe
     const working = r.agent.state === "running";
     const glyph = working ? (opts.ascii ? "*" : "◍") : opts.ascii ? "." : "·";
     const host = clip(r.node.name, 12);
-    const width = Math.max(8, opts.width - 11 - host.length);
+    const width = Math.max(8, opts.width - 8 - host.length);
     return {
-      text: `     ${glyph} ${clip(r.agent.label, width)}`,
-      full: `     ${glyph} ${r.agent.label}`,
-      indent: 7,
+      text: `    ${glyph} ${clip(r.agent.label, width)}`,
+      full: `    ${glyph} ${r.agent.label}`,
+      indent: 6,
       hl: working ? "Status.Monitoring" : "Sidebar.Remote",
       right: { text: `${host} `, hl: "Sidebar.Remote" },
       value: {
@@ -2638,14 +2827,28 @@ function sessionRow(
     : s.updated_at > 0 ? ago(now / 1000 - s.updated_at) : "";
   // Two more columns per level: a conversation inside a worktree sits inside the worktree's row
   // the way the worktree sits inside its repository's.
-  const pad = "     " + "  ".repeat(depth);
+  const pad = "    " + "  ".repeat(depth);
+  // What is left for the title, counted rather than guessed at. The indent, the glyph and the
+  // space after it come off the front; the age column and the space keeping it off the panel edge
+  // come off the end, plus one column of air so a title cannot run into a timestamp. The old
+  // number was a constant two columns larger than the prefix it stood for, which is two characters
+  // of every title in the panel spent on nothing.
+  const room = Math.max(
+    8,
+    opts.width - pad.length - 2 - (right === "" ? 0 : right.length + 2),
+  );
   return {
-    text: `${pad}${glyph} ${clip(s.label, Math.max(8, opts.width - 9 - 2 * depth - right.length))}`,
+    text: `${pad}${glyph} ${clip(s.label, room)}`,
     // The title is the only thing telling two conversations in one project apart, and a generated
     // title is a sentence rather than a word — so the column cuts it at about the point where it
     // was going to say which of them this is.
     full: `${pad}${glyph} ${s.label}`,
-    indent: 7 + 2 * depth,
+    // The conversation you are in is not a row you are considering, it is where you are — so it
+    // says its whole name whether or not the cursor is on it. Everything else in this column is
+    // scannable because it is one line each; the current row is the one place that trade is wrong,
+    // and there is only ever one of it.
+    expand: s.is_active,
+    indent: pad.length + 2,
     hl: asking
       // The palette's group for waiting on something outside the program — which here is a person,
       // and the reason it is the one row in this column that moves. `Status.Unread` deliberately
@@ -2700,6 +2903,8 @@ function hints(opts: DrawOptions): ListRow<Target>[] {
     // `^O` is not here and `+ Add project` is a row you can see: a key strip has two lines, and the
     // verb with a row of its own is the one that can afford to give up its place on them.
     ? ["^T projects  ^N new   ^F archive", "^K palette   ^B hide  ^Z keys"]
+    : kind === "custom"
+      ? ["↵ open it     <> width", "esc back      ? keys"]
     : kind === "project"
       // `X` is on the strip because a list you cannot shorten is a list that grows forever, and a
       // project that outlives its conversations — which is the point of it — has to have a way off.
@@ -2718,7 +2923,16 @@ function hints(opts: DrawOptions): ListRow<Target>[] {
   return [
     blank(),
     { text: "─".repeat(Math.max(1, opts.width)), hl: "Separator", inert: true },
-    ...lines.map((text) => ({ text: ` ${text}`, hl: "Sidebar.Dim", inert: true })),
+    // Half a motion, at the foot, where Vim puts it: without it a count is a keypress with no
+    // effect until the next one, which is indistinguishable from a key that does nothing. On the
+    // first key line rather than on the rule above it — the rule is a row of full width, and a
+    // flush-right virtual text has nowhere to sit on a row that is already full.
+    ...lines.map((text, i) => ({
+      text: ` ${text}`,
+      hl: "Sidebar.Dim",
+      right: i === 0 && opts.count !== "" ? { text: `${opts.count} `, hl: "Accent" } : undefined,
+      inert: true,
+    })),
     ...(mine === "" ? [] : [{ text: ` ${mine}`, hl: "Sidebar.Dim", inert: true }]),
   ];
 }

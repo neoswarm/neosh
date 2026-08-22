@@ -77,6 +77,16 @@ async function declareOptions(neosh: Neosh) {
     description: "Show what the plan has left at the foot of the sidebar.",
   });
   await neosh.opt.declare({
+    name: "usage.sidebar.style",
+    type: { type: "str" },
+    default: "one",
+    description:
+      "How much of the plan the sidebar spends rows on. `one` is a row per account — the limit " +
+      "that would refuse the next request, plus any other that is already critical. `windows` is " +
+      "a row per limit. `full` adds the account row and the sentence under it. `<Tab>` on a plan " +
+      "row steps through them, and `^L` is the whole of it whichever is set.",
+  });
+  await neosh.opt.declare({
     name: "usage.poll",
     type: { type: "bool" },
     default: true,
@@ -138,7 +148,7 @@ async function installStrip({ neosh, subscriptions }: PluginContext) {
       }
       return;
     }
-    const [quotas, ascii, nerd, width] = await Promise.all([
+    const [quotas, ascii, nerd, width, style] = await Promise.all([
       neosh.quota.list().catch(() => [] as QuotaSnapshot[]),
       neosh.opt.get<boolean>("ui.ascii_only").catch(() => false),
       neosh.opt.get<boolean>("ui.nerd_font").catch(() => false),
@@ -147,6 +157,7 @@ async function installStrip({ neosh, subscriptions }: PluginContext) {
       // built to a guessed width does not wrap — it collides, and the countdown lands on the last
       // letter of the label.
       neosh.opt.get<number>("sidebar.width").catch(() => 34),
+      neosh.opt.get<string>("usage.sidebar.style").catch(() => "one"),
     ]);
     // An account we cannot name yet. Reaching a quota for an instance that is not in the credential
     // list means the list is stale — a provider registered late, or somebody has just signed in —
@@ -154,7 +165,7 @@ async function installStrip({ neosh, subscriptions }: PluginContext) {
     // this avoids. Once per staleness, not once per frame: `who` is replaced before the next one.
     if (quotas.some((q) => !who.some((c) => c.instance === q.instance))) await reload();
     const glyphs = { ascii: ascii ?? false, nerd: nerd ?? false };
-    const item = section(quotas, who, glyphs, width ?? 34, Date.now() / 1000);
+    const item = section(quotas, who, glyphs, width ?? 34, Date.now() / 1000, styleOf(style));
     // Compared as JSON rather than by identity: this runs on a tick, and re-contributing the same
     // rows makes the sidebar rebuild its whole list — cursor, scroll and all — several times a
     // second, for no change anybody can see.
@@ -168,6 +179,36 @@ async function installStrip({ neosh, subscriptions }: PluginContext) {
     await neosh.ext.contribute("sidebar.section", "plan", item, { priority: -10 });
   };
 
+  // Stepping the density, and taking the strip off the column altogether. Commands rather than
+  // config-file lines: `^K` runs them, `^Z` lists the key, and `init.ts` moves it — the same way
+  // every other verb here works. They write the *setting*, so `config.toml` decides where you
+  // start and the key decides where you are.
+  subscriptions.push(
+    await neosh.cmd.register(`${NS}.sidebar.cycle`, async () => {
+      const now = styleOf(await neosh.opt.get<string>("usage.sidebar.style").catch(() => "one"));
+      const next = STYLES[(STYLES.indexOf(now) + 1) % STYLES.length] ?? "one";
+      await neosh.opt.set("usage.sidebar.style", next);
+    }, { desc: "How much of the plan the sidebar shows" }),
+  );
+  subscriptions.push(
+    await neosh.cmd.register(`${NS}.sidebar.toggle`, async () => {
+      const on = (await neosh.opt.get<boolean>("usage.sidebar").catch(() => true)) ?? true;
+      await neosh.opt.set("usage.sidebar", !on);
+    }, { desc: "Show or hide the plan at the foot of the sidebar" }),
+  );
+  // And a key on the rows themselves. `<Tab>` because that is what opens and folds a thing you are
+  // standing on everywhere else in neosh, and `on: "custom"` so it is a verb about *these* rows
+  // rather than one advertised over every conversation in the panel.
+  await neosh.ext.contribute("sidebar.action", "plan.detail", {
+    key: "<Tab>",
+    label: "plan detail",
+    command: `${NS}.sidebar.cycle`,
+    on: "custom",
+  }).catch(() => {});
+  subscriptions.push({
+    dispose: () => void neosh.ext.remove("sidebar.action", "plan.detail").catch(() => {}),
+  });
+
   await reload();
   await refresh();
   subscriptions.push(neosh.quota.onChange((s) => {
@@ -176,8 +217,8 @@ async function installStrip({ neosh, subscriptions }: PluginContext) {
   }));
   subscriptions.push(neosh.opt.onChange((e) => {
     if (
-      e.name === "usage.sidebar" || e.name === "ui.ascii_only" || e.name === "ui.nerd_font" ||
-      e.name === "sidebar.width"
+      e.name === "usage.sidebar" || e.name === "usage.sidebar.style" ||
+      e.name === "ui.ascii_only" || e.name === "ui.nerd_font" || e.name === "sidebar.width"
     ) void refresh();
   }));
   // A selection change is the cheap signal that the provider list may have moved — signing in is
@@ -195,6 +236,8 @@ async function installStrip({ neosh, subscriptions }: PluginContext) {
 interface StripRow {
   text: string;
   hl?: string;
+  /** Pieces of the row in their own group, over the top of `hl`: the provider's mark. */
+  spans?: Array<{ from: number; to: number; hl: string }>;
   right?: { text: string; hl?: string };
   command?: string;
 }
@@ -219,53 +262,124 @@ interface StripRow {
  * round they go. One line in words, about the limit that actually binds, says both: how much is
  * left, and when it comes back.
  */
+/**
+ * How much of the column the plan is allowed to be.
+ *
+ * A plan with three limits and a name and a sentence under it is five rows, which is most of a
+ * short sidebar spent on a number that changes twice an hour. `one` is the answer to the question
+ * people actually have — *may I start something long* — and the rest is a keypress away.
+ *
+ * Ordered, because `<Tab>` steps along them.
+ */
+const STYLES = ["one", "windows", "full"] as const;
+type Style = (typeof STYLES)[number];
+
+export function styleOf(value: unknown): Style {
+  return STYLES.includes(value as Style) ? value as Style : "one";
+}
+
+/**
+ * The limits worth a row when there is only room for the answer.
+ *
+ * The one that binds, because it is the one that would refuse the next request — and anything else
+ * already critical, because a weekly cap at 94% is news whether or not the session limit is the one
+ * about to stop you. Never more than that: this is the summary, and a summary that grows back to
+ * the full list is not one.
+ */
+function summarised(q: QuotaSnapshot): QuotaWindow[] {
+  const first = q.windows.find((w) => w.active) ?? binding(q.windows);
+  const out = first ? [first] : [];
+  for (const w of q.windows) {
+    if (w === first) continue;
+    if (w.severity === "critical" || w.severity === "exhausted") out.push(w);
+  }
+  return out;
+}
+
 function section(
   quotas: QuotaSnapshot[],
   who: CredentialInfo[],
   glyphs: { ascii: boolean; nerd: boolean },
   width: number,
   now: number,
+  style: Style,
 ) {
   const rows: StripRow[] = [];
   // What the sidebar leaves for the text (`   ` and its own margin), less the widest countdown and
   // a space to keep it off the label.
   const room = Math.max(14, width - 6 - 5);
+  const accounts = quotas.filter((q) => q.windows.length > 0);
 
-  for (const q of quotas) {
-    if (q.windows.length === 0) continue;
+  for (const q of accounts) {
     // Air between accounts. Two of them run together into one block of bars otherwise, and the
-    // second account's name reads as another limit belonging to the first.
-    if (rows.length > 0) rows.push({ text: "" });
-    rows.push(accountRow(q, who, glyphs, room));
+    // second account's name reads as another limit belonging to the first. Not in `one`, where an
+    // account *is* a row and a blank line between two of them costs more than it separates.
+    if (rows.length > 0 && style !== "one") rows.push({ text: "" });
+    // Whose allowance this is. Always in `full`; in `windows` only when there is more than one
+    // account, since with a single one it is a row that says what the mark on the bar already
+    // says; never in `one`, where an account is a row.
+    if (style === "full" || (style === "windows" && accounts.length > 1)) {
+      rows.push(accountRow(q, who, glyphs, room));
+    }
+    const windows = style === "one" ? summarised(q) : q.windows;
+    // The mark goes on the bar itself when there is no account row above it to carry it: a row of
+    // brand colour with no brand on it is a coloured bar nobody can attribute.
+    const brand = style === "one" ? `${markFor(brandOf(q, who), glyphs)} ` : "";
+    // A `▸` says which limit binds, and is worth two columns only when there is more than one
+    // limit on screen to distinguish it from.
+    const marker = windows.length > 1 ? MARKER : 0;
     // Widest label first, so every bar in an account starts in the same column — a bar whose left
     // edge moves from row to row cannot be compared with the one above it, which is the only thing
     // a stack of bars is for.
-    const labels = q.windows.map((w) => compactLabel(w, room));
+    const labels = windows.map((w) => compactLabel(w, room - cells(brand)));
     const labelWidth = Math.min(
-      Math.max(...labels.map(cells)),
-      Math.max(6, room - MARKER - BAR_MIN - PCT - 1),
+      Math.max(...labels.map(cells), 0),
+      Math.max(6, room - cells(brand) - marker - BAR_MIN - PCT - 1),
     );
-    const bar = Math.max(BAR_MIN, Math.min(10, room - MARKER - labelWidth - PCT - 1));
-    for (const [i, w] of q.windows.entries()) {
+    const bar = Math.max(
+      BAR_MIN,
+      Math.min(10, room - cells(brand) - marker - labelWidth - PCT - 1),
+    );
+    // The mark keeps its own colour. The row is graded by severity — that is what a bar is for —
+    // but the one thing on it that says *whose* allowance this is has a brand colour of its own,
+    // and Anthropic's orange on the `✳` is how you know which of two accounts you are looking at
+    // without reading a word. The theme owns the colour: `Brand.Anthropic` is a group, never a
+    // value, so a palette that wants a different orange changes it in one place.
+    const mark = brand === ""
+      ? undefined
+      : [{ from: 0, to: byteLength(brand.trimEnd()), hl: brandOf(q, who)?.hl ?? "Sidebar.Heading" }];
+    for (const [i, w] of windows.entries()) {
       rows.push({
-        text: windowRow(w, labels[i] ?? w.label, labelWidth, bar, glyphs.ascii),
+        text: brand + windowRow(w, labels[i] ?? w.label, labelWidth, bar, glyphs.ascii, marker > 0),
         hl: severityGroup(w),
+        spans: mark,
         right: { text: countdown(w, now), hl: "Sidebar.Dim" },
         // Every row opens the panel, so there is no row here you can land on and press `↵` on to
         // no effect — which is the thing that teaches people the column is not interactive.
         command: `${NS}.panel`,
       });
     }
-    const said = plainly(q, now, room);
-    if (said) rows.push({ ...said, command: `${NS}.panel` });
-    const credit = creditRow(q);
-    if (credit) rows.push({ ...credit, command: `${NS}.panel` });
+    // The sentence under the bars, and the credit line: both are explanations, and an explanation
+    // is the first thing to give up when the column is being asked to say less.
+    if (style === "full") {
+      const said = plainly(q, now, room);
+      if (said) rows.push({ ...said, command: `${NS}.panel` });
+    }
+    if (style !== "one") {
+      const credit = creditRow(q);
+      if (credit) rows.push({ ...credit, command: `${NS}.panel` });
+    }
   }
   if (rows.length === 0) return null;
   // The way in, on the heading. Every row here opens the panel too, but a key you can press from
   // the composer without going to the sidebar first is a different affordance from a row you have
   // to arrive at — and it is the one somebody who has never focused this column will find.
   return { title: "PLAN", hint: "^L", at: "below" as const, rows };
+}
+
+/** The credential this allowance belongs to, for its mark and its colour. */
+function brandOf(q: QuotaSnapshot, who: CredentialInfo[]): Brand | null | undefined {
+  return who.find((c) => c.instance === q.instance)?.brand;
 }
 
 /**
@@ -351,10 +465,13 @@ function windowRow(
   labelWidth: number,
   bar: number,
   ascii: boolean,
+  marked = true,
 ): string {
   // The limit that would actually refuse the next request, marked the way the panel marks it. Two
-  // spaces otherwise, so the labels stay in one column.
-  const marker = w.active ? (ascii ? "> " : "▸ ") : "  ";
+  // spaces otherwise, so the labels stay in one column — and nothing at all when there is only one
+  // limit on the strip, since a marker that is on every row it can be on marks nothing and costs
+  // two columns of a label that is being clipped.
+  const marker = !marked ? "" : w.active ? (ascii ? "> " : "▸ ") : "  ";
   const pct = `${Math.round(w.used_percent)}%`.padStart(PCT);
   const name = clip(label, labelWidth);
   return `${marker}${name}${" ".repeat(Math.max(0, labelWidth - cells(name)))} ${

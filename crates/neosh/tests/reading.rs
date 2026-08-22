@@ -255,6 +255,49 @@ impl Session {
 // Getting a piece of the answer out
 // ---------------------------------------------------------------------------
 
+/// A count before a motion, the way it works everywhere these keys come from.
+///
+/// `5j` is five lines and `3G` is the third one — the count is a repetition on a motion and a
+/// destination on `G`, which is the distinction the digits are for. `0` is the start of the line
+/// when nothing has been typed and part of the number when something has. See ADR 0049.
+#[test]
+fn a_count_repeats_a_motion_and_places_a_jump() {
+    let sb = Sandbox::new("counts");
+    let mut s = sb.start();
+    s.answered_and_reading();
+    s.to_top();
+
+    s.ch("5");
+    // A digit on its own moves nothing and says so: the strip is the only thing that can tell you
+    // the first of two keystrokes landed anywhere.
+    assert!(
+        s.pump(|s| s.chat_cursor() == Some(0)),
+        "nothing has moved yet: {:?}",
+        s.chat_cursor()
+    );
+    s.ch("j");
+    assert!(
+        s.pump(|s| s.chat_cursor() == Some(5)),
+        "five lines, not one: {:?}",
+        s.chat_cursor()
+    );
+
+    // And the count is spent — the next `j` is one line, not another five.
+    s.ch("j");
+    assert!(s.pump(|s| s.chat_cursor() == Some(6)), "one line: {:?}", s.chat_cursor());
+
+    // `G` with a number in front of it is a row rather than that many of anything.
+    s.ch("3");
+    s.ch("G");
+    assert!(s.pump(|s| s.chat_cursor() == Some(2)), "the third row: {:?}", s.chat_cursor());
+
+    // And `gg` takes one too.
+    s.ch("4");
+    s.ch("g");
+    s.ch("g");
+    assert!(s.pump(|s| s.chat_cursor() == Some(3)), "the fourth row: {:?}", s.chat_cursor());
+}
+
 /// `yc` takes the code and nothing else: not the language line above it, not the indent the
 /// renderer added, not the sentence after it.
 ///

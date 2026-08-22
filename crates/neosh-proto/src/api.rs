@@ -274,6 +274,17 @@ pub enum ApiCall {
     WinClose {
         win: WindowId,
     },
+    /// Change how wide (or tall) a docked window is, without closing it.
+    ///
+    /// Reopening was the only way to resize a dock, and reopening is not the same thing: the window
+    /// id changes, whatever had the keyboard loses it, and a panel resized from inside itself would
+    /// throw you back to the composer on every press. `None` gives the dock back its default
+    /// extent. A float is configured through [`ApiCall::FloatConfigure`] and is refused here — the
+    /// two have nothing in common but the word.
+    WinResize {
+        win: WindowId,
+        size: Option<u16>,
+    },
     WinSetBuf {
         win: WindowId,
         buf: BufferId,

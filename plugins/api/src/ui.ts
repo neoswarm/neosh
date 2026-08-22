@@ -1722,6 +1722,18 @@ export interface ListRow<T = unknown> {
    */
   full?: string;
   /**
+   * Keep this row unfolded whether or not the cursor is on it.
+   *
+   * The cursor asking is the rule, and this is the one exception worth having: the conversation
+   * you are *in* is not a row you are considering, it is where you are, and a panel that abbreviates
+   * it to `Fix the login re…` until you happen to move the cursor onto it is abbreviating the one
+   * row you already know you want. Needs {@link ListRow.full} and
+   * {@link CursoredListOptions.width}, like every other unfolding here. Use it for a row that is
+   * *current*, never for one that is merely long — every row that opts in is a row the column can
+   * no longer be scanned down.
+   */
+  expand?: boolean;
+  /**
    * The column continuation lines line up under. Defaults to the row's own indent plus two.
    *
    * Set it where the default would be wrong — a row whose text starts with a marker and a glyph
@@ -1827,18 +1839,72 @@ export class CursoredList<T = unknown> {
     }
   }
 
-  /** Move by `delta` selectable rows. Wraps, because a list you cannot get back to the top of is a chore. */
-  move(delta: number): void {
-    if (this.rows.length === 0) return;
+  /**
+   * Move by `delta` selectable rows.
+   *
+   * Wraps by default, because a list you cannot get back to the top of is a chore. A page step
+   * passes `wrap: false`: `^D` at the foot of the list means "there is no more", and one that
+   * silently reappears at the top is a keypress that loses your place in a column you were
+   * reading downwards.
+   *
+   * `delta` counts rows you can land on, not buffer rows — headings, rules and blanks are not
+   * places, so `5j` past two separators moves five conversations rather than three.
+   */
+  move(delta: number, opts: { wrap?: boolean } = {}): void {
+    if (this.rows.length === 0 || delta === 0) return;
+    const wrap = opts.wrap ?? true;
+    const step = delta < 0 ? -1 : 1;
+    let remaining = Math.abs(delta);
     let i = this.cursor;
-    for (let n = 0; n < this.rows.length; n++) {
-      i = (i + delta + this.rows.length) % this.rows.length;
+    let landed = -1;
+    // Bounded by the whole list per row asked for: an all-inert list has nowhere to go, and a
+    // wrapping search for a row that does not exist would otherwise spin.
+    const limit = this.rows.length * Math.abs(delta) + this.rows.length;
+    for (let n = 0; n < limit && remaining > 0; n++) {
+      let next = i + step;
+      if (next < 0 || next >= this.rows.length) {
+        if (!wrap) break;
+        next = (next + this.rows.length) % this.rows.length;
+      }
+      i = next;
       if (!this.rows[i]?.inert) {
+        landed = i;
+        remaining--;
+      }
+    }
+    if (landed < 0) return;
+    this.cursor = landed;
+    this.opts.onMove?.(landed);
+  }
+
+  /**
+   * The first or last row you can land on — `gg` and `G`.
+   *
+   * A separate verb from a large `move`, because "the end" is a place and "a hundred rows down"
+   * is a guess about where the end is.
+   */
+  toEnd(which: "first" | "last"): void {
+    const found = which === "first"
+      ? this.rows.findIndex((r) => !r.inert)
+      : this.rows.reduce((acc, r, i) => (r.inert ? acc : i), -1);
+    if (found < 0) return;
+    this.cursor = found;
+    this.opts.onMove?.(found);
+  }
+
+  /** The n-th row you can land on, 1-based, the way `5G` counts. */
+  nth(n: number): void {
+    let seen = 0;
+    for (const [i, row] of this.rows.entries()) {
+      if (row.inert) continue;
+      seen += 1;
+      if (seen === n) {
         this.cursor = i;
         this.opts.onMove?.(i);
         return;
       }
     }
+    this.toEnd("last");
   }
 
   /** Put the cursor on the first row whose value matches. */
@@ -1854,8 +1920,17 @@ export class CursoredList<T = unknown> {
    *
    * `showCursor` is false when the panel does not have the keyboard: a cursor drawn on an unfocused
    * list claims an attention it does not have, and two visible cursors is worse than none.
+   *
+   * `pinned` is how many rows at the end sit against the *bottom edge* rather than after the
+   * content: a gauge or a key strip is a foot, and a foot that floats halfway up a half-empty
+   * column is chrome that moves every time the list above it grows by one. It costs blank lines
+   * and nothing else — when the list is longer than the window there is no room to pin anything
+   * to, and the rows go back to being the end of the list, which is where scrolling will find
+   * them.
    */
-  async render(opts: { showCursor?: boolean; win?: WindowId } = {}): Promise<void> {
+  async render(
+    opts: { showCursor?: boolean; win?: WindowId; pinned?: number } = {},
+  ): Promise<void> {
     const cursorHl = this.opts.cursorHl ?? "Sidebar.Selected";
     const columns = this.opts.width?.() ?? 0;
     const drawn: DrawnRow[] = [];
@@ -1895,22 +1970,48 @@ export class CursoredList<T = unknown> {
       }
       drawn.push({ text: row.text, marks });
 
-      // The rest of a row that did not fit, under the row and only while the cursor is on it.
-      if (!onCursor || row.full === undefined || columns < 1) return;
+      // The rest of a row that did not fit: under the cursor, or on a row that asked to stay open.
+      if ((!onCursor && !row.expand) || row.full === undefined || columns < 1) return;
       const indent = Math.max(0, Math.min(row.indent ?? leading(row.text) + 2, columns - 8));
       const rest = overflowOf(row.text, row.full, columns - indent);
-      block = 1 + rest.length;
+      // Only the cursor's block is scrolled to. A row that is permanently open is not somewhere
+      // the cursor is, so counting its height here would scroll the panel to a row nobody moved to.
+      if (onCursor) block = 1 + rest.length;
       for (const line of rest) {
         const text = `${" ".repeat(indent)}${line}`;
         const end = byteLength(text);
         const cont: DrawnMark[] = [];
         // The band runs the whole block. A continuation drawn on the terminal background reads as
-        // a separate row that happens to be indented, which is the one thing it must not be.
-        cont.push({ col: 0, opts: { hlGroup: cursorHl, endCol: end, priority: 200 } });
+        // a separate row that happens to be indented, which is the one thing it must not be. Only
+        // where there is a band to run: an always-open row that is not under the cursor gets its
+        // own colour and nothing else, or every one of them would look selected.
+        if (onCursor) cont.push({ col: 0, opts: { hlGroup: cursorHl, endCol: end, priority: 200 } });
         if (row.hl) cont.push({ col: 0, opts: { hlGroup: row.hl, endCol: end } });
         drawn.push({ text, marks: cont });
       }
     });
+
+    // The foot, against the bottom edge. Measured after everything is drawn rather than counted in
+    // rows, because an unfolded row is several lines tall and padding by row count would leave the
+    // strip one line short for every row that happened to be open.
+    const pinned = Math.min(Math.max(0, opts.pinned ?? 0), this.rows.length);
+    // One round trip, used twice — and skipped when neither the foot nor the cursor needs it, since
+    // this runs on a tick while a turn is in flight and an unfocused panel that pins nothing has
+    // nothing to measure.
+    const needed = pinned > 0 || opts.showCursor !== false;
+    const view = opts.win === undefined || !needed
+      ? null
+      : await this.neosh.win.viewport(opts.win).catch(() => null);
+    if (pinned > 0) {
+      const at = lineOf[this.rows.length - pinned] ?? drawn.length;
+      const filler = (view?.height ?? 0) - drawn.length;
+      if (filler > 0) {
+        drawn.splice(at, 0, ...Array.from({ length: filler }, () => ({ text: "", marks: [] })));
+        for (let i = this.rows.length - pinned; i < this.rows.length; i++) {
+          lineOf[i] = (lineOf[i] ?? 0) + filler;
+        }
+      }
+    }
 
     // One call, not one per mark. A panel that wrote its text, cleared its namespace and then set
     // its marks a call at a time was observable halfway through — and a frame landing after the
@@ -1922,7 +2023,7 @@ export class CursoredList<T = unknown> {
     // indices: an unfolded row is several lines tall and the two stopped agreeing the moment one
     // was — which would scroll to the wrong place by however many rows above it had ever unfolded.
     if (opts.win !== undefined && opts.showCursor !== false) {
-      const v = await this.neosh.win.viewport(opts.win).catch(() => null);
+      const v = view;
       if (v && v.height > 0) {
         const at = lineOf[this.cursor] ?? this.cursor;
         // The whole of the row, not only the line it starts on: scrolling until the *first* line
