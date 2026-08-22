@@ -63,7 +63,7 @@ per decision, and records the *reasoning*, not the choice.
   (`ext.contribute`/`ext.list`), which is how rows and verbs arrive from plugins we have never heard
   of; and **shared vars** (`vars`, scoped to the workspace, a conversation or a project) for anything
   about a thing rather than about us — `state` stays private and a favourite is not private. Every
-  key in a panel is an ordinary binding pointed at a named command, so `F1` lists it and `init.ts`
+  key in a panel is an ordinary binding pointed at a named command, so `^Z` lists it and `init.ts`
   can move it; a `switch` on `KeyContext` inside a plugin is the thing this replaced. Keep the
   capture, but only as a sink for keys nothing claimed. See ADR 0040.
 - **A panel you are in the middle of using has the keyboard.** `FloatConfig::modal` takes
@@ -78,6 +78,16 @@ per decision, and records the *reasoning*, not the choice.
   default. A modal that borrows a global key to open itself owes a binding to close itself, which is
   why `^E` shuts the sheet from inside. Answering a question is not this: `^T` is how you reach a
   question waiting in another conversation. See ADR 0047.
+- **A default binding is a key every terminal sends.** Not "a key most people can press once they
+  have found the setting": `F1` is brightness on a Mac out of the box, `⌥V` is `√`, and a key
+  neosh never receives is a key no amount of rebinding will fix. That leaves Ctrl-with-a-letter,
+  `⇧⇥`, `⏎`, `⌫` and `Esc` — and Ctrl with *punctuation* is not in the list, because a plain
+  terminal cannot tell `Ctrl+/` from `Ctrl+7`. Arrows, `PgUp`, `Home` and `End` are bound wherever
+  they mean something and are **never the only way** to do anything, which is also why the first
+  key in a `ui.keys.*` list is the chord: the first one is what a hint row prints, and a legend is
+  a promise about a keyboard. A capability that runs out of chords loses its key and keeps its
+  command — `^K` runs it by name and `init.ts` can bind it — because inventing a prefix layer for
+  one verb costs every user a concept to save one of them a keystroke. See ADR 0048.
 - **Pairing is a decision each machine makes, and neither of them restarts.** A node presents its
   identity to anyone who connects — as an SSH server presents a host key — so adding a computer is
   typing an address and being shown a name and a fingerprint that came from the far end. The other
@@ -349,8 +359,13 @@ the plugin tree is embedded with `include_dir!` and cargo will not notice otherw
 # Keys
 
 Everything here is an ordinary binding in the same table your `init.ts` writes to, bound to a
-*command name* rather than a callback. Setting the same key replaces it. `F1` lists the live
+*command name* rather than a callback. Setting the same key replaces it. `^Z` lists the live
 registry — this table is what ships.
+
+Every key here is one **every terminal sends on every platform**: Ctrl-with-a-letter, `⇧⇥`, `⏎`,
+`⌫`, `Esc`. Nothing needs `fn`, nothing needs Option-as-Alt, and nothing is reachable only by an
+arrow — arrows and `PgUp`/`Home`/`End` are bound wherever they mean something, and are never the
+only way to do anything. See ADR 0048.
 
 ## Chat
 
@@ -360,10 +375,9 @@ registry — this table is what ships.
 | `⇧⏎` | Newline, so a pasted snippet stays one message |
 | `^Y` | Take the last thing you queued back into the composer, to change it or drop it. Readline's yank: `^U`/`^W` kill, `^Y` brings it back |
 | `^V` | Attach the image on the clipboard. A key rather than a paste, because a terminal's paste can only ever hand over text |
-| `⌥V` | Take the last attached image back off |
+| `⌫` | On an empty composer, take the last attached image back off |
 | `^P` | Pick a model. Mid-turn too — the running agent is told, and thinks the rest with it |
-| `^E` | Everything this model can be told, on one panel: effort, thinking, fast mode, context, and whatever a driver invented. `←→` along a row, `↑↓` between them, and it applies as you move. Nothing else reaches the keyboard while it is open; `^E` again closes it |
-| `⌥↑` `⌥↓` | One rung up or down the capability ladder, same provider |
+| `^E` | Everything this model can be told, on one panel: effort, thinking, fast mode, context, and whatever a driver invented. `h`/`l` along a row, `j`/`k` between them, arrows too, and it applies as you move. Nothing else reaches the keyboard while it is open; `^E` again closes it |
 | `⇧⇥` | Permission mode — full access to start with, then ask, allow-listed, deny. Belongs to this conversation, saved with it, and takes effect on the turn that is running |
 | `^T` | Projects and conversations. Switching is never refused — turns keep running where they are |
 | `^J` | The computers in this workspace. Add one by its address, allow one that is asking, or open what it is running |
@@ -383,7 +397,7 @@ registry — this table is what ships.
 | `PgUp` `PgDn` `^End` | Scroll, and back to the newest message |
 | `^R` | Reload configuration |
 | `^Q` | Close this terminal. Whatever is running keeps running, and so does every other terminal open on this workspace — `neosh` puts you back |
-| `F1` | Every binding, live |
+| `^Z` | Every binding, live |
 | `Esc` | Interrupt the turn in this conversation. The agent is asked to stop, so the conversation survives it |
 
 Dragging an image onto the terminal pastes its path, and a pasted path to an image is attached
@@ -391,7 +405,9 @@ rather than typed out. What is attached sits above the field until the message g
 
 Composer editing is a text field: `←`/`→` by character and `^←`/`^→` by word, `Home`/`End` and
 `^Home`/`^End` for the ends, shift with any of them to select, `^W` and `^U` to delete a word or
-back to the start of the line.
+back to the start of the line. The capability ladder — `model.upgrade`, `model.downgrade` — has no
+default key: it had `⌥↑`/`⌥↓`, which is not a key every terminal sends, and `^K` runs both by
+name.
 
 ## Reading the transcript — `^S`
 
@@ -440,7 +456,7 @@ Two corollaries, both of which were bugs:
 What an agent gets when it asks *you* something. One question at a time, `⇧⇥` to go back and change
 an earlier answer, and **typing is answering** — it goes into the composer, where you can see and
 edit it, and the numbered shortcuts disappear to say a digit is now a character. Every key here is
-an ordinary binding against the `neosh.question` buffer kind, so `F1` lists it and `init.ts` can
+an ordinary binding against the `neosh.question` buffer kind, so `^Z` lists it and `init.ts` can
 move it.
 
 | Key | Does |
@@ -448,7 +464,7 @@ move it.
 | `↵` | Take the option under the cursor, and go on to the next question. On one that takes several, confirm what is ticked. With something typed, send that instead |
 | `1`–`9` | Take that option, while nothing has been typed |
 | `⇥` | Tick or untick the option under the cursor, on a question that takes more than one |
-| `↑` `↓`, `^P` `^N` | Move |
+| `^P` `^N`, `↑` `↓` | Move |
 | `⇧⇥` | Back to the previous question |
 | type | Your own answer, for when none of them is it. `⌫` back to the options, `^W` a word, `^U` all of it |
 | `Esc` | Dismiss. The agent is told nobody answered — which is a thing it can act on, not an error |
@@ -480,7 +496,7 @@ says how many are asking, `^T` is where you go, and it opens when you get there.
 | Key | Does |
 |---|---|
 | `↵` | Choose |
-| `↑`/`↓`, `^N`/`^P`, `^J`/`^K` | Move |
+| `^N`/`^P`, `^J`/`^K`, `↑`/`↓` | Move |
 | type | Filter |
 | `⇥` `⇧⇥`, `→` `←` | Between the two panes of the model picker |
 | `Esc`, `^C` | Close |
