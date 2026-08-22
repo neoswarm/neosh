@@ -503,6 +503,15 @@ export interface WindowApi {
     opts?: { size?: number; gravity?: Gravity; wrap?: boolean },
   ): Promise<WindowId>;
   close(win: WindowId): Promise<void>;
+  /**
+   * Change how wide (or tall) a docked window is, without closing it.
+   *
+   * Reopening is not the same thing: the window id changes and whatever had the keyboard loses it,
+   * so a panel resized from inside itself would throw the cursor back to the composer on every
+   * press. `null` gives the dock its default extent back. Floats are configured with
+   * {@link FloatApi.configure}, and are refused here.
+   */
+  resize(win: WindowId, size: number | null): Promise<void>;
   setBuf(win: WindowId, buf: BufferId): Promise<void>;
   /** `col` is a UTF-8 byte offset, not a character or display column. */
   cursor(win: WindowId): Promise<{ row: number; col: number }>;
@@ -1806,6 +1815,9 @@ export function __createContext(plugin: string, config: unknown, version: number
       },
       async close(win) {
         await c({ call: "win_close", win });
+      },
+      async resize(win, size) {
+        await c({ call: "win_resize", win, size });
       },
       async setBuf(win, buf) {
         await c({ call: "win_set_buf", win, buf });

@@ -77,14 +77,15 @@ pub struct Glyphs {
     /// already says. What is news is a call still out and a call that went wrong, so those are the
     /// two that get a mark and finished ones get the blank of the same width.
     pub fail: &'static str,
-    /// The rule down the left of what a tool came back with.
+    /// The corner on the first row of what a tool came back with.
     ///
-    /// A rule and not an elbow. An elbow marks where a body *starts*, which is the one thing a
-    /// body's position under its header already says; it leaves the other forty rows unmarked, so
-    /// a long result has no visible extent and reads as loose text that happens to be indented.
-    /// A rule answers the question that is actually open — how far does this go — and costs three
-    /// columns less, which on a diff is three columns of code.
-    pub rule: &'static str,
+    /// It used to be a rule down the whole left side, on the argument that a long body needs its
+    /// extent marked. What that actually produced was a wall: forty rows each saying the same
+    /// thing, down the side of a diff whose own colours are the thing to read, in a column already
+    /// carrying an indent that says the same. The corner says where a body *starts* — which is the
+    /// one moment the eye needs telling, now that a card no longer has a blank row above it — and
+    /// the indent carries the rest.
+    pub elbow: &'static str,
     /// Unchanged lines a diff is not showing.
     pub fold: &'static str,
     /// The mark on the row that stands in for what is not being shown.
@@ -110,7 +111,7 @@ impl Glyphs {
                 bar: "|",
                 live: ">",
                 fail: "x",
-                rule: "|",
+                elbow: "\\",
                 fold: ":",
                 elision: "...",
                 between: "...",
@@ -126,7 +127,7 @@ impl Glyphs {
                 bar: "\u{258c}",
                 live: "\u{25b8}",
                 fail: "\u{2717}",
-                rule: "\u{2502}",
+                elbow: "\u{2514}",
                 fold: "\u{22ee}",
                 elision: "\u{2026}",
                 between: "\u{22ef}",
@@ -140,17 +141,24 @@ impl Glyphs {
         }
     }
 
-    /// What every row of a card body starts with: two columns of indent, the rule, one space.
+    /// What every row of a card body starts with: four columns of indent.
     ///
-    /// The same on the first row as on the last, which is the whole point of it being a rule.
+    /// Four rather than two because the first row of a body wears a corner in the same space —
+    /// see [`Glyphs::opener`] — and a body whose first line is indented differently from the rest
+    /// of it is a body that reads as two things.
     fn margin(&self) -> String {
-        format!("  {} ", self.rule)
+        "    ".into()
+    }
+
+    /// The first row of a body: the same four columns, with the corner in them.
+    fn opener(&self) -> String {
+        format!("  {} ", self.elbow)
     }
 
     /// The two columns a card's header opens with: a mark, when the state is news, and a space.
     ///
     /// Always two columns wide, so the names line up down the column whatever each card is doing,
-    /// and so the rule under a card sits directly beneath the name it belongs to.
+    /// and so a card's body sits directly beneath the name it belongs to.
     fn mark(&self, state: ToolState) -> (&'static str, &'static str) {
         match state {
             ToolState::Running => (self.live, "Agent.ToolRunning"),
@@ -506,7 +514,7 @@ pub fn exit_code(content: &str) -> Option<i64> {
 /// there is already the claim that the call happened. So the column holds a mark only while the
 /// call is out — where it sweeps, and is then the one moving thing in the transcript — or when the
 /// call failed. Otherwise it is two blanks of the same width, which keeps the names in a column
-/// and puts the body's rule directly under the name it belongs to.
+/// and puts the body's corner directly under the name it belongs to.
 ///
 /// The subject sits after the name with a gap, rather than inside brackets. `Edit(src/main.rs)`
 /// reads as a function call, which is what it is on the wire and not what it is on screen: what
@@ -706,11 +714,11 @@ pub fn group_header(g: &Glyphs, heads: &[Head], root: &std::path::Path, width: u
     Row::new(text, spans)
 }
 
-/// What an opened run shows: one row per call, under the rule.
+/// What an opened run shows: one row per call, under the header.
 ///
 /// ```text
-///   │ Read  crates/neosh/src/host.rs  620 lines
-///   │ Grep  fn header  12 lines
+///   └ Read  crates/neosh/src/host.rs  620 lines
+///     Grep  fn header  12 lines
 /// ```
 ///
 /// The full subject rather than the short name the folded row uses, because "which file" is the
@@ -729,7 +737,7 @@ pub fn group_body(
     }
     let margin = g.margin();
     let room = width.saturating_sub(margin.chars().count()).max(8);
-    heads
+    let mut rows: Vec<Row> = heads
         .iter()
         .map(|h| {
             let (text, spans) = label(h, root, room);
@@ -738,7 +746,9 @@ pub fn group_body(
             all.extend(spans.into_iter().map(|(a, b, hl)| (at + a, at + b, hl)));
             Row::new(format!("{margin}{text}"), all)
         })
-        .collect()
+        .collect();
+    attach(g, &mut rows);
+    rows
 }
 
 /// Whether two calls may share one card: both only looked at something.
@@ -978,23 +988,23 @@ fn clip(text: &str, room: usize) -> String {
 
 /// What goes under a header once the call has come back.
 ///
-/// For an edit that worked, the change itself — a rule down the left, a line number where one is
-/// known, a sign, and the code, syntax-coloured, on a band that says which way it went:
+/// For an edit that worked, the change itself — a corner where it starts, a line number where one
+/// is known, a sign, and the code, syntax-coloured, on a band that says which way it went:
 ///
 /// ```text
-///   │ 142    impl Session {
-///   │ 143  - let x = 1;
-///   │ 143  + let x = 2;
-///   │ ⋮ 4 unchanged
+///   └ 142    impl Session {
+///     143  - let x = 1;
+///     143  + let x = 2;
+///     ⋮ 4 unchanged
 /// ```
 ///
 /// For anything else — and for an edit that failed, whose error is the thing to read — what came
-/// back, under the same rule:
+/// back, at the same indent:
 ///
 /// ```text
-///   │ hello
-///   │ world
-///   │ … +2 more lines (^S ⇥ to expand)
+///   └ hello
+///     world
+///     … +2 more lines (^S ⇥ to expand)
 /// ```
 ///
 /// Folded to `limits` rows unless `expanded`, because the point is to see that something happened
@@ -1010,17 +1020,38 @@ pub fn body(
     expanded: bool,
     width: usize,
 ) -> Vec<Row> {
-    if !result.is_error {
-        let changes = edits_of(input);
-        if !changes.is_empty() {
-            return diff_rows(g, &changes, limits.diff_lines, expanded, width);
-        }
+    let mut rows = if !result.is_error && !edits_of(input).is_empty() {
+        diff_rows(g, &edits_of(input), limits.diff_lines, expanded, width)
+    } else if !result.is_error && !expanded && looks_at_something(input) {
         // Folded to the header alone. The count is already on it, and `⇥` opens this.
-        if !expanded && looks_at_something(input) {
-            return Vec::new();
-        }
+        Vec::new()
+    } else {
+        result_rows(g, result, limits.output_lines, expanded, width)
+    };
+    attach(g, &mut rows);
+    rows
+}
+
+/// Put the corner on the first row of a body.
+///
+/// Done here rather than in each builder because every one of them lays a row out from
+/// [`Glyphs::margin`] and counts its spans from the end of it — so the corner is a swap of the
+/// first four columns and a shift of whatever that row's spans said about them, in one place, and
+/// nothing downstream has to know there are two kinds of margin.
+fn attach(g: &Glyphs, rows: &mut [Row]) {
+    let Some(first) = rows.first_mut() else { return };
+    let (from, to) = (g.margin(), g.opener());
+    if !first.text.starts_with(&from) {
+        return;
     }
-    result_rows(g, result, limits.output_lines, expanded, width)
+    first.text = format!("{to}{}", &first.text[from.len()..]);
+    // Byte offsets, so the two margins being the same *width* is not the same as being the same
+    // length: `└` is three bytes and a space is one.
+    let shift = |x: usize| if x >= from.len() { x + to.len() - from.len() } else { x };
+    for (a, b, _) in &mut first.spans {
+        *a = shift(*a);
+        *b = shift(*b);
+    }
 }
 
 /// The row that stands in for what is not being shown.
@@ -1045,9 +1076,9 @@ fn trailer(g: &Glyphs, margin: &str, rest: usize, what: &str) -> Row {
 /// gets one row, the tail gets the rest, and the count of what fell out sits between them.
 ///
 /// ```text
-///   │    Compiling neosh v0.1.0
-///   │ … +4 lines (^S ⇥ to expand)
-///   │ test result: ok. 12 passed
+///   └    Compiling neosh v0.1.0
+///     … +4 lines (^S ⇥ to expand)
+///     test result: ok. 12 passed
 /// ```
 ///
 /// One row of head rather than half: what the head is *for* is telling you which command's output
@@ -1144,7 +1175,7 @@ fn look(op: diff::Op) -> (&'static str, Option<&'static str>, &'static str, &'st
 
 /// The change itself.
 ///
-/// Three columns and then the code: the rule, the line number if anyone knew it, and the sign. The
+/// Three columns and then the code: the margin, the line number if anyone knew it, and the sign. The
 /// sign stays even though the band already says the same thing, because the band is the first thing
 /// to go — on a sixteen-colour terminal, under `NO_COLOR`, in a screenshot somebody pasted into a
 /// ticket — and a diff whose two halves are told apart by nothing at all is not a diff. It is the
@@ -1267,7 +1298,7 @@ fn paint(change: &Change) -> Option<Vec<neosh_syntax::Spans>> {
 ///
 /// Long lines wrap rather than being cut. A clipped line of prose has lost an adjective; a clipped
 /// line of code has lost the half of it you were about to read, and there is no scrolling sideways
-/// to get it back. The continuation carries the band and the rule and nothing else — no repeated
+/// to get it back. The continuation carries the band and the margin and nothing else — no repeated
 /// sign, no repeated number, because both of those are facts about *a line* and this is still the
 /// same one.
 fn code_rows(
@@ -1341,7 +1372,7 @@ fn shift(spans: &neosh_syntax::Spans, from: usize, to: usize, at: usize) -> Vec<
 /// made here and for the same reason: the frontend owns width, wraps whatever still overflows, and
 /// re-wrapping something already close to right is invisible. Doing it here at all is what buys the
 /// continuation rows their indent — a line the frontend wraps starts again at column zero, under
-/// the rule rather than beside it.
+/// the margin rather than beside it.
 fn split_at_width(text: &str, room: usize) -> Vec<(usize, String)> {
     let chars: Vec<(usize, char)> = text.char_indices().collect();
     if chars.len() <= room {
@@ -1683,8 +1714,8 @@ mod tests {
         // Opened, every call gets its own row with the *whole* subject: the short names on the
         // folded row are the loose answer, and this is where it is exact.
         assert_eq!(texts(&rows), vec![
-            "  \u{2502} Read  deep/down/a.rs  120 lines",
-            "  \u{2502} Searched  fn main  3 lines",
+            "  \u{2514} Read  deep/down/a.rs  120 lines",
+            "    Searched  fn main  3 lines",
         ]);
     }
 
@@ -1766,7 +1797,7 @@ mod tests {
         assert!(t[1].contains("\u{2026} +"), "then what was dropped: {t:?}");
         assert!(t.last().unwrap().ends_with("test result: ok. 12 passed"), "the answer: {t:?}");
         // And no row is spent on a blank line, of which that output has two.
-        assert!(t.iter().all(|r| !r.trim_end().ends_with('\u{2502}')), "{t:?}");
+        assert!(t.iter().all(|r| !r.trim().is_empty()), "{t:?}");
     }
 
     #[test]
@@ -1822,7 +1853,7 @@ mod tests {
         let result = neosh_proto::ToolResult::ok("ok");
         let rows = body(&g(), &input, &result, Limits { diff_lines: 12, output_lines: 3 }, false, 80);
         let t = texts(&rows);
-        assert_eq!(t[0], "  \u{2502}   l8", "context first, no gap row at the top: {t:?}");
+        assert_eq!(t[0], "  \u{2514}   l8", "context first, no gap row at the top: {t:?}");
         assert!(t.iter().any(|r| r.ends_with("- l10")), "{t:?}");
         assert!(t.iter().any(|r| r.ends_with("+ L10")), "{t:?}");
         assert!(!t.iter().any(|r| r.contains("unchanged")), "no gap at either end: {t:?}");
@@ -1872,7 +1903,7 @@ mod tests {
         let input = json!({ "file_path": "/work/a.rs", "old_string": "a\nb", "new_string": "a\nc" });
         let result = neosh_proto::ToolResult::ok("ok");
         let rows = body(&g(), &input, &result, Limits { diff_lines: 12, output_lines: 3 }, false, 80);
-        assert_eq!(texts(&rows), vec!["  \u{2502}   a", "  \u{2502} - b", "  \u{2502} + c"]);
+        assert_eq!(texts(&rows), vec!["  \u{2514}   a", "    - b", "    + c"]);
     }
 
     #[test]
@@ -1880,7 +1911,7 @@ mod tests {
         let input = json!({ "file_path": "/work/a.rs", "old_string": "a", "new_string": "b" });
         let result = neosh_proto::ToolResult::error("old_string not found");
         let rows = body(&g(), &input, &result, Limits { diff_lines: 12, output_lines: 0 }, false, 80);
-        assert_eq!(texts(&rows), vec!["  \u{2502} old_string not found"]);
+        assert_eq!(texts(&rows), vec!["  \u{2514} old_string not found"]);
         assert_eq!(rows[0].spans[0].2, "Agent.ToolError");
     }
 
@@ -1893,9 +1924,9 @@ mod tests {
         // One line of head, then what was dropped, then the end — which for a command is the
         // answer. Folding from the end would keep `one` and `two` and throw away the result.
         assert_eq!(t, vec![
-            "  \u{2502} one",
-            "  \u{2502} \u{2026} +2 lines (^S \u{21e5} to expand)",
-            "  \u{2502} four",
+            "  \u{2514} one",
+            "    \u{2026} +2 lines (^S \u{21e5} to expand)",
+            "    four",
         ]);
         let open = body(&g(), &input, &result, Limits { diff_lines: 12, output_lines: 2 }, true, 80);
         assert_eq!(texts(&open).len(), 4);
@@ -1960,7 +1991,7 @@ mod tests {
         });
         let rows =
             body(&g(), &strings, &result, Limits { diff_lines: 12, output_lines: 3 }, false, 80);
-        assert_eq!(texts(&rows), vec!["  \u{2502} -     let x = 1;", "  \u{2502} +     let x = 2;"]);
+        assert_eq!(texts(&rows), vec!["  \u{2514} -     let x = 1;", "    +     let x = 2;"]);
     }
 
     #[test]
@@ -2013,7 +2044,7 @@ mod tests {
         // get by pressing `⇥`.
         let rows = body(&g(), &json!({"file_path": "/work/a.rs"}), &result,
             Limits { diff_lines: 12, output_lines: 3 }, true, 80);
-        assert_eq!(texts(&rows), vec!["  \u{2502}      1    impl Session {"]);
+        assert_eq!(texts(&rows), vec!["  \u{2514}      1    impl Session {"]);
     }
 
     /// A turn that reads six files should read as six rows, not as thirty.
@@ -2042,7 +2073,7 @@ mod tests {
         let input = json!({"path": "/work/gone.rs"});
         let result = neosh_proto::ToolResult::error("no such file");
         let rows = body(&g(), &input, &result, Limits { diff_lines: 12, output_lines: 3 }, false, 80);
-        assert_eq!(texts(&rows), vec!["  \u{2502} no such file"]);
+        assert_eq!(texts(&rows), vec!["  \u{2514} no such file"]);
     }
 
     /// A command's output *is* its answer, so it keeps its body — and its header does not repeat
@@ -2062,7 +2093,7 @@ mod tests {
     fn a_limit_of_zero_counts_a_result_and_hides_a_diff() {
         let result = neosh_proto::ToolResult::ok("one\ntwo");
         let rows = body(&g(), &json!({}), &result, Limits { diff_lines: 0, output_lines: 0 }, false, 80);
-        assert_eq!(texts(&rows), vec!["  \u{2502} 2 lines"]);
+        assert_eq!(texts(&rows), vec!["  \u{2514} 2 lines"]);
         let input = json!({ "file_path": "/work/a.rs", "old_string": "a", "new_string": "b" });
         let rows = body(&g(), &input, &result, Limits { diff_lines: 0, output_lines: 3 }, false, 80);
         assert!(rows.is_empty(), "the header already has the stats: {:?}", texts(&rows));
@@ -2160,6 +2191,6 @@ mod tests {
         let g = Glyphs::new(true);
         let result = neosh_proto::ToolResult::ok("one\ntwo");
         let rows = body(&g, &json!({}), &result, Limits { diff_lines: 12, output_lines: 1 }, false, 80);
-        assert_eq!(texts(&rows), vec!["  | ... +1 line (^S Tab to expand)", "  | two"]);
+        assert_eq!(texts(&rows), vec!["  \\ ... +1 line (^S Tab to expand)", "    two"]);
     }
 }

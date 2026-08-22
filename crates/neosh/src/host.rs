@@ -264,6 +264,13 @@ pub struct Host {
     /// Cleared by the key that follows, whatever it is, so a mistyped second key ends the sequence
     /// instead of leaving the next unrelated press to be swallowed by it.
     reading_pending: Option<char>,
+    /// A count typed before a motion in the transcript — `5j`, `12G`.
+    ///
+    /// Kept as the digits rather than a number so that it can be shown while it is half typed: a
+    /// count is two keystrokes with nothing between them, and the first one is otherwise a press
+    /// that appears to have done nothing at all. Ended by whatever motion spends it, and by any
+    /// key that is not one.
+    reading_count: String,
     /// Whether the running selection takes whole lines — `V` rather than `v`.
     ///
     /// A flag rather than a second kind of selection, because there is one selection model here and
@@ -711,6 +718,7 @@ impl Host {
             keys_touched: false,
             reading: false,
             reading_pending: None,
+            reading_count: String::new(),
             reading_linewise: false,
             search: None,
             searched: String::new(),
@@ -2616,6 +2624,14 @@ impl Host {
             used += display_width(head);
             out.push(chunk(head, "Status.Pending"));
         }
+        // A count that has been typed and not yet spent. It goes first because it is about the key
+        // you are in the middle of pressing, and without it the digit is a press with no effect —
+        // which is indistinguishable from a key that does nothing.
+        if !self.reading_count.is_empty() {
+            let head = format!("{}  ", self.reading_count);
+            used += display_width(&head);
+            out.push(chunk(head, "Accent"));
+        }
         for (keys, label) in pairs {
             let gap = if out.len() > usize::from(self.reading_pending.is_some()) { 2 } else { 0 };
             let cost = gap + display_width(keys) + 1 + display_width(label);
@@ -3382,6 +3398,7 @@ impl Host {
         }
         self.reading = false;
         self.reading_pending = None;
+        self.reading_count.clear();
         self.reading_linewise = false;
         self.editor.set_mode(self.mode_before_reading);
         self.clear_matches();
@@ -3407,6 +3424,29 @@ impl Host {
         };
         let select = self.chat_anchored() || key.mods.shift;
 
+        // A count, typed before the motion it belongs to. Digits first, because `0` is also a
+        // motion: it is the start of the line when nothing is pending and part of the number when
+        // something is, which is what it means everywhere else these keys come from.
+        if !key.mods.ctrl
+            && !key.mods.alt
+            && self.reading_pending.is_none()
+            && let Some(d) = ch.chars().next().filter(char::is_ascii_digit)
+            && !(d == '0' && self.reading_count.is_empty())
+        {
+            // Three digits is already more rows than any transcript has on screen, and it is what
+            // stops a leant-on key growing a string without end.
+            if self.reading_count.len() < 3 {
+                self.reading_count.push(d);
+            }
+            self.refresh_composer();
+            return;
+        }
+        // Whatever was typed, the motion that follows is the only thing that spends it — so take it
+        // here and let every arm below run with it already gone. A key that is not a motion
+        // therefore ends the count, which is what makes a half-typed one abandonable.
+        let typed = self.take_reading_count();
+        let count = typed.unwrap_or(1);
+
         // Chords first — before the pending pair and before the plain motions, because a chord is
         // a different key and not a modified one. Read after them, `^B` was matched by the `b` arm
         // of the motion table and moved a word left, `^Y` opened a pending yank, and `^E` moved a
@@ -3414,14 +3454,15 @@ impl Host {
         // share. `<C-d>`/`<C-u>` are half a screen because that is what they are everywhere; a full
         // screen with no overlap loses the line you were reading.
         let page = self.chat_height().max(2);
+        let n = count as i64;
         if key.mods.ctrl {
             match ch {
-                "d" => return self.reading_by(page as i64 / 2, select),
-                "u" => return self.reading_by(-(page as i64 / 2), select),
-                "f" => return self.reading_by(page as i64, select),
-                "b" => return self.reading_by(-(page as i64), select),
-                "e" => return self.reading_by(1, select),
-                "y" => return self.reading_by(-1, select),
+                "d" => return self.reading_by(n * page as i64 / 2, select),
+                "u" => return self.reading_by(-(n * page as i64 / 2), select),
+                "f" => return self.reading_by(n * page as i64, select),
+                "b" => return self.reading_by(-(n * page as i64), select),
+                "e" => return self.reading_by(n, select),
+                "y" => return self.reading_by(-n, select),
                 _ => {}
             }
         }
@@ -3438,7 +3479,7 @@ impl Host {
         // mistyped `y` would sit there waiting to eat an unrelated keystroke later.
         if let Some(first) = self.reading_pending.take() {
             self.refresh_composer();
-            self.reading_pair(first, &key, ch);
+            self.reading_pair(first, &key, ch, typed);
             return;
         }
         // `y` is the only one of the three that is two keys in one: an operator when nothing is
@@ -3448,10 +3489,24 @@ impl Host {
         // making, with no message either way to say why.
         if matches!(ch, "g" | "z") || (ch == "y" && !self.chat_anchored()) {
             self.reading_pending = ch.chars().next();
+            // Put the count back for the key that finishes the pair. `5gg` is one motion with a
+            // number in front of it, and the first `g` is not the thing that spends it.
+            if let Some(n) = typed {
+                self.reading_count = n.to_string();
+            }
             self.refresh_composer();
             return;
         }
 
+        // `G` with a count in front of it is a *row* — `12G` — and it is the one motion here where
+        // the number is the destination rather than how many times to go. Before the table, because
+        // afterwards it is a repetition like everything else in it.
+        if ch == "G"
+            && let Some(n) = typed
+        {
+            self.reading_by_row(n, select);
+            return;
+        }
         let motion = match (&key.code, ch) {
             (KeyCode::Left, _) | (_, "h") => Some(CursorMotion::Left),
             (KeyCode::Right, _) | (_, "l") => Some(CursorMotion::Right),
@@ -3465,11 +3520,23 @@ impl Host {
             _ => None,
         };
         if let Some(motion) = motion {
-            let _ = self.editor.apply(&PluginId::from(BUILTIN), ApiCall::WinMotion {
-                win: self.chat_win,
-                motion,
-                select,
-            });
+            // Repeated rather than computed: `5j` is five of what `j` does, including what it does
+            // at the ends and to the column it remembers, and a version of it that worked out a row
+            // number would be a second answer to a question the core already answers. The ends of
+            // the transcript are the exception — there is only one of each, and going there five
+            // times is going there.
+            let times = if matches!(motion, CursorMotion::BufEnd | CursorMotion::BufStart) {
+                1
+            } else {
+                count
+            };
+            for _ in 0..times {
+                let _ = self.editor.apply(&PluginId::from(BUILTIN), ApiCall::WinMotion {
+                    win: self.chat_win,
+                    motion,
+                    select,
+                });
+            }
             self.resnap_linewise();
             self.follow_cursor();
             // The hint row says what the row under the cursor can do, so it moves with it.
@@ -3539,8 +3606,15 @@ impl Host {
     }
 
     /// The second key of a pair: `gg`, `zz`/`zt`/`zb`, and the `y` operator.
-    fn reading_pair(&mut self, first: char, key: &neosh_proto::KeyPress, ch: &str) {
+    ///
+    /// `typed` is the count the *first* key put back for this one — `5gg` is one motion with a
+    /// number in front of it, and the `g` that opened the pair is not what spends it.
+    fn reading_pair(&mut self, first: char, key: &neosh_proto::KeyPress, ch: &str, typed: Option<u32>) {
         match (first, ch) {
+            ('g', "g") if typed.is_some() => {
+                let select = key.mods.shift || self.chat_anchored();
+                self.reading_by_row(typed.unwrap_or(1), select);
+            }
             ('g', "g") => {
                 // Extends whenever a selection is running, exactly as `k` does. Shift alone would
                 // mean `v` then `gg` threw away what you had selected and jumped, which is the one
@@ -3628,6 +3702,21 @@ impl Host {
         self.resnap_linewise();
         self.follow_cursor();
         self.refresh_composer();
+    }
+
+    /// The count typed before a motion, if one was, and forget it.
+    ///
+    /// `None` rather than `1` for "nobody typed one", because the two are different keys: `G` is
+    /// the end of the transcript and `1G` is its first row.
+    fn take_reading_count(&mut self) -> Option<u32> {
+        let typed = std::mem::take(&mut self.reading_count);
+        typed.parse::<u32>().ok().filter(|n| *n > 0)
+    }
+
+    /// Go to a row, counted from one, the way `12G` counts.
+    fn reading_by_row(&mut self, row: u32, select: bool) {
+        let last = self.chat_lines().len().saturating_sub(1) as u32;
+        self.reading_jump((row.saturating_sub(1).min(last), 0), select);
     }
 
     /// Move `delta` rows, clamped to the transcript.
@@ -4303,12 +4392,11 @@ impl Host {
             output: None,
         };
         let card = cards::header(&g, &head, &root, width);
-        // A blank row between one action and the next. Butted together, a header, four rows of
-        // output and the next header are one block of text with no edges in it, and finding where
-        // an action starts means reading for it. A row of air is what turns the transcript into a
-        // list of things that happened — it is the cheapest structure there is, and every program
-        // that reads well spends it.
-        self.chat_gap();
+        // No blank row above it. Air used to go between one action and the next on the argument
+        // that it turns the transcript into a list — but a card is already a header at column zero
+        // with its body indented under a corner, and a run of actions reads as a list without
+        // paying a row for every one of them. Prose still gets its blank, because a paragraph and
+        // a command are different kinds of thing; two commands are not.
         let row = self.chat_push(vec![card.text.clone()]);
         self.chat_row(row, &card);
         self.cards.push(Card::new(leg, row));
@@ -5488,6 +5576,24 @@ impl Host {
                     // The plan was built from calls the driver can no longer see. Keeping it would
                     // be a checklist for work nothing is going to pick up.
                     r.plan.clear();
+                }
+                // What the window holds *now*. Compaction is the one moment the number moves
+                // without a request being made, and the card said `20.3k → 1.6k` while the meter
+                // under it went on reporting the number from before — for the rest of the
+                // conversation, because a driver that has answered "how full is it" once turns the
+                // estimate in `add_usage` off, and the next answer only arrives with the next
+                // request. The driver said `post_tokens`; this is what it is for.
+                if let Some(used) = after {
+                    let window = self
+                        .agent
+                        .sessions()
+                        .get(&session)
+                        .and_then(|s| s.context_window)
+                        .unwrap_or(0);
+                    if let Some(s) = self.agent.sessions().get_mut(&session) {
+                        s.set_context(used, window);
+                    }
+                    self.persist_sessions();
                 }
                 if on_screen {
                     let r = cards::compaction(&self.glyphs(), before, after);
@@ -7711,8 +7817,8 @@ fn transcript(
                         cards[i].legs.push(leg);
                         cards[i].row
                     } else {
-                        // The row of air the live path puts between one action and the next.
-                        gap(&mut lines);
+                        // No gap, exactly as the live path draws it: the two have to produce the
+                        // same rows, or switching away and back re-spaces the conversation.
                         let at = lines.len() as u32;
                         cards.push(Card::new(leg, at));
                         lines.push(String::new());

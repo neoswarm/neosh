@@ -142,15 +142,26 @@ impl Session {
         let before = self.sidebar_rows();
         self.ctrl("n");
         assert!(
-            self.pump(|s| s.sidebar_rows() > before),
+            self.pump(move |s| s.sidebar_rows() > before),
             "a conversation was started\n{:?}",
             self.sidebar_now()
         );
     }
 
     /// How many conversation rows the panel is showing, however they are named.
+    ///
+    /// Counted by the age in the right-hand column rather than by the indent. A row the panel has
+    /// unfolded is several lines, and a line of somebody's title is indented exactly as far as the
+    /// row it belongs to — so the text alone cannot tell a second line of a title from an idle
+    /// conversation. The age can: it is virtual text on the row, and a continuation has none.
+
     fn sidebar_rows(&self) -> usize {
-        self.sidebar_now().iter().filter(|l| l.starts_with("     ") || l.starts_with("       ")).count()
+        let text = self.sidebar_now();
+        let virt = self.sidebar_virt_now();
+        text.iter()
+            .zip(virt.iter())
+            .filter(|(l, v)| l.starts_with("    ") && !v.trim().is_empty())
+            .count()
     }
 
     fn ctrl(&mut self, c: &str) {
@@ -2066,7 +2077,7 @@ fn a_worktree_nests_under_the_repository_it_belongs_to() {
             match (repo, tree) {
                 // Below its repository, indented past the repository's own arrow, and the branch
                 // alone — `work · sideline` is the flat list this replaced.
-                (Some(r), Some(t)) => t > r && rows[t].starts_with("     ") && !rows[t].contains('\u{b7}'),
+                (Some(r), Some(t)) => t > r && rows[t].starts_with("    ") && !rows[t].contains('\u{b7}'),
                 _ => false,
             }
         }),
@@ -2116,7 +2127,7 @@ fn an_emptied_worktree_is_still_inside_its_repository() {
             let repo = rows.iter().position(|l| l.contains("work") && !l.contains("sideline"));
             let tree = rows.iter().position(|l| l.contains("sideline"));
             match (repo, tree) {
-                (Some(r), Some(t)) => t > r && rows[t].starts_with("     "),
+                (Some(r), Some(t)) => t > r && rows[t].starts_with("    "),
                 _ => false,
             }
         }),
@@ -3652,6 +3663,45 @@ export async function activate({ neosh }: PluginContext) {
 }
 "#;
 
+/// A driver that fills its context and then compacts it, reporting both the way `claude` does.
+///
+/// `Activity::Context` is the driver answering "how full is it"; `Activity::Compacted` carries the
+/// count either side of a compaction. The second one is the whole subject of the test: it is the
+/// only moment the number moves without a request being made.
+const COMPACTOR: &str = r#"
+import type { PluginContext } from "@neosh/api";
+const nap = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+export async function activate({ neosh }: PluginContext) {
+  await neosh.provider.register("compactor", [{
+    id: "compactor", driver: "compactor", display_name: "Compactor",
+    models: [{ id: "compactor", display_name: "Compactor" }],
+  }], async (_req, emit) => {
+    emit({ type: "message_start", model: "compactor", usage: {} });
+    emit({ type: "activity", activity: { kind: "context", used: 180000, total: 200000 } });
+    await nap(400);
+    emit({ type: "activity", activity: { kind: "compacted", before: 180000, after: 12000 } });
+    emit({ type: "block_start", index: 0, block: { kind: "text" } });
+    emit({ type: "text_delta", index: 0, text: "Carrying on." });
+    emit({ type: "block_stop", index: 0 });
+    emit({ type: "message_delta", stop_reason: { kind: "end_turn" }, usage: {} });
+    emit({ type: "message_stop" });
+  }, { agentLoop: true });
+  neosh.notify("compactor ready");
+}
+"#;
+
+fn install_compactor(sb: &Sandbox) {
+    let dir = sb.root.join("config/plugins/compactor");
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    std::fs::write(
+        dir.join("plugin.toml"),
+        "name = \"compactor\"\nversion = \"0.1.0\"\nentry = \"main.ts\"\npermissions = [\"providers\"]\n",
+    )
+    .expect("manifest");
+    std::fs::write(dir.join("main.ts"), COMPACTOR).expect("plugin");
+}
+
 fn install_wide(sb: &Sandbox) {
     let dir = sb.root.join("config/plugins/wide");
     std::fs::create_dir_all(&dir).expect("mkdir");
@@ -4002,6 +4052,45 @@ fn there_is_exactly_one_context_meter() {
     let line = s.status_now().join(" ");
     let bars = line.match_indices('\u{2588}').count();
     assert!(bars > 0 && bars <= 8, "one bar of at most eight cells, not two: {line:?}");
+}
+
+/// Compaction moves the meter, because compaction is what moved the context.
+///
+/// The card said `180k → 12k` and the meter under it went on reporting 180k — for the rest of the
+/// conversation, because a driver that has once answered "how full is it" turns off the estimate
+/// derived from usage, and the next answer only arrives with the next request. The driver said
+/// `after`; that is the number.
+#[test]
+fn compacting_updates_the_context_meter() {
+    let sb = Sandbox::new("compactctx");
+    install_compactor(&sb);
+    sb.write_config("[options]\n\"agent.model\" = \"compactor/compactor\"\n");
+    let mut s = sb.start_letting_config_choose();
+    s.wait_for("compactor ready");
+    s.type_text("go");
+    s.enter();
+
+    assert!(
+        s.pump(|s| s.chat_now().iter().any(|l| l.contains("Compacted the conversation"))),
+        "it compacted, and said so\n{:?}",
+        s.chat_now()
+    );
+    // The card carries both numbers, so the one the meter has to agree with is on screen beside
+    // it. 12k of the 200k window the driver reported is 6%; 180k is 90%, which is what the meter
+    // went on saying.
+    assert!(
+        s.chat_now().iter().any(|l| l.contains("180.0k") && l.contains("12.0k")),
+        "with the count either side of it\n{:?}",
+        s.chat_now()
+    );
+    assert!(
+        s.pump(|s| {
+            let line = s.status_now().join("");
+            line.contains("6% of 200k") && !line.contains("90%")
+        }),
+        "and the meter says what the window holds now\n{:?}",
+        s.status_now()
+    );
 }
 
 /// A strip too narrow for everything drops whole segments, least important first, rather than
@@ -4884,9 +4973,9 @@ fn a_tool_call_says_what_came_back_not_only_that_it_ran() {
         s.chat_now()
     );
     assert!(
-        s.pump(|s| s.chat_now().iter().any(|l| l.contains('\u{2502}')
+        s.pump(|s| s.chat_now().iter().any(|l| l.contains('\u{2514}')
             && l.contains("could not read"))),
-        "and what it came back with, under it\n{:?}",
+        "and what it came back with, under it and joined to it\n{:?}",
         s.chat_now()
     );
 }
@@ -4978,8 +5067,10 @@ fn calls_that_only_looked_at_things_share_one_row_and_open_into_several() {
         !rows.iter().any(|l| l.starts_with('\u{23fa}')),
         "no card carries the old dot\n{rows:?}"
     );
-    // The edit is its own card, right under the run, with its diff.
-    assert!(rows[run + 2].starts_with("  Edited  "), "with a row of air between\n{rows:?}");
+    // The edit is its own card, on the very next row: a card is a header at column zero with its
+    // body indented under a corner, which is what says where one action ends and the next begins —
+    // a blank row between every two of them was a row spent saying it again.
+    assert!(rows[run + 1].starts_with("  Edited  "), "directly under the run\n{rows:?}");
     assert!(rows.iter().any(|l| l.ends_with("- a")), "the edit kept its diff\n{rows:?}");
 
     // Opened, one row per call, with the whole subject and how much came back.
@@ -5356,7 +5447,172 @@ export async function activate({ neosh }: PluginContext) {
     );
 }
 
+/// A count moves that many rows you can land on, and the panel says one is being typed.
+///
+/// The keys are Vim's because this is a cursor over a column in a terminal, and a list of thirty
+/// conversations reached one `j` at a time is a list nobody moves around in. Counted in rows the
+/// cursor can *land* on rather than lines, so the headings and rules it already skips do not
+/// silently eat two of the five. See ADR 0048.
+#[test]
+fn a_count_before_a_motion_moves_that_many_rows() {
+    let sb = Sandbox::new("counts");
+    let mut s = sb.start();
+    s.wait_for("PROJECTS");
+
+    // Three conversations, so there is somewhere to count to. Named by what was typed into them,
+    // which is what a conversation with no title is called in a list.
+    let named = |s: &mut Session, name: &str| {
+        s.type_text(name);
+        s.enter();
+        // Waited for in the *panel*, not in the transcript: the next thing this test does is start
+        // another conversation, and a row still called "New conversation" because the rename has
+        // not arrived yet is a row that makes counting them meaningless.
+        let want = name.to_string();
+        assert!(
+            s.pump(move |s| s.sidebar_now().iter().any(|l| l.contains(&want))),
+            "the panel says what this conversation is about"
+        );
+    };
+    named(&mut s, "alpha");
+    s.new_conversation();
+    named(&mut s, "beta");
+    s.new_conversation();
+    named(&mut s, "gamma");
+
+    // The panel lands on the conversation you are in, and the list is newest first — so counting
+    // down from `gamma` two rows is `alpha`, with `beta` in between.
+    s.enter_panel();
+    assert!(
+        s.pump(|s| s.sidebar_cursor().is_some_and(|l| l.contains("gamma"))),
+        "the cursor starts where you are\n{:?}",
+        s.sidebar_now()
+    );
+
+    // Half of it: a digit on its own moves nothing and says so, because a first press with no
+    // visible effect is indistinguishable from a key that does nothing.
+    s.key("2");
+    assert!(
+        s.pump(|s| s.sidebar_virt_now().iter().any(|v| v.trim() == "2")),
+        "the count being typed is on screen\n{:?}",
+        s.sidebar_virt_now()
+    );
+    assert!(
+        s.sidebar_cursor().is_some_and(|l| l.contains("gamma")),
+        "and nothing has moved yet\n{:?}",
+        s.sidebar_now()
+    );
+
+    s.key("j");
+    assert!(
+        s.pump(|s| s.sidebar_cursor().is_some_and(|l| l.contains("alpha"))),
+        "two rows down, not two lines\n{:?}",
+        s.sidebar_now()
+    );
+    assert!(
+        !s.sidebar_virt_now().iter().any(|v| v.trim() == "2"),
+        "and the count is spent\n{:?}",
+        s.sidebar_virt_now()
+    );
+
+    // `gg` is the top of the list, which is the project heading — the first row anything can land
+    // on. `G` is the far end.
+    s.key("g");
+    s.key("g");
+    assert!(
+        s.pump(|s| s.sidebar_cursor().is_some_and(|l| l.contains("work"))),
+        "gg is the first row you can land on\n{:?}",
+        s.sidebar_now()
+    );
+    s.key("2");
+    s.key("G");
+    assert!(
+        s.pump(|s| s.sidebar_cursor().is_some_and(|l| l.contains("gamma"))),
+        "2G is the second row, not the end\n{:?}",
+        s.sidebar_now()
+    );
+}
+
+/// The column is as wide as you want it, and resizing it does not take the keyboard away.
+///
+/// Reopening the dock was how this used to be done, and it gives the window a new id: the panel
+/// resized from inside itself threw the cursor back to the composer on every press. The width is
+/// the `sidebar.width` setting either way, so a key and a line of `config.toml` say one number.
+#[test]
+fn the_panel_is_resized_in_place_and_keeps_the_cursor() {
+    let sb = Sandbox::new("width");
+    let mut s = sb.start();
+    s.wait_for("PROJECTS");
+    s.enter_panel();
+
+    let rule = |s: &Session| {
+        s.sidebar_now().iter().filter(|l| l.starts_with('\u{2500}')).map(|l| l.chars().count()).max()
+    };
+    let before = rule(&s).expect("the panel has a rule under its heading");
+
+    s.key("3");
+    s.key(">");
+    assert!(
+        s.pump(move |s| rule(s).is_some_and(|w| w > before)),
+        "the column got wider\n{:?}",
+        s.sidebar_now()
+    );
+    // Still in the panel: the hint strip is the panel's own, not the composer's.
+    assert!(
+        s.sidebar_now().iter().any(|l| l.contains("? keys")),
+        "and the panel still has the keyboard\n{:?}",
+        s.sidebar_now()
+    );
+
+    s.key("=");
+    assert!(
+        s.pump(move |s| rule(s) == Some(before)),
+        "and back to the default\n{:?}",
+        s.sidebar_now()
+    );
+}
+
 impl Session {
+    /// The right-hand column of every panel row, as it is *now*.
+    ///
+    /// [`Session::sidebar_virt`] is every one ever drawn, which answers a different question: a
+    /// count that was on screen and has since been spent is in that list for the rest of the
+    /// session, so "it is gone" is not a thing it can be asked.
+    fn sidebar_virt_now(&self) -> Vec<String> {
+        let Some(buf) = self.buffer_named("[sidebar]") else { return Vec::new() };
+        let mut rows: Vec<String> = Vec::new();
+        for e in &self.events {
+            if e["type"] != "buffer_lines" || e["buf"].as_u64() != Some(buf) {
+                continue;
+            }
+            let start = e["start"].as_i64().unwrap_or(0);
+            let old_end = e["old_end"].as_i64().unwrap_or(start);
+            let new: Vec<String> = e["lines"]
+                .as_array()
+                .map(|a| {
+                    a.iter()
+                        .map(|l| {
+                            l["marks"]
+                                .as_array()
+                                .map(|ms| {
+                                    ms.iter()
+                                        .filter_map(|m| m["virt_text"].as_array())
+                                        .flatten()
+                                        .filter_map(|c| c["text"].as_str())
+                                        .collect::<Vec<_>>()
+                                        .join("")
+                                })
+                                .unwrap_or_default()
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            let s = start.clamp(0, rows.len() as i64) as usize;
+            let en = if old_end < 0 { rows.len() } else { (old_end as usize).clamp(s, rows.len()) };
+            rows.splice(s..en, new);
+        }
+        rows
+    }
+
     /// The panel row the cursor is on, read from the highlight rather than from a count.
     ///
     /// A count would be a test that passes for the wrong reason the moment the panel gains a row.
@@ -5392,6 +5648,9 @@ const win = (id: string, label: string, pct: number, active = false) => ({
 export async function activate({ neosh }: PluginContext) {
   await neosh.provider.register("planner", [{
     id: "planner", driver: "planner", display_name: "Planner",
+    // How it is drawn, declared by the plugin exactly as a bundled provider declares it. A group
+    // name, never a colour: the theme owns what `Brand.Anthropic` looks like.
+    brand: { mark: "\u2733", ascii: "A", hl: "Brand.Anthropic" },
     models: [{ id: "planner-1", display_name: "Planner One", context_window: 300000 }],
   }], async (_req, emit) => {
     emit({ type: "message_start", model: "planner-1", usage: {} });
@@ -5444,7 +5703,9 @@ fn install_planner(sb: &Sandbox) {
 fn a_plugins_own_provider_appears_in_the_plan_strip() {
     let sb = Sandbox::new("planstrip");
     install_planner(&sb);
-    sb.write_config("[options]\n\"agent.model\" = \"planner/planner-1\"\n");
+    sb.write_config(
+        "[options]\n\"agent.model\" = \"planner/planner-1\"\n\"usage.sidebar.style\" = \"full\"\n",
+    );
     let mut s = sb.start_letting_config_choose();
     s.wait_for("planner ready");
 
@@ -5476,6 +5737,102 @@ fn a_plugins_own_provider_appears_in_the_plan_strip() {
     );
 }
 
+/// The plan is one row until you ask for more of it.
+///
+/// Three bars, a name and a sentence is five rows of a column whose job is your conversations —
+/// and four of them answer a question you did not ask. The default is the limit that would refuse
+/// the next request, plus anything else already critical; `<Tab>` on the row steps up to every
+/// window and then to the whole block, and `^L` is all of it whichever is showing. See ADR 0048.
+#[test]
+fn the_plan_strip_is_one_row_until_you_ask_for_more() {
+    let sb = Sandbox::new("plandense");
+    install_planner(&sb);
+    sb.write_config("[options]\n\"agent.model\" = \"planner/planner-1\"\n");
+    let mut s = sb.start_letting_config_choose();
+    s.wait_for("planner ready");
+    s.send(&command("planner.publish"));
+    s.wait_for("published");
+
+    // `session` is the window the provider marked active, so it is the one that would refuse the
+    // next request — and `weekly` at 40% is not news, so it is not a row.
+    assert!(
+        s.pump(|s| s.sidebar_now().iter().any(|l| l.contains("Session"))),
+        "the limit that binds is on the strip\n{:?}",
+        s.sidebar_now()
+    );
+    let strip = s.sidebar_now().join("\n");
+    assert!(!strip.contains("Weekly"), "and a limit at 40% is not news:\n{strip}");
+    assert!(!strip.contains("% left ·"), "nor is the sentence that explains it:\n{strip}");
+
+    // Onto a plan row and `<Tab>`: every window, contributed as a verb on the rows it belongs to
+    // rather than bound over every conversation in the panel.
+    s.enter_panel();
+    s.key("G");
+    assert!(
+        s.pump(|s| s.sidebar_now().iter().any(|l| l.contains("plan detail"))),
+        "the key is advertised on the rows it applies to\n{:?}",
+        s.sidebar_now()
+    );
+    s.special("tab");
+    assert!(
+        s.pump(|s| s.sidebar_now().join("\n").contains("Weekly")),
+        "every window, one step up\n{:?}",
+        s.sidebar_now()
+    );
+    s.special("tab");
+    assert!(
+        s.pump(|s| s.sidebar_now().join("\n").contains("88% left")),
+        "and the account and the sentence at the top of the ladder\n{:?}",
+        s.sidebar_now()
+    );
+    s.special("tab");
+    assert!(
+        s.pump(|s| !s.sidebar_now().join("\n").contains("Weekly")),
+        "and round to one row again\n{:?}",
+        s.sidebar_now()
+    );
+}
+
+/// The provider's mark keeps the provider's colour, on a row graded by something else.
+///
+/// The bar is coloured by how close the limit is, which is what a bar is for — and the one thing on
+/// the row that says *whose* allowance it is has a colour of its own. Two accounts are then two
+/// rows you tell apart without reading a word. It needs a span rather than a row highlight, so
+/// `sidebar.section` rows carry spans: a contributed row that can only be one colour is a row a
+/// plugin cannot put a mark on.
+#[test]
+fn the_plan_row_keeps_the_providers_own_colour() {
+    let sb = Sandbox::new("planbrand");
+    install_planner(&sb);
+    sb.write_config("[options]\n\"agent.model\" = \"planner/planner-1\"\n");
+    let mut s = sb.start_letting_config_choose();
+    s.wait_for("planner ready");
+    s.send(&command("planner.publish"));
+    s.wait_for("published");
+    assert!(
+        s.pump(|s| s.sidebar_now().iter().any(|l| l.contains("Session"))),
+        "the strip is drawn\n{:?}",
+        s.sidebar_now()
+    );
+
+    let buf = s.buffer_named("[sidebar]").expect("the panel buffer");
+    let at = s
+        .sidebar_now()
+        .iter()
+        .position(|l| l.contains("Session"))
+        .expect("the row with the binding limit on it");
+    let groups = s.groups_of(buf);
+    let on_row = groups.get(at).cloned().unwrap_or_default();
+    assert!(
+        on_row.iter().any(|g| g == "Brand.Anthropic"),
+        "the mark carries the provider's group\n{on_row:?}"
+    );
+    assert!(
+        on_row.iter().any(|g| g != "Brand.Anthropic"),
+        "and the rest of the row is graded by how close the limit is\n{on_row:?}"
+    );
+}
+
 /// Whose allowance it is, said on the strip.
 ///
 /// Three bars and no name answers "how much is left" without ever saying *of what* — and on a
@@ -5487,7 +5844,9 @@ fn a_plugins_own_provider_appears_in_the_plan_strip() {
 fn the_plan_strip_says_which_account_it_is_about() {
     let sb = Sandbox::new("planwho");
     install_planner(&sb);
-    sb.write_config("[options]\n\"agent.model\" = \"planner/planner-1\"\n");
+    sb.write_config(
+        "[options]\n\"agent.model\" = \"planner/planner-1\"\n\"usage.sidebar.style\" = \"full\"\n",
+    );
     let mut s = sb.start_letting_config_choose();
     s.wait_for("planner ready");
 
@@ -5529,7 +5888,9 @@ fn the_plan_strip_says_which_account_it_is_about() {
 fn a_mid_turn_report_does_not_erase_the_other_windows() {
     let sb = Sandbox::new("planpatch");
     install_planner(&sb);
-    sb.write_config("[options]\n\"agent.model\" = \"planner/planner-1\"\n");
+    sb.write_config(
+        "[options]\n\"agent.model\" = \"planner/planner-1\"\n\"usage.sidebar.style\" = \"full\"\n",
+    );
     let mut s = sb.start_letting_config_choose();
     s.wait_for("planner ready");
 
@@ -5770,14 +6131,16 @@ export async function activate({ neosh }: PluginContext) {
     );
 }
 
-/// The row under the cursor says all of a title the column had to cut.
+/// The row you are in says all of its title; every other row waits for the cursor.
 ///
 /// A conversation's title is the only thing telling two of them in one project apart, and a
 /// generated title is a sentence rather than a word — so a 34-column panel cuts it at about the
-/// point where it was going to say which of them this is. Arriving on the row is what asks for the
-/// rest; leaving it folds the row back, so the column is still something you read down.
+/// point where it was going to say which of them this is. The conversation you are *in* is not a
+/// row you are considering, it is where you are, so it stays open with nothing on it. Everywhere
+/// else the cursor is what asks, and leaving folds the row back — which is what keeps the column
+/// something you read down.
 #[test]
-fn the_sidebar_row_under_the_cursor_says_all_of_a_title_it_had_to_cut() {
+fn the_row_you_are_in_says_all_of_a_title_the_column_had_to_cut() {
     let sb = Sandbox::new("unfold");
     let mut s = sb.start();
     s.wait_for("PROJECTS");
@@ -5795,23 +6158,35 @@ fn the_sidebar_row_under_the_cursor_says_all_of_a_title_it_had_to_cut() {
         "the title does not fit the column\n{:?}",
         s.sidebar_now()
     );
-    // And the tail of it is nowhere, because nothing has the cursor on it yet.
+    // And open, with the cursor nowhere near it and the panel not even focused: this is the
+    // conversation on screen, and abbreviating the one row you are certain about is the one place
+    // the cursor rule is wrong.
     assert!(
-        !s.sidebar_now().iter().any(|l| l.contains("has to fit inside")),
-        "a row nobody is on stays one row\n{:?}",
+        s.pump(|s| s.sidebar_now().iter().any(|l| l.contains("has to fit inside"))),
+        "the conversation you are in says its whole name\n{:?}",
         s.sidebar_now()
     );
 
-    // Onto the conversation, which is where the cursor already is: the panel keeps it on the
-    // conversation you are in, which is the whole point of anchoring it to a value.
+    // Somewhere else. The row that was open is now an ordinary one, and goes back to a line.
+    s.new_conversation();
+    assert!(
+        s.pump(|s| !s.sidebar_now().iter().any(|l| l.contains("has to fit inside"))),
+        "a row nobody is in or on stays one row\n{:?}",
+        s.sidebar_now()
+    );
+
+    // Onto it with the cursor, and it says the rest of itself again. The panel keeps the cursor on
+    // the conversation you are in, and the list is newest first — so the older one is the row
+    // below where the cursor lands.
     s.enter_panel();
+    s.key("j");
     assert!(
         s.pump(|s| s.sidebar_now().iter().any(|l| l.contains("has to fit inside"))),
         "the row under the cursor says the rest of itself\n{:?}",
         s.sidebar_now()
     );
 
-    // Up onto the project, and it folds away again.
+    // Off it again, and it folds away.
     s.key("k");
     assert!(
         s.pump(|s| !s.sidebar_now().iter().any(|l| l.contains("has to fit inside"))),

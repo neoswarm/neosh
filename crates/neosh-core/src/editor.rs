@@ -766,6 +766,24 @@ impl Editor {
                 });
                 Ok(ApiOk::Unit)
             }
+            ApiCall::WinResize { win, size } => {
+                let layout = match &self.win(win)?.layout {
+                    WindowLayout::Docked { dock, gravity, wrap, .. } => WindowLayout::Docked {
+                        dock: *dock,
+                        size,
+                        gravity: *gravity,
+                        wrap: *wrap,
+                    },
+                    WindowLayout::Float { .. } => {
+                        return Err(ApiError::InvalidArgument {
+                            message: "win_resize is for docked windows; a float is configured with float_configure".into(),
+                        });
+                    }
+                };
+                self.win_mut(win)?.layout = layout.clone();
+                self.push_ui(UiEvent::WindowConfigured { win, layout });
+                Ok(ApiOk::Unit)
+            }
             ApiCall::WinClose { win } => {
                 self.win(win)?;
                 self.windows.remove(&win);

@@ -11,16 +11,30 @@
 
 import type { Neosh, PluginContext, SessionId } from "@neosh/api";
 
-const DEFAULT_PROMPT = `Generate a title that will help someone recognise this conversation weeks later.
+/**
+ * How much of a title a list can actually show.
+ *
+ * A sidebar is a narrow column with an indent, a state glyph and an age on it, so a title of forty
+ * characters is a title that ends in an ellipsis in the one place it is read. Asked for *and*
+ * enforced: a model told "under 40" writes 46 often enough that the clamp is what the panel
+ * actually gets, and a clamp is a truncation — the sentence it cuts is one the model would have
+ * written shorter if it had been asked to.
+ */
+const LIMIT = 32;
+
+const DEFAULT_PROMPT =
+  `Generate a title that will help someone recognise this conversation weeks later.
 Return a JSON object with exactly one key: title.
 
 Rules:
-- 3 to 8 words, under 40 characters.
+- 2 to 5 words, at most ${LIMIT} characters. Shorter is better.
 - A compact noun phrase, or a clear action phrase.
 - Name the subject and what the user wants, not the process used to get there.
+- Leave out articles, and anything a sidebar already shows: the project, the language, the word
+  "conversation".
 - Do not claim the work is finished.
 - Do not copy and truncate the user's message.
-- No quotes, no trailing punctuation, no project name that a sidebar already shows.`;
+- No quotes, no trailing punctuation.`;
 
 export async function activate({ neosh, subscriptions }: PluginContext) {
   await neosh.opt.declare({
@@ -61,6 +75,19 @@ export async function activate({ neosh, subscriptions }: PluginContext) {
   );
 }
 
+/**
+ * A title that is too long for the column it lives in, cut at a word.
+ *
+ * Mid-word is worse than short: `Fix the authenticati` reads as a bug in the panel, and the two
+ * characters saved by cutting there buy nothing.
+ */
+function clamp(title: string): string {
+  if (Array.from(title).length <= LIMIT) return title;
+  const cut = Array.from(title).slice(0, LIMIT).join("");
+  const space = cut.lastIndexOf(" ");
+  return (space > LIMIT / 2 ? cut.slice(0, space) : cut).trimEnd();
+}
+
 async function retitle(neosh: Neosh, attempted: Set<SessionId>, forced: boolean): Promise<void> {
   if (!forced && !((await neosh.opt.get<boolean>("session.autotitle")) ?? true)) return;
 
@@ -95,7 +122,7 @@ async function retitle(neosh: Neosh, attempted: Set<SessionId>, forced: boolean)
     if (title === "") return;
     // The conversation may have been switched away from while the model was thinking; renaming by
     // id rather than "the current one" is what stops the answer landing on the wrong thread.
-    await neosh.session.rename(current.id, title.slice(0, 60));
+    await neosh.session.rename(current.id, clamp(title));
   } catch (e) {
     // Not worth a message: failing to name a conversation costs the user nothing, and a popup
     // every time a cheap model hiccups would cost them plenty.

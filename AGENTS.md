@@ -78,6 +78,24 @@ per decision, and records the *reasoning*, not the choice.
   default. A modal that borrows a global key to open itself owes a binding to close itself, which is
   why `^E` shuts the sheet from inside. Answering a question is not this: `^T` is how you reach a
   question waiting in another conversation. See ADR 0047.
+- **A list is a place you move in.** Anywhere there is a cursor over rows and no text field — the
+  project panel, the transcript reader — the motions are Vim's and they take a count: `5j` is five
+  rows you can *land on*, `^D`/`^U` are half of the panel's real height, `12G` is a row rather than
+  twelve of anything, and a half-typed count is on screen because a first press with no visible
+  effect is indistinguishable from a key that does nothing. The motion after it spends it and
+  anything else ends it. Not in the core, and not in a picker: the panel keys live in `chat` mode,
+  which is the mode the composer types in, so a digit that became a count globally is a digit you
+  could no longer send. Two more things belong to the same list: the row you are *in* stays
+  unfolded (`ListRow.expand`, and only ever one row — the cursor is what asks, everywhere else),
+  and the foot is held against the bottom edge (`render({ pinned })`, padded in *drawn lines*
+  because an unfolded row is several). A dock resizes in place with `win.resize` — reopening gives
+  the window a new id and drops the keyboard, so a panel resized from inside itself used to throw
+  you back to the composer on every press. And what a foot *says* is on the same budget: the plan
+  strip is the one limit that would refuse the next request, plus anything else already critical,
+  because three bars and a name and a sentence is five rows of a column whose job is your
+  conversations. `⇥` steps it up to every window and then to all of it — contributed as a
+  `sidebar.action` with `on: "custom"`, which is how a plugin puts a key on rows it owns rather
+  than on every row in somebody else's panel. See ADR 0048.
 - **Pairing is a decision each machine makes, and neither of them restarts.** A node presents its
   identity to anyone who connects — as an SSH server presents a host key — so adding a computer is
   typing an address and being shown a name and a fingerprint that came from the far end. The other
@@ -230,8 +248,10 @@ per decision, and records the *reasoning*, not the choice.
   read off the arguments, like the colour. A call nothing here classifies keeps the name its author
   gave it, so a plugin's tool is never renamed. **A command's output folds from the middle**: the
   head is how it started and the tail is what it decided, and it is the second one you were waiting
-  for. And **one row of air between actions**, which is the cheapest structure there is. See ADR
-  0040.
+  for. **A card is attached to what it did**: no blank row above it, and its body under a corner
+  (`└`) at a four-column indent rather than a rule down the whole left side. Air between every two
+  actions and a wall beside every diff were both structure said twice — the header is at column
+  zero, the body is indented, and that is already a list. See ADR 0040 and ADR 0049.
 - **A terminal cannot paste a picture, so pasting one is a key.** Bracketed paste is a text
   protocol: a screenshot arrives as nothing, and a dragged file arrives as its path. `^V` asks the
   system clipboard through whichever of `wl-paste`/`xclip`/`pngpaste`/`osascript`/`powershell` is
@@ -261,6 +281,11 @@ per decision, and records the *reasoning*, not the choice.
   clips or pads every frame to the width of the run underneath, so a spinner can never move the
   column after it. The buffer keeps the glyph that was written — a frame is what a cell looks like,
   not what the line says. See ADR 0045.
+- **Compaction moves the meter, because compaction is what moved the context.** A driver that has
+  once answered "how full is it" turns off the estimate derived from usage, so the next answer only
+  arrives with the next request — and a `Compacted` whose `after` nobody applied left the footer
+  reporting the pre-compaction number for the rest of the conversation, under a card that said
+  `180k → 12k`. See ADR 0049.
 - **What the plan has left cannot be counted, only reported and then kept.** A subscription's
   allowance is opaque and is not a function of anything on this machine — a turn run in `claude`
   directly spent it too. `claude` says so on a `rate_limit_event` line and `codex` on
@@ -373,7 +398,7 @@ registry — this table is what ships.
 | `^B` | Toggle the sidebar |
 | `^K` | Command palette |
 | `/` | Completes a command by name — neosh's, and whatever the agent says it accepts. Keep typing; the composer is still the field, and `↵` sends what you typed when nothing matches |
-| `^L` | What the plan has left, and where the week went. Live gauges per limit, and the last 30 days from the agents' own transcripts |
+| `^L` | What the plan has left, and where the week went. Live gauges per limit, and the last 30 days from the agents' own transcripts. The sidebar keeps one row of it; `⇥` on that row asks for more |
 | `^G` | Git status |
 | `^D` | Show what changed |
 | `^S` | Read the transcript — see below |
@@ -412,11 +437,11 @@ Two corollaries, both of which were bugs:
 
 | Key | Does |
 |---|---|
-| `hjkl`, arrows | Move |
+| `hjkl`, arrows | Move. A count first does it that many times: `5j` |
 | `w` `b` | By word |
 | `0` `$` | Ends of the line |
-| `gg` `G` | Ends of the transcript |
-| `^D` `^U` | Half a screen |
+| `gg` `G` | Ends of the transcript. With a count it is a row: `12G`, `12gg` |
+| `^D` `^U` | Half a screen, or that many of them |
 | `^F` `^B`, `PgUp`/`PgDn` | A screen |
 | `zz` `zt` `zb` | Put the cursor's line in the middle, at the top, at the bottom |
 | `[` `]` | Previous / next **turn** |
@@ -460,7 +485,10 @@ says how many are asking, `^T` is where you go, and it opens when you get there.
 | Key | Does |
 |---|---|
 | `↵` | Open a conversation, fold a project, or add one from the `+` row |
-| `j` `k` | Move |
+| `j` `k` | Move. With a count, that many rows you can land on: `5j` |
+| `^D` `^U` | Half a screen; `PgUp`/`PgDn` for a whole one. Not `^F`/`^B` — those stay the archive and hiding the panel |
+| `gg` `G` | The ends of the list, and `5gg` / `5G` for the fifth row |
+| `>` `<` `=` | Wider, narrower, back to the default. It is the `sidebar.width` setting, so `config.toml` and this key say the same number |
 | `n` | New conversation — the same question `^N` asks, about the project the cursor is on |
 | `o` | Add a project |
 | `f` | Pin a project to the top |
@@ -468,6 +496,7 @@ says how many are asking, `^T` is where you go, and it opens when you get there.
 | `r` | Rename a conversation |
 | `x` `X` | Archive, delete. On a project heading, `X` takes the project off the list — the only thing that does |
 | `a` | The archive. Nothing archived is ever a row in this panel — `↵` restores one, `^U` puts it back without going there, `^X` deletes |
+| `⇥` | On the plan rows: how much of it to show — the limit that binds, every limit, or all of it with the account and the sentence. `usage.sidebar.style` is where it starts, `usage.sidebar` turns it off |
 | `?` | The keys for whatever row you are on |
 | `Esc` | Back to the composer |
 
