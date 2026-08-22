@@ -312,6 +312,26 @@ and without it the selection is dropped. That is shift-and-arrow, in one call.
 Selection is drawn as an extmark in a namespace the core reserves, linked to `Visual`, so your theme
 already styles it and no rendering code had to learn a new concept.
 
+A selection is two positions, and the *shape* is what says whether the character the cursor is on is
+in it:
+
+```ts
+await neosh.edit.selectShape(win, "inclusive"); // the cursor is on a character, and it is selected
+await neosh.edit.selectShape(win, "line");      // whole rows, in whichever direction it runs
+await neosh.edit.cursorShape(win, "block");     // and the caret says so before any key is pressed
+```
+
+`exclusive` is the default and is what a text field wants: the cursor sits *between* two characters,
+so one that swallowed the character to its right would delete a letter nobody highlighted. A normal
+mode wants the other answer — `v` then `y` copies a letter rather than reporting an empty selection
+— and a `line` selection snaps both ends to whole rows, including when it is extended upwards.
+Dropping a selection puts the shape back to `exclusive`.
+
+`cursorShape` is per window. A block caret is painted by the frontend over the character it is on
+(reverse video unless a theme defines `Cursor`) *and* asked of the terminal, which is what a screen
+reader follows. Give it back when your mode ends: a shell that inherits a block cursor because
+something exited mid-mode is a terminal that looks broken.
+
 `copy` goes out as OSC 52 through the frontend, which is the only thing holding a terminal. That is
 also why it works over SSH, where a clipboard library would be talking to the wrong machine.
 

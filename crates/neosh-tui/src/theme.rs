@@ -89,6 +89,16 @@ impl Theme {
         self.to_style(&spec)
     }
 
+    /// Whether this group resolves to anything at all.
+    ///
+    /// The one caller that needs to know is the block caret: `style` answers "plain" for a group
+    /// nobody defined, which for a caret is the same as not drawing one. A theme that has never
+    /// heard of `Cursor` should get a visible cursor anyway — a palette entry is how you change
+    /// what it looks like, not whether there is one.
+    pub fn defines(&self, name: &str) -> bool {
+        self.resolve(name).is_some()
+    }
+
     /// The animation a group carries, if any. Follows links, like the colours do.
     pub fn animation(&self, name: &str) -> Option<neosh_proto::Animation> {
         self.resolve(name).and_then(|s| s.animate)

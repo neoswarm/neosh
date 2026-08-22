@@ -15,8 +15,8 @@ use std::collections::{HashMap, HashSet};
 use neosh_proto::{
     ApiCall, ApiError, ApiOk, ApiResult, BufferId, Contribution, ExtmarkId, ExtmarkOpts,
     FloatConfig, KeyContext, KeyPress, KeymapEntry, KeymapScope, MessageLevel, Mode, NamespaceId,
-    OnDelete, OptionValue, PluginId, Rect, SurfaceId, TextEdit, UiEvent, VirtTextPos, WindowId,
-    WindowLayout,
+    OnDelete, OptionValue, PluginId, Rect, SelectShape, SurfaceId, TextEdit, UiEvent, VirtTextPos,
+    WindowId, WindowLayout,
 };
 
 use crate::buffer::{Buffer, LineEdit};
@@ -314,9 +314,11 @@ impl Editor {
         for win in windows {
             let Some(w) = self.windows.get(&win) else { continue };
             let (buf, layout, cursor, top) = (w.buf, w.layout.clone(), w.cursor, w.top_line);
+            let shape = w.cursor_shape;
             self.push_ui(UiEvent::WindowOpened { win, buf, layout });
             self.push_ui(UiEvent::CursorMoved { win, row: cursor.0, col: cursor.1 });
             self.push_ui(UiEvent::ScrollTo { win, top_line: top });
+            self.push_ui(UiEvent::CursorShapeChanged { win, shape });
         }
 
         let mut surfaces: Vec<SurfaceId> = self.surfaces.keys().copied().collect();
@@ -833,6 +835,7 @@ impl Editor {
                         width: v.width,
                         height: v.height,
                         top_line: v.top_line,
+                        rows: v.rows,
                         line_count,
                     }),
                 })
@@ -862,14 +865,36 @@ impl Editor {
             ApiCall::WinSelect { win, on } => {
                 let w = self.win_mut(win)?;
                 w.anchor = on.then_some(w.cursor);
+                // Dropping a selection drops its shape with it. A window left `Line` after the one
+                // linewise selection it ever had would draw the next `v` as whole rows.
+                if !on {
+                    w.select_shape = SelectShape::Exclusive;
+                }
                 self.refresh_selection(win);
+                Ok(ApiOk::Unit)
+            }
+            ApiCall::WinSelectShape { win, shape } => {
+                self.win_mut(win)?.select_shape = shape;
+                self.refresh_selection(win);
+                Ok(ApiOk::Unit)
+            }
+            ApiCall::WinCursorShape { win, shape } => {
+                let w = self.win_mut(win)?;
+                if w.cursor_shape == shape {
+                    return Ok(ApiOk::Unit);
+                }
+                w.cursor_shape = shape;
+                self.push_ui(UiEvent::CursorShapeChanged { win, shape });
                 Ok(ApiOk::Unit)
             }
             ApiCall::WinSelection { win } => {
                 let w = self.win(win)?;
-                let (buf, cursor, anchor) = (w.buf, w.cursor, w.anchor);
+                let (buf, cursor, anchor, shape) = (w.buf, w.cursor, w.anchor, w.select_shape);
                 let text = match (anchor, self.buffers.get(&buf)) {
-                    (Some(a), Some(b)) => text::slice(b.lines(), a, cursor),
+                    (Some(a), Some(b)) => match selected_range(b.lines(), a, cursor, shape) {
+                        Some((from, to)) => text::slice(b.lines(), from, to),
+                        None => String::new(),
+                    },
                     _ => String::new(),
                 };
                 Ok(ApiOk::Text { text })
@@ -1198,17 +1223,19 @@ impl Editor {
         let w = self.win(win)?;
         let (buf, at, anchor) = (w.buf, w.cursor, w.anchor);
 
-        let selected = anchor.filter(|a| *a != at);
+        let shape = w.select_shape;
+        let selected = anchor
+            .and_then(|a| self.buffers.get(&buf).and_then(|b| selected_range(b.lines(), a, at, shape)));
         let edit = match edit {
             TextEdit::DeleteSelection => match selected {
-                Some(a) => TextEdit::DeleteRange { from: a, to: at },
+                Some((from, to)) => TextEdit::DeleteRange { from, to },
                 // Not an error: `<Del>` with nothing selected is an ordinary keystroke that this
                 // window happens to have nothing to do with.
                 None => return Ok(()),
             },
             TextEdit::Insert { text } => {
-                if let Some(a) = selected {
-                    self.apply_plan(win, buf, at, &TextEdit::DeleteRange { from: a, to: at })?;
+                if let Some((from, to)) = selected {
+                    self.apply_plan(win, buf, at, &TextEdit::DeleteRange { from, to })?;
                 }
                 TextEdit::Insert { text }
             }
@@ -1219,6 +1246,7 @@ impl Editor {
         self.apply_plan(win, buf, at, &edit)?;
         let w = self.win_mut(win)?;
         w.anchor = None;
+        w.select_shape = SelectShape::Exclusive;
         w.goal_col = None;
         self.refresh_selection(win);
         Ok(())
@@ -1250,7 +1278,7 @@ impl Editor {
     /// exists to avoid.
     fn refresh_selection(&mut self, win: WindowId) {
         let Ok(w) = self.win(win) else { return };
-        let (buf, cursor, anchor) = (w.buf, w.cursor, w.anchor);
+        let (buf, cursor, anchor, shape) = (w.buf, w.cursor, w.anchor, w.select_shape);
         let ns = self.selection_ns;
 
         let Some(b) = self.buffers.get_mut(&buf) else { return };
@@ -1258,8 +1286,7 @@ impl Editor {
         let (cleared_start, cleared_end) = b.clear_marks(ns, 0, count);
 
         let mut touched = (cleared_start, cleared_end);
-        if let Some(a) = anchor.filter(|a| *a != cursor) {
-            let (from, to) = if a <= cursor { (a, cursor) } else { (cursor, a) };
+        if let Some((from, to)) = anchor.and_then(|a| selected_range(b.lines(), a, cursor, shape)) {
             for row in from.0..=to.0.min(count.saturating_sub(1)) {
                 let line_len = b.lines().get(row as usize).map(|l| l.text.len() as u32).unwrap_or(0);
                 let start = if row == from.0 { from.1 } else { 0 };
@@ -1328,6 +1355,8 @@ fn call_name(call: &ApiCall) -> &'static str {
         ApiCall::KeymapCapture { .. } => "keymap.capture",
         ApiCall::KeymapRelease { .. } => "keymap.release",
         ApiCall::WinGetViewport { .. } => "win.getViewport",
+        ApiCall::WinSelectShape { .. } => "win.selectShape",
+        ApiCall::WinCursorShape { .. } => "win.cursorShape",
         ApiCall::RtpList => "rtp.list",
         ApiCall::GitStatus => "git.status",
         ApiCall::GitBranches { .. } => "git.branches",
@@ -1372,3 +1401,39 @@ pub fn float(anchor: neosh_proto::Anchor) -> FloatConfig {
 
 /// Marker so `ExtmarkId` is re-exported where callers expect it.
 pub type MarkId = ExtmarkId;
+
+/// The two ends of a selection, in order, with its shape applied.
+///
+/// `None` when nothing is selected — which is not the same thing for every shape. Exclusive, the
+/// anchor and the cursor being in the same place selects nothing, because the cursor sits *between*
+/// characters and there is no character between one place and itself. Inclusive and linewise, the
+/// same two positions select the character or the row the cursor is on: `v` and then `y` copies a
+/// letter, and `V` and then `y` copies a line. Answering "nothing" there is what made `v` `y` print
+/// "the selection is empty" at somebody who had just pressed the two keys that mean "copy this".
+fn selected_range(
+    lines: &[crate::buffer::Line],
+    anchor: (u32, u32),
+    cursor: (u32, u32),
+    shape: SelectShape,
+) -> Option<((u32, u32), (u32, u32))> {
+    let (from, to) = if anchor <= cursor { (anchor, cursor) } else { (cursor, anchor) };
+    match shape {
+        SelectShape::Exclusive => (from != to).then_some((from, to)),
+        // One grapheme past the far end, which is what makes the character the cursor is on part
+        // of what is selected. Past the last one on the row, the end of the row — the line break
+        // is not a character you can be on.
+        SelectShape::Inclusive => {
+            let text = lines.get(to.0 as usize).map(|l| l.text.as_str()).unwrap_or("");
+            let end = text::after(text, to.1);
+            Some((from, (to.0, end)))
+        }
+        // Whole rows, in whichever direction the selection runs. The anchor has to move too — a
+        // range that starts halfway along the first row is a range whose first row is half in it,
+        // which extending *upwards* is exactly what produced: the one line you definitely meant
+        // was the one that dropped out.
+        SelectShape::Line => {
+            let end = lines.get(to.0 as usize).map(|l| l.text.len() as u32).unwrap_or(0);
+            Some(((from.0, 0), (to.0, end)))
+        }
+    }
+}

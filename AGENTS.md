@@ -88,6 +88,22 @@ per decision, and records the *reasoning*, not the choice.
   a promise about a keyboard. A capability that runs out of chords loses its key and keeps its
   command — `^K` runs it by name and `init.ts` can bind it — because inventing a prefix layer for
   one verb costs every user a concept to save one of them a keystroke. See ADR 0048.
+- **The cursor is on a character, and the frontend is the only thing that knows where that is.**
+  Reading the transcript is a normal mode, so `$` is the last character rather than the space after
+  it, `h` at column zero stays on its row, nothing parks past the end of one, and a selection
+  contains the character the cursor is on — `v` then `y` copies a letter instead of reporting an
+  empty selection. That last one is `SelectShape` on the window (`exclusive` / `inclusive` / `line`),
+  not an invariant the caller re-establishes after every motion, because a motion that forgets to is
+  a frame with the wrong rows lit. The motions are `crate::vim`, over plain rows, and deliberately
+  not a second set of answers in `CursorMotion`: that vocabulary is the composer's and every text
+  field's, and one `h` that means two things is a call whose behaviour depends on who is asking.
+  **And the caret is placed from the rows that were drawn**, never from `cursor_row - top_line`:
+  the transcript wraps, one buffer row is four screen rows, and the two counts agree until the
+  first long paragraph and then diverge by one row per wrap — far enough in, the caret was off the
+  window and therefore not drawn at all, which is a mode with no cursor in it. A window bends its
+  own scroll to keep its cursor on screen and reports back what it actually drew, including `rows`,
+  the buffer rows on the screen — which is what `^D` and `H`/`M`/`L` are counted in and is not the
+  height. See ADR 0051.
 - **A list is a place you move in.** Anywhere there is a cursor over rows and no text field — the
   project panel, the transcript reader — the motions are Vim's and they take a count: `5j` is five
   rows you can *land on*, `^D`/`^U` are half of the panel's real height, `12G` is a row rather than
@@ -452,29 +468,49 @@ Two corollaries, both of which were bugs:
 - **A key another mode claimed never arrives.** Reading's keys come through the *unbound* path,
   which is the last thing consulted — so `^D` was whatever the git plugin bound it to.
 
+**The cursor is on a character, not between two.** Which is why the caret is a *block* here and a
+bar in the composer, why `$` is the last character rather than the space after it, why `h` at column
+zero stops rather than going to the row above, and why `v` then `y` copies the character you were
+looking at instead of saying there is nothing there. A screen is counted in the buffer rows actually
+on it, which after wrapping is not the window's height. See ADR 0051.
+
 | Key | Does |
 |---|---|
 | `hjkl`, arrows | Move. A count first does it that many times: `5j` |
-| `w` `b` | By word |
-| `0` `$` | Ends of the line |
+| `w` `b` `e` `ge` | By word. `W` `B` `E` by **WORD** — everything that is not a space |
+| `0` `^` `$` `g_` | The start of the line, its first non-blank, its last character, its last non-blank |
+| `f` `F` `t` `T` then `;` `,` | To a character on this line, or just before it. `;` again, `,` the other way |
+| `%` | The bracket matching the one under the cursor, however many rows away |
 | `gg` `G` | Ends of the transcript. With a count it is a row: `12G`, `12gg` |
 | `^D` `^U` | Half a screen, or that many of them |
 | `^F` `^B`, `PgUp`/`PgDn` | A screen |
+| `^E` `^Y` | Scroll a line without moving the cursor — until it would go off the edge |
+| `H` `M` `L` | The top, middle and bottom row **of the window** |
 | `zz` `zt` `zb` | Put the cursor's line in the middle, at the top, at the bottom |
 | `[` `]` | Previous / next **turn** |
 | `{` `}` | Previous / next **block** |
 | `⇥` `za` | Open or fold the **tool card** under the cursor — the whole diff, the whole output |
-| `/` `?` then `n` `N` | Search, and step through the matches |
+| `/` `?` then `n` `N` | Search, and step through the matches. `n` is *onwards*, so after `?` it goes up |
+| `*` `#` | Search for the word under the cursor, forwards or back |
 | `v` | Start a selection that motions extend. Again, or on a `V` selection, gives it up |
 | `V` | The same by whole lines — both ways, so extending upwards keeps the line you started on |
+| `o` | While selecting: the other end of what you have, so you can fix the end you got wrong |
+| `gv` | The selection you last gave up, back where it was |
+| `iw` `aw` `ip` `ap` `i"` `i(` `i[` `i{` … | While selecting: the word, paragraph, string or brackets the cursor is in. `a` takes the delimiters |
 | `y` | Copy the selection, and leave |
 | `yy` `Y` | Copy the line |
+| `y` + a motion | Copy what it covers: `yw`, `y$`, `y5j`, `yG`. Whole lines when it crosses rows |
+| `yi` + an object | Copy one without selecting it first — `yiw`, `yi"` |
 | `yc` | Copy the **code block** the cursor is in, without its indent or language line |
 | `ym` | Copy the whole **turn** — the question and everything it produced |
-| `ya` | Copy the entire transcript |
-| `i` `a` `o` `⏎` | Back to the composer |
+| `ya` | Copy the entire transcript. Which is why `ya`*w* is the one thing here that is not Vim's — `viwy` is |
+| `i` `a` `o` `⏎` | Back to the composer. While selecting, `i` and `a` open a text object and `o` swaps ends |
 | `^S` | And back out, the way you came in |
 | `Esc` | One thing per press: the selection, then the search highlight, then the mode |
+
+There is no `^V`: a blockwise selection is a rectangle rather than a range, and every consumer of a
+selection would have to grow a case for it. The key says so rather than doing nothing. Nothing here
+edits, either — no `d`, `c`, `x` or `p`. The transcript is an artefact you take pieces out of.
 
 ## Answering a question — the panel over the composer
 

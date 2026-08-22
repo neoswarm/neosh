@@ -101,6 +101,13 @@ whole tool loop. This one calls your tool, then replies:
 To record a real one instead of hand-writing it, run with `NEOSH_LOG_LEVEL=trace` and lift the
 provider events out of the log.
 
+There are two ready-made ones under `crates/neosh/tests/fixtures/`.
+`markdown_turn.jsonl` is an answer with a heading, a list and a fenced block in it — enough shape
+that "the block under the cursor" is a real question. `wrapping_turn.jsonl` is six paragraphs of
+prose long enough to **wrap**, which the first one deliberately is not: a buffer row that draws as
+four screen rows is the case every piece of caret and page arithmetic gets wrong, and it is
+invisible in a fixture whose lines all fit. Use it for anything about where the cursor is.
+
 ### 2. Run it
 
 ```sh

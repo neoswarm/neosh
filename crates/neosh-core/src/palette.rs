@@ -289,6 +289,14 @@ pub fn groups(variant: Variant) -> Vec<(&'static str, HighlightDef)> {
         // The row the cursor is on. Background rather than reverse: reverse would fight any
         // foreground the row already carries, and a list row usually carries one.
         ("CursorLine", spec(bg(r.cursor_bg))),
+        // The character the cursor is *on*, where the cursor is a block rather than a bar.
+        //
+        // Reverse rather than a colour of its own, and deliberately unlike `CursorLine`: this one
+        // has to be findable at a glance in a screenful of prose, and a background a shade off the
+        // one beside it is not. Reverse also survives whatever the character underneath already
+        // carries — a syntax colour, a diff band, a selection — which nothing with a fixed
+        // background does.
+        ("Cursor", spec(reverse(fg(r.fg)))),
         ("Visual", spec(bg(r.match_bg))),
         ("Search", spec(bold(fg(r.active)))),
         ("Directory", spec(fg(r.accent))),
@@ -697,6 +705,8 @@ mod tests {
         let names: BTreeSet<_> = contract().into_iter().collect();
         for required in [
             "CursorLine",
+            "Cursor",
+            "Visual",
             "Search",
             "Comment",
             "Title",

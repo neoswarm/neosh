@@ -209,7 +209,13 @@ impl Client {
         let wins: Vec<_> = self.mirror.windows.keys().copied().collect();
         for win in wins {
             self.send(ClientMessage::Input {
-                event: InputEvent::ViewportChanged { win, width, height, top_line: 0 },
+                event: InputEvent::ViewportChanged {
+                    win,
+                    width,
+                    height,
+                    top_line: 0,
+                    rows: height as u32,
+                },
             });
         }
     }

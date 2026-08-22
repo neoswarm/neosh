@@ -14,7 +14,7 @@
 //! that lets a web frontend reuse the entire protocol.
 
 use neosh_proto::{
-    Anchor, Dock, Extent, LineRender, VirtTextPos, WindowId, WindowLayout,
+    Anchor, CursorShape, Dock, Extent, LineRender, VirtTextPos, WindowId, WindowLayout,
 };
 use ratatui::layout::Rect;
 use ratatui::style::Style;
@@ -487,7 +487,7 @@ pub fn resolve_layout_with_rules(
                     // rows a line folds into — only the text and the window's width can.
                     let h = match mirror.windows.get(&win) {
                         Some(w) if w.wraps() => {
-                            let rows = rendered_lines(
+                            let rows = rendered_rows(
                                 mirror,
                                 w,
                                 &Theme::new(crate::theme::ColorDepth::Ansi16),
@@ -583,9 +583,14 @@ pub fn resolve_layout_with_rules(
 ///
 /// The caret is not decoration. Without one the composer gives no sign that typing goes anywhere,
 /// and a terminal program with no visible insertion point reads as frozen.
-pub fn draw(frame: &mut Frame, mirror: &Mirror, theme: &Theme) -> Option<(u16, u16)> {
+pub fn draw(frame: &mut Frame, mirror: &Mirror, theme: &Theme) -> Drawn {
     let area = frame.area();
     let (rects, rules) = resolve_layout_with_rules(mirror, area);
+    // Which window the caret belongs to is decided before anything is drawn, because the window it
+    // belongs to is also the one whose scroll has to bend to keep it on screen.
+    let caret_win = caret_target(mirror, &rects);
+    let mut caret = None;
+    let mut tops: Vec<(WindowId, (u32, u32))> = Vec::new();
 
     // Drawn before the windows so a float still covers it, and before content so nothing has to
     // know the rule is there.
@@ -641,7 +646,8 @@ pub fn draw(frame: &mut Frame, mirror: &Mirror, theme: &Theme) -> Option<(u16, u
         // Wrapping is per window: the chat has to wrap or a long answer is silently cut off at the
         // right edge, while the sidebar and the status line must clip or one long path would push
         // everything below it off the screen.
-        let rendered = rendered_lines(mirror, w, theme, inner.width);
+        let rendered = rendered_rows(mirror, w, theme, inner.width);
+        let here = (caret_win == Some(win)).then(|| caret_in(mirror, w, &rendered, inner.width)).flatten();
 
         // Follow the tail. Taking the *first* n lines shows a long conversation's opening and
         // never its answer, which is the wrong end of every transcript ever written. An explicit
@@ -650,11 +656,41 @@ pub fn draw(frame: &mut Frame, mirror: &Mirror, theme: &Theme) -> Option<(u16, u
         // transcript: asking put the window back at the last one.
         let height = inner.height as usize;
         let unscrolled = w.follows_tail() && w.top_line.is_none();
-        let lines: Vec<Line> = if unscrolled && rendered.len() > height {
-            rendered[rendered.len() - height..].to_vec()
-        } else {
-            rendered.into_iter().take(height).collect()
+        let mut start = match rendered.len().checked_sub(height) {
+            Some(over) if unscrolled && over > 0 => over,
+            _ => 0,
         };
+        // And then: the cursor is never off the window it is in. `top_line` counts buffer rows,
+        // one of which is several screen rows the moment it wraps, so a scroll that put the cursor
+        // on screen by that arithmetic can still leave it well below the bottom edge — which is
+        // how the transcript reader opened with no cursor anywhere on it. Minimally, the way a
+        // scroll that chases a cursor has to be: any more and reading downwards would jump.
+        if let Some((idx, _)) = here {
+            if idx < start {
+                start = idx;
+            } else if height > 0 && idx >= start + height {
+                start = idx + 1 - height;
+            }
+        }
+        let start = start.min(rendered.len());
+        // What is actually on screen, in buffer rows — which is not what the core asked for once
+        // the caret has bent it, and is not `height` either once anything wraps. Both are numbers
+        // only the frontend can produce, and everything that pages by a screenful reads them.
+        let shown = &rendered[start..rendered.len().min(start + height.max(1))];
+        let mut seen: Option<(u32, u32)> = None;
+        for (row, _) in shown.iter().filter_map(|r| r.at) {
+            seen = Some(match seen {
+                Some((first, _)) => (first, row),
+                None => (row, row),
+            });
+        }
+        tops.push((
+            win,
+            seen.map(|(first, last)| (first, last + 1 - first))
+                .unwrap_or((w.top_line.unwrap_or(0), 0)),
+        ));
+        let lines: Vec<Line> =
+            rendered[start..].iter().take(height).map(|r| r.line.clone()).collect();
 
         // Gravity only bites when the content does not fill the window — the case a scroll offset
         // cannot express, because there is nothing to scroll. Done by shrinking the rectangle
@@ -672,13 +708,19 @@ pub fn draw(frame: &mut Frame, mirror: &Mirror, theme: &Theme) -> Option<(u16, u
             _ => inner,
         };
 
+        // Gravity has already moved `inner` down by however many rows the content falls short of,
+        // so the caret moves with it by construction rather than by a second sum that has to agree.
+        if let Some((idx, column)) = here {
+            let line = u16::try_from(idx.saturating_sub(start)).unwrap_or(u16::MAX);
+            if line < inner.height && column < inner.width {
+                caret = Some((inner.x + column, inner.y + line));
+            }
+        }
+
         frame.render_widget(Paragraph::new(lines).style(theme.style("Normal")), inner);
     }
 
     draw_notifications(frame, area, mirror, theme);
-
-    // Raw-cell surfaces blit last: a plugin claimed those cells and owns them outright.
-    let caret = caret_position(mirror, &rects, theme);
 
     for surface in mirror.surfaces.values() {
         let Some((_, host)) = rects.iter().find(|(id, _)| *id == surface.win) else { continue };
@@ -701,7 +743,44 @@ pub fn draw(frame: &mut Frame, mirror: &Mirror, theme: &Theme) -> Option<(u16, u
         }
     }
 
-    caret
+    // The block cursor, last of all and over whatever the row under it ended up being.
+    //
+    // Painted as a cell rather than left to the terminal's own caret, because the terminal's is a
+    // thin bar in most of them and the one thing it has to do here is be findable in a screenful
+    // of prose. The terminal's caret is still put in the same place — it is what a screen reader
+    // and a terminal's own "where am I" follow — this just makes it visible.
+    if let Some(((x, y), true)) = caret.zip(
+        caret_win
+            .and_then(|id| mirror.windows.get(&id))
+            .map(|w| w.cursor_shape == CursorShape::Block),
+    ) && let Some(cell) = frame.buffer_mut().cell_mut((x, y))
+    {
+        // Reverse video when nothing has said otherwise. A palette entry is how you change what a
+        // block cursor looks like, never whether there is one — and a theme that has never heard
+        // of `Cursor` giving you a mode with no visible cursor in it is the whole bug.
+        let style = if theme.defines("Cursor") {
+            theme.style("Cursor")
+        } else {
+            Style::default().add_modifier(ratatui::style::Modifier::REVERSED)
+        };
+        cell.set_style(cell.style().patch(style));
+    }
+
+    Drawn { caret, caret_win: caret.and(caret_win), tops }
+}
+
+/// What one frame turned out to be: where the caret goes, and what each window actually showed.
+///
+/// The tops are not what the core asked for. A window whose scroll was bent to keep its cursor on
+/// screen is showing a different first row than `top_line` says, and every plugin that pages by a
+/// screenful reads that number.
+#[derive(Debug, Clone, Default)]
+pub struct Drawn {
+    pub caret: Option<(u16, u16)>,
+    /// The window the caret is in, whose cursor shape decides what it looks like.
+    pub caret_win: Option<WindowId>,
+    /// Per window: the first buffer row drawn, and how many buffer rows were drawn.
+    pub tops: Vec<(WindowId, (u32, u32))>,
 }
 
 /// Every screen line a window's visible buffer range turns into, marks and wrapping applied.
@@ -730,42 +809,62 @@ fn border_style(theme: &Theme, name: &str) -> ratatui::style::Style {
     }
 }
 
-fn rendered_lines(
+/// One screen row: what to draw, and which buffer row it came from.
+///
+/// The provenance is the whole point. A caret that works its own screen row out from a buffer row
+/// counts one thing while the draw counts another, and the two agree exactly until the first line
+/// long enough to wrap — after which the caret is placed above the character it is on, and far
+/// enough into a transcript of paragraphs it is off the window altogether and therefore hidden.
+/// One calculation, read by both.
+struct ScreenRow {
+    line: Line<'static>,
+    /// The buffer row this is part of and which wrapped segment of it, or `None` for a virtual
+    /// line — a row that exists on the screen and not in the text.
+    at: Option<(u32, u16)>,
+}
+
+fn rendered_rows(
     mirror: &Mirror,
     w: &crate::mirror::MirrorWindow,
     theme: &Theme,
     width: u16,
-) -> Vec<Line<'static>> {
+) -> Vec<ScreenRow> {
     // Wrapping is per window: the chat has to wrap or a long answer is silently cut off at the
     // right edge, while the sidebar and the status line must clip or one long path would push
     // everything below it off the screen.
     let wraps = w.wraps();
-    mirror
-        .buffers
-        .get(&w.buf)
-        .map(|b| {
-            b.lines
-                .iter()
-                .skip(w.top_line.unwrap_or(0) as usize)
-                .flat_map(|l| render_line_in(l, theme, Some(width as usize)))
-                .flat_map(|l| if wraps { wrap_line(&l, width as usize) } else { vec![l] })
-                .map(|l| fill_to_edge(l, width as usize))
-                .collect()
-        })
-        .unwrap_or_default()
+    let cols = (width as usize).max(1);
+    let Some(b) = mirror.buffers.get(&w.buf) else { return Vec::new() };
+    let mut out: Vec<ScreenRow> = Vec::new();
+    for (row, l) in b.lines.iter().enumerate().skip(w.top_line.unwrap_or(0) as usize) {
+        // `render_line_in` emits the virtual lines that go above, then the row's own text, then
+        // the ones that go below. Which of them is the text is exactly what the caret needs.
+        let above = l
+            .marks
+            .iter()
+            .filter(|m| m.opts.virt_text_pos == VirtTextPos::Above && !m.opts.virt_text.is_empty())
+            .count();
+        for (i, line) in render_line_in(l, theme, Some(cols)).into_iter().enumerate() {
+            let pieces = if wraps { wrap_line(&line, cols) } else { vec![line] };
+            for (seg, piece) in pieces.into_iter().enumerate() {
+                out.push(ScreenRow {
+                    line: fill_to_edge(piece, cols),
+                    at: (i == above).then_some((row as u32, seg as u16)),
+                });
+            }
+        }
+    }
+    out
 }
 
 /// Where the caret goes, in screen cells.
 ///
+/// Which window the caret belongs to.
+///
 /// The focused window if there is one, else the bottom-most docked window — which is the composer,
-/// and is where typing lands when nothing else has claimed the keyboard. Returns `None` when the
-/// target is off-screen, so the caller hides it rather than parking it in a corner.
-fn caret_position(
-    mirror: &Mirror,
-    rects: &[(WindowId, Rect)],
-    theme: &Theme,
-) -> Option<(u16, u16)> {
-    let target = mirror.focus.or_else(|| {
+/// and is where typing lands when nothing else has claimed the keyboard.
+fn caret_target(mirror: &Mirror, rects: &[(WindowId, Rect)]) -> Option<WindowId> {
+    mirror.focus.or_else(|| {
         // The composer: the last docked-bottom window, matching how the host stacks them.
         rects
             .iter()
@@ -777,31 +876,20 @@ fn caret_position(
             })
             .min_by_key(|(_, r)| r.y)
             .map(|(id, _)| *id)
-    })?;
+    })
+}
 
-    let (_, rect) = rects.iter().find(|(id, _)| *id == target)?;
-    let w = mirror.windows.get(&target)?;
-    let inner = if w.layout_is_float() {
-        // Inside the border, when there is one.
-        let has_border = matches!(&w.layout, WindowLayout::Float { config }
-            if !matches!(config.border, neosh_proto::BorderStyle::None));
-        if has_border {
-            Rect {
-                x: rect.x.saturating_add(1),
-                y: rect.y.saturating_add(1),
-                width: rect.width.saturating_sub(2),
-                height: rect.height.saturating_sub(2),
-            }
-        } else {
-            *rect
-        }
-    } else {
-        *rect
-    };
-    if inner.width == 0 || inner.height == 0 {
-        return None;
-    }
-
+/// Where a window's cursor sits in the rows that window rendered to: which one, and how far along.
+///
+/// Both numbers are read off the *rendered* rows rather than computed a second time from the
+/// buffer, which is what makes the caret and the text it is on inseparable. `None` when the cursor
+/// is on a row this window did not render — above its top, or past the end of the buffer.
+fn caret_in(
+    mirror: &Mirror,
+    w: &crate::mirror::MirrorWindow,
+    rendered: &[ScreenRow],
+    width: u16,
+) -> Option<(usize, u16)> {
     let (row, col) = w.cursor;
     let buffer = mirror.buffers.get(&w.buf)?;
     let line_render = buffer.lines.get(row as usize);
@@ -815,25 +903,11 @@ fn caret_position(
     // bug only shows up as "typing appears one column off", which is a nightmare to trace back.
     column = column.saturating_add(inline_before(line_render, col as usize));
 
-    // Saturating throughout: a row far below `top_line` must clamp to "off-screen" rather than
-    // wrap around into a plausible-looking coordinate.
-    let top = w.top_line.unwrap_or(0);
-    let mut line = u16::try_from(row.saturating_sub(top)).unwrap_or(u16::MAX);
-    line = line.saturating_add(virt_rows_before(buffer, top, row));
-    // Content pushed down by gravity takes the caret with it.
-    if let WindowLayout::Docked { gravity: neosh_proto::Gravity::End, .. } = &w.layout {
-        let rows = rendered_lines(mirror, w, theme, inner.width).len();
-        line = line.saturating_add((inner.height as usize).saturating_sub(rows) as u16);
-    }
-    if w.wraps() {
-        // On a wrapped line the caret moves down as well as along.
-        line = line.saturating_add(column / inner.width);
-        column %= inner.width;
-    }
-    if line >= inner.height || column >= inner.width {
-        return None;
-    }
-    Some((inner.x + column, inner.y + line))
+    // On a wrapped line the caret moves down as well as along, onto the segment it fell into.
+    let cols = width.max(1);
+    let (seg, column) = if w.wraps() { (column / cols, column % cols) } else { (0, column) };
+    let idx = rendered.iter().position(|r| r.at == Some((row, seg)))?;
+    Some((idx, column))
 }
 
 /// How many screen columns of inline virtual text sit before `col` on this row.
@@ -853,31 +927,6 @@ fn inline_before(line: Option<&LineRender>, col: usize) -> u16 {
         .map(|c| width(&c.text))
         .sum();
     u16::try_from(shift).unwrap_or(u16::MAX)
-}
-
-/// How many extra screen rows the virtual lines between `top` and `row` take up.
-///
-/// `Above` on a row at or before the caret pushes it down; `Below` only counts for rows strictly
-/// before it, since a line under the caret's own row is drawn after the caret.
-fn virt_rows_before(buffer: &crate::mirror::MirrorBuffer, top: u32, row: u32) -> u16 {
-    let mut extra: usize = 0;
-    for (i, line) in buffer.lines.iter().enumerate().skip(top as usize) {
-        let i = i as u32;
-        if i > row {
-            break;
-        }
-        for m in &line.marks {
-            if m.opts.virt_text.is_empty() {
-                continue;
-            }
-            match m.opts.virt_text_pos {
-                VirtTextPos::Above => extra += 1,
-                VirtTextPos::Below if i < row => extra += 1,
-                _ => {}
-            }
-        }
-    }
-    u16::try_from(extra).unwrap_or(u16::MAX)
 }
 
 /// How long a notification stays on screen.

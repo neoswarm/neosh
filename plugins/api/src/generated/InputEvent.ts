@@ -14,6 +14,15 @@ export type InputEvent =
     width: number;
     height: number;
     top_line: number;
+    /**
+     * How many *buffer* rows are on the screen, which on a wrapping window is not the height.
+     *
+     * The frontend is the only thing that can answer it, and everything that pages by a
+     * screenful needs it: a transcript of paragraphs draws six buffer rows in thirty cells of
+     * height, so half a screen counted as `height / 2` is four screens of scrolling and a
+     * cursor that lands somewhere nobody asked for.
+     */
+    rows: number;
   }
   | { "type": "command"; name: string; args: Array<string> }
   | { "type": "repaint" }
