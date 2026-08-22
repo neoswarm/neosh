@@ -1494,6 +1494,26 @@ impl Host {
         Ok(got)
     }
 
+    /// Whether the conversation on screen has an image attached that has not been sent.
+    fn has_attachment(&self) -> bool {
+        self.attached.get(&self.active_session()).is_some_and(|v| !v.is_empty())
+    }
+
+    /// Take the last attached image back off, saying which one went.
+    ///
+    /// Said out loud because the chip it removes may have been the only one on screen: a row that
+    /// silently becomes no row is indistinguishable from a key that did nothing.
+    fn drop_attachment(&mut self) {
+        let here = self.active_session();
+        match self.attached.entry(here).or_default().pop() {
+            None => self.editor_message(MessageLevel::Info, "nothing attached"),
+            Some(a) => {
+                self.editor_message(MessageLevel::Info, format!("took off {}", a.label()));
+                self.refresh_composer();
+            }
+        }
+    }
+
     /// Start a turn in a named conversation, drawing it only if it is the one on screen.
     ///
     /// Named rather than implied, because the caller is not always the keyboard: a turn that ends
@@ -2464,7 +2484,7 @@ impl Host {
             ];
             if i + 1 == attached.len() {
                 v.push(chunk("  ", "Composer.Hint"));
-                v.push(chunk("\u{2325}v", "Composer.HintKey"));
+                v.push(chunk(if ascii { "Bksp" } else { "\u{232b}" }, "Composer.HintKey"));
                 v.push(chunk(" take off", "Composer.Hint"));
             }
             self.composer_mark(0, VirtTextPos::Above, v);
@@ -2756,13 +2776,13 @@ impl Host {
             rows.push(String::new());
         }
         // The keys worth knowing before the first question — and the one most people never find,
-        // which is that the transcript is a place you can go. The rest of the table is on F1.
+        // which is that the transcript is a place you can go. The rest of the table is on `^Z`.
         let keys: [(&str, &str); 5] = [
             (if ascii { "Enter" } else { "\u{23ce}" }, "send"),
             ("^S", "browse & copy"),
             ("^P", "model"),
             ("^T", "projects"),
-            ("F1", "every key"),
+            ("^Z", "every key"),
         ];
         let mut line = String::from("  ");
         let mut spans = Vec::new();
@@ -2771,7 +2791,7 @@ impl Host {
             // As many as fit, in the order they are worth knowing. A row of hints that wraps is
             // two rows of hints, the second of which starts mid-phrase — and the whole point of
             // this line is to be readable at a glance. `^S` is second because it is the one most
-            // people never find; the ones that get dropped first are the ones `F1` also names.
+            // people never find; the ones that get dropped first are the ones `^Z` also names.
             let would = sep.len() + key.chars().count() + 1 + label.chars().count();
             if i > 0 && line.chars().count() + would > width {
                 break;
@@ -3067,6 +3087,13 @@ impl Host {
                 self.start_turn(text);
             }
 
+            // Nothing left to erase, and a chip above the field: the next backspace takes that
+            // off. It is how a chip row behaves everywhere else, it needs no modifier anybody's
+            // terminal has an opinion about, and "that was the wrong screenshot" is one key away
+            // from having pasted it.
+            KeyCode::Backspace if self.composer_text().is_empty() && self.has_attachment() => {
+                self.drop_attachment()
+            }
             KeyCode::Backspace if m.ctrl || m.alt => self.compose(TextEdit::DeleteWordBack),
             KeyCode::Backspace => self.compose(TextEdit::DeleteBack),
             KeyCode::Delete if m.ctrl || m.alt => self.compose(TextEdit::DeleteWordForward),
@@ -6408,9 +6435,11 @@ impl Host {
             // `^V` is the one every hand is already on. It stays free for that: nothing else in
             // chat wants it, and the composer has never had a use for it.
             ("<C-v>", "chat.image.paste", "Attach the image on the clipboard"),
-            // Beside it rather than somewhere else, because "that was the wrong screenshot" is
-            // one keystroke away from having taken it.
-            ("<M-v>", "chat.image.drop", "Take the last attached image off"),
+            // Taking one back off is `⌫` on an empty composer, handled below rather than bound
+            // here. It was `⌥V`, which is not a key: a Mac terminal turns Option-v into `√`
+            // unless its owner has been into the settings, and a keyboard whose Alt is a layer
+            // toggle cannot send it at all. `chat.image.drop` is still a command, so `^K` runs it
+            // and `init.ts` can put it back on a chord of your own.
         ] {
             let _ = self.editor.apply(&plugin, ApiCall::KeymapSet {
                 mode: Mode::Chat,
@@ -6631,16 +6660,7 @@ impl Host {
                     self.editor_message(MessageLevel::Warn, e);
                 }
             }
-            "chat.image.drop" => {
-                let here = self.active_session();
-                match self.attached.entry(here).or_default().pop() {
-                    None => self.editor_message(MessageLevel::Info, "nothing attached"),
-                    Some(a) => {
-                        self.editor_message(MessageLevel::Info, format!("took off {}", a.label()));
-                        self.refresh_composer();
-                    }
-                }
-            }
+            "chat.image.drop" => self.drop_attachment(),
             "chat.image.clear" => {
                 let here = self.active_session();
                 let n = self.attached.remove(&here).unwrap_or_default().len();
@@ -6861,20 +6881,26 @@ impl Host {
                 ),
             },
             // Widget keys. Space-separated lists in Neovim notation, so more than one key can mean
-            // the same thing — `<Down>` and `<C-n>` both move down, and adding a third is a
+            // the same thing — `<C-n>` and `<Down>` both move down, and adding a third is a
             // setting rather than a fork. Declared by the host rather than by whichever plugin
             // happens to open a picker first, because two plugins declaring the same option name
             // is an error and every plugin uses this widget library.
+            //
+            // **The chord comes first, and the arrow second.** The first key in the list is the
+            // one a widget prints on its hint row, and a legend is a promise about a keyboard:
+            // every terminal sends `^N`, while an arrow is a key some keyboards only have on a
+            // layer and some remote sessions mangle. Both work — this is the order they are
+            // *offered* in, not the set.
             OptionSpec {
                 name: "ui.keys.next".into(),
                 ty: OptionType::Str,
-                default: OptionValue::Str("<Down> <C-n> <C-j>".into()),
+                default: OptionValue::Str("<C-n> <Down> <C-j>".into()),
                 description: Some("Move down in a picker or completion list.".into()),
             },
             OptionSpec {
                 name: "ui.keys.prev".into(),
                 ty: OptionType::Str,
-                default: OptionValue::Str("<Up> <C-p> <C-k>".into()),
+                default: OptionValue::Str("<C-p> <Up> <C-k>".into()),
                 description: Some("Move up in a picker or completion list.".into()),
             },
             OptionSpec {
@@ -6994,7 +7020,7 @@ impl Host {
                 default: OptionValue::Bool(false),
                 description: Some(
                     "Show a shortcut row under the composer. Off by default: the sidebar's footer \
-                     carries the same keys and `F1` carries all of them, so the row mostly cost \
+                     carries the same keys and `^Z` carries all of them, so the row mostly cost \
                      the transcript a line."
                         .into(),
                 ),

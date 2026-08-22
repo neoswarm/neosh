@@ -21,7 +21,7 @@
  * resort rather than the first, and three things are here so that it usually is not necessary:
  *
  * - **Every key in this panel is an ordinary binding**, on the buffer kind `neosh.sidebar`, pointed
- *   at a command with a name. `F1` lists them, the palette runs them, and one line in your
+ *   at a command with a name. `^Z` lists them, the palette runs them, and one line in your
  *   `init.ts` moves any of them. There is no private switch statement any more — there was, and
  *   what it meant was that adding one key to this panel meant forking all twelve hundred lines of
  *   it.
@@ -133,7 +133,7 @@ interface SectionItem {
 interface ActionItem {
   /** Key notation, as `keymap.set` takes it: `d`, `<C-y>`, `gd`. */
   key: string;
-  /** What it does, for the hint strip and for `F1`. */
+  /** What it does, for the hint strip and for `^Z`. */
   label: string;
   command: string;
   /** Which rows it applies to. Defaults to `any`. */
@@ -740,7 +740,7 @@ async function registerCommands(w: Wiring): Promise<void> {
    * Register one verb, and bind it inside this panel.
    *
    * Every key in this list goes through here, which is the point: there is no private key handler
-   * any more, so `F1` lists the panel's keys with the rest, `^K` runs them, and
+   * any more, so `^Z` lists the panel's keys with the rest, `^K` runs them, and
    * `keymap.set("chat", "d", "…", { scope: { kind: "buf_kind", name: "neosh.sidebar" } })` from
    * anybody's `init.ts` replaces one. The scope is the buffer kind rather than the window, because
    * the window is opened and closed as you toggle the panel and a binding on it would go with it.
@@ -1045,7 +1045,7 @@ async function registerCommands(w: Wiring): Promise<void> {
  * conversation. Going through here, the command is invoked with the row as arguments and the
  * contributor never has to know the panel has a cursor at all.
  *
- * They are real bindings all the same. `F1` lists them with the contributed label, `^K` runs the
+ * They are real bindings all the same. `^Z` lists them with the contributed label, `^K` runs the
  * command, and a user who dislikes the key rebinds it exactly as they would one of ours.
  */
 function installActions(
@@ -1943,7 +1943,7 @@ async function openRemote(
 /**
  * The keys inside a remote view.
  *
- * Registered once and bound at buffer-kind scope, so `F1` lists them and `init.ts` can move them —
+ * Registered once and bound at buffer-kind scope, so `^Z` lists them and `init.ts` can move them —
  * the same deal every other panel key gets. Registered lazily rather than at activation because
  * most workspaces never open one.
  */
@@ -2699,7 +2699,7 @@ function hints(opts: DrawOptions): ListRow<Target>[] {
   const lines = !opts.focused
     // `^O` is not here and `+ Add project` is a row you can see: a key strip has two lines, and the
     // verb with a row of its own is the one that can afford to give up its place on them.
-    ? ["^T projects  ^N new   ^F archive", "^K palette   ^B hide  F1 keys"]
+    ? ["^T projects  ^N new   ^F archive", "^K palette   ^B hide  ^Z keys"]
     : kind === "project"
       // `X` is on the strip because a list you cannot shorten is a list that grows forever, and a
       // project that outlives its conversations — which is the point of it — has to have a way off.

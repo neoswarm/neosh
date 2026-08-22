@@ -386,7 +386,7 @@ await neosh.keymap.set("chat", "x", "acme.mine", {
 ```
 
 Resolution is window → buffer → kind → global, first match winning. Your binding is an ordinary one:
-`F1` lists it under the panel's section, `^K` runs the command, and the panel's own default loses to
+`^Z` lists it under the panel's section, `^K` runs the command, and the panel's own default loses to
 it because a default that overwrites a choice is not a default.
 
 Publish a kind for anything of yours that is more than a scratch buffer — it is one argument, and it

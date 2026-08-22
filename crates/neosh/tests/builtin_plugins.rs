@@ -645,7 +645,9 @@ fn the_key_strip_says_the_keys_that_are_actually_bound() {
     s.wait_for("PROJECTS");
     s.ctrl("k");
     assert!(
-        s.pump(|s| s.picker_named("[Go to]").iter().any(|l| l.contains("^y choose"))),
+        // `^Y`, capitalised: nobody presses shift to send it, and the capital is how a terminal
+        // has spelled a chord since curses.
+        s.pump(|s| s.picker_named("[Go to]").iter().any(|l| l.contains("^Y choose"))),
         "the strip follows the setting\n{:?}",
         s.picker_named("[Go to]")
     );
@@ -1352,9 +1354,9 @@ fn nothing_else_reaches_the_keyboard_while_the_option_sheet_is_open() {
 
 #[test]
 fn a_knob_row_says_it_is_a_control_before_you_press_anything() {
-    // A ladder with one rung lit reads identically whether or not `←→` do anything to it — which is
-    // how a live control came to look like a summary, and why `↵` on it (which means "done") felt
-    // like a key that does nothing at all.
+    // A ladder with one rung lit reads identically whether or not `h`/`l` do anything to it — which
+    // is how a live control came to look like a summary, and why `↵` on it (which means "done")
+    // felt like a key that does nothing at all.
     let sb = Sandbox::new("railsheet");
     let dir = sb.root.join("config/plugins/lab");
     std::fs::create_dir_all(&dir).expect("mkdir");
@@ -1378,7 +1380,8 @@ fn a_knob_row_says_it_is_a_control_before_you_press_anything() {
         s.transcript()
     );
     // And the key that changes something is named before the key that leaves.
-    assert!(s.saw("←→ change"), "the hints lead with the key that does the thing\n{}", s.transcript());
+    // Letters, not arrows: the arrows are bound too, and the row is a promise about a keyboard.
+    assert!(s.saw("h l change"), "the hints lead with the key that does the thing\n{}", s.transcript());
 }
 
 #[test]
@@ -3005,6 +3008,26 @@ fn the_key_list_opens_from_the_panel_and_any_key_dismisses_it() {
     assert!(s.pump(|s| s.windows_for(keys).is_empty()), "any key closes it\n{}", s.transcript());
 }
 
+/// The key list is reachable from the composer, and by a chord rather than by `F1`. Apple's top
+/// row is brightness until somebody finds the setting, so the key whose job is teaching every
+/// other key was the one key a new Mac could not press. See ADR 0048.
+#[test]
+fn the_key_list_opens_on_a_chord_from_the_composer() {
+    let sb = Sandbox::new("keylistchord");
+    let mut s = sb.start();
+    s.wait_for("PROJECTS");
+
+    s.ctrl("z");
+    s.wait_for("CHAT");
+    let keys = s.buffer_named("[keys]").expect("key list buffer");
+    assert!(
+        s.pump(|s| s.lines_of(keys).iter().any(|l| l.contains("Command palette"))),
+        "the live registry, not a written-down list\n{:?}",
+        s.lines_of(keys)
+    );
+    assert!(s.pump(|s| s.windows_for(keys).len() == 1), "it is on screen\n{}", s.transcript());
+}
+
 #[test]
 fn escape_leaves_the_thread_list_and_typing_goes_back_to_the_composer() {
     let sb = Sandbox::new("leave");
@@ -3710,7 +3733,7 @@ impl Session {
 #[test]
 fn the_shortcut_row_is_off_because_the_sidebar_already_says_all_of_it() {
     // It read as a good idea and was not. `^T`, `^N` and `^K` are in the sidebar's own footer two
-    // rows below, `F1` is on the row it points at, and what the duplication actually bought was
+    // rows below, `^Z` is on the row it points at, and what the duplication actually bought was
     // one fewer line of transcript and a composer pressed against the status strip.
     let sb = Sandbox::new("nohints");
     let mut s = sb.start();
@@ -3735,7 +3758,7 @@ fn the_shortcut_row_comes_back_if_you_ask_for_it() {
     // Waiting on a plugin's entry, not the host's: the host seeds `⏎ send` before any plugin has
     // loaded, so asserting on that alone would pass before the row was finished.
     assert!(
-        s.pump(|s| s.composer_chrome().iter().any(|t| t.contains("F1 keys"))),
+        s.pump(|s| s.composer_chrome().iter().any(|t| t.contains("^Z keys"))),
         "the way to the keys that did not fit\n{:?}",
         s.composer_chrome()
     );
@@ -5422,7 +5445,7 @@ fn a_third_party_verb_fires_on_its_key_with_the_row_it_was_pointed_at() {
 /// replace one.
 ///
 /// This is the claim the whole rewrite rests on. Before it, the panel resolved keys in a private
-/// switch statement: `F1` could not list them, `^K` could not run them, and rebinding `x` meant
+/// switch statement: `^Z` could not list them, `^K` could not run them, and rebinding `x` meant
 /// forking the plugin.
 #[test]
 fn the_panels_keys_are_in_the_registry_and_a_user_can_rebind_them() {
@@ -5710,7 +5733,7 @@ fn the_usage_panel_opens_with_the_plan_above_the_history() {
 /// The panel's keys are the panel's keys, bound to named commands.
 ///
 /// `t` and `c` are ordinary letters. Bound at buffer-kind scope they only fire here — and because
-/// they point at named commands rather than at a `switch` inside a handler, `F1` lists them and an
+/// they point at named commands rather than at a `switch` inside a handler, `^Z` lists them and an
 /// `init.ts` can move them. See ADR 0040.
 #[test]
 fn the_usage_panel_swaps_metric_on_its_own_key() {

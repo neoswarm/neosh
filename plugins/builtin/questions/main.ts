@@ -28,7 +28,7 @@
  * have to notice. While there is something typed the numbered shortcuts go away, which is how the
  * panel says a digit is a character now. See ADR 0037.
  *
- * **Every key is a named command.** `question.accept`, `question.next` — so `F1` lists them and an
+ * **Every key is a named command.** `question.accept`, `question.next` — so `^Z` lists them and an
  * `init.ts` can move them, and a third party can bind their own against the `neosh.question` buffer
  * kind without forking this. Only the printable keys come through the raw capture, and only because
  * they are text rather than verbs. See ADR 0040.
