@@ -254,6 +254,15 @@ pub enum PluginEvent {
         session: SessionId,
         event: StreamEvent,
     },
+    /// The account's allowance changed, or was asked about and answered.
+    ///
+    /// Sent to every plugin, whatever caused it: a driver reporting mid-turn, a poll landing, a
+    /// plugin publishing its own provider's. A gauge then has one thing to listen to instead of
+    /// knowing which vendors exist — which is what makes a third-party provider's plan appear in
+    /// the sidebar strip without the sidebar being changed.
+    Quota {
+        snapshot: crate::quota::QuotaSnapshot,
+    },
     /// Stop producing events for this stream and release its resources.
     ProviderCancel {
         stream: StreamId,

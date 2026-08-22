@@ -7,6 +7,7 @@ import type { KeyContext } from "./KeyContext";
 import type { ModelSelection } from "./ModelSelection";
 import type { NodeId } from "./NodeId";
 import type { OptionValue } from "./OptionValue";
+import type { QuotaSnapshot } from "./QuotaSnapshot";
 import type { SessionId } from "./SessionId";
 import type { StopReason } from "./StopReason";
 import type { StreamEvent } from "./StreamEvent";
@@ -68,5 +69,6 @@ export type PluginEvent =
     session: SessionId;
     event: StreamEvent;
   }
+  | { "type": "quota"; snapshot: QuotaSnapshot }
   | { "type": "provider_cancel"; stream: StreamId }
   | { "type": "shutdown" };

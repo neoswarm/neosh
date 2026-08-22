@@ -23,9 +23,10 @@ use crate::provider::{
     CredentialInfo, DriverCommand, DriverKind, InstanceConfig, InstanceId, ModelEntry,
     ModelSelection, ProviderEvent,
 };
+use crate::quota::{QuotaSample, QuotaSnapshot, UsageHistory, UsageResolution};
 use crate::ui::{
-    CursorMotion, ExtmarkInfo, ExtmarkOpts, FloatConfig, HighlightDef, KeyPress, MessageLevel,
-    Rect, SurfaceCell, TextEdit, WindowLayout,
+    CursorMotion, ExtmarkInfo, ExtmarkOpts, FloatConfig, HighlightDef, KeyPress, LineDraw,
+    MessageLevel, Rect, SurfaceCell, TextEdit, WindowLayout,
 };
 use crate::vcs::{BranchInfo, CommitInfo, DiffTarget, RepoStatus, WorktreeInfo};
 
@@ -833,6 +834,68 @@ pub enum ApiCall {
     /// Machines that have asked to join, or that we found and have not added.
     SwarmStrangers,
 
+    // ---- the plan ------------------------------------------------------
+    // What the account has left, and what it has already spent. The capability is in the host
+    // because it reads credentials and other programs' transcripts; every decision about what to
+    // *draw* is a plugin's, which is why this surface is numbers and nothing else.
+    /// The latest snapshot for every instance that has one, newest fact first.
+    ///
+    /// Answers from what the host kept rather than by asking the vendor, so it costs nothing and is
+    /// safe to call on every redraw. [`QuotaSnapshot::observed_at`] is how stale each one is;
+    /// [`ApiCall::QuotaRefresh`] is how to make it less so.
+    QuotaList,
+    /// Ask the vendor now, for one instance or for every instance that can be asked.
+    ///
+    /// Answers as soon as the request is *made*, not when it lands — a poll is a network round trip
+    /// and a redraw that awaited it would be a panel that opens late. The answer arrives as
+    /// [`crate::plugin::PluginEvent::Quota`], the same way an unprompted one does, so a caller
+    /// needs one code path rather than two.
+    QuotaRefresh {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        instance: Option<InstanceId>,
+    },
+    /// Publish a snapshot for an instance this plugin's own driver serves.
+    ///
+    /// The other half of [`ApiCall::ProviderRegisterDriver`]: a provider written as a plugin knows
+    /// its own vendor's allowance and nothing in the host does. Reported this way it is kept,
+    /// sampled, broadcast and drawn exactly like a built-in one — which is the whole test, since
+    /// the built-in sources publish through the same store.
+    QuotaReport {
+        snapshot: QuotaSnapshot,
+    },
+    /// Every percentage this workspace has seen, so a gauge can be a line.
+    ///
+    /// Bounded by time rather than by count: the interesting window is "this reset period", and a
+    /// caller that asked for the last N samples would get a different span depending on how long
+    /// neosh happened to be running.
+    QuotaHistory {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        instance: Option<InstanceId>,
+        /// Unix seconds, inclusive.
+        #[ts(type = "number")]
+        since: i64,
+        /// Unix seconds, exclusive.
+        #[ts(type = "number")]
+        until: i64,
+    },
+    /// Tokens and their money-equivalent over a span, read out of the vendor CLIs' own transcripts.
+    ///
+    /// Not from neosh's conversations: a turn run in `claude` directly spent the same allowance and
+    /// a history that could not see it would be answering a different question from the one asked.
+    /// Expensive — it reads files — so it is a call a panel makes when it opens, never a redraw.
+    UsageHistory {
+        /// Unix seconds, inclusive.
+        #[ts(type = "number")]
+        since: i64,
+        /// Unix seconds, exclusive.
+        #[ts(type = "number")]
+        until: i64,
+        resolution: UsageResolution,
+        /// IANA zone to bucket days in. An offset is wrong for any span crossing a DST boundary.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        time_zone: Option<String>,
+    },
+
     // ---- runtime path --------------------------------------------------
     /// Add a directory to search for plugins.
     ///
@@ -1048,6 +1111,10 @@ pub enum ApiOk {
     SwarmNodes { nodes: Vec<SwarmNode> },
     SwarmAgents { agents: Vec<SwarmAgent> },
     SwarmStrangers { strangers: Vec<SwarmStranger> },
+    // ---- the plan ----
+    Quotas { quotas: Vec<QuotaSnapshot> },
+    QuotaHistory { samples: Vec<QuotaSample> },
+    UsageHistory { history: UsageHistory },
 }
 
 /// An image the composer is holding, as far as anything outside the host is concerned.

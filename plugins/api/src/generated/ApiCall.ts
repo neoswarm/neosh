@@ -24,6 +24,7 @@ import type { OptionValue } from "./OptionValue";
 import type { PermissionMode } from "./PermissionMode";
 import type { ProjectKey } from "./ProjectKey";
 import type { ProviderEvent } from "./ProviderEvent";
+import type { QuotaSnapshot } from "./QuotaSnapshot";
 import type { Rect } from "./Rect";
 import type { SessionId } from "./SessionId";
 import type { StatusSegment } from "./StatusSegment";
@@ -32,6 +33,8 @@ import type { SurfaceCell } from "./SurfaceCell";
 import type { SurfaceId } from "./SurfaceId";
 import type { TextEdit } from "./TextEdit";
 import type { ToolDef } from "./ToolDef";
+import type { UsageResolution } from "./UsageResolution";
+import type { UserQuestion } from "./UserQuestion";
 import type { VarScope } from "./VarScope";
 import type { WindowId } from "./WindowId";
 import type { WindowLayout } from "./WindowLayout";
@@ -292,6 +295,37 @@ export type ApiCall =
   | { "call": "swarm_pair"; node: NodeId; name: string; addr?: string | null }
   | { "call": "swarm_unpair"; node: NodeId }
   | { "call": "swarm_strangers" }
+  | { "call": "quota_list" }
+  | { "call": "quota_refresh"; instance?: InstanceId | null }
+  | { "call": "quota_report"; snapshot: QuotaSnapshot }
+  | {
+    "call": "quota_history";
+    instance?: InstanceId | null;
+    /**
+     * Unix seconds, inclusive.
+     */
+    since: number;
+    /**
+     * Unix seconds, exclusive.
+     */
+    until: number;
+  }
+  | {
+    "call": "usage_history";
+    /**
+     * Unix seconds, inclusive.
+     */
+    since: number;
+    /**
+     * Unix seconds, exclusive.
+     */
+    until: number;
+    resolution: UsageResolution;
+    /**
+     * IANA zone to bucket days in. An offset is wrong for any span crossing a DST boundary.
+     */
+    time_zone?: string | null;
+  }
   | { "call": "rtp_add"; path: string }
   | { "call": "rtp_list" }
   | { "call": "path_complete"; prefix: string }
