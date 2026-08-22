@@ -1,5 +1,8 @@
 <div class="stage">
-  <img class="stage-bg" src="/hero-bg.jpg" alt="" width="1683" height="935" fetchpriority="high" decoding="async" />
+  <picture>
+    <source type="image/webp" srcset="/hero-bg-800.webp 800w, /hero-bg-1600.webp 1600w" sizes="(max-width: 900px) 100vw, 1520px" />
+    <img class="stage-bg" src="/hero-bg-1600.jpg" alt="" width="1600" height="889" fetchpriority="high" decoding="async" />
+  </picture>
   <div class="term" id="neosh-demo" aria-hidden="true">
     <div class="term-bar">
       <span class="dot red"></span>
@@ -13,18 +16,20 @@
       <aside class="side">
         <div class="srow"><span class="t hd"> PROJECTS</span></div>
         <div class="srow"><span class="t sep">──────────────────────────────────</span></div>
-        <div class="srow"><span class="t"> <span class="fav">★</span> <span class="acc">▾ neosh</span></span><span class="r" id="sb-proj-r"><span class="cmt">4</span></span></div>
-        <div class="srow"><span class="t acc">    ▾ ⎇ glad-sparrow</span><span class="r" id="sb-wt-r"><span class="cmt">1</span></span></div>
-        <div class="srow"><span class="t">      <span class="g" id="sb-glyph"><span class="acc">▸</span></span> <span id="sb-title" class="acc">make the flaky test…</span></span><span class="r" id="sb-sess-r"><span class="cmt">now</span></span></div>
+        <div class="srow"><span class="t"> <span class="fav">★</span> <span class="acc">▾ neosh</span></span><span class="r" id="sb-proj-r"><span class="cmt">6</span></span></div>
+        <div class="srow"><span class="t acc">    ▾ ⎇ glad-sparrow</span><span class="r" id="sb-wt-r"><span class="cmt">2</span></span></div>
+        <div class="srow" id="sb-row-s1"><span class="t">      <span class="g" id="sb-glyph"><span class="acc">▸</span></span> <span id="sb-title" class="acc">make the flaky test…</span></span><span class="r" id="sb-sess-r"><span class="cmt">now</span></span></div>
+        <div class="srow" id="sb-row-s2"><span class="t">      <span class="g" id="sb-s2-glyph"><span class="live-dim">◍</span></span> <span id="sb-s2-title" class="live-dim">speed up startup…</span></span><span class="r"><span class="live-fg" id="sb-bench-r">8m 02s</span></span></div>
         <div class="srow"><span class="t cmt">    ▸ <span class="acc">⎇ </span>fix/ascp-vectors<span class="unread"> ●</span></span><span class="r"><span class="cmt">2</span></span></div>
         <div class="srow"><span class="t unread">    ● website copy pass</span><span class="r"><span class="unread">12h</span></span></div>
-        <div class="srow"><span class="t">      <span class="live-dim">◍</span> speed up startup…</span><span class="r"><span class="live-fg" id="sb-bench-r">8m 02s</span></span></div>
+        <div class="srow"><span class="t cmt">      rethink the palette keys</span><span class="r"><span class="cmt">3d</span></span></div>
         <div class="srow"><span class="t cmt">   ▾ dotfiles</span><span class="r"><span class="cmt">1</span></span></div>
         <div class="srow"><span class="t">      tidy the zshrc aliases</span><span class="r"><span class="cmt">36h</span></span></div>
         <div class="srow"><span class="t cmt">   ▸ blog</span><span class="r"><span class="live-fg" id="sb-blog-r">4m 40s</span></span></div>
+        <div class="srow"><span class="t cmt">   ▸ infra</span><span class="r"><span class="cmt">3</span></span></div>
         <div class="srow"><span class="t"> </span></div>
         <div class="srow"><span class="t acc">   + Add project</span></div>
-        <div class="srow"><span class="t cmt">   ┈ Archived</span><span class="r"><span class="cmt">10</span></span></div>
+        <div class="srow"><span class="t cmt">   ┈ Archived</span><span class="r"><span class="cmt">23</span></span></div>
         <div class="side-fill"></div>
         <div class="srow"><span class="t"> </span></div>
         <div class="srow"><span class="t hd"> PLAN</span><span class="r"><span class="cmt">^L</span></span></div>
@@ -48,7 +53,7 @@
         </div>
         <div class="term-status">
           <span class="t"><span class="cmt"> <span id="st-mode">chat</span>  </span><span class="ok">full access</span><span class="cmt"> </span><span class="key">⇧⇥</span><span class="cmt">  </span><span class="warn">glad-sparrow ●2</span><span class="cmt">  ██░░░░░░ 22% of 1.0M  ↑12.4k ↓3.1k</span></span>
-          <span class="r"><span id="st-turn" class="hidden"><span class="spin" data-spin>⠋</span><span class="live-fg"> </span><span class="live-fg elapsed">0s</span><span>  </span></span><span class="acc">claude-fable-5</span><span> </span><span class="key">^P</span><span class="cmt">  High 1M </span><span class="key">^E</span><span> </span></span>
+          <span class="r"><span id="st-turn" class="hidden"><span class="spin blue" data-spin>⠋</span><span class="live-fg"> </span><span id="st-elapsed" class="live-fg elapsed">0s</span><span>  </span></span><span class="acc">claude-fable-5</span><span> </span><span class="key">^P</span><span class="cmt">  High 1M </span><span class="key">^E</span><span> </span></span>
         </div>
       </div>
     </div>
@@ -103,7 +108,9 @@
     border-radius: 8px;
     overflow: hidden;
     padding: clamp(24px, 5vw, 76px);
-    background: #22211d;
+    /* a 358-byte thumbnail of the backdrop, painted before any request: the
+       real image swaps in over the same picture, never over a flat colour */
+    background: #22211d url("data:image/jpeg;base64,/9j/2wBDABQUFBQVFBcZGRcfIh4iHy4rJycrLkYyNjI2MkZqQk5CQk5Cal5yXVZdcl6phXZ2hanDpJukw+zT0+z/////////2wBDARQUFBQVFBcZGRcfIh4iHy4rJycrLkYyNjI2MkZqQk5CQk5Cal5yXVZdcl6phXZ2hanDpJukw+zT0+z/////////wgARCAANABgDASIAAhEBAxEB/8QAGAAAAgMAAAAAAAAAAAAAAAAAAAQDBQb/xAAVAQEBAAAAAAAAAAAAAAAAAAAAAf/aAAwDAQACEAMQAAAAz06VgAuR/8QAGxAAAgIDAQAAAAAAAAAAAAAAAQIAEQMSITH/2gAIAQEAAT8AUbeRcRMONBdsLmPYHjERF2HWMdaJ7P/EABURAQEAAAAAAAAAAAAAAAAAAAEQ/9oACAECAQE/AGf/xAAUEQEAAAAAAAAAAAAAAAAAAAAQ/9oACAEDAQE/AD//2Q==") center / cover no-repeat;
     user-select: none;
     -webkit-user-select: none;
   }
@@ -363,6 +370,13 @@
     50% { opacity: 1; }
   }
 
+  /* pulseBright(): 1s bright, 1s dim — two states, never a ramp */
+  .stage .pulse-work { animation: neosh-pulse-work 2s steps(1) infinite; }
+  @keyframes neosh-pulse-work {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.55; }
+  }
+
   /* composer */
   .stage .crule { color: var(--faint); opacity: 0.62; }
   .stage .prompt { color: var(--accent);  }
@@ -443,6 +457,7 @@
     .stage .live-subj,
     .stage .landed,
     .stage .pulse,
+    .stage .pulse-work,
     .stage .caret { animation: none; }
   }
 </style>
@@ -454,11 +469,17 @@
   const ph = document.getElementById("ph")!;
   const stTurn = document.getElementById("st-turn")!;
   const stMode = document.getElementById("st-mode")!;
+  const stElapsed = document.getElementById("st-elapsed")!;
   const hud = document.getElementById("hud")!;
   const sbGlyph = document.getElementById("sb-glyph")!;
+  const sbTitle = document.getElementById("sb-title")!;
   const sbProjR = document.getElementById("sb-proj-r")!;
   const sbWtR = document.getElementById("sb-wt-r")!;
   const sbSessR = document.getElementById("sb-sess-r")!;
+  const sbRowS1 = document.getElementById("sb-row-s1")!;
+  const sbRowS2 = document.getElementById("sb-row-s2")!;
+  const sbS2Glyph = document.getElementById("sb-s2-glyph")!;
+  const sbS2Title = document.getElementById("sb-s2-title")!;
 
   const reduced = matchMedia("(prefers-reduced-motion: reduce)").matches;
   const BRAILLE = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
@@ -599,6 +620,11 @@
     el?.classList.add("cursor");
   }
 
+  function panelCursor(el: HTMLElement | null) {
+    document.querySelectorAll("#neosh-demo .side .srow.cursor").forEach((r) => r.classList.remove("cursor"));
+    el?.classList.add("cursor");
+  }
+
   // the rest of the workspace keeps working: two other conversations, elapsed
   // clocks running, whatever conversation the demo is in
   const benchR = document.getElementById("sb-bench-r")!;
@@ -607,8 +633,10 @@
   if (!reduced) {
     setInterval(() => {
       const t = Date.now() - parallelStart;
-      benchR.textContent = fmtElapsed(t + 8 * 60_000 + 2000);
+      const benchText = fmtElapsed(t + 8 * 60_000 + 2000);
+      benchR.textContent = benchText;
       blogR.textContent = fmtElapsed(t + 4 * 60_000 + 40_000);
+      document.querySelectorAll("[data-bench-elapsed]").forEach((el) => (el.textContent = benchText));
     }, 1000);
   }
 
@@ -623,9 +651,11 @@
     ph.classList.remove("hidden");
   }
 
+  // the row you are in pulses while it works: pulseBright() alternates
+  // Status.Working and Status.Monitoring in the real sidebar
   function sidebarBusy() {
-    sbGlyph.innerHTML = '<span class="live-fg" data-spin-side>⠋</span>';
-    document.getElementById("sb-title")!.className = "live-fg";
+    sbGlyph.innerHTML = '<span class="live-fg pulse-work" data-spin-side>⠋</span>';
+    sbTitle.className = "live-fg pulse-work";
     sbProjR.innerHTML = '<span class="live-fg elapsed">0s</span>';
     sbWtR.innerHTML = '<span class="live-fg elapsed">0s</span>';
     sbSessR.innerHTML = '<span class="live-fg elapsed">0s</span>';
@@ -633,10 +663,29 @@
 
   function sidebarIdle() {
     sbGlyph.innerHTML = '<span class="acc">▸</span>';
-    document.getElementById("sb-title")!.className = "acc";
-    sbProjR.innerHTML = '<span class="cmt">3</span>';
-    sbWtR.innerHTML = '<span class="cmt">1</span>';
+    sbTitle.className = "acc";
+    sbProjR.innerHTML = '<span class="cmt">6</span>';
+    sbWtR.innerHTML = '<span class="cmt">2</span>';
     sbSessR.innerHTML = '<span class="cmt">now</span>';
+  }
+
+  // The row you are in is the only one whose glyph spins (`spinnerFrame()` vs
+  // `◍` in the real sidebar); a running row you are elsewhere for is the same
+  // blue, dimmed — Status.Working over Status.Monitoring, active in both.
+  function s2Active(on: boolean) {
+    sbS2Glyph.innerHTML = on
+      ? '<span class="live-fg pulse-work" data-spin-side>⠋</span>'
+      : '<span class="live-dim">◍</span>';
+    sbS2Title.className = on ? "live-fg pulse-work" : "live-dim";
+  }
+
+  // a turn that ends off screen goes unread: amber, still, until you arrive
+  function sidebarUnread() {
+    sbGlyph.innerHTML = '<span class="unread">●</span>';
+    sbTitle.className = "unread";
+    sbProjR.innerHTML = '<span class="cmt">6</span>';
+    sbWtR.innerHTML = '<span class="cmt">2</span>';
+    sbSessR.innerHTML = '<span class="unread">now</span>';
   }
 
   function turnOn() {
@@ -653,8 +702,101 @@
     if (turnTimer) clearInterval(turnTimer);
   }
 
+  // Switching sessions swaps what the one chat surface shows. The nodes keep
+  // living either way — a turn in a stashed transcript keeps finishing.
+  function stashChat(): ChildNode[] {
+    const nodes = [...chat.childNodes];
+    chat.textContent = "";
+    return nodes;
+  }
+
+  function restoreChat(nodes: ChildNode[]) {
+    chat.textContent = "";
+    for (const n of nodes) {
+      (n as HTMLElement).classList?.remove("landed"); // reattaching is a redraw, and a redraw never flashes
+      chat.appendChild(n);
+    }
+  }
+
+  // the other conversation in this worktree: 8 minutes into its own turn
+  function renderS2() {
+    add('<span class="ubar">▌</span> the workspace takes three seconds to attach, find out why');
+    blank();
+    add(
+      '<span class="spin"> </span> <span class="v-read">Read</span>  <span class="cmt">daemon.rs, client.rs and 3 more</span>  <span class="cmt">5 files</span>',
+    );
+    add(
+      '<span class="spin"> </span> <span class="v-run">Ran</span>  <span class="cmt">cargo build --release</span>  <span class="cmt">41s</span>',
+    );
+    add('<span class="cmt">  └ Finished `release` profile [optimized] in 40.9s</span>');
+    const bench = card("v-run", "Ran", "hyperfine ./target/release/neosh --attach");
+    working = row(
+      '<span class="live-subj">✳ Benchmarking…</span><span class="cmt">  <span class="live-fg" data-bench-elapsed>8m 10s</span>  ·  esc to interrupt</span>',
+    );
+    chat.appendChild(working);
+    return bench;
+  }
+
+  // in the second conversation, the status line clocks that turn, not ours
+  function statusBench() {
+    stTurn.classList.remove("hidden");
+    stElapsed.classList.remove("elapsed");
+    stElapsed.setAttribute("data-bench-elapsed", "");
+  }
+
+  function statusOwn() {
+    stElapsed.classList.add("elapsed");
+    stElapsed.removeAttribute("data-bench-elapsed");
+  }
+
+  // the first conversation's turn ends while we are elsewhere: the rerun
+  // passes, the answer streams into the stashed transcript, and the sidebar
+  // row goes amber — news until you go and look
+  function finishS1(
+    nodes: ChildNode[],
+    s1Working: HTMLElement,
+    pass: { el: HTMLElement; done: (tails: string[], failed?: boolean) => void },
+  ) {
+    pass.done(['<span class="cmt">8.2s</span>']);
+    const i = nodes.indexOf(s1Working);
+    if (i >= 0) nodes.splice(i, 1);
+    const a2 = row("");
+    a2.innerHTML =
+      '<span class="co">delay</span> takes a <span class="co">Clock</span> now, and the test hands it a fake one.';
+    const sum = row('<span class="cmt">  changed 1 file  </span><span class="ok">+2</span> <span class="dl">-2</span>');
+    nodes.push(
+      row('<span class="cmt">  └ running 418 tests</span>'),
+      row('<span class="cmt">    … +416 lines (^S ⇥ to expand)</span>'),
+      row('<span class="cmt">    test retry::backs_off_between_attempts ... ok</span>'),
+      row('<span class="cmt">    test result: ok. 418 passed; 0 failed</span>'),
+      row("&nbsp;"),
+      row("The retry loop read the wall clock, so the test raced it."),
+      a2,
+      row("&nbsp;"),
+      sum,
+      row('<span class="cmt">    crates/neosh-core/src/retry.rs  </span><span class="ok">+2</span> <span class="dl">-2</span>'),
+    );
+    if (turnTimer) clearInterval(turnTimer);
+    sidebarUnread();
+    return sum;
+  }
+
+  function resetAll() {
+    removeWorking();
+    if (turnTimer) clearInterval(turnTimer);
+    stTurn.classList.add("hidden");
+    statusOwn();
+    stMode.textContent = "chat";
+    sidebarIdle();
+    s2Active(false);
+    panelCursor(null);
+    cursorTo(null);
+    caret.classList.remove("hidden");
+  }
+
   async function play() {
-    chat.innerHTML = "";
+    resetAll();
+    chat.textContent = "";
     welcome();
 
     await sleep(1200);
@@ -697,45 +839,62 @@
     ];
     await sleep(800);
 
-    // the run that passes
+    // the rerun goes out — and we leave before it comes back
     const pass = card("v-run", "Ran", "cargo test -p neosh-core");
-    await sleep(1800);
-    pass.done(['<span class="cmt">8.2s</span>']);
-    out("running 418 tests", false, true);
-    elision(416);
-    out("test retry::backs_off_between_attempts ... ok");
-    out("test result: ok. 418 passed; 0 failed");
-    await sleep(600);
+    showWorking("Testing");
+    await sleep(1400);
 
-    // the answer streams in above the working line
-    blank();
-    const a1 = add("");
-    const line1 = "The retry loop read the wall clock, so the test raced it.";
-    for (let i = 0; i <= line1.length; i += 3) {
-      a1.textContent = line1.slice(0, i);
-      await sleep(28);
-    }
-    a1.textContent = line1;
-    const a2 = add("");
-    const line2 = ["delay", " takes a ", "Clock", " now, and the test hands it a fake one."];
-    a2.innerHTML = `<span class="co">${line2[0]}</span>${line2[1]}<span class="co">${line2[2]}</span>`;
-    const tail = a2.appendChild(document.createElement("span"));
-    for (let i = 0; i <= line2[3].length; i += 3) {
-      tail.textContent = line2[3].slice(0, i);
-      await sleep(28);
-    }
-    tail.textContent = line2[3];
+    // switching is never refused: the turn keeps running where it is
+    caret.classList.add("hidden");
+    press("^T", "projects");
+    panelCursor(sbRowS1);
+    await sleep(900);
+    press("j");
+    panelCursor(sbRowS2);
+    await sleep(800);
+    press("⏎", "open");
+    panelCursor(null);
+    const s1Working = working!;
+    working = null;
+    const s1Nodes = stashChat();
+    s2Active(true);
+    sbGlyph.innerHTML = '<span class="live-dim">◍</span>';
+    sbTitle.className = "live-dim";
+    const bench = renderS2();
+    statusBench();
+    caret.classList.remove("hidden");
+    await sleep(1700);
 
-    removeWorking();
-    turnOff();
-    blank();
-    const sumRow = add('<span class="cmt">  changed 1 file  </span><span class="ok">+2</span> <span class="dl">-2</span>');
-    add('<span class="cmt">    crates/neosh-core/src/retry.rs  </span><span class="ok">+2</span> <span class="dl">-2</span>');
+    // this conversation is mid-turn too, on its own clock
+    bench.done(['<span class="cmt">14 runs</span>', '<span class="cmt">6.1 ms ± 0.2 ms</span>']);
+    await sleep(900);
+
+    // meanwhile the first conversation finishes, off screen
+    const sumRow = finishS1(s1Nodes, s1Working, pass);
+    await sleep(1900);
+
+    // amber means news: go and look, and arriving clears it
+    caret.classList.add("hidden");
+    press("^T", "projects");
+    panelCursor(sbRowS2);
+    await sleep(800);
+    press("k");
+    panelCursor(sbRowS1);
+    await sleep(700);
+    press("⏎", "open");
+    panelCursor(null);
+    working = null;
+    s2Active(false);
+    restoreChat(s1Nodes);
+    sidebarIdle();
+    stTurn.classList.add("hidden");
+    statusOwn();
+    caret.classList.remove("hidden");
 
     if (reduced) return;
+    await sleep(1600);
 
     // then read what came back: ^S is a mode, and a mode's keys are the mode's keys
-    await sleep(1600);
     caret.classList.add("hidden");
     press("^S", "read the transcript");
     stMode.textContent = "normal";
@@ -773,30 +932,6 @@
     stMode.textContent = "chat";
     for (const r of [edit.el, diffRows[0], diffRows[1]]) r.classList.remove("vsel");
     cursorTo(null);
-    caret.classList.remove("hidden");
-
-    // and the projects panel is a list you move in too
-    await sleep(1400);
-    const srows = document.querySelectorAll<HTMLElement>("#neosh-demo .side .srow");
-    const hop = (i: number) => {
-      document.querySelectorAll("#neosh-demo .side .srow.cursor").forEach((r) => r.classList.remove("cursor"));
-      srows[i]?.classList.add("cursor");
-    };
-    caret.classList.add("hidden");
-    press("^T", "projects");
-    hop(4);
-    await sleep(900);
-    press("j");
-    hop(5);
-    await sleep(550);
-    press("j");
-    hop(6);
-    await sleep(550);
-    press("j");
-    hop(7);
-    await sleep(1000);
-    press("esc", "back to the composer");
-    document.querySelectorAll("#neosh-demo .side .srow.cursor").forEach((r) => r.classList.remove("cursor"));
     caret.classList.remove("hidden");
 
     await sleep(4200);
