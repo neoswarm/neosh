@@ -751,7 +751,7 @@ pub enum ApiCall {
     // write and invokes commands it has never heard of, and neither side imports the other.
     //
     // It is deliberately data rather than a callback. A contribution survives being listed by the
-    // palette, described in `F1`, and disabled by the user, none of which is possible for a
+    // palette, described in `^Z`, and disabled by the user, none of which is possible for a
     // function pointer held inside somebody's closure.
     /// Add an item to a point, replacing whatever this plugin had put there under the same `id`.
     ExtContribute {
@@ -1209,7 +1209,7 @@ pub struct AttachmentInfo {
 #[ts(export)]
 pub struct StatusSegment {
     pub text: String,
-    /// The key that changes this, written the way the user would press it — `^P`, `F1`.
+    /// The key that changes this, written the way the user would press it — `^P`, `^Z`.
     ///
     /// Beside what it acts on rather than in a list of its own, because a key is only memorable
     /// once you have seen it next to the thing it does. A separate legend is a second place to

@@ -972,7 +972,7 @@ export interface SessionApi {
  * built from what is actually registered right now, so a plugin that is switched off takes its
  * shortcut with it rather than leaving a key advertised that no longer does anything.
  *
- * Write the key the way the user would press it — `^P`, `⇧⏎`, `F1` — not the way a keymap spells
+ * Write the key the way the user would press it — `^P`, `⇧⏎`, `^Z` — not the way a keymap spells
  * it. Hints are dropped from the end when the terminal is too narrow, so put the one you would
  * most want seen at the lowest priority.
  */
@@ -989,7 +989,7 @@ export interface PermissionApi {
 export interface StatusApi {
   /**
    * `keys` is drawn immediately after `text`, dimmed — the key that changes this thing, beside the
-   * thing it changes. Write it the way the user would press it (`^P`, `F1`), not the way a keymap
+   * thing it changes. Write it the way the user would press it (`^P`, `^Z`), not the way a keymap
    * spells it.
    */
   set(
@@ -1102,7 +1102,7 @@ export function sessionScope(session: SessionId): VarScope {
  * it has never heard of, and neither side imports the other.
  *
  * Data rather than a callback on purpose. A contribution can be listed by the palette, described in
- * `F1` and disabled by the user, none of which is possible for a function held inside your closure.
+ * `^Z` and disabled by the user, none of which is possible for a function held inside your closure.
  *
  * Your contributions are withdrawn when your plugin unloads, so `plugins.disabled` takes your rows
  * with it and there is no way to leave a row behind pointing at a command that no longer exists.
