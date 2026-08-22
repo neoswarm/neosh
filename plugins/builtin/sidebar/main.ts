@@ -1147,10 +1147,11 @@ async function newConversation(neosh: Neosh, base?: string): Promise<void> {
   // nowhere. Offering an action that cannot happen is worse than not offering it.
   const commands = new Set((await neosh.cmd.list().catch(() => [])).map((c) => c.name));
   const canBranch = trees.length > 0 && commands.has("git.worktree.new.auto");
+  const canInside = trees.length > 0 && commands.has("git.worktree.new.inside");
   const canName = trees.length > 0 && commands.has("git.worktree.new");
   const others = trees.filter((t) => t.path !== here);
 
-  if (!canBranch && !canName && others.length === 0) {
+  if (!canBranch && !canInside && !canName && others.length === 0) {
     await neosh.session.create(here ? { cwd: here } : undefined);
     return;
   }
@@ -1158,6 +1159,7 @@ async function newConversation(neosh: Neosh, base?: string): Promise<void> {
   type Where =
     | { kind: "here" }
     | { kind: "scratch" }
+    | { kind: "inside" }
     | { kind: "new" }
     | { kind: "elsewhere" }
     | { kind: "tree"; path: string; label: string }
@@ -1183,6 +1185,24 @@ async function newConversation(neosh: Neosh, base?: string): Promise<void> {
       icon: "+",
       hl: "Diagnostic.Ok",
       value: { kind: "scratch" },
+    });
+  }
+  if (canInside) {
+    // Where it will land, said in the row: a choice between two places is only a choice if both
+    // rows name theirs. A relative `worktree.root` renames this directory, so it is read rather
+    // than assumed.
+    const configured = ((await neosh.opt.get<string>("worktree.root").catch(() => "")) ?? "")
+      .trim();
+    const dir = configured !== "" && !configured.startsWith("/")
+      ? configured.replace(/\/+$/, "")
+      : ".worktrees";
+    rows.push({
+      label: "In a new worktree, in this project",
+      detail: `kept in ${dir}/ — travels with the repository`,
+      keywords: "branch worktree inside project local",
+      icon: "⌂",
+      hl: "Accent",
+      value: { kind: "inside" },
     });
   }
   if (canName) {
@@ -1249,6 +1269,10 @@ async function newConversation(neosh: Neosh, base?: string): Promise<void> {
       return;
     case "scratch":
       await neosh.cmd.exec("git.worktree.new.auto", at)
+        .catch((e: unknown) => neosh.notify(String(e), "warn"));
+      return;
+    case "inside":
+      await neosh.cmd.exec("git.worktree.new.inside", at)
         .catch((e: unknown) => neosh.notify(String(e), "warn"));
       return;
     case "new":
@@ -2496,12 +2520,26 @@ function worktreeRow(
   const mark = unseen === 0 ? "" : unseen === 1
     ? opts.ascii ? " !" : " ●"
     : opts.ascii ? ` !${unseen}` : ` ●${unseen}`;
-  const name = clip(p.name, Math.max(6, opts.width - 10 - byteLength(mark)));
-  const from = byteLength(`     ${arrow} ${name}`);
+  // The branch glyph, in the branch colour — what says "this row is a checkout" at a glance, so
+  // the name can be just the branch. No ASCII stand-in earns its column, so ASCII goes without.
+  const glyph = opts.ascii ? "" : "⎇ ";
+  const name = clip(
+    p.name,
+    Math.max(6, opts.width - 10 - byteLength(glyph) - byteLength(mark)),
+  );
+  const spans: Array<{ from: number; to: number; hl: string }> = [];
+  if (glyph !== "") {
+    const at = byteLength(`     ${arrow} `);
+    spans.push({ from: at, to: at + byteLength(glyph), hl: "Git.Branch" });
+  }
+  if (mark !== "") {
+    const at = byteLength(`     ${arrow} ${glyph}${name}`);
+    spans.push({ from: at, to: at + byteLength(mark), hl: "Status.Unread" });
+  }
   return {
-    text: `     ${arrow} ${name}${mark}`,
+    text: `     ${arrow} ${glyph}${name}${mark}`,
     hl: here ? "Directory" : "Sidebar.Dim",
-    spans: mark === "" ? undefined : [{ from, to: from + byteLength(mark), hl: "Status.Unread" }],
+    spans: spans.length > 0 ? spans : undefined,
     right,
     value: { kind: "project", cwd: p.cwd },
   };

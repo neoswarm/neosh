@@ -120,6 +120,11 @@ export async function activate({ neosh, subscriptions }: PluginContext) {
       (args: string[]) => newWorktree(neosh, { cwd: arg(args, 0), auto: true }),
       "A worktree on a branch named for you, with nothing to answer — `git.worktree.new.auto [cwd]`",
     ],
+    [
+      "git.worktree.new.inside",
+      (args: string[]) => newWorktree(neosh, { cwd: arg(args, 0), auto: true, inside: true }),
+      "A worktree kept inside the repository, on a branch named for you — `git.worktree.new.inside [cwd]`",
+    ],
     ["git.worktree.remove", () => removeWorktree(neosh), "Remove a worktree"],
   ];
   for (const [name, fn, desc] of cmds) {
@@ -583,6 +588,15 @@ interface WorktreeSpec {
   cwd?: string;
   /** Name it rather than ask. See {@link scratchName}. */
   auto?: boolean;
+  /**
+   * Inside the repository, whatever `worktree.root` says.
+   *
+   * The per-call form of a relative root: the picker offers "in this project" as a *choice*, and a
+   * choice that only works after editing config.toml is a row that lies to everyone who has not.
+   * A relative `worktree.root` still names the directory; absent one, `.worktrees` is the word
+   * every tool that does this has already agreed on.
+   */
+  inside?: boolean;
 }
 
 /**
@@ -621,7 +635,7 @@ async function newWorktree(neosh: Neosh, spec: WorktreeSpec = {}): Promise<void>
       : await prompt(neosh, "Branch for the new worktree", { width: 70 }));
   if (!asked || !asked.trim()) return;
   const name = slug(asked);
-  const where = (spec.path ?? (await worktreePath(neosh, root, name))).trim();
+  const where = (spec.path ?? (await worktreePath(neosh, root, name, spec.inside))).trim();
   if (where === "") return;
 
   const create = !taken.has(name);
@@ -709,13 +723,27 @@ const SCRATCH_NOUNS = [
  * Slashes in a branch become dashes: `feat/thing` is one directory, not two, because the directory
  * is a name and not a path.
  */
-async function worktreePath(neosh: Neosh, repoRoot: string, branch: string): Promise<string> {
+async function worktreePath(
+  neosh: Neosh,
+  repoRoot: string,
+  branch: string,
+  inside = false,
+): Promise<string> {
   const leaf = branch.replace(/\//g, "-");
   const repoName = repoRoot.split("/").filter(Boolean).pop() ?? "repo";
   const configured = ((await neosh.opt.get<string>("worktree.root")) ?? "").trim();
+  // Asked to stay inside regardless of what is configured. A relative root still names the
+  // directory; anything else falls back to the conventional one.
+  if (inside) return `${repoRoot}/${insideDir(configured)}/${leaf}`;
   if (configured === "") return `${parentOf(repoRoot)}/${repoName}-worktrees/${leaf}`;
   if (configured.startsWith("/")) return `${configured}/${repoName}/${leaf}`;
   return `${repoRoot}/${configured}/${leaf}`;
+}
+
+/** The in-repository directory worktrees go in: a relative `worktree.root`, else `.worktrees`. */
+function insideDir(configured: string): string {
+  const c = configured.trim();
+  return c !== "" && !c.startsWith("/") ? c.replace(/\/+$/, "") : ".worktrees";
 }
 
 async function removeWorktree(neosh: Neosh): Promise<void> {

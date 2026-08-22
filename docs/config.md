@@ -156,13 +156,20 @@ conversations in one worktree as you like; `n` on its row is how a second one st
 ```
 New conversation
 >
-❯ ● Here                       /home/you/work/project
-  + In a new worktree          a clean branch, named for you, nothing to answer
-  + In a new worktree, named…  a branch of its own, checked out somewhere else
-  ⎇ fix/thing                  worktree  ·  ~/.nsh/project/fix-thing
-  → api                        on studio  ·  /home/you/work/api
-  … Another directory…         somewhere else entirely
+❯ ● Here                                 /home/you/work/project
+  + In a new worktree                    a clean branch, named for you, nothing to answer
+  ⌂ In a new worktree, in this project   kept in .worktrees/ — travels with the repository
+  + In a new worktree, named…            a branch of its own, checked out somewhere else
+  ⎇ fix/thing                            worktree  ·  ~/.nsh/project/fix-thing
+  → api                                  on studio  ·  /home/you/work/api
+  … Another directory…                   somewhere else entirely
 ```
+
+The in-project row is `git.worktree.new.inside` — a branch named for you, kept at
+`<repo>/.worktrees/<branch>` (or wherever a relative `worktree.root` points) with the exclude
+entry written, no configuration needed. It is the same thing a relative `worktree.root` makes
+`In a new worktree` do; the row exists so the choice is visible before you have configured
+anything.
 
 `Here` is selected, so `^N ⏎` is what `^N` always did. Outside a git repository the question has
 one answer and is not asked at all — `^N` stays a single key everywhere the choice would be

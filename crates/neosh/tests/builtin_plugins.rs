@@ -1976,6 +1976,45 @@ fn a_new_conversation_in_a_repository_offers_a_worktree() {
     let rows = s.picker_named("[New conversation]");
     assert!(rows.iter().any(|l| l.contains("Here")), "the default\n{rows:?}");
     assert!(rows.iter().any(|l| l.contains("new worktree")), "and the other one\n{rows:?}");
+    // The in-project variant is a visible row, not a setting you have to know about: a choice
+    // that only exists after editing config.toml is a choice nobody discovers.
+    assert!(
+        rows.iter().any(|l| l.contains("in this project")),
+        "and the one that stays in the repository\n{rows:?}"
+    );
+}
+
+/// The picker's in-project row works with nothing configured: the tree lands in `.worktrees/`
+/// and the exclude entry keeps it out of `git status` — no `worktree.root` edit required.
+#[test]
+fn a_worktree_inside_the_project_needs_no_configuration() {
+    let sb = Sandbox::new("wtinsidecmd");
+    sb.git_init();
+    let mut s = sb.start();
+    s.wait_for("PROJECTS");
+
+    s.send(&command("git.worktree.new.inside"));
+
+    let under = sb.work().join(".worktrees");
+    assert!(
+        s.pump(|_| std::fs::read_dir(&under).is_ok_and(|d| d.count() > 0)),
+        "a worktree appeared under {} with nothing asked and nothing configured",
+        under.display()
+    );
+    let made = std::fs::read_dir(&under)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .next()
+        .expect("one worktree");
+    let exclude = sb.work().join(".git/info/exclude");
+    let want = format!("/.worktrees/{made}/");
+    assert!(
+        s.pump(|_| std::fs::read_to_string(&exclude)
+            .is_ok_and(|t| t.lines().any(|l| l.trim() == want))),
+        "and .git/info/exclude keeps it out of git status\n{:?}",
+        std::fs::read_to_string(&exclude)
+    );
 }
 
 #[test]
