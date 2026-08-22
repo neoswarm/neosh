@@ -66,6 +66,18 @@ per decision, and records the *reasoning*, not the choice.
   key in a panel is an ordinary binding pointed at a named command, so `F1` lists it and `init.ts`
   can move it; a `switch` on `KeyContext` inside a plugin is the thing this replaced. Keep the
   capture, but only as a sink for keys nothing claimed. See ADR 0040.
+- **A panel you are in the middle of using has the keyboard.** `FloatConfig::modal` takes
+  `KeymapScope::Global` out of the chain, and a key nothing claimed is swallowed rather than reaching
+  the composer behind the float. Shadowing the keys a widget wants is the other half and not a
+  substitute: a panel can name the keys it *wants* and never the ones it merely does not want to
+  happen, so `^N` over the option sheet opened a conversation behind it and `^T` opened the project
+  panel underneath with focus in neither. Nearer scopes still resolve, so a modal is exactly as
+  rebindable as any other panel. `ui.modal_escape_keys` — `^Q` and `^R` — resolve globally anyway,
+  consulted only *after* the panel has declined the key; **absent is not empty**, because the one
+  thing between a broken panel and a lost terminal must not depend on somebody having declared a
+  default. A modal that borrows a global key to open itself owes a binding to close itself, which is
+  why `^E` shuts the sheet from inside. Answering a question is not this: `^T` is how you reach a
+  question waiting in another conversation. See ADR 0047.
 - **Pairing is a decision each machine makes, and neither of them restarts.** A node presents its
   identity to anyone who connects — as an SSH server presents a host key — so adding a computer is
   typing an address and being shown a name and a fingerprint that came from the far end. The other
@@ -126,9 +138,11 @@ per decision, and records the *reasoning*, not the choice.
   takes (OpenRouter's `supported_parameters`, `codex`'s `model/list`), written down where it will
   not — and a provider with no knobs listed is a bug in a catalogue, not a model without options.
   Some of them are words rather than parameters: `ultrathink` and `ultracode` are read by a
-  *harness*, so they live on `claude-cli` and never on `anthropic`, they travel as
-  `prompt_injected_values` / `prompt_injected_word`, and the injection happens once, above every
-  driver, on the copy of the message this turn sends — never on the transcript, never on a tool
+  *harness*, so they live on `claude-cli` and never on `anthropic`, they are **two rungs past the
+  top of the same ladder** rather than a level and a switch beside it — one message carries one
+  word, and a slider marked "how hard should it think" with an `off / on` under it is two questions
+  about one decision — they travel as `prompt_injected_values`, and the injection happens once,
+  above every driver, on the copy of the message this turn sends — never on the transcript, never on a tool
   round, and always with a sendable value put back in the selection's place. `^E` shows *all* of
   them at once and applies as you move, because a knob you cannot see is a knob you do not have. See
   ADR 0043.
@@ -174,6 +188,14 @@ per decision, and records the *reasoning*, not the choice.
   no `<repo>` level, nothing else's trees can land there — and `add_worktree` writes the directory
   into `.git/info/exclude`, or every `git status` reads as one giant untracked directory. See ADR
   0046.
+- **A project outlives the conversations in it.** The panel's list is written down (`sidebar.projects`,
+  a workspace var) rather than worked out from where the conversations happen to be — derived, it
+  deleted the directory you had worked in all month the moment you cleared out the last thread in
+  it, and left nothing to start the next one from. A project arrives by being added or by a
+  conversation being started in it, keeps the name the host gave it (`sidebar.name`, so emptying a
+  worktree does not rename it to `wt-fe3c0d93`), and leaves by `X` on its heading and nothing else.
+  Empty, that asks nothing — `o` puts it back; with conversations still in it, it is a delete of
+  every one of them and asks like one. See ADR 0039.
 - **What you have archived is not in the sidebar.** The panel is the list you work in; a section of
   things you are finished with is the only part of that column that is never the answer, and it
   grows forever. One row with a count, `a` in the panel or `^F` anywhere, and it opens as a picker
@@ -186,6 +208,16 @@ per decision, and records the *reasoning*, not the choice.
   every list agrees and a restart does not lose it; it wears `Status.Unread`, the amber the palette
   already uses for *act now*, and it never moves — motion means "something is happening you cannot
   see", and this is the opposite. A folded project carries a dot for what it is hiding. See ADR 0042.
+- **A conversation that is asking you something is not a conversation that is working.** Its turn is
+  still in flight — blocked on the hook — so `active_turn` is set and every list draws the spinner,
+  which is the one row in the panel that most needs finding drawn as the nineteen that do not. Which
+  ones are waiting travels as `question.asking`, a **workspace var** written by whatever serves
+  `ask_user` and read by whatever draws conversations, because it is a fact about them rather than
+  about the panel that happened to learn it. It **outranks working** wherever the two meet, it wears
+  `Status.Pending` and therefore *moves* — a block ends when you answer, which is exactly what
+  `Status.Unread` must not do — and the queue behind it is in memory while the var is on disk, so it
+  is announced once at startup, empty, and that is what clears the one left behind by a workspace
+  that stopped mid-question. See ADR 0043.
 - **A card is a row until you ask for more.** A call that only *looked* at something folds to its
   header with the size of what came back on the end of it; a command keeps its output, an edit keeps
   its diff, and a failure always shows. See ADR 0033.
@@ -260,6 +292,14 @@ per decision, and records the *reasoning*, not the choice.
   row of a transcript that no longer existed. Reading is a place *in* a conversation, so the switch
   takes you out of it too. ADR 0036's rule, one more time: a value that is only forwarded is a value
   that comes back wrong.
+- **Following the newest is not a row, and row zero is.** `top_line` is an `Option`: `None` is
+  unscrolled — the frontend's own answer, the last screenful of a transcript and the first of
+  everything else — and `Some(0)` is the top. Encoded as the same `0`, the first row of a
+  conversation was the one place in it nothing could ask for: `^U` and `PageUp` up to the top asked
+  for row zero, which was read as "follow the tail", and the window drew the *end* instead — cursor
+  off screen, and nothing on the way there to say what had happened. A frontend decides where an
+  unscrolled window sits, which is why the state has to be sayable rather than spelled with a row
+  number that means something else.
 
 ## Verification
 
@@ -322,7 +362,7 @@ registry — this table is what ships.
 | `^V` | Attach the image on the clipboard. A key rather than a paste, because a terminal's paste can only ever hand over text |
 | `⌥V` | Take the last attached image back off |
 | `^P` | Pick a model. Mid-turn too — the running agent is told, and thinks the rest with it |
-| `^E` | Everything this model can be told, on one panel: effort, thinking, fast mode, context, and whatever a driver invented. `←→` along a row, `↑↓` between them, and it applies as you move |
+| `^E` | Everything this model can be told, on one panel: effort, thinking, fast mode, context, and whatever a driver invented. `←→` along a row, `↑↓` between them, and it applies as you move. Nothing else reaches the keyboard while it is open; `^E` again closes it |
 | `⌥↑` `⌥↓` | One rung up or down the capability ladder, same provider |
 | `⇧⇥` | Permission mode — full access to start with, then ask, allow-listed, deny. Belongs to this conversation, saved with it, and takes effect on the turn that is running |
 | `^T` | Projects and conversations. Switching is never refused — turns keep running where they are |
@@ -426,7 +466,7 @@ says how many are asking, `^T` is where you go, and it opens when you get there.
 | `f` | Pin a project to the top |
 | `J` `K` | Reorder within a group |
 | `r` | Rename a conversation |
-| `x` `X` | Archive, delete |
+| `x` `X` | Archive, delete. On a project heading, `X` takes the project off the list — the only thing that does |
 | `a` | The archive. Nothing archived is ever a row in this panel — `↵` restores one, `^U` puts it back without going there, `^X` deletes |
 | `?` | The keys for whatever row you are on |
 | `Esc` | Back to the composer |

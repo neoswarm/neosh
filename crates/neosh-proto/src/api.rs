@@ -294,9 +294,16 @@ pub enum ApiCall {
     WinGetViewport {
         win: WindowId,
     },
+    /// Put a buffer row at the top of a window, or give the scroll position back.
+    ///
+    /// `None` means *unscrolled* — the frontend's own answer, which for the transcript is the last
+    /// screenful and for everything else is the first. It is a different place from `Some(0)`, and
+    /// the difference is the whole point: while the two shared an encoding, scrolling a transcript
+    /// to its first row asked for the state that draws its last one, so reaching the top of a long
+    /// answer showed the bottom of it.
     WinScrollTo {
         win: WindowId,
-        top_line: u32,
+        top_line: Option<u32>,
     },
     /// Every window that is open, what is in it, and where it sits.
     ///

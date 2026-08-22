@@ -163,7 +163,10 @@ impl TerminalUi {
     /// Tell the core where each window ended up, but only when it moved.
     fn report_geometry(&mut self, geometry: &[(neosh_proto::WindowId, neosh_proto::Rect)]) {
         for (win, rect) in geometry {
-            let top = self.mirror.windows.get(win).map(|w| w.top_line).unwrap_or(0);
+            // Unscrolled reports as zero: what the frontend chose for a tail-following window is
+            // a *rendered* row, and the core counts in buffer rows — there is no honest number to
+            // put here, and every plugin reading it wants "the top of what is drawn".
+            let top = self.mirror.windows.get(win).and_then(|w| w.top_line).unwrap_or(0);
             let now = (rect.width, rect.height, top);
             if self.reported.get(win) == Some(&now) {
                 continue;

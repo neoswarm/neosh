@@ -32,6 +32,7 @@
 
 import type {
   Disposable,
+  FloatOptions,
   ModelEntry,
   ModelSelection,
   Neosh,
@@ -75,6 +76,10 @@ interface Sheet {
   title: string;
   /** Inside the border. What the description line has to fit in. */
   inner: number;
+  /** What the float was opened with, so `configure` can change one field without losing the rest. */
+  config: FloatOptions;
+  /** Whether anything spoken is in effect, so the border is only redone when the answer changes. */
+  beyond: boolean;
   close(): Promise<void>;
 }
 
@@ -168,10 +173,16 @@ function step(at: number, of: number): string {
  * past the top of it does not compress: five rungs stay five rungs, and the word on the end is
  * drawn as the thing off the scale that it is.
  */
-function groupFor(row: Row, at: number, live: boolean): string {
+function groupFor(row: Row, at: number, live: boolean, focused: boolean): string {
   if (!live) return "Option.Unset";
   const choice = row.choices[at]!;
   if (choice.spoken) return "Option.Beyond";
+  // The row the keys are on says so, and says it where you are looking: at the value they would
+  // move. A ladder with one rung lit reads identically whether or not `←→` do anything to it —
+  // which is how a live control came to look like a summary, and why `↵` on it felt like a key
+  // that does nothing. The ramp is still on every other row, where it is a statement about the
+  // setting rather than about the cursor.
+  if (focused) return "Option.Cursor";
   // A switch is the ends of the scale and nothing in between, said explicitly rather than left to
   // the ramp: a spoken switch has one ordinary value and one word, and a ladder of length one puts
   // its only rung in the middle — so `off` on the switch beside it came out brighter than `off` on
@@ -186,10 +197,24 @@ interface Painted {
   text: string;
   /** `[start, end]` byte offsets, one per choice. */
   spans: [number, number][];
+  /** The two chevrons, same shape, so the caller can colour them by whether they can move. */
+  rails: [[number, number], [number, number]];
 }
 
+/**
+ * A row, with the rail that says it is one.
+ *
+ * The chevrons are the whole reason this function changed. Every row here is a horizontal control
+ * and nothing on screen said so: `↵` was the only key that visibly did anything, it means "done",
+ * and a panel whose one working key closes it is a panel that does nothing. `‹` and `›` are on
+ * every row — the shape is learnt once — and they light on the row the keys act on, dimming at
+ * whichever end you have reached, so where you are on the ladder is readable without counting.
+ */
 function paint(row: Row, labelWidth: number, mark: string, glyph: string): Painted {
   let text = `${mark}${padToWidth(row.label, labelWidth)}  `;
+  const leftStart = byteLength(text);
+  text += "‹";
+  const left: [number, number] = [leftStart, byteLength(text)];
   const spans: [number, number][] = [];
   for (const choice of row.choices) {
     const label = choice.spoken ? `${glyph}${choice.label}` : choice.label;
@@ -197,7 +222,9 @@ function paint(row: Row, labelWidth: number, mark: string, glyph: string): Paint
     text += ` ${label} `;
     spans.push([start, byteLength(text)]);
   }
-  return { text, spans };
+  const rightStart = byteLength(text);
+  text += "›";
+  return { text, spans, rails: [left, [rightStart, byteLength(text)]] };
 }
 
 async function draw(neosh: Neosh, s: Sheet, hints: string): Promise<void> {
@@ -220,6 +247,21 @@ async function draw(neosh: Neosh, s: Sheet, hints: string): Promise<void> {
   const lines = [...painted.map((p) => p.text), "", `  ${said}`, ` ${hints}`];
   await neosh.buf.setLines(s.buf, 0, -1, lines);
 
+  // The whole surface says when the next turn is not an ordinary one. A word in the message is
+  // invisible everywhere else — it never reaches the transcript, and the panel it was chosen in
+  // will have been shut for an hour by the time it matters — so while one is in effect the border
+  // carries the same rainbow the value does. Reconfigured only when the answer *changes*: this is
+  // a round trip, and one per keystroke on a control that already makes several is how a panel
+  // starts lagging behind the keys being pressed. Clock-driven rather than a one-shot, so it is
+  // safe against a redraw that mints every mark again (see ADR 0045).
+  const beyond = s.rows.some((r) => r.choices[r.at]?.spoken);
+  if (beyond !== s.beyond) {
+    s.beyond = beyond;
+    await neosh.float
+      .configure(s.win, { ...s.config, borderHl: beyond ? "Option.Beyond" : undefined })
+      .catch(() => {});
+  }
+
   // Cleared before anything is drawn, every frame. A mark clamps rather than dies when the line
   // under it is replaced, so a row rewritten on every keypress otherwise accumulates them and ends
   // up painted by the narrowest one from three keystrokes ago.
@@ -241,14 +283,27 @@ async function draw(neosh: Neosh, s: Sheet, hints: string): Promise<void> {
       // covering a character and stops, so two of them here would draw one and silently drop the
       // other. `Option.Step*` carries the band as well as the step for exactly that reason.
       await neosh.ns.mark(s.ns, s.buf, i, start, {
-        hlGroup: groupFor(row, c, live),
+        hlGroup: groupFor(row, c, live, i === s.cursor),
+        endCol: end,
+      });
+    }
+    // Lit on the row the keys act on, and only at the end there is somewhere to go. A chevron that
+    // stayed bright at `max` would promise a level that is not there.
+    const ends = [row.at > 0, row.at < row.choices.length - 1];
+    for (let r = 0; r < 2; r++) {
+      const [start, end] = p.rails[r]!;
+      await neosh.ns.mark(s.ns, s.buf, i, start, {
+        hlGroup: i === s.cursor && ends[r] ? "Option.RailLive" : "Option.Rail",
         endCol: end,
       });
     }
   }
   const detail = s.rows.length + 1;
   await neosh.ns.mark(s.ns, s.buf, detail, 0, {
-    hlGroup: "Picker.Detail",
+    // What a spoken level says about itself is said in the register it belongs to. The sentence
+    // under a rainbow value is the one explaining why it is not a level, and drawing it in the
+    // same grey as "how much reasoning the model spends" buries the difference.
+    hlGroup: here?.choices[here.at]?.spoken ? "Option.Beyond" : "Picker.Detail",
     endCol: byteLength(lines[detail] ?? ""),
   });
   await neosh.ns.mark(s.ns, s.buf, detail + 1, 0, {
@@ -283,9 +338,15 @@ async function apply(
   await refresh();
 }
 
-/** The keys, as words, read off what is actually bound rather than written out here. */
+/**
+ * The keys, as words.
+ *
+ * `←→` first, because it is the key that *does* the thing and it used to be third — behind `↵`,
+ * which closes. Read in order, the old line taught you that the way to use this panel was to
+ * dismiss it.
+ */
 function hintsFor(): string {
-  return "↵ done   ←→ change   ↑↓ knob   ⇥ cycle   esc close";
+  return "←→ change   ↑↓ knob   ⇥ cycle   ↵ done   esc close";
 }
 
 export async function installOptions(
@@ -348,16 +409,26 @@ export async function installOptions(
     await apply(neosh, s, refresh);
   };
 
-  // No `^N`/`^P` here, unlike the list widgets. Those two are the most valuable keys in the
-  // program — new conversation, and the model picker — and this panel is on screen for a couple of
-  // seconds at a time. A binding that shadows one of them for the duration is a key that sometimes
-  // does something else, which is the property a keyboard interface can least afford.
+  // No `^N`/`^P` here, and none needed: the float is **modal**, so nothing global resolves while
+  // it is up. This used to be a list of keys deliberately left unbound so that `^N` and `^P` kept
+  // working — which was the wrong half of the problem. Shadowing a key is how a panel keeps the
+  // one key it needs; it does nothing about the dozen it does not, and `^T`, `^G`, `^L` and the
+  // rest all fell through and opened something behind this. A control you are in the middle of
+  // using owns the keyboard until you leave it.
   await verb(`${NS}.next`, ["j", "<Down>"], "Next knob", (s) => move(s, 1));
   await verb(`${NS}.prev`, ["k", "<Up>"], "Previous knob", (s) => move(s, -1));
   await verb(`${NS}.higher`, ["l", "<Right>"], "More", (s) => shift(s, 1, false));
   await verb(`${NS}.lower`, ["h", "<Left>"], "Less", (s) => shift(s, -1, false));
   await verb(`${NS}.cycle`, ["<Tab>", "<Space>"], "The next value along", (s) => shift(s, 1, true));
-  await verb(`${NS}.close`, ["<Esc>", "q", "<C-c>"], "Back to the composer", (s) => s.close());
+  // `^E` closes it too, the way `^S` leaves reading the transcript. A key that opens a surface and
+  // cannot shut it is one you have to remember a second key for — and with the panel modal, the
+  // global `^E` no longer arrives to do it.
+  await verb(
+    `${NS}.close`,
+    ["<Esc>", "q", "<C-c>", "<C-e>"],
+    "Back to the composer",
+    (s) => s.close(),
+  );
   // Nothing left to apply — every change is already in effect — so what this adds is where the
   // acknowledgement *goes*: the panel shuts and the strip it moved to flashes, which is the answer
   // to "fine, but where does that live now". Deliberately not a flash inside the panel: anything
@@ -409,11 +480,15 @@ export async function openOptions(neosh: Neosh): Promise<void> {
   // a page, and a float that spans the terminal reads as something you have to finish reading.
   const labelWidth = Math.max(...rows.map((r) => width(r.label)));
   const widest = Math.max(
-    ...rows.map((r) => r.choices.reduce((n, c) => n + width(c.label) + (c.spoken ? 5 : 2) + 1, 0)),
+    // `+ 2` for the rail: `‹` and `›` are part of the row, and a ladder measured without them is
+    // one whose last chevron falls off the right-hand edge on the widest row.
+    ...rows.map((r) =>
+      r.choices.reduce((n, c) => n + width(c.label) + (c.spoken ? 5 : 2) + 1, 0) + 2
+    ),
     width(hintsFor()),
   );
   const inner = Math.min(96, labelWidth + widest + 8);
-  const win = await neosh.float.open(buf, {
+  const config: FloatOptions = {
     anchor: { kind: "screen" },
     width: { kind: "max", n: inner },
     height: { kind: "fixed", n: rows.length + 3 },
@@ -421,8 +496,15 @@ export async function openOptions(neosh: Neosh): Promise<void> {
     title: ` ${model?.display_name ?? current.model} `,
     focusable: true,
     closeOnBlur: true,
+    // Nothing else reaches the keyboard while this is up. It is a control sheet you are in the
+    // middle of using: `^N` over it opened a new conversation *behind* it, `^T` opened the project
+    // panel and left focus somewhere neither of them expected, and the panel stayed on screen
+    // through both. `^Q` and `^R` still work — see `ui.modal_escape_keys` — so this can never be
+    // a terminal somebody has to kill.
+    modal: true,
     z: 200,
-  });
+  };
+  const win = await neosh.float.open(buf, config);
   await neosh.focus.push(win);
 
   const s: Sheet = {
@@ -434,6 +516,10 @@ export async function openOptions(neosh: Neosh): Promise<void> {
     selection: current,
     title: model?.display_name ?? String(current.model),
     inner,
+    config,
+    // What the border currently says, not what the rows currently are — so the first `draw` finds
+    // them different and lights it, which is what opening straight onto `ultracode` needs.
+    beyond: false,
     close: async () => {
       if (sheet !== s) return;
       sheet = null;

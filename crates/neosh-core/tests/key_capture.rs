@@ -240,3 +240,164 @@ fn closing_a_window_takes_the_keys_it_claimed_with_it() {
     e.apply(&plugin, ApiCall::WinClose { win }).expect("close");
     assert_eq!(listed(&mut e), 0, "and gone with it");
 }
+
+// ---------------------------------------------------------------------------
+// Modal floats
+// ---------------------------------------------------------------------------
+//
+// The other half of the same problem, and the half a capture cannot solve. A widget shadows the
+// keys it *wants*; it has no way to name the keys it merely does not want to happen, and there is
+// no list it could write down anyway — `^T`, `^G`, `^L` and whatever a plugin binds next week.
+// `FloatConfig::modal` is that statement, made once: while this has focus, global bindings do not
+// resolve.
+
+/// An editor with a modal float focused, and `quit` bound globally to stand in for `^Q`.
+fn modal_setup() -> (Editor, PluginId, WindowId) {
+    let mut e = Editor::new();
+    let plugin = PluginId::from("panel");
+    let buf = e.create_buffer("[panel]");
+    let win = e.open_window(buf, WindowLayout::Float {
+        config: neosh_proto::FloatConfig { modal: true, ..Default::default() },
+    });
+    for name in ["quit", "session.new", "panel.key"] {
+        e.apply(&plugin, ApiCall::CmdRegister { name: name.into(), desc: None }).expect("registers");
+    }
+    for (lhs, command) in [("<C-q>", "quit"), ("<C-n>", "session.new")] {
+        e.apply(&plugin, ApiCall::KeymapSet {
+            mode: Mode::Normal,
+            lhs: lhs.into(),
+            command: command.into(),
+            scope: None,
+            desc: None,
+        })
+        .expect("binds");
+    }
+    e.apply(&plugin, ApiCall::FocusPush { win }).expect("focuses");
+    e.drain_effects();
+    (e, plugin, win)
+}
+
+#[test]
+fn a_modal_takes_the_global_bindings_out_of_reach() {
+    let (mut e, _plugin, _win) = modal_setup();
+    e.feed_key(ctrl("n"));
+    let effects = e.drain_effects();
+    assert!(invoked(&effects).is_empty(), "`^N` must not start a conversation behind the panel");
+}
+
+#[test]
+fn a_modal_keeps_its_own_bindings() {
+    // Scoped to the window, which is what every widget here does with the keys it wants. Modality
+    // is about *global* bindings; it must not cost a panel the keys it bound for itself.
+    let (mut e, plugin, win) = modal_setup();
+    e.apply(&plugin, ApiCall::KeymapSet {
+        mode: Mode::Normal,
+        lhs: "<C-n>".into(),
+        command: "panel.key".into(),
+        scope: Some(neosh_proto::KeymapScope::Window { win }),
+        desc: None,
+    })
+    .expect("binds");
+    e.drain_effects();
+
+    e.feed_key(ctrl("n"));
+    assert_eq!(invoked(&e.drain_effects()), vec!["panel.key"]);
+}
+
+#[test]
+fn the_escape_hatches_survive_a_modal() {
+    // The reason this is safe at all. A panel that failed to bind a way out would otherwise be a
+    // terminal somebody has to kill, and "the panel is buggy" must never be the same event as
+    // "the program is gone".
+    let (mut e, _plugin, _win) = modal_setup();
+    e.feed_key(ctrl("q"));
+    assert_eq!(invoked(&e.drain_effects()), vec!["quit"]);
+}
+
+#[test]
+fn a_modal_that_binds_an_escape_key_itself_keeps_it() {
+    // Nearer scope wins, exactly as it does everywhere else — the escape list is consulted only
+    // once the panel's own scopes have declined the key.
+    let (mut e, plugin, win) = modal_setup();
+    e.apply(&plugin, ApiCall::KeymapSet {
+        mode: Mode::Normal,
+        lhs: "<C-q>".into(),
+        command: "panel.key".into(),
+        scope: Some(neosh_proto::KeymapScope::Window { win }),
+        desc: None,
+    })
+    .expect("binds");
+    e.drain_effects();
+
+    e.feed_key(ctrl("q"));
+    assert_eq!(invoked(&e.drain_effects()), vec!["panel.key"]);
+}
+
+#[test]
+fn an_emptied_escape_list_is_honoured_and_an_undeclared_one_is_not() {
+    // Absent means nobody declared the option; empty means somebody said so. Defaulting the first
+    // to "no escapes" would make the safety net depend on a declaration having been remembered.
+    let (mut e, plugin, _win) = modal_setup();
+    e.apply(&plugin, ApiCall::OptDeclare {
+        spec: neosh_proto::OptionSpec {
+            name: "ui.modal_escape_keys".into(),
+            ty: neosh_proto::OptionType::List,
+            default: neosh_proto::OptionValue::List(Vec::new()),
+            description: None,
+        },
+    })
+    .expect("declares");
+    e.drain_effects();
+
+    e.feed_key(ctrl("q"));
+    assert!(invoked(&e.drain_effects()).is_empty(), "an empty list means no way past the panel");
+}
+
+#[test]
+fn a_modal_swallows_what_nothing_claimed() {
+    // Otherwise the key reaches the host, which puts characters in the composer behind the float
+    // and reads `<Esc>` as "interrupt the turn". Typing into a field you cannot see is worse than
+    // a key that does nothing.
+    let (mut e, _plugin, _win) = modal_setup();
+    e.feed_key(key("x"));
+    let effects = e.drain_effects();
+    assert_eq!(unhandled(&effects), 0);
+    assert!(invoked(&effects).is_empty());
+}
+
+#[test]
+fn a_modal_with_a_capture_still_gets_its_raw_keys() {
+    // A filter box in a modal panel: the capture is what makes typing work, and modality must not
+    // take it away.
+    let (mut e, plugin, win) = modal_setup();
+    e.apply(&plugin, ApiCall::KeymapCapture { win, command: "panel.key".into() }).expect("captures");
+    e.drain_effects();
+
+    e.feed_key(key("x"));
+    assert_eq!(invoked(&e.drain_effects()), vec!["panel.key"]);
+}
+
+#[test]
+fn an_ordinary_float_is_unaffected() {
+    // `modal` defaults off, and every float that has ever been opened here relies on that.
+    let mut e = Editor::new();
+    let plugin = PluginId::from("panel");
+    let buf = e.create_buffer("[hint]");
+    let win = e.open_window(buf, WindowLayout::Float { config: neosh_proto::FloatConfig::default() });
+    e.apply(&plugin, ApiCall::CmdRegister { name: "quit".into(), desc: None }).expect("registers");
+    e.apply(&plugin, ApiCall::KeymapSet {
+        mode: Mode::Normal,
+        lhs: "<C-q>".into(),
+        command: "quit".into(),
+        scope: None,
+        desc: None,
+    })
+    .expect("binds");
+    e.apply(&plugin, ApiCall::FocusPush { win }).expect("focuses");
+    e.drain_effects();
+
+    e.feed_key(ctrl("q"));
+    assert_eq!(invoked(&e.drain_effects()), vec!["quit"]);
+    e.feed_key(key("x"));
+    assert_eq!(unhandled(&e.drain_effects()), 1, "still reaches the composer");
+}

@@ -125,6 +125,28 @@ export async function activate({ neosh }: PluginContext) {
     ]);
     neosh.notify(`answered: ${answers === null ? "nothing" : JSON.stringify(answers)}`);
   });
+  // One question whose descriptions are longer than any column can hold, for the panel's rule that
+  // the row under the cursor says all of itself.
+  await neosh.cmd.register("t.ask.long", async () => {
+    const answers = await neosh.ask([
+      {
+        question: "Which database should this use?",
+        header: "Database",
+        multi_select: false,
+        options: [
+          {
+            label: "Postgres",
+            description: "the primary write database, the one everything else already points at and the one a fixture suite must never be aimed anywhere-near",
+          },
+          {
+            label: "SQLite",
+            description: "one file and no server, which stops being a simplification the moment a second process wants to write to it concurrently-somehow",
+          },
+        ],
+      },
+    ]);
+    neosh.notify(`answered: ${answers === null ? "nothing" : JSON.stringify(answers)}`);
+  });
   // Toggles: to the other conversation if there is one, and to a new one if there is not. Enough
   // for a test to move the screen off a question and back onto it.
   await neosh.cmd.register("t.switch", async () => {
@@ -510,4 +532,95 @@ fn dismissing_leaves_what_you_had_typed_where_you_typed_it() {
         "what was typed is still in the composer\n{}",
         s.transcript()
     );
+}
+
+/// The panel, with one question on it, raised by `command`.
+fn open_with(name: &str, command: &str, question: &str) -> Session {
+    let sb = Sandbox::new(name);
+    sb.install_asker(ASKER);
+    let mut s = sb.start();
+    s.wait_for("asker ready");
+    s.command(command);
+    s.wait_for(question);
+    std::mem::forget(sb);
+    s
+}
+
+/// The row under the cursor says all of itself, and the rows either side of it do not.
+///
+/// A description is the *only* thing that says what taking an option would mean, and it is the
+/// first thing a two-column row inside a bordered float runs out of room for. Clipped, four options
+/// are four sentences that stop at the same word and the answer is a guess — which is the failure
+/// this panel exists to prevent, arrived at from the other direction.
+#[test]
+fn the_option_under_the_cursor_says_all_of_itself() {
+    let mut s = open_with("expand", "t.ask.long", "Which database should this use?");
+
+    // The cursor starts on the first option, so the end of its description is on screen — which it
+    // can only be by having been continued onto another line.
+    assert!(
+        s.pump(|s| s.saw("anywhere-near")),
+        "the whole description of the option under the cursor is drawn\n{}",
+        s.transcript()
+    );
+    // And the one below it is still one row. Asserted before moving, because `saw` scans everything
+    // the session has ever drawn and cannot tell a row that folded back from one never unfolded.
+    assert!(
+        !s.saw("concurrently-somehow"),
+        "an option the cursor is not on stays a row\n{}",
+        s.transcript()
+    );
+
+    // Moving swaps which of them is spelled out.
+    s.special("down");
+    s.wait_for("concurrently-somehow");
+}
+
+/// There is a row for the answer nobody listed, and it is a row rather than a rumour.
+///
+/// Typing has always been how you answer a question none of the options answer, and for as long as
+/// the only thing that said so was one phrase in a dim strip at the foot, it was a capability
+/// nobody had: nothing on the panel looked like a field, so four options read as four options and a
+/// dead end.
+#[test]
+fn the_row_at_the_foot_takes_an_answer_nobody_listed() {
+    let mut s = open_with("other", "t.ask.one", "Tabs or spaces?");
+    assert!(s.saw("Other"), "the row is on the panel\n{}", s.transcript());
+    assert!(
+        s.saw("type an answer of your own"),
+        "and it says what it is for\n{}",
+        s.transcript()
+    );
+
+    // `0` is the digit the options deliberately do not use: on a numbered list it already reads as
+    // *none of them*, which is what this row is.
+    s.key("0");
+    s.wait_for("send this answer");
+
+    for c in "two spaces".chars() {
+        s.key(&c.to_string());
+    }
+    s.special("enter");
+    s.wait_for(r#""answers":["two spaces"]"#);
+    assert!(
+        s.saw(r#""custom":true"#),
+        "an answer of your own is marked as one\n{}",
+        s.transcript()
+    );
+}
+
+/// Backspacing off the front of an empty field puts you back among the options.
+///
+/// The one key people already reach for, and the reason the field can be entered without it being a
+/// trap: a panel you can get into and not out of is worse than one with no field at all.
+#[test]
+fn backspacing_off_an_empty_answer_goes_back_to_the_options() {
+    let mut s = open_with("unwrite", "t.ask.one", "Tabs or spaces?");
+    s.key("0");
+    s.wait_for("send this answer");
+    s.special("backspace");
+    // The shortcuts come back, which is the panel saying a digit is a digit again.
+    s.wait_for("1-2 pick");
+    s.key("1");
+    s.wait_for(r#""answers":["Tabs"]"#);
 }

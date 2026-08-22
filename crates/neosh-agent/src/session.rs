@@ -153,8 +153,14 @@ impl Session {
         match first.map(str::trim).filter(|t| !t.is_empty()) {
             // Truncated by *character*, not byte: slicing a multi-byte boundary would panic, and
             // the frontend measures display width anyway.
+            //
+            // Generously, and deliberately more generously than any list will draw. This is a value
+            // that is *forwarded*, so cutting it here cuts it for everybody — and a panel that can
+            // unfold the row under the cursor to show the rest of a title cannot show a rest that
+            // was thrown away three crates ago. Every consumer clips to its own column; the bound
+            // here is only so that a pasted wall of text does not become a label.
             Some(text) => {
-                let mut out: String = text.lines().next().unwrap_or(text).chars().take(48).collect();
+                let mut out: String = text.lines().next().unwrap_or(text).chars().take(160).collect();
                 if out.chars().count() < text.chars().count() {
                     out.push('\u{2026}');
                 }

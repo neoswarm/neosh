@@ -69,8 +69,37 @@ const KIND = "neosh.question";
 /** The most options a digit can reach. Ten would be `0`, which reads as "none of them". */
 const SHORTCUTS = 9;
 
+/**
+ * Which conversations have stopped and are waiting on an answer, in a workspace var.
+ *
+ * Written here because this is the only thing that knows, and shared because it is not about this
+ * plugin: "somebody is waiting on you in *that* conversation" is a fact about the conversation, and
+ * every list of conversations wants it. The footer can only ever say *how many* — it is one line and
+ * it is shared — so without this the answer to "which one" is opening conversations until you find
+ * it, which is the same hunt `SessionInfo::unread` exists to end.
+ *
+ * A conversation that is asking looks exactly like one that is thinking: the turn is still in
+ * flight, blocked on the hook below, so `active_turn` is set and every panel draws a spinner. That
+ * is the bug this fixes, and it is why anything reading this must let it outrank *working*.
+ *
+ * The value is the session ids, newest last. It is on disk with the rest of `vars.json` and the
+ * queue is in memory, so a workspace that stopped with a question on it would come back claiming
+ * one is still open — [`announce`] therefore writes once at activation, when the queue is empty,
+ * and that is what clears it.
+ */
+const VAR_ASKING = "question.asking";
+
 /** How much of the row the label column may take before the description gives up its place. */
 const LABEL_MAX = 28;
+
+/**
+ * The label on the row that takes an answer of your own.
+ *
+ * One word, and a conventional one, because it shares the label column with the options: anything
+ * longer widens that column on every question, including the `Yes`/`No` ones where the whole row is
+ * four characters and the description is what you are reading.
+ */
+const OTHER = "Other";
 
 /**
  * The characters the panel is drawn with, at whatever fidelity the terminal has.
@@ -226,6 +255,28 @@ export async function activate({ neosh, subscriptions }: PluginContext) {
       });
     }
     await elsewhere(neosh, queue, open?.ask ?? null);
+    await announce();
+  };
+
+  /**
+   * Say which conversations are waiting, for anything that draws a list of them.
+   *
+   * `null` to start rather than an empty string, so the first call writes whatever the queue is —
+   * including the empty one, which is how a var left behind by a workspace that stopped mid-question
+   * is cleared. Diffed rather than written every time because a var is a file: `sync` runs on every
+   * conversation switch and most of them change nothing here.
+   */
+  let announced: string | null = null;
+  const announce = async () => {
+    // A question raised by something with no conversation of its own belongs to no row, so it is
+    // the footer's business and not this one's.
+    const ids = [...new Set(queue.map((a) => a.session).filter((s): s is SessionId => Boolean(s)))];
+    const next = ids.join("\n");
+    if (announced === next) return;
+    announced = next;
+    await (ids.length === 0
+      ? neosh.vars.remove({ scope: "global" }, VAR_ASKING)
+      : neosh.vars.set({ scope: "global" }, VAR_ASKING, ids)).catch(() => {});
   };
 
   // First, before anything that awaits. A question arriving while this plugin is still starting up
@@ -309,6 +360,9 @@ export async function activate({ neosh, subscriptions }: PluginContext) {
       void open?.close();
       open = null;
       void neosh.status.clear("question");
+      // And take the mark off the rows. Unloading this plugin unblocks every turn it was holding,
+      // so a conversation still flagged as asking would be one nothing is going to ask again.
+      void neosh.vars.remove({ scope: "global" }, VAR_ASKING).catch(() => {});
     },
   });
 }
@@ -388,6 +442,15 @@ async function draw(neosh: Neosh, ask: Ask, seed: string, done: () => void): Pro
 
   /** What is in the composer, which is the answer nobody listed. */
   let typed = "";
+  /**
+   * Whether the panel is being written into rather than chosen from.
+   *
+   * Explicit rather than `typed !== ""`, and the difference is the row at the foot of the list. You
+   * get here by landing on that row and pressing `↵`, which has to show you an empty field to type
+   * into — derived from the text, the field would not appear until after the first character, so
+   * the key would look like it did nothing and the thing it opened would look like a typo.
+   */
+  let writing = false;
   let closed = false;
 
   const q = () => ask.questions[ask.at]!;
@@ -396,7 +459,7 @@ async function draw(neosh: Neosh, ask: Ask, seed: string, done: () => void): Pro
 
   const render = async () => {
     if (closed) return;
-    const rows = compose(ask, typed, width, glyphs);
+    const rows = compose(ask, typed, writing, width, glyphs);
     await neosh.buf.render(buf, ns, 0, -1, rows.rows).catch(() => {});
     // The caret goes where you are acting: on the row under the cursor, and at the end of what you
     // have typed once you are typing. Without it the terminal's caret parks in the corner of a
@@ -448,6 +511,7 @@ async function draw(neosh: Neosh, ask: Ask, seed: string, done: () => void): Pro
       typed = "";
       await neosh.agent.setDraft("").catch(() => {});
     }
+    writing = false;
 
     // The first one still unanswered, which is not always the next one along: `⇧⇥` goes back to
     // change an earlier answer, and finishing that one should return you to where you were rather
@@ -467,18 +531,56 @@ async function draw(neosh: Neosh, ask: Ask, seed: string, done: () => void): Pro
     await render();
   };
 
+  /**
+   * Move the cursor, over the options *and* the row that lets you write your own.
+   *
+   * `+ 1` because that row is real: it takes the cursor, it wraps round to the first option, and it
+   * is reachable with the same key as everything else. A row you can see and cannot arrive at is
+   * worse than no row.
+   */
   const move = async (delta: number) => {
-    const n = q().options.length;
-    if (n === 0) return;
+    const n = q().options.length + 1;
+    // Moving off the field is how you go back to the options without erasing what you wrote — it
+    // is still there when you come back to the row.
+    if (writing) writing = false;
     ask.cursor = (ask.cursor + delta + n) % n;
     await render();
   };
 
-  /** Take an option, by index. Single-select answers with it; multi-select toggles it. */
+  /** Start writing an answer of your own, with the cursor parked on the row that is the field. */
+  const write = async () => {
+    ask.cursor = q().options.length;
+    writing = true;
+    await render();
+  };
+
+  /**
+   * Stop writing, and go back to choosing.
+   *
+   * What was typed stays typed. Backspacing past the first character is how you change your mind
+   * about writing at all, and one that threw the sentence away would make `⌫` a key you have to be
+   * careful with — on a panel whose entire job is to be answered quickly.
+   */
+  const unwrite = async () => {
+    writing = false;
+    await render();
+  };
+
+  /**
+   * Take an option, by index. Single-select answers with it; multi-select toggles it.
+   *
+   * The index one past the last option is the row that lets you write your own, which is a row and
+   * so answers to every key the rows answer to.
+   */
   const take = async (index: number) => {
     const question = q();
+    if (index === question.options.length) {
+      await write();
+      return;
+    }
     const option = question.options[index];
     if (!option) return;
+    writing = false;
     // Typing wins over the rows while there is anything typed — but reaching for a row is a plain
     // statement that the rows are the answer after all, so it clears what was typed rather than
     // being ignored underneath it.
@@ -512,6 +614,16 @@ async function draw(neosh: Neosh, ask: Ask, seed: string, done: () => void): Pro
   };
 
   await cmd("question.accept", "Answer this question and go on to the next", async () => {
+    if (writing) {
+      if (typed.trim()) {
+        await advance();
+        return;
+      }
+      // An empty field and `↵`. Saying so beats sending nothing: an answer of "" is one the agent
+      // reads as an answer, and a key that silently does nothing is one you press again harder.
+      neosh.notify("type an answer, or ⌫ back to the options", "info");
+      return;
+    }
     if (typed.trim()) {
       await advance();
       return;
@@ -543,6 +655,10 @@ async function draw(neosh: Neosh, ask: Ask, seed: string, done: () => void): Pro
     const picked = draftOf(q()).picked[0];
     ask.cursor = Math.max(0, q().options.findIndex((o) => o.label === picked));
     const was = draftOf(q()).typed;
+    // Back onto a question you answered in your own words puts you back in the field with those
+    // words in it, rather than on a list of options you had already decided against.
+    writing = was !== "";
+    if (writing) ask.cursor = q().options.length;
     if (was !== typed) await retype(was);
     else await render();
   });
@@ -580,7 +696,10 @@ async function draw(neosh: Neosh, ask: Ask, seed: string, done: () => void): Pro
       if (!key || closed) return;
       const code = key.key.code;
       if (code.kind === "backspace") {
-        if (typed) await retype(typed.slice(0, -1));
+        // Back off the end of an empty field and you are choosing again. The one key that leaves
+        // the field, and the one people already reach for.
+        if (!typed) await unwrite();
+        else await retype(typed.slice(0, -1));
         return;
       }
       if (code.kind !== "char" || key.key.mods.alt) return;
@@ -590,9 +709,19 @@ async function draw(neosh: Neosh, ask: Ask, seed: string, done: () => void): Pro
         return;
       }
       const c = code.c;
-      if (!typed && c >= "1" && c <= "9") {
-        await take(Number(c) - 1);
+      // Digits are shortcuts until something is being written, and characters afterwards — which
+      // the panel says out loud by taking the numbers off the rows. `0` is the row at the foot:
+      // on a numbered list it already reads as *none of them*, which is what that row is.
+      if (!writing && c >= "0" && c <= "9") {
+        await take(c === "0" ? q().options.length : Number(c) - 1);
         return;
+      }
+      // The first character of an answer is also the thing that starts one. Typing has always been
+      // how you say something the options do not, and it stays that way — the row at the foot is
+      // how you *find out* that it is, not a gate in front of it.
+      if (!writing) {
+        ask.cursor = q().options.length;
+        writing = true;
       }
       await retype(typed + c);
     }, { desc: "question: a character of your own answer" }),
@@ -615,6 +744,8 @@ async function draw(neosh: Neosh, ask: Ask, seed: string, done: () => void): Pro
   // away: the panel appeared over a field somebody was using, and what they had written is very
   // often the answer — it is the sentence they were about to send.
   typed = seed;
+  writing = seed.trim() !== "";
+  if (writing) ask.cursor = q().options.length;
   await render();
 
   return { ask, close };
@@ -675,11 +806,14 @@ function mark(col: number, end: number, hl: string, priority?: number): DrawnMar
 function compose(
   ask: Ask,
   typed: string,
+  writing: boolean,
   width: number,
   g: Glyphs,
 ): { rows: DrawnRow[]; caret: number; caretCol: number } {
   const question = ask.questions[ask.at]!;
-  const custom = typed.trim().length > 0;
+  const custom = writing;
+  /** The row after the last option: the answer nobody listed. */
+  const customAt = question.options.length;
   const picked = new Set(ask.drafts.get(question.question)?.picked ?? []);
   const rows: DrawnRow[] = [];
   /** The left margin, shared by every row so the panel has one edge rather than several. */
@@ -714,9 +848,12 @@ function compose(
   // One gutter for the whole list — the marker, a space, the box, a space — so the labels line up
   // whether or not the cursor is on the row.
   const gutter = cols(g.cursor) + 1 + cols(on) + 1;
+  // The row at the foot is one of the rows, so its label is one of the labels the column has to
+  // fit. Left out, a question whose options are `Yes` and `No` gives the column three columns and
+  // `Other` arrives clipped — a row offering to take your answer, unable to say so.
   const labelWidth = Math.min(
     LABEL_MAX,
-    question.options.reduce((w, o) => Math.max(w, cols(o.label)), 0),
+    question.options.reduce((w, o) => Math.max(w, cols(o.label)), cols(OTHER)),
   );
   const shortcuts = !custom && question.options.length > 1;
   const badgeWidth = shortcuts ? cols(String(Math.min(SHORTCUTS, question.options.length))) : 0;
@@ -724,61 +861,131 @@ function compose(
   let caret = rows.length;
   let caretCol = 0;
   question.options.forEach((option, i) => {
-    const here = i === ask.cursor;
+    const here = !custom && i === ask.cursor;
     if (here) caret = rows.length;
     const taken = !custom && picked.has(option.label);
     const lead = pad(`${here ? g.cursor : g.blank} ${taken ? on : off} `, gutter);
-    const label = pad(clip(option.label, labelWidth), labelWidth);
     const badge = shortcuts && i < SHORTCUTS ? String(i + 1) : "";
     // What is left for the description, once the row has paid for its gutter, its label column and
     // the shortcut hanging off the right edge.
     const forDetail = room - gutter - labelWidth - 2 - (badgeWidth ? badgeWidth + 2 : 0);
     const detail = option.description.trim();
-    const shown = detail && forDetail >= 8 ? clip(detail, forDetail) : "";
-    const body = shown ? `${label}  ${shown}` : label.trimEnd();
-    // Right-aligned against the panel's own edge, so the shortcuts read as a column rather than as
-    // punctuation trailing each row by a different amount.
+
+    // The row under the cursor says all of itself, on as many lines as that takes, and folds back
+    // to one the moment the cursor leaves.
+    //
+    // This is the whole point of the panel. An option's description is the *only* thing that says
+    // what taking it would mean — "the primary write database" against "the read replica" — and it
+    // is the first thing a two-column row inside a bordered float runs out of room for. Clipped, an
+    // agent asking which of four things you want is a list of four sentences that all stop at the
+    // same word, and the answer is a guess. It goes under the row rather than in a float over it
+    // because there is nowhere else to put it: this panel is already a float over the composer, and
+    // a second one on top would cover the options it is describing.
+    //
+    // Only the cursor's row, and only ever one of them, so the list is still a list you can read
+    // down. The columns hold their places on the continuation lines — a description that reflowed
+    // under the label would read as a new option.
+    const labelLines = here ? wrapCols(option.label, labelWidth) : [clip(option.label, labelWidth)];
+    const detailLines = detail === "" || forDetail < 8
+      ? []
+      : here
+        ? wrapCols(detail, forDetail)
+        : [clip(detail, forDetail)];
+
+    const lines = Math.max(labelLines.length, detailLines.length, 1);
+    for (let n = 0; n < lines; n++) {
+      const label = pad(labelLines[n] ?? "", labelWidth);
+      const shown = detailLines[n] ?? "";
+      const body = shown ? `${label}  ${shown}` : label.trimEnd();
+      // The gutter is paid for on every line, and drawn on the first: the marker and the box are
+      // what the row *is*, and repeating them down the side would read as one option per line.
+      const run = n === 0 ? lead : " ".repeat(gutter);
+      const tail = n === 0 ? badge : "";
+      // Right-aligned against the panel's own edge, so the shortcuts read as a column rather than
+      // as punctuation trailing each row by a different amount.
+      const filler = tail ? " ".repeat(Math.max(1, room - gutter - cols(body) - cols(tail))) : "";
+      const text = `  ${run}${body}${filler}${tail}`;
+
+      const marks: DrawnMark[] = [];
+      // The band goes on first and everything else is patched over it, so a highlighted row keeps
+      // saying what its parts are instead of becoming one flat colour. See the `line_hl_group`
+      // rule. Every line of an unfolded row wears it, or the rest of the description reads as
+      // something that fell out from under the row rather than as part of it.
+      if (here) marks.push({ col: 0, opts: { lineHlGroup: "Question.Cursor" } });
+      const leadAt = LEFT;
+      if (n === 0) {
+        marks.push(mark(leadAt, leadAt + byteLength(lead), taken ? "Question.Taken" : "Question.Box", 100));
+      }
+      const labelAt = leadAt + byteLength(run);
+      if (label.trimEnd() !== "") {
+        marks.push(mark(
+          labelAt,
+          labelAt + byteLength(label.trimEnd()),
+          custom ? "Question.Muted" : "Question.Option",
+          100,
+        ));
+      }
+      if (shown) {
+        const detailAt = labelAt + byteLength(label) + 2;
+        marks.push(mark(detailAt, detailAt + byteLength(shown), "Question.Detail", 100));
+      }
+      if (tail) {
+        marks.push(mark(byteLength(text) - byteLength(tail), byteLength(text), "Question.Shortcut", 100));
+      }
+      rows.push({ text, marks });
+    }
+  });
+
+  // --- the answer nobody listed ----------------------------------------------
+  //
+  // A row, not a note in the key strip. Typing has always been how you answer a question none of
+  // the options answer, and a capability whose entire advertisement is one phrase in a dim strip at
+  // the bottom is a capability nobody has: there is nothing on screen that looks like a field, so
+  // the panel reads as four options and a dead end. It is the last row because that is where "none
+  // of these" belongs, it takes the cursor like any other row, and `↵` on it starts the answer.
+  //
+  // `0` is its shortcut, which is the digit the option rows deliberately do not use: on a numbered
+  // list `0` already reads as *none of them*, and that is exactly what this row is.
+  {
+    const here = custom || ask.cursor === customAt;
+    const lead = pad(`${here ? g.cursor : g.blank} ${g.pen} `, gutter);
+    const badge = shortcuts ? "0" : "";
+    const forDetail = room - gutter - labelWidth - 2 - (badgeWidth ? badgeWidth + 2 : 0);
+    // Once you are writing, the row *is* the field: what is in it is your answer, and it takes the
+    // whole width because a sentence is not a label.
+    const body = custom
+      ? clip(typed, Math.max(8, room - gutter - 2))
+      : (() => {
+        const label = pad(clip(OTHER, labelWidth), labelWidth);
+        const hint = forDetail >= 8 ? clip("type an answer of your own", forDetail) : "";
+        return hint ? `${label}  ${hint}` : label.trimEnd();
+      })();
     const filler = badge ? " ".repeat(Math.max(1, room - gutter - cols(body) - cols(badge))) : "";
     const text = `  ${lead}${body}${filler}${badge}`;
 
-    const marks: DrawnMark[] = [];
-    // The band goes on first and everything else is patched over it, so a highlighted row keeps
-    // saying what its parts are instead of becoming one flat colour. See the `line_hl_group` rule.
-    if (here) marks.push({ col: 0, opts: { lineHlGroup: "Question.Cursor" } });
-    const leadAt = LEFT;
-    marks.push(mark(leadAt, leadAt + byteLength(lead), taken ? "Question.Taken" : "Question.Box", 100));
-    const labelAt = leadAt + byteLength(lead);
-    marks.push(mark(
-      labelAt,
-      labelAt + byteLength(label.trimEnd()),
-      custom ? "Question.Muted" : "Question.Option",
-      100,
-    ));
-    if (shown) {
-      const detailAt = labelAt + byteLength(label) + 2;
-      marks.push(mark(detailAt, detailAt + byteLength(shown), "Question.Detail", 100));
+    const marks: DrawnMark[] = [
+      mark(LEFT, LEFT + byteLength(lead), custom ? "Question.Taken" : "Question.Box", 100),
+    ];
+    if (here) marks.unshift({ col: 0, opts: { lineHlGroup: "Question.Cursor" } });
+    const bodyAt = LEFT + byteLength(lead);
+    if (custom) {
+      marks.push(mark(bodyAt, byteLength(text), "Question.Custom", 100));
+      // The caret sits at the end of what has been typed, which is the one place on this panel
+      // where a terminal cursor means "the keyboard goes here".
+      caret = rows.length;
+      caretCol = bodyAt + byteLength(body);
+    } else {
+      marks.push(mark(bodyAt, bodyAt + byteLength(clip(OTHER, labelWidth)), "Question.Option", 100));
+      const hintAt = bodyAt + byteLength(pad(clip(OTHER, labelWidth), labelWidth)) + 2;
+      if (byteLength(text) > hintAt) {
+        marks.push(mark(hintAt, byteLength(text), "Question.Detail", 100));
+      }
+      if (here) caret = rows.length;
     }
     if (badge) {
       marks.push(mark(byteLength(text) - byteLength(badge), byteLength(text), "Question.Shortcut", 100));
     }
     rows.push({ text, marks });
-  });
-
-  // --- what you typed instead ------------------------------------------------
-  if (custom) {
-    rows.push({ text: "" });
-    const shown = clip(typed.trim(), Math.max(8, room - cols(g.pen) - 1));
-    const text = `  ${g.pen} ${shown}`;
-    caret = rows.length;
-    caretCol = byteLength(text);
-    rows.push({
-      text,
-      marks: [
-        { col: 0, opts: { lineHlGroup: "Question.Cursor" } },
-        mark(LEFT, LEFT + byteLength(g.pen), "Question.Taken", 100),
-        mark(LEFT + byteLength(`${g.pen} `), byteLength(text), "Question.Custom", 100),
-      ],
-    });
   }
 
   // --- the keys --------------------------------------------------------------
@@ -807,8 +1014,18 @@ function progress(ask: Ask, g: Glyphs): string {
  */
 function hints(question: UserQuestion, ask: Ask, custom: boolean, room: number): string {
   /** `[what it says, how readily it goes]`, lower going last. */
+  const onCustom = ask.cursor === question.options.length;
   const parts: Array<[string, number]> = custom
-    ? [["\u21b5 send this answer", 0], ["\u232b back to the options", 2], ["esc dismiss", 1]]
+    ? [["\u21b5 send this answer", 0], ["\u232b back to the options", 1], ["esc dismiss", 1]]
+    : onCustom
+    // On the row at the foot, the only thing worth saying is what it does. The keys that move
+    // between rows are the ones you just used to get here.
+    ? [
+      ["\u21b5 write your own answer", 0],
+      ["\u2191\u2193 move", 3],
+      ...(ask.at > 0 ? [["\u21e7\u21e5 back", 5] as [string, number]] : []),
+      ["esc dismiss", 1],
+    ]
     : [
       [question.multi_select ? "\u21e5 tick" : "\u21b5 choose", 0],
       ...(question.multi_select ? [["\u21b5 done", 0] as [string, number]] : []),
@@ -816,7 +1033,7 @@ function hints(question: UserQuestion, ask: Ask, custom: boolean, room: number):
       ...(question.options.length > 1
         ? [[`1-${Math.min(SHORTCUTS, question.options.length)} pick`, 4] as [string, number]]
         : []),
-      ["type your own", 2],
+      ["0 write your own", 2],
       ...(ask.at > 0 ? [["\u21e7\u21e5 back", 5] as [string, number]] : []),
       ["esc dismiss", 1],
     ];
@@ -837,6 +1054,41 @@ function clip(text: string, room: number): string {
   const chars = [...text];
   if (chars.length <= room) return text;
   return `${chars.slice(0, Math.max(1, room - 1)).join("")}…`;
+}
+
+/**
+ * Break `text` onto lines of at most `width`, cutting a word that is wider than the column.
+ *
+ * The difference from [`wrap`] is where the result lands. That one fills the panel, which is as
+ * wide as the conversation, so a long word simply runs to the next line. This one fills a *column*
+ * beside another column — and a word wider than it does not overhang harmlessly, it pushes the
+ * description sideways and takes the alignment of every line below it with it. Option labels are
+ * routinely identifiers, paths or flags, which is to say routinely longer than 28 columns.
+ */
+function wrapCols(text: string, width: number): string[] {
+  const limit = Math.max(1, width);
+  const out: string[] = [];
+  let line = "";
+  for (const word of text.trim().split(/\s+/).filter(Boolean)) {
+    const next = line ? `${line} ${word}` : word;
+    if (cols(next) <= limit) {
+      line = next;
+      continue;
+    }
+    if (line) {
+      out.push(line);
+      line = "";
+    }
+    let rest = word;
+    while (cols(rest) > limit) {
+      const chars = [...rest];
+      out.push(chars.slice(0, limit).join(""));
+      rest = chars.slice(limit).join("");
+    }
+    line = rest;
+  }
+  if (line) out.push(line);
+  return out.length > 0 ? out : [""];
 }
 
 /**

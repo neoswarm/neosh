@@ -145,12 +145,17 @@ pub struct Host {
 
     chat: BufferId,
     chat_win: WindowId,
-    /// Where the transcript is scrolled to, as the host intends it.
+    /// Where the transcript is scrolled to, as the host intends it. `None` follows the newest.
     ///
     /// Not read back from the frontend's report: two page-ups inside one 16 ms coalescing window
     /// would both compute from the same stale value and the second would do nothing. The frontend
     /// reports what it drew; this is what we asked for.
-    chat_top: u32,
+    ///
+    /// Following the tail is `None` and the first row is `Some(0)`, which are two different places
+    /// — the frontend draws the last screenful for one and the first for the other. Sharing zero
+    /// between them made the top of a long answer unreachable: `^U` up to it asked for row zero,
+    /// which was read as "follow", and the transcript jumped back to the end.
+    chat_top: Option<u32>,
     composer: BufferId,
     composer_win: WindowId,
     /// Marks for the chrome around the composer: the prompt, the placeholder, the shortcut row.
@@ -682,7 +687,7 @@ impl Host {
             frontend,
             chat,
             chat_win,
-            chat_top: 0,
+            chat_top: None,
             composer,
             composer_win,
             status,
@@ -3701,10 +3706,11 @@ impl Host {
     fn place_cursor_line(&mut self, at: u32) {
         let row = self.chat_cursor().0;
         let top = row.saturating_sub(at);
-        self.chat_top = top.max(1);
-        let _ = self
-            .editor
-            .apply(&PluginId::from(BUILTIN), ApiCall::WinScrollTo { win: self.chat_win, top_line: top });
+        self.chat_top = Some(top);
+        let _ = self.editor.apply(&PluginId::from(BUILTIN), ApiCall::WinScrollTo {
+            win: self.chat_win,
+            top_line: Some(top),
+        });
     }
 
     /// `v` and `V`: start a selection of that shape, change a running one into it, or — pressed on
@@ -4111,10 +4117,13 @@ impl Host {
         let row = w.cursor.0;
         let Some(v) = w.viewport else { return };
         let height = (v.height as u32).max(1);
-        let top = self.chat_top;
         let lines = self.editor.buffer(self.chat).map(|b| b.line_count()).unwrap_or(0);
-        // `chat_top == 0` means "following the tail", which is a different place from line zero.
-        let showing = if top == 0 { lines.saturating_sub(height) } else { top };
+        // `None` means "following the tail", which is a different place from line zero — and the
+        // first row of the transcript is a place the reader arrives at, so it has to be sayable.
+        // Sent as a bare `0` it was read as "follow" instead, and `^U` up to the top of a long
+        // answer put the window back at the bottom of it, cursor off screen, with nothing on the
+        // way there to say what had happened.
+        let showing = self.chat_top.unwrap_or_else(|| lines.saturating_sub(height));
         let next = if row < showing {
             row
         } else if row >= showing + height {
@@ -4122,10 +4131,10 @@ impl Host {
         } else {
             return;
         };
-        self.chat_top = next.max(1);
+        self.chat_top = Some(next);
         let _ = self.editor.apply(&PluginId::from(BUILTIN), ApiCall::WinScrollTo {
             win: self.chat_win,
-            top_line: next,
+            top_line: Some(next),
         });
     }
 
@@ -4163,7 +4172,7 @@ impl Host {
         // that no longer has those rows.
         self.working = false;
         self.plan_rows = 0;
-        self.chat_top = 0;
+        self.chat_top = None;
         let ascii = self.option_bool("ui.ascii_only");
         let limits = self.limits();
         let width = self.chat_width();
@@ -4190,7 +4199,7 @@ impl Host {
             lines,
         });
         self.draw_marks(&marks, 0);
-        // Where the window *is*, and not only what this end believes about it. `chat_top = 0` above
+        // Where the window *is*, and not only what this end believes about it. `chat_top = None`
         // says "following the tail"; the window has to be told, because it is still sitting at
         // whatever row the last conversation was scrolled to — and a scroll offset is kept rather
         // than derived, precisely so that a client attaching later can be told it. Read a long
@@ -4203,7 +4212,7 @@ impl Host {
         // shorter one.
         let _ = self
             .editor
-            .apply(&plugin, ApiCall::WinScrollTo { win: self.chat_win, top_line: 0 });
+            .apply(&plugin, ApiCall::WinScrollTo { win: self.chat_win, top_line: None });
         let _ = self
             .editor
             .apply(&plugin, ApiCall::WinSetCursor { win: self.chat_win, row: 0, col: 0 });
@@ -5831,7 +5840,7 @@ impl Host {
                 // declarative geometry it already has. Redraw so it takes effect.
                 let _ = self.editor.apply(&PluginId::from(BUILTIN), ApiCall::WinScrollTo {
                     win: self.composer_win,
-                    top_line: 0,
+                    top_line: Some(0),
                 });
                 // Except the welcome, which is drawn to a width: the word at the top of it has to
                 // fit or not be there.
@@ -6511,8 +6520,10 @@ impl Host {
 
     /// Page the transcript. `0` returns to following the tail.
     ///
-    /// `top_line == 0` is the "follow the newest" state, which is why jumping to the end is a reset
+    /// Following the newest is `None` rather than a row, which is why jumping to the end is a reset
     /// rather than a seek: the renderer already shows the last screenful when nothing has scrolled.
+    /// Row zero is `Some(0)` and means the top — paging up to it used to ask for "follow" and land
+    /// back at the end, one page short of the beginning every time.
     fn scroll_chat(&mut self, direction: i32) {
         let plugin = PluginId::from(BUILTIN);
         let lines = self.editor.buffer(self.chat).map(|b| b.line_count() as u32).unwrap_or(0);
@@ -6527,17 +6538,22 @@ impl Host {
         let current = self.chat_top;
 
         let top = match direction {
-            0 => 0,
+            0 => None,
             d if d < 0 => {
                 // From "following", scrolling up starts from where the tail actually begins.
-                let from = if current == 0 { lines.saturating_sub(page) } else { current };
-                from.saturating_sub(page)
+                let from = current.unwrap_or_else(|| lines.saturating_sub(page));
+                Some(from.saturating_sub(page))
             }
-            _ => {
-                let next = current.saturating_add(page);
-                // Past the end means back to following, so a user cannot scroll into blank space.
-                if current == 0 || next + page >= lines { 0 } else { next }
-            }
+            _ => match current {
+                // Already at the end, and there is nowhere past it to scroll into.
+                None => None,
+                Some(c) => {
+                    let next = c.saturating_add(page);
+                    // Past the end means back to following, so a user cannot scroll into blank
+                    // space.
+                    if next + page >= lines { None } else { Some(next) }
+                }
+            },
         };
         self.chat_top = top;
         let _ = self.editor.apply(&plugin, ApiCall::WinScrollTo { win, top_line: top });
@@ -6979,6 +6995,22 @@ impl Host {
                     "Show a shortcut row under the composer. Off by default: the sidebar's footer \
                      carries the same keys and `F1` carries all of them, so the row mostly cost \
                      the transcript a line."
+                        .into(),
+                ),
+            },
+            // The way out of a panel that has taken the keyboard. A modal float stops global
+            // bindings resolving — which is what makes `^N` over an open picker do nothing instead
+            // of opening a conversation behind it — so these are named to survive that. A list
+            // rather than a constant because they are keys, and every key here is the user's; empty
+            // it and the only way out of a panel is the way the panel gives you.
+            OptionSpec {
+                name: "ui.modal_escape_keys".into(),
+                ty: OptionType::List,
+                default: OptionValue::List(vec!["<C-q>".into(), "<C-r>".into()]),
+                description: Some(
+                    "Keys that still reach the workspace while a modal panel is open. Quit and \
+                     reload by default, so a panel that fails to bind a way out is never a \
+                     terminal you have to kill."
                         .into(),
                 ),
             },

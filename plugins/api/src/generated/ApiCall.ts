@@ -88,7 +88,7 @@ export type ApiCall =
   | { "call": "win_get_cursor"; win: WindowId }
   | { "call": "win_set_cursor"; win: WindowId; row: number; col: number }
   | { "call": "win_get_viewport"; win: WindowId }
-  | { "call": "win_scroll_to"; win: WindowId; top_line: number }
+  | { "call": "win_scroll_to"; win: WindowId; top_line: number | null }
   | { "call": "win_list" }
   | {
     "call": "win_motion";

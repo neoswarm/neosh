@@ -70,3 +70,48 @@ changes nothing.
 - **An archive with nothing to reclaim it is still an archive.** 0023's note stands: nothing sweeps
   it, and deleting someone's history on a timer remains the move neither ADR is willing to make.
   What is new is that emptying it by hand is now something you can actually do.
+
+## What was added afterwards: a project outlives the conversations in it
+
+The panel had no list of projects. It had a list of *conversations*, grouped by the directory each
+one named, with pinned directories seeded in so that a favourite with nothing in it still drew a
+row. Everything else about a project was inferred from what was inside it.
+
+Which meant deleting was two things at once. `X` on the last conversation in a directory removed the
+conversation, and then — with nothing left to infer the heading from — removed the directory too.
+You cleared out a month of finished threads in a repository you work in every day and the repository
+left the panel with them: no row, no `n`, nothing to start the next conversation from except `^O`
+and typing the path again. The pinned exception is the tell. Somebody had already hit this, and the
+fix was a special case for favourites rather than the observation that a project is a place you
+work rather than a property of the work in it.
+
+**The list is written down.** `sidebar.projects`, a workspace var, is now the panel's list rather
+than an index into one. A directory joins it by being added, by a conversation being started there,
+or by anybody setting a project var on it, and it leaves it by exactly one route — see below. The
+draw path also writes `sidebar.name` for every project that has a conversation to read a name off,
+because the name comes from the host by way of a conversation and a project with none has nobody to
+ask: without it, emptying a worktree renamed it from `neosh (feat/thing)` to `wt-fe3c0d93` at the
+moment you were least likely to recognise it.
+
+**`X` on a heading removes the project**, and it is the only thing that does. That verb did not
+exist — there was nothing to remove, because the list removed itself — and a list that can only grow
+is the other half of this being a list at all. It is the key that already means *for good* on the
+row below, saying the same thing about the row it is on.
+
+It asks by 0039's rule and not by a rule of its own. An empty project is a row and no files: nothing
+is at stake, `o` puts it back, and a dialog there is the kind you learn to clear without reading.
+With conversations still in it, removing the project is deleting every one of them, so it asks like
+the delete it is — how many, how many of those you would still have found in your list, and that
+`x` archives instead. The conversations go first and the project only goes if all of them did: the
+store refuses to delete the very last conversation in a workspace, and a project removed anyway
+would take a row off the list that still had something in it.
+
+### Consequences
+
+- **A directory you visited once is a row until you say otherwise.** That is the trade: the old
+  behaviour cleaned up after itself and took your projects with it. `X` is the broom.
+- **Removing a var is not an announcement.** The arrangement adds any directory somebody sets a
+  project var on, which is how a plugin can pin something this panel has never seen — so a *removal*
+  had to stop counting, or `forget` would put the project straight back as it cleared it.
+- **Only this panel's vars go.** Another plugin's note about the directory is that plugin's to keep,
+  and a directory it still cares about comes back the next time it says so.

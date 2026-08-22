@@ -352,6 +352,20 @@ export interface FloatOptions {
   title?: string;
   closeOnBlur?: boolean;
   focusable?: boolean;
+  /**
+   * Take the keyboard while this float has focus.
+   *
+   * Global bindings stop resolving: `^N`, `^T`, `^G` and the rest do nothing until it closes,
+   * instead of opening a second panel behind the first. Your own bindings still work — window,
+   * buffer and kind scopes are all nearer than global — and so does anything in
+   * `ui.modal_escape_keys` (`^Q` and `^R` by default), so a panel that forgets to bind a way out
+   * is never a terminal somebody has to kill. A key nothing claimed is swallowed rather than
+   * falling through to the composer.
+   *
+   * For a panel you are meant to answer before doing anything else: a question, a confirmation, a
+   * control sheet. Not for a hint or a hover card.
+   */
+  modal?: boolean;
 }
 
 export interface Neosh {
@@ -493,7 +507,14 @@ export interface WindowApi {
   /** `col` is a UTF-8 byte offset, not a character or display column. */
   cursor(win: WindowId): Promise<{ row: number; col: number }>;
   setCursor(win: WindowId, row: number, col: number): Promise<void>;
-  scrollTo(win: WindowId, topLine: number): Promise<void>;
+  /**
+   * Put a buffer row at the top of a window, or hand the scroll position back.
+   *
+   * `null` is *unscrolled*, which is where a window starts and is not the same place as row `0`:
+   * a window that follows its content — the transcript — shows its last screenful unscrolled and
+   * its first row at `0`. Anything else shows the same thing either way.
+   */
+  scrollTo(win: WindowId, topLine: number | null): Promise<void>;
   /**
    * How big this window actually is, in cells.
    *
@@ -1433,6 +1454,7 @@ function floatConfig(o: FloatOptions = {}): FloatConfig {
     title: o.title ?? null,
     close_on_blur: o.closeOnBlur ?? false,
     focusable: o.focusable ?? true,
+    modal: o.modal ?? false,
   };
 }
 

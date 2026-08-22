@@ -1302,6 +1302,86 @@ fn a_level_that_is_a_word_is_said_rather_than_sent() {
 }
 
 #[test]
+fn nothing_else_reaches_the_keyboard_while_the_option_sheet_is_open() {
+    // Every global key used to fall straight through it. `^N` opened a new conversation *behind*
+    // the panel, which stayed on screen; `^T` opened the project panel underneath and moved focus
+    // into it. Shadowing the keys the panel wants could never have fixed this — a panel can name
+    // the keys it wants and never the ones it merely does not want to happen. See ADR 0047.
+    let sb = Sandbox::new("modalsheet");
+    let dir = sb.root.join("config/plugins/lab");
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    std::fs::write(
+        dir.join("plugin.toml"),
+        "name = \"lab\"\nversion = \"0.1.0\"\nentry = \"main.ts\"\npermissions = [\"providers\"]\n",
+    )
+    .expect("write manifest");
+    std::fs::write(dir.join("main.ts"), INVENTED_KNOB).expect("write plugin");
+    sb.write_config("[options]\n\"agent.model\" = \"lab/brainy\"\n");
+
+    let mut s = sb.start_letting_config_choose();
+    s.wait_for("lab ready");
+    s.ctrl("e");
+    s.wait_open("[model options]");
+
+    s.ctrl("n");
+    s.ctrl("t");
+    // A letter, too: a modal that let characters through would be typing into the composer behind
+    // the float, where you cannot see what you are writing.
+    s.key("z");
+    // Nothing to wait *for* — the assertion is that none of those three did anything — so this is
+    // the one case that has to spend real time before it can say so.
+    s.drain_for(Duration::from_millis(1200));
+
+    assert!(
+        s.buffers_named("[New conversation]").is_empty(),
+        "`^N` opened a conversation behind the panel\n{}",
+        s.transcript()
+    );
+    let sheet = s.buffers_named("[model options]");
+    assert!(
+        sheet.iter().any(|b| !s.windows_for(*b).is_empty()),
+        "the panel that ate the keys is not even on screen\n{}",
+        s.transcript()
+    );
+
+    // And the key that opened it closes it, which is the obligation modality creates: the global
+    // `^E` no longer arrives to toggle it off.
+    s.ctrl("e");
+    s.wait_closed("[model options]");
+}
+
+#[test]
+fn a_knob_row_says_it_is_a_control_before_you_press_anything() {
+    // A ladder with one rung lit reads identically whether or not `←→` do anything to it — which is
+    // how a live control came to look like a summary, and why `↵` on it (which means "done") felt
+    // like a key that does nothing at all.
+    let sb = Sandbox::new("railsheet");
+    let dir = sb.root.join("config/plugins/lab");
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    std::fs::write(
+        dir.join("plugin.toml"),
+        "name = \"lab\"\nversion = \"0.1.0\"\nentry = \"main.ts\"\npermissions = [\"providers\"]\n",
+    )
+    .expect("write manifest");
+    std::fs::write(dir.join("main.ts"), INVENTED_KNOB).expect("write plugin");
+    sb.write_config("[options]\n\"agent.model\" = \"lab/brainy\"\n");
+
+    let mut s = sb.start_letting_config_choose();
+    s.wait_for("lab ready");
+    s.ctrl("e");
+    s.wait_open("[model options]");
+    s.wait_for("Vibe");
+
+    assert!(
+        s.texts().iter().any(|l| l.contains("‹") && l.contains("›") && l.contains("Chill")),
+        "the row is drawn without the rail that says it is one\n{}",
+        s.transcript()
+    );
+    // And the key that changes something is named before the key that leaves.
+    assert!(s.saw("←→ change"), "the hints lead with the key that does the thing\n{}", s.transcript());
+}
+
+#[test]
 fn what_you_typed_is_what_the_transcript_keeps() {
     // The word belongs to the *request*, not to the conversation. Written into the stored message it
     // would be replayed on every later turn — so turning the level off would not turn it off — and
@@ -2221,6 +2301,91 @@ fn a_second_project_can_be_opened_and_dragged_above_the_first() {
             matches!((w, e), (Some(w), Some(e)) if w < e)
         }),
         "the project moved above the one that was newer\n{:?}",
+        s.sidebar_now()
+    );
+}
+
+/// A project is a place you work, not a property of the work in it.
+///
+/// The list used to be derived from where the conversations were, so emptying a project deleted it:
+/// you cleared out a month of threads and the directory you had been working in all month went with
+/// them, leaving nothing to start the next one from.
+#[test]
+fn a_project_outlives_the_conversations_in_it() {
+    let sb = Sandbox::new("emptyproject");
+    sb.write_config("[options]\n\"ui.confirm_destructive\" = false\n");
+    let other = sb.root.join("elsewhere");
+    std::fs::create_dir_all(&other).expect("mkdir");
+
+    {
+        let mut s = sb.start();
+        s.wait_for("PROJECTS");
+        s.send(&command_with("project.open", &other.display().to_string()));
+        assert!(
+            s.pump(|s| s.sidebar_now().iter().any(|l| l.contains("elsewhere"))),
+            "the second project appears\n{:?}",
+            s.sidebar_now()
+        );
+
+        // The conversation `project.open` started is the active one, so this is the last thing in
+        // that directory going away.
+        s.send(&command("session.close"));
+        assert!(
+            s.pump(|s| {
+                let p = s.sidebar_now();
+                p.iter().any(|l| l.contains("elsewhere"))
+                    && p.iter().any(|l| l.contains("nothing here yet"))
+            }),
+            "the project is still a row, with nothing in it\n{:?}",
+            s.sidebar_now()
+        );
+    }
+
+    // And still there next time: the list is written down rather than worked out again from
+    // whatever happens to be in it.
+    let mut s = sb.start();
+    assert!(
+        s.pump(|s| s.sidebar_now().iter().any(|l| l.contains("elsewhere"))),
+        "the project survived a restart\n{:?}",
+        s.sidebar_now()
+    );
+}
+
+/// Which means there has to be a way off the list, and it is the key that already means "for good".
+#[test]
+fn a_project_is_removed_by_the_key_on_its_heading() {
+    let sb = Sandbox::new("removeproject");
+    sb.write_config("[options]\n\"ui.confirm_destructive\" = false\n");
+    let other = sb.root.join("elsewhere");
+    std::fs::create_dir_all(&other).expect("mkdir");
+
+    let mut s = sb.start();
+    s.wait_for("PROJECTS");
+    s.send(&command_with("project.open", &other.display().to_string()));
+    assert!(s.pump(|s| s.sidebar_now().iter().any(|l| l.contains("elsewhere"))));
+    s.send(&command("session.close"));
+    assert!(s.pump(|s| s.sidebar_now().iter().any(|l| l.contains("nothing here yet"))));
+
+    // The cursor lands on the conversation you are in — the one left in `work` — and the row under
+    // it is the empty project's heading.
+    s.enter_panel();
+    s.down();
+    assert!(
+        s.pump(|s| s.sidebar_now().iter().any(|l| l.contains("X remove"))),
+        "the cursor is on a project, and the strip says the verb\n{:?}",
+        s.sidebar_now()
+    );
+
+    s.key("X");
+    assert!(
+        s.pump(|s| !s.sidebar_now().iter().any(|l| l.contains("elsewhere"))),
+        "the project is off the list\n{:?}",
+        s.sidebar_now()
+    );
+    // And the one it was sitting next to is untouched.
+    assert!(
+        s.sidebar_now().iter().any(|l| l.contains("work")),
+        "the other project is still here\n{:?}",
         s.sidebar_now()
     );
 }
@@ -5261,6 +5426,50 @@ fn a_plugins_own_provider_appears_in_the_plan_strip() {
     );
 }
 
+/// Whose allowance it is, said on the strip.
+///
+/// Three bars and no name answers "how much is left" without ever saying *of what* — and on a
+/// machine with a Claude plan and a Codex one it was two identical-looking stacks with nothing to
+/// tell them apart. The account row carries the provider's display name and its plan, and the
+/// provider here is one a plugin registered, so nothing in the sidebar or the usage plugin has
+/// heard of it: the name is read off the credential list, like the model picker reads it.
+#[test]
+fn the_plan_strip_says_which_account_it_is_about() {
+    let sb = Sandbox::new("planwho");
+    install_planner(&sb);
+    sb.write_config("[options]\n\"agent.model\" = \"planner/planner-1\"\n");
+    let mut s = sb.start_letting_config_choose();
+    s.wait_for("planner ready");
+
+    s.send(&command("planner.publish"));
+    s.wait_for("published");
+
+    assert!(
+        s.pump(|s| s.sidebar_now().iter().any(|l| l.contains("Planner"))),
+        "the account is named, not left as an instance id\n{:?}",
+        s.sidebar_now()
+    );
+
+    // What the vendor calls the plan, and the way into the panel. Both are right-aligned virtual
+    // text rather than buffer content, because only the frontend knows how wide the column is.
+    let virt = s.sidebar_virt().join("|");
+    assert!(virt.contains("flightplan"), "the plan's own name sits on the account row:\n{virt}");
+    assert!(
+        virt.contains("^L"),
+        "and the heading says how to see the rest of it:\n{virt}"
+    );
+
+    // The one row here that is a sentence. Every other row is a measurement whose direction you
+    // have to already know: a bar that fills as an allowance is *spent* reads as "how much is left"
+    // to about half of everyone. `session` is at 12% and is the window the provider marked active,
+    // so the strip says 88 — the number in the direction people ask the question.
+    let strip = s.sidebar_now().join("\n");
+    assert!(
+        strip.contains("88% left"),
+        "the binding window, in words and the right way round:\n{strip}"
+    );
+}
+
 /// A mid-turn report patches; it does not replace.
 ///
 /// `claude`'s `rate_limit_event` carries exactly one window and says nothing at all about the
@@ -5411,4 +5620,152 @@ export async function activate({ neosh }: PluginContext) {
     s.send(&command("liar.try"));
     assert!(s.pump(|s| s.saw("liar refused")), "refused, by name\n{}", s.transcript());
     assert!(!s.saw("liar accepted"), "and not accepted\n{}", s.transcript());
+}
+
+#[test]
+fn a_conversation_waiting_on_an_answer_is_marked_in_the_panel() {
+    // A conversation that has asked you something looks *exactly* like one that is thinking: the
+    // turn is still in flight, blocked on the hook, so the row is a spinner and the only way to
+    // find it is to open conversations until one of them asks. The footer can only say how many —
+    // it is one line and it is shared — so the panel is the only place that can say which.
+    //
+    // The two halves are both under test: the `questions` plugin writing `question.asking`, and
+    // this panel reading it. They are separate plugins and neither imports the other, which is the
+    // point — a question panel of your own writes the same var and this row still lights up.
+    const ASKER: &str = r#"
+import type { PluginContext } from "@neosh/api";
+
+export async function activate({ neosh }: PluginContext) {
+  await neosh.cmd.register("t.ask", async () => {
+    const answers = await neosh.ask([{
+      question: "Tabs or spaces?",
+      header: "Indentation",
+      multi_select: false,
+      options: [
+        { label: "Tabs", description: "tab characters" },
+        { label: "Spaces", description: "space characters" },
+      ],
+    }]);
+    neosh.notify(`answered: ${answers === null ? "nothing" : JSON.stringify(answers)}`);
+  });
+  // To the other conversation if there is one, to a new one if there is not.
+  await neosh.cmd.register("t.switch", async () => {
+    const list = await neosh.session.list();
+    const other = list.find((x) => !x.is_active);
+    if (other) await neosh.session.switch(other.id);
+    else await neosh.session.create({ activate: true });
+  });
+  neosh.notify("asker ready");
+}
+"#;
+    let sb = Sandbox::new("asking-row");
+    let dir = sb.root.join("config/plugins/asker");
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    std::fs::write(
+        dir.join("plugin.toml"),
+        "name = \"asker\"\nversion = \"0.1.0\"\nentry = \"main.ts\"\n",
+    )
+    .expect("manifest");
+    std::fs::write(dir.join("main.ts"), ASKER).expect("plugin");
+
+    let mut s = sb.start();
+    s.wait_for("asker ready");
+    s.wait_for("PROJECTS");
+
+    s.send(&command("t.ask"));
+    s.wait_for("Tabs or spaces?");
+    // Away, so the question is one you cannot see. This is the whole case: on screen it is a panel
+    // over the composer and nothing needs saying twice.
+    s.send(&command("t.switch"));
+    s.wait_for("conversation is asking");
+
+    let marked = |s: &Session| {
+        s.sidebar_now().iter().filter(|l| l.trim_start().starts_with("? ")).count()
+    };
+    assert!(
+        s.pump(|s| marked(s) == 1),
+        "one row says a question is waiting on it\n{:?}",
+        s.sidebar_now()
+    );
+    // And in the colour the palette keeps for waiting on something outside the program — the same
+    // one the footer's `Question.Waiting` links to. A glyph nobody can pick out of a column of
+    // thirty is a glyph that is not there.
+    let buf = s.buffer_named("[sidebar]").expect("sidebar buffer");
+    assert!(
+        s.groups_of(buf).iter().flatten().any(|g| g == "Status.Pending"),
+        "the row is coloured, not only marked\n{:?}",
+        s.groups_of(buf)
+    );
+
+    // Answering is what takes it off. Nothing to dismiss, and nothing left behind on a row that is
+    // not waiting on anybody any more.
+    //
+    // Counted rather than waited for: the question has already been on screen once, so anything
+    // scanning everything ever drawn is satisfied before the panel has come back — and the key
+    // would land in the composer of the conversation being switched to.
+    let drawn = |s: &Session| s.texts().iter().filter(|l| l.contains("Tabs or spaces?")).count();
+    let quiet = drawn(&s);
+    s.send(&command("t.switch"));
+    assert!(
+        s.pump(move |x| drawn(x) > quiet + 1),
+        "the question is in front of you again\n{}",
+        s.transcript()
+    );
+    s.key("2");
+    s.wait_for(r#""answers":["Spaces"]"#);
+    assert!(
+        s.pump(|s| marked(s) == 0),
+        "and the mark goes with the answer\n{:?}",
+        s.sidebar_now()
+    );
+}
+
+/// The row under the cursor says all of a title the column had to cut.
+///
+/// A conversation's title is the only thing telling two of them in one project apart, and a
+/// generated title is a sentence rather than a word — so a 34-column panel cuts it at about the
+/// point where it was going to say which of them this is. Arriving on the row is what asks for the
+/// rest; leaving it folds the row back, so the column is still something you read down.
+#[test]
+fn the_sidebar_row_under_the_cursor_says_all_of_a_title_it_had_to_cut() {
+    let sb = Sandbox::new("unfold");
+    let mut s = sb.start();
+    s.wait_for("PROJECTS");
+
+    let title = "a conversation whose title is longer than the panel it has to fit inside";
+    for c in title.chars() {
+        s.key(&c.to_string());
+    }
+    s.enter();
+    s.wait_for("longer than the panel");
+
+    // Cut, first of all — otherwise this test would pass on a panel that never had the problem.
+    assert!(
+        s.pump(|s| s.sidebar_now().iter().any(|l| l.contains('…'))),
+        "the title does not fit the column\n{:?}",
+        s.sidebar_now()
+    );
+    // And the tail of it is nowhere, because nothing has the cursor on it yet.
+    assert!(
+        !s.sidebar_now().iter().any(|l| l.contains("has to fit inside")),
+        "a row nobody is on stays one row\n{:?}",
+        s.sidebar_now()
+    );
+
+    // Onto the conversation, which is where the cursor already is: the panel keeps it on the
+    // conversation you are in, which is the whole point of anchoring it to a value.
+    s.enter_panel();
+    assert!(
+        s.pump(|s| s.sidebar_now().iter().any(|l| l.contains("has to fit inside"))),
+        "the row under the cursor says the rest of itself\n{:?}",
+        s.sidebar_now()
+    );
+
+    // Up onto the project, and it folds away again.
+    s.key("k");
+    assert!(
+        s.pump(|s| !s.sidebar_now().iter().any(|l| l.contains("has to fit inside"))),
+        "and folds back when the cursor leaves\n{:?}",
+        s.sidebar_now()
+    );
 }

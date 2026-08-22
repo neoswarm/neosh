@@ -104,6 +104,41 @@ kept, sampled, broadcast and drawn exactly like a built-in one — gated on havi
 driver that serves the instance, because a figure anybody could spoof is not one to draw as fact next
 to a decision about spending an afternoon.
 
+## A measurement without a name is not information
+
+The strip shipped as three bars, three percentages and three countdowns, and every one of them was
+correct. It was still not readable, for two reasons that are the same reason.
+
+It never said **whose** allowance it was. `QuotaSnapshot::instance` is a configuration key, and the
+strip drew none of it — so on a machine with a Claude plan and a Codex one it was two stacks of
+identical bars with nothing between them, and on a machine with one it answered "how much is left"
+without ever saying *of what*. The account row fixes it with the [`Brand`] the model picker already
+draws: same mark at the same three fidelities, same brand colour, same display name. The point is
+not decoration. It is that the thing you chose in `^P` and the thing being spent here are visibly
+one thing, and nothing had ever said so.
+
+And it never said **which way round** any of it went. A bar that fills as an allowance is spent
+reads as "how much is left" to about half of everyone; a bare `3h` beside a percentage is as easily
+"running for" as "back in". So one row per account is a sentence — `78% left · back in 3h` — about
+the window the vendor marked `active`, with `▸` on the row it belongs to so the sentence never has
+to name it twice. The panel does the same job with a column legend (`limit / used / last 7 days /
+refills`) and two lines saying what a rolling allowance is, because a percentage of something opaque
+is exactly the number people otherwise plan around as though it were money.
+
+Two smaller things follow from the same rule. A label is shortened by giving up its separator, then
+by abbreviating its *base*, and only then by clipping its scope — `Weekly · Opus 5` clipped from the
+right became `Weekly ·…`, which loses the only characters that distinguish a per-model cap from the
+plain weekly one and leaves two rows with the same name and different numbers. And a countdown
+counts in days once there are days: `elapsed` measures a turn, which never runs for a week, so a
+weekly window came back as `resets in 164h 34m` — a number you have to do arithmetic on to find out
+means Tuesday.
+
+The way in is on the heading. `sidebar.section` grew an optional `hint`, drawn dim at the right of
+the title, because a summary with no way out of it is one you read and then have to go and find the
+rest of by guessing — and `^L` pressed from the composer is a different affordance from a row you
+have to focus the sidebar and arrive at. It is on the contribution point rather than special-cased
+for this plugin, so the git panel or anybody else's section can say the same thing.
+
 ## Consequences
 
 - Two numbers now exist that neosh cannot verify and did not compute. Both carry their age, and the

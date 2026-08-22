@@ -27,6 +27,8 @@
  */
 
 import type {
+  Brand,
+  CredentialInfo,
   ModelEntry,
   Neosh,
   PluginContext,
@@ -116,6 +118,16 @@ async function installStrip({ neosh, subscriptions }: PluginContext) {
   let drawn = "";
   /** Windows already complained about, keyed by instance and window. Cleared when one resets. */
   const warned = new Set<string>();
+  /**
+   * Who each instance is, for the account row.
+   *
+   * Cached because this runs on a tick and the answer changes when somebody signs in, not several
+   * times a second. Refreshed on the events that can change it rather than polled.
+   */
+  let who: CredentialInfo[] = [];
+  const reload = async () => {
+    who = await neosh.agent.credentials().catch(() => [] as CredentialInfo[]);
+  };
 
   const refresh = async () => {
     const on = (await neosh.opt.get<boolean>("usage.sidebar").catch(() => true)) ?? true;
@@ -126,16 +138,23 @@ async function installStrip({ neosh, subscriptions }: PluginContext) {
       }
       return;
     }
-    const [quotas, ascii, width] = await Promise.all([
+    const [quotas, ascii, nerd, width] = await Promise.all([
       neosh.quota.list().catch(() => [] as QuotaSnapshot[]),
       neosh.opt.get<boolean>("ui.ascii_only").catch(() => false),
+      neosh.opt.get<boolean>("ui.nerd_font").catch(() => false),
       // The column this has to fit in. Read rather than assumed: the sidebar clips a contributed
       // row to its own width and then draws `right` over the top of whatever survived, so a row
       // built to a guessed width does not wrap — it collides, and the countdown lands on the last
       // letter of the label.
       neosh.opt.get<number>("sidebar.width").catch(() => 34),
     ]);
-    const item = section(quotas, ascii ?? false, width ?? 34, Date.now() / 1000);
+    // An account we cannot name yet. Reaching a quota for an instance that is not in the credential
+    // list means the list is stale — a provider registered late, or somebody has just signed in —
+    // and drawing `claude-cli` where `Claude` belongs for the rest of the session is the failure
+    // this avoids. Once per staleness, not once per frame: `who` is replaced before the next one.
+    if (quotas.some((q) => !who.some((c) => c.instance === q.instance))) await reload();
+    const glyphs = { ascii: ascii ?? false, nerd: nerd ?? false };
+    const item = section(quotas, who, glyphs, width ?? 34, Date.now() / 1000);
     // Compared as JSON rather than by identity: this runs on a tick, and re-contributing the same
     // rows makes the sidebar rebuild its whole list — cursor, scroll and all — several times a
     // second, for no change anybody can see.
@@ -149,33 +168,87 @@ async function installStrip({ neosh, subscriptions }: PluginContext) {
     await neosh.ext.contribute("sidebar.section", "plan", item, { priority: -10 });
   };
 
+  await reload();
   await refresh();
   subscriptions.push(neosh.quota.onChange((s) => {
     void refresh();
     void announce(neosh, s, warned);
   }));
   subscriptions.push(neosh.opt.onChange((e) => {
-    if (e.name === "usage.sidebar" || e.name === "ui.ascii_only") void refresh();
+    if (
+      e.name === "usage.sidebar" || e.name === "ui.ascii_only" || e.name === "ui.nerd_font" ||
+      e.name === "sidebar.width"
+    ) void refresh();
   }));
+  // A selection change is the cheap signal that the provider list may have moved — signing in is
+  // what puts a name and a mark on an account that had neither, and it is usually followed by
+  // choosing something on it. `refresh` also reloads on its own when a quota turns up for an
+  // instance it cannot name, so a sign-in nobody selected after is caught within a tick either way.
+  subscriptions.push(neosh.agent.onSelectionChange(() => void reload().then(refresh)));
   // A countdown is the only thing here that moves without anything happening, and it moves once a
   // minute. The tick is already running for the working line; `refresh` bails on an unchanged
   // render, so this costs a string compare.
   subscriptions.push(onTick(() => void refresh()));
 }
 
-/** What the sidebar is handed. `null` when there is nothing to say — no rows rather than a heading
- * over an empty block, because a section that is always there and usually empty is a section people
- * stop looking at. */
-function section(quotas: QuotaSnapshot[], ascii: boolean, width: number, now: number) {
-  const rows: Array<{ text: string; hl?: string; right?: { text: string; hl?: string }; command?: string }> = [];
+/** A contributed sidebar row, in the shape `sidebar.section` takes. */
+interface StripRow {
+  text: string;
+  hl?: string;
+  right?: { text: string; hl?: string };
+  command?: string;
+}
+
+/**
+ * What the sidebar is handed.
+ *
+ * `null` when there is nothing to say — no rows rather than a heading over an empty block, because
+ * a section that is always there and usually empty is a section people stop looking at.
+ *
+ * # Shape
+ *
+ * An account, then its limits, then one sentence. The account row is the part that used to be
+ * missing entirely: three bars and no name is a column that answers "how much is left" without
+ * ever saying *of what*, and on a machine with both a Claude plan and a Codex one it was two sets
+ * of identical-looking bars stacked on top of each other. It carries the same mark and the same
+ * brand colour the model picker uses, so the thing you chose in `^P` and the thing being spent
+ * here are visibly one thing.
+ *
+ * The sentence is the other half. A bar that fills as an allowance is *spent* and a countdown with
+ * no verb on it are both readable and neither is unambiguous — `12%` and `3h` do not say which way
+ * round they go. One line in words, about the limit that actually binds, says both: how much is
+ * left, and when it comes back.
+ */
+function section(
+  quotas: QuotaSnapshot[],
+  who: CredentialInfo[],
+  glyphs: { ascii: boolean; nerd: boolean },
+  width: number,
+  now: number,
+) {
+  const rows: StripRow[] = [];
   // What the sidebar leaves for the text (`   ` and its own margin), less the widest countdown and
   // a space to keep it off the label.
-  const room = Math.max(12, width - 6 - 5);
+  const room = Math.max(14, width - 6 - 5);
+
   for (const q of quotas) {
     if (q.windows.length === 0) continue;
-    for (const w of q.windows) {
+    // Air between accounts. Two of them run together into one block of bars otherwise, and the
+    // second account's name reads as another limit belonging to the first.
+    if (rows.length > 0) rows.push({ text: "" });
+    rows.push(accountRow(q, who, glyphs, room));
+    // Widest label first, so every bar in an account starts in the same column — a bar whose left
+    // edge moves from row to row cannot be compared with the one above it, which is the only thing
+    // a stack of bars is for.
+    const labels = q.windows.map((w) => compactLabel(w, room));
+    const labelWidth = Math.min(
+      Math.max(...labels.map(cells)),
+      Math.max(6, room - MARKER - BAR_MIN - PCT - 1),
+    );
+    const bar = Math.max(BAR_MIN, Math.min(10, room - MARKER - labelWidth - PCT - 1));
+    for (const [i, w] of q.windows.entries()) {
       rows.push({
-        text: windowRow(w, ascii, room),
+        text: windowRow(w, labels[i] ?? w.label, labelWidth, bar, glyphs.ascii),
         hl: severityGroup(w),
         right: { text: countdown(w, now), hl: "Sidebar.Dim" },
         // Every row opens the panel, so there is no row here you can land on and press `↵` on to
@@ -183,32 +256,174 @@ function section(quotas: QuotaSnapshot[], ascii: boolean, width: number, now: nu
         command: `${NS}.panel`,
       });
     }
+    const said = plainly(q, now, room);
+    if (said) rows.push({ ...said, command: `${NS}.panel` });
     const credit = creditRow(q);
     if (credit) rows.push({ ...credit, command: `${NS}.panel` });
   }
   if (rows.length === 0) return null;
-  return { title: "PLAN", at: "below" as const, rows };
+  // The way in, on the heading. Every row here opens the panel too, but a key you can press from
+  // the composer without going to the sidebar first is a different affordance from a row you have
+  // to arrive at — and it is the one somebody who has never focused this column will find.
+  return { title: "PLAN", hint: "^L", at: "below" as const, rows };
+}
+
+/**
+ * Whose allowance this is: the provider's mark, its name, and what the plan is called.
+ *
+ * The mark and the colour come from the same [`Brand`] the model picker draws, at whatever fidelity
+ * the terminal has — a Nerd Font glyph, geometry, or a letter under `ui.ascii_only`. Drawing our
+ * own would mean two pictures of Anthropic in one program that disagree.
+ *
+ * The name is the *instance's* display name rather than the vendor's, because that is what the
+ * picker calls it and what a second account of the same vendor would be distinguished by. Falling
+ * back to the instance id is deliberate: `claude-cli` is worse than `Claude` and far better than a
+ * blank row, and it happens only before the credential list has arrived.
+ */
+function accountRow(
+  q: QuotaSnapshot,
+  who: CredentialInfo[],
+  glyphs: { ascii: boolean; nerd: boolean },
+  room: number,
+): StripRow {
+  const cred = who.find((c) => c.instance === q.instance);
+  const name = cred?.display_name || q.instance;
+  const mark = markFor(cred?.brand, glyphs);
+  return {
+    text: `${mark} ${clip(name, Math.max(4, room - 2))}`,
+    // The brand colour on the whole row, not just the mark: a contributed row carries one highlight
+    // group, and of the two ways to spend it, the one that makes the account legible at a glance
+    // beats a coloured glyph beside grey text.
+    hl: cred?.brand?.hl ?? "Sidebar.Heading",
+    right: q.plan ? { text: q.plan, hl: "Sidebar.Dim" } : undefined,
+  };
+}
+
+/** The mark for a provider, at whatever fidelity this terminal has. See the model picker's copy. */
+function markFor(b: Brand | null | undefined, glyphs: { ascii: boolean; nerd: boolean }): string {
+  if (!b) return glyphs.ascii ? "?" : "·";
+  if (glyphs.ascii) return b.ascii;
+  return (glyphs.nerd && b.nerd) || b.mark;
 }
 
 /**
  * How many cells a bar in a narrow column is.
  *
- * Eight, because the useful resolution here is about an eighth: plenty of room, getting full,
+ * Six to ten, because the useful resolution here is about an eighth: plenty of room, getting full,
  * nearly out. The exact figure is the number beside it, and a thirty-cell bar in a column this
  * narrow would leave no room for the label that says which allowance it is.
+ */
+const BAR_MIN = 5;
+/** `▸ `, or the two spaces that keep an unmarked row in the same column as a marked one. */
+const MARKER = 2;
+/** ` 100%` — never given up, at any width. A bar with no number on it is a picture. */
+const PCT = 5;
+
+/**
+ * A limit's name, shortened only as far as it has to be, and never past the part that identifies it.
  *
- * Shared by the plan strip and the context meter, which sit in the same kind of space and would
- * read as two different scales if they disagreed.
+ * The old row put the bar first and clipped whatever was left of the label, which turned
+ * `Weekly · Opus 5` into `Weekly ·…` — every character that distinguishes the per-model cap from
+ * the plain weekly one, gone, leaving two rows with the same name and different numbers. So the
+ * ladder goes the other way: give up the separator, then abbreviate the *base*, and only then clip
+ * — and clip the scope, because `Wk Opus…` still says which two things it is about and
+ * `Weekly ·…` says neither.
+ */
+function compactLabel(w: QuotaWindow, room: number): string {
+  // The space between the label and the bar is part of the row too. Forgetting it is one column of
+  // overflow at exactly the width where the label was already the thing being squeezed.
+  const most = Math.max(6, room - MARKER - BAR_MIN - PCT - 1);
+  if (cells(w.label) <= most) return w.label;
+  const scope = w.scope ?? "";
+  // Not a scoped limit, just a long name from a provider nobody here has heard of.
+  if (scope === "") return clip(w.label, most);
+  const base = w.label.slice(0, w.label.length - scope.length).replace(/[\s·]+$/, "");
+  for (const b of [base, base.replace(/^Weekly$/i, "Wk")]) {
+    if (cells(`${b} ${scope}`) <= most) return `${b} ${scope}`;
+  }
+  const short = base.replace(/^Weekly$/i, "Wk");
+  return clip(`${short} ${scope}`, most);
+}
+
+function windowRow(
+  w: QuotaWindow,
+  label: string,
+  labelWidth: number,
+  bar: number,
+  ascii: boolean,
+): string {
+  // The limit that would actually refuse the next request, marked the way the panel marks it. Two
+  // spaces otherwise, so the labels stay in one column.
+  const marker = w.active ? (ascii ? "> " : "▸ ") : "  ";
+  const pct = `${Math.round(w.used_percent)}%`.padStart(PCT);
+  const name = clip(label, labelWidth);
+  return `${marker}${name}${" ".repeat(Math.max(0, labelWidth - cells(name)))} ${
+    meter(w.used_percent / 100, bar, { ascii })
+  }${pct}`;
+}
+
+/**
+ * How long a string is, counted the way {@link clip} counts it.
+ *
+ * Code points rather than UTF-16 units, so a label and the padding computed for it agree. Not
+ * display width — that question is `neosh-tui`'s and is not answerable here — but the labels this
+ * pads are limit names, and the alternative is a `.length` that disagrees with the clip on the
+ * same string.
+ */
+function cells(s: string): number {
+  return [...s].length;
+}
+
+/**
+ * The one row here that is a sentence.
+ *
+ * Everything above it is a measurement, and a measurement has a direction you have to already know:
+ * a bar that fills as an allowance is spent reads as "how much is left" to about half of everyone,
+ * and a bare `3h` beside it could as easily be how long it has been running. This says which way
+ * round both go, about the window that is actually doing the limiting — which is the only one of
+ * the three that answers "may I start something long".
+ *
+ * It never names the window. The `▸` above already did, and a strip this narrow cannot afford to
+ * say `Weekly · Opus 5` twice.
+ */
+function plainly(q: QuotaSnapshot, now: number, room: number): StripRow | null {
+  const w = q.windows.find((x) => x.active) ?? binding(q.windows);
+  if (!w) return null;
+  const back = typeof w.resets_at === "number" ? countdown(w, now) : "";
+  const left = Math.max(0, 100 - Math.round(w.used_percent));
+  const text = left === 0
+    ? back
+      ? `used up · back in ${back}`
+      : "used up"
+    : back
+      ? `${left}% left · back in ${back}`
+      : `${left}% left`;
+  return {
+    text: clip(text, room),
+    // Dim rather than graded: this is the explanation of the rows above, and an explanation that
+    // shouts is one more red thing to work out the meaning of. The row it explains carries the
+    // grade.
+    hl: w.severity === "exhausted" ? "Diagnostic.Error" : "Sidebar.Dim",
+  };
+}
+
+/** The fullest window, for a provider that did not say which of its limits binds. */
+function binding(windows: QuotaWindow[]): QuotaWindow | undefined {
+  return windows.reduce<QuotaWindow | undefined>(
+    (best, w) => (!best || w.used_percent > best.used_percent ? w : best),
+    undefined,
+  );
+}
+
+/**
+ * How many cells the context meter in the footer is.
+ *
+ * Eight, because the useful resolution there is about an eighth: plenty of room, getting full,
+ * nearly out. The exact figure is the number beside it. The plan strip sizes its own bars from the
+ * column it was given (see [`BAR_MIN`]) rather than sharing this, because the footer's width is the
+ * terminal's and the sidebar's is a setting.
  */
 const CELLS = 8;
-
-function windowRow(w: QuotaWindow, ascii: boolean, room: number): string {
-  const pct = Math.round(w.used_percent);
-  const head = `${meter(w.used_percent / 100, CELLS, { ascii })} ${String(pct).padStart(3)}% `;
-  // The bar and the number are never given up; the label is. A row that dropped a digit off `100%`
-  // to keep the word `Fable` would be losing the only part of it that is a measurement.
-  return head + clip(w.label, Math.max(3, room - CELLS - 6));
-}
 
 /**
  * The group a row wears.
@@ -335,6 +550,14 @@ interface View {
   asked: boolean;
   /** What the scan could not read, drawn as a caveat rather than swallowed. */
   note: string | null;
+  /**
+   * Who each instance is, so a gauge can be headed by a provider rather than by an id.
+   *
+   * `claude-cli` is a configuration key. It was what this panel drew, and on a machine with two
+   * accounts it made the one thing the reader needs to tell them apart — which vendor, which plan —
+   * the one thing neither block said.
+   */
+  who: CredentialInfo[];
 }
 
 const WINDOWS = [1, 7, 30, 90];
@@ -353,6 +576,7 @@ async function installPanel({ neosh, subscriptions }: PluginContext) {
     loading: false,
     asked: false,
     note: null,
+    who: [],
   };
 
   const load = async () => {
@@ -361,14 +585,16 @@ async function installPanel({ neosh, subscriptions }: PluginContext) {
     const until = Math.floor(Date.now() / 1000);
     const since = until - view.days * 86_400;
     const resolution: UsageResolution = view.days <= 1 ? "hour" : "day";
-    const [history, quotas, samples] = await Promise.all([
+    const [history, quotas, samples, who] = await Promise.all([
       neosh.quota.usage({ since, until, resolution }).catch(() => null),
       neosh.quota.list().catch(() => [] as QuotaSnapshot[]),
       // The sparklines want the reset period, not the chart's span: a weekly window drawn over
       // ninety days is a flat line with four cliffs in it, which says nothing about this week.
       neosh.quota.history({ since: until - 7 * 86_400, until }).catch(() => []),
+      neosh.agent.credentials().catch(() => [] as CredentialInfo[]),
     ]);
     view.history = history;
+    view.who = who;
     // Merged, never assigned. This read started seconds ago — the transcript scan is the slow part
     // — and a snapshot that arrived by event in the meantime is newer than anything in it. Assigned,
     // a poll landing during the scan was drawn for an instant and then replaced by the empty list
@@ -384,8 +610,12 @@ async function installPanel({ neosh, subscriptions }: PluginContext) {
   const draw = async () => {
     if (buf === null || ns === null || list === null) return;
     const cols = Math.max(40, await panelWidth(neosh, win));
-    const ascii = (await neosh.opt.get<boolean>("ui.ascii_only").catch(() => false)) ?? false;
-    const rows = await body(neosh, view, cols, ascii);
+    const [ascii, nerd] = await Promise.all([
+      neosh.opt.get<boolean>("ui.ascii_only").catch(() => false),
+      neosh.opt.get<boolean>("ui.nerd_font").catch(() => false),
+    ]);
+    const glyphs = { ascii: ascii ?? false, nerd: nerd ?? false };
+    const rows = await body(neosh, view, cols, glyphs);
     list.setRows(rows);
     await list.render({ win: win ?? undefined });
   };
@@ -566,8 +796,9 @@ async function body(
   neosh: Neosh,
   view: View,
   cols: number,
-  ascii: boolean,
+  glyphs: { ascii: boolean; nerd: boolean },
 ): Promise<ListRow<null>[]> {
+  const { ascii } = glyphs;
   const rows: ListRow<null>[] = [];
   const rule = () => rows.push({ text: "─".repeat(cols), hl: "Separator", inert: true });
   const blank = () => rows.push({ text: "", inert: true });
@@ -580,8 +811,28 @@ async function body(
     });
 
   const now = Date.now() / 1000;
-  head("YOUR PLAN", view.quotas.length ? `${NS}.panel.refresh · r` : undefined);
+  // `r refresh`, not `usage.panel.refresh · r`. A command name in a heading is the program telling
+  // you what it calls something rather than what you can do with it.
+  head("YOUR PLAN", view.quotas.length ? "r refresh" : undefined);
   rule();
+  if (view.quotas.length > 0) {
+    // What these numbers *are*, which no amount of care with the bars can say on its own. A rolling
+    // allowance is not a balance and not a token count: it refills on a clock, the vendor decides
+    // how big it is and will not itemise it, and a turn you ran in the vendor's own CLI spent it
+    // too. Everything below is a percentage of something opaque, and saying so once is what stops
+    // people planning around it as though it were money.
+    rows.push({
+      text: "   Rolling allowances your plan enforces. They refill on a clock, and the vendor",
+      hl: "Comment",
+      inert: true,
+    });
+    rows.push({
+      text: "   never says how big they are — so these are percentages, never token counts.",
+      hl: "Comment",
+      inert: true,
+    });
+    blank();
+  }
   if (view.quotas.length === 0) {
     // Two different situations, and only one of them is about to change on its own. A workspace
     // that has never been told is waiting for a turn; one that asked and got nowhere is waiting
@@ -603,7 +854,7 @@ async function body(
     });
   }
   for (const q of view.quotas) {
-    rows.push(...gaugeBlock(q, view.samples, cols, ascii, now));
+    rows.push(...gaugeBlock(q, view.who, view.samples, cols, glyphs, now));
   }
 
   blank();
@@ -662,16 +913,25 @@ function hints(): string {
  */
 function gaugeBlock(
   q: QuotaSnapshot,
+  who: CredentialInfo[],
   samples: View["samples"],
   cols: number,
-  ascii: boolean,
+  glyphs: { ascii: boolean; nerd: boolean },
   now: number,
 ): ListRow<null>[] {
+  const { ascii } = glyphs;
   const rows: ListRow<null>[] = [];
   const age = now - q.observed_at;
+  // The provider, drawn the way the model picker draws it: same mark, same brand colour, same name.
+  // This row used to be the instance id, which is a configuration key — and on a machine with a
+  // Claude plan and a Codex one it made the single thing that tells the two blocks apart the one
+  // thing neither of them said.
+  const cred = who.find((c) => c.instance === q.instance);
   rows.push({
-    text: `   ${q.instance}${q.plan ? `  ${q.plan}` : ""}`,
-    hl: "Sidebar.Heading",
+    text: `   ${markFor(cred?.brand, glyphs)} ${cred?.display_name || q.instance}${
+      q.plan ? `  ${q.plan}` : ""
+    }`,
+    hl: cred?.brand?.hl ?? "Sidebar.Heading",
     // How old the number is, always. A percentage with no age on it is one people trust for longer
     // than they should — and at rest, with polling off, "an hour ago" is the whole answer.
     right: { text: `${freshness(age, q.source)} `, hl: "Comment" },
@@ -687,6 +947,20 @@ function gaugeBlock(
   // the word `resets`.
   const FIXED = 5 + labelWidth + 2 + 6 + 2 + SPARK + 2 + 18;
   const barWidth = Math.max(8, Math.min(40, cols - FIXED));
+
+  // What each column is, once, over the columns themselves.
+  //
+  // Every part of the row below is a measurement with a direction you have to already know: a bar
+  // that fills as an allowance is *spent*, a sparkline that is not labelled could be any span, and
+  // a bare `3h` is as easily "running for" as "back in". Naming them costs one dim row per account
+  // and is the difference between a display you read and one you interpret.
+  rows.push({
+    text: `     ${"limit".padEnd(labelWidth)}  ${"used".padEnd(barWidth)}      ${
+      "last 7 days".padEnd(SPARK)
+    }  refills`,
+    hl: "Comment",
+    inert: true,
+  });
 
   for (const w of q.windows) {
     const pct = Math.round(w.used_percent);
@@ -739,6 +1013,14 @@ function resetsWord(w: QuotaWindow, now: number): string {
   if (typeof w.resets_at !== "number") return "";
   const left = w.resets_at - now;
   if (left <= 0) return "resetting";
+  // Days, once there are any. `elapsed` counts a turn, which never runs for a week, so it tops out
+  // at hours — and a weekly allowance came back as `resets in 164h 34m`, a number you have to do
+  // arithmetic on to find out it means Tuesday.
+  if (left >= 86_400) {
+    const days = Math.floor(left / 86_400);
+    const hours = Math.floor((left % 86_400) / 3600);
+    return `resets in ${days}d${hours > 0 ? ` ${hours}h` : ""}`;
+  }
   return `resets in ${elapsed(left * 1000).replace(/ \d+s$/, "")}`;
 }
 

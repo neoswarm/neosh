@@ -101,6 +101,15 @@ const POINT_ACTION = "sidebar.action";
 interface SectionItem {
   /** Drawn as a heading with a rule under it, matching `PROJECTS`. Omit for rows with no heading. */
   title?: string;
+  /**
+   * The way in, drawn dim at the right of the heading: `^L`, `^G`.
+   *
+   * A section here is a summary of something that has a real panel behind it, and a summary with no
+   * way out of it is one you read and then have to go and find the rest of by guessing. The heading
+   * is where it goes because that costs no row and is the first thing the eye lands on — a hint on
+   * the last row is one you have already scrolled past by the time you want it.
+   */
+  hint?: string;
   /** Where it goes relative to the project list. Defaults to `below`. */
   at?: "above" | "below";
   rows?: Array<{
@@ -169,14 +178,55 @@ const VAR_FAVORITE = "sidebar.favorite";
 const VAR_RANK = "sidebar.rank";
 const VAR_FOLDED = "sidebar.folded";
 /**
- * The directories this panel knows about, in workspace scope.
+ * The projects, in workspace scope. This list *is* what the panel shows.
  *
- * An index rather than a second source of truth: a project with no conversation in it has nothing
- * to derive its existence from, so pinning one has to be written down somewhere. Kept current from
- * both ends — every conversation's directory goes in, and so does any directory somebody sets a
- * project var on, which is how a project this panel has never seen becomes a row in it.
+ * It used to be an index — a hint, with the real list derived from the conversations that happened
+ * to live somewhere. That is the bug this replaced: deleting the last conversation in a directory
+ * deleted the directory too, so clearing out a project you had spent a month in removed it from the
+ * panel and there was nothing left to start the next conversation from. A project is a place you
+ * work, not a property of the work in it.
+ *
+ * Kept current from three ends — every conversation's directory goes in, so does any directory
+ * somebody sets a project var on, and so does anything added by hand — and taken out of by exactly
+ * one thing, which is asking for it to go. See [`Arrangement.forget`].
  */
 const VAR_KNOWN = "sidebar.projects";
+/**
+ * What a project is called, remembered for when there is nothing in it to ask.
+ *
+ * The name comes from the host, which reads it off the repository — `neosh (feat/thing)` for a
+ * worktree rather than the directory's own `wt-fe3c0d93` — and it arrives stamped on a conversation.
+ * A project with no conversations left has nobody to ask, and falling back to the basename renames
+ * a worktree you have used for a fortnight into something you do not recognise the moment you empty
+ * it. Written when it is known, read when it is not.
+ */
+const VAR_NAME = "sidebar.name";
+/**
+ * The checkout a directory is a linked worktree of, for when there is nothing in it to ask.
+ *
+ * Which tree belongs to which repository is read off a conversation's `repo_root`, so a worktree
+ * you have emptied has nobody to say it — and without this it stops being a worktree the moment it
+ * stops having conversations, jumps out of the repository it belongs to and lands at the top level
+ * as a project of its own. Which is the thing ADR 0046 is about, arrived at from the other
+ * direction: a tree does not become a project by being idle.
+ */
+const VAR_ROOT = "sidebar.root";
+/**
+ * Which conversations have stopped and are waiting on an answer.
+ *
+ * Written by whatever serves `ask_user` — the bundled `questions` plugin, or yours instead of it —
+ * and read here, which is the whole reason it is a var and not that plugin's private state. Nothing
+ * else in this column can be worked out: a conversation blocked on a question still has a turn in
+ * flight, so `active_turn` is set and the row it draws is the spinner, identical to the twenty above
+ * it that are actually thinking. An answer nobody is going to give looks like work in progress until
+ * you happen to open it.
+ *
+ * So it outranks *working* wherever the two meet below, and it wears `Status.Pending` — the
+ * palette's own group for waiting on something outside the program, which is what the footer's
+ * `Question.Waiting` links to, so the two say the same thing in the same colour without this panel
+ * having to know the other one exists.
+ */
+const VAR_ASKING = "question.asking";
 
 export async function activate({ neosh, subscriptions }: PluginContext) {
   await declareOptions(neosh);
@@ -197,12 +247,22 @@ export async function activate({ neosh, subscriptions }: PluginContext) {
       .map((s) => s.cwd),
   );
 
+  // Read once and then kept current from `vars.onChange`, like the arrangement and for the same
+  // reason: a draw runs on a 100 ms tick while a turn is in flight and must not spend a round trip
+  // per frame asking a question whose answer changes twice an hour.
+  let asking = asked(
+    await neosh.vars.get<string[]>({ scope: "global" }, VAR_ASKING).catch(() => null),
+  );
+
   // The kind is what makes this panel something other plugins can act on: it is the scope their
   // keymaps bind at and the handle `win.ofKind` finds it by. One argument, and the difference
   // between a panel you can extend and one you can only replace.
   const buf = await neosh.buf.create({ name: "[sidebar]", scratch: true, kind: KIND });
   const ns = await neosh.ns.create(NS);
-  const list = new CursoredList<Target>(neosh, buf, ns);
+  // The panel's own width, as of the last frame. The list needs it to unfold the row under the
+  // cursor, and reading the option again per render would be a round trip inside a redraw.
+  let panelWidth = 34;
+  const list = new CursoredList<Target>(neosh, buf, ns, { width: () => panelWidth });
   let win: WindowId | null = null;
   let focused = false;
   let capture: Disposable | null = null;
@@ -231,13 +291,15 @@ export async function activate({ neosh, subscriptions }: PluginContext) {
           neosh.opt.get<boolean>("ui.ascii_only"),
           neosh.opt.get<boolean>("sidebar.hints"),
         ]);
+        panelWidth = width ?? 34;
         const built = await collect(neosh, arrangement, {
-          width: width ?? 34,
+          width: panelWidth,
           ascii: ascii ?? false,
           hints: hints ?? true,
           focused,
           selected: list.value,
           actions: actions(),
+          asking,
           // Filled in by `collect`, which is what reads the swarm.
           remote: new Map(),
           hosts: new Map(),
@@ -324,6 +386,12 @@ export async function activate({ neosh, subscriptions }: PluginContext) {
   subscriptions.push(
     neosh.vars.onChange((e) => {
       if (arrangement.observe(e.scope, e.key, e.value)) void draw();
+      // Somebody started waiting on an answer, or stopped. Deleting the var is how "nobody is
+      // asking" arrives, and it comes through here with `value` unset rather than as an empty list.
+      if (e.scope.scope === "global" && e.key === VAR_ASKING) {
+        asking = asked(e.value);
+        void draw();
+      }
     }),
   );
   // Rows somebody contributed came or went. Redrawing on this is what stops a plugin that loads
@@ -484,7 +552,10 @@ class Arrangement {
     this.cache.set(scope.cwd, entry);
     // A project somebody else has just said something about is a project this panel should be
     // showing. Without this, pinning a directory from another plugin sets a var nothing ever reads.
-    if (!this.known.includes(scope.cwd)) {
+    //
+    // A var being *removed* is not somebody saying something about a project — it is the last thing
+    // `forget` does, and treating it as an announcement would put the project straight back.
+    if (value !== null && value !== undefined && !this.known.includes(scope.cwd)) {
       this.known.push(scope.cwd);
       void this.neosh.vars.set({ scope: "global" }, VAR_KNOWN, this.known);
     }
@@ -507,9 +578,55 @@ class Arrangement {
     await this.neosh.vars.set({ scope: "global" }, VAR_KNOWN, this.known);
   }
 
-  /** Pinned directories. Also the seed for projects with no conversations. */
-  pinned(): string[] {
-    return this.known.filter((cwd) => this.isFavorite(cwd));
+  /** Every project, whether or not there is anything going on in it. The panel's list. */
+  all(): string[] {
+    return [...this.known];
+  }
+
+  /** What this project was called the last time anything knew. `null` when nothing ever did. */
+  name(cwd: string): string | null {
+    const v = this.cache.get(cwd)?.[VAR_NAME];
+    return typeof v === "string" && v !== "" ? v : null;
+  }
+
+  /** The checkout this one is a worktree of, if anything ever said so. */
+  root(cwd: string): string | null {
+    const v = this.cache.get(cwd)?.[VAR_ROOT];
+    return typeof v === "string" && v !== "" && v !== cwd ? v : null;
+  }
+
+  /**
+   * Write down what the host calls a project, for when it is empty.
+   *
+   * Called from the draw path with every project that has a conversation to read a name off, so it
+   * has to be free when nothing has changed — which it is: the cache is checked first and the
+   * common case is a comparison per project per frame.
+   */
+  remember(named: Array<{ cwd: string; name: string; root?: string }>): void {
+    for (const { cwd, name, root } of named) {
+      if (name !== "" && this.name(cwd) !== name) void this.set(cwd, VAR_NAME, name);
+      if (root !== undefined && root !== cwd && this.root(cwd) !== root) {
+        void this.set(cwd, VAR_ROOT, root);
+      }
+    }
+  }
+
+  /**
+   * Take a project out of the list.
+   *
+   * The one thing that removes one, and the reason the list can be trusted to survive its
+   * conversations. Only this panel's own vars go: another plugin's note about the directory is that
+   * plugin's to keep, and a directory it still cares about comes back the next time it says so.
+   */
+  async forget(cwd: string): Promise<void> {
+    this.known = this.known.filter((c) => c !== cwd);
+    this.cache.delete(cwd);
+    await this.neosh.vars.set({ scope: "global" }, VAR_KNOWN, this.known);
+    await Promise.all(
+      [VAR_FAVORITE, VAR_RANK, VAR_FOLDED, VAR_NAME, VAR_ROOT].map((key) =>
+        this.neosh.vars.remove(projectScope(cwd), key).catch(() => {})
+      ),
+    );
   }
 
   isFavorite(cwd: string): boolean {
@@ -717,10 +834,23 @@ async function registerCommands(w: Wiring): Promise<void> {
     await setArchived(neosh, target.id, true);
   });
   // Shifted, because this is the one that cannot be undone.
-  await verb(`${NS}.delete`, "X", "Delete this conversation permanently", async (target) => {
-    if (target?.kind !== "session") return;
-    await deleteSession(neosh, target.id);
-  });
+  //
+  // One key, two rows, and the same sentence: take this off the list for good. On a heading that is
+  // the project — which is the verb that had been missing entirely, and the reason the panel used
+  // to remove a project *for* you the moment you deleted the last thing in it.
+  await verb(
+    `${NS}.delete`,
+    "X",
+    "Delete this conversation, or remove this project",
+    async (target) => {
+      if (target?.kind === "project") {
+        await removeProject(neosh, arrangement, target.cwd);
+        return;
+      }
+      if (target?.kind !== "session") return;
+      await deleteSession(neosh, target.id);
+    },
+  );
   await verb(`${NS}.new`, "n", "New conversation in this project", async (target) => {
     // The same question `^N` asks, about the project you are looking at — which is the whole reason
     // the cursor is there. It used to create one outright, and that was the bug: `n` and `^N` were
@@ -823,6 +953,19 @@ async function registerCommands(w: Wiring): Promise<void> {
         neosh.notify(String(e), "warn");
       }
     }, { desc: "Add a project — start a conversation in another directory" }),
+  );
+  w.subscriptions.push(
+    await neosh.cmd.register("project.remove", async (args) => {
+      // The row under the cursor when there is one, so the palette entry does something useful from
+      // inside the panel and a plugin can still name a directory outright.
+      const cwd = args[0]?.trim() || owningProject(list.value);
+      if (!cwd) {
+        neosh.notify("project.remove needs a directory", "warn");
+        return;
+      }
+      await removeProject(neosh, arrangement, cwd);
+      await w.draw();
+    }, { desc: "Take a project off the list" }),
   );
 
   await neosh.keymap.set("chat", "<C-b>", "sidebar.toggle", { desc: "Toggle the sidebar" });
@@ -1288,6 +1431,72 @@ async function deleteSession(neosh: Neosh, session: string): Promise<boolean> {
     neosh.notify(String(e), "warn");
     return false;
   }
+}
+
+/**
+ * Take a project off the list.
+ *
+ * Empty, this asks nothing: no file moves, the row goes, and `o` puts the directory back in one
+ * keystroke — a dialog for that is the kind you learn to clear without reading. With conversations
+ * still in it, removing the project is deleting every one of them, so it asks as the delete it is
+ * and says how many and where they would otherwise go.
+ *
+ * The conversations go first and the project only goes if they all did. The store refuses to delete
+ * the very last conversation in the workspace — there has to be somewhere for the next message to
+ * land — and a project removed anyway would take a row that still had something in it off the list.
+ */
+async function removeProject(
+  neosh: Neosh,
+  arrangement: Arrangement,
+  cwd: string,
+): Promise<void> {
+  const inside = (await neosh.session.list({ includeArchived: true }).catch(() => [] as SessionInfo[]))
+    .filter((s) => s.cwd === cwd);
+  const name = inside[0]?.project || arrangement.name(cwd) || basename(cwd);
+
+  if (inside.length > 0) {
+    const many = inside.length === 1 ? "conversation" : `${inside.length} conversations`;
+    const ok = await confirmDestructive(neosh, `Remove "${clip(name, 40)}" and its ${many}?`, {
+      yes: "Delete",
+      no: "Keep",
+      detail: [
+        atStake(inside),
+        "`x` on a conversation archives it instead, and an archived one is already out of the way.",
+      ],
+    });
+    if (!ok) return;
+    for (const s of inside) {
+      try {
+        await neosh.session.close(s.id);
+      } catch (e) {
+        neosh.notify(String(e), "warn");
+        return;
+      }
+    }
+  }
+
+  await arrangement.forget(cwd);
+  neosh.notify(`removed ${short(cwd)} — \`o\` adds it back`);
+}
+
+/**
+ * How much is about to go, in a sentence.
+ *
+ * What is at stake is the point of the question, and the number that says it is how many of these
+ * you would still have found in the panel: something you archived a month ago going is a different
+ * size of loss from a conversation you were in this morning.
+ */
+function atStake(inside: SessionInfo[]): string {
+  const archived = inside.filter((s) => s.archived).length;
+  if (inside.length === 1) {
+    return archived === 1
+      ? "It is archived, and it goes from disk with the project."
+      : "It goes from disk with the project.";
+  }
+  if (archived === inside.length) return `All ${inside.length} are archived, and all of them go from disk.`;
+  if (archived === 0) return `All ${inside.length} go from disk.`;
+  const live = inside.length - archived;
+  return `${live} of them ${live === 1 ? "is" : "are"} still in your list, and all ${inside.length} go from disk.`;
 }
 
 /**
@@ -1836,10 +2045,11 @@ async function renameSession(neosh: Neosh, session: string): Promise<void> {
 /**
  * Projects, as two ordered groups: pinned, then the rest.
  *
- * A project is a directory some conversation lives in — there is no registry to keep in sync, and
- * opening a conversation in another checkout is what makes a second project appear. Pinned
- * directories are seeded even with nothing in them, so unpinning is the only way a favourite
- * disappears.
+ * A project is a directory you have worked in — added by hand, or arrived at because a conversation
+ * was started there — and it stays one until you remove it. Every known directory is seeded, empty
+ * or not, which is the whole of the fix for a project vanishing when you cleared out its
+ * conversations: the list is written down (see [`VAR_KNOWN`]) rather than inferred from what
+ * happens to be in it, and `X` on the heading is the only thing that shortens it.
  */
 function group(
   sessions: SessionInfo[],
@@ -1847,20 +2057,25 @@ function group(
   keys: Map<string, string>,
 ): Project[][] {
   const by = new Map<string, SessionInfo[]>();
-  for (const cwd of arrangement.pinned()) by.set(cwd, []);
+  for (const cwd of arrangement.all()) by.set(cwd, []);
   for (const s of sessions) {
     const existing = by.get(s.cwd);
     if (existing) existing.push(s);
     else by.set(s.cwd, [s]);
   }
 
-  // Which checkout each directory is a linked worktree of, learned from its conversations. A
-  // pinned directory with nothing in it has nobody to say, and stays top-level until it does.
+  // Which checkout each directory is a linked worktree of, learned from its conversations — and
+  // from what was written down the last time one of them said so, because a project stays on the
+  // list after its conversations have gone and an emptied worktree is still a worktree.
   const rootOf = new Map<string, string>();
   for (const s of sessions) {
     if (s.repo_root && s.repo_root !== s.cwd && !rootOf.has(s.cwd)) {
       rootOf.set(s.cwd, s.repo_root);
     }
+  }
+  for (const cwd of by.keys()) {
+    const remembered = arrangement.root(cwd);
+    if (remembered && !rootOf.has(cwd)) rootOf.set(cwd, remembered);
   }
 
   // `session.list()` is most-recently-used first, so index in it is recency. Anything you have
@@ -1875,8 +2090,9 @@ function group(
     // What the host decided to call it. For a worktree that is the repository and the branch,
     // rather than whatever the directory happens to be named — a row reading `wt-fe3c0d93`
     // tells you nothing about which checkout it is, and reads as somebody else's directory having
-    // wandered into your workspace.
-    name: list[0]?.project || basename(cwd),
+    // wandered into your workspace. With nothing in it there is nobody to ask, so the last answer
+    // is kept: emptying a project must not also rename it.
+    name: list[0]?.project || arrangement.name(cwd) || basename(cwd),
     favorite: arrangement.isFavorite(cwd),
     sessions: list,
     key: keys.get(cwd) ?? `dir:${basename(cwd)}`,
@@ -1940,10 +2156,24 @@ interface DrawOptions {
   selected: Target | undefined;
   /** The verbs other plugins put on our rows, for the hint strip. */
   actions: ActionItem[];
+  /** Which conversations are waiting on an answer from you. See [`VAR_ASKING`]. */
+  asking: Set<string>;
   /** Conversations on other computers, grouped by the project key they share with ours. */
   remote: Map<string, SwarmAgent[]>;
   /** Which other machines have each project, by key. */
   hosts: Map<string, string[]>;
+}
+
+/**
+ * The waiting set, out of whatever was in the var.
+ *
+ * Checked rather than trusted, like every contribution: this is JSON written by a plugin this one
+ * has never heard of, and a panel that throws on it is a panel a third party can take off the screen
+ * by writing a string where a list goes.
+ */
+function asked(value: unknown): Set<string> {
+  if (!Array.isArray(value)) return new Set();
+  return new Set(value.filter((v): v is string => typeof v === "string"));
 }
 
 async function collect(
@@ -1989,6 +2219,14 @@ async function collect(
   // A directory that turned up in the conversation list and we had not seen before. Noted rather
   // than fetched inline: the draw runs on a tick and must not wait on a round trip per project.
   void arrangement.note(all.map((s) => s.cwd));
+  // And what the host calls it, and which checkout a tree hangs off, so the row still says both
+  // once the last conversation in it has gone.
+  arrangement.remember([
+    ...projects.filter((p) => p.sessions.length > 0),
+    ...projects.flatMap((p) =>
+      p.worktrees.filter((t) => t.sessions.length > 0).map((t) => ({ ...t, root: p.cwd }))
+    ),
+  ]);
 
   // Rows other plugins own. Read every frame rather than cached, because a contribution is replaced
   // in place when its author's data changes and re-reading is one call.
@@ -2083,12 +2321,19 @@ function sectionRows(
 
     rows.push(blank());
     if (typeof c.item.title === "string" && c.item.title !== "") {
-      rows.push(...heading(clip(c.item.title, opts.width - 2), opts.width));
+      const hint = typeof c.item.hint === "string" ? c.item.hint : undefined;
+      rows.push(
+        ...heading(clip(c.item.title, opts.width - 2), opts.width, hint),
+      );
     }
     for (const r of contributed) {
       if (typeof r?.text !== "string") continue;
       rows.push({
         text: `   ${clip(r.text, Math.max(4, opts.width - 6))}`,
+        // A third party's row gets the same treatment ours do: we have no idea how long its text
+        // is, and a plugin's row cut at our column is our bug rather than theirs.
+        full: `   ${r.text}`,
+        indent: 3,
         hl: typeof r.hl === "string" ? r.hl : undefined,
         right: typeof r.right?.text === "string"
           ? { text: `${r.right.text} `, hl: r.right.hl }
@@ -2112,9 +2357,16 @@ function sectionRows(
  * weight and the eye has to parse the words to find the structure — which is exactly the work a
  * layout is supposed to have already done.
  */
-function heading(text: string, width: number): ListRow<Target>[] {
+function heading(text: string, width: number, hint?: string): ListRow<Target>[] {
   return [
-    { text: ` ${text}`, hl: "Sidebar.Heading", inert: true },
+    {
+      text: ` ${text}`,
+      hl: "Sidebar.Heading",
+      // Dim, and on the heading rather than beside the title: it is an answer to "and then what",
+      // which is a question you ask after reading the section, not while finding it.
+      right: hint ? { text: `${hint} `, hl: "Sidebar.Dim" } : undefined,
+      inert: true,
+    },
     { text: "─".repeat(Math.max(1, width)), hl: "Separator", inert: true },
   ];
 }
@@ -2137,11 +2389,16 @@ function projectRow(
   const within = [...p.sessions, ...p.worktrees.flatMap((t) => t.sessions)];
   const busy = within.find((s) => s.active_turn);
   const here = p.sessions.some((s) => s.is_active);
+  // Something in here has stopped and is waiting on an answer. It is still a turn in flight, so
+  // `busy` finds it too — this is what decides which of the two the row says. Over `within` for the
+  // reason the count is: a question asked in a scratch tree of this repository is a question in
+  // this repository, and folding is what hid the row that would otherwise say so.
+  const waiting = within.some((s) => opts.asking.has(s.id));
 
   // The count is the useful thing when a project is folded, and the elapsed time is the useful
   // thing when something inside it is working. Never both — there is one column.
   const right = busy
-    ? { text: `${turnFor(busy, now)} `, hl: "Status.Working" }
+    ? { text: `${turnFor(busy, now)} `, hl: waiting ? "Status.Pending" : "Status.Working" }
     : within.length > 0
       ? { text: `${within.length} `, hl: "Sidebar.Dim" }
       : { text: "" };
@@ -2170,10 +2427,18 @@ function projectRow(
   // It sits after the name rather than in the right-hand column: that column is already spoken for
   // by the elapsed time of whatever is running, and a project can perfectly well have one turn
   // still going and another that finished an hour ago.
-  const unseen = folded ? within.filter((s) => !s.active_turn && s.unread).length : 0;
-  const mark = unseen === 0 ? "" : unseen === 1
-    ? opts.ascii ? " !" : " ●"
-    : opts.ascii ? ` !${unseen}` : ` ●${unseen}`;
+  // A question in there outranks it, and for the same reason it does on the conversation's own row:
+  // one of them is news that will keep, and the other is a turn that has stopped until you answer.
+  // Only one mark, because there is one column and two would be a puzzle rather than a summary.
+  const unseen = folded && !waiting
+    ? within.filter((s) => !s.active_turn && s.unread).length
+    : 0;
+  const mark = folded && waiting
+    ? " ?"
+    : unseen === 0 ? "" : unseen === 1
+      ? opts.ascii ? " !" : " ●"
+      : opts.ascii ? ` !${unseen}` : ` ●${unseen}`;
+  const markHl = folded && waiting ? "Status.Pending" : "Status.Unread";
 
   const name = clip(
     p.name,
@@ -2183,10 +2448,16 @@ function projectRow(
   if (p.favorite) spans.push({ from: 1, to: 1 + byteLength(star), hl: "Sidebar.Favorite" });
   if (mark !== "") {
     const from = byteLength(` ${star} ${arrow} ${name}`);
-    spans.push({ from, to: from + byteLength(mark), hl: "Status.Unread" });
+    spans.push({ from, to: from + byteLength(mark), hl: markHl });
   }
   return {
     text: ` ${star} ${arrow} ${name}${mark}`,
+    // A project's name is a directory name, and directory names are long. Clipped it is the same
+    // eight characters as the three others you have open beside it, which is the panel failing at
+    // the one thing it is for. The unread dot is left off deliberately: it survived the clip and
+    // is already on the row.
+    full: ` ${star} ${arrow} ${p.name}`,
+    indent: 5,
     hl: here ? "Directory" : "Sidebar.Dim",
     spans: spans.length > 0 ? spans : undefined,
     right: elsewhere.length > 0
@@ -2250,6 +2521,8 @@ function remoteRow(r: SwarmAgent, opts: DrawOptions, now: number): ListRow<Targe
     const width = Math.max(8, opts.width - 11 - host.length);
     return {
       text: `     ${glyph} ${clip(r.agent.label, width)}`,
+      full: `     ${glyph} ${r.agent.label}`,
+      indent: 7,
       hl: working ? "Status.Monitoring" : "Sidebar.Remote",
       right: { text: `${host} `, hl: "Sidebar.Remote" },
       value: {
@@ -2268,44 +2541,73 @@ function sessionRow(
   opts: DrawOptions,
   depth = 0,
 ): ListRow<Target> {
+  // The agent has stopped and is waiting on you. First, because it is the only state here that a
+  // turn being in flight does not already describe: the turn *is* in flight — blocked on the
+  // question — so without this the row is a spinner, indistinguishable from one that is thinking,
+  // and the way you find it is by opening conversations until one of them asks you something.
+  const asking = opts.asking.has(s.id);
   // Working is the only state that moves, and only where the work is. An idle row's status is
   // deliberately static: twenty animating rows carry no more information than one and cost twenty
   // times the attention.
-  const working = Boolean(s.active_turn);
+  const working = !asking && Boolean(s.active_turn);
   // Finished while you were somewhere else. The one row in this column that is asking for
   // something, so it is the one row that gets the attention colour — and it does not move, because
   // it is not going to stop being true on its own and a mark that pulses forever is a mark you
   // learn to look past. It goes away by being opened. See ADR 0042.
-  const unread = !working && s.unread;
-  const glyph = working
-    ? s.is_active
-      ? spinnerFrame()
-      : opts.ascii ? "*" : "◍"
-    : unread
-      ? opts.ascii ? "!" : "●"
-      : s.is_active
-        ? opts.ascii ? ">" : "▸"
-        : " ";
-  const right = working ? turnFor(s, now) : s.updated_at > 0 ? ago(now / 1000 - s.updated_at) : "";
+  const unread = !working && !asking && s.unread;
+  const glyph = asking
+    // A question mark, in both alphabets. Every other glyph here has an ASCII understudy because
+    // the Unicode one is prettier; this one is already the character that means what it means, and
+    // a shape people have to learn would be worse in either.
+    ? "?"
+    : working
+      ? s.is_active
+        ? spinnerFrame()
+        : opts.ascii ? "*" : "◍"
+      : unread
+        ? opts.ascii ? "!" : "●"
+        : s.is_active
+          ? opts.ascii ? ">" : "▸"
+          : " ";
+  // The clock, and it keeps running while the question sits there: one asked four minutes ago and
+  // one asked while you were reading this row are not the same news. Off the turn rather than off
+  // `working`, because a question can be raised by a plugin with no turn behind it at all — and
+  // then the honest number is when the conversation last moved, not a turn that never started.
+  const right = s.active_turn
+    ? turnFor(s, now)
+    : s.updated_at > 0 ? ago(now / 1000 - s.updated_at) : "";
   // Two more columns per level: a conversation inside a worktree sits inside the worktree's row
   // the way the worktree sits inside its repository's.
   const pad = "     " + "  ".repeat(depth);
   return {
     text: `${pad}${glyph} ${clip(s.label, Math.max(8, opts.width - 9 - 2 * depth - right.length))}`,
-    hl: working
-      ? s.is_active && pulseBright() ? "Status.Working" : "Status.Monitoring"
-      : unread
-        // The whole row, not only the dot: a single coloured character five columns in is findable
-        // if you already know it is there, which is the one thing you cannot assume about the
-        // conversation you have forgotten you started.
-        ? "Status.Unread"
-        : s.is_active
-          ? "Accent"
-          : undefined,
+    // The title is the only thing telling two conversations in one project apart, and a generated
+    // title is a sentence rather than a word — so the column cuts it at about the point where it
+    // was going to say which of them this is.
+    full: `${pad}${glyph} ${s.label}`,
+    indent: 7 + 2 * depth,
+    hl: asking
+      // The palette's group for waiting on something outside the program — which here is a person,
+      // and the reason it is the one row in this column that moves. `Status.Unread` deliberately
+      // does not: that is news, and news does not stop being true if you ignore it. This is a
+      // *block*, it ends the moment you answer, and until then nothing in the workspace goes on.
+      ? "Status.Pending"
+      : working
+        ? s.is_active && pulseBright() ? "Status.Working" : "Status.Monitoring"
+        : unread
+          // The whole row, not only the dot: a single coloured character five columns in is findable
+          // if you already know it is there, which is the one thing you cannot assume about the
+          // conversation you have forgotten you started.
+          ? "Status.Unread"
+          : s.is_active
+            ? "Accent"
+            : undefined,
     // A trailing space so the age does not sit flush against the panel's edge rule.
     right: {
       text: right === "" ? "" : `${right} `,
-      hl: working ? "Status.Working" : unread ? "Status.Unread" : "Sidebar.Dim",
+      hl: asking
+        ? "Status.Pending"
+        : working ? "Status.Working" : unread ? "Status.Unread" : "Sidebar.Dim",
     },
     value: { kind: "session", id: s.id, cwd: s.cwd },
   };
@@ -2339,7 +2641,9 @@ function hints(opts: DrawOptions): ListRow<Target>[] {
     // verb with a row of its own is the one that can afford to give up its place on them.
     ? ["^T projects  ^N new   ^F archive", "^K palette   ^B hide  F1 keys"]
     : kind === "project"
-      ? ["↵ fold   f ★       JK move", "n new    a archive  ? keys"]
+      // `X` is on the strip because a list you cannot shorten is a list that grows forever, and a
+      // project that outlives its conversations — which is the point of it — has to have a way off.
+      ? ["↵ fold   f ★       JK move", "n new    X remove   ? keys"]
       : kind === "session"
         ? ["↵ open   r rename   x archive", "X delete a archive   ? keys"]
         : kind === "browse"

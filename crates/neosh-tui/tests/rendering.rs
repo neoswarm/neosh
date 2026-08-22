@@ -900,10 +900,36 @@ fn an_explicit_scroll_position_still_means_start_here() {
     // Tail-following must not take paging away.
     let lines: Vec<String> = (0..40).map(|i| format!("line {i}")).collect();
     let mut m = main_window_with(lines.iter().map(String::as_str).collect());
-    m.apply(UiEvent::ScrollTo { win: WindowId(1), top_line: 10 });
+    m.apply(UiEvent::ScrollTo { win: WindowId(1), top_line: Some(10) });
     let rows = rows_of(&m, 20, 5).join("\n");
     assert!(rows.contains("line 10"), "started where asked:\n{rows}");
     assert!(!rows.contains("line 39"), "and did not jump to the end:\n{rows}");
+}
+
+/// Row zero is a place, and asking for it is not asking to follow the tail.
+///
+/// The two shared an encoding, so the top of a transcript was the one row in it nothing could
+/// reach: `^U` up to the first line asked for `0`, which was read as "unscrolled", and the window
+/// drew the last screenful instead. Reading upwards ended at the bottom.
+#[test]
+fn scrolling_to_the_first_row_shows_the_first_row() {
+    let lines: Vec<String> = (0..40).map(|i| format!("line {i}")).collect();
+    let mut m = main_window_with(lines.iter().map(String::as_str).collect());
+    m.apply(UiEvent::ScrollTo { win: WindowId(1), top_line: Some(0) });
+    let rows = rows_of(&m, 20, 5).join("\n");
+    assert!(rows.contains("line 0"), "the top of the transcript:\n{rows}");
+    assert!(!rows.contains("line 39"), "and not the bottom of it:\n{rows}");
+}
+
+/// And giving the position back is still how you follow the newest.
+#[test]
+fn an_unscrolled_transcript_is_back_at_the_end() {
+    let lines: Vec<String> = (0..40).map(|i| format!("line {i}")).collect();
+    let mut m = main_window_with(lines.iter().map(String::as_str).collect());
+    m.apply(UiEvent::ScrollTo { win: WindowId(1), top_line: Some(0) });
+    m.apply(UiEvent::ScrollTo { win: WindowId(1), top_line: None });
+    let rows = rows_of(&m, 20, 5).join("\n");
+    assert!(rows.contains("line 39"), "the newest line is on screen:\n{rows}");
 }
 
 #[test]

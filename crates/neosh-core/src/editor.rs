@@ -27,6 +27,12 @@ use crate::options::OptionRegistry;
 use crate::text;
 use crate::window::{Viewport, Window};
 
+/// The keys that reach the workspace even under a modal float, when nothing has said otherwise.
+///
+/// Quit and reload configuration: the two things you need when a panel is wrong. `ui.modal_escape_keys`
+/// replaces this, including with an empty list — see [`Editor::is_modal_escape`].
+const MODAL_ESCAPES: &[&str] = &["<C-q>", "<C-r>"];
+
 /// Work the core cannot do itself, drained by the host after every apply.
 #[derive(Debug, Clone, PartialEq)]
 pub enum CoreEffect {
@@ -465,8 +471,38 @@ impl Editor {
                 }
             }
         }
-        scopes.push(KeymapScope::Global);
+        if !self.focus_is_modal() {
+            scopes.push(KeymapScope::Global);
+        }
         scopes
+    }
+
+    /// Whether the focused window has declared itself modal. See [`FloatConfig::modal`].
+    fn focus_is_modal(&self) -> bool {
+        self.focus
+            .current()
+            .and_then(|win| self.windows.get(&win))
+            .is_some_and(crate::window::Window::modal)
+    }
+
+    /// The keys that resolve globally even under a modal.
+    ///
+    /// Read out of `ui.modal_escape_keys` on every press rather than cached, because it is a
+    /// setting and `^R` reloads settings — and a stale copy of *this* list is the one that cannot
+    /// be corrected without restarting, since the key to reload is on it.
+    fn is_modal_escape(&self, seq: &[KeyPress]) -> bool {
+        let keys = match self.options.get("ui.modal_escape_keys") {
+            Some(neosh_proto::OptionValue::List(keys)) => keys.clone(),
+            // Absent is not the same as empty. Absent means nothing has *declared* the option —
+            // a bare `Editor`, a frontend that never registered it — and falling through to "no
+            // escapes" there would make the one thing standing between a buggy panel and a
+            // terminal you have to kill contingent on somebody having remembered to declare a
+            // default. An empty list is honoured, because that is a person saying so.
+            _ => MODAL_ESCAPES.iter().map(|k| (*k).to_string()).collect(),
+        };
+        keys.iter()
+            .filter_map(|lhs| crate::keymap::parse_keys(&self.with_leader(lhs)).ok())
+            .any(|k| k == seq)
     }
 
     /// Whatever `mapleader` is, or Neovim's default.
@@ -490,7 +526,17 @@ impl Editor {
         self.pending_keys.push(key.clone());
         let scopes = self.active_scopes();
         let seq = self.pending_keys.clone();
-        let res = self.keymaps.resolve(self.mode, &scopes, &seq);
+        let mut res = self.keymaps.resolve(self.mode, &scopes, &seq);
+        // A modal drops `Global` from its scopes, so the escape hatches have to be let back in by
+        // name. Consulted only once the panel's own scopes have declined the key: a modal that
+        // binds `<C-r>` for something of its own keeps it, which is the same rule every other
+        // scope follows.
+        if matches!(res, KeyResolution::Unhandled)
+            && self.focus_is_modal()
+            && self.is_modal_escape(&seq)
+        {
+            res = self.keymaps.resolve(self.mode, &[KeymapScope::Global], &seq);
+        }
         match &res {
             KeyResolution::Pending => {}
             KeyResolution::Matched { command, .. } => {
@@ -532,8 +578,14 @@ impl Editor {
     /// A key no binding wanted.
     ///
     /// A capture claims what the keymaps did not, so a picker gets its filter keys while `<C-q>`
-    /// still quits. Checked here rather than before `resolve` for exactly that reason: a modal that
-    /// swallowed every binding would be a trap.
+    /// still quits. Checked here rather than before `resolve` for exactly that reason: a capture
+    /// that swallowed every binding would be a trap.
+    ///
+    /// Under a [modal](neosh_proto::FloatConfig::modal) with no capture the key stops here. It has
+    /// already been offered to the panel's own scopes and to the escape list and neither wanted
+    /// it; the only place left is the host, which would put a character in the composer behind the
+    /// float or read `<Esc>` as "interrupt the turn". Typing into a field you cannot see is worse
+    /// than a key that does nothing.
     fn unclaimed(&mut self, key: KeyPress) {
         let captured = self.focus.current().and_then(|w| self.captures.get(&w).cloned());
         match captured {
@@ -541,6 +593,7 @@ impl Editor {
                 let ctx = KeyContext { key, mode: self.mode, win: self.focus.current() };
                 self.invoke_command(&command, Vec::new(), Some(ctx));
             }
+            None if self.focus_is_modal() => {}
             None => self.effects.push(CoreEffect::UnhandledKey { key, mode: self.mode }),
         }
     }
