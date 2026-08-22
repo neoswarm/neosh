@@ -4140,6 +4140,18 @@ impl Host {
         // somebody else's. Left running, the mode survives into a conversation it was never opened
         // on, and the rows it names there are whatever happens to be at those numbers.
         self.leave_reading();
+        // Arriving is reading. Every way into a conversation comes through here — switching, a new
+        // one, the one you land on after closing or archiving, and the one a restored workspace
+        // opens on — so this is the one place that has to clear the mark, and a flag left set on
+        // the conversation you are sitting in would say "new" about the answer on screen.
+        let arrived = {
+            let mut store = self.agent.sessions();
+            let here = store.active_id().clone();
+            store.mark_read(&here)
+        };
+        if arrived {
+            self.persist_sessions();
+        }
         // Not closed: the buffer is about to be replaced wholesale, so settling an answer into rows
         // that are on their way out would write into the conversation being left behind.
         self.answer = None;
@@ -5292,6 +5304,12 @@ impl Host {
                 self.rounds.remove(&session);
                 if let Some(s) = self.agent.sessions().get_mut(&session) {
                     s.updated_at = now_secs();
+                    // News, and only where you were not looking. A turn that ended in the
+                    // conversation on screen has been seen by definition — including with nothing
+                    // attached, because reattaching lands you in that conversation with the answer
+                    // already in it. Anywhere else, the row is the only thing that will ever
+                    // mention it, so it has to say so until you go there. See ADR 0042.
+                    s.unread = !on_screen;
                 }
                 self.persist_sessions();
                 if self.watched(&session) {
