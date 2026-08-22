@@ -388,8 +388,10 @@ pub struct Host {
     repos: std::collections::HashMap<std::path::PathBuf, Option<neosh_vcs::Git>>,
     /// Where neosh was started, and the fallback for a session that names nowhere.
     cwd: std::path::PathBuf,
-    /// What to call each directory a conversation lives in, worked out once when it is first seen.
-    projects: std::collections::HashMap<std::path::PathBuf, String>,
+    /// What to call each directory a conversation lives in — and what checkout it is, so a list
+    /// can group worktrees under the repository they belong to. Worked out once when the
+    /// directory is first seen.
+    projects: std::collections::HashMap<std::path::PathBuf, ProjectFacts>,
     /// What each directory is called *across machines*. See [`neosh_proto::ProjectKey`].
     ///
     /// Separate from `projects`, which is a label for this screen. This is an identity, resolved
@@ -6199,7 +6201,14 @@ impl Host {
             // Asked once, when the directory is first seen, and remembered. A label is read on
             // every redraw of the panel and is not worth a `rev-parse` each time.
             let (branch, main) = g.identity().await;
-            self.projects.insert(dir.clone(), project_name(&dir, branch, main));
+            self.projects.insert(
+                dir.clone(),
+                ProjectFacts {
+                    name: project_name(&dir, branch.clone(), main.clone()),
+                    repo_root: main.map(|p| p.display().to_string()),
+                    branch,
+                },
+            );
             // Asked here for the same reason and at the same time as the name: once per directory,
             // and the answer does not change while a checkout is open.
             if let Some(key) = g.origin_url().await.and_then(|u| neosh_proto::ProjectKey::from_remote(&u)) {
@@ -6215,8 +6224,10 @@ impl Host {
     /// the repository, which is the host's job — the store holds conversations and knows nothing
     /// about git.
     fn named(&self, mut info: neosh_proto::SessionInfo) -> neosh_proto::SessionInfo {
-        if let Some(name) = self.projects.get(std::path::Path::new(&info.cwd)) {
-            info.project = name.clone();
+        if let Some(facts) = self.projects.get(std::path::Path::new(&info.cwd)) {
+            info.project = facts.name.clone();
+            info.repo_root = facts.repo_root.clone();
+            info.branch = facts.branch.clone();
         }
         info
     }
@@ -6945,7 +6956,9 @@ impl Host {
                 default: OptionValue::Str(default_worktree_root()),
                 description: Some(
                     "Where `git.worktree.new` puts a new worktree, as `<root>/<repo>/<branch>`. \
-                     A leading `~` is expanded. Empty means beside the repository instead, in \
+                     A leading `~` is expanded. A relative path is inside the repository itself — \
+                     `.worktrees` puts them at `<repo>/.worktrees/<branch>`, kept out of `git \
+                     status` for you. Empty means beside the repository instead, in \
                      `<repo>-worktrees/`."
                         .into(),
                 ),
@@ -7796,6 +7809,20 @@ fn chunk(text: impl Into<String>, hl: &str) -> neosh_proto::VirtChunk {
 fn display_width(s: &str) -> usize {
     use unicode_width::UnicodeWidthStr;
     s.width()
+}
+
+/// What the host learned about a directory the first time it looked: the display name, and the
+/// checkout facts the name was made from. Kept whole because [`SessionInfo`] carries both — the
+/// name for reading, the root for grouping — and deriving one from the other means parsing a
+/// display format back apart.
+///
+/// [`SessionInfo`]: neosh_proto::SessionInfo
+struct ProjectFacts {
+    name: String,
+    /// The main checkout's path; `None` outside a repository.
+    repo_root: Option<String>,
+    /// The branch at that directory when it was first seen; `None` detached.
+    branch: Option<String>,
 }
 
 /// What to call a checkout.

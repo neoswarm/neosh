@@ -1954,14 +1954,15 @@ fn a_worktree_is_created_under_the_configured_root_and_you_land_in_it() {
     );
 }
 
-/// A worktree is named by the repository it belongs to and the branch it is on, not by whatever
-/// the directory happens to be called.
+/// A worktree is a row *inside* the repository it belongs to, named by its branch.
 ///
-/// The directory is named by whoever created it, which for a worktree made by another tool is a
-/// string like `wt-fe3c0d93`. A panel of those says nothing about which checkout is which, and
-/// reads as somebody else's directory having wandered into your workspace.
+/// It used to be a top-level project named `work · sideline` — correct in that a worktree is a
+/// place conversations live, and wrong as a list: four scratch trees of one repository read as
+/// four unrelated projects, and the name carried the relationship precisely because the structure
+/// did not. Nested, the repository's name is said once by the row above, and what is left to say
+/// about the tree is the branch.
 #[test]
-fn a_worktree_is_listed_by_its_repository_and_branch() {
+fn a_worktree_nests_under_the_repository_it_belongs_to() {
     let sb = Sandbox::new("wtname");
     sb.git_init();
     let root = sb.root.join("trees");
@@ -1978,8 +1979,18 @@ fn a_worktree_is_listed_by_its_repository_and_branch() {
 
     s.send(&command_with("git.worktree.new", "sideline"));
     assert!(
-        s.pump(|s| s.sidebar_now().iter().any(|l| l.contains("work \u{b7} sideline"))),
-        "and the worktree says which repository and which branch\n{:?}",
+        s.pump(|s| {
+            let rows = s.sidebar_now();
+            let repo = rows.iter().position(|l| l.contains("work") && !l.contains("sideline"));
+            let tree = rows.iter().position(|l| l.contains("sideline"));
+            match (repo, tree) {
+                // Below its repository, indented past the repository's own arrow, and the branch
+                // alone — `work · sideline` is the flat list this replaced.
+                (Some(r), Some(t)) => t > r && rows[t].starts_with("     ") && !rows[t].contains('\u{b7}'),
+                _ => false,
+            }
+        }),
+        "the worktree is a nested row named by its branch\n{:?}",
         s.sidebar_now()
     );
 }
@@ -2095,6 +2106,42 @@ fn an_empty_worktree_root_puts_them_beside_the_repository() {
     assert!(
         s.pump(|_| std::path::Path::new(&want).is_dir()),
         "the worktree went beside the repository, at {want}"
+    );
+}
+
+/// A relative root is inside the repository itself — `<repo>/.worktrees/<branch>`, with no
+/// `<repo>` level, because inside the repository nothing else's worktrees can collide with yours.
+///
+/// The exclude entry is the half that makes the layout livable: git happily creates a worktree
+/// inside its own repository and then reports the entire checkout as one untracked directory, in
+/// every status, forever. `.git/info/exclude` is local to the clone, so opting into this layout
+/// never shows up in anyone's diff.
+#[test]
+fn a_relative_worktree_root_lives_inside_the_repository_and_stays_out_of_status() {
+    let sb = Sandbox::new("wtinside");
+    sb.git_init();
+    sb.write_config("[options]\n\"worktree.root\" = \".worktrees\"\n");
+    let mut s = sb.start_letting_config_choose();
+    s.wait_for("PROJECTS");
+
+    s.send(&command("git.worktree.new"));
+    s.wait_for("Branch for the new worktree");
+    s.type_text("inside");
+    s.enter();
+
+    let repo = sb.root.join("work");
+    let want = repo.join(".worktrees/inside");
+    assert!(
+        s.pump(|_| want.is_dir()),
+        "the worktree is inside the repository, at {}",
+        want.display()
+    );
+    let exclude = repo.join(".git/info/exclude");
+    assert!(
+        s.pump(|_| std::fs::read_to_string(&exclude)
+            .is_ok_and(|t| t.lines().any(|l| l.trim() == "/.worktrees/inside/"))),
+        "and .git/info/exclude keeps it out of git status\n{:?}",
+        std::fs::read_to_string(&exclude)
     );
 }
 

@@ -145,6 +145,21 @@ pub struct SessionInfo {
     /// Computed by the host so every frontend and plugin agrees, the same as `label`.
     #[serde(default)]
     pub project: String,
+    /// The main checkout of the repository `cwd` is in, when it is in one.
+    ///
+    /// This is what lets a list *group* rather than merely label: `project` says `neosh ·
+    /// fix/thing` about a linked worktree, but a string made for reading is not a key — the only
+    /// way to find the worktree's siblings in it is to parse a display format back apart. The
+    /// sidebar nests a worktree under the project it is a worktree *of*, and this is the field
+    /// that says which one that is. Equal to `cwd` in the main checkout itself; `None` outside a
+    /// repository.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repo_root: Option<String>,
+    /// The branch checked out at `cwd` when the host last looked, `None` on a detached head or
+    /// outside a repository. A label, not a fact about *now*: it is refreshed when the directory
+    /// is next visited, not on every `git switch` someone runs in a shell.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch: Option<String>,
     pub message_count: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub active_turn: Option<TurnId>,

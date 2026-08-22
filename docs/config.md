@@ -146,8 +146,10 @@ told per turn, through `TurnRequest.cwd`.
 
 A worktree is a second checkout of the same repository on a different branch, and it is the answer
 to "I want to try something without disturbing what is checked out". neosh treats one as a
-*project*: it gets its own group in the sidebar, its own conversations, and its own branch in the
-footer.
+*project*: it has its own conversations and its own branch in the footer, and in the sidebar it
+sits **inside the repository it is a tree of** — the repository is the row, its worktrees nest
+under it by branch, and each folds, reorders and starts conversations on its own. Run as many
+conversations in one worktree as you like; `n` on its row is how a second one starts there.
 
 `^N` asks where a new conversation goes when there is something to ask:
 
@@ -185,9 +187,9 @@ themselves; the message says where it landed. `git.worktree.new <branch> [path] 
 explicit path for the times you want one, and a repository for the times it is not the one you are
 in.
 
-A worktree is listed by the repository it belongs to and the branch it is on — `neosh · fix/thing`
-— rather than by its directory name. The directory is named by whoever created it, and a panel of
-those says nothing about which checkout is which.
+A worktree is listed by the branch it is on, under the repository it belongs to, rather than by its
+directory name. The directory is named by whoever created it, and a panel of those says nothing
+about which checkout is which.
 
 New worktrees go under `worktree.root`, laid out as `<root>/<repo>/<branch>`:
 
@@ -201,6 +203,18 @@ of the project you are working on and littering its parent with `project-worktre
 end up with checkouts they cannot account for. The repository name is a level of its own so two
 projects with a `main` branch do not collide, and a slash in a branch becomes a dash — `feat/thing`
 is one directory, not two, because the directory is a name and not a path.
+
+A **relative** root keeps the trees inside the repository itself:
+
+```toml
+[options]
+"worktree.root" = ".worktrees"   # <repo>/.worktrees/<branch>
+```
+
+No `<repo>` level there — inside the repository, nothing else's worktrees can collide with yours —
+and neosh writes the directory into `.git/info/exclude` when it creates the tree, so an in-repo
+checkout never sits in `git status` as one giant untracked directory. That file is local to the
+clone; nothing about this layout appears in anyone's diff.
 
 Setting it to `""` restores the sibling layout, for anyone who wants their trees next to the thing
 they are trees of.

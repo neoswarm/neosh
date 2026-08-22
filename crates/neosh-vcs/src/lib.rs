@@ -280,7 +280,54 @@ impl Git {
             args.push(path.display().to_string());
             args.push(branch.to_string());
         }
-        self.git(args).await.map(|_| ())
+        self.git(args).await?;
+        self.exclude_if_inside(path).await;
+        Ok(())
+    }
+
+    /// Keep an in-tree worktree out of `git status`.
+    ///
+    /// Git is happy to put a worktree inside the repository it belongs to, and then reports the
+    /// whole checkout as one untracked directory — in every status, forever. The fix is a line in
+    /// `.git/info/exclude`: local to this clone, so it never appears in anyone's diff, and about
+    /// this machine's layout, which is exactly what that file is for.
+    ///
+    /// The entry is the worktree's own directory, not its parent: excluding `/<parent>/` would
+    /// swallow any other untracked file somebody later puts there, and this function cannot know
+    /// the parent exists only for worktrees.
+    ///
+    /// Best-effort by design. The worktree already exists when this runs; failing the call over a
+    /// status-noise fix would report an operation as failed after it worked.
+    async fn exclude_if_inside(&self, path: &Path) {
+        let Ok(out) = self.git(["rev-parse", "--path-format=absolute", "--git-common-dir"]).await
+        else {
+            return;
+        };
+        let common = PathBuf::from(out.stdout.trim());
+        // "Inside the repository" means inside the *main* checkout — the common dir's parent —
+        // not inside whichever worktree this command happened to run from.
+        let Some(main) = common.parent() else { return };
+        let Ok(rel) = path.strip_prefix(main) else { return };
+        let rel = rel.to_string_lossy().replace('\\', "/");
+        if rel.is_empty() {
+            return;
+        }
+        let exclude = common.join("info").join("exclude");
+        let line = format!("/{}/", rel.trim_matches('/'));
+        let current = tokio::fs::read_to_string(&exclude).await.unwrap_or_default();
+        if current.lines().any(|l| l.trim() == line) {
+            return;
+        }
+        let mut next = current;
+        if !next.is_empty() && !next.ends_with('\n') {
+            next.push('\n');
+        }
+        next.push_str(&line);
+        next.push('\n');
+        if let Some(dir) = exclude.parent() {
+            let _ = tokio::fs::create_dir_all(dir).await;
+        }
+        let _ = tokio::fs::write(&exclude, next).await;
     }
 
     pub async fn remove_worktree(&self, path: &Path, force: bool) -> Result<(), VcsError> {

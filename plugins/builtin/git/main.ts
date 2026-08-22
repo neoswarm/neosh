@@ -697,6 +697,12 @@ const SCRATCH_NOUNS = [
  * end up with checkouts they cannot account for. The repository name is a level of its own so two
  * projects with a `main` branch do not collide.
  *
+ * A *relative* root is inside the repository — `worktree.root = ".worktrees"` puts every tree at
+ * `<repo>/.worktrees/<branch>` — and there the repository's name is a level of noise rather than a
+ * disambiguator: nothing but this repository's worktrees can land in its own directory. The host
+ * keeps an in-tree checkout out of `git status` via `.git/info/exclude`, so choosing this layout
+ * does not mean reading past an untracked directory forever.
+ *
  * An empty `worktree.root` restores the sibling layout, for anyone who wants their trees next to
  * the thing they are trees of.
  *
@@ -708,8 +714,8 @@ async function worktreePath(neosh: Neosh, repoRoot: string, branch: string): Pro
   const repoName = repoRoot.split("/").filter(Boolean).pop() ?? "repo";
   const configured = ((await neosh.opt.get<string>("worktree.root")) ?? "").trim();
   if (configured === "") return `${parentOf(repoRoot)}/${repoName}-worktrees/${leaf}`;
-  const base = configured.startsWith("/") ? configured : `${repoRoot}/${configured}`;
-  return `${base}/${repoName}/${leaf}`;
+  if (configured.startsWith("/")) return `${configured}/${repoName}/${leaf}`;
+  return `${repoRoot}/${configured}/${leaf}`;
 }
 
 async function removeWorktree(neosh: Neosh): Promise<void> {

@@ -139,6 +139,17 @@ interface Project {
   sessions: SessionInfo[];
   /** The cross-machine identity, for matching against what other computers have. */
   key: string;
+  /**
+   * Linked worktrees of this checkout, nested rather than listed beside it.
+   *
+   * A worktree used to be a top-level project — correct by ADR 0029's "a worktree is a project",
+   * and wrong as a *list*: four scratch trees of one repository read as four unrelated projects,
+   * and the thing they have in common is the thing the column no longer said. The name carried
+   * the relationship (`neosh · brisk-otter`) precisely because the structure did not. Each entry
+   * is an ordinary {@link Project} — its own cwd, its own fold and rank vars — whose `worktrees`
+   * is always empty, because git does not nest them either.
+   */
+  worktrees: Project[];
 }
 
 const NS = "neosh.sidebar";
@@ -275,7 +286,9 @@ export async function activate({ neosh, subscriptions }: PluginContext) {
     // Land on the conversation you are in, not wherever the cursor happened to be.
     const current = await neosh.session.current().catch(() => null);
     if (current) {
-      // Unfold the project it lives in, or "go to where I am" lands on a collapsed heading.
+      // Unfold the project it lives in, or "go to where I am" lands on a collapsed heading. For a
+      // conversation in a worktree that is two folds: the repository's, then the worktree's own.
+      if (current.repo_root) arrangement.unfold(current.repo_root);
       arrangement.unfold(current.cwd);
       list.select((t) => t.kind === "session" && t.id === current.id);
     }
@@ -541,7 +554,10 @@ class Arrangement {
    * you undo.
    */
   async move(groups: Project[][], cwd: string, delta: number): Promise<boolean> {
-    const group = groups.find((g) => g.some((p) => p.cwd === cwd));
+    // A worktree moves among its siblings under the same repository; a project among its group.
+    const group: Project[] | undefined =
+      groups.flat().find((p) => p.worktrees.some((t) => t.cwd === cwd))?.worktrees ??
+        groups.find((g) => g.some((p) => p.cwd === cwd));
     if (!group) return false;
     const from = group.findIndex((p) => p.cwd === cwd);
     const to = from + delta;
@@ -663,8 +679,14 @@ async function registerCommands(w: Wiring): Promise<void> {
     await arrangement.toggleFold(target.cwd);
   });
   await verb(`${NS}.favorite`, "f", "Pin this project to the top", async (target) => {
-    const cwd = owningProject(target);
+    let cwd = owningProject(target);
     if (cwd === null) return;
+    // Pinning is about the top of the column, and a worktree is never at the top of the column —
+    // `f` on one pins the repository it belongs to, the same way `f` on a conversation pins the
+    // project it is in.
+    const inside = (await neosh.session.list().catch(() => [] as SessionInfo[]))
+      .find((s) => s.cwd === cwd && s.repo_root && s.repo_root !== s.cwd);
+    if (inside?.repo_root) cwd = inside.repo_root;
     const now = await arrangement.toggleFavorite(cwd);
     neosh.notify(now ? `favourited ${short(cwd)}` : `unfavourited ${short(cwd)}`, "info");
   });
@@ -1152,8 +1174,10 @@ async function activateTarget(
   }
   if (target.kind === "project") {
     // A pinned project with nothing in it yet: `↵` should start something, not fold an empty list.
+    // A repository whose conversations are all in its worktrees is not that — the row has children
+    // to fold, which is what `s.repo_root === target.cwd` finds.
     const sessions = await neosh.session.list().catch(() => [] as SessionInfo[]);
-    if (!sessions.some((s) => s.cwd === target.cwd)) {
+    if (!sessions.some((s) => s.cwd === target.cwd || s.repo_root === target.cwd)) {
       await neosh.session.create({ cwd: target.cwd });
       await w.leave();
       return;
@@ -1830,6 +1854,15 @@ function group(
     else by.set(s.cwd, [s]);
   }
 
+  // Which checkout each directory is a linked worktree of, learned from its conversations. A
+  // pinned directory with nothing in it has nobody to say, and stays top-level until it does.
+  const rootOf = new Map<string, string>();
+  for (const s of sessions) {
+    if (s.repo_root && s.repo_root !== s.cwd && !rootOf.has(s.cwd)) {
+      rootOf.set(s.cwd, s.repo_root);
+    }
+  }
+
   // `session.list()` is most-recently-used first, so index in it is recency. Anything you have
   // never dragged sorts by that, after everything you have.
   const recency = new Map<string, number>();
@@ -1837,7 +1870,7 @@ function group(
     if (!recency.has(s.cwd)) recency.set(s.cwd, i);
   });
 
-  const projects: Project[] = [...by.entries()].map(([cwd, list]) => ({
+  const make = (cwd: string, list: SessionInfo[]): Project => ({
     cwd,
     // What the host decided to call it. For a worktree that is the repository and the branch,
     // rather than whatever the directory happens to be named — a row reading `wt-fe3c0d93`
@@ -1847,17 +1880,52 @@ function group(
     favorite: arrangement.isFavorite(cwd),
     sessions: list,
     key: keys.get(cwd) ?? `dir:${basename(cwd)}`,
-  }));
+    worktrees: [],
+  });
+
+  const tops = new Map<string, Project>();
+  const linked: Project[] = [];
+  for (const [cwd, list] of by) {
+    const root = rootOf.get(cwd);
+    if (!root) {
+      tops.set(cwd, make(cwd, list));
+      continue;
+    }
+    // Nested under the repository, the repository's name is said by the row above — what is left
+    // to say is which tree this one is. The branch, like the host's own label; the directory only
+    // on a detached head, where it is all there is.
+    linked.push({ ...make(cwd, list), name: list[0]?.branch || basename(cwd) });
+  }
+  for (const child of linked) {
+    const root = rootOf.get(child.cwd)!;
+    // A repository whose every conversation is in a worktree still has a row of its own — the
+    // worktrees have to hang from something, and the checkout is a real place `↵` can start a
+    // conversation in.
+    const parent = tops.get(root) ?? make(root, []);
+    tops.set(root, parent);
+    parent.worktrees.push(child);
+  }
+
+  // A project's recency is its newest conversation *anywhere in it* — a repository whose only
+  // activity is in a worktree should float with that work, not sink because its own checkout is
+  // quiet.
+  const newest = (p: Project): number =>
+    Math.min(
+      recency.get(p.cwd) ?? Number.MAX_SAFE_INTEGER,
+      ...p.worktrees.map((t) => recency.get(t.cwd) ?? Number.MAX_SAFE_INTEGER),
+    );
 
   const sort = (a: Project, b: Project) => {
     const ra = arrangement.rank(a.cwd);
     const rb = arrangement.rank(b.cwd);
     if (ra !== rb) return ra - rb;
-    const fa = recency.get(a.cwd) ?? Number.MAX_SAFE_INTEGER;
-    const fb = recency.get(b.cwd) ?? Number.MAX_SAFE_INTEGER;
+    const fa = newest(a);
+    const fb = newest(b);
     return fa !== fb ? fa - fb : a.name.localeCompare(b.name);
   };
 
+  const projects = [...tops.values()];
+  for (const p of projects) p.worktrees.sort(sort);
   return [
     projects.filter((p) => p.favorite).sort(sort),
     projects.filter((p) => !p.favorite).sort(sort),
@@ -1932,11 +2000,22 @@ async function collect(
     rows.push(projectRow(p, arrangement, opts, now));
     if (arrangement.isFolded(p.cwd)) continue;
     for (const s of p.sessions) rows.push(sessionRow(s, now, opts));
+    // Its worktrees, inside it. Each is a project row one level down — its own fold, its own
+    // rank, `n` makes another conversation in it — because a worktree of a repository is not a
+    // neighbour of the repository, and the column should say so.
+    for (const t of p.worktrees) {
+      rows.push(worktreeRow(t, arrangement, opts, now));
+      if (arrangement.isFolded(t.cwd)) continue;
+      for (const s of t.sessions) rows.push(sessionRow(s, now, opts, 1));
+    }
     // The same project, being worked on elsewhere. Under the same heading rather than in a section
     // of their own: they are not a different kind of thing, they are the same work on a different
     // computer, and a separate `REMOTE` block would make you check two places for one project.
     for (const r of remote.get(p.key) ?? []) rows.push(remoteRow(r, opts, now));
-    if (p.sessions.length === 0 && (remote.get(p.key) ?? []).length === 0) {
+    if (
+      p.sessions.length === 0 && p.worktrees.length === 0 &&
+      (remote.get(p.key) ?? []).length === 0
+    ) {
       rows.push({ text: "       nothing here yet", hl: "Sidebar.Dim", inert: true });
     }
   }
@@ -2052,15 +2131,19 @@ function projectRow(
 ): ListRow<Target> {
   const folded = arrangement.isFolded(p.cwd);
   const arrow = opts.ascii ? (folded ? ">" : "v") : folded ? "▸" : "▾";
-  const busy = p.sessions.find((s) => s.active_turn);
+  // "Inside it" includes its worktrees: a repository whose only running turn is in a scratch tree
+  // is still a repository where something is happening, and the folded count has to count what
+  // folding hid.
+  const within = [...p.sessions, ...p.worktrees.flatMap((t) => t.sessions)];
+  const busy = within.find((s) => s.active_turn);
   const here = p.sessions.some((s) => s.is_active);
 
   // The count is the useful thing when a project is folded, and the elapsed time is the useful
   // thing when something inside it is working. Never both — there is one column.
   const right = busy
     ? { text: `${turnFor(busy, now)} `, hl: "Status.Working" }
-    : p.sessions.length > 0
-      ? { text: `${p.sessions.length} `, hl: "Sidebar.Dim" }
+    : within.length > 0
+      ? { text: `${within.length} `, hl: "Sidebar.Dim" }
       : { text: "" };
 
   // The star sits before the fold arrow rather than after the name: it is what you scan the
@@ -2087,7 +2170,7 @@ function projectRow(
   // It sits after the name rather than in the right-hand column: that column is already spoken for
   // by the elapsed time of whatever is running, and a project can perfectly well have one turn
   // still going and another that finished an hour ago.
-  const unseen = folded ? p.sessions.filter((s) => !s.active_turn && s.unread).length : 0;
+  const unseen = folded ? within.filter((s) => !s.active_turn && s.unread).length : 0;
   const mark = unseen === 0 ? "" : unseen === 1
     ? opts.ascii ? " !" : " ●"
     : opts.ascii ? ` !${unseen}` : ` ●${unseen}`;
@@ -2111,6 +2194,44 @@ function projectRow(
       // a more useful thing to know than how many conversations are in it here.
       ? { text: `${clip(elsewhere.join(" "), 14)} `, hl: "Sidebar.Remote" }
       : right,
+    value: { kind: "project", cwd: p.cwd },
+  };
+}
+
+/**
+ * A worktree, one level inside the repository it is a tree of.
+ *
+ * The same kind of row as a project — same `Target`, so folding, `n`, `f` and `J`/`K` need no
+ * second code path — drawn at the indent of the conversations beside it, because that is the
+ * claim the nesting makes: this belongs to the row above. No star column; pinning is the
+ * repository's, and a second ragged column of stars is what the alignment here pays for.
+ */
+function worktreeRow(
+  p: Project,
+  arrangement: Arrangement,
+  opts: DrawOptions,
+  now: number,
+): ListRow<Target> {
+  const folded = arrangement.isFolded(p.cwd);
+  const arrow = opts.ascii ? (folded ? ">" : "v") : folded ? "▸" : "▾";
+  const busy = p.sessions.find((s) => s.active_turn);
+  const here = p.sessions.some((s) => s.is_active);
+  const right = busy
+    ? { text: `${turnFor(busy, now)} `, hl: "Status.Working" }
+    : p.sessions.length > 0
+      ? { text: `${p.sessions.length} `, hl: "Sidebar.Dim" }
+      : { text: "" };
+  const unseen = folded ? p.sessions.filter((s) => !s.active_turn && s.unread).length : 0;
+  const mark = unseen === 0 ? "" : unseen === 1
+    ? opts.ascii ? " !" : " ●"
+    : opts.ascii ? ` !${unseen}` : ` ●${unseen}`;
+  const name = clip(p.name, Math.max(6, opts.width - 10 - byteLength(mark)));
+  const from = byteLength(`     ${arrow} ${name}`);
+  return {
+    text: `     ${arrow} ${name}${mark}`,
+    hl: here ? "Directory" : "Sidebar.Dim",
+    spans: mark === "" ? undefined : [{ from, to: from + byteLength(mark), hl: "Status.Unread" }],
+    right,
     value: { kind: "project", cwd: p.cwd },
   };
 }
@@ -2141,7 +2262,12 @@ function remoteRow(r: SwarmAgent, opts: DrawOptions, now: number): ListRow<Targe
     };
 }
 
-function sessionRow(s: SessionInfo, now: number, opts: DrawOptions): ListRow<Target> {
+function sessionRow(
+  s: SessionInfo,
+  now: number,
+  opts: DrawOptions,
+  depth = 0,
+): ListRow<Target> {
   // Working is the only state that moves, and only where the work is. An idle row's status is
   // deliberately static: twenty animating rows carry no more information than one and cost twenty
   // times the attention.
@@ -2161,8 +2287,11 @@ function sessionRow(s: SessionInfo, now: number, opts: DrawOptions): ListRow<Tar
         ? opts.ascii ? ">" : "▸"
         : " ";
   const right = working ? turnFor(s, now) : s.updated_at > 0 ? ago(now / 1000 - s.updated_at) : "";
+  // Two more columns per level: a conversation inside a worktree sits inside the worktree's row
+  // the way the worktree sits inside its repository's.
+  const pad = "     " + "  ".repeat(depth);
   return {
-    text: `     ${glyph} ${clip(s.label, Math.max(8, opts.width - 9 - right.length))}`,
+    text: `${pad}${glyph} ${clip(s.label, Math.max(8, opts.width - 9 - 2 * depth - right.length))}`,
     hl: working
       ? s.is_active && pulseBright() ? "Status.Working" : "Status.Monitoring"
       : unread
