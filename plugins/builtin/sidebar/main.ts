@@ -2079,11 +2079,33 @@ function projectRow(
   // Which other computers have this project. The whole reason a project key is a normalised git
   // remote rather than a path: on two machines the path is different and this is the same.
   const elsewhere = opts.hosts.get(p.key) ?? [];
-  const name = clip(p.name, Math.max(6, opts.width - 8 - (elsewhere.length ? 8 : 0)));
+
+  // What is finished and unseen inside a project you have folded shut. Only when folded, because
+  // folding is the thing that hid it: with the project open the conversation says so on its own
+  // row, and saying it twice on two adjacent lines is how a panel teaches you to stop reading it.
+  //
+  // It sits after the name rather than in the right-hand column: that column is already spoken for
+  // by the elapsed time of whatever is running, and a project can perfectly well have one turn
+  // still going and another that finished an hour ago.
+  const unseen = folded ? p.sessions.filter((s) => !s.active_turn && s.unread).length : 0;
+  const mark = unseen === 0 ? "" : unseen === 1
+    ? opts.ascii ? " !" : " ●"
+    : opts.ascii ? ` !${unseen}` : ` ●${unseen}`;
+
+  const name = clip(
+    p.name,
+    Math.max(6, opts.width - 8 - byteLength(mark) - (elsewhere.length ? 8 : 0)),
+  );
+  const spans: Array<{ from: number; to: number; hl: string }> = [];
+  if (p.favorite) spans.push({ from: 1, to: 1 + byteLength(star), hl: "Sidebar.Favorite" });
+  if (mark !== "") {
+    const from = byteLength(` ${star} ${arrow} ${name}`);
+    spans.push({ from, to: from + byteLength(mark), hl: "Status.Unread" });
+  }
   return {
-    text: ` ${star} ${arrow} ${name}`,
+    text: ` ${star} ${arrow} ${name}${mark}`,
     hl: here ? "Directory" : "Sidebar.Dim",
-    spans: p.favorite ? [{ from: 1, to: 1 + byteLength(star), hl: "Sidebar.Favorite" }] : undefined,
+    spans: spans.length > 0 ? spans : undefined,
     right: elsewhere.length > 0
       // The machines take the column the count would have used. A project that is in two places is
       // a more useful thing to know than how many conversations are in it here.
@@ -2124,25 +2146,37 @@ function sessionRow(s: SessionInfo, now: number, opts: DrawOptions): ListRow<Tar
   // deliberately static: twenty animating rows carry no more information than one and cost twenty
   // times the attention.
   const working = Boolean(s.active_turn);
+  // Finished while you were somewhere else. The one row in this column that is asking for
+  // something, so it is the one row that gets the attention colour — and it does not move, because
+  // it is not going to stop being true on its own and a mark that pulses forever is a mark you
+  // learn to look past. It goes away by being opened. See ADR 0042.
+  const unread = !working && s.unread;
   const glyph = working
     ? s.is_active
       ? spinnerFrame()
       : opts.ascii ? "*" : "◍"
-    : s.is_active
-      ? opts.ascii ? ">" : "▸"
-      : " ";
+    : unread
+      ? opts.ascii ? "!" : "●"
+      : s.is_active
+        ? opts.ascii ? ">" : "▸"
+        : " ";
   const right = working ? turnFor(s, now) : s.updated_at > 0 ? ago(now / 1000 - s.updated_at) : "";
   return {
     text: `     ${glyph} ${clip(s.label, Math.max(8, opts.width - 9 - right.length))}`,
     hl: working
       ? s.is_active && pulseBright() ? "Status.Working" : "Status.Monitoring"
-      : s.is_active
-        ? "Accent"
-        : undefined,
+      : unread
+        // The whole row, not only the dot: a single coloured character five columns in is findable
+        // if you already know it is there, which is the one thing you cannot assume about the
+        // conversation you have forgotten you started.
+        ? "Status.Unread"
+        : s.is_active
+          ? "Accent"
+          : undefined,
     // A trailing space so the age does not sit flush against the panel's edge rule.
     right: {
       text: right === "" ? "" : `${right} `,
-      hl: working ? "Status.Working" : "Sidebar.Dim",
+      hl: working ? "Status.Working" : unread ? "Status.Unread" : "Sidebar.Dim",
     },
     value: { kind: "session", id: s.id, cwd: s.cwd },
   };
