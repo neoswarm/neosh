@@ -111,6 +111,20 @@ pub struct Session {
     /// See [`neosh_proto::TurnRequest::resume`]. Held here rather than in the driver because the
     /// driver is a process and this is not: the whole point of the value is that it survives one.
     pub resume: Option<String>,
+    /// A place to type, minted because there was nowhere else — not a conversation you started.
+    ///
+    /// The store always has an active session: there has to be somewhere for the next message to
+    /// go. That invariant is what used to make "the last session cannot be closed" a rule, and a
+    /// workspace you have just cleared out is exactly when you want the opposite. So closing or
+    /// archiving the last one lands you in one of these instead: it is the active session, the
+    /// composer types into it and the transcript shows the welcome — but it is not in
+    /// [`list`](crate::store::SessionStore::list) and it is never written to disk, because nobody
+    /// asked for it and an empty workspace should look empty.
+    ///
+    /// It stops being one the moment anything is said in it, which is the only thing that makes a
+    /// conversation a conversation. From then on it is an ordinary session: it appears in the
+    /// panel, in its project, and is saved with the rest.
+    pub ephemeral: bool,
 }
 
 impl Session {
@@ -135,6 +149,7 @@ impl Session {
             archived_at: None,
             permission_mode: None,
             resume: None,
+            ephemeral: false,
         }
     }
 
@@ -176,6 +191,11 @@ impl Session {
 
     /// What was said, with whatever came with it.
     pub fn push_user(&mut self, prompt: &Prompt) {
+        // Saying something in a placeholder is what makes it a conversation. Here rather than at
+        // any of the call sites because there is more than one way to speak into a session — the
+        // composer, a steering message taken in mid-turn, a peer on another machine — and the one
+        // that forgot would leave a conversation with messages in it that no list ever shows.
+        self.ephemeral = false;
         self.messages.push(Message { role: Role::User, content: prompt.blocks() });
     }
 

@@ -1249,6 +1249,13 @@ impl Host {
             }
             ApiCall::SessionClose { session } => {
                 let closing_active = self.agent.sessions().active_id() == &session;
+                // Closing the conversation you are in has to land you somewhere, and the store
+                // will not step out of the last one on its own. Same line as the archive path
+                // below and for the same reason: being unable to delete the conversation you have
+                // finished with, because it is the only one, is not a rule anybody wanted.
+                if closing_active {
+                    self.ensure_somewhere_to_go(&session);
+                }
                 // Closing is the one case that does stop a turn: there is about to be nowhere to
                 // put its answer, and a stream writing into a conversation that no longer exists is
                 // a subprocess nobody can reach.
@@ -1277,6 +1284,11 @@ impl Host {
                 // somebody's stale colour.
                 self.vars.forget_session(&session);
                 if closing_active {
+                    // Where you landed is a conversation of its own, and it may be in another
+                    // directory: the banner names one, the file tools are pointed at one, and
+                    // both were still the deleted conversation's until this said otherwise.
+                    let here = { self.agent.sessions().active().cwd.clone() };
+                    self.work_in(here).await;
                     self.enter_session();
                 }
                 self.persist_sessions();
@@ -1289,8 +1301,8 @@ impl Host {
                 let leaving = archived && self.agent.sessions().active_id() == &session;
                 // Archiving the only conversation you have is a reasonable thing to want, and
                 // "there is nowhere to go" is a bad answer to it. Somewhere to go is one line.
-                if leaving && self.agent.sessions().list().len() <= 1 {
-                    self.new_session_in(self.cwd.clone());
+                if leaving {
+                    self.ensure_somewhere_to_go(&session);
                 }
                 let at = now_secs();
                 self.agent.sessions().archive(&session, archived, at).map_err(|e| match e {
@@ -1300,6 +1312,8 @@ impl Host {
                     other => ApiError::NotFound { what: other.to_string() },
                 })?;
                 if leaving {
+                    let here = { self.agent.sessions().active().cwd.clone() };
+                    self.work_in(here).await;
                     self.enter_session();
                 }
                 self.persist_sessions();
@@ -1593,18 +1607,48 @@ impl Host {
         }
     }
 
-    /// Start an empty conversation without switching to it.
+    /// Make sure leaving `session` has somewhere to land, minting a placeholder if it does not.
     ///
-    /// Exists so that archiving the only conversation you have has somewhere to land. It inherits
-    /// the model and system prompt for the same reason a new conversation does: changing what you
-    /// are talking to as a side effect of tidying up would be a strange thing to do.
-    fn new_session_in(&mut self, cwd: std::path::PathBuf) {
+    /// A conversation you are finished with is a conversation you can close, and that includes the
+    /// last one: "the last session cannot be closed" is the store refusing the only thing left to
+    /// do in a workspace you have just cleared out. The store always has an active conversation —
+    /// there has to be somewhere for the next message to go — so "nothing left" is spelled as a
+    /// [placeholder](neosh_agent::Session::ephemeral): the composer types into it and the
+    /// transcript shows the welcome, but no list contains it and nothing is written to disk. An
+    /// emptied workspace should look empty, and one conversation named after nothing is not empty.
+    ///
+    /// Asked of [`list`](neosh_agent::store::SessionStore::list), which leaves out what is
+    /// archived, because landing in something you deliberately put away is the one destination
+    /// that is definitely wrong — a workspace whose every other conversation is archived is as
+    /// alone as one with no other conversation at all.
+    fn ensure_somewhere_to_go(&mut self, leaving: &neosh_proto::SessionId) {
+        let alone = { self.agent.sessions().list().iter().all(|s| &s.id == leaving) };
+        if alone {
+            // In the directory you are leaving rather than the one neosh was started in: the next
+            // thing you type is almost certainly about the project you were just in, and a
+            // placeholder somewhere else would silently move the file tools with it.
+            let id = self.new_session_in(self.cwd.clone());
+            if let Some(s) = self.agent.sessions().get_mut(&id) {
+                s.ephemeral = true;
+            }
+        }
+    }
+
+    /// Start an empty conversation without switching to it, and say which one it is.
+    ///
+    /// Exists so that closing or archiving the only conversation you have has somewhere to land.
+    /// It inherits the model and system prompt for the same reason a new conversation does:
+    /// changing what you are talking to as a side effect of tidying up would be a strange thing to
+    /// do.
+    fn new_session_in(&mut self, cwd: std::path::PathBuf) -> neosh_proto::SessionId {
         let mut session = neosh_agent::Session::new(cwd);
         session.created_at = now_secs();
         session.updated_at = session.created_at;
         session.selection = self.agent.selection();
         session.system = self.agent.session().system.clone();
+        let id = session.id.clone();
         self.agent.sessions().insert(session);
+        id
     }
 
     fn editor_message(&mut self, level: MessageLevel, text: impl Into<String>) {
@@ -2045,8 +2089,10 @@ impl Host {
                     .map(std::path::PathBuf::from)
                     .unwrap_or_else(|| self.cwd.clone());
                 if dir.is_dir() {
-                    self.new_session_in(dir);
-                    Ok(Some(self.agent.sessions().active_id().clone()))
+                    // The one just made, not whatever is on screen here: `new_session_in` inserts
+                    // without switching, so the active id is the conversation this machine happens
+                    // to be looking at and the peer would be handed somebody else's.
+                    Ok(Some(self.new_session_in(dir)))
                 } else {
                     Err(neosh_proto::Refusal::Failed {
                         message: format!("{} is not a directory here", dir.display()),
@@ -2753,6 +2799,11 @@ impl Host {
             None => "nothing configured \u{2014} run `neosh --list-models`".to_string(),
         };
 
+        // Whether this is a workspace or an empty one. A placeholder is what you land in after
+        // closing the last conversation — or after reopening a workspace whose every conversation
+        // was archived — and the transcript is the only thing on screen with room to say what to
+        // press next, because the panel beside it is, correctly, blank.
+        let empty = !self.agent.sessions().any_open();
         let ascii = self.option_bool("ui.ascii_only");
         let width = self.chat_width();
         let mut rows: Vec<String> = vec![String::new()];
@@ -2781,6 +2832,17 @@ impl Host {
         say(&mut rows, format!("  model      {model}"), vec![(0, 13, "Comment")]);
         say(&mut rows, format!("  directory  {}", tilde(&self.cwd)), vec![(0, 13, "Comment")]);
         rows.push(String::new());
+        // Said only when it is true: there is no conversation anywhere, so nothing else on screen
+        // is going to tell you that typing is how one starts.
+        if empty {
+            // Short enough to be one row. Nothing here wraps the welcome, so a sentence longer than
+            // the chat is a second line starting at column zero, under an indented one — and the
+            // row of keys below already says how to add a project, which is the rest of it.
+            let line = "  Nothing open. What you type here starts a conversation.".to_string();
+            let len = line.len();
+            say(&mut rows, line, vec![(0, len, "Comment")]);
+            rows.push(String::new());
+        }
         // Only when there is something to say. On a working setup the welcome should be the word,
         // a few short lines, and then out of the way.
         if selection.as_ref().is_some_and(|s| !self.selection_is_usable(s)) {
@@ -2793,13 +2855,25 @@ impl Host {
         }
         // The keys worth knowing before the first question — and the one most people never find,
         // which is that the transcript is a place you can go. The rest of the table is on `^Z`.
-        let keys: [(&str, &str); 5] = [
-            (if ascii { "Enter" } else { "\u{23ce}" }, "send"),
-            ("^S", "browse & copy"),
-            ("^P", "model"),
-            ("^T", "projects"),
-            ("^Z", "every key"),
-        ];
+        let keys: [(&str, &str); 5] = if empty {
+            // A different five, because four of the everyday ones are about a conversation and
+            // there is not one. What is worth knowing here is how to get one.
+            [
+                (if ascii { "Enter" } else { "\u{23ce}" }, "start"),
+                ("^O", "add project"),
+                ("^T", "projects"),
+                ("^F", "archived"),
+                ("^Z", "every key"),
+            ]
+        } else {
+            [
+                (if ascii { "Enter" } else { "\u{23ce}" }, "send"),
+                ("^S", "browse & copy"),
+                ("^P", "model"),
+                ("^T", "projects"),
+                ("^Z", "every key"),
+            ]
+        };
         let mut line = String::from("  ");
         let mut spans = Vec::new();
         for (i, (key, label)) in keys.iter().enumerate() {
@@ -6228,10 +6302,19 @@ impl Host {
             let target = active.or_else(|| {
                 order.iter().find(|id| store.get(id).is_some_and(|s| !s.archived)).cloned()
             });
-            if let Some(id) = target
-                && store.switch(&id).is_ok()
-            {
-                let _ = store.remove(&placeholder);
+            match target.filter(|id| store.switch(id).is_ok()) {
+                Some(_) => {
+                    let _ = store.remove(&placeholder);
+                }
+                // Nothing to land in, so what you land in is not a conversation either: the
+                // session the store was constructed with becomes the placeholder, which is what
+                // makes "everything is archived" look like an empty workspace rather than like a
+                // workspace with one conversation in it that you never started.
+                None => {
+                    if let Some(s) = store.get_mut(&placeholder) {
+                        s.ephemeral = true;
+                    }
+                }
             }
             store.set_order(order);
         }

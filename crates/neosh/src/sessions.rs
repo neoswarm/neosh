@@ -173,14 +173,27 @@ pub fn save(state: &Path, session: &Session) -> std::io::Result<()> {
 }
 
 /// Write every session plus the ordering.
+///
+/// Every session that is one: a [placeholder](neosh_agent::Session::ephemeral) is somewhere to
+/// type that was minted because the workspace had nowhere else, and writing it down would mean an
+/// emptied workspace came back with a conversation in it that nobody had started. It is left out
+/// of the order too, and is never what `active` names — restarting into it happens by there being
+/// nothing to restore, which is the state it stands for.
 pub fn save_all(state: &Path, store: &SessionStore) -> std::io::Result<()> {
     std::fs::create_dir_all(dir(state))?;
-    for s in store.iter() {
+    for s in store.iter().filter(|s| !s.ephemeral) {
         save(state, s)?;
     }
+    let order: Vec<SessionId> = store
+        .order()
+        .iter()
+        .filter(|id| store.get(id).is_some_and(|s| !s.ephemeral))
+        .cloned()
+        .collect();
     let order = Order {
-        order: store.order().to_vec(),
-        active: Some(store.active_id().clone()),
+        order,
+        active: Some(store.active_id().clone())
+            .filter(|id| store.get(id).is_some_and(|s| !s.ephemeral)),
     };
     let path = order_path(state);
     let tmp = path.with_extension("json.tmp");

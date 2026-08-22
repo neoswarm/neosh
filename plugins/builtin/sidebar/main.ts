@@ -1640,9 +1640,13 @@ async function deleteSession(neosh: Neosh, session: string): Promise<boolean> {
  * still in it, removing the project is deleting every one of them, so it asks as the delete it is
  * and says how many and where they would otherwise go.
  *
- * The conversations go first and the project only goes if they all did. The store refuses to delete
- * the very last conversation in the workspace — there has to be somewhere for the next message to
- * land — and a project removed anyway would take a row that still had something in it off the list.
+ * The conversations go first and the project only goes if they all did: a project removed anyway
+ * would take a row that still had something in it off the list.
+ *
+ * Removing the *last* project used to be the one case this could not finish: the store refused to
+ * delete the very last conversation in the workspace. It no longer does — what you land in is a
+ * placeholder, which is in no list and so in no project — so `X` here can leave the panel with
+ * nothing but `+ Add project` on it. See ADR 0039.
  */
 async function removeProject(
   neosh: Neosh,
