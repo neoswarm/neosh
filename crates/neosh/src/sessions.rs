@@ -47,6 +47,13 @@ struct Stored {
     /// meter whose denominator changed on reload would move without anything having happened.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     context_window: Option<u64>,
+    /// A turn finished here and nobody has been back to look at it.
+    ///
+    /// Persisted because that is exactly the case it exists for: the workspace ran the turn while
+    /// you were elsewhere, and "elsewhere" includes having stopped and restarted the thing. A mark
+    /// that a restart cleared would go out precisely when the wait was longest.
+    #[serde(default)]
+    unread: bool,
     /// Put away rather than deleted. Defaulted, so a session written before archiving existed
     /// comes back in the open list, which is where it was.
     #[serde(default)]
@@ -113,6 +120,7 @@ impl From<&Session> for Stored {
             usage: s.usage,
             context_tokens: s.context_tokens,
             context_window: s.context_window,
+            unread: s.unread,
             archived: s.archived,
             archived_at: s.archived_at,
             permission_mode: s.permission_mode,
@@ -134,6 +142,7 @@ impl Stored {
         s.usage = self.usage;
         s.context_tokens = self.context_tokens;
         s.context_window = self.context_window;
+        s.unread = self.unread;
         s.archived = self.archived;
         s.archived_at = self.archived_at;
         s.permission_mode = self.permission_mode;
@@ -307,6 +316,28 @@ mod tests {
             None,
             "a conversation no driver has run yet has nothing to pick up, and starting fresh is right"
         );
+    }
+
+    /// The wait a restart makes longer is exactly the one the mark is for.
+    ///
+    /// A turn ran while you were elsewhere, and "elsewhere" includes having closed the terminal and
+    /// come back tomorrow. A flag that a restart cleared would go out precisely when it was doing
+    /// the most work.
+    #[test]
+    fn a_finished_turn_you_have_not_seen_survives_the_workspace() {
+        let t = tmp("unread");
+        let mut waiting = session("go and do it");
+        waiting.unread = true;
+        let seen = session("we spoke");
+        save(&t.0, &waiting).expect("save");
+        save(&t.0, &seen).expect("save");
+
+        let (loaded, _) = load(&t.0);
+        let of = |id: &neosh_proto::SessionId| {
+            loaded.iter().find(|s| &s.id == id).expect("saved").unread
+        };
+        assert!(of(&waiting.id));
+        assert!(!of(&seen.id), "and a conversation with no news does not acquire any by being saved");
     }
 
     /// A mode you chose for one conversation is a decision, not a mood.
