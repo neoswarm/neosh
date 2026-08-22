@@ -51,3 +51,5 @@ implementation — and in two cases (0005, 0008) it did not, which is itself rec
 | [0043](0043-a-question-is-not-a-permission.md) | A question is not a permission | Accepted |
 | [0044](0044-what-the-plan-has-left.md) | What the plan has left is not a number you can count | Accepted |
 | [0045](0045-a-card-that-lands-says-so.md) | A card that lands says so | Accepted |
+| [0046](0046-a-worktree-lives-inside-its-project.md) | A worktree lives inside its project | Accepted |
+| [0047](0047-a-panel-that-has-the-keyboard.md) | A panel that has the keyboard | Accepted |
