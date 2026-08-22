@@ -122,6 +122,25 @@ visible and editable, and the panel echoes it on a `✎` row. A digit is a short
 been typed and a character once something has, and the panel says which by wearing the numbers or
 not — the badges disappearing is the notice that the keyboard's meaning changed.
 
+**A field is a field, and the row is one.** The `✎` row was drawn with the same `clip` as an
+option's label, so an answer wider than the panel became its first sixty characters and an ellipsis
+— and stayed that way however much more was typed. The caret stopped, the words went somewhere
+invisible, and the only way to read back what you had written was to send it: the one row on this
+panel whose entire job is to show you what you are writing was the one row that would not. So it
+wraps, onto as many lines as the sentence takes, and past six it keeps the *end* — the end is where
+the caret is, and a field that scrolled the other way would show you everything except the word you
+are typing. The wrap keeps every character it was given, spaces included, because a line that
+rewrites what you typed is one the caret can no longer be placed on honestly.
+
+**What you are writing belongs to the question, not to the panel.** Which question you are on and
+which row the cursor is on live on the ask, which outlives the panel; what was in the field lived in
+the panel, and the panel is closed and built again from nothing every time the screen moves to
+another conversation. Go and check something next door — which is very often exactly what the
+question sent you to do — and the sentence was gone, with no key having been pressed that could have
+deleted it. It is kept on the ask, and restored into the composer as well as onto the row, because
+switching conversations empties the composer and an answer on the panel that is not in the field
+below it is two answers that disagree.
+
 **Every key is a named command** bound against the `neosh.question` buffer kind, so `F1` lists them
 and `init.ts` can move them. Only printable characters come through the raw capture, and only
 because they are text rather than verbs.

@@ -283,6 +283,28 @@ impl Session {
             .collect()
     }
 
+    /// The rows drawn into the question panel, and nothing drawn anywhere else.
+    ///
+    /// The composer holds the same sentence — the panel mirrors what you type into it, because the
+    /// composer is the field this screen actually has — so a test about what *the panel* shows has
+    /// to say which buffer it means, or it passes on the composer's copy of the text and never
+    /// looks at the row it was written about.
+    fn panel(&self) -> Vec<String> {
+        let bufs: Vec<Value> = self
+            .events
+            .iter()
+            .filter(|e| e["type"] == "buffer_opened" && e["name"].as_str() == Some("[question]"))
+            .map(|e| e["buf"].clone())
+            .collect();
+        self.events
+            .iter()
+            .filter(|e| e["type"] == "buffer_lines" && bufs.contains(&e["buf"]))
+            .filter_map(|e| e["lines"].as_array())
+            .flatten()
+            .filter_map(|l| l["text"].as_str().map(str::to_string))
+            .collect()
+    }
+
     fn saw(&self, needle: &str) -> bool {
         self.texts().iter().any(|l| l.contains(needle))
     }
@@ -623,4 +645,73 @@ fn backspacing_off_an_empty_answer_goes_back_to_the_options() {
     s.wait_for("1-2 pick");
     s.key("1");
     s.wait_for(r#""answers":["Tabs"]"#);
+}
+
+/// An answer longer than the row is wide is still an answer you can read back.
+///
+/// The row that takes an answer of your own was drawn with the same `clip` as an option's label:
+/// past the width of the panel it became the first sixty characters and an ellipsis, and stayed
+/// that way however much more was typed. The caret stopped moving, every word after it went
+/// somewhere invisible, and the only way to find out what you had written was to send it — on the
+/// one row of this panel whose entire job is to show you what you are writing.
+#[test]
+fn an_answer_longer_than_the_row_is_shown_whole() {
+    let mut s = open_with("longanswer", "t.ask.one", "Tabs or spaces?");
+    let answer = "spaces everywhere except in the makefiles, where a tab is the syntax and a space \
+                  is a build that fails, and this is the zzz-end-of-it";
+    for c in answer.chars() {
+        s.key(&c.to_string());
+    }
+    assert!(
+        s.pump(|x| x.panel().iter().any(|l| l.contains("zzz-end-of-it"))),
+        "the end of what is being typed is on the panel\n{}",
+        s.transcript()
+    );
+    // And nothing of it was thrown away to make it fit: the field wraps, it does not clip.
+    assert!(
+        !s.panel().iter().any(|l| l.contains("makefiles") && l.contains('\u{2026}')),
+        "the field wraps rather than ending in an ellipsis\n{}",
+        s.transcript()
+    );
+    s.special("enter");
+    s.wait_for(&format!("\"answers\":[\"{answer}\"]"));
+}
+
+/// What you were half-way through writing survives looking at another conversation.
+///
+/// Which question you are on and which row the cursor is on already did — they live on the ask,
+/// which outlives the panel — but what was in the field lived in the panel, and the panel is closed
+/// and built again from nothing every time the screen moves to another conversation. Go and check
+/// something in the conversation next door and the sentence you were writing was gone, with no key
+/// having been pressed that could have deleted it.
+#[test]
+fn what_you_were_writing_survives_looking_at_another_conversation() {
+    let sb = Sandbox::new("keeps-writing");
+    sb.install_asker(ASKER);
+    let mut s = sb.start();
+    s.wait_for("asker ready");
+    s.command("t.ask.one");
+    s.wait_for("Tabs or spaces?");
+    for c in "half a thought".chars() {
+        s.key(&c.to_string());
+    }
+    s.wait_for("\u{270e} half a thought");
+
+    s.command("t.switch");
+    s.wait_for("conversation is asking");
+    s.drain_for(Duration::from_millis(400));
+
+    // Counted with the panel gone, so what is waited for below is the panel *coming back* rather
+    // than the last of the redraws it made on its way out.
+    let written = s.count("\u{270e} half a thought");
+    s.command("t.switch");
+    assert!(
+        s.pump(move |x| x.count("\u{270e} half a thought") > written),
+        "coming back puts you back in the sentence\n{}",
+        s.transcript()
+    );
+    // And it is still the answer, not merely still on screen.
+    s.special("enter");
+    s.wait_for("\"answers\":[\"half a thought\"]");
+    assert!(s.saw(r#""custom":true"#), "and it is marked as typed\n{}", s.transcript());
 }
