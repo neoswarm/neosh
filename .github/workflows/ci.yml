@@ -65,8 +65,13 @@ jobs:
       #
       # Registered *after* `rust-cache` on purpose. Post steps run in reverse
       # order, so this one saves the archive before `rust-cache` prunes it.
+      # Restore and save are separate because `actions/cache` does not save on a
+      # failed job — which is precisely the run that just paid to download it,
+      # and precisely the run somebody is iterating on. A red build should still
+      # leave the 150MB behind for the next attempt.
       - name: Cache the V8 prebuilt
-        uses: actions/cache@v4
+        id: v8
+        uses: actions/cache/restore@v4
         with:
           path: target/debug/gn_out
           key: v8-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
@@ -91,7 +96,18 @@ jobs:
           git config --global init.defaultBranch main
 
       - name: Tests
-        run: cargo test --workspace --locked
+        run: cargo test --workspace --exclude neosh --locked
+
+      # The binary's own suites drive a real `neosh` under a pty, and each one
+      # is a whole workspace with a V8 runtime in it. Run at the runner's
+      # default parallelism they spend their budget waiting for each other's
+      # CPU rather than for the thing they are asserting on — sixteen of them
+      # timed out at once on a four-core runner, most in code this branch never
+      # touched. `--test-threads 2` is what AGENTS.md already prescribes for
+      # them locally, and a runner with fewer cores than a laptop needs it more
+      # rather than less.
+      - name: The binary's integration tests
+        run: cargo test -p neosh --locked -- --test-threads 2
 
       # The plugin API's wire types are generated from Rust and committed. A
       # Rust type that changed without its binding being regenerated means the
@@ -126,6 +142,15 @@ jobs:
           scaffold="$(mktemp -d)"
           cargo run --quiet --locked -p neosh -- --config-dir "$scaffold" init
           ./plugins/api/node_modules/.bin/tsc --noEmit --project "$scaffold/tsconfig.json"
+
+      # Last, because the archive only exists once something has built V8, and
+      # `if: always()` because a run that failed its tests still downloaded it.
+      - name: Save the V8 prebuilt
+        if: always() && steps.v8.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: target/debug/gn_out
+          key: v8-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
 
   lint:
     runs-on: ubuntu-latest
