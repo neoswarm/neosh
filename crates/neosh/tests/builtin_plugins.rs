@@ -3005,6 +3005,26 @@ fn the_key_list_opens_from_the_panel_and_any_key_dismisses_it() {
     assert!(s.pump(|s| s.windows_for(keys).is_empty()), "any key closes it\n{}", s.transcript());
 }
 
+/// The key list is reachable from the composer, and by a chord rather than by `F1`. Apple's top
+/// row is brightness until somebody finds the setting, so the key whose job is teaching every
+/// other key was the one key a new Mac could not press. See ADR 0048.
+#[test]
+fn the_key_list_opens_on_a_chord_from_the_composer() {
+    let sb = Sandbox::new("keylistchord");
+    let mut s = sb.start();
+    s.wait_for("PROJECTS");
+
+    s.ctrl("z");
+    s.wait_for("CHAT");
+    let keys = s.buffer_named("[keys]").expect("key list buffer");
+    assert!(
+        s.pump(|s| s.lines_of(keys).iter().any(|l| l.contains("Command palette"))),
+        "the live registry, not a written-down list\n{:?}",
+        s.lines_of(keys)
+    );
+    assert!(s.pump(|s| s.windows_for(keys).len() == 1), "it is on screen\n{}", s.transcript());
+}
+
 #[test]
 fn escape_leaves_the_thread_list_and_typing_goes_back_to_the_composer() {
     let sb = Sandbox::new("leave");
@@ -3710,7 +3730,7 @@ impl Session {
 #[test]
 fn the_shortcut_row_is_off_because_the_sidebar_already_says_all_of_it() {
     // It read as a good idea and was not. `^T`, `^N` and `^K` are in the sidebar's own footer two
-    // rows below, `F1` is on the row it points at, and what the duplication actually bought was
+    // rows below, `^Z` is on the row it points at, and what the duplication actually bought was
     // one fewer line of transcript and a composer pressed against the status strip.
     let sb = Sandbox::new("nohints");
     let mut s = sb.start();
@@ -3735,7 +3755,7 @@ fn the_shortcut_row_comes_back_if_you_ask_for_it() {
     // Waiting on a plugin's entry, not the host's: the host seeds `⏎ send` before any plugin has
     // loaded, so asserting on that alone would pass before the row was finished.
     assert!(
-        s.pump(|s| s.composer_chrome().iter().any(|t| t.contains("F1 keys"))),
+        s.pump(|s| s.composer_chrome().iter().any(|t| t.contains("^Z keys"))),
         "the way to the keys that did not fit\n{:?}",
         s.composer_chrome()
     );
