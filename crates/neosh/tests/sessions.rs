@@ -280,6 +280,11 @@ export async function activate({ neosh }: PluginContext) {
       neosh.notify(`close failed: ${e}`);
     }
   });
+  await neosh.cmd.register("t.count", async () => {
+    const open = await neosh.session.list();
+    const all = await neosh.session.list({ includeArchived: true });
+    neosh.notify(`count: ${open.length} open, ${all.length} in all`);
+  });
   await neosh.cmd.register("t.listAll", async () => {
     const all = await neosh.session.list({ includeArchived: true });
     neosh.notify(
@@ -432,14 +437,41 @@ fn a_conversation_in_another_directory_is_how_a_second_project_appears() {
 }
 
 #[test]
-fn closing_the_last_conversation_is_refused() {
-    // There is always somewhere for the next thing you type.
+fn closing_the_last_conversation_leaves_an_empty_workspace() {
+    // There is always somewhere for the next thing you type — which is a reason to *make* one,
+    // not a reason to refuse. "The last session cannot be closed" was the workspace declining the
+    // only thing left to do in a workspace you have finished clearing out.
+    //
+    // What you land in is a placeholder: the composer types into it and the transcript draws into
+    // it, but no list contains it, so an emptied workspace reads as empty rather than as one
+    // conversation nobody started.
     let sb = Sandbox::new("last");
     install_driver(&sb);
     let mut s = sb.start();
     s.wait_for("driver ready");
+
+    s.type_text("the only one");
+    s.enter();
+    s.wait_for("the only one");
+
     s.command("t.closeActive");
-    s.wait_for("close failed:");
+    s.wait_for("closed");
+    // Nothing open and nothing archived: closing is not archiving, and `includeArchived` is what
+    // would still have found it.
+    s.command("t.count");
+    s.wait_for("count: 0 open, 0 in all");
+    assert!(
+        s.pump(|s| !s.chat_now().iter().any(|l| l.contains("the only one"))),
+        "the transcript you closed is off the screen\n{:?}",
+        s.chat_now()
+    );
+    // And the transcript says what to do about it, because the panel beside it is — correctly —
+    // blank.
+    assert!(
+        s.pump(|s| s.chat_now().iter().any(|l| l.contains("Nothing open"))),
+        "an empty workspace says how to start one\n{:?}",
+        s.chat_now()
+    );
 }
 
 #[test]
@@ -462,6 +494,68 @@ fn closing_the_active_conversation_lands_on_another_one() {
         "landed back in the surviving conversation\n{:?}",
         s.chat_now()
     );
+}
+
+#[test]
+fn saying_something_in_the_placeholder_makes_it_a_conversation() {
+    // The other half of an empty workspace: what you land in is somewhere to type, and typing in it
+    // is what a conversation is. Without this the message would go into something no list ever
+    // showed and nothing ever saved.
+    let sb = Sandbox::new("placeholder");
+    install_driver(&sb);
+    let mut s = sb.start();
+    s.wait_for("driver ready");
+
+    s.command("t.closeActive");
+    s.wait_for("closed");
+    s.command("t.count");
+    s.wait_for("count: 0 open, 0 in all");
+
+    s.type_text("starting again");
+    s.enter();
+    s.wait_for("starting again");
+    s.command("t.count");
+    s.wait_for("count: 1 open, 1 in all");
+    // And it is named after what was said in it, like any other.
+    s.command("t.list");
+    s.wait_for("sessions: *starting again");
+
+    // Including on disk. `save_all` skips placeholders, so the flag being cleared is the only
+    // thing standing between this message and never being written down.
+    s.command("quit");
+    assert!(s.exits_within(Duration::from_secs(10)), "clean exit");
+    let mut s = sb.start();
+    s.wait_for("driver ready");
+    s.command("t.list");
+    s.wait_for("sessions: *starting again");
+}
+
+#[test]
+fn closing_the_only_open_conversation_does_not_land_you_in_an_archived_one() {
+    // Archived is where you put the things you are finished with, so a workspace whose every other
+    // conversation is archived is as alone as one with no other conversation at all — and landing
+    // in something you deliberately put away is the one destination that is definitely wrong.
+    let sb = Sandbox::new("closearchived");
+    install_driver(&sb);
+    let mut s = sb.start();
+    s.wait_for("driver ready");
+
+    s.type_text("put me away");
+    s.enter();
+    s.wait_for("put me away");
+    s.command("t.new");
+    s.wait_for("created");
+    s.command("t.archiveOldest");
+    s.wait_for("archived");
+
+    s.command("t.closeActive");
+    s.wait_for("closed");
+    // A placeholder, not the conversation you put away: one thing in the workspace and none of it
+    // open.
+    s.command("t.count");
+    s.wait_for("count: 0 open, 1 in all");
+    s.command("t.listAll");
+    s.wait_for("all: ~put me away");
 }
 
 #[test]
@@ -492,9 +586,10 @@ fn an_archived_conversation_leaves_the_list_without_leaving_the_store() {
 }
 
 #[test]
-fn archiving_the_only_conversation_lands_you_in_a_fresh_one_rather_than_nowhere() {
-    // The store refuses to leave you with nothing; the host answers by starting something empty,
-    // because "there is nowhere to go" is a bad answer to "I am done with this".
+fn archiving_the_only_conversation_lands_you_somewhere_rather_than_nowhere() {
+    // The store refuses to leave you with nothing; the host answers with a placeholder, because
+    // "there is nowhere to go" is a bad answer to "I am done with this" — and a placeholder rather
+    // than a conversation, because a workspace you have just emptied should read as empty.
     let sb = Sandbox::new("archivelast");
     install_driver(&sb);
     let mut s = sb.start();
@@ -506,8 +601,8 @@ fn archiving_the_only_conversation_lands_you_in_a_fresh_one_rather_than_nowhere(
 
     s.command("t.archiveActive");
     s.wait_for("archived the active one");
-    s.command("t.list");
-    s.wait_for("sessions: *New conversation");
+    s.command("t.count");
+    s.wait_for("count: 0 open, 1 in all");
     s.command("t.listAll");
     s.wait_for("~the only one");
 }
@@ -541,6 +636,37 @@ fn archiving_survives_a_restart() {
     );
     s.command("t.listAll");
     s.wait_for("~shelved");
+}
+
+#[test]
+fn a_workspace_with_everything_archived_starts_empty() {
+    // The restore path's own version of the same rule. There is something saved and nothing open to
+    // land in, so the session the store is constructed with becomes the placeholder rather than
+    // being removed — otherwise reopening a workspace you had put away entirely would greet you
+    // with one conversation you never started, in a project, next to the ones you archived.
+    let sb = Sandbox::new("allarchived");
+    install_driver(&sb);
+    {
+        let mut s = sb.start();
+        s.wait_for("driver ready");
+        s.type_text("all done");
+        s.enter();
+        s.wait_for("all done");
+        s.command("t.archiveActive");
+        s.wait_for("archived the active one");
+        s.command("quit");
+        assert!(s.exits_within(Duration::from_secs(10)), "clean exit");
+    }
+
+    let mut s = sb.start();
+    s.wait_for("driver ready");
+    s.command("t.count");
+    s.wait_for("count: 0 open, 1 in all");
+    assert!(
+        s.pump(|s| s.chat_now().iter().any(|l| l.contains("Nothing open"))),
+        "and the transcript says so\n{:?}",
+        s.chat_now()
+    );
 }
 
 #[test]

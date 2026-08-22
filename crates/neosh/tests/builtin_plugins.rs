@@ -5950,7 +5950,7 @@ fn the_plan_row_keeps_the_providers_own_colour() {
     s.send(&command("planner.publish"));
     s.wait_for("published");
     assert!(
-        s.pump(|s| s.sidebar_now().iter().any(|l| l.contains("Session"))),
+        s.pump(|s| s.sidebar_now().iter().any(|l| l.contains("Planner"))),
         "the strip is drawn\n{:?}",
         s.sidebar_now()
     );
@@ -5959,7 +5959,7 @@ fn the_plan_row_keeps_the_providers_own_colour() {
     let at = s
         .sidebar_now()
         .iter()
-        .position(|l| l.contains("Session"))
+        .position(|l| l.contains("Planner"))
         .expect("the row with the binding limit on it");
     let groups = s.groups_of(buf);
     let on_row = groups.get(at).cloned().unwrap_or_default();
