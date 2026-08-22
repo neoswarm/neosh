@@ -169,6 +169,14 @@ per decision, and records the *reasoning*, not the choice.
   things you are finished with is the only part of that column that is never the answer, and it
   grows forever. One row with a count, `a` in the panel or `^F` anywhere, and it opens as a picker
   you can filter — because a flat list of dim rows is not a way to find anything. See ADR 0039.
+- **A turn that finished while you were elsewhere is news until you go and look.** The panel says
+  what is *happening* and stops the moment it stops, so an answer that arrived while you were in
+  another conversation looks exactly like an answer you read yesterday. `SessionInfo::unread` is set
+  when a turn ends off screen and cleared by *arriving* — no dismissal key, because a mark you clear
+  by hand is a second chore attached to the first. It lives on the conversation and is persisted, so
+  every list agrees and a restart does not lose it; it wears `Status.Unread`, the amber the palette
+  already uses for *act now*, and it never moves — motion means "something is happening you cannot
+  see", and this is the opposite. A folded project carries a dot for what it is hiding. See ADR 0042.
 - **A card is a row until you ask for more.** A call that only *looked* at something folds to its
   header with the size of what came back on the end of it; a command keeps its output, an edit keeps
   its diff, and a failure always shows. See ADR 0033.
