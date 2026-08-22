@@ -6881,20 +6881,26 @@ impl Host {
                 ),
             },
             // Widget keys. Space-separated lists in Neovim notation, so more than one key can mean
-            // the same thing — `<Down>` and `<C-n>` both move down, and adding a third is a
+            // the same thing — `<C-n>` and `<Down>` both move down, and adding a third is a
             // setting rather than a fork. Declared by the host rather than by whichever plugin
             // happens to open a picker first, because two plugins declaring the same option name
             // is an error and every plugin uses this widget library.
+            //
+            // **The chord comes first, and the arrow second.** The first key in the list is the
+            // one a widget prints on its hint row, and a legend is a promise about a keyboard:
+            // every terminal sends `^N`, while an arrow is a key some keyboards only have on a
+            // layer and some remote sessions mangle. Both work — this is the order they are
+            // *offered* in, not the set.
             OptionSpec {
                 name: "ui.keys.next".into(),
                 ty: OptionType::Str,
-                default: OptionValue::Str("<Down> <C-n> <C-j>".into()),
+                default: OptionValue::Str("<C-n> <Down> <C-j>".into()),
                 description: Some("Move down in a picker or completion list.".into()),
             },
             OptionSpec {
                 name: "ui.keys.prev".into(),
                 ty: OptionType::Str,
-                default: OptionValue::Str("<Up> <C-p> <C-k>".into()),
+                default: OptionValue::Str("<C-p> <Up> <C-k>".into()),
                 description: Some("Move up in a picker or completion list.".into()),
             },
             OptionSpec {
