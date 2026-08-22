@@ -121,6 +121,17 @@ per decision, and records the *reasoning*, not the choice.
 - **Every view gets every event.** `Agent` fans its stream out to one queue per view. Never a
   `broadcast` channel: lagging consumers drop the oldest, silently, under load — and a view that
   missed one `ToolFinished` has a card that spins forever with nothing to put it right.
+- **A setting you cannot send is still a setting, and every model has some.** A knob is a
+  `ProviderOptionDescriptor` the *driver* advertises — discovered where an endpoint says what it
+  takes (OpenRouter's `supported_parameters`, `codex`'s `model/list`), written down where it will
+  not — and a provider with no knobs listed is a bug in a catalogue, not a model without options.
+  Some of them are words rather than parameters: `ultrathink` and `ultracode` are read by a
+  *harness*, so they live on `claude-cli` and never on `anthropic`, they travel as
+  `prompt_injected_values` / `prompt_injected_word`, and the injection happens once, above every
+  driver, on the copy of the message this turn sends — never on the transcript, never on a tool
+  round, and always with a sendable value put back in the selection's place. `^E` shows *all* of
+  them at once and applies as you move, because a knob you cannot see is a knob you do not have. See
+  ADR 0043.
 - **Take the transport that can do the most.** `claude` in stream-json mode with the control
   protocol; `codex app-server`, not `codex exec`. The cheaper one is not simpler for long — it is
   the one where streaming, approvals and interrupts turn out to be impossible rather than missing.
@@ -294,7 +305,7 @@ registry — this table is what ships.
 | `^V` | Attach the image on the clipboard. A key rather than a paste, because a terminal's paste can only ever hand over text |
 | `⌥V` | Take the last attached image back off |
 | `^P` | Pick a model. Mid-turn too — the running agent is told, and thinks the rest with it |
-| `^E` | Reasoning effort and the other per-model options |
+| `^E` | Everything this model can be told, on one panel: effort, thinking, fast mode, context, and whatever a driver invented. `←→` along a row, `↑↓` between them, and it applies as you move |
 | `⌥↑` `⌥↓` | One rung up or down the capability ladder, same provider |
 | `⇧⇥` | Permission mode — full access to start with, then ask, allow-listed, deny. Belongs to this conversation, saved with it, and takes effect on the turn that is running |
 | `^T` | Projects and conversations. Switching is never refused — turns keep running where they are |
