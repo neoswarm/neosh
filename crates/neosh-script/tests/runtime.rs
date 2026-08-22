@@ -322,7 +322,7 @@ fn every_bundled_plugin_is_well_formed() {
             "{}: no activate export, so nothing would happen when it loads",
             p.name
         );
-        assert!(p.url.starts_with("neosh:builtin/"), "{}: unexpected url {}", p.name, p.url);
+        assert!(p.url.starts_with("neosh:/builtin/"), "{}: unexpected url {}", p.name, p.url);
     }
 }
 

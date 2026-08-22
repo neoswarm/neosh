@@ -316,6 +316,21 @@ pub enum Animation {
         #[ts(type = "number")]
         ms: u32,
     },
+    /// Hue travelling along the run: every cell a different colour, the whole band drifting.
+    ///
+    /// The one animation that abandons the group's own colour, and it is reserved for the one thing
+    /// that deserves it — a setting that is *not on the ladder*, like an effort level bought by
+    /// putting a word in the prompt. Everything else here is a state, and states are three hues and
+    /// an attribute (see `neosh_core::palette`); this is the exception that proves it, because what
+    /// it says is "this is not one of the normal settings" and no amount of amber says that.
+    ///
+    /// Keeps the base colour's *lightness* and replaces only the hue, so a light theme gets a
+    /// rainbow it can read. Without truecolor it rotates the six ANSI hues instead, which is
+    /// coarser and still unmistakably the same idea.
+    Spectrum {
+        #[ts(type = "number")]
+        period_ms: u32,
+    },
 }
 
 /// The glyphs a [`Animation::Frames`] cycles through.
@@ -342,9 +357,10 @@ pub enum FrameSet {
 impl Animation {
     pub fn period_ms(self) -> u32 {
         match self {
-            Self::Shimmer { period_ms } | Self::Pulse { period_ms } | Self::Frames { period_ms, .. } => {
-                period_ms.max(50)
-            }
+            Self::Shimmer { period_ms }
+            | Self::Pulse { period_ms }
+            | Self::Spectrum { period_ms }
+            | Self::Frames { period_ms, .. } => period_ms.max(50),
             Self::Flash { ms } => ms.max(50),
         }
     }

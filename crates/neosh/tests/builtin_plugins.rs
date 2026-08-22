@@ -253,6 +253,42 @@ impl Session {
         open
     }
 
+    /// Every buffer that has ever been opened under `name`, newest last.
+    ///
+    /// A panel that is opened, closed and opened again is two buffers with one name, so a helper
+    /// that took the first would be watching the one from last time forever.
+    fn buffers_named(&self, name: &str) -> Vec<u64> {
+        self.events
+            .iter()
+            .filter(|e| e["type"] == "buffer_opened" && e["name"] == name)
+            .filter_map(|e| e["buf"].as_u64())
+            .collect()
+    }
+
+    /// Wait until something on screen is showing a buffer called `name`.
+    ///
+    /// Not `wait_for` on its text: that scans everything the screen has *ever* said, so the second
+    /// time a panel is opened it returns immediately — before the panel is there — and the keys
+    /// meant for it go to the composer instead.
+    fn wait_open(&mut self, name: &str) {
+        let there = |s: &Session| s.buffers_named(name).iter().any(|b| !s.windows_for(*b).is_empty());
+        assert!(self.pump(there), "{name} never opened\n{}", self.transcript());
+    }
+
+    /// Wait until nothing on screen is showing the buffer called `name`.
+    ///
+    /// The panels are plugin-drawn, so closing one is a round trip: the key resolves against the
+    /// window that is still open, the plugin is told, and the window goes away a moment later. A
+    /// test that types the next key immediately is typing it *into the panel* — which no person is
+    /// fast enough to do, and every test is.
+    fn wait_closed(&mut self, name: &str) {
+        let gone = |s: &Session| {
+            let bufs = s.buffers_named(name);
+            !bufs.is_empty() && bufs.iter().all(|b| s.windows_for(*b).is_empty())
+        };
+        assert!(self.pump(gone), "{name} never closed\n{}", self.transcript());
+    }
+
     /// Windows currently showing `buf`.
     fn windows_for(&self, buf: u64) -> Vec<u64> {
         let open = self.open_windows();
@@ -706,14 +742,15 @@ fn choosing_a_model_reports_the_new_selection() {
 }
 
 #[test]
-fn a_model_with_no_options_says_so_instead_of_opening_an_empty_picker() {
-    // The mock driver exposes no `ProviderOptionDescriptor`s, so the effort switcher has nothing to
-    // offer. Opening an empty list and making the user press Escape would be worse than a message.
+fn a_model_with_no_options_says_so_instead_of_opening_an_empty_panel() {
+    // The mock driver exposes no `ProviderOptionDescriptor`s, so the switcher has nothing to offer.
+    // Opening an empty panel and making the user press Escape would be worse than a message — and
+    // the message names the model, because the answer to "why not" is almost always "not that one".
     let sb = Sandbox::new("effort");
     let mut s = sb.start();
     s.wait_for("PROJECTS");
     s.ctrl("e");
-    s.wait_for("has no options to set");
+    s.wait_for("has nothing to set");
 }
 
 // ---------------------------------------------------------------------------
@@ -1008,6 +1045,53 @@ export async function activate({ neosh }: PluginContext) {
 }
 "#;
 
+/// A driver whose top level is a *word* rather than a parameter.
+///
+/// The shape a vendor harness has: a ladder that can be sent, plus a level you buy by saying it. The
+/// handler reads back both halves of what arrived, which is the only way to tell the difference
+/// between "the word was injected" and "the word was sent as the effort, and the endpoint would have
+/// rejected it".
+const SPOKEN_KNOB: &str = r#"
+import type { PluginContext } from "@neosh/api";
+
+export async function activate({ neosh }: PluginContext) {
+  await neosh.provider.register("spoken", [{
+    id: "lab",
+    driver: "spoken",
+    display_name: "Lab",
+    models: [{
+      id: "wordy",
+      display_name: "Wordy",
+      capabilities: {
+        tools: false, vision: false, streaming: true, thinking: true, prompt_caching: false,
+        option_descriptors: [{
+          type: "select",
+          id: "effort",
+          label: "Effort",
+          options: [
+            { id: "low", label: "Low", is_default: false },
+            { id: "high", label: "High", is_default: true },
+            { id: "abracadabra", label: "Abracadabra", is_default: false },
+          ],
+          prompt_injected_values: ["abracadabra"],
+        }],
+      },
+    }],
+  }], async (req, emit) => {
+    const last = req.messages[req.messages.length - 1];
+    const text = last?.content.map((b) => (b.type === "text" ? b.text : "")).join("") ?? "";
+    const effort = req.selection.options?.find((o) => o.id === "effort")?.value ?? "none";
+    emit({ type: "message_start", model: "wordy", usage: {} });
+    emit({ type: "block_start", index: 0, block: { kind: "text" } });
+    emit({ type: "text_delta", index: 0, text: `got[${text.replace(/\n/g, "|")}] effort[${effort}]` });
+    emit({ type: "block_stop", index: 0 });
+    emit({ type: "message_delta", stop_reason: { kind: "end_turn" }, usage: {} });
+    emit({ type: "message_stop" });
+  });
+  neosh.notify("spoken ready");
+}
+"#;
+
 /// A driver with a full ladder in it: three rungs, plus one superseded model.
 const LADDER: &str = r#"
 import type { PluginContext } from "@neosh/api";
@@ -1159,20 +1243,107 @@ fn a_driver_can_invent_an_option_and_the_switcher_renders_it() {
     let mut s = sb.start_letting_config_choose();
     s.wait_for("lab ready");
 
-    // The switcher has never heard of "vibe" and does not need to.
+    // The switcher has never heard of "vibe" and does not need to. Every value is on screen at
+    // once — that is what the panel is for — so both of them are visible before anything is chosen.
     s.ctrl("e");
+    s.wait_open("[model options]");
     s.wait_for("Vibe");
     assert!(s.saw("Chill"), "choices rendered\n{}", s.transcript());
     assert!(s.saw("Intense"), "choices rendered\n{}", s.transcript());
 
-    // Move to the second entry and take it.
-    s.special("down");
+    // Along the row, then out. Right rather than down: the values of one knob run across, and the
+    // knobs run down — which is the difference between this and the two nested lists it replaced.
+    s.special("right");
     s.special("enter");
-    s.wait_for("Vibe: Intense");
+    s.wait_closed("[model options]");
 
-    // And it is really on the selection the next turn would use, not just in a message.
+    // And it is really on the selection the next turn would use. Asserted here rather than from a
+    // notification, because there is no longer one to assert: the panel applies as you move, so the
+    // *state* is the acknowledgement.
     s.send(&command("lab.report"));
     s.wait_for(r#"selection: lab/brainy [{"id":"vibe","value":"intense"}]"#);
+}
+
+#[test]
+fn a_level_that_is_a_word_is_said_rather_than_sent() {
+    // The half of `prompt_injected_values` that never existed. The field has been on the wire since
+    // ADR 0011 and nothing acted on it, so choosing such a level put it where a parameter goes —
+    // `--effort abracadabra`, which is not a level, and the turn fails.
+    let sb = Sandbox::new("spoken");
+    let dir = sb.root.join("config/plugins/lab");
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    std::fs::write(
+        dir.join("plugin.toml"),
+        "name = \"lab\"\nversion = \"0.1.0\"\nentry = \"main.ts\"\npermissions = [\"providers\"]\n",
+    )
+    .expect("write manifest");
+    std::fs::write(dir.join("main.ts"), SPOKEN_KNOB).expect("write plugin");
+    sb.write_config("[options]\n\"agent.model\" = \"lab/wordy\"\n");
+
+    let mut s = sb.start_letting_config_choose();
+    s.wait_for("spoken ready");
+    s.ctrl("e");
+    s.wait_open("[model options]");
+    // Past the top of the sendable ladder: low, high, and then the word.
+    s.special("right");
+    s.special("right");
+    s.special("enter");
+    s.wait_closed("[model options]");
+
+    for c in ["h", "e", "l", "l", "o"] {
+        s.key(c);
+    }
+    s.special("enter");
+
+    // Both halves at once. The word arrived at the top of the message, and what went in the
+    // parameter is the ladder's own default rather than the word — so a driver that would have
+    // rejected it never sees it, and a driver whose default is lower does not quietly get its way.
+    s.wait_for("got[abracadabra||hello] effort[high]");
+}
+
+#[test]
+fn what_you_typed_is_what_the_transcript_keeps() {
+    // The word belongs to the *request*, not to the conversation. Written into the stored message it
+    // would be replayed on every later turn — so turning the level off would not turn it off — and
+    // it would be sitting in the transcript above an answer, as something you never said.
+    let sb = Sandbox::new("spokenkeep");
+    let dir = sb.root.join("config/plugins/lab");
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    std::fs::write(
+        dir.join("plugin.toml"),
+        "name = \"lab\"\nversion = \"0.1.0\"\nentry = \"main.ts\"\npermissions = [\"providers\"]\n",
+    )
+    .expect("write manifest");
+    std::fs::write(dir.join("main.ts"), SPOKEN_KNOB).expect("write plugin");
+    sb.write_config("[options]\n\"agent.model\" = \"lab/wordy\"\n");
+
+    let mut s = sb.start_letting_config_choose();
+    s.wait_for("spoken ready");
+    s.ctrl("e");
+    s.wait_open("[model options]");
+    s.special("right");
+    s.special("right");
+    s.special("enter");
+    s.wait_closed("[model options]");
+    for c in ["h", "i"] {
+        s.key(c);
+    }
+    s.special("enter");
+    s.wait_for("got[abracadabra||hi]");
+
+    // Back down the ladder, and ask again. If the first turn's word had been kept, this one would
+    // carry it too.
+    s.ctrl("e");
+    s.wait_open("[model options]");
+    s.special("left");
+    s.special("left");
+    s.special("enter");
+    s.wait_closed("[model options]");
+    for c in ["y", "o"] {
+        s.key(c);
+    }
+    s.special("enter");
+    s.wait_for("got[yo] effort[low]");
 }
 
 #[test]
@@ -1202,10 +1373,11 @@ fn switching_models_keeps_an_option_the_new_one_also_has() {
     let mut s = sb.start_letting_config_choose();
     s.wait_for("lab ready");
     s.ctrl("e");
+    s.wait_open("[model options]");
     s.wait_for("Vibe");
-    s.special("down");
+    s.special("right");
     s.special("enter");
-    s.wait_for("Vibe: Intense");
+    s.wait_closed("[model options]");
 
     // Move to "Plain", which has no options at all.
     s.ctrl("p");

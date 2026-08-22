@@ -403,6 +403,16 @@ impl Agent {
             format!("no driver for instance {} — is the plugin that provides it loaded?", selection.instance)
         })?;
 
+        // A knob spelled into the prompt applies here too. A branch name generated at `ultrathink`
+        // is silly, but a *level the endpoint would reject* is not silly, it is a failed request —
+        // and this path shares the conversation's selection, so it inherits whatever was chosen
+        // there.
+        let mut selection = selection;
+        let words = neosh_provider::prompt_injections(&instance.models, &mut selection);
+        let mut messages =
+            vec![Message { role: Role::User, content: vec![ContentBlock::Text { text: prompt }] }];
+        neosh_provider::inject(&mut messages, &words);
+
         let request = TurnRequest {
             selection,
             // A one-shot generation is nobody's conversation: it borrows the model and the
@@ -413,10 +423,7 @@ impl Agent {
             // Nobody's conversation, so there is nothing to pick up and nothing to leave behind.
             resume: None,
             system,
-            messages: vec![Message {
-                role: Role::User,
-                content: vec![ContentBlock::Text { text: prompt }],
-            }],
+            messages,
             tools: Vec::new(),
             max_output_tokens: None,
         };
@@ -610,7 +617,7 @@ impl Agent {
 
             // One guard, not two: temporaries in a struct literal live to the end of the
             // statement, so taking the session lock twice here would deadlock against itself.
-            let Some((cwd, system, messages, resume)) = self.with(&session, |s| {
+            let Some((cwd, system, mut messages, resume)) = self.with(&session, |s| {
                 (s.cwd.clone(), s.system.clone(), s.messages.clone(), s.resume.clone())
             }) else {
                 // Closed while its own turn was running. There is nowhere to put the answer, so
@@ -619,8 +626,24 @@ impl Agent {
                 stop = StopReason::Cancelled;
                 break;
             };
+            // Options that are said rather than sent. A vendor gating depth on a word in the
+            // message — `ultrathink`, and everything that has copied it — is still a setting: you
+            // choose it in the same picker, it shows in the same strip, and it applies to the same
+            // turn. It just cannot travel as a parameter, so it travels in the message this turn is
+            // about to send, and *only* that copy: the transcript keeps what you actually typed, and
+            // the round trips after a tool call do not each say it again. See
+            // `neosh_provider::injection`.
+            let mut selection = selection.clone();
+            let words = neosh_provider::prompt_injections(&instance.models, &mut selection);
+            // The first round only. A tool result travels as a user message, so every round after
+            // this one has a "last user message" that nobody typed — putting the word on that would
+            // say it again after every tool call, each time as a fresh instruction.
+            if round == 0 {
+                neosh_provider::inject(&mut messages, &words);
+            }
+
             let request = TurnRequest {
-                selection: selection.clone(),
+                selection,
                 conversation: session.clone(),
                 cwd: cwd.clone(),
                 // What this driver called the conversation last time it ran one, which is the only

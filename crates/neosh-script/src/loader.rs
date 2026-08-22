@@ -43,9 +43,11 @@ pub static API_TREE: include_dir::Dir<'static> =
 /// picker are written against the surface a third-party author has, which is how we find out when
 /// that surface is not enough.
 ///
-/// Each is a **single entry module**. Relative imports are not resolvable from a `neosh:` URL, and
-/// keeping bundled plugins to one file each is a cheaper constraint than teaching the loader a
-/// second module system.
+/// Loaded from `neosh:/builtin/<name>/main.ts`, and the leading slash is load-bearing: a `neosh:`
+/// URL with an opaque path is *cannot-be-a-base*, so `./options.ts` next to it has nothing to
+/// resolve against and fails with a URL error nobody can act on. Bundled plugins used to be one
+/// file each because of it — which made them the only plugins in the system that could not be
+/// split up, and this crate's whole claim is that they are ordinary.
 pub static BUILTIN_TREE: include_dir::Dir<'static> =
     include_dir::include_dir!("$CARGO_MANIFEST_DIR/../../plugins/builtin");
 
@@ -78,23 +80,24 @@ pub fn builtin_plugins() -> Vec<BuiltinPlugin> {
             name: name.to_string(),
             manifest: manifest.to_string(),
             entry: source.to_string(),
-            url: format!("{BUILTIN_URL_PREFIX}{name}"),
+            url: format!("{BUILTIN_URL_PREFIX}{name}/main.ts"),
         });
     }
     out
 }
 
 /// URL scheme-and-path prefix bundled plugins load from.
-pub const BUILTIN_URL_PREFIX: &str = "neosh:builtin/";
+///
+/// `neosh:/`, not `neosh:` — see [`BUILTIN_TREE`] for why the slash matters.
+pub const BUILTIN_URL_PREFIX: &str = "neosh:/builtin/";
 
+/// The file behind a `neosh:/builtin/...` URL, whether it is a plugin's entry or something it
+/// imported alongside it.
 fn builtin_source(url: &str) -> Option<String> {
-    let name = url.strip_prefix(BUILTIN_URL_PREFIX)?;
+    let path = url.strip_prefix(BUILTIN_URL_PREFIX)?;
     // Strip the reload generation, which is appended as `?v=N` exactly as it is for file modules.
-    let name = name.split('?').next().unwrap_or(name);
-    BUILTIN_TREE
-        .get_file(format!("{name}/main.ts"))
-        .and_then(|f| f.contents_utf8())
-        .map(str::to_string)
+    let path = path.split('?').next().unwrap_or(path);
+    BUILTIN_TREE.get_file(path).and_then(|f| f.contents_utf8()).map(str::to_string)
 }
 
 /// Write the API source tree to `dest`, returning the number of files written.

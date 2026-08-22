@@ -312,6 +312,10 @@ export async function activate({ neosh }: PluginContext) {
       neosh.notify(`archive failed: ${e}`);
     }
   });
+  await neosh.cmd.register("t.unread", async () => {
+    const all = await neosh.session.list();
+    neosh.notify(`unread: [${all.filter((s) => s.unread).map((s) => s.label).join(", ")}]`);
+  });
   await neosh.cmd.register("t.rename", async () => {
     const cur = await neosh.session.current();
     await neosh.session.rename(cur.id, "Renamed thread");
@@ -735,6 +739,106 @@ fn switching_away_from_a_running_turn_leaves_it_running_where_it_belongs() {
         "with the question that started it\n{:?}",
         s.chat_now()
     );
+}
+
+/// A model whose turn ends exactly when the test says so.
+///
+/// Everything else here either answers immediately or never, and what is being asserted below
+/// happens *between* the two: you switch away, and only then does the answer arrive. Both halves
+/// have to be under the test's control or it is a race with a sleep in it.
+///
+/// It reports what the conversation list says the moment a turn ends, because that is when the
+/// mark is set — asking afterwards from the test would be asking before the host had finished.
+fn install_held(sb: &Sandbox) {
+    let dir = sb.root.join("config/plugins/held");
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    std::fs::write(
+        dir.join("plugin.toml"),
+        "name = \"held\"\nversion = \"0.1.0\"\nentry = \"main.ts\"\npermissions = [\"providers\"]\n",
+    )
+    .expect("manifest");
+    std::fs::write(
+        dir.join("main.ts"),
+        r#"
+import type { PluginContext } from "@neosh/api";
+export async function activate({ neosh }: PluginContext) {
+  let release: null | (() => void) = null;
+  // Numbered, because the test waits for the answer before releasing it and "have I seen this
+  // text" cannot tell the second turn's answer from the first one's.
+  let n = 0;
+  await neosh.provider.register("held", [{
+    id: "held", driver: "held", display_name: "Held",
+    models: [{ id: "held", display_name: "Held" }],
+  }], async (_req, emit) => {
+    n += 1;
+    emit({ type: "message_start", model: "held", usage: {} });
+    emit({ type: "block_start", index: 0, block: { kind: "text" } });
+    emit({ type: "text_delta", index: 0, text: `answer ${n}` });
+    await new Promise<void>((resolve) => { release = resolve; });
+    emit({ type: "block_stop", index: 0 });
+    emit({ type: "message_delta", stop_reason: { kind: "end_turn" }, usage: {} });
+    emit({ type: "message_stop" });
+  });
+  neosh.agent.onTurnEnd(async () => {
+    const all = await neosh.session.list();
+    const news = all.filter((s) => s.unread).map((s) => s.label);
+    neosh.notify(`news: [${news.join(", ")}]`);
+  });
+  await neosh.cmd.register("t.useHeld", async () => {
+    await neosh.agent.setSelection({ instance: "held", model: "held", options: [] });
+    neosh.notify("using held");
+  });
+  await neosh.cmd.register("t.release", async () => {
+    if (release) { release(); release = null; }
+    neosh.notify("released");
+  });
+  neosh.notify("held ready");
+}
+"#,
+    )
+    .expect("plugin");
+}
+
+#[test]
+fn a_turn_that_ended_while_you_were_elsewhere_is_news_until_you_go_and_look() {
+    // The whole reason the flag exists. A turn takes minutes, you go and work in another
+    // conversation, and the row it left behind is the same row it was before — so the answer you
+    // were waiting for is found by opening things until one of them has it.
+    let sb = Sandbox::new("unread");
+    install_driver(&sb);
+    install_held(&sb);
+
+    let mut s = sb.start();
+    s.wait_for("driver ready");
+    s.wait_for("held ready");
+    s.command("t.new");
+    s.wait_for("created");
+    s.command("t.useHeld");
+    s.wait_for("using held");
+
+    s.type_text("ask me later");
+    s.enter();
+    s.wait_for("answer 1");
+
+    // Away first, and only then does it finish.
+    s.command("t.other");
+    s.wait_for("switched to");
+    s.command("t.release");
+    s.wait_for("news: [ask me later]");
+
+    // And going back is what reads it. Nobody pressed a "mark as read": arriving is the gesture.
+    s.command("t.other");
+    s.wait_for("switched to ask me later");
+    s.command("t.unread");
+    s.wait_for("unread: []");
+
+    // The other half, and the one that would make the mark useless if it were wrong: a turn that
+    // ends in the conversation you are sitting in is not news, it is the screen in front of you.
+    s.type_text("and again");
+    s.enter();
+    s.wait_for("answer 2");
+    s.command("t.release");
+    s.wait_for("news: []");
 }
 
 /// A conversation with a driver that runs its own agent loop and never finishes.

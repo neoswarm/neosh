@@ -64,6 +64,20 @@ export type SessionInfo = {
   context_window?: number | null;
   is_active: boolean;
   /**
+   * A turn finished here while you were looking at something else.
+   *
+   * The one thing a list of conversations cannot say without being told. A turn takes minutes,
+   * you switch away, and the row it left behind is indistinguishable from the twelve above it —
+   * so the answer you were waiting for is found by opening conversations until one of them has
+   * it. This is the mark that makes it findable, and it is *news* rather than state: it is set
+   * when a turn ends somewhere you were not, and cleared the moment you arrive.
+   *
+   * Off screen is the whole test. A turn that ended in the conversation on screen has already
+   * been seen — including when nothing was attached, because reattaching lands you in that
+   * conversation with the answer in it.
+   */
+  unread: boolean;
+  /**
    * Put away rather than thrown away.
    *
    * An archived conversation keeps every message and can be brought back; it is simply not in

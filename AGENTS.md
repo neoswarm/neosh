@@ -121,6 +121,17 @@ per decision, and records the *reasoning*, not the choice.
 - **Every view gets every event.** `Agent` fans its stream out to one queue per view. Never a
   `broadcast` channel: lagging consumers drop the oldest, silently, under load — and a view that
   missed one `ToolFinished` has a card that spins forever with nothing to put it right.
+- **A setting you cannot send is still a setting, and every model has some.** A knob is a
+  `ProviderOptionDescriptor` the *driver* advertises — discovered where an endpoint says what it
+  takes (OpenRouter's `supported_parameters`, `codex`'s `model/list`), written down where it will
+  not — and a provider with no knobs listed is a bug in a catalogue, not a model without options.
+  Some of them are words rather than parameters: `ultrathink` and `ultracode` are read by a
+  *harness*, so they live on `claude-cli` and never on `anthropic`, they travel as
+  `prompt_injected_values` / `prompt_injected_word`, and the injection happens once, above every
+  driver, on the copy of the message this turn sends — never on the transcript, never on a tool
+  round, and always with a sendable value put back in the selection's place. `^E` shows *all* of
+  them at once and applies as you move, because a knob you cannot see is a knob you do not have. See
+  ADR 0043.
 - **Take the transport that can do the most.** `claude` in stream-json mode with the control
   protocol; `codex app-server`, not `codex exec`. The cheaper one is not simpler for long — it is
   the one where streaming, approvals and interrupts turn out to be impossible rather than missing.
@@ -158,6 +169,14 @@ per decision, and records the *reasoning*, not the choice.
   things you are finished with is the only part of that column that is never the answer, and it
   grows forever. One row with a count, `a` in the panel or `^F` anywhere, and it opens as a picker
   you can filter — because a flat list of dim rows is not a way to find anything. See ADR 0039.
+- **A turn that finished while you were elsewhere is news until you go and look.** The panel says
+  what is *happening* and stops the moment it stops, so an answer that arrived while you were in
+  another conversation looks exactly like an answer you read yesterday. `SessionInfo::unread` is set
+  when a turn ends off screen and cleared by *arriving* — no dismissal key, because a mark you clear
+  by hand is a second chore attached to the first. It lives on the conversation and is persisted, so
+  every list agrees and a restart does not lose it; it wears `Status.Unread`, the amber the palette
+  already uses for *act now*, and it never moves — motion means "something is happening you cannot
+  see", and this is the opposite. A folded project carries a dot for what it is hiding. See ADR 0042.
 - **A card is a row until you ask for more.** A call that only *looked* at something folds to its
   header with the size of what came back on the end of it; a command keeps its output, an edit keeps
   its diff, and a failure always shows. See ADR 0033.
@@ -294,13 +313,13 @@ registry — this table is what ships.
 | `^V` | Attach the image on the clipboard. A key rather than a paste, because a terminal's paste can only ever hand over text |
 | `⌥V` | Take the last attached image back off |
 | `^P` | Pick a model. Mid-turn too — the running agent is told, and thinks the rest with it |
-| `^E` | Reasoning effort and the other per-model options |
+| `^E` | Everything this model can be told, on one panel: effort, thinking, fast mode, context, and whatever a driver invented. `←→` along a row, `↑↓` between them, and it applies as you move |
 | `⌥↑` `⌥↓` | One rung up or down the capability ladder, same provider |
 | `⇧⇥` | Permission mode — full access to start with, then ask, allow-listed, deny. Belongs to this conversation, saved with it, and takes effect on the turn that is running |
 | `^T` | Projects and conversations. Switching is never refused — turns keep running where they are |
 | `^J` | The computers in this workspace. Add one by its address, allow one that is asking, or open what it is running |
 | `^F` | What you have archived. Filter it, put one back, or finally throw it away |
-| `^N` | New conversation. In a repository it asks where: here, a new worktree, an existing one, elsewhere |
+| `^N` | New conversation. In a repository it asks where: here, a worktree you need not name, one you do, an existing one, another machine, elsewhere |
 | `^O` | Add a project |
 | `^B` | Toggle the sidebar |
 | `^K` | Command palette |
@@ -393,7 +412,7 @@ says how many are asking, `^T` is where you go, and it opens when you get there.
 |---|---|
 | `↵` | Open a conversation, fold a project, or add one from the `+` row |
 | `j` `k` | Move |
-| `n` | New conversation here |
+| `n` | New conversation — the same question `^N` asks, about the project the cursor is on |
 | `o` | Add a project |
 | `f` | Pin a project to the top |
 | `J` `K` | Reorder within a group |

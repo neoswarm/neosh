@@ -113,6 +113,15 @@ pub enum ProviderOptionDescriptor {
         description: Option<String>,
         #[serde(default)]
         current_value: bool,
+        /// A word to put in the message while this is on, for a switch a vendor reads out of the
+        /// prompt rather than off a parameter.
+        ///
+        /// The switch is then *nothing but* that word: with it on, the word is written into the
+        /// turn and no option value is sent at all. The same idea as
+        /// [`Self::Select::prompt_injected_values`], for the knobs that are a yes/no rather than a
+        /// rung — orchestration modes, personas, anything a harness gates on what you said.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        prompt_injected_word: Option<String>,
     },
 }
 
