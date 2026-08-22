@@ -54,6 +54,18 @@ struct Stored {
     /// that a restart cleared would go out precisely when the wait was longest.
     #[serde(default)]
     unread: bool,
+    /// A turn was in flight when this file was written.
+    ///
+    /// The one field here whose value is in its *staleness*. Everything else is written down so a
+    /// later process can read what this one knew; this is written down so a later process can
+    /// notice that this one never came back to clear it. See [`Session::running_since`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    running_since: Option<i64>,
+    /// And the answer, once some load has drawn it. Persisted rather than re-derived, because the
+    /// load that derives it also clears the `running_since` it derived it from — a second restart
+    /// before you had been back would otherwise lose the mark entirely.
+    #[serde(default)]
+    interrupted: bool,
     /// Put away rather than deleted. Defaulted, so a session written before archiving existed
     /// comes back in the open list, which is where it was.
     #[serde(default)]
@@ -121,6 +133,8 @@ impl From<&Session> for Stored {
             context_tokens: s.context_tokens,
             context_window: s.context_window,
             unread: s.unread,
+            running_since: s.running_since,
+            interrupted: s.interrupted,
             archived: s.archived,
             archived_at: s.archived_at,
             permission_mode: s.permission_mode,
@@ -143,6 +157,14 @@ impl Stored {
         s.context_tokens = self.context_tokens;
         s.context_window = self.context_window;
         s.unread = self.unread;
+        // A turn that was in flight when this was written is a turn nobody ended: the only process
+        // that could have ended it is the one that wrote this and is now gone. Loading is the only
+        // moment that can be noticed, and noticing it is the whole reason the note exists.
+        //
+        // The note is then dropped, so it is not re-derived forever — which is why the answer has
+        // to be saved rather than recomputed.
+        s.interrupted = self.interrupted || self.running_since.is_some();
+        s.running_since = None;
         s.archived = self.archived;
         s.archived_at = self.archived_at;
         s.permission_mode = self.permission_mode;

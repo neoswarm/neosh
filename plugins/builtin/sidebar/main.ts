@@ -2663,15 +2663,26 @@ function projectRow(
   // A question in there outranks it, and for the same reason it does on the conversation's own row:
   // one of them is news that will keep, and the other is a turn that has stopped until you answer.
   // Only one mark, because there is one column and two would be a puzzle rather than a summary.
-  const unseen = folded && !waiting
+  // A third thing the fold can be hiding, and it sits between the other two: a question stops the
+  // workspace until you answer, a killed turn lost work, and an unread answer is waiting patiently.
+  const cut = folded && !waiting
+    ? within.filter((s) => !s.active_turn && s.interrupted).length
+    : 0;
+  const unseen = folded && !waiting && cut === 0
     ? within.filter((s) => !s.active_turn && s.unread).length
     : 0;
   const mark = folded && waiting
     ? " ?"
-    : unseen === 0 ? "" : unseen === 1
-      ? opts.ascii ? " !" : " ●"
-      : opts.ascii ? ` !${unseen}` : ` ●${unseen}`;
-  const markHl = folded && waiting ? "Status.Pending" : "Status.Unread";
+    : cut > 0
+      ? cut === 1
+        ? opts.ascii ? " x" : " ✗"
+        : opts.ascii ? ` x${cut}` : ` ✗${cut}`
+      : unseen === 0 ? "" : unseen === 1
+        ? opts.ascii ? " !" : " ●"
+        : opts.ascii ? ` !${unseen}` : ` ●${unseen}`;
+  const markHl = folded && waiting
+    ? "Status.Pending"
+    : cut > 0 ? "Diagnostic.Error" : "Status.Unread";
 
   const name = clip(
     p.name,
@@ -2725,10 +2736,17 @@ function worktreeRow(
     : p.sessions.length > 0
       ? { text: `${p.sessions.length} `, hl: "Sidebar.Dim" }
       : { text: "" };
-  const unseen = folded ? p.sessions.filter((s) => !s.active_turn && s.unread).length : 0;
-  const mark = unseen === 0 ? "" : unseen === 1
-    ? opts.ascii ? " !" : " ●"
-    : opts.ascii ? ` !${unseen}` : ` ●${unseen}`;
+  const cut = folded ? p.sessions.filter((s) => !s.active_turn && s.interrupted).length : 0;
+  const unseen = folded && cut === 0
+    ? p.sessions.filter((s) => !s.active_turn && s.unread).length
+    : 0;
+  const mark = cut > 0
+    ? cut === 1
+      ? opts.ascii ? " x" : " ✗"
+      : opts.ascii ? ` x${cut}` : ` ✗${cut}`
+    : unseen === 0 ? "" : unseen === 1
+      ? opts.ascii ? " !" : " ●"
+      : opts.ascii ? ` !${unseen}` : ` ●${unseen}`;
   // The branch glyph, in the branch colour — what says "this row is a checkout" at a glance, so
   // the name can be just the branch. No ASCII stand-in earns its column, so ASCII goes without.
   const glyph = opts.ascii ? "" : "⎇ ";
@@ -2744,7 +2762,11 @@ function worktreeRow(
   }
   if (mark !== "") {
     const at = byteLength(`${pad}${arrow} ${glyph}${name}`);
-    spans.push({ from: at, to: at + byteLength(mark), hl: "Status.Unread" });
+    spans.push({
+      from: at,
+      to: at + byteLength(mark),
+      hl: cut > 0 ? "Diagnostic.Error" : "Status.Unread",
+    });
   }
   return {
     text: `${pad}${arrow} ${glyph}${name}${mark}`,
@@ -2807,7 +2829,12 @@ function sessionRow(
   // something, so it is the one row that gets the attention colour — and it does not move, because
   // it is not going to stop being true on its own and a mark that pulses forever is a mark you
   // learn to look past. It goes away by being opened. See ADR 0042.
-  const unread = !working && !asking && s.unread;
+  const unread = !working && !asking && !s.interrupted && s.unread;
+  // The turn that was running here never ended, because the workspace it was running in stopped:
+  // the machine was shut down, the process was killed. It outranks `unread` — a turn that finished
+  // while you were away and a turn that was killed are both news, and only one of them lost work —
+  // and it does not move, because nothing is happening here: it already happened.
+  const interrupted = !working && !asking && s.interrupted;
   const glyph = asking
     // A question mark, in both alphabets. Every other glyph here has an ASCII understudy because
     // the Unicode one is prettier; this one is already the character that means what it means, and
@@ -2817,6 +2844,10 @@ function sessionRow(
       ? s.is_active
         ? spinnerFrame()
         : opts.ascii ? "*" : "◍"
+      // The same mark a tool call that failed wears, and for the same reason: this did not finish.
+      // A conversation is the largest thing in the workspace that can fail to finish.
+      : interrupted
+        ? opts.ascii ? "x" : "✗"
       : unread
         ? opts.ascii ? "!" : "●"
         : s.is_active
@@ -2861,6 +2892,11 @@ function sessionRow(
       ? "Status.Pending"
       : working
         ? s.is_active && pulseBright() ? "Status.Working" : "Status.Monitoring"
+        // Red, and the palette's red for something that went wrong rather than a status colour of
+        // its own: work was lost here. The whole row again, for the reason the unread mark takes
+        // the whole row.
+        : interrupted
+          ? "Diagnostic.Error"
         : unread
           // The whole row, not only the dot: a single coloured character five columns in is findable
           // if you already know it is there, which is the one thing you cannot assume about the
@@ -2874,7 +2910,11 @@ function sessionRow(
       text: right === "" ? "" : `${right} `,
       hl: asking
         ? "Status.Pending"
-        : working ? "Status.Working" : unread ? "Status.Unread" : "Sidebar.Dim",
+        : working
+          ? "Status.Working"
+          : interrupted
+            ? "Diagnostic.Error"
+            : unread ? "Status.Unread" : "Sidebar.Dim",
     },
     value: { kind: "session", id: s.id, cwd: s.cwd },
   };

@@ -135,6 +135,16 @@ impl Workspace {
     fn alive(&mut self) -> bool {
         matches!(self.child.try_wait(), Ok(None))
     }
+
+    /// End it the way a crash does: no shutdown, no last flush, no chance to save anything.
+    ///
+    /// `Child::kill` is already `SIGKILL`, so this is that plus waiting for the socket to be
+    /// unusable — the process is gone before the next workspace tries to bind over it.
+    fn kill_hard(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        let _ = std::fs::remove_file(&self.socket);
+    }
 }
 
 /// A terminal, minus the terminal.
@@ -232,6 +242,18 @@ impl Client {
                 },
             });
         }
+    }
+
+    /// A chord, which is a different key from the letter it is made of.
+    fn ctrl(&mut self, c: char) {
+        self.send(ClientMessage::Input {
+            event: InputEvent::Key {
+                key: neosh_proto::KeyPress {
+                    code: neosh_proto::KeyCode::Char { c: c.to_string() },
+                    mods: neosh_proto::KeyMods { ctrl: true, ..Default::default() },
+                },
+            },
+        });
     }
 
     fn enter(&mut self) {
@@ -576,4 +598,171 @@ fn status_answers_while_a_turn_is_running_which_is_when_it_is_asked() {
         assert!(Instant::now() < deadline, "status never reported the turn: {text}");
         std::thread::sleep(Duration::from_millis(100));
     }
+}
+
+/// `^C` twice is a way out of a *terminal*, and a workspace is not one.
+///
+/// `^Q` has always known that. `^C`'s cascade — copy, leave reading, interrupt the turn, clear the
+/// draft, and only then quit — ended by setting `quitting` directly, so the last rung of the key
+/// people press when they want out of something took the whole workspace with it: every
+/// conversation, in every project, and every turn running in any of them.
+#[test]
+fn pressing_ctrl_c_twice_closes_the_terminal_and_not_the_workspace() {
+    let sb = Sandbox::new("ctrlc");
+    let mut ws = sb.serve("hello_turn.jsonl");
+
+    let mut c = Client::attach(&ws.socket, neosh_proto::PROTOCOL_VERSION);
+    c.ready();
+    // Nothing selected, nothing being read, no turn, no draft: the cascade is empty, so the first
+    // press arms and the second one is the way out.
+    c.ctrl('c');
+    c.ctrl('c');
+    c.until("to be sent away", |c| c.ended == Some(DetachReason::Asked));
+
+    assert!(ws.alive(), "^C^C closed the terminal, not the workspace");
+    assert!(status(&sb).contains("running"), "{}", status(&sb));
+
+    // And it is still a workspace you can come back to, which is the part that matters.
+    let mut again = Client::attach(&ws.socket, neosh_proto::PROTOCOL_VERSION);
+    again.ready();
+}
+
+/// What a turn has already done is on disk while it is still doing the rest.
+///
+/// A turn is minutes of work and a dozen tool rounds, and the only saves used to be at either end
+/// of it — so for the whole time it ran, the conversation on disk held the message you typed and
+/// nothing after it. Anything that took the workspace out without warning lost the entire answer
+/// and left the transcript ending on your own question.
+#[test]
+fn what_a_turn_has_done_is_on_disk_before_the_turn_ends() {
+    let sb = Sandbox::new("midturn");
+    let mut ws = sb.serve_paced("hello_turn.jsonl", 700);
+
+    let mut c = Client::attach(&ws.socket, neosh_proto::PROTOCOL_VERSION);
+    c.ready();
+    c.ask("read it for me");
+
+    // The first round's tool call, written down while the second round is still going. Waited for
+    // rather than slept on, and the turn is asserted to be still in flight when it arrives — a
+    // save that only happened because the turn had quietly finished would prove nothing.
+    let deadline = Instant::now() + PATIENCE;
+    loop {
+        let saved = sessions_on_disk(&sb);
+        if saved.contains("hello_greet") {
+            assert!(
+                status(&sb).contains("read it for me"),
+                "the turn was already over, so this says nothing about saving during one"
+            );
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the turn's first round never reached the disk:\n{saved}"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    // And the real test of it: take the workspace out the way a crash would, with no chance to
+    // flush anything, and see what a new one finds.
+    ws.kill_hard();
+    drop(c);
+    let ws2 = sb.serve_paced("hello_turn.jsonl", 0);
+    let mut c2 = Client::attach(&ws2.socket, neosh_proto::PROTOCOL_VERSION);
+    c2.ready();
+    c2.until("the killed turn's work to come back", |c| {
+        c.transcript().iter().any(|l| l.contains("read it for me"))
+    });
+    let back = c2.transcript().join("\n");
+    assert!(back.contains("hello_greet"), "the tool round the turn had finished is gone:\n{back}");
+}
+
+/// Every session file the sandbox has written, as one string to look for things in.
+fn sessions_on_disk(sb: &Sandbox) -> String {
+    let dir = sb.root.join("state/sessions");
+    let Ok(entries) = std::fs::read_dir(&dir) else { return String::new() };
+    entries
+        .flatten()
+        .filter(|e| e.path().extension().and_then(|x| x.to_str()) == Some("json"))
+        .filter_map(|e| std::fs::read_to_string(e.path()).ok())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// A turn killed with the workspace says so, in the panel and in the transcript.
+///
+/// The one thing a conversation cannot notice about itself. Someone shuts the computer down mid
+/// turn; the process does not get to write down that it died, so the conversation comes back
+/// ending on a half-finished piece of work with nothing anywhere saying that is what it is.
+#[test]
+fn a_turn_killed_with_the_workspace_is_marked_when_it_comes_back() {
+    let sb = Sandbox::new("cutoff");
+    let mut ws = sb.serve_paced("hello_turn.jsonl", 700);
+
+    let mut c = Client::attach(&ws.socket, neosh_proto::PROTOCOL_VERSION);
+    c.ready();
+    c.ask("do the long thing");
+    // Wait until the turn is genuinely in flight before pulling the plug, so what is being tested
+    // is a turn that was killed rather than one that had never started.
+    let deadline = Instant::now() + PATIENCE;
+    while !status(&sb).contains("do the long thing") {
+        assert!(Instant::now() < deadline, "the turn never started");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    // No shutdown, no last flush: the machine went away.
+    ws.kill_hard();
+    drop(c);
+
+    let ws2 = sb.serve_paced("hello_turn.jsonl", 0);
+    let mut c2 = Client::attach(&ws2.socket, neosh_proto::PROTOCOL_VERSION);
+    c2.ready();
+    c2.until("the cut-off turn to be accounted for", |c| {
+        c.transcript().iter().any(|l| l.contains("the workspace stopped while this turn was running"))
+    });
+
+    // And it survives a second start. The note the mark is derived from is cleared by the load that
+    // reads it, so a mark that was not itself written down would last exactly one restart — and the
+    // restart after that would quietly say everything was fine.
+    drop(c2);
+    let out = sb.neosh(&["stop"]).output().expect("stop");
+    assert!(String::from_utf8_lossy(&out.stdout).contains("stopped"));
+    let ws3 = sb.serve_paced("hello_turn.jsonl", 0);
+    let mut c3 = Client::attach(&ws3.socket, neosh_proto::PROTOCOL_VERSION);
+    c3.ready();
+    c3.until("the mark to survive a second restart", |c| {
+        c.transcript().iter().any(|l| l.contains("the workspace stopped while this turn was running"))
+    });
+}
+
+/// And it goes away when a new turn starts there, because then it is not the last turn any more.
+#[test]
+fn asking_again_clears_the_mark_a_killed_turn_left() {
+    let sb = Sandbox::new("cutoffclear");
+    let mut ws = sb.serve_paced("hello_turn.jsonl", 700);
+    let mut c = Client::attach(&ws.socket, neosh_proto::PROTOCOL_VERSION);
+    c.ready();
+    c.ask("the one that dies");
+    let deadline = Instant::now() + PATIENCE;
+    while !status(&sb).contains("the one that dies") {
+        assert!(Instant::now() < deadline, "the turn never started");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    ws.kill_hard();
+    drop(c);
+
+    let ws2 = sb.serve_paced("hello_turn.jsonl", 0);
+    let mut c2 = Client::attach(&ws2.socket, neosh_proto::PROTOCOL_VERSION);
+    c2.ready();
+    c2.until("the mark", |c| {
+        c.transcript().iter().any(|l| l.contains("the workspace stopped while this turn was running"))
+    });
+    c2.ask("and the one that does not");
+    c2.until("the new turn to finish", |c| {
+        c.transcript().iter().any(|l| l.contains("All done."))
+    });
+    let after = c2.transcript().join("\n");
+    assert!(
+        !after.contains("the workspace stopped while this turn was running"),
+        "a finished turn left the previous turn's mark behind:\n{after}"
+    );
 }
