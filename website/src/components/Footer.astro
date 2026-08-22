@@ -1,0 +1,52 @@
+---
+import Logo from "./Logo.astro";
+---
+
+<footer>
+  <div class="wrap row">
+    <Logo />
+    <div class="links">
+      <a href="https://github.com/neoswarm/neosh">GitHub</a>
+      <a href="https://github.com/neoswarm/neosh/tree/main/docs">Docs</a>
+      <a href="https://github.com/neoswarm/neosh/blob/main/website/src/data/plugins/README.md">Add a plugin</a>
+    </div>
+  </div>
+  <div class="wrap fine">
+    <span>
+      MIT licensed. Not affiliated with the Neovim project. The mark is derived from the
+      <a href="https://github.com/neovim/neovim.github.io">Neovim logo</a> by Jason Long, CC BY 3.0.
+    </span>
+  </div>
+</footer>
+
+<style>
+  footer {
+    border-top: 1px solid var(--line);
+    padding: 40px 0 32px;
+  }
+
+  .row {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 16px;
+  }
+
+  .links {
+    display: flex;
+    gap: 24px;
+    font-size: 14px;
+    color: var(--muted);
+  }
+
+  .links a:hover {
+    color: var(--fg);
+  }
+
+  .fine {
+    margin-top: 24px;
+    font-size: 12.5px;
+    color: var(--dim);
+  }
+</style>

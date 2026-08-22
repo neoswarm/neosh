@@ -1,0 +1,7 @@
+{
+  "name": "git",
+  "description": "Status, diffs and worktrees on their own keys",
+  "author": "neosh",
+  "repo": "https://github.com/neoswarm/neosh/tree/main/plugins/builtin/git",
+  "tags": ["builtin"]
+}

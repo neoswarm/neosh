@@ -1,0 +1,7 @@
+{
+  "name": "usage",
+  "description": "What the plan has left, live",
+  "author": "neosh",
+  "repo": "https://github.com/neoswarm/neosh/tree/main/plugins/builtin/usage",
+  "tags": ["builtin"]
+}

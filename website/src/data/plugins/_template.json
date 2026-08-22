@@ -1,0 +1,7 @@
+{
+  "name": "your-plugin-name",
+  "description": "One short line about what it does",
+  "author": "your-github-name",
+  "repo": "https://github.com/you/your-plugin",
+  "tags": ["ui"]
+}
