@@ -18,9 +18,35 @@ fn dir() -> PathBuf {
 
 /// Pretty-printed with sorted keys is not what goes on the wire — the wire is compact — but it is
 /// what a person diffs, and every JSON parser produces the same value from both.
+///
+/// Sorted *by this function*, rather than by leaving it to `serde_json::Value`. Its object is a
+/// `BTreeMap` — which sorts — only while the `preserve_order` feature is off, and `deno_core` turns
+/// that feature on for everything in the graph. So which order these vectors came out in depended on
+/// whether the crate that pulls in V8 happened to be in the build: `-p neosh-proto` sorted them and
+/// agreed with the committed files, `--workspace` emitted declaration order and called every one of
+/// them out of date. A canonical encoding that depends on who else is being compiled is not one.
 fn canonical(v: &impl serde::Serialize) -> String {
     let value: serde_json::Value = serde_json::to_value(v).expect("serialises");
-    serde_json::to_string_pretty(&value).expect("prints") + "\n"
+    serde_json::to_string_pretty(&sorted(value)).expect("prints") + "\n"
+}
+
+/// The same value with every object's keys in name order, whichever map is underneath.
+///
+/// Rebuilding in sorted order is what makes it hold both ways: an `IndexMap` keeps the order things
+/// were inserted in, so inserting them sorted is sorted, and a `BTreeMap` was going to sort them
+/// regardless.
+fn sorted(v: serde_json::Value) -> serde_json::Value {
+    match v {
+        serde_json::Value::Object(map) => {
+            let mut pairs: Vec<_> = map.into_iter().collect();
+            pairs.sort_by(|(a, _), (b, _)| a.cmp(b));
+            serde_json::Value::Object(pairs.into_iter().map(|(k, v)| (k, sorted(v))).collect())
+        }
+        serde_json::Value::Array(items) => {
+            serde_json::Value::Array(items.into_iter().map(sorted).collect())
+        }
+        scalar => scalar,
+    }
 }
 
 fn check(name: &str, body: String) {
