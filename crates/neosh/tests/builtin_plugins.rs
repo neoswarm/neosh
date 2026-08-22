@@ -645,7 +645,9 @@ fn the_key_strip_says_the_keys_that_are_actually_bound() {
     s.wait_for("PROJECTS");
     s.ctrl("k");
     assert!(
-        s.pump(|s| s.picker_named("[Go to]").iter().any(|l| l.contains("^y choose"))),
+        // `^Y`, capitalised: nobody presses shift to send it, and the capital is how a terminal
+        // has spelled a chord since curses.
+        s.pump(|s| s.picker_named("[Go to]").iter().any(|l| l.contains("^Y choose"))),
         "the strip follows the setting\n{:?}",
         s.picker_named("[Go to]")
     );
