@@ -1380,7 +1380,8 @@ fn a_knob_row_says_it_is_a_control_before_you_press_anything() {
         s.transcript()
     );
     // And the key that changes something is named before the key that leaves.
-    assert!(s.saw("←→ change"), "the hints lead with the key that does the thing\n{}", s.transcript());
+    // Letters, not arrows: the arrows are bound too, and the row is a promise about a keyboard.
+    assert!(s.saw("h l change"), "the hints lead with the key that does the thing\n{}", s.transcript());
 }
 
 #[test]
@@ -5444,7 +5445,7 @@ fn a_third_party_verb_fires_on_its_key_with_the_row_it_was_pointed_at() {
 /// replace one.
 ///
 /// This is the claim the whole rewrite rests on. Before it, the panel resolved keys in a private
-/// switch statement: `F1` could not list them, `^K` could not run them, and rebinding `x` meant
+/// switch statement: `^Z` could not list them, `^K` could not run them, and rebinding `x` meant
 /// forking the plugin.
 #[test]
 fn the_panels_keys_are_in_the_registry_and_a_user_can_rebind_them() {
