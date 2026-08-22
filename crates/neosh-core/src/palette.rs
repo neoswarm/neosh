@@ -228,6 +228,11 @@ fn underline(mut s: HighlightSpec) -> HighlightSpec {
     s
 }
 
+fn reverse(mut s: HighlightSpec) -> HighlightSpec {
+    s.attrs.reverse = true;
+    s
+}
+
 fn struck(mut s: HighlightSpec) -> HighlightSpec {
     s.attrs.strikethrough = true;
     s
@@ -253,6 +258,11 @@ fn flash(mut s: HighlightSpec, ms: u32) -> HighlightSpec {
     s
 }
 
+fn spectrum(mut s: HighlightSpec, period_ms: u32) -> HighlightSpec {
+    s.animate = Some(neosh_proto::Animation::Spectrum { period_ms });
+    s
+}
+
 /// Every group a plugin may link to, with a concrete spec.
 ///
 /// Kept as one list rather than scattered across the crates that use each group, because the whole
@@ -265,6 +275,9 @@ pub fn groups(variant: Variant) -> Vec<(&'static str, HighlightDef)> {
     };
 
     let spec = |s: HighlightSpec| HighlightDef::Spec { spec: s };
+    // A value that is in effect: the colour that says how far up its ladder it is, on the band that
+    // says it is the one selected.
+    let lit = |c: Color| HighlightSpec { fg: Some(c), bg: Some(r.cursor_bg), ..HighlightSpec::default() };
     let link = |to: &str| HighlightDef::Link { to: to.to_string() };
 
     vec![
@@ -510,6 +523,35 @@ pub fn groups(variant: Variant) -> Vec<(&'static str, HighlightDef)> {
         ("Account.Key", spec(fg(r.accent))),
         ("Account.Local", spec(dim(fg(r.muted)))),
         ("Account.Missing", link("Diagnostic.Warn")),
+        // ---- model options -------------------------------------------------
+        // A knob's value, drawn on the ladder it sits on. **Weight, not hue**: the rule at the top
+        // of this file says three colours do the work and a fourth would need a legend, and a
+        // reasoning level is not a state — it is a *position on a scale*, which prominence carries
+        // natively. Read down a row of them and the ramp is obvious without anything being learnt.
+        //
+        // Which step a value gets is the plugin's business, because only it knows how long the
+        // ladder is: five levels on Claude, three on most endpoints, two on Gemini.
+        // Every step carries the band as well as the colour, because a ranged highlight does not
+        // patch another ranged highlight — the renderer takes the highest-priority one covering a
+        // character and stops. Two marks, a background and a foreground, would therefore have drawn
+        // one of them and silently dropped the other; the group that means "this is the value in
+        // effect" has to say both things at once.
+        ("Option.Unset", spec(dim(fg(r.faint)))),
+        ("Option.Step1", spec(dim(lit(r.muted)))),
+        ("Option.Step2", spec(lit(r.muted))),
+        ("Option.Step3", spec(lit(r.fg))),
+        ("Option.Step4", spec(lit(r.accent))),
+        ("Option.Step5", spec(bold(lit(r.accent)))),
+        // The step that is not on the ladder: a level bought by putting a word in the prompt rather
+        // than by sending a parameter. It gets the one animation that abandons the palette, because
+        // what it has to say is "this is not one of the normal settings" — and that is a thing no
+        // amount of amber can say. See `Animation::Spectrum`.
+        ("Option.Beyond", spec(spectrum(bold(lit(r.accent)), 3200))),
+        // The value you just settled on, for the moment before the panel closes. Reverse, which
+        // the rules at the top of this file reserve for selection and for the one-shot "it moved
+        // there" flash — this is the second of those, and it is the only acknowledgement a control
+        // that takes effect as you pass over it can give you that it heard the decision.
+        ("Option.Chosen", spec(reverse(bold(fg(r.accent))))),
     ]
 }
 
