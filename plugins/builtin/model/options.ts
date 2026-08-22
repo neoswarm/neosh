@@ -10,13 +10,13 @@
  * fast mode or the context window existed. A setting you cannot see is a setting you do not have.
  *
  * So: every knob at once, one row each, values laid out along the row with the current one lit.
- * `←`/`→` moves along a row, `↑`/`↓` between rows, and what you are looking at *is* the state —
- * there is no "current value" to go and read somewhere else.
+ * `h`/`l` moves along a row and `j`/`k` between them — the arrows do the same — and what you are
+ * looking at *is* the state: there is no "current value" to go and read somewhere else.
  *
  * # Why it is a panel and not a private key handler
  *
  * Because ADR 0040 says so, and the sidebar proved why: every key here is an ordinary binding
- * pointed at a named command, scoped to this buffer's **kind**. `F1` lists them, `^K` runs them,
+ * pointed at a named command, scoped to this buffer's **kind**. `^Z` lists them, `^K` runs them,
  * and `init.ts` can move any of them. A `switch` on the key inside this file is exactly the thing
  * that rule replaced.
  *

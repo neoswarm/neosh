@@ -147,7 +147,7 @@ export async function activate({ neosh, subscriptions }: PluginContext) {
   };
   await footer();
   // The sheet's own keys, bound to this plugin's buffer kind rather than handled privately — so
-  // `F1` lists them and `init.ts` can move any of them. See `options.ts`.
+  // `^Z` lists them and `init.ts` can move any of them. See `options.ts`.
   await installOptions({ neosh, subscriptions }, (flash) => footer(flash));
   subscriptions.push(neosh.session.onChange(() => void footer()));
   subscriptions.push(neosh.agent.onTurnEnd(() => void footer()));

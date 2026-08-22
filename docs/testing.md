@@ -23,7 +23,7 @@ you out** — it cancels a running turn, then clears a draft, then offers to qui
 The bottom line shows the mode, the selected model, and those keys — if you see it, neosh is running.
 The panel on the left is the `sidebar` plugin; `<C-t>` moves into the thread list, `<C-b>` hides it,
 `<C-p>` picks a model, `<C-e>` its reasoning effort, `<C-g>` git status, `<C-d>` a diff, `<C-k>` the
-command palette, `<F1>` every binding there is.
+command palette, `<C-z>` every binding there is.
 
 ## Checking neosh
 
