@@ -82,9 +82,14 @@ impl SessionStore {
     /// Make `id` the active session, parking the current one.
     pub fn switch(&mut self, id: &SessionId) -> Result<(), StoreError> {
         if &self.active.id == id {
+            self.active.unread = false;
             return Ok(());
         }
-        let next = self.idle.remove(id).ok_or_else(|| StoreError::NoSuchSession(id.clone()))?;
+        let mut next = self.idle.remove(id).ok_or_else(|| StoreError::NoSuchSession(id.clone()))?;
+        // Arriving is what reading is. Cleared here rather than by whoever draws the list, so that
+        // every list agrees the moment you switch — a panel that cleared its own copy would keep
+        // saying "new" in the status line you did not happen to be looking at.
+        next.unread = false;
         let previous = std::mem::replace(&mut self.active, next);
         self.idle.insert(previous.id.clone(), previous);
         // Move to the front rather than re-sorting: "most recently active" is a history, and a
@@ -141,6 +146,20 @@ impl SessionStore {
 
     fn contains(&self, id: &SessionId) -> bool {
         &self.active.id == id || self.idle.contains_key(id)
+    }
+
+    /// You are looking at it, so whatever finished while you were away has been seen.
+    ///
+    /// Answers whether anything changed, because the caller's next move is a write to disk and
+    /// re-persisting every conversation on every arrival is a cost for nothing.
+    pub fn mark_read(&mut self, id: &SessionId) -> bool {
+        match self.get_mut(id) {
+            Some(s) if s.unread => {
+                s.unread = false;
+                true
+            }
+            _ => false,
+        }
     }
 
     /// Public because a turn reaches its own conversation by id: it may not be the active one, and
@@ -328,6 +347,28 @@ mod tests {
 
         s.switch(&a).expect("switch back");
         assert_eq!(s.active().messages.len(), 1, "the parked conversation survived");
+    }
+
+    #[test]
+    fn arriving_at_a_conversation_is_what_reads_it() {
+        // The mark is news, and news stops being news when you have been to look. Cleared here
+        // rather than by whoever draws a list, so the panel, the status line and a picker cannot
+        // disagree about whether you have seen something.
+        let (mut s, a, b, _c) = store();
+        s.get_mut(&b).expect("there").unread = true;
+        assert!(s.list().iter().find(|i| i.id == b).expect("listed").unread);
+
+        s.switch(&b).expect("switch");
+        assert!(!s.get(&b).expect("there").unread);
+        assert!(s.list().iter().all(|i| !i.unread));
+
+        // And it is only the one you arrived at. A "mark everything read" gesture nobody asked for
+        // is how you lose the answer you switched away to wait for.
+        s.get_mut(&a).expect("there").unread = true;
+        s.switch(&b).expect("already here");
+        assert!(s.get(&a).expect("there").unread);
+        assert!(s.mark_read(&a), "and it reports the change, so the caller knows to write it down");
+        assert!(!s.mark_read(&a), "twice is not a change");
     }
 
     #[test]
