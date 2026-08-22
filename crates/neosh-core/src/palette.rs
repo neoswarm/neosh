@@ -381,6 +381,11 @@ pub fn groups(variant: Variant) -> Vec<(&'static str, HighlightDef)> {
         ("Status.Failed", spec(bold(fg(r.danger)))),
         ("Status.Done", spec(fg(r.success))),
         ("Status.Idle", spec(dim(fg(r.muted)))),
+        // Finished, and you have not seen it. The attention hue rather than the success one, and
+        // bold rather than dim: `Status.Done` is a fact about a turn and this is a request that you
+        // go and look, which is the same thing `Status.Approval` is asking and the reason they
+        // share a colour. It is also the one group here that goes away by being read.
+        ("Status.Unread", spec(bold(fg(r.attention)))),
         // The two groups that move. Motion is reserved for "something is happening and you cannot
         // see it yet" — the one state where a still screen and a wedged program look identical.
         //
