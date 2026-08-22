@@ -88,6 +88,13 @@ pub struct Session {
     /// clock in here, so this type stays deterministic and testable.
     pub created_at: i64,
     pub updated_at: i64,
+    /// A turn ended here while you were somewhere else, and you have not been back since.
+    ///
+    /// See [`neosh_proto::SessionInfo::unread`]. Held on the conversation rather than worked out
+    /// by whoever draws a list, because "have you seen this" is a fact about the conversation and
+    /// there is more than one list: the panel, a status segment and a picker all have to agree,
+    /// and a second panel deriving it from timestamps would disagree with the first.
+    pub unread: bool,
     /// Put away, not thrown away: still on disk, still openable, just not in the everyday list.
     pub archived: bool,
     /// When it was put away, in seconds since the epoch. Set by whoever archives it, for the same
@@ -123,6 +130,7 @@ impl Session {
             title: None,
             created_at: 0,
             updated_at: 0,
+            unread: false,
             archived: false,
             archived_at: None,
             permission_mode: None,
@@ -254,6 +262,7 @@ impl Session {
             context_window: self.context_window,
             // Filled in by the store, which is the only thing that knows.
             is_active: false,
+            unread: self.unread,
             archived: self.archived,
             archived_at: self.archived_at,
             permission_mode: self.permission_mode,
