@@ -95,6 +95,19 @@ pub struct Session {
     /// there is more than one list: the panel, a status segment and a picker all have to agree,
     /// and a second panel deriving it from timestamps would disagree with the first.
     pub unread: bool,
+    /// A turn was in flight here when this conversation was last written to disk.
+    ///
+    /// Seconds since the epoch, stamped when the turn began. Persisted, and that is the entire
+    /// point: nothing running in a process can tell you that a *previous* process died, so the only
+    /// way to know a turn was cut off is to have written down that one had started and to find the
+    /// note still there. Cleared when the turn ends, however it ends — an interrupt and an error
+    /// are both endings, and neither is what this is for.
+    pub running_since: Option<i64>,
+    /// The workspace stopped while a turn was running here.
+    ///
+    /// See [`neosh_proto::SessionInfo::interrupted`]. Derived once, where it can be: at load, from
+    /// a `running_since` that outlived the process that set it.
+    pub interrupted: bool,
     /// Put away, not thrown away: still on disk, still openable, just not in the everyday list.
     pub archived: bool,
     /// When it was put away, in seconds since the epoch. Set by whoever archives it, for the same
@@ -145,6 +158,8 @@ impl Session {
             created_at: 0,
             updated_at: 0,
             unread: false,
+            running_since: None,
+            interrupted: false,
             archived: false,
             archived_at: None,
             permission_mode: None,
@@ -291,6 +306,7 @@ impl Session {
             // Filled in by the store, which is the only thing that knows.
             is_active: false,
             unread: self.unread,
+            interrupted: self.interrupted,
             archived: self.archived,
             archived_at: self.archived_at,
             permission_mode: self.permission_mode,

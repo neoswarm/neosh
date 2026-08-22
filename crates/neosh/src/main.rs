@@ -401,10 +401,14 @@ fn with_signals(
     });
 
     tokio::spawn(async move {
-        // Not from any terminal, so it is tagged with the view that is always the process's
-        // own. In a served workspace that names nobody, which is right: a signal is a reason to
-        // stop the work, not to close one of somebody's windows.
-        let quit = (views::ViewId::LOCAL, InputEvent::Command { name: "quit".into(), args: Vec::new() });
+        // `stop` rather than `quit`, because a signal is a reason to stop the work and not to
+        // close one of somebody's windows — and in a served workspace `quit` is exactly "close
+        // one of somebody's windows". Tagged with the process's own view, which in a workspace
+        // names nobody: `quit` therefore detached a view that was not there, so a `kill` on a
+        // workspace did nothing at all and the `SIGKILL` behind it was what actually stopped it,
+        // with whatever had not been written to disk still in memory. This is also the path a
+        // machine shutting down takes.
+        let quit = (views::ViewId::LOCAL, InputEvent::Command { name: "stop".into(), args: Vec::new() });
         #[cfg(unix)]
         {
             use tokio::signal::unix::{SignalKind, signal};

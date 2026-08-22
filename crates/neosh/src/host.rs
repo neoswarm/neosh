@@ -4714,6 +4714,48 @@ impl Host {
     /// messages rather than replayed from the UI events that first produced it: the messages are
     /// the truth, and a switch that reconstructed the buffer from a log of edits would drift the
     /// moment anything else touched it.
+    /// Draw the conversation on screen again from its messages, and touch nothing else.
+    ///
+    /// The buffer half of [`Self::enter_session`], for the times the *replay* has changed its mind
+    /// about a conversation you are already in. The live path only ever appends, so anything it has
+    /// already drawn stays drawn — which is right for a transcript, and wrong for the one row in it
+    /// that is a statement about the conversation's tail rather than about something that happened.
+    ///
+    /// Deliberately not `enter_session`: that clears the unread mark, leaves reading mode, and
+    /// resets the working line and the scroll, all of which are correct on arrival and destructive
+    /// in the middle of a conversation you never left.
+    fn redraw_transcript(&mut self) {
+        let ascii = self.option_bool("ui.ascii_only");
+        let limits = self.limits();
+        let width = self.chat_width();
+        let show_tools = self.option_bool("chat.show_tools");
+        let here = self.active_session();
+        let running = self.turns.contains_key(&here);
+        let (lines, marks) = {
+            let store = self.agent.sessions();
+            let s = store.active();
+            let (lines, marks, _) = transcript(s, ascii, limits, width, show_tools, running);
+            (lines, marks)
+        };
+        let plugin = PluginId::from(BUILTIN);
+        // Marks first, and all of them: a mark clamps rather than dies when the line under it is
+        // replaced, so a rebuild that skipped this would leave every previous mark stacked on the
+        // rows that happen to survive.
+        let _ = self.editor.apply(&plugin, ApiCall::MarkClear {
+            ns: self.chat_ns,
+            buf: self.chat,
+            start: None,
+            end: None,
+        });
+        let _ = self.editor.apply(&plugin, ApiCall::BufSetLines {
+            buf: self.chat,
+            start: 0,
+            end: -1,
+            lines,
+        });
+        self.draw_marks(&marks, 0);
+    }
+
     fn enter_session(&mut self) {
         // First, and while the transcript being read is still the one on screen. Reading is a place
         // *in* a conversation — a cursor at a row, a selection between two of them, a search
@@ -5771,6 +5813,30 @@ impl Host {
         let on_screen = &self.active_session() == ev.session();
         match ev {
             AgentEvent::TurnStarted { session, turn } => {
+                // Write down that a turn is in flight, and clear whatever the last one left. This
+                // has to reach the disk *now* rather than at the next commit: the window it covers
+                // starts here, and a note written after the first tool round would miss every turn
+                // that was killed before it got that far — which is most of a turn's first minute.
+                //
+                // Starting a turn is also what ends the previous one's mark. The row is red because
+                // the last turn here never finished; it stops being the last turn at this moment,
+                // and the transcript keeps the evidence either way.
+                let was_cut_off = match self.agent.sessions().get_mut(&session) {
+                    Some(sess) => {
+                        sess.running_since = Some(now_secs());
+                        std::mem::take(&mut sess.interrupted)
+                    }
+                    None => false,
+                };
+                self.persist_session(&session);
+                // The line saying the last turn was killed is now a lie, and the live path cannot
+                // take back something it has drawn — so the replay draws it again without. Done
+                // here rather than when the message was pushed because everything up to and
+                // including the new question is in `messages` by now and nothing of the answer has
+                // been drawn yet, which is the one moment a rebuild costs nothing.
+                if was_cut_off && on_screen {
+                    self.redraw_transcript();
+                }
                 // Out to anybody watching from another machine, before the local broadcast: the
                 // two are independent, and a watcher waiting on a plugin round trip would see the
                 // turn start late for no reason.
@@ -5884,6 +5950,10 @@ impl Host {
                 self.rounds.remove(&session);
                 if let Some(s) = self.agent.sessions().get_mut(&session) {
                     s.updated_at = now_secs();
+                    // The turn ended, so there is nothing for a later process to notice. Cleared
+                    // here for *every* ending — finished, errored, interrupted — because the note
+                    // means "no one ended this", and all three of those are someone ending it.
+                    s.running_since = None;
                     // News, and only where you were not looking. A turn that ended in the
                     // conversation on screen has been seen by definition — including with nothing
                     // attached, because reattaching lands you in that conversation with the answer
@@ -5925,10 +5995,21 @@ impl Host {
             }
             // What the turn produced is in the conversation now, so the round's copy of it would
             // only go stale — and drawing both on a switch would say everything twice.
+            //
+            // And it is the moment to write it down. A turn is minutes of work and dozens of tool
+            // rounds, and until this the only saves were at either end of it: the conversation on
+            // disk held the message you typed and nothing after it, for as long as the turn ran.
+            // Anything that took the workspace out without warning — a crash, an OOM kill, a
+            // reboot — lost the whole answer and left the transcript ending on your own question.
+            // A round boundary is what the agent itself resumes from, so it is the right grain to
+            // save at, and one conversation is written rather than every conversation in the
+            // workspace: `persist_sessions` several times a minute for the sake of the one that
+            // changed is a hundred files rewritten to record one.
             AgentEvent::Committed { session, .. } => {
                 if let Some(r) = self.rounds.get_mut(&session) {
                     r.said.clear();
                 }
+                self.persist_session(&session);
             }
             AgentEvent::Steered { prompt, .. } => {
                 // Drawn now rather than when it was typed: until the model has been told, a
@@ -6769,6 +6850,25 @@ impl Host {
         serde_json::from_value(self.pstate.get(BUILTIN, &key)).unwrap_or_default()
     }
 
+    /// Write one conversation, now.
+    ///
+    /// The cheap half of [`Self::persist_sessions`], for the places that fire *inside* a turn.
+    /// Ordering is not at stake — `order.json` records which conversations exist and which one you
+    /// were in, and neither changes because a tool round finished.
+    ///
+    /// A [placeholder](neosh_agent::Session::ephemeral) is skipped, the same as in `save_all`: no
+    /// caller can reach here with one today, because saying anything is what stops a session being
+    /// one and a turn cannot start before that — but the rule is about what may be written down,
+    /// not about who happens to be calling.
+    fn persist_session(&self, id: &neosh_proto::SessionId) {
+        let Some(dir) = &self.state_dir else { return };
+        let store = self.agent.sessions();
+        let Some(s) = store.get(id).filter(|s| !s.ephemeral) else { return };
+        if let Err(e) = crate::sessions::save(dir, s) {
+            tracing::warn!("could not save conversation {}: {e}", id.0);
+        }
+    }
+
     fn persist_sessions(&self) {
         let Some(dir) = &self.state_dir else { return };
         if let Err(e) = crate::sessions::save_all(dir, &self.agent.sessions()) {
@@ -7116,11 +7216,29 @@ impl Host {
         }
         let armed = self.quit_armed.is_some_and(|at| at.elapsed() < ARM_WINDOW);
         if armed {
-            self.quitting = true;
+            self.leave();
             return;
         }
         self.quit_armed = Some(std::time::Instant::now());
-        self.editor_message(MessageLevel::Info, "press ^C again to quit, or ^Q");
+        self.editor_message(MessageLevel::Info, match self.on_quit {
+            OnQuit::Stop => "press ^C again to quit, or ^Q",
+            OnQuit::Detach => "press ^C again to close this terminal, or ^Q",
+        });
+    }
+
+    /// What `quit` does here — from the key, from the command, from the last rung of `^C`.
+    ///
+    /// One door, because there is only one door. A workspace is a process with turns running in it
+    /// and possibly other terminals looking at it, so the key that ends *this* terminal must not be
+    /// able to end that. `^C^C` set `quitting` directly and took the workspace with it: every
+    /// conversation, in every project, on a key whose first four meanings — copy, leave reading,
+    /// interrupt, clear the draft — are all local. ADR 0036's rule that `^Q` must never stop a
+    /// workspace was never really about `^Q`; it is about every way out there is.
+    fn leave(&mut self) {
+        match self.on_quit {
+            OnQuit::Stop => self.quitting = true,
+            OnQuit::Detach => self.detaching = Some(self.from_view),
+        }
     }
 
     /// Page the transcript. `0` returns to following the tail.
@@ -7167,10 +7285,7 @@ impl Host {
     fn run_builtin(&mut self, name: &str, args: Vec<String>) {
         match name {
             "config.reload" => self.reload_config(),
-            "quit" => match self.on_quit {
-                OnQuit::Stop => self.quitting = true,
-                OnQuit::Detach => self.detaching = Some(self.from_view),
-            },
+            "quit" => self.leave(),
             "stop" => self.quitting = true,
             "interrupt" => self.interrupt(),
             "chat.scroll_up" => self.scroll_chat(-1),
@@ -8397,6 +8512,25 @@ fn transcript(
     // when it ends, by whoever is looking then.
     if !running {
         summarise(&mut lines, &mut marks, &mut changes);
+    }
+    // Where it stopped, when nothing stopped it.
+    //
+    // The sidebar can say *which* conversation was cut off; only the transcript can say where. What
+    // the agent had finished is above this line and is real; what it was in the middle of is not
+    // anywhere, and without a line saying so the conversation simply ends — on a half-written
+    // sentence, or on a tool call with no result, which reads exactly like an agent that gave up.
+    //
+    // Not drawn for a turn that is running: `running` is a turn in flight *now*, in this process,
+    // and this mark is about one that was in flight in a process that is gone.
+    if session.interrupted && !running {
+        gap(&mut lines);
+        let row = lines.len() as u32;
+        let r = cards::Row::plain(
+            format!("{} the workspace stopped while this turn was running", g.fail),
+            "Diagnostic.Error",
+        );
+        marks.extend(Mark::of(row, &r));
+        lines.push(r.text);
     }
     (lines, marks, cards)
 }
