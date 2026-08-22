@@ -691,6 +691,47 @@ fn a_paste_that_is_not_an_image_is_ordinary_text() {
     s.wait_composer(&[sentence.as_str()]);
 }
 
+/// Taking one back off is a key everybody has. It used to be `⌥V`, which is `√` on a Mac whose
+/// terminal has not been told to send Option as Alt — and a key that never arrives is one no
+/// amount of rebinding fixes. Backspace on an *empty* composer is what a chip row does everywhere
+/// else, and it costs the field nothing: there is nothing left to erase. See ADR 0048.
+#[test]
+fn backspace_on_an_empty_composer_takes_the_attachment_off() {
+    let sb = Sandbox::new("attachdrop");
+    let shot = png_at(&sb.root.join("work/shot.png"), 9, 9);
+    let mut s = sb.start();
+    s.ready();
+
+    s.send(&json!({"type": "paste", "text": shot.display().to_string()}));
+    s.type_text("what is this");
+    s.wait_composer(&["what is this"]);
+
+    // While there are words in the field, backspace is backspace. The attachment is not in the
+    // way of typing, which is the whole reason it is a chip and not a token.
+    s.special("backspace", &[]);
+    s.wait_composer(&["what is thi"]);
+
+    s.press(json!({"kind": "char", "c": "u"}), &["ctrl"]);
+    s.wait_composer(&[""]);
+    s.special("backspace", &[]);
+    assert!(
+        s.pump(|s| s.messages().iter().any(|m| m.contains("took off"))),
+        "the chip that went is said out loud — a row that becomes no row looks like a key that \
+         did nothing\n{:?}",
+        s.messages()
+    );
+
+    s.type_text("never mind");
+    s.wait_composer(&["never mind"]);
+    s.special("enter", &[]);
+    assert!(s.pump(|s| s.chat().iter().any(|l| l.contains("never mind"))), "the words were sent");
+    assert!(
+        !s.chat().iter().any(|l| l.contains("[png]")),
+        "and the picture was not\n{:?}",
+        s.chat()
+    );
+}
+
 /// What was attached has to be *in the message*, not only on the screen: the transcript is rebuilt
 /// from the conversation, and a picture that lives in the draft is one that vanishes on the first
 /// switch and was never sent to anything.
