@@ -219,12 +219,22 @@ A **relative** root keeps the trees inside the repository itself:
 ```
 
 No `<repo>` level there — inside the repository, nothing else's worktrees can collide with yours —
-and neosh writes the directory into `.git/info/exclude` when it creates the tree, so an in-repo
-checkout never sits in `git status` as one giant untracked directory. That file is local to the
-clone; nothing about this layout appears in anyone's diff.
+and when neosh creates the tree it writes the directory into the repository's **`.gitignore`**
+(`/.worktrees/`, one line for every tree after it), so an in-repo checkout never sits in
+`git status` as one giant untracked directory. The tracked file rather than `.git/info/exclude`,
+because the exclude file is per clone: a colleague pulling this layout would rediscover the noise.
+Nothing is written when the path is already ignored — by that line, a rule of your own, or a
+global ignore.
 
 Setting it to `""` restores the sibling layout, for anyone who wants their trees next to the thing
 they are trees of.
+
+The rest of a worktree's life is on its sidebar row: `y` copies its path for the shell you are
+about to `cd` in, `p` pulls its repository from the remote and says what git said, and `d` removes
+the checkout from disk — the branch stays, it asks first, and it tells you how many conversations
+go with it. `⌥Y` in the chat copies the *current* conversation's directory, which in a worktree is
+the worktree. `p` and `d` are contributions from the git plugin (`sidebar.action`), so they follow
+it when it is disabled, and a sidebar of your own inherits them for free.
 
 Conversations are saved as you go — one file each under `~/.local/state/neosh/sessions/` — and
 restored at startup, in the one you were last in. `--clean` neither reads nor writes them.

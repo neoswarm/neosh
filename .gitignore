@@ -2,6 +2,11 @@
 node_modules/
 *.snap.new
 
+# In-repo worktrees (`worktree.root = ".worktrees"`, or ^N → "in this project"). neosh writes this
+# line itself the first time it puts a tree here; carried in the repo so a hand-made tree and a
+# fresh clone are covered before that.
+.worktrees/
+
 # macOS AppleDouble sidecars. This volume is not HFS+, so every file gets a `._` twin —
 # 380 of them, which makes `git status` unreadable and puts junk one `git add -A` away from a commit.
 ._*

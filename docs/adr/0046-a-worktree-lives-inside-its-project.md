@@ -48,11 +48,15 @@ the checkout is one row up from the tree you were in, never elsewhere in the lis
 
 **A relative `worktree.root` is inside the repository, laid out `<repo>/<configured>/<branch>`.**
 No `<repo>` level — inside the repository, nothing else's worktrees can land there, so the
-disambiguator disambiguates nothing. And `git worktree add` into the repository writes the new
-directory into `.git/info/exclude`: local to the clone, absent from every diff, and exactly what
-that file is for — facts about this machine's layout. The entry is the worktree's own directory,
-not its parent, because excluding `/{parent}/` would swallow any other untracked file somebody
-later puts there. It is written in `neosh-vcs`, against the *main* checkout resolved from
+disambiguator disambiguates nothing. And `git worktree add` into the repository writes the
+worktrees' directory into the repository's **`.gitignore`** — `/.worktrees/`, the parent, one line
+covering every tree after it — or every `git status` reads as one giant untracked directory. The
+tracked file rather than `.git/info/exclude`, which was the first version of this: the exclude
+file is per clone, so a colleague pulling the layout — or you, on the next machine — rediscovered
+the noise the entry existed to prevent. Dirtying the working tree is the honest cost, and it is
+one line that commits with the work. Nothing is written when `git check-ignore` says the path is
+already covered — the line from last time, a broader rule, a global ignore — so opting out is
+writing your own rule. It is written in `neosh-vcs`, against the *main* checkout resolved from
 `--git-common-dir` rather than against whichever worktree the command ran from, and best-effort:
 the worktree exists by the time it runs, and failing the call over a status-noise fix would report
 an operation as failed after it worked.

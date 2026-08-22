@@ -125,11 +125,51 @@ export async function activate({ neosh, subscriptions }: PluginContext) {
       (args: string[]) => newWorktree(neosh, { cwd: arg(args, 0), auto: true, inside: true }),
       "A worktree kept inside the repository, on a branch named for you — `git.worktree.new.inside [cwd]`",
     ],
-    ["git.worktree.remove", () => removeWorktree(neosh), "Remove a worktree"],
+    [
+      "git.pull",
+      (args: string[]) => pull(neosh, arg(args, 0)),
+      "Pull from the remote — `git.pull [cwd]`",
+    ],
+    [
+      "git.worktree.remove",
+      // With a path, that worktree; without one, a picker. The path form is what a panel row
+      // needs — a picker opened from the row you were already on asks you to point twice.
+      (args: string[]) => removeWorktree(neosh, { path: arg(args, 0), cwd: arg(args, 1) }),
+      "Remove a worktree — `git.worktree.remove [path] [cwd]`",
+    ],
+    // The sidebar hands a row over as `(kind, cwd, …)`, which is not the shape the commands above
+    // take from the palette. Two small verbs translate rather than every command growing a second
+    // calling convention.
+    [
+      "git.sidebar.pull",
+      (args: string[]) => pull(neosh, arg(args, 1)),
+      "Pull the repository of the sidebar row under the cursor",
+    ],
+    [
+      "git.sidebar.worktree.remove",
+      (args: string[]) => removeWorktree(neosh, { path: arg(args, 1), cwd: arg(args, 1) }),
+      "Remove the worktree of the sidebar row under the cursor",
+    ],
   ];
   for (const [name, fn, desc] of cmds) {
     await neosh.cmd.register(name, fn, { desc });
   }
+
+  // Verbs on the sidebar's rows. Contributed rather than baked into the panel, because that is
+  // what the contribution point is for — a sidebar that is not ours picks these up unchanged, and
+  // `plugins.disabled = ["git"]` takes the keys away with the plugin.
+  await neosh.ext.contribute("sidebar.action", "pull", {
+    key: "p",
+    label: "pull",
+    command: "git.sidebar.pull",
+    on: "any",
+  });
+  await neosh.ext.contribute("sidebar.action", "worktree-remove", {
+    key: "d",
+    label: "remove worktree",
+    command: "git.sidebar.worktree.remove",
+    on: "project",
+  });
 
   await neosh.keymap.set("chat", "<C-g>", "git.status", { desc: "Git status" });
   await neosh.keymap.set("chat", "<C-d>", "git.diff", { desc: "Show what changed" });
@@ -714,8 +754,9 @@ const SCRATCH_NOUNS = [
  * A *relative* root is inside the repository — `worktree.root = ".worktrees"` puts every tree at
  * `<repo>/.worktrees/<branch>` — and there the repository's name is a level of noise rather than a
  * disambiguator: nothing but this repository's worktrees can land in its own directory. The host
- * keeps an in-tree checkout out of `git status` via `.git/info/exclude`, so choosing this layout
- * does not mean reading past an untracked directory forever.
+ * keeps an in-tree checkout out of `git status` by writing the directory into the repository's
+ * `.gitignore`, so choosing this layout does not mean reading past an untracked directory forever
+ * — in this clone or anyone else's.
  *
  * An empty `worktree.root` restores the sibling layout, for anyone who wants their trees next to
  * the thing they are trees of.
@@ -746,17 +787,68 @@ function insideDir(configured: string): string {
   return c !== "" && !c.startsWith("/") ? c.replace(/\/+$/, "") : ".worktrees";
 }
 
-async function removeWorktree(neosh: Neosh): Promise<void> {
-  const trees = (await neosh.git.worktrees().catch(() => [])).filter((t) => !t.is_main && !t.is_current);
-  if (trees.length === 0) {
-    neosh.notify("nothing to remove — the main worktree and the one you are in are off limits");
-    return;
+/**
+ * `git pull`, saying what happened.
+ *
+ * The summary is git's own — "Already up to date." and a fast-forward range are different answers,
+ * and a command that swallows both teaches you to run it twice to be sure.
+ */
+async function pull(neosh: Neosh, cwd?: string): Promise<void> {
+  neosh.notify("pulling…");
+  try {
+    const summary = await neosh.git.pull(cwd ? { cwd } : undefined);
+    neosh.notify(summary);
+  } catch (e) {
+    // Diverged branches, no remote, auth — git's message names it, and inventing a friendlier one
+    // here would mean guessing which of those it was.
+    neosh.notify(String(e), "error");
   }
-  const chosen = await picker(
-    neosh,
-    trees.map((t) => ({ label: t.branch ?? t.path, detail: t.path, value: t })),
-    { title: "Remove worktree", width: 78 },
-  );
+}
+
+/**
+ * Remove a worktree, with or without being told which.
+ *
+ * `path` given is the sidebar's flow — `d` on the row *is* the pointing — and a picker opened from
+ * a row you were already on asks you to point twice. Without one it is the palette's flow, and the
+ * picker is the pointing. Either way the removal runs from the main checkout: `git worktree
+ * remove` refuses to saw off the branch it is sitting on, and the conversation this command runs
+ * in may be sitting in exactly the tree being removed.
+ */
+async function removeWorktree(
+  neosh: Neosh,
+  spec: { path?: string; cwd?: string } = {},
+): Promise<void> {
+  const all = await neosh.git.worktrees(spec.cwd ? { cwd: spec.cwd } : undefined).catch(() => []);
+  const main = all.find((t) => t.is_main)?.path;
+  const removable = all.filter((t) => !t.is_main && !t.is_current);
+
+  let chosen: WorktreeInfo | undefined;
+  if (spec.path) {
+    const named = all.find((t) => t.path === spec.path);
+    if (!named) {
+      neosh.notify(`no worktree at ${spec.path}`, "warn");
+      return;
+    }
+    if (named.is_main) {
+      neosh.notify("this is the repository itself — `d` removes a worktree row", "warn");
+      return;
+    }
+    if (named.is_current) {
+      neosh.notify("you are in this worktree — switch to another conversation first", "warn");
+      return;
+    }
+    chosen = named;
+  } else {
+    if (removable.length === 0) {
+      neosh.notify("nothing to remove — the main worktree and the one you are in are off limits");
+      return;
+    }
+    chosen = await picker(
+      neosh,
+      removable.map((t) => ({ label: t.branch ?? t.path, detail: t.path, value: t })),
+      { title: "Remove worktree", width: 78 },
+    ) ?? undefined;
+  }
   if (!chosen) return;
   // The conversations that go with it. They are deleted below, and a dialog that does not mention
   // them is a dialog you agreed to something else in: removing a worktree is a git operation, and
@@ -779,7 +871,7 @@ async function removeWorktree(neosh: Neosh): Promise<void> {
   }
 
   try {
-    await neosh.git.removeWorktree(chosen.path);
+    await neosh.git.removeWorktree(chosen.path, main ? { cwd: main } : undefined);
   } catch (e) {
     // git refuses when the tree has changes, which is the right answer and a better message than
     // anything this plugin could invent.

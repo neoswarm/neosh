@@ -1022,6 +1022,16 @@ pub enum ApiCall {
     GitCommit {
         message: String,
     },
+    /// `git pull` in a repository, answering with what git said about it.
+    ///
+    /// The summary comes back rather than being swallowed, because "Already up to date" and
+    /// "Fast-forwarded to …" are different answers to the question the caller asked, and a `Unit`
+    /// would flatten both into silence.
+    GitPull {
+        /// The repository to pull in. The conversation's own when absent.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cwd: Option<String>,
+    },
     GitAddWorktree {
         path: String,
         branch: String,
@@ -1036,6 +1046,11 @@ pub enum ApiCall {
         path: String,
         #[serde(default)]
         force: bool,
+        /// The repository the worktree belongs to. `git worktree remove` has to run from a
+        /// checkout *other* than the one being removed, and the conversation the caller is in may
+        /// be standing in exactly that one.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cwd: Option<String>,
     },
 
     // ---- one-shot generation -------------------------------------------

@@ -1985,7 +1985,12 @@ fn a_new_conversation_in_a_repository_offers_a_worktree() {
 }
 
 /// The picker's in-project row works with nothing configured: the tree lands in `.worktrees/`
-/// and the exclude entry keeps it out of `git status` — no `worktree.root` edit required.
+/// and `.gitignore` keeps it out of `git status` — no `worktree.root` edit required.
+///
+/// The ignore line goes in the *tracked* file, not `.git/info/exclude`, because the exclude file
+/// is per clone: a colleague pulling the layout would rediscover the untracked-directory noise
+/// this exists to prevent. And it names the worktrees' directory, not the tree — one line that
+/// covers every branch after it, in a file everyone shares.
 #[test]
 fn a_worktree_inside_the_project_needs_no_configuration() {
     let sb = Sandbox::new("wtinsidecmd");
@@ -2001,19 +2006,89 @@ fn a_worktree_inside_the_project_needs_no_configuration() {
         "a worktree appeared under {} with nothing asked and nothing configured",
         under.display()
     );
+    let gitignore = sb.work().join(".gitignore");
+    assert!(
+        s.pump(|_| std::fs::read_to_string(&gitignore)
+            .is_ok_and(|t| t.lines().any(|l| l.trim() == "/.worktrees/"))),
+        "and .gitignore keeps the whole directory out of git status, for every clone\n{:?}",
+        std::fs::read_to_string(&gitignore)
+    );
+}
+
+/// `git.worktree.remove <path>` takes the checkout off the disk without a picker — the sidebar's
+/// `d` is a row that already points at one, and a picker opened from it asks you to point twice.
+///
+/// The removal runs from the main checkout regardless of where the active conversation is,
+/// because `git worktree remove` refuses to saw off the branch it is sitting on.
+#[test]
+fn a_worktree_is_removed_by_its_path_without_a_picker() {
+    let sb = Sandbox::new("wtremove");
+    sb.git_init();
+    sb.write_config("[options]\n\"ui.confirm_destructive\" = false\n");
+    let mut s = sb.start_letting_config_choose();
+    s.wait_for("PROJECTS");
+
+    s.send(&command("git.worktree.new.inside"));
+    let under = sb.work().join(".worktrees");
+    assert!(
+        s.pump(|_| std::fs::read_dir(&under).is_ok_and(|d| d.count() > 0)),
+        "the worktree exists to begin with"
+    );
+    // Canonicalised, because the worktree list reports real paths and `$TMPDIR` on macOS is a
+    // symlink — `/var/folders/…` names a directory git will only ever call `/private/var/…`.
     let made = std::fs::read_dir(&under)
         .unwrap()
         .filter_map(|e| e.ok())
-        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .map(|e| e.path())
         .next()
+        .map(|p| std::fs::canonicalize(&p).unwrap_or(p))
         .expect("one worktree");
-    let exclude = sb.work().join(".git/info/exclude");
-    let want = format!("/.worktrees/{made}/");
+
+    // Landing in the new tree is the point of creating one — which means removing it has to be
+    // refused right now: the conversation is standing in it.
+    s.send(&command_with("git.worktree.remove", &made.display().to_string()));
     assert!(
-        s.pump(|_| std::fs::read_to_string(&exclude)
-            .is_ok_and(|t| t.lines().any(|l| l.trim() == want))),
-        "and .git/info/exclude keeps it out of git status\n{:?}",
-        std::fs::read_to_string(&exclude)
+        s.pump(|s| s.saw("switch to another conversation")),
+        "removing the tree you are in is refused with a reason"
+    );
+
+    // From the main checkout it goes.
+    s.send(&command_with("project.open", &sb.work().display().to_string()));
+    s.send(&command_with("git.worktree.remove", &made.display().to_string()));
+    assert!(s.pump(|_| !made.exists()), "the checkout is gone from the disk");
+}
+
+/// `git.pull` brings the remote's commits into the conversation's checkout, and what git said
+/// about it is the answer rather than silence.
+#[test]
+fn pulling_brings_the_remote_changes_into_the_checkout() {
+    let sb = Sandbox::new("gitpull");
+    sb.git_init();
+    let git = |dir: &std::path::Path, args: &[&str]| {
+        let out = Command::new("git").current_dir(dir).args(args).output().expect("git runs");
+        assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+    };
+    // A bare "origin" beside the checkout, and a second clone playing the colleague who pushed.
+    git(&sb.root, &["clone", "--bare", "--quiet", "work", "origin.git"]);
+    git(&sb.work(), &["remote", "add", "origin", "../origin.git"]);
+    git(&sb.work(), &["fetch", "--quiet", "origin"]);
+    git(&sb.work(), &["branch", "--set-upstream-to=origin/trunk", "trunk"]);
+    git(&sb.root, &["clone", "--quiet", "origin.git", "peer"]);
+    let peer = sb.root.join("peer");
+    git(&peer, &["config", "user.email", "peer@neosh.invalid"]);
+    git(&peer, &["config", "user.name", "peer"]);
+    git(&peer, &["config", "commit.gpgsign", "false"]);
+    std::fs::write(peer.join("news.txt"), "from the remote\n").expect("write");
+    git(&peer, &["add", "."]);
+    git(&peer, &["commit", "--quiet", "-m", "news"]);
+    git(&peer, &["push", "--quiet", "origin", "trunk"]);
+
+    let mut s = sb.start();
+    s.wait_for("PROJECTS");
+    s.send(&command("git.pull"));
+    assert!(
+        s.pump(|_| sb.work().join("news.txt").is_file()),
+        "the remote's commit arrived in the working tree"
     );
 }
 
@@ -2281,10 +2356,10 @@ fn an_empty_worktree_root_puts_them_beside_the_repository() {
 /// A relative root is inside the repository itself — `<repo>/.worktrees/<branch>`, with no
 /// `<repo>` level, because inside the repository nothing else's worktrees can collide with yours.
 ///
-/// The exclude entry is the half that makes the layout livable: git happily creates a worktree
+/// The ignore entry is the half that makes the layout livable: git happily creates a worktree
 /// inside its own repository and then reports the entire checkout as one untracked directory, in
-/// every status, forever. `.git/info/exclude` is local to the clone, so opting into this layout
-/// never shows up in anyone's diff.
+/// every status, forever. It goes in the repository's `.gitignore` — tracked, so every clone gets
+/// it — and names the worktrees' directory once rather than growing a line per branch.
 #[test]
 fn a_relative_worktree_root_lives_inside_the_repository_and_stays_out_of_status() {
     let sb = Sandbox::new("wtinside");
@@ -2305,12 +2380,12 @@ fn a_relative_worktree_root_lives_inside_the_repository_and_stays_out_of_status(
         "the worktree is inside the repository, at {}",
         want.display()
     );
-    let exclude = repo.join(".git/info/exclude");
+    let gitignore = repo.join(".gitignore");
     assert!(
-        s.pump(|_| std::fs::read_to_string(&exclude)
-            .is_ok_and(|t| t.lines().any(|l| l.trim() == "/.worktrees/inside/"))),
-        "and .git/info/exclude keeps it out of git status\n{:?}",
-        std::fs::read_to_string(&exclude)
+        s.pump(|_| std::fs::read_to_string(&gitignore)
+            .is_ok_and(|t| t.lines().any(|l| l.trim() == "/.worktrees/"))),
+        "and .gitignore keeps it out of git status\n{:?}",
+        std::fs::read_to_string(&gitignore)
     );
 }
 

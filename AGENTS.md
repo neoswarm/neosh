@@ -186,8 +186,8 @@ per decision, and records the *reasoning*, not the choice.
   fold, rank and `n`; counts, unread marks and recency fold upward into the repository's row. A
   *relative* `worktree.root` puts trees inside the repository as `<repo>/<configured>/<branch>` —
   no `<repo>` level, nothing else's trees can land there — and `add_worktree` writes the directory
-  into `.git/info/exclude`, or every `git status` reads as one giant untracked directory. See ADR
-  0046.
+  into the repository's `.gitignore` (tracked, so every clone gets it; skipped when already
+  ignored), or every `git status` reads as one giant untracked directory. See ADR 0046.
 - **A project outlives the conversations in it.** The panel's list is written down (`sidebar.projects`,
   a workspace var) rather than worked out from where the conversations happen to be — derived, it
   deleted the directory you had worked in all month the moment you cleared out the last thread in
@@ -377,6 +377,7 @@ registry — this table is what ships.
 | `^G` | Git status |
 | `^D` | Show what changed |
 | `^S` | Read the transcript — see below |
+| `⌥Y` | Copy this conversation's directory — in a worktree, the worktree's path |
 | `^A` `^X` | Select everything, cut the selection |
 | `^C` | Copy the selection, or clear the draft, or (twice) quit |
 | `PgUp` `PgDn` `^End` | Scroll, and back to the newest message |
@@ -466,6 +467,9 @@ says how many are asking, `^T` is where you go, and it opens when you get there.
 | `f` | Pin a project to the top |
 | `J` `K` | Reorder within a group |
 | `r` | Rename a conversation |
+| `y` | Copy the row's directory — a worktree's path, ready to paste into a shell |
+| `p` | Pull that repository from its remote (a git-plugin contribution) |
+| `d` | Remove a worktree from disk — its branch stays, and it asks first (a git-plugin contribution) |
 | `x` `X` | Archive, delete. On a project heading, `X` takes the project off the list — the only thing that does |
 | `a` | The archive. Nothing archived is ever a row in this panel — `↵` restores one, `^U` puts it back without going there, `^X` deletes |
 | `?` | The keys for whatever row you are on |

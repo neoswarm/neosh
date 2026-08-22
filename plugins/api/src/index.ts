@@ -858,12 +858,23 @@ export interface GitApi {
   stage(paths?: string[]): Promise<void>;
   unstage(paths?: string[]): Promise<void>;
   commit(message: string): Promise<CommitInfo>;
+  /**
+   * `git pull`, answering with git's own summary — "Already up to date.", the fast-forward range —
+   * because those are different answers and a caller showing neither is a caller nobody trusts.
+   * `cwd` picks the repository, as everywhere; absent means the conversation's own.
+   */
+  pull(opts?: { cwd?: string }): Promise<string>;
   addWorktree(
     path: string,
     branch: string,
     opts?: { create?: boolean; cwd?: string },
   ): Promise<void>;
-  removeWorktree(path: string, opts?: { force?: boolean }): Promise<void>;
+  /**
+   * `cwd` names the repository the worktree belongs to. `git worktree remove` must run from a
+   * checkout other than the one being removed, and the active conversation may be standing in
+   * exactly that one.
+   */
+  removeWorktree(path: string, opts?: { force?: boolean; cwd?: string }): Promise<void>;
 }
 
 /**
@@ -2106,8 +2117,17 @@ export function __createContext(plugin: string, config: unknown, version: number
           cwd: opts?.cwd ?? null,
         });
       },
+      async pull(opts) {
+        const v = await c({ call: "git_pull", cwd: opts?.cwd ?? null });
+        return expect(v, "text").text;
+      },
       async removeWorktree(path, opts) {
-        await c({ call: "git_remove_worktree", path, force: opts?.force ?? false });
+        await c({
+          call: "git_remove_worktree",
+          path,
+          force: opts?.force ?? false,
+          cwd: opts?.cwd ?? null,
+        });
       },
     },
     gen: {

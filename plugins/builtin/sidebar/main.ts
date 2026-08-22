@@ -826,6 +826,15 @@ async function registerCommands(w: Wiring): Promise<void> {
     if (target?.kind !== "session") return;
     await renameSession(neosh, target.id);
   });
+  // The panel's own copy verb, same letter the transcript uses. What a row is *at* is the thing
+  // you paste into a terminal, an editor or a message, and retyping a generated worktree path is
+  // the kind of chore this panel exists to remove.
+  await verb(`${NS}.copy.path`, "y", "Copy this row's directory", async (target) => {
+    const cwd = owningProject(target);
+    if (cwd === null) return;
+    await neosh.edit.copy(cwd);
+    neosh.notify(`copied ${cwd}`);
+  }, { redraw: false });
   // The everyday verb, and it is reversible. Archiving takes a conversation out of the list without
   // taking anything away, which is what people were reaching for `x` to do before `x` deleted
   // things. Where it goes is `a`, not four dim rows at the foot of this panel.
@@ -910,6 +919,19 @@ async function registerCommands(w: Wiring): Promise<void> {
       await neosh.session.create();
     }, { desc: "Start a new conversation in this project, without asking where" }),
   );
+  w.subscriptions.push(
+    await neosh.cmd.register("session.copy.path", async () => {
+      // The conversation's directory — which in a worktree is the worktree, and that is the point:
+      // the path you want on the clipboard is the one your shell should cd to.
+      const current = await neosh.session.current().catch(() => null);
+      if (!current) return;
+      await neosh.edit.copy(current.cwd);
+      neosh.notify(`copied ${current.cwd}`);
+    }, { desc: "Copy this conversation's directory to the clipboard" }),
+  );
+  await neosh.keymap.set("chat", "<A-y>", "session.copy.path", {
+    desc: "Copy this conversation's directory",
+  });
   w.subscriptions.push(
     await neosh.cmd.register("session.close", async (args) => {
       // Through the same gate as the key, so the palette cannot become a way around the question.
@@ -1099,7 +1121,7 @@ function installActions(
 
 /** The keys this panel has already spoken for. A contribution asking for one of these is a bug in it. */
 const RESERVED = new Set([
-  "j", "k", "q", "f", "J", "K", "r", "x", "X", "n", "a", "o", "?", " ",
+  "j", "k", "q", "f", "J", "K", "r", "x", "X", "n", "a", "o", "y", "?", " ",
   "<Esc>", "<CR>", "<Up>", "<Down>", "<Space>", "<C-n>", "<C-p>", "<C-c>",
 ]);
 
@@ -2681,9 +2703,9 @@ function hints(opts: DrawOptions): ListRow<Target>[] {
     : kind === "project"
       // `X` is on the strip because a list you cannot shorten is a list that grows forever, and a
       // project that outlives its conversations — which is the point of it — has to have a way off.
-      ? ["↵ fold   f ★       JK move", "n new    X remove   ? keys"]
+      ? ["↵ fold   f ★       JK move", "n new    y path     X remove  ? keys"]
       : kind === "session"
-        ? ["↵ open   r rename   x archive", "X delete a archive   ? keys"]
+        ? ["↵ open   r rename   x archive", "X delete y path     a archive  ? keys"]
         : kind === "browse"
           ? ["↵ what you have put away", "? keys"]
           : ["↵ add project    a archive", "esc back         ? keys"];

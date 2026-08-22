@@ -810,6 +810,7 @@ impl Host {
                 | ApiCall::GitStage { .. }
                 | ApiCall::GitUnstage { .. }
                 | ApiCall::GitCommit { .. }
+                | ApiCall::GitPull { .. }
                 | ApiCall::GitAddWorktree { .. }
                 | ApiCall::GitRemoveWorktree { .. }
                 | ApiCall::GenComplete { .. }
@@ -7435,10 +7436,13 @@ async fn run_slow(svc: Services, call: ApiCall) -> ApiResult {
         ApiCall::GitStage { paths } => svc.git_stage(paths).await,
         ApiCall::GitUnstage { paths } => svc.git_unstage(paths).await,
         ApiCall::GitCommit { message } => svc.git_commit(message).await,
+        ApiCall::GitPull { cwd } => svc.git_pull(cwd).await,
         ApiCall::GitAddWorktree { path, branch, create, cwd } => {
             svc.git_add_worktree(path, branch, create, cwd).await
         }
-        ApiCall::GitRemoveWorktree { path, force } => svc.git_remove_worktree(path, force).await,
+        ApiCall::GitRemoveWorktree { path, force, cwd } => {
+            svc.git_remove_worktree(path, force, cwd).await
+        }
         ApiCall::GenComplete { prompt, system, json, selection } => {
             svc.gen_complete(prompt, system, json, selection).await
         }

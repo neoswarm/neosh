@@ -366,6 +366,13 @@ export type ApiCall =
   | { "call": "git_unstage"; paths: Array<string> }
   | { "call": "git_commit"; message: string }
   | {
+    "call": "git_pull";
+    /**
+     * The repository to pull in. The conversation's own when absent.
+     */
+    cwd?: string | null;
+  }
+  | {
     "call": "git_add_worktree";
     path: string;
     branch: string;
@@ -376,7 +383,17 @@ export type ApiCall =
      */
     cwd?: string | null;
   }
-  | { "call": "git_remove_worktree"; path: string; force: boolean }
+  | {
+    "call": "git_remove_worktree";
+    path: string;
+    force: boolean;
+    /**
+     * The repository the worktree belongs to. `git worktree remove` has to run from a
+     * checkout *other* than the one being removed, and the conversation the caller is in may
+     * be standing in exactly that one.
+     */
+    cwd?: string | null;
+  }
   | {
     "call": "gen_complete";
     prompt: string;
