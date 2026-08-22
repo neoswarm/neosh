@@ -63,7 +63,7 @@ per decision, and records the *reasoning*, not the choice.
   (`ext.contribute`/`ext.list`), which is how rows and verbs arrive from plugins we have never heard
   of; and **shared vars** (`vars`, scoped to the workspace, a conversation or a project) for anything
   about a thing rather than about us — `state` stays private and a favourite is not private. Every
-  key in a panel is an ordinary binding pointed at a named command, so `F1` lists it and `init.ts`
+  key in a panel is an ordinary binding pointed at a named command, so `^Z` lists it and `init.ts`
   can move it; a `switch` on `KeyContext` inside a plugin is the thing this replaced. Keep the
   capture, but only as a sink for keys nothing claimed. See ADR 0040.
 - **A panel you are in the middle of using has the keyboard.** `FloatConfig::modal` takes
@@ -78,6 +78,16 @@ per decision, and records the *reasoning*, not the choice.
   default. A modal that borrows a global key to open itself owes a binding to close itself, which is
   why `^E` shuts the sheet from inside. Answering a question is not this: `^T` is how you reach a
   question waiting in another conversation. See ADR 0047.
+- **A default binding is a key every terminal sends.** Not "a key most people can press once they
+  have found the setting": `F1` is brightness on a Mac out of the box, `⌥V` is `√`, and a key
+  neosh never receives is a key no amount of rebinding will fix. That leaves Ctrl-with-a-letter,
+  `⇧⇥`, `⏎`, `⌫` and `Esc` — and Ctrl with *punctuation* is not in the list, because a plain
+  terminal cannot tell `Ctrl+/` from `Ctrl+7`. Arrows, `PgUp`, `Home` and `End` are bound wherever
+  they mean something and are **never the only way** to do anything, which is also why the first
+  key in a `ui.keys.*` list is the chord: the first one is what a hint row prints, and a legend is
+  a promise about a keyboard. A capability that runs out of chords loses its key and keeps its
+  command — `^K` runs it by name and `init.ts` can bind it — because inventing a prefix layer for
+  one verb costs every user a concept to save one of them a keystroke. See ADR 0048.
 - **A list is a place you move in.** Anywhere there is a cursor over rows and no text field — the
   project panel, the transcript reader — the motions are Vim's and they take a count: `5j` is five
   rows you can *land on*, `^D`/`^U` are half of the panel's real height, `12G` is a row rather than
@@ -95,7 +105,7 @@ per decision, and records the *reasoning*, not the choice.
   because three bars and a name and a sentence is five rows of a column whose job is your
   conversations. `⇥` steps it up to every window and then to all of it — contributed as a
   `sidebar.action` with `on: "custom"`, which is how a plugin puts a key on rows it owns rather
-  than on every row in somebody else's panel. See ADR 0048.
+  than on every row in somebody else's panel. See ADR 0049.
 - **Pairing is a decision each machine makes, and neither of them restarts.** A node presents its
   identity to anyone who connects — as an SSH server presents a host key — so adding a computer is
   typing an address and being shown a name and a fingerprint that came from the far end. The other
@@ -204,8 +214,8 @@ per decision, and records the *reasoning*, not the choice.
   fold, rank and `n`; counts, unread marks and recency fold upward into the repository's row. A
   *relative* `worktree.root` puts trees inside the repository as `<repo>/<configured>/<branch>` —
   no `<repo>` level, nothing else's trees can land there — and `add_worktree` writes the directory
-  into `.git/info/exclude`, or every `git status` reads as one giant untracked directory. See ADR
-  0046.
+  into the repository's `.gitignore` (tracked, so every clone gets it; skipped when already
+  ignored), or every `git status` reads as one giant untracked directory. See ADR 0046.
 - **A project outlives the conversations in it.** The panel's list is written down (`sidebar.projects`,
   a workspace var) rather than worked out from where the conversations happen to be — derived, it
   deleted the directory you had worked in all month the moment you cleared out the last thread in
@@ -251,7 +261,7 @@ per decision, and records the *reasoning*, not the choice.
   for. **A card is attached to what it did**: no blank row above it, and its body under a corner
   (`└`) at a four-column indent rather than a rule down the whole left side. Air between every two
   actions and a wall beside every diff were both structure said twice — the header is at column
-  zero, the body is indented, and that is already a list. See ADR 0040 and ADR 0049.
+  zero, the body is indented, and that is already a list. See ADR 0040 and ADR 0050.
 - **A terminal cannot paste a picture, so pasting one is a key.** Bracketed paste is a text
   protocol: a screenshot arrives as nothing, and a dragged file arrives as its path. `^V` asks the
   system clipboard through whichever of `wl-paste`/`xclip`/`pngpaste`/`osascript`/`powershell` is
@@ -285,7 +295,7 @@ per decision, and records the *reasoning*, not the choice.
   once answered "how full is it" turns off the estimate derived from usage, so the next answer only
   arrives with the next request — and a `Compacted` whose `after` nobody applied left the footer
   reporting the pre-compaction number for the rest of the conversation, under a card that said
-  `180k → 12k`. See ADR 0049.
+  `180k → 12k`. See ADR 0050.
 - **What the plan has left cannot be counted, only reported and then kept.** A subscription's
   allowance is opaque and is not a function of anything on this machine — a turn run in `claude`
   directly spent it too. `claude` says so on a `rate_limit_event` line and `codex` on
@@ -374,8 +384,13 @@ the plugin tree is embedded with `include_dir!` and cargo will not notice otherw
 # Keys
 
 Everything here is an ordinary binding in the same table your `init.ts` writes to, bound to a
-*command name* rather than a callback. Setting the same key replaces it. `F1` lists the live
+*command name* rather than a callback. Setting the same key replaces it. `^Z` lists the live
 registry — this table is what ships.
+
+Every key here is one **every terminal sends on every platform**: Ctrl-with-a-letter, `⇧⇥`, `⏎`,
+`⌫`, `Esc`. Nothing needs `fn`, nothing needs Option-as-Alt, and nothing is reachable only by an
+arrow — arrows and `PgUp`/`Home`/`End` are bound wherever they mean something, and are never the
+only way to do anything. See ADR 0048.
 
 ## Chat
 
@@ -385,15 +400,14 @@ registry — this table is what ships.
 | `⇧⏎` | Newline, so a pasted snippet stays one message |
 | `^Y` | Take the last thing you queued back into the composer, to change it or drop it. Readline's yank: `^U`/`^W` kill, `^Y` brings it back |
 | `^V` | Attach the image on the clipboard. A key rather than a paste, because a terminal's paste can only ever hand over text |
-| `⌥V` | Take the last attached image back off |
+| `⌫` | On an empty composer, take the last attached image back off |
 | `^P` | Pick a model. Mid-turn too — the running agent is told, and thinks the rest with it |
-| `^E` | Everything this model can be told, on one panel: effort, thinking, fast mode, context, and whatever a driver invented. `←→` along a row, `↑↓` between them, and it applies as you move. Nothing else reaches the keyboard while it is open; `^E` again closes it |
-| `⌥↑` `⌥↓` | One rung up or down the capability ladder, same provider |
+| `^E` | Everything this model can be told, on one panel: effort, thinking, fast mode, context, and whatever a driver invented. `h`/`l` along a row, `j`/`k` between them, arrows too, and it applies as you move. Nothing else reaches the keyboard while it is open; `^E` again closes it |
 | `⇧⇥` | Permission mode — full access to start with, then ask, allow-listed, deny. Belongs to this conversation, saved with it, and takes effect on the turn that is running |
 | `^T` | Projects and conversations. Switching is never refused — turns keep running where they are |
 | `^J` | The computers in this workspace. Add one by its address, allow one that is asking, or open what it is running |
 | `^F` | What you have archived. Filter it, put one back, or finally throw it away |
-| `^N` | New conversation. In a repository it asks where: here, a worktree you need not name, one you do, an existing one, another machine, elsewhere |
+| `^N` | New conversation. In a repository it asks where: here, a worktree you need not name, one kept inside the project, one you do name, an existing one, another machine, elsewhere |
 | `^O` | Add a project |
 | `^B` | Toggle the sidebar |
 | `^K` | Command palette |
@@ -402,12 +416,13 @@ registry — this table is what ships.
 | `^G` | Git status |
 | `^D` | Show what changed |
 | `^S` | Read the transcript — see below |
+| `⌥Y` | Copy this conversation's directory — in a worktree, the worktree's path |
 | `^A` `^X` | Select everything, cut the selection |
 | `^C` | Copy the selection, or clear the draft, or (twice) quit |
 | `PgUp` `PgDn` `^End` | Scroll, and back to the newest message |
 | `^R` | Reload configuration |
 | `^Q` | Close this terminal. Whatever is running keeps running, and so does every other terminal open on this workspace — `neosh` puts you back |
-| `F1` | Every binding, live |
+| `^Z` | Every binding, live |
 | `Esc` | Interrupt the turn in this conversation. The agent is asked to stop, so the conversation survives it |
 
 Dragging an image onto the terminal pastes its path, and a pasted path to an image is attached
@@ -415,7 +430,9 @@ rather than typed out. What is attached sits above the field until the message g
 
 Composer editing is a text field: `←`/`→` by character and `^←`/`^→` by word, `Home`/`End` and
 `^Home`/`^End` for the ends, shift with any of them to select, `^W` and `^U` to delete a word or
-back to the start of the line.
+back to the start of the line. The capability ladder — `model.upgrade`, `model.downgrade` — has no
+default key: it had `⌥↑`/`⌥↓`, which is not a key every terminal sends, and `^K` runs both by
+name.
 
 ## Reading the transcript — `^S`
 
@@ -464,7 +481,7 @@ Two corollaries, both of which were bugs:
 What an agent gets when it asks *you* something. One question at a time, `⇧⇥` to go back and change
 an earlier answer, and **typing is answering** — it goes into the composer, where you can see and
 edit it, and the numbered shortcuts disappear to say a digit is now a character. Every key here is
-an ordinary binding against the `neosh.question` buffer kind, so `F1` lists it and `init.ts` can
+an ordinary binding against the `neosh.question` buffer kind, so `^Z` lists it and `init.ts` can
 move it.
 
 | Key | Does |
@@ -472,7 +489,7 @@ move it.
 | `↵` | Take the option under the cursor, and go on to the next question. On one that takes several, confirm what is ticked. With something typed, send that instead |
 | `1`–`9` | Take that option, while nothing has been typed |
 | `⇥` | Tick or untick the option under the cursor, on a question that takes more than one |
-| `↑` `↓`, `^P` `^N` | Move |
+| `^P` `^N`, `↑` `↓` | Move |
 | `⇧⇥` | Back to the previous question |
 | type | Your own answer, for when none of them is it. `⌫` back to the options, `^W` a word, `^U` all of it |
 | `Esc` | Dismiss. The agent is told nobody answered — which is a thing it can act on, not an error |
@@ -494,6 +511,9 @@ says how many are asking, `^T` is where you go, and it opens when you get there.
 | `f` | Pin a project to the top |
 | `J` `K` | Reorder within a group |
 | `r` | Rename a conversation |
+| `y` | Copy the row's directory — a worktree's path, ready to paste into a shell |
+| `p` | Pull that repository from its remote (a git-plugin contribution) |
+| `d` | Remove a worktree from disk — its branch stays, and it asks first (a git-plugin contribution) |
 | `x` `X` | Archive, delete. On a project heading, `X` takes the project off the list — the only thing that does |
 | `a` | The archive. Nothing archived is ever a row in this panel — `↵` restores one, `^U` puts it back without going there, `^X` deletes |
 | `⇥` | On the plan rows: how much of it to show — the limit that binds, every limit, or all of it with the account and the sentence. `usage.sidebar.style` is where it starts, `usage.sidebar` turns it off |
@@ -505,7 +525,7 @@ says how many are asking, `^T` is where you go, and it opens when you get there.
 | Key | Does |
 |---|---|
 | `↵` | Choose |
-| `↑`/`↓`, `^N`/`^P`, `^J`/`^K` | Move |
+| `^N`/`^P`, `^J`/`^K`, `↑`/`↓` | Move |
 | type | Filter |
 | `⇥` `⇧⇥`, `→` `←` | Between the two panes of the model picker |
 | `Esc`, `^C` | Close |

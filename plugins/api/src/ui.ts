@@ -255,7 +255,13 @@ function keyLabel(keys: Map<WidgetAction, KeySpec[]>, action: WidgetAction): str
     "<CR>": "↵",
     "<Esc>": "esc",
   };
-  return pretty[spec.lhs] ?? spec.lhs.replace(/^<C-(.)>$/, "^$1").replace(/^<|>$/g, "");
+  // `^N`, not `^n`: nobody presses shift to send it, and the capital is how every terminal
+  // program has written a chord since curses. The first key of `ui.keys.*` is the one that
+  // reaches this — which is why the defaults lead with the chord and keep the arrow behind it.
+  return (
+    pretty[spec.lhs] ??
+    spec.lhs.replace(/^<C-(.)>$/, (_, c: string) => `^${c.toUpperCase()}`).replace(/^<|>$/g, "")
+  );
 }
 
 /**

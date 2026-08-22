@@ -259,7 +259,7 @@ impl Session {
 ///
 /// `5j` is five lines and `3G` is the third one — the count is a repetition on a motion and a
 /// destination on `G`, which is the distinction the digits are for. `0` is the start of the line
-/// when nothing has been typed and part of the number when something has. See ADR 0048.
+/// when nothing has been typed and part of the number when something has. See ADR 0049.
 #[test]
 fn a_count_repeats_a_motion_and_places_a_jump() {
     let sb = Sandbox::new("counts");

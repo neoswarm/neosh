@@ -656,7 +656,9 @@ fn the_key_strip_says_the_keys_that_are_actually_bound() {
     s.wait_for("PROJECTS");
     s.ctrl("k");
     assert!(
-        s.pump(|s| s.picker_named("[Go to]").iter().any(|l| l.contains("^y choose"))),
+        // `^Y`, capitalised: nobody presses shift to send it, and the capital is how a terminal
+        // has spelled a chord since curses.
+        s.pump(|s| s.picker_named("[Go to]").iter().any(|l| l.contains("^Y choose"))),
         "the strip follows the setting\n{:?}",
         s.picker_named("[Go to]")
     );
@@ -1363,9 +1365,9 @@ fn nothing_else_reaches_the_keyboard_while_the_option_sheet_is_open() {
 
 #[test]
 fn a_knob_row_says_it_is_a_control_before_you_press_anything() {
-    // A ladder with one rung lit reads identically whether or not `←→` do anything to it — which is
-    // how a live control came to look like a summary, and why `↵` on it (which means "done") felt
-    // like a key that does nothing at all.
+    // A ladder with one rung lit reads identically whether or not `h`/`l` do anything to it — which
+    // is how a live control came to look like a summary, and why `↵` on it (which means "done")
+    // felt like a key that does nothing at all.
     let sb = Sandbox::new("railsheet");
     let dir = sb.root.join("config/plugins/lab");
     std::fs::create_dir_all(&dir).expect("mkdir");
@@ -1389,7 +1391,8 @@ fn a_knob_row_says_it_is_a_control_before_you_press_anything() {
         s.transcript()
     );
     // And the key that changes something is named before the key that leaves.
-    assert!(s.saw("←→ change"), "the hints lead with the key that does the thing\n{}", s.transcript());
+    // Letters, not arrows: the arrows are bound too, and the row is a promise about a keyboard.
+    assert!(s.saw("h l change"), "the hints lead with the key that does the thing\n{}", s.transcript());
 }
 
 #[test]
@@ -1987,6 +1990,120 @@ fn a_new_conversation_in_a_repository_offers_a_worktree() {
     let rows = s.picker_named("[New conversation]");
     assert!(rows.iter().any(|l| l.contains("Here")), "the default\n{rows:?}");
     assert!(rows.iter().any(|l| l.contains("new worktree")), "and the other one\n{rows:?}");
+    // The in-project variant is a visible row, not a setting you have to know about: a choice
+    // that only exists after editing config.toml is a choice nobody discovers.
+    assert!(
+        rows.iter().any(|l| l.contains("in this project")),
+        "and the one that stays in the repository\n{rows:?}"
+    );
+}
+
+/// The picker's in-project row works with nothing configured: the tree lands in `.worktrees/`
+/// and `.gitignore` keeps it out of `git status` — no `worktree.root` edit required.
+///
+/// The ignore line goes in the *tracked* file, not `.git/info/exclude`, because the exclude file
+/// is per clone: a colleague pulling the layout would rediscover the untracked-directory noise
+/// this exists to prevent. And it names the worktrees' directory, not the tree — one line that
+/// covers every branch after it, in a file everyone shares.
+#[test]
+fn a_worktree_inside_the_project_needs_no_configuration() {
+    let sb = Sandbox::new("wtinsidecmd");
+    sb.git_init();
+    let mut s = sb.start();
+    s.wait_for("PROJECTS");
+
+    s.send(&command("git.worktree.new.inside"));
+
+    let under = sb.work().join(".worktrees");
+    assert!(
+        s.pump(|_| std::fs::read_dir(&under).is_ok_and(|d| d.count() > 0)),
+        "a worktree appeared under {} with nothing asked and nothing configured",
+        under.display()
+    );
+    let gitignore = sb.work().join(".gitignore");
+    assert!(
+        s.pump(|_| std::fs::read_to_string(&gitignore)
+            .is_ok_and(|t| t.lines().any(|l| l.trim() == "/.worktrees/"))),
+        "and .gitignore keeps the whole directory out of git status, for every clone\n{:?}",
+        std::fs::read_to_string(&gitignore)
+    );
+}
+
+/// `git.worktree.remove <path>` takes the checkout off the disk without a picker — the sidebar's
+/// `d` is a row that already points at one, and a picker opened from it asks you to point twice.
+///
+/// The removal runs from the main checkout regardless of where the active conversation is,
+/// because `git worktree remove` refuses to saw off the branch it is sitting on.
+#[test]
+fn a_worktree_is_removed_by_its_path_without_a_picker() {
+    let sb = Sandbox::new("wtremove");
+    sb.git_init();
+    sb.write_config("[options]\n\"ui.confirm_destructive\" = false\n");
+    let mut s = sb.start_letting_config_choose();
+    s.wait_for("PROJECTS");
+
+    s.send(&command("git.worktree.new.inside"));
+    let under = sb.work().join(".worktrees");
+    assert!(
+        s.pump(|_| std::fs::read_dir(&under).is_ok_and(|d| d.count() > 0)),
+        "the worktree exists to begin with"
+    );
+    // Canonicalised, because the worktree list reports real paths and `$TMPDIR` on macOS is a
+    // symlink — `/var/folders/…` names a directory git will only ever call `/private/var/…`.
+    let made = std::fs::read_dir(&under)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .next()
+        .map(|p| std::fs::canonicalize(&p).unwrap_or(p))
+        .expect("one worktree");
+
+    // Landing in the new tree is the point of creating one — which means removing it has to be
+    // refused right now: the conversation is standing in it.
+    s.send(&command_with("git.worktree.remove", &made.display().to_string()));
+    assert!(
+        s.pump(|s| s.saw("switch to another conversation")),
+        "removing the tree you are in is refused with a reason"
+    );
+
+    // From the main checkout it goes.
+    s.send(&command_with("project.open", &sb.work().display().to_string()));
+    s.send(&command_with("git.worktree.remove", &made.display().to_string()));
+    assert!(s.pump(|_| !made.exists()), "the checkout is gone from the disk");
+}
+
+/// `git.pull` brings the remote's commits into the conversation's checkout, and what git said
+/// about it is the answer rather than silence.
+#[test]
+fn pulling_brings_the_remote_changes_into_the_checkout() {
+    let sb = Sandbox::new("gitpull");
+    sb.git_init();
+    let git = |dir: &std::path::Path, args: &[&str]| {
+        let out = Command::new("git").current_dir(dir).args(args).output().expect("git runs");
+        assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+    };
+    // A bare "origin" beside the checkout, and a second clone playing the colleague who pushed.
+    git(&sb.root, &["clone", "--bare", "--quiet", "work", "origin.git"]);
+    git(&sb.work(), &["remote", "add", "origin", "../origin.git"]);
+    git(&sb.work(), &["fetch", "--quiet", "origin"]);
+    git(&sb.work(), &["branch", "--set-upstream-to=origin/trunk", "trunk"]);
+    git(&sb.root, &["clone", "--quiet", "origin.git", "peer"]);
+    let peer = sb.root.join("peer");
+    git(&peer, &["config", "user.email", "peer@neosh.invalid"]);
+    git(&peer, &["config", "user.name", "peer"]);
+    git(&peer, &["config", "commit.gpgsign", "false"]);
+    std::fs::write(peer.join("news.txt"), "from the remote\n").expect("write");
+    git(&peer, &["add", "."]);
+    git(&peer, &["commit", "--quiet", "-m", "news"]);
+    git(&peer, &["push", "--quiet", "origin", "trunk"]);
+
+    let mut s = sb.start();
+    s.wait_for("PROJECTS");
+    s.send(&command("git.pull"));
+    assert!(
+        s.pump(|_| sb.work().join("news.txt").is_file()),
+        "the remote's commit arrived in the working tree"
+    );
 }
 
 #[test]
@@ -2253,10 +2370,10 @@ fn an_empty_worktree_root_puts_them_beside_the_repository() {
 /// A relative root is inside the repository itself — `<repo>/.worktrees/<branch>`, with no
 /// `<repo>` level, because inside the repository nothing else's worktrees can collide with yours.
 ///
-/// The exclude entry is the half that makes the layout livable: git happily creates a worktree
+/// The ignore entry is the half that makes the layout livable: git happily creates a worktree
 /// inside its own repository and then reports the entire checkout as one untracked directory, in
-/// every status, forever. `.git/info/exclude` is local to the clone, so opting into this layout
-/// never shows up in anyone's diff.
+/// every status, forever. It goes in the repository's `.gitignore` — tracked, so every clone gets
+/// it — and names the worktrees' directory once rather than growing a line per branch.
 #[test]
 fn a_relative_worktree_root_lives_inside_the_repository_and_stays_out_of_status() {
     let sb = Sandbox::new("wtinside");
@@ -2277,12 +2394,12 @@ fn a_relative_worktree_root_lives_inside_the_repository_and_stays_out_of_status(
         "the worktree is inside the repository, at {}",
         want.display()
     );
-    let exclude = repo.join(".git/info/exclude");
+    let gitignore = repo.join(".gitignore");
     assert!(
-        s.pump(|_| std::fs::read_to_string(&exclude)
-            .is_ok_and(|t| t.lines().any(|l| l.trim() == "/.worktrees/inside/"))),
-        "and .git/info/exclude keeps it out of git status\n{:?}",
-        std::fs::read_to_string(&exclude)
+        s.pump(|_| std::fs::read_to_string(&gitignore)
+            .is_ok_and(|t| t.lines().any(|l| l.trim() == "/.worktrees/"))),
+        "and .gitignore keeps it out of git status\n{:?}",
+        std::fs::read_to_string(&gitignore)
     );
 }
 
@@ -2900,6 +3017,26 @@ fn the_key_list_opens_from_the_panel_and_any_key_dismisses_it() {
 
     s.key("z");
     assert!(s.pump(|s| s.windows_for(keys).is_empty()), "any key closes it\n{}", s.transcript());
+}
+
+/// The key list is reachable from the composer, and by a chord rather than by `F1`. Apple's top
+/// row is brightness until somebody finds the setting, so the key whose job is teaching every
+/// other key was the one key a new Mac could not press. See ADR 0048.
+#[test]
+fn the_key_list_opens_on_a_chord_from_the_composer() {
+    let sb = Sandbox::new("keylistchord");
+    let mut s = sb.start();
+    s.wait_for("PROJECTS");
+
+    s.ctrl("z");
+    s.wait_for("CHAT");
+    let keys = s.buffer_named("[keys]").expect("key list buffer");
+    assert!(
+        s.pump(|s| s.lines_of(keys).iter().any(|l| l.contains("Command palette"))),
+        "the live registry, not a written-down list\n{:?}",
+        s.lines_of(keys)
+    );
+    assert!(s.pump(|s| s.windows_for(keys).len() == 1), "it is on screen\n{}", s.transcript());
 }
 
 #[test]
@@ -3607,7 +3744,7 @@ impl Session {
 #[test]
 fn the_shortcut_row_is_off_because_the_sidebar_already_says_all_of_it() {
     // It read as a good idea and was not. `^T`, `^N` and `^K` are in the sidebar's own footer two
-    // rows below, `F1` is on the row it points at, and what the duplication actually bought was
+    // rows below, `^Z` is on the row it points at, and what the duplication actually bought was
     // one fewer line of transcript and a composer pressed against the status strip.
     let sb = Sandbox::new("nohints");
     let mut s = sb.start();
@@ -3632,7 +3769,7 @@ fn the_shortcut_row_comes_back_if_you_ask_for_it() {
     // Waiting on a plugin's entry, not the host's: the host seeds `⏎ send` before any plugin has
     // loaded, so asserting on that alone would pass before the row was finished.
     assert!(
-        s.pump(|s| s.composer_chrome().iter().any(|t| t.contains("F1 keys"))),
+        s.pump(|s| s.composer_chrome().iter().any(|t| t.contains("^Z keys"))),
         "the way to the keys that did not fit\n{:?}",
         s.composer_chrome()
     );
@@ -5399,7 +5536,7 @@ fn a_third_party_verb_fires_on_its_key_with_the_row_it_was_pointed_at() {
 /// replace one.
 ///
 /// This is the claim the whole rewrite rests on. Before it, the panel resolved keys in a private
-/// switch statement: `F1` could not list them, `^K` could not run them, and rebinding `x` meant
+/// switch statement: `^Z` could not list them, `^K` could not run them, and rebinding `x` meant
 /// forking the plugin.
 #[test]
 fn the_panels_keys_are_in_the_registry_and_a_user_can_rebind_them() {
@@ -5452,7 +5589,7 @@ export async function activate({ neosh }: PluginContext) {
 /// The keys are Vim's because this is a cursor over a column in a terminal, and a list of thirty
 /// conversations reached one `j` at a time is a list nobody moves around in. Counted in rows the
 /// cursor can *land* on rather than lines, so the headings and rules it already skips do not
-/// silently eat two of the five. See ADR 0048.
+/// silently eat two of the five. See ADR 0049.
 #[test]
 fn a_count_before_a_motion_moves_that_many_rows() {
     let sb = Sandbox::new("counts");
@@ -5742,7 +5879,7 @@ fn a_plugins_own_provider_appears_in_the_plan_strip() {
 /// Three bars, a name and a sentence is five rows of a column whose job is your conversations —
 /// and four of them answer a question you did not ask. The default is the limit that would refuse
 /// the next request, plus anything else already critical; `<Tab>` on the row steps up to every
-/// window and then to the whole block, and `^L` is all of it whichever is showing. See ADR 0048.
+/// window and then to the whole block, and `^L` is all of it whichever is showing. See ADR 0049.
 #[test]
 fn the_plan_strip_is_one_row_until_you_ask_for_more() {
     let sb = Sandbox::new("plandense");
@@ -5957,7 +6094,7 @@ fn the_usage_panel_opens_with_the_plan_above_the_history() {
 /// The panel's keys are the panel's keys, bound to named commands.
 ///
 /// `t` and `c` are ordinary letters. Bound at buffer-kind scope they only fire here — and because
-/// they point at named commands rather than at a `switch` inside a handler, `F1` lists them and an
+/// they point at named commands rather than at a `switch` inside a handler, `^Z` lists them and an
 /// `init.ts` can move them. See ADR 0040.
 #[test]
 fn the_usage_panel_swaps_metric_on_its_own_key() {

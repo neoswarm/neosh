@@ -265,6 +265,28 @@ impl Git {
         })
     }
 
+    /// `git pull`, answering with the last thing git said about it.
+    ///
+    /// `--no-edit` because there is no editor here to open: a pull that wants a merge message gets
+    /// the default one, and a pull that wants credentials fails now rather than hanging — `run`
+    /// closes stdin and forbids terminal prompts for exactly this call.
+    ///
+    /// The summary is the tail of git's output, not the whole of it: "Already up to date." and
+    /// "Fast-forward" are what the caller wants to show, and the object-counting progress above
+    /// them is noise nobody typed `git pull` to read.
+    pub async fn pull(&self) -> Result<String, VcsError> {
+        let out = self.git(["pull", "--no-edit"]).await?;
+        let summary = out
+            .stdout
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            .next_back()
+            .unwrap_or("done")
+            .to_string();
+        Ok(summary)
+    }
+
     pub async fn add_worktree(
         &self,
         path: &Path,
@@ -285,16 +307,22 @@ impl Git {
         Ok(())
     }
 
-    /// Keep an in-tree worktree out of `git status`.
+    /// Keep an in-tree worktree out of `git status` — in every clone.
     ///
     /// Git is happy to put a worktree inside the repository it belongs to, and then reports the
-    /// whole checkout as one untracked directory — in every status, forever. The fix is a line in
-    /// `.git/info/exclude`: local to this clone, so it never appears in anyone's diff, and about
-    /// this machine's layout, which is exactly what that file is for.
+    /// whole checkout as one untracked directory, forever. The fix is a line in the repository's
+    /// **`.gitignore`**, not `.git/info/exclude`: the exclude file is per clone, so a colleague —
+    /// or the same person on another machine — pulls the layout and rediscovers the noise, while
+    /// the tracked file says it once for everyone. Making the working tree dirty is the honest
+    /// cost, and it is one line that commits with the work.
     ///
-    /// The entry is the worktree's own directory, not its parent: excluding `/<parent>/` would
-    /// swallow any other untracked file somebody later puts there, and this function cannot know
-    /// the parent exists only for worktrees.
+    /// The entry is the worktrees' *directory* — `/.worktrees/`, the tree's parent — because a
+    /// shared file that grew a line per scratch branch would be churn everyone has to pull. A
+    /// worktree sitting directly in the root, with no parent to name, gets its own directory.
+    ///
+    /// Nothing is written when git already ignores the path — the line from last time, a broader
+    /// rule somebody wrote, a global ignore. `git check-ignore` answers that the way `git status`
+    /// will, which a string search of one file cannot.
     ///
     /// Best-effort by design. The worktree already exists when this runs; failing the call over a
     /// status-noise fix would report an operation as failed after it worked.
@@ -306,15 +334,24 @@ impl Git {
         let common = PathBuf::from(out.stdout.trim());
         // "Inside the repository" means inside the *main* checkout — the common dir's parent —
         // not inside whichever worktree this command happened to run from.
-        let Some(main) = common.parent() else { return };
-        let Ok(rel) = path.strip_prefix(main) else { return };
-        let rel = rel.to_string_lossy().replace('\\', "/");
-        if rel.is_empty() {
+        let Some(main) = common.parent().map(Path::to_path_buf) else { return };
+        let Ok(rel) = path.strip_prefix(&main) else { return };
+        let rel_text = rel.to_string_lossy().replace('\\', "/");
+        if rel_text.is_empty() {
             return;
         }
-        let exclude = common.join("info").join("exclude");
-        let line = format!("/{}/", rel.trim_matches('/'));
-        let current = tokio::fs::read_to_string(&exclude).await.unwrap_or_default();
+        // Exit 0 is "ignored". Exit 1 — which `run` surfaces as an error — is "not ignored", and a
+        // real failure lands on the same conservative answer: write the line.
+        if run(&main, ["check-ignore", "-q", "--", rel_text.as_str()]).await.is_ok() {
+            return;
+        }
+        let dir = match rel.parent().map(|p| p.to_string_lossy().replace('\\', "/")) {
+            Some(parent) if !parent.is_empty() => parent,
+            _ => rel_text,
+        };
+        let line = format!("/{}/", dir.trim_matches('/'));
+        let gitignore = main.join(".gitignore");
+        let current = tokio::fs::read_to_string(&gitignore).await.unwrap_or_default();
         if current.lines().any(|l| l.trim() == line) {
             return;
         }
@@ -324,10 +361,7 @@ impl Git {
         }
         next.push_str(&line);
         next.push('\n');
-        if let Some(dir) = exclude.parent() {
-            let _ = tokio::fs::create_dir_all(dir).await;
-        }
-        let _ = tokio::fs::write(&exclude, next).await;
+        let _ = tokio::fs::write(&gitignore, next).await;
     }
 
     pub async fn remove_worktree(&self, path: &Path, force: bool) -> Result<(), VcsError> {

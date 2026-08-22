@@ -22,7 +22,7 @@
  *
  * The strip is a `sidebar.section` contribution, so it can be turned off and something else put
  * there. The panel is a buffer with a `kind`, so its keys are bindable and a plugin can add rows to
- * it. Every key is a named command, so `F1` lists them and `init.ts` can move them. Nothing in this
+ * it. Every key is a named command, so `^Z` lists them and `init.ts` can move them. Nothing in this
  * file calls anything a third party could not.
  */
 
@@ -180,7 +180,7 @@ async function installStrip({ neosh, subscriptions }: PluginContext) {
   };
 
   // Stepping the density, and taking the strip off the column altogether. Commands rather than
-  // config-file lines: `^K` runs them, `F1` lists the key, and `init.ts` moves it — the same way
+  // config-file lines: `^K` runs them, `^Z` lists the key, and `init.ts` moves it — the same way
   // every other verb here works. They write the *setting*, so `config.toml` decides where you
   // start and the key decides where you are.
   subscriptions.push(
@@ -782,7 +782,7 @@ async function installPanel({ neosh, subscriptions }: PluginContext) {
     await neosh.win.close(w).catch(() => {});
   };
 
-  // Every key is a named command, so `F1` lists them and `init.ts` can move them. A `switch` on the
+  // Every key is a named command, so `^Z` lists them and `init.ts` can move them. A `switch` on the
   // key inside a handler is the thing this replaced — see ADR 0040.
   const cmd = async (name: string, desc: string, fn: () => void | Promise<void>) => {
     subscriptions.push(await neosh.cmd.register(`${NS}.${name}`, fn, { desc }));

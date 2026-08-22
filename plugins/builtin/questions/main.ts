@@ -28,7 +28,7 @@
  * have to notice. While there is something typed the numbered shortcuts go away, which is how the
  * panel says a digit is a character now. See ADR 0037.
  *
- * **Every key is a named command.** `question.accept`, `question.next` — so `F1` lists them and an
+ * **Every key is a named command.** `question.accept`, `question.next` — so `^Z` lists them and an
  * `init.ts` can move them, and a third party can bind their own against the `neosh.question` buffer
  * kind without forking this. Only the printable keys come through the raw capture, and only because
  * they are text rather than verbs. See ADR 0040.
@@ -100,6 +100,18 @@ const LABEL_MAX = 28;
  * four characters and the description is what you are reading.
  */
 const OTHER = "Other";
+
+/**
+ * How many lines of the answer you are writing the panel will show at once.
+ *
+ * A field, not a paragraph: what is being typed goes on as many lines as it takes and the panel
+ * follows the *end* of it, because the end is where the caret is and the caret is what you are
+ * looking at. Unbounded, a long answer would grow the float until it had eaten the conversation it
+ * is a question about; clipped to one line — which is what this was — everything past the width of
+ * the row is an ellipsis, and typing into a field that stopped showing what you were typing is the
+ * one thing a field must never do.
+ */
+const FIELD_LINES = 6;
 
 /**
  * The characters the panel is drawn with, at whatever fidelity the terminal has.
@@ -181,6 +193,17 @@ type Ask = {
   at: number;
   /** Which option is under the cursor, for the question on screen. */
   cursor: number;
+  /**
+   * What is in the field, and whether the field is open at all.
+   *
+   * On the ask rather than in the panel, because the panel is closed and built again from nothing
+   * every time you look at another conversation — and a sentence somebody is half-way through
+   * writing belongs to the question, not to the float that happened to be drawing it. Separate
+   * from `drafts`, which is what has been *answered*: a half-written sentence is not an answer,
+   * and one filed as though it were would have the panel tick the question off and walk past it.
+   */
+  typing: string;
+  writing: boolean;
   /** Called once, with the answers or `null` for "nobody answered". */
   settle: (answers: QuestionAnswer[] | null) => void;
   settled: boolean;
@@ -295,6 +318,8 @@ export async function activate({ neosh, subscriptions }: PluginContext) {
           drafts: new Map(),
           at: 0,
           cursor: 0,
+          typing: "",
+          writing: false,
           settle: () => {},
           settled: false,
         };
@@ -470,6 +495,11 @@ async function draw(neosh: Neosh, ask: Ask, seed: string, done: () => void): Pro
   const close = async () => {
     if (closed) return;
     closed = true;
+    // Onto the ask, before the panel goes. Looking at another conversation closes this panel and
+    // builds a new one on the way back — the cursor and which question you were on already survive
+    // that, and what you were writing is the one part of it you would notice losing.
+    ask.typing = typed;
+    ask.writing = writing;
     for (const d of disposers) d.dispose();
     await neosh.focus.pop().catch(() => {});
     await neosh.win.close(win).catch(() => {});
@@ -740,12 +770,17 @@ async function draw(neosh: Neosh, ask: Ask, seed: string, done: () => void): Pro
     });
   }
 
-  // Seeded from whatever was already half-typed when the question arrived, rather than thrown
-  // away: the panel appeared over a field somebody was using, and what they had written is very
-  // often the answer — it is the sentence they were about to send.
-  typed = seed;
-  writing = seed.trim() !== "";
+  // What was in the field when this question was last on screen, if it has been: coming back to a
+  // conversation you left mid-sentence puts you back in the sentence. Otherwise, whatever was
+  // already half-typed when the question arrived, rather than thrown away — the panel appeared
+  // over a field somebody was using, and what they had written is very often the answer.
+  typed = ask.typing || seed;
+  writing = ask.writing || typed.trim() !== "";
   if (writing) ask.cursor = q().options.length;
+  // And the composer says the same thing, because switching conversations emptied it. The panel
+  // mirrors the answer into the composer so you can see it in the field this screen actually has;
+  // restoring one without the other is arriving at two answers that disagree.
+  if (typed !== "") await neosh.agent.setDraft(typed).catch(() => {});
   await render();
 
   return { ask, close };
@@ -951,41 +986,59 @@ function compose(
     const lead = pad(`${here ? g.cursor : g.blank} ${g.pen} `, gutter);
     const badge = shortcuts ? "0" : "";
     const forDetail = room - gutter - labelWidth - 2 - (badgeWidth ? badgeWidth + 2 : 0);
-    // Once you are writing, the row *is* the field: what is in it is your answer, and it takes the
-    // whole width because a sentence is not a label.
-    const body = custom
-      ? clip(typed, Math.max(8, room - gutter - 2))
-      : (() => {
-        const label = pad(clip(OTHER, labelWidth), labelWidth);
-        const hint = forDetail >= 8 ? clip("type an answer of your own", forDetail) : "";
-        return hint ? `${label}  ${hint}` : label.trimEnd();
-      })();
-    const filler = badge ? " ".repeat(Math.max(1, room - gutter - cols(body) - cols(badge))) : "";
-    const text = `  ${lead}${body}${filler}${badge}`;
-
-    const marks: DrawnMark[] = [
-      mark(LEFT, LEFT + byteLength(lead), custom ? "Question.Taken" : "Question.Box", 100),
-    ];
-    if (here) marks.unshift({ col: 0, opts: { lineHlGroup: "Question.Cursor" } });
-    const bodyAt = LEFT + byteLength(lead);
     if (custom) {
-      marks.push(mark(bodyAt, byteLength(text), "Question.Custom", 100));
-      // The caret sits at the end of what has been typed, which is the one place on this panel
-      // where a terminal cursor means "the keyboard goes here".
-      caret = rows.length;
-      caretCol = bodyAt + byteLength(body);
+      // Once you are writing, the row *is* the field: what is in it is your answer, it takes the
+      // whole width because a sentence is not a label, and it takes as many lines as the sentence
+      // takes. Clipped to the one row — which is what it did — an answer longer than the panel is
+      // wide became the first sixty characters and an ellipsis, and stayed that way however much
+      // more you typed: the caret stopped moving, the words went nowhere visible, and the only way
+      // to read back what you had written was to send it.
+      //
+      // The *end* is what is kept when there is more of it than [`FIELD_LINES`] can hold, because
+      // the end is where the caret is. A field that scrolled the other way would be one that shows
+      // you everything except the word you are typing.
+      const lines = wrapField(typed, Math.max(8, room - gutter - 2));
+      const shown = lines.slice(Math.max(0, lines.length - FIELD_LINES));
+      shown.forEach((line, n) => {
+        // The gutter is paid for on every line and drawn on the first, as the option rows do it:
+        // repeating the pen down the side would read as one answer per line.
+        const run = n === 0 ? lead : " ".repeat(gutter);
+        const text = `  ${run}${line}`;
+        const marks: DrawnMark[] = [{ col: 0, opts: { lineHlGroup: "Question.Cursor" } }];
+        if (n === 0) marks.push(mark(LEFT, LEFT + byteLength(lead), "Question.Taken", 100));
+        const bodyAt = LEFT + byteLength(run);
+        if (line !== "") marks.push(mark(bodyAt, byteLength(text), "Question.Custom", 100));
+        if (n === shown.length - 1) {
+          // The caret sits at the end of what has been typed, which is the one place on this panel
+          // where a terminal cursor means "the keyboard goes here".
+          caret = rows.length;
+          caretCol = bodyAt + byteLength(line);
+        }
+        rows.push({ text, marks });
+      });
     } else {
+      const label = pad(clip(OTHER, labelWidth), labelWidth);
+      const hint = forDetail >= 8 ? clip("type an answer of your own", forDetail) : "";
+      const body = hint ? `${label}  ${hint}` : label.trimEnd();
+      const filler = badge ? " ".repeat(Math.max(1, room - gutter - cols(body) - cols(badge))) : "";
+      const text = `  ${lead}${body}${filler}${badge}`;
+
+      const marks: DrawnMark[] = [mark(LEFT, LEFT + byteLength(lead), "Question.Box", 100)];
+      if (here) marks.unshift({ col: 0, opts: { lineHlGroup: "Question.Cursor" } });
+      const bodyAt = LEFT + byteLength(lead);
       marks.push(mark(bodyAt, bodyAt + byteLength(clip(OTHER, labelWidth)), "Question.Option", 100));
-      const hintAt = bodyAt + byteLength(pad(clip(OTHER, labelWidth), labelWidth)) + 2;
+      const hintAt = bodyAt + byteLength(label) + 2;
       if (byteLength(text) > hintAt) {
         marks.push(mark(hintAt, byteLength(text), "Question.Detail", 100));
       }
       if (here) caret = rows.length;
+      if (badge) {
+        marks.push(
+          mark(byteLength(text) - byteLength(badge), byteLength(text), "Question.Shortcut", 100),
+        );
+      }
+      rows.push({ text, marks });
     }
-    if (badge) {
-      marks.push(mark(byteLength(text) - byteLength(badge), byteLength(text), "Question.Shortcut", 100));
-    }
-    rows.push({ text, marks });
   }
 
   // --- the keys --------------------------------------------------------------
@@ -1089,6 +1142,43 @@ function wrapCols(text: string, width: number): string[] {
   }
   if (line) out.push(line);
   return out.length > 0 ? out : [""];
+}
+
+/**
+ * Break what is being *typed* onto lines of at most `width`.
+ *
+ * The third of these, and it exists because the other two rewrite what they wrap. [`wrap`] and
+ * [`wrapCols`] split on whitespace and join with single spaces, which is right for a label or a
+ * sentence that arrived finished and wrong for a field: the two spaces somebody typed would come
+ * back as one, a trailing space would vanish the moment it was typed and reappear with the next
+ * word, and the caret — which is placed at the end of the last line — would sit somewhere other
+ * than where the next character is going to land.
+ *
+ * So every character survives, and the space a line breaks at stays on the end of the line it broke
+ * from: the lines joined back together are exactly what was typed. Words are still kept whole where
+ * one fits, and one that does not is cut, because a word wider than the field has to go somewhere.
+ */
+function wrapField(text: string, width: number): string[] {
+  const limit = Math.max(1, width);
+  const out: string[] = [];
+  let rest = text;
+  while (cols(rest) > limit) {
+    const chars = [...rest];
+    // The last space that would still leave something before it — a break at the very front would
+    // push the whole line down and make no progress.
+    let at = -1;
+    for (let i = limit - 1; i > 0; i--) {
+      if (chars[i] === " ") {
+        at = i;
+        break;
+      }
+    }
+    const cut = at > 0 ? at + 1 : limit;
+    out.push(chars.slice(0, cut).join(""));
+    rest = chars.slice(cut).join("");
+  }
+  out.push(rest);
+  return out;
 }
 
 /**

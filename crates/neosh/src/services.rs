@@ -233,9 +233,21 @@ impl Services {
         Ok(ApiOk::Unit)
     }
 
-    pub async fn git_remove_worktree(&self, path: String, force: bool) -> ApiResult {
+    pub async fn git_pull(&self, cwd: Option<String>) -> ApiResult {
+        self.permit_write("pull")?;
+        let repo = self.repo_at(cwd).await?;
+        Ok(ApiOk::Text { text: repo.pull().await.map_err(vcs_err)? })
+    }
+
+    pub async fn git_remove_worktree(
+        &self,
+        path: String,
+        force: bool,
+        cwd: Option<String>,
+    ) -> ApiResult {
         self.permit_write("worktree remove")?;
-        self.repo()?.remove_worktree(&PathBuf::from(path), force).await.map_err(vcs_err)?;
+        let repo = self.repo_at(cwd).await?;
+        repo.remove_worktree(&PathBuf::from(path), force).await.map_err(vcs_err)?;
         Ok(ApiOk::Unit)
     }
 

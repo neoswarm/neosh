@@ -53,5 +53,6 @@ implementation — and in two cases (0005, 0008) it did not, which is itself rec
 | [0045](0045-a-card-that-lands-says-so.md) | A card that lands says so | Accepted |
 | [0046](0046-a-worktree-lives-inside-its-project.md) | A worktree lives inside its project | Accepted |
 | [0047](0047-a-panel-that-has-the-keyboard.md) | A panel that has the keyboard | Accepted |
-| [0048](0048-a-list-is-a-place-you-move-in.md) | A list is a place you move in | Accepted |
-| [0049](0049-a-card-is-attached-to-what-it-did.md) | A card is attached to what it did | Accepted |
+| [0048](0048-a-key-every-terminal-sends.md) | A default binding is a key every terminal sends | Accepted |
+| [0049](0049-a-list-is-a-place-you-move-in.md) | A list is a place you move in | Accepted |
+| [0050](0050-a-card-is-attached-to-what-it-did.md) | A card is attached to what it did | Accepted |

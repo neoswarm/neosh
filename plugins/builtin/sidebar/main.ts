@@ -21,7 +21,7 @@
  * resort rather than the first, and three things are here so that it usually is not necessary:
  *
  * - **Every key in this panel is an ordinary binding**, on the buffer kind `neosh.sidebar`, pointed
- *   at a command with a name. `F1` lists them, the palette runs them, and one line in your
+ *   at a command with a name. `^Z` lists them, the palette runs them, and one line in your
  *   `init.ts` moves any of them. There is no private switch statement any more — there was, and
  *   what it meant was that adding one key to this panel meant forking all twelve hundred lines of
  *   it.
@@ -143,7 +143,7 @@ interface SectionItem {
 interface ActionItem {
   /** Key notation, as `keymap.set` takes it: `d`, `<C-y>`, `gd`. */
   key: string;
-  /** What it does, for the hint strip and for `F1`. */
+  /** What it does, for the hint strip and for `^Z`. */
   label: string;
   command: string;
   /**
@@ -791,7 +791,7 @@ async function registerCommands(w: Wiring): Promise<void> {
    * Register one verb, and bind it inside this panel.
    *
    * Every key in this list goes through here, which is the point: there is no private key handler
-   * any more, so `F1` lists the panel's keys with the rest, `^K` runs them, and
+   * any more, so `^Z` lists the panel's keys with the rest, `^K` runs them, and
    * `keymap.set("chat", "d", "…", { scope: { kind: "buf_kind", name: "neosh.sidebar" } })` from
    * anybody's `init.ts` replaces one. The scope is the buffer kind rather than the window, because
    * the window is opened and closed as you toggle the panel and a binding on it would go with it.
@@ -892,7 +892,7 @@ async function registerCommands(w: Wiring): Promise<void> {
   /**
    * A digit, before a motion.
    *
-   * One command for all ten, reading which digit it was off the key that ran it — so `F1` lists it
+   * One command for all ten, reading which digit it was off the key that ran it — so `^Z` lists it
    * once and `init.ts` can move it, rather than ten near-identical verbs. A leading `0` is not a
    * count anywhere and is left to whatever else might want the key.
    */
@@ -976,6 +976,15 @@ async function registerCommands(w: Wiring): Promise<void> {
     if (target?.kind !== "session") return;
     await renameSession(neosh, target.id);
   });
+  // The panel's own copy verb, same letter the transcript uses. What a row is *at* is the thing
+  // you paste into a terminal, an editor or a message, and retyping a generated worktree path is
+  // the kind of chore this panel exists to remove.
+  await verb(`${NS}.copy.path`, "y", "Copy this row's directory", async (target) => {
+    const cwd = owningProject(target);
+    if (cwd === null) return;
+    await neosh.edit.copy(cwd);
+    neosh.notify(`copied ${cwd}`);
+  }, { redraw: false });
   // The everyday verb, and it is reversible. Archiving takes a conversation out of the list without
   // taking anything away, which is what people were reaching for `x` to do before `x` deleted
   // things. Where it goes is `a`, not four dim rows at the foot of this panel.
@@ -1060,6 +1069,19 @@ async function registerCommands(w: Wiring): Promise<void> {
       await neosh.session.create();
     }, { desc: "Start a new conversation in this project, without asking where" }),
   );
+  w.subscriptions.push(
+    await neosh.cmd.register("session.copy.path", async () => {
+      // The conversation's directory — which in a worktree is the worktree, and that is the point:
+      // the path you want on the clipboard is the one your shell should cd to.
+      const current = await neosh.session.current().catch(() => null);
+      if (!current) return;
+      await neosh.edit.copy(current.cwd);
+      neosh.notify(`copied ${current.cwd}`);
+    }, { desc: "Copy this conversation's directory to the clipboard" }),
+  );
+  await neosh.keymap.set("chat", "<A-y>", "session.copy.path", {
+    desc: "Copy this conversation's directory",
+  });
   w.subscriptions.push(
     await neosh.cmd.register("session.close", async (args) => {
       // Through the same gate as the key, so the palette cannot become a way around the question.
@@ -1173,7 +1195,7 @@ async function registerCommands(w: Wiring): Promise<void> {
  * conversation. Going through here, the command is invoked with the row as arguments and the
  * contributor never has to know the panel has a cursor at all.
  *
- * They are real bindings all the same. `F1` lists them with the contributed label, `^K` runs the
+ * They are real bindings all the same. `^Z` lists them with the contributed label, `^K` runs the
  * command, and a user who dislikes the key rebinds it exactly as they would one of ours.
  */
 function installActions(
@@ -1249,7 +1271,7 @@ function installActions(
 
 /** The keys this panel has already spoken for. A contribution asking for one of these is a bug in it. */
 const RESERVED = new Set([
-  "j", "k", "q", "f", "J", "K", "r", "x", "X", "n", "a", "o", "?", " ",
+  "j", "k", "q", "f", "J", "K", "r", "x", "X", "n", "a", "o", "y", "?", " ",
   "<Esc>", "<CR>", "<Up>", "<Down>", "<Space>", "<C-n>", "<C-p>", "<C-c>",
 ]);
 
@@ -1300,10 +1322,11 @@ async function newConversation(neosh: Neosh, base?: string): Promise<void> {
   // nowhere. Offering an action that cannot happen is worse than not offering it.
   const commands = new Set((await neosh.cmd.list().catch(() => [])).map((c) => c.name));
   const canBranch = trees.length > 0 && commands.has("git.worktree.new.auto");
+  const canInside = trees.length > 0 && commands.has("git.worktree.new.inside");
   const canName = trees.length > 0 && commands.has("git.worktree.new");
   const others = trees.filter((t) => t.path !== here);
 
-  if (!canBranch && !canName && others.length === 0) {
+  if (!canBranch && !canInside && !canName && others.length === 0) {
     await neosh.session.create(here ? { cwd: here } : undefined);
     return;
   }
@@ -1311,6 +1334,7 @@ async function newConversation(neosh: Neosh, base?: string): Promise<void> {
   type Where =
     | { kind: "here" }
     | { kind: "scratch" }
+    | { kind: "inside" }
     | { kind: "new" }
     | { kind: "elsewhere" }
     | { kind: "tree"; path: string; label: string }
@@ -1336,6 +1360,24 @@ async function newConversation(neosh: Neosh, base?: string): Promise<void> {
       icon: "+",
       hl: "Diagnostic.Ok",
       value: { kind: "scratch" },
+    });
+  }
+  if (canInside) {
+    // Where it will land, said in the row: a choice between two places is only a choice if both
+    // rows name theirs. A relative `worktree.root` renames this directory, so it is read rather
+    // than assumed.
+    const configured = ((await neosh.opt.get<string>("worktree.root").catch(() => "")) ?? "")
+      .trim();
+    const dir = configured !== "" && !configured.startsWith("/")
+      ? configured.replace(/\/+$/, "")
+      : ".worktrees";
+    rows.push({
+      label: "In a new worktree, in this project",
+      detail: `kept in ${dir}/ — travels with the repository`,
+      keywords: "branch worktree inside project local",
+      icon: "⌂",
+      hl: "Accent",
+      value: { kind: "inside" },
     });
   }
   if (canName) {
@@ -1402,6 +1444,10 @@ async function newConversation(neosh: Neosh, base?: string): Promise<void> {
       return;
     case "scratch":
       await neosh.cmd.exec("git.worktree.new.auto", at)
+        .catch((e: unknown) => neosh.notify(String(e), "warn"));
+      return;
+    case "inside":
+      await neosh.cmd.exec("git.worktree.new.inside", at)
         .catch((e: unknown) => neosh.notify(String(e), "warn"));
       return;
     case "new":
@@ -2050,7 +2096,7 @@ async function openRemote(
 /**
  * The keys inside a remote view.
  *
- * Registered once and bound at buffer-kind scope, so `F1` lists them and `init.ts` can move them —
+ * Registered once and bound at buffer-kind scope, so `^Z` lists them and `init.ts` can move them —
  * the same deal every other panel key gets. Registered lazily rather than at activation because
  * most workspaces never open one.
  */
@@ -2679,14 +2725,32 @@ function worktreeRow(
   const mark = unseen === 0 ? "" : unseen === 1
     ? opts.ascii ? " !" : " ●"
     : opts.ascii ? ` !${unseen}` : ` ●${unseen}`;
-  const name = clip(p.name, Math.max(6, opts.width - 9 - byteLength(mark)));
-  const from = byteLength(`    ${arrow} ${name}`);
+  // The branch glyph, in the branch colour — what says "this row is a checkout" at a glance, so
+  // the name can be just the branch. No ASCII stand-in earns its column, so ASCII goes without.
+  const glyph = opts.ascii ? "" : "⎇ ";
+  const pad = "    ";
+  const name = clip(
+    p.name,
+    Math.max(6, opts.width - 9 - byteLength(glyph) - byteLength(mark)),
+  );
+  const spans: Array<{ from: number; to: number; hl: string }> = [];
+  if (glyph !== "") {
+    const at = byteLength(`${pad}${arrow} `);
+    spans.push({ from: at, to: at + byteLength(glyph), hl: "Git.Branch" });
+  }
+  if (mark !== "") {
+    const at = byteLength(`${pad}${arrow} ${glyph}${name}`);
+    spans.push({ from: at, to: at + byteLength(mark), hl: "Status.Unread" });
+  }
   return {
-    text: `    ${arrow} ${name}${mark}`,
-    full: `    ${arrow} ${p.name}`,
-    indent: 6,
+    text: `${pad}${arrow} ${glyph}${name}${mark}`,
+    // A branch name is as long as somebody made it, and this row is two columns narrower than a
+    // project's. The unread mark is left off the unfolded form: it survived the clip and is
+    // already on the row.
+    full: `${pad}${arrow} ${glyph}${p.name}`,
+    indent: byteLength(`${pad}${arrow} `),
     hl: here ? "Directory" : "Sidebar.Dim",
-    spans: mark === "" ? undefined : [{ from, to: from + byteLength(mark), hl: "Status.Unread" }],
+    spans: spans.length > 0 ? spans : undefined,
     right,
     value: { kind: "project", cwd: p.cwd },
   };
@@ -2838,15 +2902,15 @@ function hints(opts: DrawOptions): ListRow<Target>[] {
   const lines = !opts.focused
     // `^O` is not here and `+ Add project` is a row you can see: a key strip has two lines, and the
     // verb with a row of its own is the one that can afford to give up its place on them.
-    ? ["^T projects  ^N new   ^F archive", "^K palette   ^B hide  F1 keys"]
+    ? ["^T projects  ^N new   ^F archive", "^K palette   ^B hide  ^Z keys"]
     : kind === "custom"
       ? ["↵ open it     <> width", "esc back      ? keys"]
     : kind === "project"
       // `X` is on the strip because a list you cannot shorten is a list that grows forever, and a
       // project that outlives its conversations — which is the point of it — has to have a way off.
-      ? ["↵ fold   f ★       JK move", "n new    X remove   ? keys"]
+      ? ["↵ fold   f ★       JK move", "n new    y path     X remove  ? keys"]
       : kind === "session"
-        ? ["↵ open   r rename   x archive", "X delete a archive   ? keys"]
+        ? ["↵ open   r rename   x archive", "X delete y path     a archive  ? keys"]
         : kind === "browse"
           ? ["↵ what you have put away", "? keys"]
           : ["↵ add project    a archive", "esc back         ? keys"];

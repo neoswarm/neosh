@@ -152,7 +152,7 @@ async function show(neosh: Neosh, query: () => string, done: () => void): Promis
     // the catalogue — and a menu that eats a third of the transcript to say so is one you close
     // before reading.
     height: 8,
-    hints: "↵ run   ↑/↓ move   type to filter   esc keep typing",
+    hints: "↵ run   ^P/^N move   type to filter   esc keep typing",
   });
   done();
 
