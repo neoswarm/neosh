@@ -341,12 +341,13 @@ async function apply(
 /**
  * The keys, as words.
  *
- * `←→` first, because it is the key that *does* the thing and it used to be third — behind `↵`,
- * which closes. Read in order, the old line taught you that the way to use this panel was to
- * dismiss it.
+ * The key that *changes something* first: it used to be third, behind `↵`, which closes. Read in
+ * order, the old line taught you that the way to use this panel was to dismiss it.
  */
 function hintsFor(): string {
-  return "←→ change   ↑↓ knob   ⇥ cycle   ↵ done   esc close";
+  // Letters rather than arrows, and not because the arrows do not work — they are bound too. The
+  // row is a promise about a keyboard, and `h j k l` is a promise every keyboard keeps.
+  return "h l change   j k knob   ⇥ cycle   ↵ done   esc close";
 }
 
 export async function installOptions(
