@@ -20,10 +20,12 @@
 //! than pretending the two kinds are interchangeable.
 
 pub mod approval;
+pub mod ask;
 pub mod catalog;
 pub mod credentials;
 pub mod drivers;
 pub mod image;
+pub mod quota;
 pub mod registry;
 pub mod sse;
 
@@ -50,6 +52,13 @@ pub enum ProviderError {
     Unsupported(String),
     #[error("bad response: {0}")]
     BadResponse(String),
+    /// The endpoint said to ask less often.
+    ///
+    /// Its own variant rather than a `BadResponse` carrying a number, because the only useful
+    /// response to it is different in kind: everything else is worth retrying at the usual cadence,
+    /// and this is the one where the usual cadence is the problem.
+    #[error("rate limited")]
+    RateLimited,
 }
 
 #[async_trait::async_trait]

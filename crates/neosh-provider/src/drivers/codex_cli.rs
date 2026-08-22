@@ -350,6 +350,23 @@ pub fn app_server_event(v: &Value, state: &mut CodexState) -> Vec<ProviderEvent>
             }
             out
         }
+        // What the plan has left, pushed unprompted whenever it changes. Whole, unlike `claude`'s
+        // single-window line — every limit this account has, every time — so the store may replace
+        // rather than patch on it.
+        "account/rateLimits/updated" => {
+            let q = crate::quota::parse_codex_rate_limits(
+                p.get("rateLimits").filter(|r| !r.is_null()).unwrap_or(p),
+            );
+            if q.is_empty() {
+                Vec::new()
+            } else {
+                vec![activity(Activity::Quota {
+                    plan: q.plan,
+                    windows: q.windows,
+                    credits: q.credits,
+                })]
+            }
+        }
         // No token counts on this one, unlike `claude`'s boundary. Saying it happened is still worth
         // a row: the conversation the agent is holding was just replaced by a summary of itself.
         "context/compacted" => vec![activity(Activity::Compacted { before: None, after: None })],

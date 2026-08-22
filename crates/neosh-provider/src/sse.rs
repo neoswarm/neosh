@@ -211,6 +211,29 @@ pub fn claude_cli_line(v: &Value, state: &mut ClaudeState) -> Vec<ProviderEvent>
             out
         }
         "system" => system_line(v, state),
+        // What the plan has left. Not a content block and never one: it is the CLI's account of
+        // the circumstances it is running under, which is exactly what `Activity` is for. It is
+        // also the only figure of its kind that moves *during* a turn — and an agent driver's turn
+        // can be twenty minutes long, which is plenty of time to cross a threshold.
+        //
+        // One window, the one closest to binding. The store patches rather than replaces on this,
+        // because a line saying the weekly limit is at 91% says nothing at all about the session
+        // limit, and treating it as a whole snapshot would erase every other row.
+        "rate_limit_event" => {
+            let info = v.get("rate_limit_info").unwrap_or(&Value::Null);
+            let q = crate::quota::parse_claude_rate_limit_event(info);
+            if q.is_empty() {
+                Vec::new()
+            } else {
+                vec![ProviderEvent::Activity {
+                    activity: Activity::Quota {
+                        plan: q.plan,
+                        windows: q.windows,
+                        credits: q.credits,
+                    },
+                }]
+            }
+        }
         // A `result` with is_error signals the CLI itself failed (auth, spawn, quota).
         "result" if v.get("is_error").and_then(Value::as_bool) == Some(true) => {
             state.said = false;
