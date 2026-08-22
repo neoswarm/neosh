@@ -47,3 +47,7 @@ implementation — and in two cases (0005, 0008) it did not, which is itself rec
 | [0039](0039-the-archive-is-a-place-you-go.md) | The archive is a place you go, and the question is worth asking | Accepted |
 | [0040](0040-a-panel-is-a-surface-not-a-program.md) | A panel is a surface, not a program | Accepted |
 | [0041](0041-an-agent-belongs-to-its-machine.md) | An agent belongs to its machine, and the swarm is a view of it | Accepted |
+| [0042](0042-however-many-terminals-you-open.md) | However many terminals you open, you see everything | Accepted |
+| [0043](0043-a-question-is-not-a-permission.md) | A question is not a permission | Accepted |
+| [0044](0044-what-the-plan-has-left.md) | What the plan has left is not a number you can count | Accepted |
+| [0045](0045-a-card-that-lands-says-so.md) | A card that lands says so | Accepted |

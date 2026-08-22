@@ -561,6 +561,77 @@ Plugins own the strip's contents:
 await neosh.status.set("model", { text: "opus", keys: "^P", align: "right", priority: 10 });
 ```
 
+### What the plan has left — `^L`
+
+```
+ PLAN
+─────────────────────────────────
+   ██████░░  75% Session      27m
+   ████████  96% Weekly        8h
+   ████████ 100% Weekly ·…     8h
+   extra usage off
+```
+
+At the foot of the sidebar, because unlike the context meter it is not about the conversation you
+are in — it is the same number whichever one you open, and it is the thing you want to have seen
+*before* starting something long. A rolling allowance is what actually stops work, and hearing about
+it for the first time as a refusal twenty minutes into a turn is hearing about it too late.
+
+It cannot be counted, only reported. A percentage of a subscription's allowance is not a function of
+anything on this machine — a turn you ran in `claude` directly spent it too — so neosh keeps
+whatever the vendor last said and draws how old that is. `claude` reports it on a line in the middle
+of a turn; `codex` pushes it when it moves.
+
+One row per window, never collapsed to the worst of them: a session limit that is nearly full comes
+back in an hour and a weekly one does not, and that difference is the whole of what you would do
+differently. The `▸` marks the one that binds — vendors run several at once and only one of them is
+the reason a request would be refused — and the colour is the **vendor's** grade of its own limit,
+not a threshold neosh picked.
+
+`^L` opens the panel behind it: the same gauges full width with a sparkline of how each has moved,
+and under them where the time actually went — tokens and their money-equivalent by day or hour, per
+model, read from the agents' own transcripts rather than from neosh's conversations, so a turn you
+ran outside neosh is in it.
+
+| Key | Does |
+|---|---|
+| `1` `7` `3` `9` | A day, a week, a month, a quarter |
+| `[` `]` | One step shorter or longer |
+| `⇥`, `t` `c` | Tokens or what they would have cost |
+| `r` | Ask the provider again, now |
+| `j` `k` | Move |
+| `q`, `Esc` | Close |
+
+The cost is API-equivalent, not money spent: a subscription bills separately and a plan turn costs
+nothing extra at all. It is there because it is the only common unit that puts Opus and Haiku on one
+axis. A model with no published rate still appears — its tokens count and its cost does not, marked
+`*` — because dropping it would make the busiest week look like the quietest.
+
+The two numbers never share an axis. An opaque percentage and a token count do not convert into each
+other, and a chart that drew them together would be inventing an exchange rate.
+
+```toml
+[options]
+"usage.sidebar"  = true   # the strip at the foot of the sidebar
+"usage.warn_at"  = 90     # say something the first time a limit passes this. 0 to never
+"usage.days"     = 30     # the span the panel opens on
+"usage.poll"     = true   # ask while nothing is running — see below
+"usage.show_tokens" = true  # the running token total, beside the context meter
+```
+
+`usage.poll` is the one worth a sentence. Nothing reports an allowance while nothing is running, and
+at rest is exactly when the question gets asked — so neosh asks. `codex` has a request for it that
+costs nothing. Anthropic has no such door: the only credential on the machine that can ask is the
+`claude` CLI's own login, and neosh reads it. That is the same trade the `claude-cli` driver already
+makes, and the rules do not bend for it — the token is read at request time, never written anywhere,
+never logged, and structurally absent from every event a plugin can see. What crosses that boundary
+is percentages. Turn it off and the gauges show what the last turn reported, saying how long ago
+that was.
+
+Everything here is ordinary API. The strip is a `sidebar.section` contribution, the panel is a
+buffer with a `kind`, every key is a named command, and `neosh.quota.report()` lets a provider you
+wrote publish its own vendor's allowance into the same strip.
+
 ### The row under the composer
 
 Under the field you type into is a row of shortcuts: `⏎ send`, `^P model`, `^T conversations`, and
@@ -656,7 +727,7 @@ A conversation that is working says so wherever it appears. In the panel it carr
 its turn has been running; the one you are in gets the spinner:
 
 ```
- ♥ ▾ neosh                        3
+ ★ ▾ neosh                        3
      ▸ the flaky test in ci     1m 4s
        ◍ rename the extmark api    22s
        a question from yesterday   3h
