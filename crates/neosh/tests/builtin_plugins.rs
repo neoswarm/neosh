@@ -1650,7 +1650,7 @@ fn a_favourite_sorts_above_a_project_that_was_used_more_recently() {
     assert!(
         s.pump(|s| {
             let p = s.sidebar_now();
-            let w = p.iter().position(|l| l.contains(HEART) && l.contains("work"));
+            let w = p.iter().position(|l| l.contains(STAR) && l.contains("work"));
             let e = p.iter().position(|l| l.contains("elsewhere"));
             matches!((w, e), (Some(w), Some(e)) if w < e)
         }),
@@ -4935,4 +4935,261 @@ impl Session {
             .position(|row| row.iter().any(|g| g == "Sidebar.Selected"))
             .and_then(|i| text.get(i).cloned())
     }
+}
+
+/* -------------------------------------------------------------------------- */
+/* What the plan has left — ADR 0044                                          */
+/* -------------------------------------------------------------------------- */
+
+/// A provider written as a plugin, reporting its own vendor's allowance two ways.
+///
+/// Both paths at once because they are the two halves of the rule: the mid-turn `Activity::Quota`
+/// carries one window and must *patch*, and `quota.report` is complete and must *replace*. A
+/// fixture that only exercised one of them would pass with the other wired backwards.
+const PLANNER: &str = r#"
+import type { PluginContext } from "@neosh/api";
+const nap = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+const win = (id: string, label: string, pct: number, active = false) => ({
+  id, label, used_percent: pct, severity: pct >= 90 ? "critical" : "normal",
+  active, resets_at: null, window_minutes: null, scope: null,
+});
+
+export async function activate({ neosh }: PluginContext) {
+  await neosh.provider.register("planner", [{
+    id: "planner", driver: "planner", display_name: "Planner",
+    models: [{ id: "planner-1", display_name: "Planner One", context_window: 300000 }],
+  }], async (_req, emit) => {
+    emit({ type: "message_start", model: "planner-1", usage: {} });
+    // One window, mid-turn, before a word of the answer. Everything else must survive it.
+    emit({ type: "activity", activity: {
+      kind: "quota", windows: [win("weekly", "Weekly", 93, true)],
+    } });
+    await nap(600);
+    emit({ type: "block_start", index: 0, block: { kind: "text" } });
+    emit({ type: "text_delta", index: 0, text: "ok" });
+    emit({ type: "block_stop", index: 0 });
+    emit({ type: "message_delta", stop_reason: { kind: "end_turn" }, usage: {} });
+    emit({ type: "message_stop" });
+  }, { agentLoop: true });
+
+  // The complete picture, published the way a plugin provider does it.
+  await neosh.cmd.register("planner.publish", async () => {
+    await neosh.quota.report({
+      instance: "planner",
+      plan: "flightplan",
+      windows: [win("session", "Session", 12, true), win("weekly", "Weekly", 40)],
+      credits: null,
+      observed_at: Math.floor(Date.now() / 1000),
+      source: "plugin",
+    });
+    neosh.notify("published");
+  });
+
+  neosh.notify("planner ready");
+}
+"#;
+
+fn install_planner(sb: &Sandbox) {
+    let dir = sb.root.join("config/plugins/planner");
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    std::fs::write(
+        dir.join("plugin.toml"),
+        "name = \"planner\"\nversion = \"0.1.0\"\nentry = \"main.ts\"\npermissions = [\"providers\"]\n",
+    )
+    .expect("manifest");
+    std::fs::write(dir.join("main.ts"), PLANNER).expect("plugin");
+}
+
+/// A provider written as a plugin gets its plan drawn like anybody's.
+///
+/// The whole test of the extensibility claim for this feature: nothing in the sidebar has heard of
+/// `planner`, and the strip draws its windows anyway — because it listens for the event rather than
+/// knowing which vendors exist.
+#[test]
+fn a_plugins_own_provider_appears_in_the_plan_strip() {
+    let sb = Sandbox::new("planstrip");
+    install_planner(&sb);
+    sb.write_config("[options]\n\"agent.model\" = \"planner/planner-1\"\n");
+    let mut s = sb.start_letting_config_choose();
+    s.wait_for("planner ready");
+
+    s.send(&command("planner.publish"));
+    s.wait_for("published");
+
+    assert!(
+        s.pump(|s| s.sidebar_now().iter().any(|l| l.contains("PLAN"))),
+        "the strip is a section like any other\n{:?}",
+        s.sidebar_now()
+    );
+    let strip = s.sidebar_now().join("\n");
+    assert!(strip.contains("Session"), "both windows, not just the worst:\n{strip}");
+    assert!(strip.contains("Weekly"), "both windows, not just the worst:\n{strip}");
+    assert!(strip.contains("12%"), "the vendor's own figures:\n{strip}");
+    assert!(strip.contains("40%"), "the vendor's own figures:\n{strip}");
+
+    // And it is on disk, because a percentage is only ever reported: a workspace that forgot the
+    // last one opens with empty gauges and stays that way until something reports again — which on
+    // a machine that is offline, signed out, or being told to ask less often is indefinitely.
+    let saved = sb.root.join("state/quota.json");
+    assert!(saved.is_file(), "the snapshot is kept, not only forwarded");
+    let body = std::fs::read_to_string(&saved).expect("readable");
+    assert!(body.contains("flightplan"), "with the plan it belongs to:\n{body}");
+    assert!(
+        std::fs::read_to_string(sb.root.join("state/quota.jsonl"))
+            .is_ok_and(|h| h.contains("session")),
+        "and the samples beside it, so a gauge can be a line"
+    );
+}
+
+/// A mid-turn report patches; it does not replace.
+///
+/// `claude`'s `rate_limit_event` carries exactly one window and says nothing at all about the
+/// others. Treated as a snapshot it deletes every other row — so the session limit vanishes from
+/// the strip the first time the weekly one moves, which is precisely when somebody is watching it.
+#[test]
+fn a_mid_turn_report_does_not_erase_the_other_windows() {
+    let sb = Sandbox::new("planpatch");
+    install_planner(&sb);
+    sb.write_config("[options]\n\"agent.model\" = \"planner/planner-1\"\n");
+    let mut s = sb.start_letting_config_choose();
+    s.wait_for("planner ready");
+
+    s.send(&command("planner.publish"));
+    s.wait_for("published");
+    assert!(s.pump(|s| s.sidebar_now().join("\n").contains("40%")), "the published weekly");
+
+    // The turn reports the weekly window alone, at a different figure.
+    s.type_text("go");
+    s.enter();
+    assert!(
+        s.pump(|s| s.sidebar_now().join("\n").contains("93%")),
+        "the driver's mid-turn figure lands\n{:?}",
+        s.sidebar_now()
+    );
+
+    let strip = s.sidebar_now().join("\n");
+    assert!(
+        strip.contains("Session") && strip.contains("12%"),
+        "and the window it said nothing about is still there:\n{strip}"
+    );
+    assert!(!strip.contains("40%"), "with the stale weekly figure replaced:\n{strip}");
+}
+
+/// The panel opens on its own key, with both halves in it.
+///
+/// Two blocks and never one axis: an opaque percentage and a token count do not convert into each
+/// other, and the panel that drew them together would be inventing an exchange rate.
+#[test]
+fn the_usage_panel_opens_with_the_plan_above_the_history() {
+    let sb = Sandbox::new("planpanel");
+    install_planner(&sb);
+    sb.write_config("[options]\n\"agent.model\" = \"planner/planner-1\"\n");
+    let mut s = sb.start_letting_config_choose();
+    s.wait_for("planner ready");
+    s.send(&command("planner.publish"));
+    s.wait_for("published");
+
+    s.ctrl("l");
+    assert!(
+        s.pump(|s| s.buffer_named("[usage]").is_some()),
+        "^L opens a buffer of its own\n{}",
+        s.transcript()
+    );
+    let buf = s.buffer_named("[usage]").expect("the panel buffer");
+    // Pumped on the *plan name*, not on the heading. The heading is drawn immediately, with
+    // "nothing has reported an allowance yet" under it, while the transcript scan runs — so a test
+    // that stopped at the heading would be reading the panel mid-load and asserting on the
+    // placeholder.
+    assert!(
+        s.pump(|s| s.lines_of(buf).iter().any(|l| l.contains("flightplan"))),
+        "the plan's own name, where the vendor gives one\n{:?}",
+        s.lines_of(buf)
+    );
+    let text = s.lines_of(buf).join("\n");
+    assert!(text.contains("YOUR PLAN"), "the gauges are the first thing in it:\n{text}");
+    assert!(text.contains("Session") && text.contains("Weekly"), "every window:\n{text}");
+    assert!(
+        text.contains("THE LAST"),
+        "and the history under it, as a separate block:\n{text}"
+    );
+}
+
+/// The panel's keys are the panel's keys, bound to named commands.
+///
+/// `t` and `c` are ordinary letters. Bound at buffer-kind scope they only fire here — and because
+/// they point at named commands rather than at a `switch` inside a handler, `F1` lists them and an
+/// `init.ts` can move them. See ADR 0040.
+#[test]
+fn the_usage_panel_swaps_metric_on_its_own_key() {
+    let sb = Sandbox::new("planmetric");
+    install_planner(&sb);
+    sb.write_config("[options]\n\"agent.model\" = \"planner/planner-1\"\n");
+    let mut s = sb.start_letting_config_choose();
+    s.wait_for("planner ready");
+
+    s.ctrl("l");
+    assert!(s.pump(|s| s.buffer_named("[usage]").is_some()), "the panel opens");
+    let buf = s.buffer_named("[usage]").expect("the panel buffer");
+    // Asserted on the breakdown's own figures, not on the heading: the metric is drawn there as
+    // right-aligned virtual text, which is a mark rather than buffer text and so is not something
+    // this harness can read back. The `$` is what a reader is actually looking at.
+    assert!(
+        s.pump(|s| s.lines_of(buf).iter().any(|l| l.contains("calls") && l.contains('$'))),
+        "it opens on cost\n{:?}",
+        s.lines_of(buf)
+    );
+
+    s.key("t");
+    assert!(
+        s.pump(|s| s.lines_of(buf).iter().any(|l| l.contains("calls") && !l.contains('$'))),
+        "`t` is tokens\n{:?}",
+        s.lines_of(buf)
+    );
+    s.key("c");
+    assert!(
+        s.pump(|s| s.lines_of(buf).iter().any(|l| l.contains("calls") && l.contains('$'))),
+        "`c` is back to cost\n{:?}",
+        s.lines_of(buf)
+    );
+}
+
+/// A plugin may only publish for a driver it registered.
+///
+/// The strip is a thing people look at before deciding whether to spend an afternoon on something.
+/// A figure any plugin could put under `claude-cli` is not one to draw as fact.
+#[test]
+fn a_plugin_cannot_publish_a_quota_for_somebody_elses_provider() {
+    const LIAR: &str = r#"
+import type { PluginContext } from "@neosh/api";
+export async function activate({ neosh }: PluginContext) {
+  await neosh.cmd.register("liar.try", async () => {
+    try {
+      await neosh.quota.report({
+        instance: "claude-cli", plan: "free", windows: [], credits: null,
+        observed_at: 1, source: "plugin",
+      });
+      neosh.notify("liar accepted");
+    } catch (e) {
+      neosh.notify(`liar refused: ${e}`);
+    }
+  });
+  neosh.notify("liar ready");
+}
+"#;
+    let sb = Sandbox::new("planliar");
+    let dir = sb.root.join("config/plugins/liar");
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    std::fs::write(
+        dir.join("plugin.toml"),
+        "name = \"liar\"\nversion = \"0.1.0\"\nentry = \"main.ts\"\n",
+    )
+    .expect("manifest");
+    std::fs::write(dir.join("main.ts"), LIAR).expect("plugin");
+
+    let mut s = sb.start();
+    s.wait_for("liar ready");
+    s.send(&command("liar.try"));
+    assert!(s.pump(|s| s.saw("liar refused")), "refused, by name\n{}", s.transcript());
+    assert!(!s.saw("liar accepted"), "and not accepted\n{}", s.transcript());
 }

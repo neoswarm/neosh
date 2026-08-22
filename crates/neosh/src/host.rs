@@ -259,6 +259,12 @@ pub struct Host {
     /// Cleared by the key that follows, whatever it is, so a mistyped second key ends the sequence
     /// instead of leaving the next unrelated press to be swallowed by it.
     reading_pending: Option<char>,
+    /// Whether the running selection takes whole lines — `V` rather than `v`.
+    ///
+    /// A flag rather than a second kind of selection, because there is one selection model here and
+    /// it is a pair of positions. "The whole line" is therefore something to re-establish after
+    /// every motion, in whichever direction the selection now runs. See [`Host::resnap_linewise`].
+    reading_linewise: bool,
     /// The search being typed in the transcript, if one is.
     search: Option<SearchPrompt>,
     /// The last thing searched for, so `n` still works after the prompt has closed.
@@ -698,6 +704,7 @@ impl Host {
             keys_touched: false,
             reading: false,
             reading_pending: None,
+            reading_linewise: false,
             search: None,
             searched: String::new(),
             search_ns,
@@ -2572,9 +2579,12 @@ impl Host {
             Some('g') => vec![("g", "top")],
             Some('z') => vec![("z", "centre"), ("t", "top"), ("b", "bottom"), ("a", "card")],
             Some(_) => vec![],
-            None if self.chat_anchored() => {
-                vec![("y", "copy"), ("v", "drop"), ("hjkl", "extend"), ("esc", "leave")]
-            }
+            None if self.chat_anchored() => vec![
+                ("y", "copy"),
+                ("hjkl", "extend"),
+                if self.reading_linewise { ("v", "characters") } else { ("V", "whole lines") },
+                ("esc", "drop"),
+            ],
             None => vec![
                 ("y", "copy"),
                 ("v", "select"),
@@ -2749,9 +2759,16 @@ impl Host {
         let mut line = String::from("  ");
         let mut spans = Vec::new();
         for (i, (key, label)) in keys.iter().enumerate() {
-            if i > 0 {
-                line.push_str("   ");
+            let sep = if i > 0 { "   " } else { "" };
+            // As many as fit, in the order they are worth knowing. A row of hints that wraps is
+            // two rows of hints, the second of which starts mid-phrase — and the whole point of
+            // this line is to be readable at a glance. `^S` is second because it is the one most
+            // people never find; the ones that get dropped first are the ones `F1` also names.
+            let would = sep.len() + key.chars().count() + 1 + label.chars().count();
+            if i > 0 && line.chars().count() + would > width {
+                break;
             }
+            line.push_str(sep);
             let from = line.len();
             line.push_str(key);
             spans.push((from, line.len(), "Key"));
@@ -3326,6 +3343,7 @@ impl Host {
         }
         self.reading = true;
         self.reading_pending = None;
+        self.reading_linewise = false;
         // And the keymap has to be told, or the sentence above is only true of the keys nobody
         // else wanted. Reading's keys arrive through [`Self::handle_unbound_key`], which is the
         // *last* thing consulted — so `^D` scrolled half a screen only until the git plugin bound
@@ -3357,6 +3375,7 @@ impl Host {
         }
         self.reading = false;
         self.reading_pending = None;
+        self.reading_linewise = false;
         self.editor.set_mode(self.mode_before_reading);
         self.clear_matches();
         let plugin = PluginId::from(BUILTIN);
@@ -3415,7 +3434,12 @@ impl Host {
             self.reading_pair(first, &key, ch);
             return;
         }
-        if matches!(ch, "y" | "g" | "z") && !self.chat_anchored() {
+        // `y` is the only one of the three that is two keys in one: an operator when nothing is
+        // selected, and "copy this" when something is. `g` and `z` mean the same thing either way,
+        // and gating them alongside it made both dead — `v` then `gg` could not extend to the top
+        // of the transcript, and `zz` could not recentre a selection you were in the middle of
+        // making, with no message either way to say why.
+        if matches!(ch, "g" | "z") || (ch == "y" && !self.chat_anchored()) {
             self.reading_pending = ch.chars().next();
             self.refresh_composer();
             return;
@@ -3439,6 +3463,7 @@ impl Host {
                 motion,
                 select,
             });
+            self.resnap_linewise();
             self.follow_cursor();
             // The hint row says what the row under the cursor can do, so it moves with it.
             self.refresh_composer();
@@ -3455,17 +3480,8 @@ impl Host {
             (_, "}") => self.reading_to_block(1, select),
             (_, "{") => self.reading_to_block(-1, select),
 
-            (_, "v") => {
-                let on = !self.chat_anchored();
-                let _ = self.editor.apply(&PluginId::from(BUILTIN), ApiCall::WinSelect {
-                    win: self.chat_win,
-                    on,
-                });
-                self.refresh_composer();
-            }
-            // Not a linewise mode — there is no such thing here — but the thing people press `V`
-            // for, which is "this whole line, and then let me extend it".
-            (_, "V") => self.select_line(),
+            (_, "v") => self.select_as(false),
+            (_, "V") => self.select_as(true),
 
             // A folded card opens; an open one folds. `Tab` because it is the key that toggles a
             // fold in every file tree and outliner; `za` for the Vim hands. See ADR 0033.
@@ -3480,13 +3496,31 @@ impl Host {
             // take something, and staying would mean pressing Esc every single time. Without one,
             // `y` has already been held as a pending operator above.
             (_, "y") if self.copy_selection(false) => self.leave_reading(),
+            // Anchored, but with the two ends in the same place: `v` and then `y` straight away.
+            // Unanchored, `y` never reaches here — it was held as a pending operator above — so
+            // this is only ever the empty selection, and silence there reads as a broken key.
+            (_, "y") => {
+                self.editor_message(MessageLevel::Warn, "nothing to copy — the selection is empty")
+            }
             (_, "Y") => self.yank_line(),
 
             // Back to typing, at the key every editor uses for it, because the usual reason to
             // stop reading is that you have thought of what to say.
             (KeyCode::Enter, _) | (_, "i") | (_, "a") | (_, "o") => self.leave_reading(),
-            // Esc gives up the search highlight first and the mode second: one press per thing you
-            // want to be rid of, in the order you stopped wanting them.
+            // Esc gives up one thing per press, in the order you stopped wanting them: the
+            // selection, then the search highlight, then the mode. A running selection is the most
+            // local of the three and the one you are most likely to have changed your mind about —
+            // half way up a turn, having decided you wanted a different piece of it. Leaving
+            // outright there is a keystroke that undoes the wrong amount: the transcript is the
+            // thing you were still reading.
+            (KeyCode::Esc, _) if self.chat_anchored() => {
+                self.reading_linewise = false;
+                let _ = self.editor.apply(&PluginId::from(BUILTIN), ApiCall::WinSelect {
+                    win: self.chat_win,
+                    on: false,
+                });
+                self.refresh_composer();
+            }
             (KeyCode::Esc, _) if !self.searched.is_empty() => {
                 self.searched.clear();
                 self.clear_matches();
@@ -3501,11 +3535,16 @@ impl Host {
     fn reading_pair(&mut self, first: char, key: &neosh_proto::KeyPress, ch: &str) {
         match (first, ch) {
             ('g', "g") => {
+                // Extends whenever a selection is running, exactly as `k` does. Shift alone would
+                // mean `v` then `gg` threw away what you had selected and jumped, which is the one
+                // thing nobody presses it for.
+                let select = key.mods.shift || self.chat_anchored();
                 let _ = self.editor.apply(&PluginId::from(BUILTIN), ApiCall::WinMotion {
                     win: self.chat_win,
                     motion: CursorMotion::BufStart,
-                    select: key.mods.shift,
+                    select,
                 });
+                self.resnap_linewise();
                 self.follow_cursor();
             }
             // Where the cursor's line sits on screen. `zz` is the one worth having: it is how you
@@ -3579,6 +3618,7 @@ impl Host {
             row: at.0,
             col: at.1,
         });
+        self.resnap_linewise();
         self.follow_cursor();
         self.refresh_composer();
     }
@@ -3665,22 +3705,80 @@ impl Host {
             .apply(&PluginId::from(BUILTIN), ApiCall::WinScrollTo { win: self.chat_win, top_line: top });
     }
 
-    /// Select the line the cursor is on, end to end.
-    fn select_line(&mut self) {
+    /// `v` and `V`: start a selection of that shape, change a running one into it, or — pressed on
+    /// the shape it already is — drop it.
+    ///
+    /// Vim's, and not out of nostalgia: a second `v` meaning "no longer selecting" is what every
+    /// hand expects, and having `V` restart from one line instead would throw away the four you had
+    /// just extended over.
+    fn select_as(&mut self, linewise: bool) {
         let plugin = PluginId::from(BUILTIN);
-        let _ = self.editor.apply(&plugin, ApiCall::WinSelect { win: self.chat_win, on: false });
-        let _ = self.editor.apply(&plugin, ApiCall::WinMotion {
+        match (self.chat_anchored(), self.reading_linewise == linewise) {
+            (true, true) => {
+                self.reading_linewise = false;
+                let _ = self
+                    .editor
+                    .apply(&plugin, ApiCall::WinSelect { win: self.chat_win, on: false });
+            }
+            // Between the two shapes, keeping both ends: `v` narrows a linewise selection back to
+            // where the cursor actually is, and `V` widens the one you have to whole lines.
+            (true, false) => {
+                self.reading_linewise = linewise;
+                self.resnap_linewise();
+            }
+            (false, _) => {
+                self.reading_linewise = linewise;
+                let _ = self
+                    .editor
+                    .apply(&plugin, ApiCall::WinSelect { win: self.chat_win, on: true });
+                self.resnap_linewise();
+            }
+        }
+        self.refresh_composer();
+    }
+
+    /// Put a `V` selection back onto whole lines, in whichever direction it now runs.
+    ///
+    /// There is one selection here and it is two positions, so linewise is not a mode the core
+    /// knows about — it is an invariant this end re-establishes after every motion. Downwards it
+    /// was already right by accident: the anchor sits at the start of the first line and the cursor
+    /// walks along the last. Extending *upwards* is what it was wrong for. The anchor stayed at the
+    /// start of the line `V` was pressed on and the cursor went above it, which makes that line the
+    /// *end* of a backwards range that stops at its first column — so the one line you definitely
+    /// meant is the one that dropped out, and the rows you moved over came in half-selected.
+    ///
+    /// Three calls because the anchor is only settable by standing on it, which is the whole of the
+    /// public API for a selection and exactly what a plugin doing this would have to write.
+    fn resnap_linewise(&mut self) {
+        if !self.reading_linewise {
+            return;
+        }
+        let Some(w) = self.editor.window(self.chat_win) else { return };
+        let cursor = w.cursor;
+        let Some(anchor) = w.anchor else { return };
+        let lines = self.chat_lines();
+        // Columns on the wire are UTF-8 byte offsets, so the end of a line is its byte length.
+        let end_of = |row: u32| lines.get(row as usize).map(|l| l.len() as u32).unwrap_or(0);
+        let (a, c) = if anchor.0 <= cursor.0 {
+            ((anchor.0, 0), (cursor.0, end_of(cursor.0)))
+        } else {
+            ((anchor.0, end_of(anchor.0)), (cursor.0, 0))
+        };
+        if (a, c) == (anchor, cursor) {
+            return;
+        }
+        let plugin = PluginId::from(BUILTIN);
+        let _ = self.editor.apply(&plugin, ApiCall::WinSetCursor {
             win: self.chat_win,
-            motion: CursorMotion::LineStart,
-            select: false,
+            row: a.0,
+            col: a.1,
         });
         let _ = self.editor.apply(&plugin, ApiCall::WinSelect { win: self.chat_win, on: true });
-        let _ = self.editor.apply(&plugin, ApiCall::WinMotion {
+        let _ = self.editor.apply(&plugin, ApiCall::WinSetCursor {
             win: self.chat_win,
-            motion: CursorMotion::LineEnd,
-            select: true,
+            row: c.0,
+            col: c.1,
         });
-        self.refresh_composer();
     }
 
     /// Copy some rows of the transcript, and say how many.
@@ -4036,6 +4134,12 @@ impl Host {
     /// the truth, and a switch that reconstructed the buffer from a log of edits would drift the
     /// moment anything else touched it.
     fn enter_session(&mut self) {
+        // First, and while the transcript being read is still the one on screen. Reading is a place
+        // *in* a conversation — a cursor at a row, a selection between two of them, a search
+        // highlight — and every one of those addresses text that is about to be replaced by
+        // somebody else's. Left running, the mode survives into a conversation it was never opened
+        // on, and the rows it names there are whatever happens to be at those numbers.
+        self.leave_reading();
         // Not closed: the buffer is about to be replaced wholesale, so settling an answer into rows
         // that are on their way out would write into the conversation being left behind.
         self.answer = None;
@@ -4072,6 +4176,24 @@ impl Host {
             lines,
         });
         self.draw_marks(&marks, 0);
+        // Where the window *is*, and not only what this end believes about it. `chat_top = 0` above
+        // says "following the tail"; the window has to be told, because it is still sitting at
+        // whatever row the last conversation was scrolled to — and a scroll offset is kept rather
+        // than derived, precisely so that a client attaching later can be told it. Read a long
+        // answer with `^S`, go up, come out, switch project: the new conversation was drawn from
+        // row two hundred of a transcript that no longer exists, which is to say it was blank.
+        //
+        // The cursor with it. Nothing draws a caret in the transcript while the composer has focus,
+        // but every question the reader asks — which card is under it, which turn, which block — is
+        // asked of a row number, and one left over from a longer conversation is off the end of a
+        // shorter one.
+        let _ = self
+            .editor
+            .apply(&plugin, ApiCall::WinScrollTo { win: self.chat_win, top_line: 0 });
+        let _ = self
+            .editor
+            .apply(&plugin, ApiCall::WinSetCursor { win: self.chat_win, row: 0, col: 0 });
+        let _ = self.editor.apply(&plugin, ApiCall::WinSelect { win: self.chat_win, on: false });
         let _ = self.editor.apply(&plugin, ApiCall::BufSetName {
             buf: self.chat,
             name: format!("[chat] {label}"),

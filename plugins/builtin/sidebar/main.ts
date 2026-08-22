@@ -1893,7 +1893,7 @@ async function collect(
   const running = sessions.some((s) => s.active_turn);
   const now = Date.now();
   // One list, favourites first. A separate `FAVORITES` section splits a short list in half and
-  // makes you check two places for the same kind of thing; the heart says which is which without
+  // makes you check two places for the same kind of thing; the star says which is which without
   // costing a heading, a rule and a blank line.
   // What the other computers are running. One call; empty and harmless on a single machine.
   const swarm = await neosh.swarm.agents().catch(() => [] as SwarmAgent[]);
@@ -2174,7 +2174,7 @@ function hints(opts: DrawOptions): ListRow<Target>[] {
     // verb with a row of its own is the one that can afford to give up its place on them.
     ? ["^T projects  ^N new   ^F archive", "^K palette   ^B hide  F1 keys"]
     : kind === "project"
-      ? ["↵ fold   f ♥       JK move", "n new    a archive  ? keys"]
+      ? ["↵ fold   f ★       JK move", "n new    a archive  ? keys"]
       : kind === "session"
         ? ["↵ open   r rename   x archive", "X delete a archive   ? keys"]
         : kind === "browse"

@@ -157,6 +157,7 @@ impl Editor {
                 | ApiCall::ProviderRegisterDriver { .. }
                 | ApiCall::ProviderEmit { .. }
                 | ApiCall::PermissionCheck { .. }
+                | ApiCall::AskUser { .. }
                 | ApiCall::PermissionGetMode
                 | ApiCall::PermissionSetMode { .. }
                 | ApiCall::RtpAdd { .. }
@@ -215,6 +216,13 @@ impl Editor {
                 | ApiCall::SwarmPair { .. }
                 | ApiCall::SwarmUnpair { .. }
                 | ApiCall::SwarmStrangers
+                // The plan's allowance: credentials, other programs' transcripts and a clock.
+                // Nothing here is UI state, and the store outlives every window that draws it.
+                | ApiCall::QuotaList
+                | ApiCall::QuotaRefresh { .. }
+                | ApiCall::QuotaReport { .. }
+                | ApiCall::QuotaHistory { .. }
+                | ApiCall::UsageHistory { .. }
         )
     }
 
@@ -704,6 +712,14 @@ impl Editor {
             ApiCall::WinSetCursor { win, row, col } => {
                 self.win_mut(win)?.cursor = (row, col);
                 self.push_ui(UiEvent::CursorMoved { win, row, col });
+                // A selection is the anchor *and* the cursor, so moving one of them moves it — and
+                // a highlight that is not redrawn is the previous selection, still on screen while
+                // `y` copies a different one. Deliberately without touching the anchor, which is
+                // what separates this from `WinMotion`: a jump with a selection running takes the
+                // text it jumped over. Only `WinMotion` repainted, so every jump the transcript
+                // reader makes — `^U`, `{`, `[`, a search hit — extended a selection that could
+                // not be seen until the next `hjkl`.
+                self.refresh_selection(win);
                 Ok(ApiOk::Unit)
             }
             ApiCall::WinGetViewport { win } => {

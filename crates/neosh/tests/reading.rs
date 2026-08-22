@@ -636,7 +636,327 @@ fn i_gives_the_keyboard_back_to_the_composer() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// Selecting
+// ---------------------------------------------------------------------------
+
+/// A selection extended by a *jump* is drawn, not merely recorded.
+///
+/// Every way of getting somewhere in a transcript except `hjkl` is a jump: `^U` and `^D`, `[` and
+/// `]`, `{` and `}`, a search hit. Only `WinMotion` repainted the highlight, so `v` and then a
+/// screen upwards selected six lines and showed none of them — and `y` then copied text that had
+/// never been on screen. Which is worse than no selection at all: it is one you cannot check.
+#[test]
+fn a_jump_that_extends_a_selection_paints_it() {
+    let sb = Sandbox::new("jumppaint");
+    let mut s = sb.start();
+    s.answered_and_reading();
+
+    s.ch("v");
+    assert!(s.pump(|s| s.composer_hints().iter().any(|h| h.contains("extend"))), "selecting");
+    s.press(json!({"kind": "char", "c": "u"}), &["ctrl"]);
+
+    assert!(
+        s.pump(|s| s.chat_selected().len() > 1),
+        "a screen upwards is painted: {:?}",
+        s.chat_selected()
+    );
+    // And what it copies is what it showed.
+    let painted = s.chat_selected();
+    s.ch("y");
+    assert!(s.pump(|s| !s.copied().is_empty()), "and it copies\n{:?}", s.messages());
+    assert_eq!(
+        s.last_copy().lines().count(),
+        painted.len(),
+        "the copy is the highlight: {:?} vs {:?}",
+        s.last_copy(),
+        painted
+    );
+}
+
+/// `V` takes whole lines in *both* directions.
+///
+/// Underneath there is one selection and it is two positions, so going up from `V` used to leave
+/// the anchor at the start of the line you pressed it on and put the cursor above it — making that
+/// line the far end of a backwards range that stopped at its own first column. The one line you
+/// definitely meant was the one that dropped out.
+#[test]
+fn linewise_takes_whole_lines_going_upwards() {
+    let sb = Sandbox::new("linewiseup");
+    let mut s = sb.start();
+    s.answered_and_reading();
+
+    // Onto a line with words on it, so "the whole line" is a claim with something to check. Named
+    // rather than read back afterwards: `pump` stops as soon as its predicate holds, so asking
+    // where the cursor is straight after a key answers from the events already in hand — which is
+    // where it was *before* it moved.
+    let text = s.chat();
+    let at = text
+        .iter()
+        .position(|l| l.contains("Three things"))
+        .expect("the fixture says it") as u64;
+    let here = text[at as usize].clone();
+    s.ch("/");
+    s.keys("Three things");
+    s.special("enter");
+    assert!(s.pump(|s| s.chat_cursor() == Some(at)), "on it: {:?}", s.chat_cursor());
+
+    s.ch("V");
+    assert!(
+        s.pump(|s| s.chat_selected().contains(&(at as usize))),
+        "the line it was pressed on: {at} vs {:?} / {:?}",
+        s.chat_selected(),
+        s.chat_cursor()
+    );
+    s.ch("k");
+    s.ch("k");
+    assert!(
+        s.pump(|s| s.chat_selected().len() == 3),
+        "and the two above it, whole: {:?}",
+        s.chat_selected()
+    );
+
+    s.ch("y");
+    assert!(s.pump(|s| !s.copied().is_empty()), "copied\n{:?}", s.messages());
+    let got = s.last_copy();
+    assert!(
+        got.ends_with(here.trim_end()),
+        "the line `V` was pressed on is still the end of it: {got:?} / {here:?}"
+    );
+    assert_eq!(got.lines().count(), 3, "three whole lines: {got:?}");
+    assert_eq!(got.lines().next(), Some(text[at as usize - 2].as_str()), "from the top of one");
+}
+
+/// `Esc` gives up one thing per press, and a running selection is the first of them.
+///
+/// Changing your mind half way up a turn is the ordinary case — you meant a different piece of it —
+/// and leaving the transcript outright there undoes the wrong amount of work.
+#[test]
+fn esc_drops_the_selection_before_it_leaves() {
+    let sb = Sandbox::new("escdrop");
+    let mut s = sb.start();
+    s.answered_and_reading();
+
+    s.ch("v");
+    s.ch("k");
+    s.ch("k");
+    assert!(s.pump(|s| !s.chat_selected().is_empty()), "something is selected");
+
+    s.special("esc");
+    assert!(s.pump(|s| s.chat_selected().is_empty()), "the first press drops it");
+    assert!(s.is_reading(), "and leaves you where you were: {:?}", s.buffer("[status]"));
+
+    s.special("esc");
+    assert!(s.pump(|s| !s.is_reading()), "the second one leaves: {:?}", s.buffer("[status]"));
+}
+
+/// `gg` extends whenever a selection is running, exactly as `k` does.
+///
+/// It was gated with the `y` operator — which does need to know, because `y` is two keys in one —
+/// and so `v` then `gg` was a dead key, with no message to say why.
+#[test]
+fn gg_extends_a_running_selection_to_the_top() {
+    let sb = Sandbox::new("ggextend");
+    let mut s = sb.start();
+    s.answered_and_reading();
+
+    s.ch("v");
+    s.ch("g");
+    s.ch("g");
+    assert!(s.pump(|s| s.chat_cursor() == Some(0)), "at the top: {:?}", s.chat_cursor());
+    assert!(
+        s.pump(|s| !s.chat_selected().is_empty()),
+        "with everything on the way selected: {:?}",
+        s.chat_selected()
+    );
+
+    s.ch("y");
+    assert!(s.pump(|s| !s.copied().is_empty()), "and it copies\n{:?}", s.messages());
+    assert!(
+        s.last_copy().contains("What I found"),
+        "from the first line of the transcript: {:?}",
+        s.last_copy()
+    );
+}
+
+/// `v` on an empty selection says so. Silence there reads as a key that does not work.
+#[test]
+fn yanking_an_empty_selection_says_there_is_nothing_in_it() {
+    let sb = Sandbox::new("emptyyank");
+    let mut s = sb.start();
+    s.answered_and_reading();
+
+    s.ch("v");
+    s.ch("y");
+    assert!(
+        s.pump(|s| s.messages().iter().any(|m| m.contains("nothing to copy"))),
+        "{:?}",
+        s.messages()
+    );
+    assert!(s.copied().is_empty(), "and nothing went to the clipboard");
+}
+
+/// `^S` is the door, and a door opens both ways.
+#[test]
+fn the_key_that_opens_the_transcript_closes_it() {
+    let sb = Sandbox::new("readtoggle");
+    let mut s = sb.start();
+    s.answered_and_reading();
+
+    s.press(json!({"kind": "char", "c": "s"}), &["ctrl"]);
+    assert!(s.pump(|s| !s.is_reading()), "and back out: {:?}", s.buffer("[status]"));
+}
+
+// ---------------------------------------------------------------------------
+// Leaving the conversation you were reading
+// ---------------------------------------------------------------------------
+
+/// Switching conversation says where the transcript window now *is*.
+///
+/// The scroll offset is kept rather than derived — that is what lets a client attaching later be
+/// told it — so the host believing "back at the end" is not the same as the window being there.
+/// Read a long answer, go up, come out, switch: the next conversation was drawn from a row of a
+/// transcript that no longer existed, which on a short one means it was drawn blank.
+#[test]
+fn switching_conversation_puts_the_transcript_back_at_the_end() {
+    let sb = Sandbox::new("switchscroll");
+    let mut s = sb.start();
+    s.answered_and_reading();
+    s.to_top();
+    assert!(s.pump(|s| s.chat_scrolls().last() == Some(&0)), "at the top");
+
+    // Somewhere that is not the end, and not the beginning either.
+    s.ch("j");
+    s.ch("j");
+    let before = s.chat_scrolls().len();
+
+    s.run_command("session.new", move |s| {
+        s.chat_scrolls().len() > before && s.chat_scrolls().last() == Some(&0)
+    });
+}
+
+/// And it takes the reader out with it.
+///
+/// Reading is a place *in* a conversation: a cursor at a row, a selection between two of them.
+/// Every one of those addresses text that the switch is about to replace with somebody else's, and
+/// a selection left running over it is a highlight in mid-air.
+#[test]
+fn switching_conversation_leaves_the_transcript_reader() {
+    let sb = Sandbox::new("switchread");
+    let mut s = sb.start();
+    s.answered_and_reading();
+    s.ch("v");
+    s.ch("k");
+    assert!(s.pump(|s| !s.chat_selected().is_empty()), "something is selected");
+
+    s.run_command("session.new", |s| !s.is_reading());
+    assert!(
+        s.pump(|s| s.chat_selected().is_empty()),
+        "and nothing is selected in the new one: {:?}",
+        s.chat_selected()
+    );
+}
+
 impl Session {
+    /// Which rows of the transcript are painted as selected, by the marks the frontend was sent.
+    ///
+    /// Off the wire rather than off the anchor, because the anchor was never the bug: a selection
+    /// whose two ends are right and whose highlight is three keystrokes stale looks exactly like a
+    /// key that does not work, right up until `y` copies something you cannot see.
+    fn chat_selected(&self) -> Vec<usize> {
+        let Some(buf) = self.chat_buf() else { return Vec::new() };
+        let mut rows: Vec<bool> = Vec::new();
+        for e in &self.events {
+            if e["type"] != "buffer_lines" || e["buf"].as_u64() != Some(buf) {
+                continue;
+            }
+            let start = (e["start"].as_u64().unwrap_or(0) as usize).min(rows.len());
+            let old_end = e["old_end"].as_i64().unwrap_or(0);
+            let end = if old_end < 0 { rows.len() } else { (old_end as usize).min(rows.len()) };
+            let new: Vec<bool> = e["lines"]
+                .as_array()
+                .map(|a| {
+                    a.iter()
+                        .map(|l| {
+                            l["marks"].as_array().is_some_and(|ms| {
+                                ms.iter().any(|m| m["hl_group"] == "Visual")
+                            })
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            rows.splice(start..end.max(start), new);
+        }
+        rows.iter().enumerate().filter(|(_, on)| **on).map(|(i, _)| i).collect()
+    }
+
+    fn chat_buf(&self) -> Option<u64> {
+        let name = self.events.iter().find_map(|e| {
+            let n = e["name"].as_str()?;
+            (e["type"] == "buffer_opened" && n.starts_with("[chat]")).then(|| n.to_string())
+        })?;
+        self.buffer_named(&name)
+    }
+
+    fn chat_win(&self) -> Option<u64> {
+        let buf = self.chat_buf()?;
+        self.events.iter().find_map(|w| {
+            (w["type"] == "window_opened" && w["buf"].as_u64() == Some(buf))
+                .then(|| w["win"].as_u64())?
+        })
+    }
+
+    /// Every row the transcript window has been told to start drawing at, in order.
+    fn chat_scrolls(&self) -> Vec<u64> {
+        let Some(win) = self.chat_win() else { return Vec::new() };
+        self.events
+            .iter()
+            .filter(|e| e["type"] == "scroll_to" && e["win"].as_u64() == Some(win))
+            .filter_map(|e| e["top_line"].as_u64())
+            .collect()
+    }
+
+    /// Run a registered command by name — the way a menu entry, a palette row or another plugin
+    /// does — and wait until it has actually happened.
+    ///
+    /// Sent again rather than once, because switching conversation is a *plugin* command: the
+    /// sidebar owns the list, so it owns the verbs on it, and a plugin registers its commands some
+    /// time after the frontend has a screen. Sending it before then is answered with "no such
+    /// command" — a real answer, and not the one under test. There is nothing on the wire that says
+    /// "the registry has this now", so the only honest signal is the effect itself.
+    fn run_command(&mut self, name: &str, done: impl Fn(&Session) -> bool) {
+        let deadline = Instant::now() + BUDGET;
+        while Instant::now() < deadline {
+            self.send(&json!({"type": "command", "name": name, "args": []}));
+            let attempt = (Instant::now() + Duration::from_millis(500)).min(deadline);
+            loop {
+                if done(self) {
+                    return;
+                }
+                let left = attempt.saturating_duration_since(Instant::now());
+                if left.is_zero() {
+                    break;
+                }
+                match self.lines.recv_timeout(left) {
+                    Ok(line) => {
+                        if let Ok(v) = serde_json::from_str::<Value>(&line) {
+                            self.events.push(v);
+                        }
+                    }
+                    Err(RecvTimeoutError::Timeout) => break,
+                    Err(RecvTimeoutError::Disconnected) => {
+                        panic!("{name}: the workspace went away")
+                    }
+                }
+            }
+        }
+        assert!(done(self), "{name} never took effect");
+    }
+
+    fn is_reading(&self) -> bool {
+        self.buffer("[status]").iter().any(|l| l.contains("reading"))
+    }
+
     /// The virtual text under the composer — the shortcut row.
     fn composer_hints(&self) -> Vec<String> {
         let Some(buf) = self.buffer_named("[composer]") else { return Vec::new() };
