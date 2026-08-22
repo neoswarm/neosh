@@ -10,6 +10,7 @@
 import type {
   AccountKind,
   CredentialInfo,
+  Disposable,
   ModelInfo,
   CredentialSource,
   ModelEntry,
@@ -22,8 +23,7 @@ import type {
 } from "@neosh/api";
 import type { PaneItem, RailItem } from "@neosh/api/ui";
 import { confirmDestructive, defineHighlights, picker, prompt, railPicker } from "@neosh/api/ui";
-
-type SelectDescriptor = Extract<ProviderOptionDescriptor, { type: "select" }>;
+import { installOptions, openOptions } from "./options.ts";
 
 export async function activate({ neosh, subscriptions }: PluginContext) {
   await defineHighlights(neosh);
@@ -38,8 +38,8 @@ export async function activate({ neosh, subscriptions }: PluginContext) {
   await neosh.cmd.register("model.pick", () => pickModel(neosh), {
     desc: "Choose the model for this conversation",
   });
-  await neosh.cmd.register("model.options", () => pickOptions(neosh), {
-    desc: "Choose reasoning effort and other per-model options",
+  await neosh.cmd.register("model.options", () => openOptions(neosh), {
+    desc: "Reasoning effort, and everything else this model can be told",
   });
   await neosh.cmd.register("provider.auth", () => pickProvider(neosh), {
     desc: "Sign in to a provider, or forget a key",
@@ -69,7 +69,15 @@ export async function activate({ neosh, subscriptions }: PluginContext) {
   // The footer. The model and its options belong beside the composer rather than on a settings
   // page: they are the two things you change mid-conversation — and each carries its own key,
   // because a key is only memorable next to the thing it changes.
-  const footer = async () => {
+  /**
+   * `flash` lights the options segment for a moment before settling.
+   *
+   * The "it moved there" flash the palette reserves reverse for, and it is here rather than in the
+   * panel that was just dismissed for two reasons: it is where the setting now lives, which is the
+   * thing worth teaching, and a panel held open to be looked at after the key that closed it is a
+   * panel still swallowing the next key.
+   */
+  const footer = async (flash = false) => {
     const selection = await neosh.agent.selection().catch(() => null);
     if (!selection) {
       await neosh.status.set("model", {
@@ -110,14 +118,31 @@ export async function activate({ neosh, subscriptions }: PluginContext) {
       await neosh.status.set("effort", {
         text: options,
         keys: "^E",
+        // A setting that is not a level — one bought by saying a word rather than by sending a
+        // parameter — wears the group that animates, so the strip itself says the next turn is not
+        // an ordinary one. It is the only place that *can* say it: the word never appears in the
+        // transcript, and the picker it was chosen in has been shut for an hour.
+        hl: flash
+          ? "Option.Chosen"
+          : beyond(selection.options ?? [], descriptors)
+          ? "Option.Beyond"
+          : undefined,
         align: "right",
         priority: 11,
       });
+      // Long enough to be seen, short enough that nobody waits for it. Settling is an ordinary
+      // redraw, so whatever the strip should say — including a rainbow, if what you chose is a word
+      // rather than a level — is said by the same code that would have said it anyway.
+      if (flash) flashOff?.dispose();
+      if (flash) flashOff = neosh.timer.after(320, () => void footer());
     } else {
       await neosh.status.clear("effort");
     }
   };
   await footer();
+  // The sheet's own keys, bound to this plugin's buffer kind rather than handled privately — so
+  // `F1` lists them and `init.ts` can move any of them. See `options.ts`.
+  await installOptions({ neosh, subscriptions }, (flash) => footer(flash));
   subscriptions.push(neosh.session.onChange(() => void footer()));
   subscriptions.push(neosh.agent.onTurnEnd(() => void footer()));
   // Whoever changed it — this plugin, a stored model that would not authenticate, or a provider
@@ -128,6 +153,9 @@ export async function activate({ neosh, subscriptions }: PluginContext) {
 
 /** Set by `activate`, so the pickers can update the footer the moment a choice lands. */
 let refreshFooter: () => Promise<void> = async () => {};
+
+/** The pending "settle back to normal" after a flash, so two in a row do not fight. */
+let flashOff: Disposable | null = null;
 
 /**
  * The option values, as a line short enough to sit in a footer.
@@ -151,6 +179,24 @@ function summarise(
     }
   }
   return out.join(" ");
+}
+
+/**
+ * Whether anything in effect is applied by *saying* it rather than by sending it.
+ *
+ * Asked of the descriptors rather than of the value's name, because which words a vendor reads is
+ * the vendor's business: this file has never heard of "ultrathink" and does not need to.
+ */
+function beyond(
+  chosen: readonly OptionSelection[],
+  descriptors: readonly ProviderOptionDescriptor[],
+): boolean {
+  return descriptors.some((d) => {
+    const value = chosen.find((o) => o.id === d.id)?.value;
+    return d.type === "boolean"
+      ? value === true && typeof d.prompt_injected_word === "string"
+      : typeof value === "string" && (d.prompt_injected_values ?? []).includes(value);
+  });
 }
 
 /**
@@ -708,77 +754,3 @@ async function pickProvider(neosh: Neosh): Promise<void> {
   await refreshFooter();
 }
 
-async function pickOptions(neosh: Neosh): Promise<void> {
-  const current = await neosh.agent.selection();
-  if (!current) {
-    neosh.notify("no model selected", "warn");
-    return;
-  }
-  const entries = await neosh.agent.listModels(current.instance);
-  const descriptors =
-    entries.find((e) => e.model.id === current.model)?.model.capabilities?.option_descriptors ?? [];
-  if (descriptors.length === 0) {
-    neosh.notify(`${current.model} has no options to set`);
-    return;
-  }
-
-  // One knob goes straight to its values; more than one asks which knob first. Keeping the common
-  // case — reasoning effort, and nothing else — a single keystroke is worth the branch.
-  const descriptor =
-    descriptors.length === 1
-      ? descriptors[0]
-      : await picker(
-          neosh,
-          descriptors.map((d) => ({ label: d.label, detail: d.description ?? "", value: d })),
-          { title: `${current.model} options`, width: 64 },
-        );
-  if (!descriptor) return;
-
-  if (descriptor.type === "boolean") {
-    const chosen = await picker<boolean>(
-      neosh,
-      [
-        { label: "On", value: true },
-        { label: "Off", value: false },
-      ],
-      { title: descriptor.label, height: 2, width: 40 },
-    );
-    if (chosen === null) return;
-    await applyOption(neosh, current, descriptor.id, chosen);
-    neosh.notify(`${descriptor.label}: ${chosen ? "on" : "off"}`);
-    return;
-  }
-
-  const select: SelectDescriptor = descriptor;
-  const currentValue =
-    current.options?.find((o) => o.id === select.id)?.value ??
-    select.current_value ??
-    select.options.find((o) => o.is_default)?.id;
-
-  const items = select.options.map((o) => ({
-    label: o.label,
-    detail: o.description ?? (o.is_default ? "default" : ""),
-    value: o.id,
-  }));
-
-  const chosen = await picker(neosh, items, {
-    title: select.label,
-    selected: Math.max(0, items.findIndex((i) => i.value === currentValue)),
-    width: 64,
-  });
-  if (chosen === null) return;
-  await applyOption(neosh, current, select.id, chosen);
-  neosh.notify(`${select.label}: ${select.options.find((o) => o.id === chosen)?.label ?? chosen}`);
-}
-
-async function applyOption(
-  neosh: Neosh,
-  current: ModelSelection,
-  id: string,
-  value: string | boolean,
-): Promise<void> {
-  const options: OptionSelection[] = (current.options ?? []).filter((o) => o.id !== id);
-  options.push({ id, value });
-  await neosh.agent.setSelection({ ...current, options });
-  await refreshFooter();
-}
