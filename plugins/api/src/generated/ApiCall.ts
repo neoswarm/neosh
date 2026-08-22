@@ -14,6 +14,7 @@ import type { HookName } from "./HookName";
 import type { InstanceConfig } from "./InstanceConfig";
 import type { InstanceId } from "./InstanceId";
 import type { KeymapScope } from "./KeymapScope";
+import type { LineDraw } from "./LineDraw";
 import type { MessageLevel } from "./MessageLevel";
 import type { Mode } from "./Mode";
 import type { ModelSelection } from "./ModelSelection";
@@ -66,6 +67,14 @@ export type ApiCall =
     start: number;
     end: number;
     lines: Array<string>;
+  }
+  | {
+    "call": "buf_render";
+    buf: BufferId;
+    ns: NamespaceId;
+    start: number;
+    end: number;
+    lines: Array<LineDraw>;
   }
   | { "call": "buf_append_text"; buf: BufferId; text: string }
   | { "call": "buf_set_name"; buf: BufferId; name: string }

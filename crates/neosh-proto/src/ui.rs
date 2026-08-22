@@ -506,6 +506,33 @@ pub struct LineRender {
     pub marks: Vec<ExtmarkRender>,
 }
 
+/// One line of a repaint on the way *in*: text, and the marks to put on it.
+///
+/// The inbound twin of [`LineRender`], and deliberately the same shape. A panel that draws itself
+/// hands over rows, not a script of mutations — see [`ApiCall::BufRender`](crate::ApiCall::BufRender)
+/// for why the script was the bug.
+///
+/// No `ns` or `id` per mark: the namespace is the call's, and an id is a handle for deleting one
+/// mark later, which is not a thing a wholesale repaint ever does — it clears by namespace and
+/// writes the lot again.
+#[derive(TS, Serialize, Deserialize, Clone, PartialEq, Eq, Debug, Default)]
+#[ts(export)]
+pub struct LineDraw {
+    pub text: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub marks: Vec<MarkDraw>,
+}
+
+/// One mark of a [`LineDraw`], positioned on that line.
+#[derive(TS, Serialize, Deserialize, Clone, PartialEq, Eq, Debug, Default)]
+#[ts(export)]
+pub struct MarkDraw {
+    /// UTF-8 byte offset into the line's text, as every column on this wire is.
+    pub col: u32,
+    #[serde(flatten)]
+    pub opts: ExtmarkOpts,
+}
+
 // ---------------------------------------------------------------------------
 // Raw cells
 // ---------------------------------------------------------------------------

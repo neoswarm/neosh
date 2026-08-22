@@ -638,6 +638,36 @@ impl Editor {
                 self.emit_edit(buf, edit);
                 Ok(ApiOk::Unit)
             }
+            ApiCall::BufRender { buf, ns, start, end, lines } => {
+                self.ns(ns)?;
+                let b = self.buf_mut(buf)?;
+                let (s, e) = (b.resolve_index(start), b.resolve_index(end));
+                let edit = b.set_lines(s, e, lines.iter().map(|l| l.text.clone()).collect());
+                let (from, count) = (edit.start, lines.len() as u32);
+                // The namespace's own marks over the rows just written. `set_lines` carries marks
+                // onto the positional counterpart of each replaced line — which is what makes
+                // streaming work and what would otherwise leave a repainted row wearing the
+                // clamped remains of the last repaint.
+                b.clear_marks(ns, from, from + count);
+                for (i, line) in lines.iter().enumerate() {
+                    for m in &line.marks {
+                        // Rows are the ones just written and columns are clamped, so this cannot
+                        // fail; `?` rather than a discard so a future range check is not silent.
+                        b.set_mark(ns, from + i as u32, m.col, m.opts.clone())?;
+                    }
+                }
+                // One event, carrying the finished rows. Emitted after every mutation rather than
+                // per step: a repaint that is observable halfway through is the bug this call
+                // exists to remove.
+                let rendered = b.render_range(from, from + count);
+                self.push_ui(UiEvent::BufferLines {
+                    buf,
+                    start: from,
+                    old_end: edit.old_end,
+                    lines: rendered,
+                });
+                Ok(ApiOk::Unit)
+            }
             ApiCall::BufAppendText { buf, text } => {
                 let edit = self.buf_mut(buf)?.append_text(&text);
                 self.emit_edit(buf, edit);

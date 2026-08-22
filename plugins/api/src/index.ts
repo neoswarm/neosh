@@ -325,6 +325,22 @@ export interface MarkOptions {
   priority?: number;
 }
 
+/** One mark of a {@link DrawnRow}, positioned on that row. */
+export interface DrawnMark {
+  /**
+   * UTF-8 byte offset into the row's text — the unit every column on the wire uses. Build it with
+   * {@link byteLength}, never `.length`.
+   */
+  col: number;
+  opts?: MarkOptions;
+}
+
+/** One row of a repaint: its text, and everything drawn on it. */
+export interface DrawnRow {
+  text: string;
+  marks?: DrawnMark[];
+}
+
 export interface FloatOptions {
   anchor?: FloatConfig["anchor"];
   offset?: { row: number; col: number };
@@ -422,6 +438,28 @@ export interface BufferApi {
    * `setLines(buf, 0, -1, lines)` replaces the buffer; `setLines(buf, -1, -1, lines)` appends.
    */
   setLines(buf: BufferId, start: number, end: number, lines: string[]): Promise<void>;
+  /**
+   * Replace a range of rows **and** `ns`'s marks on them, in one call. What a panel should use to
+   * draw itself.
+   *
+   * The atomic form of `setLines` + `ns.clear` + a `ns.mark` per mark. That sequence is correct at
+   * rest and wrong in flight: each call is a round trip, the frontend draws on a ~16 ms deadline
+   * that knows nothing about how far through a repaint you are, and a frame landing after the clear
+   * draws every row with no marks at all — in `Normal`, which is near-white. A dim panel redrawing
+   * ten times a second flashes bright. This has no halfway state to observe, and costs one round
+   * trip instead of one per mark.
+   *
+   * Indices resolve as {@link setLines}'s do, and the clear covers exactly the rows written — so a
+   * partial repaint leaves the rest of the panel alone. Other namespaces are untouched, which is
+   * what lets an overlay survive the panel under it redrawing.
+   */
+  render(
+    buf: BufferId,
+    ns: NamespaceId,
+    start: number,
+    end: number,
+    rows: DrawnRow[],
+  ): Promise<void>;
   /** Append to the final line without resending it. The streaming fast path. */
   appendText(buf: BufferId, text: string): Promise<void>;
   setName(buf: BufferId, name: string): Promise<void>;
@@ -1700,6 +1738,19 @@ export function __createContext(plugin: string, config: unknown, version: number
       },
       async setLines(buf, start, end, lines) {
         await c({ call: "buf_set_lines", buf, start, end, lines });
+      },
+      async render(buf, ns, start, end, rows) {
+        await c({
+          call: "buf_render",
+          buf,
+          ns,
+          start,
+          end,
+          lines: rows.map((r) => ({
+            text: r.text,
+            marks: (r.marks ?? []).map((m) => ({ col: m.col, ...markOpts(m.opts) })),
+          })),
+        });
       },
       async appendText(buf, text) {
         await c({ call: "buf_append_text", buf, text });

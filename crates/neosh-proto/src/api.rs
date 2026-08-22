@@ -209,6 +209,32 @@ pub enum ApiCall {
         end: i64,
         lines: Vec<String>,
     },
+    /// Replace a range of lines **and** this namespace's marks on them, in one call.
+    ///
+    /// The atomic form of the sequence every panel used to write by hand: `BufSetLines`, then
+    /// `MarkClear`, then one `MarkSet` per mark. That sequence is correct at rest and wrong in
+    /// flight — the frontend draws on a coalescing deadline that knows nothing about how far
+    /// through a repaint a plugin is, so a frame landing after the clear draws every row with no
+    /// marks at all, in `Normal`. A dim sidebar becomes bright white for a frame, which is what a
+    /// panel redrawing ten times a second looks like when agents are running.
+    ///
+    /// [`UiEvent::BufferLines`] already promises that text and its marks travel together. This is
+    /// the same promise on the way in: one call, one mutation, one event, and no window in which
+    /// half of a repaint is observable.
+    ///
+    /// `start`/`end` are resolved like [`ApiCall::BufSetLines`]'s, and the clear covers exactly the
+    /// rows written — a partial repaint does not disturb the marks on rows it did not touch. Marks
+    /// belonging to other namespaces are left alone, so a selection drawn in its own namespace
+    /// survives the panel underneath it being redrawn.
+    BufRender {
+        buf: BufferId,
+        ns: NamespaceId,
+        #[ts(type = "number")]
+        start: i64,
+        #[ts(type = "number")]
+        end: i64,
+        lines: Vec<LineDraw>,
+    },
     /// Append to the final line without resending it. The streaming fast path.
     BufAppendText {
         buf: BufferId,

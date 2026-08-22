@@ -41,6 +41,7 @@ import type {
   AgentSummary,
   Contribution,
   Disposable,
+  DrawnRow,
   Neosh,
   PluginContext,
   NodeInfo,
@@ -1579,23 +1580,24 @@ async function openRemote(
 
   const redraw = async () => {
     const all = [...header, ...body];
-    await neosh.buf.setLines(buf, 0, -1, all);
-    await neosh.ns.clear(ns, buf);
-    await neosh.ns.mark(ns, buf, 0, 0, {
-      hlGroup: "Title",
-      endCol: byteLength(all[0] ?? ""),
-    });
-    if (all[1]) {
-      await neosh.ns.mark(ns, buf, 1, 0, { hlGroup: "Comment", endCol: byteLength(all[1]) });
-    }
+    // One call. This redraws per token, so a repaint the frontend could draw halfway through — text
+    // written, marks not yet — would be a transcript strobing white for the whole of an answer.
+    const drawn: DrawnRow[] = all.map((text) => ({ text, marks: [] }));
+    const mark = (line: number, hl: string, text: string) => {
+      drawn[line]?.marks!.push({ col: 0, opts: { hlGroup: hl, endCol: byteLength(text) } });
+    };
+
+    mark(0, "Title", all[0] ?? "");
+    if (all[1]) mark(1, "Comment", all[1]);
     for (let i = header.length; i < all.length; i++) {
       const text = all[i] ?? "";
       if (text.startsWith("  › ")) {
-        await neosh.ns.mark(ns, buf, i, 0, { hlGroup: "Accent", endCol: byteLength(text) });
+        mark(i, "Accent", text);
       } else if (text.startsWith("  · ")) {
-        await neosh.ns.mark(ns, buf, i, 0, { hlGroup: "Comment", endCol: byteLength(text) });
+        mark(i, "Comment", text);
       }
     }
+    await neosh.buf.render(buf, ns, 0, -1, drawn);
     // The newest line, not the oldest: a transcript you have just opened should be showing the end
     // of the conversation, which is the part that is still happening.
     await neosh.win.scrollTo(win, Math.max(0, all.length - 24));
