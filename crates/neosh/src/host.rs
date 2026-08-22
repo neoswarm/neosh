@@ -1494,6 +1494,26 @@ impl Host {
         Ok(got)
     }
 
+    /// Whether the conversation on screen has an image attached that has not been sent.
+    fn has_attachment(&self) -> bool {
+        self.attached.get(&self.active_session()).is_some_and(|v| !v.is_empty())
+    }
+
+    /// Take the last attached image back off, saying which one went.
+    ///
+    /// Said out loud because the chip it removes may have been the only one on screen: a row that
+    /// silently becomes no row is indistinguishable from a key that did nothing.
+    fn drop_attachment(&mut self) {
+        let here = self.active_session();
+        match self.attached.entry(here).or_default().pop() {
+            None => self.editor_message(MessageLevel::Info, "nothing attached"),
+            Some(a) => {
+                self.editor_message(MessageLevel::Info, format!("took off {}", a.label()));
+                self.refresh_composer();
+            }
+        }
+    }
+
     /// Start a turn in a named conversation, drawing it only if it is the one on screen.
     ///
     /// Named rather than implied, because the caller is not always the keyboard: a turn that ends
@@ -2464,7 +2484,7 @@ impl Host {
             ];
             if i + 1 == attached.len() {
                 v.push(chunk("  ", "Composer.Hint"));
-                v.push(chunk("\u{2325}v", "Composer.HintKey"));
+                v.push(chunk(if ascii { "Bksp" } else { "\u{232b}" }, "Composer.HintKey"));
                 v.push(chunk(" take off", "Composer.Hint"));
             }
             self.composer_mark(0, VirtTextPos::Above, v);
@@ -3067,6 +3087,13 @@ impl Host {
                 self.start_turn(text);
             }
 
+            // Nothing left to erase, and a chip above the field: the next backspace takes that
+            // off. It is how a chip row behaves everywhere else, it needs no modifier anybody's
+            // terminal has an opinion about, and "that was the wrong screenshot" is one key away
+            // from having pasted it.
+            KeyCode::Backspace if self.composer_text().is_empty() && self.has_attachment() => {
+                self.drop_attachment()
+            }
             KeyCode::Backspace if m.ctrl || m.alt => self.compose(TextEdit::DeleteWordBack),
             KeyCode::Backspace => self.compose(TextEdit::DeleteBack),
             KeyCode::Delete if m.ctrl || m.alt => self.compose(TextEdit::DeleteWordForward),
@@ -6408,9 +6435,11 @@ impl Host {
             // `^V` is the one every hand is already on. It stays free for that: nothing else in
             // chat wants it, and the composer has never had a use for it.
             ("<C-v>", "chat.image.paste", "Attach the image on the clipboard"),
-            // Beside it rather than somewhere else, because "that was the wrong screenshot" is
-            // one keystroke away from having taken it.
-            ("<M-v>", "chat.image.drop", "Take the last attached image off"),
+            // Taking one back off is `⌫` on an empty composer, handled below rather than bound
+            // here. It was `⌥V`, which is not a key: a Mac terminal turns Option-v into `√`
+            // unless its owner has been into the settings, and a keyboard whose Alt is a layer
+            // toggle cannot send it at all. `chat.image.drop` is still a command, so `^K` runs it
+            // and `init.ts` can put it back on a chord of your own.
         ] {
             let _ = self.editor.apply(&plugin, ApiCall::KeymapSet {
                 mode: Mode::Chat,
@@ -6631,16 +6660,7 @@ impl Host {
                     self.editor_message(MessageLevel::Warn, e);
                 }
             }
-            "chat.image.drop" => {
-                let here = self.active_session();
-                match self.attached.entry(here).or_default().pop() {
-                    None => self.editor_message(MessageLevel::Info, "nothing attached"),
-                    Some(a) => {
-                        self.editor_message(MessageLevel::Info, format!("took off {}", a.label()));
-                        self.refresh_composer();
-                    }
-                }
-            }
+            "chat.image.drop" => self.drop_attachment(),
             "chat.image.clear" => {
                 let here = self.active_session();
                 let n = self.attached.remove(&here).unwrap_or_default().len();
