@@ -1354,9 +1354,9 @@ fn nothing_else_reaches_the_keyboard_while_the_option_sheet_is_open() {
 
 #[test]
 fn a_knob_row_says_it_is_a_control_before_you_press_anything() {
-    // A ladder with one rung lit reads identically whether or not `←→` do anything to it — which is
-    // how a live control came to look like a summary, and why `↵` on it (which means "done") felt
-    // like a key that does nothing at all.
+    // A ladder with one rung lit reads identically whether or not `h`/`l` do anything to it — which
+    // is how a live control came to look like a summary, and why `↵` on it (which means "done")
+    // felt like a key that does nothing at all.
     let sb = Sandbox::new("railsheet");
     let dir = sb.root.join("config/plugins/lab");
     std::fs::create_dir_all(&dir).expect("mkdir");
@@ -5733,7 +5733,7 @@ fn the_usage_panel_opens_with_the_plan_above_the_history() {
 /// The panel's keys are the panel's keys, bound to named commands.
 ///
 /// `t` and `c` are ordinary letters. Bound at buffer-kind scope they only fire here — and because
-/// they point at named commands rather than at a `switch` inside a handler, `F1` lists them and an
+/// they point at named commands rather than at a `switch` inside a handler, `^Z` lists them and an
 /// `init.ts` can move them. See ADR 0040.
 #[test]
 fn the_usage_panel_swaps_metric_on_its_own_key() {
