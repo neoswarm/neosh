@@ -56,11 +56,17 @@ export async function activate({ neosh, subscriptions }: PluginContext) {
 
   await neosh.keymap.set("chat", "<C-p>", "model.pick", { desc: "Pick a model" });
   await neosh.keymap.set("chat", "<C-e>", "model.options", { desc: "Pick reasoning effort" });
-  // Alt-arrows because they are unclaimed in every mode and mean "along an axis" in most editors.
-  // Rebind like anything else: every one of these is an ordinary command in the same table your
-  // own bindings live in.
-  await neosh.keymap.set("chat", "<A-Up>", "model.upgrade", { desc: "A more capable model" });
-  await neosh.keymap.set("chat", "<A-Down>", "model.downgrade", { desc: "A cheaper model" });
+  // The rungs have no default key. They had `⌥↑` and `⌥↓`, which read well and are not keys a
+  // terminal can be relied on to send: a Mac terminal turns Option-arrow into a word motion or an
+  // escape sequence depending on a setting its owner has probably never opened, and a keyboard
+  // whose arrows live on a layer cannot hold Alt and reach them at all. Chat mode has no chord
+  // left to move them to, and inventing a two-key prefix for two rungs is a worse trade than the
+  // one row of `^P` they are already on.
+  //
+  // They stay ordinary commands, which is the part that matters: `^K` runs them by name, and one
+  // line in `init.ts` puts them on whichever key your keyboard actually has.
+  //
+  //     await neosh.keymap.set("chat", "<A-Up>", "model.upgrade");
 
   // Deliberately *not* on the shortcut row. The key lives beside the model name in the footer,
   // where the thing it changes is already being read — saying it twice costs a row and teaches
