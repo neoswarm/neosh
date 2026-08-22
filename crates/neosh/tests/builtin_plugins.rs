@@ -2075,6 +2075,56 @@ fn a_worktree_nests_under_the_repository_it_belongs_to() {
     );
 }
 
+/// And it is still inside it once you have deleted everything you were doing in there.
+///
+/// Which tree belongs to which repository is read off a conversation's `repo_root` — so an emptied
+/// worktree has nobody left to say it, and a project that outlives its conversations would jump out
+/// of the repository it belongs to and land at the top level as a project of its own. A tree does
+/// not become a project by being idle: the relationship is written down (`sidebar.root`) while
+/// something still knows it.
+#[test]
+fn an_emptied_worktree_is_still_inside_its_repository() {
+    let sb = Sandbox::new("wtempty");
+    sb.git_init();
+    let root = sb.root.join("trees");
+    sb.write_config(&format!(
+        "[options]\n\"worktree.root\" = \"{}\"\n\"ui.confirm_destructive\" = false\n",
+        root.display()
+    ));
+    let mut s = sb.start_letting_config_choose();
+    s.wait_for("PROJECTS");
+
+    s.send(&command_with("git.worktree.new", "sideline"));
+    assert!(
+        s.pump(|s| s.sidebar_now().iter().any(|l| l.contains("sideline"))),
+        "the worktree is there to begin with\n{:?}",
+        s.sidebar_now()
+    );
+
+    // The conversation the worktree was made for is the active one, so this empties the tree. Wait
+    // for it to actually go: every claim below is true of the panel *before* the delete as well, so
+    // a test that only asserted the shape would pass without waiting for anything to happen.
+    s.send(&command("session.close"));
+    assert!(
+        s.pump(|s| s.sidebar_now().iter().filter(|l| l.contains("New conversation")).count() == 1),
+        "the tree's only conversation is gone\n{:?}",
+        s.sidebar_now()
+    );
+    assert!(
+        s.pump(|s| {
+            let rows = s.sidebar_now();
+            let repo = rows.iter().position(|l| l.contains("work") && !l.contains("sideline"));
+            let tree = rows.iter().position(|l| l.contains("sideline"));
+            match (repo, tree) {
+                (Some(r), Some(t)) => t > r && rows[t].starts_with("     "),
+                _ => false,
+            }
+        }),
+        "the emptied tree is still nested under its repository\n{:?}",
+        s.sidebar_now()
+    );
+}
+
 /// No questions at all. A branch named before the work is a decision made at the worst possible
 /// moment, and needing to make it is what stops people reaching for a clean tree in the first
 /// place.
