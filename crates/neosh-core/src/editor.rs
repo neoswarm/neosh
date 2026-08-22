@@ -157,6 +157,7 @@ impl Editor {
                 | ApiCall::ProviderRegisterDriver { .. }
                 | ApiCall::ProviderEmit { .. }
                 | ApiCall::PermissionCheck { .. }
+                | ApiCall::AskUser { .. }
                 | ApiCall::PermissionGetMode
                 | ApiCall::PermissionSetMode { .. }
                 | ApiCall::RtpAdd { .. }
@@ -215,6 +216,13 @@ impl Editor {
                 | ApiCall::SwarmPair { .. }
                 | ApiCall::SwarmUnpair { .. }
                 | ApiCall::SwarmStrangers
+                // The plan's allowance: credentials, other programs' transcripts and a clock.
+                // Nothing here is UI state, and the store outlives every window that draws it.
+                | ApiCall::QuotaList
+                | ApiCall::QuotaRefresh { .. }
+                | ApiCall::QuotaReport { .. }
+                | ApiCall::QuotaHistory { .. }
+                | ApiCall::UsageHistory { .. }
         )
     }
 
@@ -282,10 +290,16 @@ impl Editor {
             let Some(b) = self.buffers.get(&buf) else { continue };
             let (name, count) = (b.name.clone(), b.line_count());
             self.push_ui(UiEvent::BufferOpened { buf, name });
-            // `old_end: 0` and not `count`: this is a splice into a mirror that has nothing, so it
-            // is an insertion at the top and not a replacement of rows that are not there.
+            // `old_end: u32::MAX` — "however many rows you have, they are these now". Not `0`,
+            // which would be an insertion at the top: correct for a mirror that has nothing and
+            // silently doubling for one that already has the state. A mirror that already has it
+            // is the ordinary case now that a workspace can have several views: a terminal
+            // joining republishes to *all* of them, which is what brings the ones already here
+            // back into step. Not `count` either, because a mirror can be holding more rows than
+            // the buffer now has. The mirror clamps the range, so this is exactly "replace it all"
+            // at either end.
             let lines = self.buffers[&buf].render_range(0, count);
-            self.push_ui(UiEvent::BufferLines { buf, start: 0, old_end: 0, lines });
+            self.push_ui(UiEvent::BufferLines { buf, start: 0, old_end: u32::MAX, lines });
         }
 
         let mut windows: Vec<WindowId> = self.windows.keys().copied().collect();
@@ -624,6 +638,36 @@ impl Editor {
                 self.emit_edit(buf, edit);
                 Ok(ApiOk::Unit)
             }
+            ApiCall::BufRender { buf, ns, start, end, lines } => {
+                self.ns(ns)?;
+                let b = self.buf_mut(buf)?;
+                let (s, e) = (b.resolve_index(start), b.resolve_index(end));
+                let edit = b.set_lines(s, e, lines.iter().map(|l| l.text.clone()).collect());
+                let (from, count) = (edit.start, lines.len() as u32);
+                // The namespace's own marks over the rows just written. `set_lines` carries marks
+                // onto the positional counterpart of each replaced line — which is what makes
+                // streaming work and what would otherwise leave a repainted row wearing the
+                // clamped remains of the last repaint.
+                b.clear_marks(ns, from, from + count);
+                for (i, line) in lines.iter().enumerate() {
+                    for m in &line.marks {
+                        // Rows are the ones just written and columns are clamped, so this cannot
+                        // fail; `?` rather than a discard so a future range check is not silent.
+                        b.set_mark(ns, from + i as u32, m.col, m.opts.clone())?;
+                    }
+                }
+                // One event, carrying the finished rows. Emitted after every mutation rather than
+                // per step: a repaint that is observable halfway through is the bug this call
+                // exists to remove.
+                let rendered = b.render_range(from, from + count);
+                self.push_ui(UiEvent::BufferLines {
+                    buf,
+                    start: from,
+                    old_end: edit.old_end,
+                    lines: rendered,
+                });
+                Ok(ApiOk::Unit)
+            }
             ApiCall::BufAppendText { buf, text } => {
                 let edit = self.buf_mut(buf)?.append_text(&text);
                 self.emit_edit(buf, edit);
@@ -698,6 +742,14 @@ impl Editor {
             ApiCall::WinSetCursor { win, row, col } => {
                 self.win_mut(win)?.cursor = (row, col);
                 self.push_ui(UiEvent::CursorMoved { win, row, col });
+                // A selection is the anchor *and* the cursor, so moving one of them moves it — and
+                // a highlight that is not redrawn is the previous selection, still on screen while
+                // `y` copies a different one. Deliberately without touching the anchor, which is
+                // what separates this from `WinMotion`: a jump with a selection running takes the
+                // text it jumped over. Only `WinMotion` repainted, so every jump the transcript
+                // reader makes — `^U`, `{`, `[`, a search hit — extended a selection that could
+                // not be seen until the next `hjkl`.
+                self.refresh_selection(win);
                 Ok(ApiOk::Unit)
             }
             ApiCall::WinGetViewport { win } => {

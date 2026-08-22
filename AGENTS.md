@@ -102,8 +102,25 @@ per decision, and records the *reasoning*, not the choice.
   for your config directory, starting one if there is none. Closing a terminal detaches — turns keep
   running. `neosh stop` is what ends a workspace, and `^Q` must never be able to. `UiEvent` is a
   delta stream, so anything a client needs on reattach has to be *kept* by the editor and said again
-  by `Editor::republish`; a value that is only forwarded is a value that comes back wrong. One
-  viewer at a time, newest wins. See ADR 0036.
+  by `Editor::republish`; a value that is only forwarded is a value that comes back wrong. See ADR
+  0036.
+- **However many terminals you open, you see everything.** Attaching joins; it does not take over.
+  Every attached terminal is a mirror of one `Editor` — same transcript, same composer, live — and
+  `^Q` closes the one it was pressed in. Which one is read off the tag input arrives with, never
+  from whoever spoke most recently: the host can be behind the channel, and "the last event sent"
+  is not "the event being handled". Three things follow and each was a bug. **`republish` goes to
+  every view, so it has to be idempotent** — it spliced at `old_end: 0`, an insertion, which is
+  right only against a mirror that has nothing and doubled every buffer in one that had the state.
+  **The workspace is the size of the smallest attached terminal**, because a card is one row of
+  buffer *content* shared by all of them, and a card measured for the wide window wraps in the
+  narrow one; sizes are re-merged when a view *leaves* too, since nobody reports a size when
+  somebody else closes a window. **`ViewportChanged` is where the host learns a width**, so
+  anything drawn to one is redrawn there. Independent views — a transcript here, a diff there —
+  are not this: they need `Host` split into a `Workspace` and a `View`, and an `ApiCall` that names
+  the view it draws into. See ADR 0042.
+- **Every view gets every event.** `Agent` fans its stream out to one queue per view. Never a
+  `broadcast` channel: lagging consumers drop the oldest, silently, under load — and a view that
+  missed one `ToolFinished` has a card that spins forever with nothing to put it right.
 - **Take the transport that can do the most.** `claude` in stream-json mode with the control
   protocol; `codex app-server`, not `codex exec`. The cheaper one is not simpler for long — it is
   the one where streaming, approvals and interrupts turn out to be impossible rather than missing.
@@ -117,6 +134,19 @@ per decision, and records the *reasoning*, not the choice.
   *configured* mode and is never written by `⇧⇥` — the moment it follows the active conversation,
   every conversation without a mode inherits the last one you touched. The configured default is
   full access. See ADR 0038.
+- **A question is not a permission.** *May this happen* has one question, a yes-or-no answer, and a
+  policy that can answer it without waking anybody; *which of these* has a list of them, sometimes
+  several answers each, sometimes an answer nobody listed, and nothing in a mode or an allow-list
+  knows which database you want. Routed through the permission path — which is where
+  `AskUserQuestion` was — the configured `allow` said yes before anybody was asked, the bare yes
+  carried no answers, and `claude` told its own model *"The user did not answer the questions."* So
+  a question is its own family end to end: `UserQuestion` on the wire, `QuestionAsker` beside
+  `PermissionAsker`, `ask_user` for a plugin to serve and `neosh.ask` for a plugin to raise, and a
+  `DriverQuestioner` that does not *hold* a permission layer rather than one that declines to call
+  it. **The question text is its own key** — the agent looks an answer up by the question it answers,
+  so a generated id is an answer to nothing — and **nobody answering is a denial with a sentence in
+  it**, never an `allow` with an empty map, because the empty map is what the agent reads as
+  "ignored me". See ADR 0043.
 - **Everything irreversible asks, and nothing reversible does.** No exceptions on either side: a
   dialog that appears for some deletes and not others is a key whose behaviour you cannot predict
   from the row it is pointed at, and one charged for an action you can undo is what teaches people
@@ -160,9 +190,48 @@ per decision, and records the *reasoning*, not the choice.
   message and nothing else, so N queued messages meant N-1 questions drawn as asked and never put to
   anybody — which reads exactly like being ignored. `take_steering_into` joins them, in the order
   they were typed. See ADR 0041.
+- **A flash is one thing happening; a burst is a redraw.** `Animation::Flash` is the only motion
+  here that fires once, so it needs a moment to count from — and a highlight group, shared by every
+  row using it, cannot hold one. The *mark* does: an extmark is created once, so the frontend keys
+  the one-shot from the first time it saw that mark, and scrolling a row away and back cannot fire
+  it again. More than a few arrivals at once are a bulk redraw — republishing on reattach mints
+  every mark in a conversation — and none of them flash, because a transcript that blinks when you
+  switch to it is the worst version of this. A spinner (`Animation::Frames`) is the other half:
+  frames travel as a *name* because only the frontend knows what the terminal can draw, and it
+  clips or pads every frame to the width of the run underneath, so a spinner can never move the
+  column after it. The buffer keeps the glyph that was written — a frame is what a cell looks like,
+  not what the line says. See ADR 0045.
+- **What the plan has left cannot be counted, only reported and then kept.** A subscription's
+  allowance is opaque and is not a function of anything on this machine — a turn run in `claude`
+  directly spent it too. `claude` says so on a `rate_limit_event` line and `codex` on
+  `account/rateLimits/updated`; both are `Activity::Quota`, both are *kept* by the host, and a
+  mid-turn line **patches** while a poll **replaces** — the first carries one window and says
+  nothing about the others, the second is the only thing that can express a limit that has gone. A
+  window id is a *string* and severity is the **vendor's** grade: the `limits` array grew three
+  kinds between two releases, and 94% weekly is `critical` where 55% session is `normal`. Polling at
+  rest reads the vendor CLI's own login — `SecretString`, request-time, never on disk, structurally
+  absent from `UiEvent` — and is `usage.poll`. **Quota and token history never share an axis**: a
+  percentage of an opaque allowance does not convert into a token count. History comes from the
+  vendors' own transcripts, never from ours, and a bounded scan that hits its cap says so. See ADR
+  0044.
 - **Redrawing a row means clearing its marks first.** A mark clamps rather than dies when the line
   under it is replaced, and at equal priority the *narrower* one wins — so a row rewritten every
   tick accumulates marks and ends up painted by the shortest one from several seconds ago.
+- **A selection is two positions, so moving either end redraws it.** `WinMotion` and `WinSetCursor`
+  differ on purpose — the first throws the selection away unless told to extend, the second leaves
+  the anchor alone, which is what makes a *jump* take the text it jumped over — but both have to
+  repaint. Only `WinMotion` did, so `v` and then anything but `hjkl` (`^U`, `{`, `[`, a search hit)
+  selected six lines, showed none of them, and copied all six: a selection you cannot check is worse
+  than none. `V` is not a second kind of selection either — it is the same pair of positions with an
+  invariant re-established after every motion, because extending *upwards* from a line-start anchor
+  otherwise drops the one line you definitely meant.
+- **Arriving in a conversation reseats the view, not just the buffer.** The transcript's scroll
+  offset, cursor and selection are *kept* — that is what lets a client attaching later be told where
+  it is — so `enter_session` believing "back at the end" is not the same as the window being there.
+  Read a long answer, go up, come out, switch project, and the next conversation was drawn from a
+  row of a transcript that no longer existed. Reading is a place *in* a conversation, so the switch
+  takes you out of it too. ADR 0036's rule, one more time: a value that is only forwarded is a value
+  that comes back wrong.
 
 ## Verification
 
@@ -236,6 +305,7 @@ registry — this table is what ships.
 | `^B` | Toggle the sidebar |
 | `^K` | Command palette |
 | `/` | Completes a command by name — neosh's, and whatever the agent says it accepts. Keep typing; the composer is still the field, and `↵` sends what you typed when nothing matches |
+| `^L` | What the plan has left, and where the week went. Live gauges per limit, and the last 30 days from the agents' own transcripts |
 | `^G` | Git status |
 | `^D` | Show what changed |
 | `^S` | Read the transcript — see below |
@@ -243,7 +313,7 @@ registry — this table is what ships.
 | `^C` | Copy the selection, or clear the draft, or (twice) quit |
 | `PgUp` `PgDn` `^End` | Scroll, and back to the newest message |
 | `^R` | Reload configuration |
-| `^Q` | Close this terminal. Whatever is running keeps running — `neosh` puts you back |
+| `^Q` | Close this terminal. Whatever is running keeps running, and so does every other terminal open on this workspace — `neosh` puts you back |
 | `F1` | Every binding, live |
 | `Esc` | Interrupt the turn in this conversation. The agent is asked to stop, so the conversation survives it |
 
@@ -285,15 +355,37 @@ Two corollaries, both of which were bugs:
 | `{` `}` | Previous / next **block** |
 | `⇥` `za` | Open or fold the **tool card** under the cursor — the whole diff, the whole output |
 | `/` `?` then `n` `N` | Search, and step through the matches |
-| `v` | Start a selection that motions extend |
-| `V` | Select this whole line |
+| `v` | Start a selection that motions extend. Again, or on a `V` selection, gives it up |
+| `V` | The same by whole lines — both ways, so extending upwards keeps the line you started on |
 | `y` | Copy the selection, and leave |
 | `yy` `Y` | Copy the line |
 | `yc` | Copy the **code block** the cursor is in, without its indent or language line |
 | `ym` | Copy the whole **turn** — the question and everything it produced |
 | `ya` | Copy the entire transcript |
 | `i` `a` `o` `⏎` | Back to the composer |
-| `Esc` | Drop the search highlight, then leave |
+| `^S` | And back out, the way you came in |
+| `Esc` | One thing per press: the selection, then the search highlight, then the mode |
+
+## Answering a question — the panel over the composer
+
+What an agent gets when it asks *you* something. One question at a time, `⇧⇥` to go back and change
+an earlier answer, and **typing is answering** — it goes into the composer, where you can see and
+edit it, and the numbered shortcuts disappear to say a digit is now a character. Every key here is
+an ordinary binding against the `neosh.question` buffer kind, so `F1` lists it and `init.ts` can
+move it.
+
+| Key | Does |
+|---|---|
+| `↵` | Take the option under the cursor, and go on to the next question. On one that takes several, confirm what is ticked. With something typed, send that instead |
+| `1`–`9` | Take that option, while nothing has been typed |
+| `⇥` | Tick or untick the option under the cursor, on a question that takes more than one |
+| `↑` `↓`, `^P` `^N` | Move |
+| `⇧⇥` | Back to the previous question |
+| type | Your own answer, for when none of them is it. `⌫` back to the options, `^W` a word, `^U` all of it |
+| `Esc` | Dismiss. The agent is told nobody answered — which is a thing it can act on, not an error |
+
+A question for a conversation you are not looking at waits rather than taking the screen: the footer
+says how many are asking, `^T` is where you go, and it opens when you get there.
 
 ## The project panel — `^T`
 

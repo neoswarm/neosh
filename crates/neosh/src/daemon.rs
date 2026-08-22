@@ -19,15 +19,17 @@
 //! ([`ClientMessage`] / [`ServerMessage`]) for the things a *connection* has to say and a view does
 //! not: attaching, detaching, and being told somebody else took over.
 //!
-//! # One viewer at a time
+//! # However many terminals you open
 //!
-//! A second `neosh` takes the workspace over and the first is told so. Not because sharing is
-//! undesirable — it is the next thing to build — but because it is the only honest thing this
-//! shape can do: there is one `Editor`, so there is one cursor, one scroll position and one
-//! terminal size, and fanning that out to two windows of different sizes draws the wrong layout in
-//! at least one of them. Taking over rather than refusing is deliberate too: a client that died
-//! without saying so is indistinguishable from one that is merely quiet, and refusing would mean a
-//! crashed terminal locks you out of your own workspace.
+//! A second `neosh` used to take the workspace over and tell the first why, on the grounds that
+//! there is one `Editor` and therefore one cursor, one scroll position and one size. That is still
+//! true, and it turns out to be an argument for *mirroring* rather than for refusing: every
+//! attached terminal shows the same thing, live, and closing one leaves the others alone. The
+//! reason to open a second window is that a turn is running in the first, and taking it over is
+//! exactly the moment you lose sight of that turn.
+//!
+//! What a connection has to reconcile is size, because several terminals report several of them.
+//! See [`crate::views`], which owns that and says why it is the smallest one.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -41,6 +43,7 @@ use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{Mutex, mpsc};
 
 use crate::frontend::Frontend;
+use crate::views::{ViewId, Views};
 
 /// What the workspace is doing, for anyone who asks without attaching.
 ///
@@ -96,42 +99,42 @@ impl Live {
     }
 }
 
-/// The frontend of a workspace nobody may currently be looking at.
+/// The frontend of a workspace that may have several terminals looking at it, or none.
 ///
-/// A batch with no client goes nowhere, and that is correct rather than lossy: the events are
+/// A batch with no views goes nowhere, and that is correct rather than lossy: the events are
 /// deltas against a mirror, every one of them is already reflected in the editor's own state, and
 /// the next client to attach is told the state rather than the history. Dropping them is also what
 /// keeps a headless workspace from growing a queue for the rest of its life.
 pub struct Viewer {
-    to_client: Arc<Mutex<Option<mpsc::UnboundedSender<ServerMessage>>>>,
+    views: Arc<Mutex<Views>>,
 }
 
 impl Viewer {
-    fn new(to_client: Arc<Mutex<Option<mpsc::UnboundedSender<ServerMessage>>>>) -> Self {
-        Self { to_client }
+    fn new(views: Arc<Mutex<Views>>) -> Self {
+        Self { views }
     }
 }
 
 #[async_trait::async_trait]
 impl Frontend for Viewer {
-    /// The viewer asked to leave. Tell it so, and let go of it.
+    /// One viewer asked to leave — `^Q` in that terminal, and only that one. Tell it so, and let
+    /// go of it.
     ///
-    /// The slot is cleared here rather than left for the reader task to notice, so the very next
-    /// frame the host draws goes nowhere instead of racing a socket that is closing.
-    async fn detach(&mut self) -> anyhow::Result<()> {
-        if let Some(tx) = self.to_client.lock().await.take() {
-            let _ = tx.send(ServerMessage::Detached { reason: DetachReason::Asked });
-        }
+    /// Dropped here rather than left for the reader task to notice, so the very next frame the
+    /// host draws goes to the terminals that are still there instead of racing a socket that is
+    /// closing.
+    async fn detach(&mut self, view: ViewId) -> anyhow::Result<()> {
+        let mut views = self.views.lock().await;
+        views.tell(view, ServerMessage::Detached { reason: DetachReason::Asked });
+        views.detach(view);
         Ok(())
     }
 
     async fn send(&mut self, batch: Vec<UiEvent>) -> anyhow::Result<()> {
-        if let Some(tx) = self.to_client.lock().await.as_ref() {
-            // A send failure is a client that went away between the lock and the write, which the
-            // reader task notices and cleans up. Not the host's problem, and certainly not a
-            // reason to end a turn.
-            let _ = tx.send(ServerMessage::Events { batch });
-        }
+        // A send failure is a client that went away between the lock and the write, which the
+        // reader task notices and cleans up. Not the host's problem, and certainly not a reason to
+        // end a turn.
+        self.views.lock().await.send(batch);
         Ok(())
     }
 }
@@ -139,8 +142,8 @@ impl Frontend for Viewer {
 /// A workspace listening for viewers.
 pub struct Daemon {
     listener: UnixListener,
-    to_client: Arc<Mutex<Option<mpsc::UnboundedSender<ServerMessage>>>>,
-    to_host: mpsc::UnboundedSender<InputEvent>,
+    views: Arc<Mutex<Views>>,
+    to_host: mpsc::UnboundedSender<(ViewId, InputEvent)>,
     live: Arc<Live>,
 }
 
@@ -181,7 +184,7 @@ impl Daemon {
         let (to_host, _) = mpsc::unbounded_channel();
         Ok(Self {
             listener,
-            to_client: Arc::new(Mutex::new(None)),
+            views: Arc::new(Mutex::new(Views::default())),
             to_host,
             live: Live::new(),
         })
@@ -196,10 +199,10 @@ impl Daemon {
     /// Called once, before [`Self::serve`]. The host then runs forever, with clients coming and
     /// going underneath it — which is the whole point: the run loop never learns that anybody
     /// attached, beyond one [`InputEvent::Attached`] telling it to say everything again.
-    pub fn wire(&mut self) -> (Box<dyn Frontend>, mpsc::UnboundedReceiver<InputEvent>) {
+    pub fn wire(&mut self) -> (Box<dyn Frontend>, mpsc::UnboundedReceiver<(ViewId, InputEvent)>) {
         let (tx, rx) = mpsc::unbounded_channel();
         self.to_host = tx;
-        (Box::new(Viewer::new(self.to_client.clone())), rx)
+        (Box::new(Viewer::new(self.views.clone())), rx)
     }
 
     /// Accept clients until the process ends. Runs alongside the host, not instead of it.
@@ -207,7 +210,7 @@ impl Daemon {
         loop {
             let Ok((stream, _)) = self.listener.accept().await else { continue };
             let this = Handle {
-                to_client: self.to_client.clone(),
+                views: self.views.clone(),
                 to_host: self.to_host.clone(),
                 live: self.live.clone(),
             };
@@ -224,8 +227,8 @@ impl Daemon {
 
 #[derive(Clone)]
 struct Handle {
-    to_client: Arc<Mutex<Option<mpsc::UnboundedSender<ServerMessage>>>>,
-    to_host: mpsc::UnboundedSender<InputEvent>,
+    views: Arc<Mutex<Views>>,
+    to_host: mpsc::UnboundedSender<(ViewId, InputEvent)>,
     live: Arc<Live>,
 }
 
@@ -250,6 +253,7 @@ impl Handle {
         });
 
         let mut attached = false;
+        let mut view: Option<ViewId> = None;
         while let Ok(Some(line)) = lines.next_line().await {
             if line.trim().is_empty() {
                 continue;
@@ -265,7 +269,7 @@ impl Handle {
             };
             match msg {
                 ClientMessage::Status => {
-                    let attached_now = self.to_client.lock().await.is_some();
+                    let attached_now = !self.views.lock().await.is_empty();
                     let _ = out.send(ServerMessage::Status {
                         status: self.live.snapshot(attached_now),
                     });
@@ -276,9 +280,10 @@ impl Handle {
                     // is the one that means it. It goes through the command registry like any
                     // other, so the workspace leaves the way it always has — conversations
                     // flushed to disk, plugins torn down.
-                    let _ = self
-                        .to_host
-                        .send(InputEvent::Command { name: "stop".into(), args: Vec::new() });
+                    let _ = self.to_host.send((
+                        ViewId::LOCAL,
+                        InputEvent::Command { name: "stop".into(), args: Vec::new() },
+                    ));
                     break;
                 }
                 ClientMessage::Attach { protocol_version, width, height } => {
@@ -294,28 +299,50 @@ impl Handle {
                         });
                         break;
                     }
-                    // Whoever had it is told why, before the swap, so the message reaches them
-                    // over a channel that is still theirs.
-                    let mut slot = self.to_client.lock().await;
-                    if let Some(old) = slot.take() {
-                        let _ = old.send(ServerMessage::Detached {
-                            reason: DetachReason::TakenOver,
-                        });
-                    }
-                    *slot = Some(out.clone());
-                    drop(slot);
+                    // Alongside whoever is already here, rather than instead of them.
+                    let (id, size) = {
+                        let mut views = self.views.lock().await;
+                        let id = views.attach(out.clone(), (width, height));
+                        (id, views.size().unwrap_or((width, height)))
+                    };
+                    view = Some(id);
                     attached = true;
                     let _ = out.send(ServerMessage::Attached {
                         protocol_version: neosh_proto::PROTOCOL_VERSION,
                     });
-                    let _ = self.to_host.send(InputEvent::Attached { width, height });
+                    // The *workspace's* size, which is the smallest attached terminal's and may
+                    // not be this one's. The host says its whole state in reply, and that goes to
+                    // every view — which is what makes a terminal joining a workspace also the
+                    // moment every other terminal is brought back into step with it.
+                    let (width, height) = size;
+                    let _ = self.to_host.send((id, InputEvent::Attached { width, height }));
                 }
                 ClientMessage::Input { event } => {
-                    if !attached {
+                    let Some(id) = view else {
                         tracing::warn!("input before attach, ignored");
                         continue;
-                    }
-                    if self.to_host.send(event).is_err() {
+                    };
+                    // Two events are about *this terminal's* shape rather than about the
+                    // workspace, and several terminals have several answers. They are reconciled
+                    // here and forwarded as one, so the host goes on believing there is one screen
+                    // — which is exactly what it can still assume, because every view is a mirror
+                    // of the same one.
+                    let forward = match event {
+                        InputEvent::Resize { width, height } => {
+                            match self.views.lock().await.resized(id, (width, height)) {
+                                Some((width, height)) => Some(InputEvent::Resize { width, height }),
+                                // Somebody smaller is still attached, so nothing the host draws
+                                // changes. The view re-lays-out its own geometry regardless.
+                                None => None,
+                            }
+                        }
+                        InputEvent::ViewportChanged { win, width, height, top_line } => {
+                            self.views.lock().await.viewport(id, win, (width, height, top_line))
+                        }
+                        other => Some(other),
+                    };
+                    let Some(event) = forward else { continue };
+                    if self.to_host.send((id, event)).is_err() {
                         break;
                     }
                 }
@@ -327,20 +354,28 @@ impl Handle {
         }
 
         // However this connection ended — asked to leave, took a signal, or the terminal it was in
-        // was closed — the workspace keeps going. That is the entire point of it being here.
-        if attached {
-            let mut slot = self.to_client.lock().await;
-            // Only if we are still the one holding it: another client may have taken over while
-            // this connection was winding down, and clearing the slot would blank *their* screen.
-            if slot.as_ref().is_some_and(|s| s.same_channel(&out)) {
-                *slot = None;
+        // was closed — the workspace keeps going, and so does every other terminal looking at it.
+        // That is the entire point of it being here.
+        if let Some(id) = view {
+            let (size, remerged, empty) = {
+                let mut views = self.views.lock().await;
+                // `detach` may already have happened: `^Q` is answered by the host, which lets go
+                // of the view before this connection has finished winding down.
+                views.detach(id);
+                // Nobody reports a size when somebody *else* closes a window, so a workspace that
+                // was pinned narrow by this terminal has to be given its width back from here or
+                // it stays narrow for as long as it runs.
+                (views.size(), views.remerge(), views.is_empty())
+            };
+            if let Some((width, height)) = size {
+                let _ = self.to_host.send((id, InputEvent::Resize { width, height }));
             }
-            // Stamped from what is true now rather than from having just cleared it. `^Q` is
-            // answered by the host, which lets go of the viewer before this connection has
-            // finished closing — so by the time we get here the slot is often already empty, and
-            // keying the stamp off our own clearing would leave `neosh status` reporting an idle
-            // time measured from whenever somebody last closed a terminal the hard way.
-            if slot.is_none() {
+            for ev in remerged {
+                let _ = self.to_host.send((id, ev));
+            }
+            // Stamped from what is true now rather than from having just removed ourselves: the
+            // question `neosh status` asks is whether *anybody* is looking.
+            if empty {
                 self.live.detached_at.store(now(), Ordering::Relaxed);
             }
         }

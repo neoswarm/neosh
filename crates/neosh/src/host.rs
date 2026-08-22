@@ -259,6 +259,12 @@ pub struct Host {
     /// Cleared by the key that follows, whatever it is, so a mistyped second key ends the sequence
     /// instead of leaving the next unrelated press to be swallowed by it.
     reading_pending: Option<char>,
+    /// Whether the running selection takes whole lines — `V` rather than `v`.
+    ///
+    /// A flag rather than a second kind of selection, because there is one selection model here and
+    /// it is a pair of positions. "The whole line" is therefore something to re-establish after
+    /// every motion, in whichever direction the selection now runs. See [`Host::resnap_linewise`].
+    reading_linewise: bool,
     /// The search being typed in the transcript, if one is.
     search: Option<SearchPrompt>,
     /// The last thing searched for, so `n` still works after the prompt has closed.
@@ -282,7 +288,17 @@ pub struct Host {
     /// the workspace is a thing you say on purpose, with `neosh stop`.
     on_quit: OnQuit,
     /// Set by `quit` while serving; the run loop sends the viewer away and carries on.
-    detaching: bool,
+    /// The terminal that asked to leave, if one has. `^Q` closes *that* window and no other.
+    ///
+    /// Which view is not a guess from whoever spoke most recently: input arrives already tagged
+    /// with the view it came from, and this is set while that very event is being handled.
+    detaching: Option<crate::views::ViewId>,
+    /// The view whose input is being handled right now.
+    ///
+    /// [`crate::views::ViewId::LOCAL`] between events and in a process that is its own terminal.
+    /// A command run from a plugin or a signal is nobody's key press, and lands here as the local
+    /// view — which in a served workspace names no terminal, and so closes none.
+    from_view: crate::views::ViewId,
     /// Where to report what this workspace is holding, when it is a workspace rather than a
     /// process somebody is watching.
     live: Option<std::sync::Arc<crate::daemon::Live>>,
@@ -350,6 +366,18 @@ pub struct Host {
     swarm_allowed: neosh_swarm::Allowed,
     /// The node's events, held here between construction and the loop taking them.
     swarm_events: Option<tokio::sync::mpsc::UnboundedReceiver<neosh_swarm::SwarmEvent>>,
+    /// What each account has left on its plan, kept between the moments anything says so.
+    ///
+    /// In the host and not in a plugin for the reason every capability here is: it reads a
+    /// credential and it outlives every window that draws it. What a plugin gets is the numbers.
+    quota: crate::quota::QuotaStore,
+    /// Where a poll's answer comes back to. Polls are network round trips and process spawns, so
+    /// they cannot happen on the host loop — the single writer for the editor — and cannot be
+    /// awaited by whoever asked, because nobody asked: the interval did.
+    quota_tx: tokio::sync::mpsc::UnboundedSender<crate::quota::Polled>,
+    quota_rx: Option<tokio::sync::mpsc::UnboundedReceiver<crate::quota::Polled>>,
+    /// Set by a turn ending, cleared by the poll that follows it. See [`crate::quota::AFTER_TURN`].
+    quota_due: bool,
     /// Repositories by directory, discovered on demand.
     ///
     /// Keyed rather than singular because the *conversation* decides which repository is in play:
@@ -499,11 +527,18 @@ struct Card {
     body: u32,
     /// Whether the body is the whole of it or the first few rows.
     expanded: bool,
+    /// Whether this card has already had its moment.
+    ///
+    /// A landing is an event, and an event happens once. Without this the row would light up again
+    /// every time the card is redrawn for any other reason — opening it, folding it, the clock on
+    /// the row above it ticking — and a flash that fires on a redraw is a flash that means
+    /// "something was drawn", which is not news.
+    flashed: bool,
 }
 
 impl Card {
     fn new(leg: Leg, row: u32) -> Self {
-        Self { legs: vec![leg], row, body: 0, expanded: false }
+        Self { legs: vec![leg], row, body: 0, expanded: false, flashed: false }
     }
 
     /// Whether this card holds a call answering to `id`, and which one.
@@ -597,6 +632,7 @@ impl Host {
         frontend: Box<dyn Frontend>,
     ) -> Self {
         let mut editor = Editor::new();
+        let (quota_tx, quota_rx) = tokio::sync::mpsc::unbounded_channel();
 
         let chat = editor.create_buffer("[chat]");
         let chat_win =
@@ -668,6 +704,7 @@ impl Host {
             keys_touched: false,
             reading: false,
             reading_pending: None,
+            reading_linewise: false,
             search: None,
             searched: String::new(),
             search_ns,
@@ -676,7 +713,8 @@ impl Host {
             startup: Startup::default(),
             quitting: false,
             on_quit: OnQuit::Stop,
-            detaching: false,
+            detaching: None,
+            from_view: crate::views::ViewId::LOCAL,
             live: None,
             live_at: None,
             live_turns: 0,
@@ -696,6 +734,10 @@ impl Host {
             swarm_strangers: Default::default(),
             swarm_allowed: neosh_swarm::Allowed::load(None),
             swarm_events: None,
+            quota: crate::quota::QuotaStore::new(None),
+            quota_tx,
+            quota_rx: Some(quota_rx),
+            quota_due: false,
             repos: Default::default(),
             cwd: std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
             projects: Default::default(),
@@ -767,6 +809,8 @@ impl Host {
                 | ApiCall::AgentListModels { .. }
                 | ApiCall::PermissionCheck { .. }
                 | ApiCall::PathComplete { .. }
+                | ApiCall::AskUser { .. }
+                | ApiCall::UsageHistory { .. }
         ) {
             return false;
         }
@@ -1010,6 +1054,43 @@ impl Host {
             ApiCall::SwarmStrangers => Ok(ApiOk::SwarmStrangers {
                 strangers: self.swarm_strangers.values().cloned().collect(),
             }),
+            // ---- the plan ------------------------------------------------
+            // Answered from what the store kept, which is what makes this safe to call on every
+            // redraw. Nothing here asks a vendor anything except `QuotaRefresh`, and that one
+            // answers before its own answer arrives.
+            ApiCall::QuotaList => Ok(ApiOk::Quotas { quotas: self.quota.list() }),
+            ApiCall::QuotaRefresh { instance } => {
+                self.refresh_quota(instance);
+                Ok(ApiOk::Unit)
+            }
+            // A plugin publishing for a provider it registered. Its own instances only: a plugin
+            // that could report for `claude-cli` could put any number it liked in the strip, and
+            // the strip is a thing people are going to trust before spending an afternoon.
+            ApiCall::QuotaReport { snapshot } => {
+                if !self.plugin_drivers_own(&plugin, &snapshot.instance) {
+                    return Err(ApiError::NotPermitted {
+                        capability: format!(
+                            "quota.report for {} (plugin {} did not register a driver serving it)",
+                            snapshot.instance, plugin.0
+                        ),
+                    });
+                }
+                self.take_quota(
+                    snapshot.instance.clone(),
+                    neosh_proto::QuotaSource::Plugin,
+                    neosh_provider::quota::Quota {
+                        plan: snapshot.plan,
+                        windows: snapshot.windows,
+                        credits: snapshot.credits,
+                    },
+                );
+                Ok(ApiOk::Unit)
+            }
+            ApiCall::QuotaHistory { instance, since, until } => Ok(ApiOk::QuotaHistory {
+                samples: self.quota.history(instance.as_ref(), since, until),
+            }),
+            // `UsageHistory` is not here: it reads thousands of files somebody else wrote, so it
+            // goes through `spawn_slow` with git and generation, for the same reason they do.
             ApiCall::SwarmPair { node, name, addr } => {
                 let Some(h) = &self.swarm_node else {
                     return Err(ApiError::NotFound { what: "the swarm is not running".into() });
@@ -2498,9 +2579,12 @@ impl Host {
             Some('g') => vec![("g", "top")],
             Some('z') => vec![("z", "centre"), ("t", "top"), ("b", "bottom"), ("a", "card")],
             Some(_) => vec![],
-            None if self.chat_anchored() => {
-                vec![("y", "copy"), ("v", "drop"), ("hjkl", "extend"), ("esc", "leave")]
-            }
+            None if self.chat_anchored() => vec![
+                ("y", "copy"),
+                ("hjkl", "extend"),
+                if self.reading_linewise { ("v", "characters") } else { ("V", "whole lines") },
+                ("esc", "drop"),
+            ],
             None => vec![
                 ("y", "copy"),
                 ("v", "select"),
@@ -2675,9 +2759,16 @@ impl Host {
         let mut line = String::from("  ");
         let mut spans = Vec::new();
         for (i, (key, label)) in keys.iter().enumerate() {
-            if i > 0 {
-                line.push_str("   ");
+            let sep = if i > 0 { "   " } else { "" };
+            // As many as fit, in the order they are worth knowing. A row of hints that wraps is
+            // two rows of hints, the second of which starts mid-phrase — and the whole point of
+            // this line is to be readable at a glance. `^S` is second because it is the one most
+            // people never find; the ones that get dropped first are the ones `F1` also names.
+            let would = sep.len() + key.chars().count() + 1 + label.chars().count();
+            if i > 0 && line.chars().count() + would > width {
+                break;
             }
+            line.push_str(sep);
             let from = line.len();
             line.push_str(key);
             spans.push((from, line.len(), "Key"));
@@ -2795,8 +2886,14 @@ impl Host {
     ) {
         let asker: Arc<dyn neosh_provider::approval::PermissionAsker> =
             Arc::new(neosh_agent::DriverAsker::new(&self.agent, self.bridge.clone()));
+        // The other half of "a request one of them cannot answer alone": not whether something may
+        // happen, but which of several things you want. Policy has no answer to that one, so it
+        // goes somewhere else entirely — see [`neosh_agent::DriverQuestioner`].
+        let questioner: Arc<dyn neosh_provider::ask::QuestionAsker> =
+            Arc::new(neosh_agent::DriverQuestioner::new(&self.agent, self.bridge.clone()));
         for d in &drivers {
             d.set_permission_asker(asker.clone());
+            d.set_question_asker(questioner.clone());
         }
         self.agent_drivers = drivers;
         self.sync_agent_drivers();
@@ -3246,6 +3343,7 @@ impl Host {
         }
         self.reading = true;
         self.reading_pending = None;
+        self.reading_linewise = false;
         // And the keymap has to be told, or the sentence above is only true of the keys nobody
         // else wanted. Reading's keys arrive through [`Self::handle_unbound_key`], which is the
         // *last* thing consulted — so `^D` scrolled half a screen only until the git plugin bound
@@ -3277,6 +3375,7 @@ impl Host {
         }
         self.reading = false;
         self.reading_pending = None;
+        self.reading_linewise = false;
         self.editor.set_mode(self.mode_before_reading);
         self.clear_matches();
         let plugin = PluginId::from(BUILTIN);
@@ -3335,7 +3434,12 @@ impl Host {
             self.reading_pair(first, &key, ch);
             return;
         }
-        if matches!(ch, "y" | "g" | "z") && !self.chat_anchored() {
+        // `y` is the only one of the three that is two keys in one: an operator when nothing is
+        // selected, and "copy this" when something is. `g` and `z` mean the same thing either way,
+        // and gating them alongside it made both dead — `v` then `gg` could not extend to the top
+        // of the transcript, and `zz` could not recentre a selection you were in the middle of
+        // making, with no message either way to say why.
+        if matches!(ch, "g" | "z") || (ch == "y" && !self.chat_anchored()) {
             self.reading_pending = ch.chars().next();
             self.refresh_composer();
             return;
@@ -3359,6 +3463,7 @@ impl Host {
                 motion,
                 select,
             });
+            self.resnap_linewise();
             self.follow_cursor();
             // The hint row says what the row under the cursor can do, so it moves with it.
             self.refresh_composer();
@@ -3375,17 +3480,8 @@ impl Host {
             (_, "}") => self.reading_to_block(1, select),
             (_, "{") => self.reading_to_block(-1, select),
 
-            (_, "v") => {
-                let on = !self.chat_anchored();
-                let _ = self.editor.apply(&PluginId::from(BUILTIN), ApiCall::WinSelect {
-                    win: self.chat_win,
-                    on,
-                });
-                self.refresh_composer();
-            }
-            // Not a linewise mode — there is no such thing here — but the thing people press `V`
-            // for, which is "this whole line, and then let me extend it".
-            (_, "V") => self.select_line(),
+            (_, "v") => self.select_as(false),
+            (_, "V") => self.select_as(true),
 
             // A folded card opens; an open one folds. `Tab` because it is the key that toggles a
             // fold in every file tree and outliner; `za` for the Vim hands. See ADR 0033.
@@ -3400,13 +3496,31 @@ impl Host {
             // take something, and staying would mean pressing Esc every single time. Without one,
             // `y` has already been held as a pending operator above.
             (_, "y") if self.copy_selection(false) => self.leave_reading(),
+            // Anchored, but with the two ends in the same place: `v` and then `y` straight away.
+            // Unanchored, `y` never reaches here — it was held as a pending operator above — so
+            // this is only ever the empty selection, and silence there reads as a broken key.
+            (_, "y") => {
+                self.editor_message(MessageLevel::Warn, "nothing to copy — the selection is empty")
+            }
             (_, "Y") => self.yank_line(),
 
             // Back to typing, at the key every editor uses for it, because the usual reason to
             // stop reading is that you have thought of what to say.
             (KeyCode::Enter, _) | (_, "i") | (_, "a") | (_, "o") => self.leave_reading(),
-            // Esc gives up the search highlight first and the mode second: one press per thing you
-            // want to be rid of, in the order you stopped wanting them.
+            // Esc gives up one thing per press, in the order you stopped wanting them: the
+            // selection, then the search highlight, then the mode. A running selection is the most
+            // local of the three and the one you are most likely to have changed your mind about —
+            // half way up a turn, having decided you wanted a different piece of it. Leaving
+            // outright there is a keystroke that undoes the wrong amount: the transcript is the
+            // thing you were still reading.
+            (KeyCode::Esc, _) if self.chat_anchored() => {
+                self.reading_linewise = false;
+                let _ = self.editor.apply(&PluginId::from(BUILTIN), ApiCall::WinSelect {
+                    win: self.chat_win,
+                    on: false,
+                });
+                self.refresh_composer();
+            }
             (KeyCode::Esc, _) if !self.searched.is_empty() => {
                 self.searched.clear();
                 self.clear_matches();
@@ -3421,11 +3535,16 @@ impl Host {
     fn reading_pair(&mut self, first: char, key: &neosh_proto::KeyPress, ch: &str) {
         match (first, ch) {
             ('g', "g") => {
+                // Extends whenever a selection is running, exactly as `k` does. Shift alone would
+                // mean `v` then `gg` threw away what you had selected and jumped, which is the one
+                // thing nobody presses it for.
+                let select = key.mods.shift || self.chat_anchored();
                 let _ = self.editor.apply(&PluginId::from(BUILTIN), ApiCall::WinMotion {
                     win: self.chat_win,
                     motion: CursorMotion::BufStart,
-                    select: key.mods.shift,
+                    select,
                 });
+                self.resnap_linewise();
                 self.follow_cursor();
             }
             // Where the cursor's line sits on screen. `zz` is the one worth having: it is how you
@@ -3499,6 +3618,7 @@ impl Host {
             row: at.0,
             col: at.1,
         });
+        self.resnap_linewise();
         self.follow_cursor();
         self.refresh_composer();
     }
@@ -3585,22 +3705,80 @@ impl Host {
             .apply(&PluginId::from(BUILTIN), ApiCall::WinScrollTo { win: self.chat_win, top_line: top });
     }
 
-    /// Select the line the cursor is on, end to end.
-    fn select_line(&mut self) {
+    /// `v` and `V`: start a selection of that shape, change a running one into it, or — pressed on
+    /// the shape it already is — drop it.
+    ///
+    /// Vim's, and not out of nostalgia: a second `v` meaning "no longer selecting" is what every
+    /// hand expects, and having `V` restart from one line instead would throw away the four you had
+    /// just extended over.
+    fn select_as(&mut self, linewise: bool) {
         let plugin = PluginId::from(BUILTIN);
-        let _ = self.editor.apply(&plugin, ApiCall::WinSelect { win: self.chat_win, on: false });
-        let _ = self.editor.apply(&plugin, ApiCall::WinMotion {
+        match (self.chat_anchored(), self.reading_linewise == linewise) {
+            (true, true) => {
+                self.reading_linewise = false;
+                let _ = self
+                    .editor
+                    .apply(&plugin, ApiCall::WinSelect { win: self.chat_win, on: false });
+            }
+            // Between the two shapes, keeping both ends: `v` narrows a linewise selection back to
+            // where the cursor actually is, and `V` widens the one you have to whole lines.
+            (true, false) => {
+                self.reading_linewise = linewise;
+                self.resnap_linewise();
+            }
+            (false, _) => {
+                self.reading_linewise = linewise;
+                let _ = self
+                    .editor
+                    .apply(&plugin, ApiCall::WinSelect { win: self.chat_win, on: true });
+                self.resnap_linewise();
+            }
+        }
+        self.refresh_composer();
+    }
+
+    /// Put a `V` selection back onto whole lines, in whichever direction it now runs.
+    ///
+    /// There is one selection here and it is two positions, so linewise is not a mode the core
+    /// knows about — it is an invariant this end re-establishes after every motion. Downwards it
+    /// was already right by accident: the anchor sits at the start of the first line and the cursor
+    /// walks along the last. Extending *upwards* is what it was wrong for. The anchor stayed at the
+    /// start of the line `V` was pressed on and the cursor went above it, which makes that line the
+    /// *end* of a backwards range that stops at its first column — so the one line you definitely
+    /// meant is the one that dropped out, and the rows you moved over came in half-selected.
+    ///
+    /// Three calls because the anchor is only settable by standing on it, which is the whole of the
+    /// public API for a selection and exactly what a plugin doing this would have to write.
+    fn resnap_linewise(&mut self) {
+        if !self.reading_linewise {
+            return;
+        }
+        let Some(w) = self.editor.window(self.chat_win) else { return };
+        let cursor = w.cursor;
+        let Some(anchor) = w.anchor else { return };
+        let lines = self.chat_lines();
+        // Columns on the wire are UTF-8 byte offsets, so the end of a line is its byte length.
+        let end_of = |row: u32| lines.get(row as usize).map(|l| l.len() as u32).unwrap_or(0);
+        let (a, c) = if anchor.0 <= cursor.0 {
+            ((anchor.0, 0), (cursor.0, end_of(cursor.0)))
+        } else {
+            ((anchor.0, end_of(anchor.0)), (cursor.0, 0))
+        };
+        if (a, c) == (anchor, cursor) {
+            return;
+        }
+        let plugin = PluginId::from(BUILTIN);
+        let _ = self.editor.apply(&plugin, ApiCall::WinSetCursor {
             win: self.chat_win,
-            motion: CursorMotion::LineStart,
-            select: false,
+            row: a.0,
+            col: a.1,
         });
         let _ = self.editor.apply(&plugin, ApiCall::WinSelect { win: self.chat_win, on: true });
-        let _ = self.editor.apply(&plugin, ApiCall::WinMotion {
+        let _ = self.editor.apply(&plugin, ApiCall::WinSetCursor {
             win: self.chat_win,
-            motion: CursorMotion::LineEnd,
-            select: true,
+            row: c.0,
+            col: c.1,
         });
-        self.refresh_composer();
     }
 
     /// Copy some rows of the transcript, and say how many.
@@ -3956,6 +4134,12 @@ impl Host {
     /// the truth, and a switch that reconstructed the buffer from a log of edits would drift the
     /// moment anything else touched it.
     fn enter_session(&mut self) {
+        // First, and while the transcript being read is still the one on screen. Reading is a place
+        // *in* a conversation — a cursor at a row, a selection between two of them, a search
+        // highlight — and every one of those addresses text that is about to be replaced by
+        // somebody else's. Left running, the mode survives into a conversation it was never opened
+        // on, and the rows it names there are whatever happens to be at those numbers.
+        self.leave_reading();
         // Not closed: the buffer is about to be replaced wholesale, so settling an answer into rows
         // that are on their way out would write into the conversation being left behind.
         self.answer = None;
@@ -3992,6 +4176,24 @@ impl Host {
             lines,
         });
         self.draw_marks(&marks, 0);
+        // Where the window *is*, and not only what this end believes about it. `chat_top = 0` above
+        // says "following the tail"; the window has to be told, because it is still sitting at
+        // whatever row the last conversation was scrolled to — and a scroll offset is kept rather
+        // than derived, precisely so that a client attaching later can be told it. Read a long
+        // answer with `^S`, go up, come out, switch project: the new conversation was drawn from
+        // row two hundred of a transcript that no longer exists, which is to say it was blank.
+        //
+        // The cursor with it. Nothing draws a caret in the transcript while the composer has focus,
+        // but every question the reader asks — which card is under it, which turn, which block — is
+        // asked of a row number, and one left over from a longer conversation is off the end of a
+        // shorter one.
+        let _ = self
+            .editor
+            .apply(&plugin, ApiCall::WinScrollTo { win: self.chat_win, top_line: 0 });
+        let _ = self
+            .editor
+            .apply(&plugin, ApiCall::WinSetCursor { win: self.chat_win, row: 0, col: 0 });
+        let _ = self.editor.apply(&plugin, ApiCall::WinSelect { win: self.chat_win, on: false });
         let _ = self.editor.apply(&plugin, ApiCall::BufSetName {
             buf: self.chat,
             name: format!("[chat] {label}"),
@@ -4268,6 +4470,16 @@ impl Host {
         self.chat_row(row, &header);
         for (k, r) in body.iter().enumerate() {
             self.chat_row(row + 1 + k as u32, r);
+        }
+        // The one redraw that is an arrival rather than a redraw.
+        //
+        // Every mark on this row was just cleared and re-set, so the band is a mark the frontend
+        // has never seen — which is exactly what it keys the one-shot from. Guarded by `flashed`
+        // rather than by "is this the first time we settled", because the two are the same fact and
+        // only one of them survives a card being opened and folded again.
+        if self.cards[i].settled() && !self.cards[i].flashed {
+            self.cards[i].flashed = true;
+            self.chat_band(row, "Agent.ToolLanded");
         }
         let new_body = body.len() as u32;
         self.cards[i].body = new_body;
@@ -5095,6 +5307,11 @@ impl Host {
                     stop_reason,
                     usage,
                 });
+                // The one moment these numbers definitely moved. Asked for rather than done here:
+                // the vendor's own accounting lags the end of the stream by a second or two, and a
+                // poll at zero reliably returns the figure from *before* the turn — which draws as
+                // a turn that cost nothing at all.
+                self.quota_due = true;
                 if !leftover.is_empty() {
                     self.start_turn_in(session, Prompt {
                         text: leftover
@@ -5280,7 +5497,117 @@ impl Host {
                 }
                 self.persist_sessions();
             }
+            // Attributed to the *conversation's* instance, not to whatever the picker is showing.
+            // A workspace runs several conversations at once and they need not be on the same
+            // provider, so reading the active selection here would file `codex`'s weekly figure
+            // under the account you happen to have open.
+            Activity::Quota { plan, windows, credits } => {
+                let Some(instance) = self.instance_of(&session) else { return };
+                self.take_quota(
+                    instance,
+                    neosh_proto::QuotaSource::Turn,
+                    neosh_provider::quota::Quota { plan, windows, credits },
+                );
+            }
         }
+    }
+
+    /// Which configured instance a conversation is talking to.
+    ///
+    /// The conversation's own selection first, and the workspace's only as the fallback for one
+    /// that has not chosen. Getting this the other way round attributes every driver's report to
+    /// whichever row the model picker was last left on.
+    fn instance_of(
+        &self,
+        session: &neosh_proto::SessionId,
+    ) -> Option<neosh_proto::InstanceId> {
+        let chosen = {
+            let store = self.agent.sessions();
+            store.get(session).and_then(|s| s.selection.as_ref().map(|sel| sel.instance.clone()))
+        };
+        chosen.or_else(|| self.agent.selection().map(|sel| sel.instance))
+    }
+
+    /// Put a snapshot in the store, and tell everyone if it changed anything.
+    ///
+    /// One door, whatever the source: a plugin's provider, a mid-turn line and a poll all arrive
+    /// here. That is what makes a third-party provider's plan appear in the sidebar strip without
+    /// the sidebar having heard of that provider — the strip listens for the event, not the vendor.
+    fn take_quota(
+        &mut self,
+        instance: neosh_proto::InstanceId,
+        source: neosh_proto::QuotaSource,
+        quota: neosh_provider::quota::Quota,
+    ) {
+        let Some(snapshot) = self.quota.apply(instance, source, quota, now_secs()) else { return };
+        self.bridge.broadcast(PluginEvent::Quota { snapshot });
+    }
+
+    /// Whether a plugin registered the driver serving this instance.
+    ///
+    /// The gate on [`ApiCall::QuotaReport`]. Without it any plugin could publish any number for
+    /// `claude-cli`, and this strip is a thing people are going to look at before deciding whether
+    /// to spend an afternoon on something — a figure it is possible to spoof is a figure that
+    /// should not be drawn as fact.
+    fn plugin_drivers_own(
+        &self,
+        plugin: &PluginId,
+        instance: &neosh_proto::InstanceId,
+    ) -> bool {
+        let Some(drivers) = self.plugin_drivers.get(plugin) else { return false };
+        self.agent
+            .providers()
+            .instances()
+            .any(|cfg| &cfg.id == instance && drivers.contains(&cfg.driver))
+    }
+
+    /// Every instance this machine could actually ask, right now.
+    ///
+    /// Built from the configured instances rather than from a written list of vendors, so an
+    /// instance the user named something else — a second `claude-cli` pointed at another account —
+    /// is polled too. Whether it *can* answer is decided in the poll itself, which is where the
+    /// filesystem and `PATH` checks belong.
+    fn quota_targets(&self) -> Vec<crate::quota::Target> {
+        self.agent
+            .providers()
+            .usable_instances()
+            .filter_map(|cfg| {
+                let which = neosh_provider::quota::pollable(cfg.driver.0.as_str())?;
+                // The program to run is the one the instance says it authenticates with, which is
+                // also the one that owns the login being read. A default here would poll the
+                // `codex` on `PATH` for an instance pointed at a different build of it.
+                let program = match &cfg.auth {
+                    neosh_proto::AuthRef::Cli { program, .. } => program.clone(),
+                    _ => return None,
+                };
+                Some(crate::quota::Target { instance: cfg.id.clone(), which, program })
+            })
+            .collect()
+    }
+
+    /// Ask, off the host loop.
+    ///
+    /// Nothing is awaited here. A poll is a network round trip and a process spawn, and the host
+    /// loop is the single writer for the editor — awaiting one inside it freezes typing for as long
+    /// as somebody else's server takes to answer.
+    fn refresh_quota(&self, only: Option<neosh_proto::InstanceId>) {
+        // A poll reads the vendor CLI's own login to ask about the vendor's own account. That is
+        // the same trade the CLI drivers already make — neosh is useful the minute it is installed
+        // because it reuses a login you have — but it is somebody else's credential store, so it is
+        // a setting rather than a decision made on their behalf. Off, the gauges show what the last
+        // turn reported and say how long ago that was.
+        if self.editor.options().bool("usage.poll") == Some(false) {
+            return;
+        }
+        let mut targets = self.quota_targets();
+        if let Some(id) = only {
+            targets.retain(|t| t.instance == id);
+        }
+        if targets.is_empty() {
+            return;
+        }
+        let tx = self.quota_tx.clone();
+        tokio::spawn(crate::quota::poll(targets, tx));
     }
 
     async fn handle_script_out(&mut self, out: ScriptOutbound) {
@@ -5454,7 +5781,15 @@ impl Host {
                 self.compose(TextEdit::Insert { text });
             }
             InputEvent::ViewportChanged { win, width, height, top_line } => {
+                let was = self.chat_width();
                 self.editor.set_viewport(win, neosh_core::Viewport { width, height, top_line });
+                // This is where the host *learns* a width — `Resize` is the terminal's outer size
+                // and the transcript is some part of it. So anything drawn to a width has to be
+                // drawn again here, or a narrow terminal joining a wide workspace keeps the wide
+                // one's welcome until something unrelated happens to redraw it.
+                if win == self.chat_win && self.chat_width() != was {
+                    self.draw_welcome();
+                }
             }
             InputEvent::Attached { .. } => {
                 // A client that has never seen any of this. Whatever was queued was queued for
@@ -5512,7 +5847,7 @@ impl Host {
         mut self,
         mut script_rx: mpsc::UnboundedReceiver<ScriptOutbound>,
         mut agent_rx: mpsc::UnboundedReceiver<AgentEvent>,
-        mut input_rx: mpsc::UnboundedReceiver<InputEvent>,
+        mut input_rx: mpsc::UnboundedReceiver<(crate::views::ViewId, InputEvent)>,
     ) -> anyhow::Result<()> {
         // Send the initial state before anything else, so the frontend has a screen immediately.
         self.flush().await?;
@@ -5541,6 +5876,17 @@ impl Host {
         // which case `recv` on it is never ready and this costs a branch that is never taken.
         let mut swarm_rx = self.swarm_events.take();
 
+        // What a plan has left. A fourth deadline rather than a share of any of the others, for the
+        // same reason they are all separate: it answers a different question, on a scale of minutes
+        // rather than frames, and the answer is a network round trip. Armed immediately so the
+        // first screen has real numbers on it — a gauge that only appears after five minutes of
+        // sitting there is one nobody knows exists.
+        let mut quota_rx = self.quota_rx.take();
+        let plan = tokio::time::sleep(crate::quota::AFTER_TURN);
+        tokio::pin!(plan);
+        // How many times in a row a poll has come back with nothing. Doubles the wait each time.
+        let mut quota_backoff: u32 = 0;
+
         loop {
             tokio::select! {
                 Some(out) = script_rx.recv() => self.handle_script_out(out).await,
@@ -5552,7 +5898,7 @@ impl Host {
                     }
                 } => self.on_swarm_event(ev),
                 Some(ev) = agent_rx.recv() => self.handle_agent_event(ev),
-                Some(input) = input_rx.recv() => {
+                Some((view, input)) = input_rx.recv() => {
                     // A repaint changes nothing, so it must not go through the input path: the
                     // frontend is asking to draw the same state again while something on it moves.
                     // Answering with an empty batch is what makes an animation unable to
@@ -5561,7 +5907,12 @@ impl Host {
                         self.frontend.send(vec![UiEvent::Flush]).await?;
                         continue;
                     }
-                    if !self.handle_input(input) {
+                    // Set for the whole of handling, so anything this key reaches — a command, a
+                    // keymap, a plugin — can be answered in the terminal it was pressed in.
+                    self.from_view = view;
+                    let carry_on = self.handle_input(input);
+                    self.from_view = crate::views::ViewId::LOCAL;
+                    if !carry_on {
                         break;
                     }
                 }
@@ -5583,6 +5934,47 @@ impl Host {
                         self.drain_effects();
                     }
                 }
+                Some(polled) = async {
+                    match quota_rx.as_mut() {
+                        Some(rx) => rx.recv().await,
+                        // Never ready, rather than ready-with-nothing: the latter would spin.
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    match polled.quota {
+                        Some(quota) => {
+                            quota_backoff = 0;
+                            self.take_quota(
+                                polled.instance,
+                                neosh_proto::QuotaSource::Poll,
+                                quota,
+                            );
+                        }
+                        // Asked and not answered. Slow down, and slow down hard when the vendor was
+                        // explicit about it: the endpoint that reports rate limits has one of its
+                        // own, and a poller that keeps its cadence through a 429 is a gauge added
+                        // to avoid hitting limits that is itself hitting one.
+                        None => {
+                            quota_backoff = if polled.throttled {
+                                (quota_backoff + 1).max(3)
+                            } else {
+                                quota_backoff + 1
+                            };
+                            let wait = crate::quota::IDLE_INTERVAL
+                                .saturating_mul(1u32 << quota_backoff.min(6))
+                                .min(crate::quota::MAX_BACKOFF);
+                            plan.as_mut().reset(Instant::now() + wait);
+                        }
+                    }
+                }
+                () = &mut plan => {
+                    self.refresh_quota(None);
+                    // Reset unconditionally, and to the idle interval whichever branch armed it.
+                    // A turn ending shortens the *next* wait only; leaving it short afterwards
+                    // would poll every five seconds forever after the first turn.
+                    self.quota_due = false;
+                    plan.as_mut().reset(Instant::now() + crate::quota::IDLE_INTERVAL);
+                }
                 else => break,
             }
 
@@ -5591,10 +5983,10 @@ impl Host {
             }
             // The viewer asked to leave. The workspace does not: this is the whole difference
             // between closing a window and stopping the work in it.
-            if std::mem::take(&mut self.detaching) {
+            if let Some(view) = self.detaching.take() {
                 self.persist_sessions();
                 self.flush().await?;
-                self.frontend.detach().await?;
+                self.frontend.detach(view).await?;
                 self.report_live_now();
             }
             if std::mem::take(&mut self.keys_touched) {
@@ -5607,6 +5999,11 @@ impl Host {
             if self.working && !ticking {
                 clock.as_mut().reset(Instant::now() + Duration::from_secs(1));
                 ticking = true;
+            }
+            // A turn is the only thing that moves these numbers by an amount worth redrawing for,
+            // so the poll that matters is the one just after one ends.
+            if std::mem::take(&mut self.quota_due) {
+                plan.as_mut().reset(Instant::now() + crate::quota::AFTER_TURN);
             }
             if self.editor.has_pending_ui() && !armed {
                 idle.as_mut().reset(Instant::now() + COALESCE);
@@ -5642,6 +6039,11 @@ impl Host {
         self.state_dir = Some(dir.clone());
         self.pstate = crate::pstate::PluginState::new(Some(dir.clone()));
         self.vars = crate::vars::Vars::new(Some(dir.clone()));
+        // The sampled percentages, which are the only record anywhere of what a plan looked like an
+        // hour ago. Loaded here rather than at construction because this is where the workspace
+        // finds out it has a state directory at all — under `--clean` it never does, and the
+        // history is then in memory for as long as the process lives and nowhere afterwards.
+        self.quota = crate::quota::QuotaStore::new(Some(&dir));
 
         let (saved, active) = crate::sessions::load(&dir);
         if saved.is_empty() {
@@ -6117,14 +6519,23 @@ impl Host {
             "config.reload" => self.reload_config(),
             "quit" => match self.on_quit {
                 OnQuit::Stop => self.quitting = true,
-                OnQuit::Detach => self.detaching = true,
+                OnQuit::Detach => self.detaching = Some(self.from_view),
             },
             "stop" => self.quitting = true,
             "interrupt" => self.interrupt(),
             "chat.scroll_up" => self.scroll_chat(-1),
             "chat.scroll_down" => self.scroll_chat(1),
             "chat.scroll_end" => self.scroll_chat(0),
-            "chat.read" => self.enter_reading(),
+            // A toggle, because it is the door and a door opens both ways. Pressed while already
+            // reading it used to do nothing at all, which for the one key bound in *every* mode is
+            // the wrong answer — that set exists so there is always something that works.
+            "chat.read" => {
+                if self.reading {
+                    self.leave_reading();
+                } else {
+                    self.enter_reading();
+                }
+            }
             // Sending while a turn runs *queues*, which is the right default and is also the one
             // send you cannot take back by pressing anything. Enter is a decision made in half a
             // second about a sentence you were still writing; this is the other half of it.
@@ -6972,6 +7383,10 @@ async fn run_slow(svc: Services, call: ApiCall) -> ApiResult {
         // configured provider, and doing it inline freezes typing for as long as it takes.
         ApiCall::AgentListModels { instance, refresh } => svc.list_models(instance, refresh).await,
         ApiCall::PermissionCheck { capability } => svc.permission_check(capability).await,
+        ApiCall::AskUser { questions } => svc.ask_user(questions).await,
+        ApiCall::UsageHistory { since, until, resolution, time_zone } => {
+            svc.usage_history(since, until, resolution, time_zone).await
+        }
         other => Err(ApiError::Internal {
             message: format!("{other:?} is not a background call"),
         }),

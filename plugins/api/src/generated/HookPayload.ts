@@ -2,11 +2,14 @@
 import type { BufferId } from "./BufferId";
 import type { Capability } from "./Capability";
 import type { PermissionOption } from "./PermissionOption";
+import type { QuestionAnswer } from "./QuestionAnswer";
+import type { SessionId } from "./SessionId";
 import type { StopReason } from "./StopReason";
 import type { ToolCall } from "./ToolCall";
 import type { ToolResult } from "./ToolResult";
 import type { TurnId } from "./TurnId";
 import type { Usage } from "./Usage";
+import type { UserQuestion } from "./UserQuestion";
 
 export type HookPayload =
   | { "hook": "tool_pre"; call: ToolCall }
@@ -40,4 +43,28 @@ export type HookPayload =
      * carrying this payload back — that is how an answer richer than yes-or-no gets home.
      */
     chosen?: string;
+  }
+  | {
+    "hook": "ask_user";
+    /**
+     * Which conversation is asking. A workspace runs several turns at once and only one of
+     * them is on screen, so a panel that assumed "the one in front of you" would put another
+     * conversation's question over the one you are reading.
+     */
+    session?: SessionId;
+    turn?: TurnId;
+    /**
+     * Where the turn is running, so a question about a file can be read against the right
+     * tree.
+     */
+    cwd: string;
+    questions: Array<UserQuestion>;
+    /**
+     * The answers. Set by the hook, in a [`HookOutcome::Modify`] carrying this payload back —
+     * the same way [`Self::PermissionPre::chosen`] comes home.
+     *
+     * `None` means nobody has answered yet. An empty list is not the same thing and is read as
+     * a refusal: it is what a hook that ran and declined to ask anybody returns.
+     */
+    answers?: Array<QuestionAnswer>;
   };

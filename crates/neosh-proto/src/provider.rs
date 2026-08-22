@@ -756,6 +756,23 @@ pub enum Activity {
         #[ts(type = "number")]
         total: u64,
     },
+    /// What the account behind this driver has left on its plan.
+    ///
+    /// An account of the driver's own circumstances rather than a content block, which is what puts
+    /// it here: `claude` says so on a `rate_limit_event` line, `codex app-server` on an
+    /// `account/rateLimits/updated` notification, and neither is anything the turn produced. The
+    /// receiver's job is to *keep* it — a percentage is only reported while a turn runs, and the
+    /// question it answers is asked with nothing running.
+    ///
+    /// Whole every time. Every source of these reports the complete set, and a patched percentage
+    /// is one that can be wrong forever without anything noticing.
+    Quota {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        plan: Option<String>,
+        windows: Vec<crate::quota::QuotaWindow>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        credits: Option<crate::quota::QuotaCredits>,
+    },
 }
 
 /// Normalized streaming events.

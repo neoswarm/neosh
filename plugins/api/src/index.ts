@@ -66,8 +66,22 @@ import type { PermissionDecision } from "./generated/PermissionDecision";
 import type { PermissionMode } from "./generated/PermissionMode";
 import type { PermissionOption } from "./generated/PermissionOption";
 import type { PermissionOptionKind } from "./generated/PermissionOptionKind";
+import type { QuestionAnswer } from "./generated/QuestionAnswer";
+import type { QuestionOption } from "./generated/QuestionOption";
+import type { UserQuestion } from "./generated/UserQuestion";
 import type { PluginEvent } from "./generated/PluginEvent";
 import type { Pricing } from "./generated/Pricing";
+import type { QuotaCredits } from "./generated/QuotaCredits";
+import type { QuotaSample } from "./generated/QuotaSample";
+import type { QuotaSeverity } from "./generated/QuotaSeverity";
+import type { QuotaSnapshot } from "./generated/QuotaSnapshot";
+import type { QuotaSource } from "./generated/QuotaSource";
+import type { QuotaWindow } from "./generated/QuotaWindow";
+import type { UsageBucket } from "./generated/UsageBucket";
+import type { UsageHistory } from "./generated/UsageHistory";
+import type { UsageResolution } from "./generated/UsageResolution";
+import type { UsageScanSource } from "./generated/UsageScanSource";
+import type { CostBasis } from "./generated/CostBasis";
 import type { DriverCommand } from "./generated/DriverCommand";
 import type { PlanState } from "./generated/PlanState";
 import type { PlanStep } from "./generated/PlanStep";
@@ -118,6 +132,9 @@ export type {
   OptionChoice, OptionEntry, OptionSelection, OptionSpec, OptionType, OptionValue,
   DriverCommand, PlanState, PlanStep, TaskId, TaskStatus,
   Message, PermissionDecision, PermissionMode, PermissionOption, PermissionOptionKind, PluginEvent, Pricing, ProviderEvent, ProviderOptionDescriptor,
+  QuestionAnswer, QuestionOption, UserQuestion,
+  CostBasis, QuotaCredits, QuotaSample, QuotaSeverity, QuotaSnapshot, QuotaSource, QuotaWindow,
+  UsageBucket, UsageHistory, UsageResolution, UsageScanSource,
   Rect, RepoInfo, RepoStatus, SessionId, SessionInfo, StatusAlign, StatusSegment, StopReason,
   SurfaceCell, SurfaceId, TextEdit, ToolCall, ToolDef, ToolResult, TurnRequest, Usage,
   NodeCapabilities, NodeId, NodeInfo, ProjectKey, RemoteProject, StreamEvent,
@@ -308,6 +325,22 @@ export interface MarkOptions {
   priority?: number;
 }
 
+/** One mark of a {@link DrawnRow}, positioned on that row. */
+export interface DrawnMark {
+  /**
+   * UTF-8 byte offset into the row's text — the unit every column on the wire uses. Build it with
+   * {@link byteLength}, never `.length`.
+   */
+  col: number;
+  opts?: MarkOptions;
+}
+
+/** One row of a repaint: its text, and everything drawn on it. */
+export interface DrawnRow {
+  text: string;
+  marks?: DrawnMark[];
+}
+
 export interface FloatOptions {
   anchor?: FloatConfig["anchor"];
   offset?: { row: number; col: number };
@@ -348,6 +381,7 @@ export interface Neosh {
   readonly ext: ExtensionApi;
   readonly event: EventApi;
   readonly swarm: SwarmApi;
+  readonly quota: QuotaApi;
   readonly rtp: RuntimePathApi;
   readonly path: PathApi;
   readonly timer: TimerApi;
@@ -356,6 +390,22 @@ export interface Neosh {
   notify(message: string, level?: MessageLevel): void;
   /** Ask the host whether a side effect is allowed. */
   permit(capability: Capability): Promise<PermissionDecision>;
+  /**
+   * Ask the *person* a question, and wait for the answer.
+   *
+   * Not a permission and not a picker. A permission asks whether something may happen and policy
+   * can answer it without waking anybody; a picker is a list you opened. This is the panel an agent
+   * gets when it asks you which library, which approach, which of these to enable — several
+   * questions in one sitting, some of them taking more than one answer, any of them answerable with
+   * something nobody listed.
+   *
+   * Whatever serves the `ask_user` hook draws it, so your question and the agent's look the same
+   * and a plugin that replaces the panel replaces both.
+   *
+   * `null` is *nobody answered* — dismissed, or timed out. Not an error: treating it as one means
+   * reporting a failure every time somebody presses `<Esc>`.
+   */
+  ask(questions: UserQuestion[]): Promise<QuestionAnswer[] | null>;
   /**
    * What the agent is allowed to do without asking, and how to change it.
    *
@@ -388,6 +438,28 @@ export interface BufferApi {
    * `setLines(buf, 0, -1, lines)` replaces the buffer; `setLines(buf, -1, -1, lines)` appends.
    */
   setLines(buf: BufferId, start: number, end: number, lines: string[]): Promise<void>;
+  /**
+   * Replace a range of rows **and** `ns`'s marks on them, in one call. What a panel should use to
+   * draw itself.
+   *
+   * The atomic form of `setLines` + `ns.clear` + a `ns.mark` per mark. That sequence is correct at
+   * rest and wrong in flight: each call is a round trip, the frontend draws on a ~16 ms deadline
+   * that knows nothing about how far through a repaint you are, and a frame landing after the clear
+   * draws every row with no marks at all — in `Normal`, which is near-white. A dim panel redrawing
+   * ten times a second flashes bright. This has no halfway state to observe, and costs one round
+   * trip instead of one per mark.
+   *
+   * Indices resolve as {@link setLines}'s do, and the clear covers exactly the rows written — so a
+   * partial repaint leaves the rest of the panel alone. Other namespaces are untouched, which is
+   * what lets an overlay survive the panel under it redrawing.
+   */
+  render(
+    buf: BufferId,
+    ns: NamespaceId,
+    start: number,
+    end: number,
+    rows: DrawnRow[],
+  ): Promise<void>;
   /** Append to the final line without resending it. The streaming fast path. */
   appendText(buf: BufferId, text: string): Promise<void>;
   setName(buf: BufferId, name: string): Promise<void>;
@@ -1064,6 +1136,81 @@ export interface EventApi {
  * Empty and harmless when no swarm is configured, which is the default. A plugin that draws remote
  * agents needs no special case for the single-machine setup — `nodes()` is simply empty.
  */
+/**
+ * What the plan has left, and what the week went on.
+ *
+ * Two questions that look alike and are not. {@link list} is *now* — an opaque fraction of an
+ * allowance the vendor enforces, which is the number that decides whether to start something.
+ * {@link usage} is *history* — tokens and their money-equivalent, read out of the vendor CLIs' own
+ * transcripts, which is the number that explains where the week went. Neither converts into the
+ * other, and a chart that put them on one axis would be inventing an exchange rate.
+ *
+ * Everything here is data. Nothing in this API draws, which is what makes the bundled strip
+ * replaceable by a panel of your own that reads exactly the same calls.
+ */
+export interface QuotaApi {
+  /**
+   * The latest snapshot for every instance that has one, freshest observation first.
+   *
+   * Answers from what the workspace kept rather than by asking a vendor, so it costs nothing and is
+   * safe to call on every redraw. `observed_at` is how stale each one is — draw it, because a
+   * percentage with no age on it is one people will trust for longer than they should.
+   */
+  list(): Promise<QuotaSnapshot[]>;
+  /**
+   * Ask the vendor now, for one instance or for every instance that can be asked.
+   *
+   * Resolves as soon as the request is *made*. A poll is a network round trip or a process spawn,
+   * so a panel that awaited the answer would be a panel that opens late; the answer arrives at
+   * {@link onChange}, the same way an unprompted one does, so there is one code path rather than
+   * two.
+   */
+  refresh(instance?: string): Promise<void>;
+  /**
+   * Publish a snapshot for an instance your own driver serves.
+   *
+   * The other half of {@link ProviderApi.register}: a provider written as a plugin knows its
+   * vendor's allowance and nothing in the workspace does. Reported this way it is kept, sampled,
+   * broadcast and drawn exactly like a built-in one. Rejects for an instance your plugin did not
+   * register a driver for — a figure anybody could spoof is not one this should draw as fact.
+   */
+  report(snapshot: QuotaSnapshot): Promise<void>;
+  /**
+   * Every percentage this workspace has seen in a span, so a gauge can be a line.
+   *
+   * `since` and `until` are unix **seconds**, `until` exclusive. Sampled on change, so the points
+   * are unevenly spaced and the gaps are real: a stretch with no samples is a stretch where the
+   * machine was off, and drawing a straight line across it invents usage that did not happen.
+   */
+  history(opts: { since: number; until: number; instance?: string }): Promise<QuotaSample[]>;
+  /**
+   * Tokens and their money-equivalent over a span, from the vendor CLIs' transcripts.
+   *
+   * Not from this workspace's conversations: a turn you ran in `claude` directly spent the same
+   * allowance, and a history that could not see it would answer a different question. Reads
+   * thousands of files, so this is a call a panel makes when it opens — never one it makes on a
+   * redraw.
+   *
+   * `cost_usd` is what those tokens would cost at API rates. It is not money spent: a subscription
+   * bills separately. Check `fully_priced` before putting a currency symbol in a heading.
+   */
+  usage(opts: {
+    since: number;
+    until: number;
+    resolution: UsageResolution;
+    /** IANA zone to bucket days in. Defaults to this machine's. */
+    timeZone?: string;
+  }): Promise<UsageHistory>;
+  /**
+   * Any account's allowance changed, whatever moved it: a driver reporting mid-turn, a poll
+   * landing, a plugin publishing its own.
+   *
+   * One thing to listen to instead of knowing which vendors exist — which is what lets a strip draw
+   * a provider that shipped after it did.
+   */
+  onChange(cb: (snapshot: QuotaSnapshot) => void): Disposable;
+}
+
 export interface SwarmApi {
   /** This machine, or `null` when the swarm is not running. */
   self(): Promise<NodeInfo | null>;
@@ -1199,6 +1346,7 @@ interface Registered {
   activityListeners: Array<(e: { session: SessionId; turn: string; activity: Activity }) => void>;
   varListeners: Array<(e: { scope: VarScope; key: string; value: unknown }) => void>;
   swarmListeners: Array<() => void>;
+  quotaListeners: Array<(snapshot: QuotaSnapshot) => void>;
   swarmStreamListeners: Array<
     (e: { node: NodeId; session: string; event: StreamEvent }) => void
   >;
@@ -1237,6 +1385,7 @@ function reg(plugin: string): Registered {
       activityListeners: [],
       varListeners: [],
       swarmListeners: [],
+      quotaListeners: [],
       swarmStreamListeners: [],
       contributionListeners: [],
       eventListeners: new Map(),
@@ -1312,6 +1461,9 @@ export function __createContext(plugin: string, config: unknown, version: number
     },
     async permit(capability) {
       return expect(await c({ call: "permission_check", capability }), "permission").decision;
+    },
+    async ask(questions) {
+      return expect(await c({ call: "ask_user", questions }), "answers").answers ?? null;
     },
     opt: {
       async declare(spec) {
@@ -1460,6 +1612,39 @@ export function __createContext(plugin: string, config: unknown, version: number
         return listener(r.swarmStreamListeners, cb);
       },
     },
+    quota: {
+      async list() {
+        return expect(await c({ call: "quota_list" }), "quotas").quotas;
+      },
+      async refresh(instance) {
+        await c({ call: "quota_refresh", instance: instance ?? null });
+      },
+      async report(snapshot) {
+        await c({ call: "quota_report", snapshot });
+      },
+      async history(opts) {
+        const got = await c({
+          call: "quota_history",
+          instance: opts.instance ?? null,
+          since: opts.since,
+          until: opts.until,
+        });
+        return expect(got, "quota_history").samples;
+      },
+      async usage(opts) {
+        const got = await c({
+          call: "usage_history",
+          since: opts.since,
+          until: opts.until,
+          resolution: opts.resolution,
+          time_zone: opts.timeZone ?? null,
+        });
+        return expect(got, "usage_history").history;
+      },
+      onChange(cb) {
+        return listener(r.quotaListeners, cb);
+      },
+    },
     event: {
       async emit(name, data) {
         await c({ call: "event_emit", name, data: data ?? null });
@@ -1553,6 +1738,19 @@ export function __createContext(plugin: string, config: unknown, version: number
       },
       async setLines(buf, start, end, lines) {
         await c({ call: "buf_set_lines", buf, start, end, lines });
+      },
+      async render(buf, ns, start, end, rows) {
+        await c({
+          call: "buf_render",
+          buf,
+          ns,
+          start,
+          end,
+          lines: rows.map((r) => ({
+            text: r.text,
+            marks: (r.marks ?? []).map((m) => ({ col: m.col, ...markOpts(m.opts) })),
+          })),
+        });
       },
       async appendText(buf, text) {
         await c({ call: "buf_append_text", buf, text });
@@ -2139,6 +2337,9 @@ export async function __dispatch(plugin: string, msg: Record<string, unknown>): 
       case "var_changed":
         for (const cb of r.varListeners)
           cb({ scope: ev.scope, key: ev.key, value: ev.value });
+        break;
+      case "quota":
+        for (const cb of [...r.quotaListeners]) cb(ev.snapshot);
         break;
       case "swarm_changed":
         for (const cb of [...r.swarmListeners]) cb();

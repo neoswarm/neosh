@@ -282,13 +282,80 @@ pub enum Animation {
         #[ts(type = "number")]
         period_ms: u32,
     },
+    /// The run is *replaced* by successive glyphs — a spinner.
+    ///
+    /// The one animation that changes what is drawn rather than what colour it is, and the only
+    /// one whose run has to be a single glyph: the frontend clips or pads each frame to the
+    /// display width of the text underneath, so a spinner can never shift the column after it
+    /// however badly chosen its frames are. The buffer still holds the glyph the writer wrote,
+    /// which is what `^S` searches and what a yank copies out — a frame is what a cell *looks*
+    /// like for a sixteenth of a second, not what the line says.
+    ///
+    /// Which glyphs, though, is the frontend's: a frame set travels as a name because the sets
+    /// that read well are the ones drawn from a font the terminal actually has, and a plugin
+    /// picking codepoints cannot know that. Every set has an ASCII fallback for the terminals
+    /// that would otherwise draw a column of replacement characters.
+    Frames {
+        set: FrameSet,
+        /// One full cycle through the set, in milliseconds.
+        #[ts(type = "number")]
+        period_ms: u32,
+    },
+    /// One brightening, once, and then never again — what a row does the moment it lands.
+    ///
+    /// The only animation here that is not a function of the clock alone: "once" needs a moment to
+    /// count from, and the moment is the first time the frontend saw the mark carrying it. Which
+    /// makes the mark the unit — an extmark is created once, so a flash fires once, and scrolling
+    /// the row away and back does not fire it again.
+    ///
+    /// Meant for [`ExtmarkOpts::line_hl_group`], where it lifts every span on the row together.
+    /// On a ranged group it lifts that run alone, which is legible but rarely what you want: a
+    /// card that landed is one event, not four coloured pieces that each had an idea.
+    Flash {
+        /// How long the lift takes to fall back to nothing.
+        #[ts(type = "number")]
+        ms: u32,
+    },
+}
+
+/// The glyphs a [`Animation::Frames`] cycles through.
+///
+/// Named rather than carried, so the frontend can answer the two questions a plugin cannot: what
+/// this terminal can draw, and how wide it comes out. Adding one here is adding it for everybody.
+#[derive(TS, Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug, Default)]
+#[serde(rename_all = "snake_case")]
+#[ts(export)]
+pub enum FrameSet {
+    /// `⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏` — the quietest of these at a small size, and the default for that reason.
+    #[default]
+    Braille,
+    /// `⠁⠂⠄⡀⢀⠠⠐⠈` — one dot orbiting. Slower to read as motion, quieter still.
+    Dots,
+    /// `▁▂▃▄▅▆▇▆▅▄▃▂` — a bar breathing. The loudest, for something that wants finding.
+    Bars,
+    /// `◐◓◑◒` — a half-disc turning.
+    Arc,
+    /// `▖▘▝▗` — a corner walking around a cell.
+    Corners,
 }
 
 impl Animation {
     pub fn period_ms(self) -> u32 {
         match self {
-            Self::Shimmer { period_ms } | Self::Pulse { period_ms } => period_ms.max(50),
+            Self::Shimmer { period_ms } | Self::Pulse { period_ms } | Self::Frames { period_ms, .. } => {
+                period_ms.max(50)
+            }
+            Self::Flash { ms } => ms.max(50),
         }
+    }
+
+    /// Whether this animation runs for ever, or fires once and is over.
+    ///
+    /// What decides whether a frame being drawn is a reason to ask for another one. A flash that
+    /// has finished must stop costing frames, or an idle transcript full of landed cards keeps the
+    /// ticker alive for ever.
+    pub fn repeats(self) -> bool {
+        !matches!(self, Self::Flash { .. })
     }
 }
 
@@ -437,6 +504,33 @@ pub struct LineRender {
     pub text: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub marks: Vec<ExtmarkRender>,
+}
+
+/// One line of a repaint on the way *in*: text, and the marks to put on it.
+///
+/// The inbound twin of [`LineRender`], and deliberately the same shape. A panel that draws itself
+/// hands over rows, not a script of mutations — see [`ApiCall::BufRender`](crate::ApiCall::BufRender)
+/// for why the script was the bug.
+///
+/// No `ns` or `id` per mark: the namespace is the call's, and an id is a handle for deleting one
+/// mark later, which is not a thing a wholesale repaint ever does — it clears by namespace and
+/// writes the lot again.
+#[derive(TS, Serialize, Deserialize, Clone, PartialEq, Eq, Debug, Default)]
+#[ts(export)]
+pub struct LineDraw {
+    pub text: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub marks: Vec<MarkDraw>,
+}
+
+/// One mark of a [`LineDraw`], positioned on that line.
+#[derive(TS, Serialize, Deserialize, Clone, PartialEq, Eq, Debug, Default)]
+#[ts(export)]
+pub struct MarkDraw {
+    /// UTF-8 byte offset into the line's text, as every column on this wire is.
+    pub col: u32,
+    #[serde(flatten)]
+    pub opts: ExtmarkOpts,
 }
 
 // ---------------------------------------------------------------------------

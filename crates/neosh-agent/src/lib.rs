@@ -13,7 +13,7 @@ pub mod store;
 pub mod tools;
 pub mod turn;
 
-pub use agent::{Agent, AgentEvent, DriverAsker, TurnOutcome};
+pub use agent::{Agent, AgentEvent, DriverAsker, DriverQuestioner, Fanout, TurnOutcome};
 pub use hooks::HookRegistry;
 pub use permission::PermissionLayer;
 pub use session::{Prompt, Session};

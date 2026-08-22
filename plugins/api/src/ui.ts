@@ -16,10 +16,13 @@ import { byteLength, byteOffsets, clipToWidth, padToWidth, width } from "@neosh/
 import type {
   BufferId,
   Disposable,
+  DrawnMark,
+  DrawnRow,
   FileChange,
   FileState,
   FloatOptions,
   KeyContext,
+  MarkOptions,
   Neosh,
   WindowId,
 } from "@neosh/api";
@@ -617,16 +620,16 @@ export async function picker<T>(
       while (lines.length < hintLine) lines.push("");
       lines.push(` ${hints}`);
     }
-    await neosh.buf.setLines(buf, 0, -1, lines);
+    // Marks are collected against their row and handed over with the text, in one call. Set one at
+    // a time they were a sequence the frontend could draw the middle of: the moment the clear had
+    // landed and the marks had not, every row drew unmarked — in `Normal`, which is near-white.
+    const drawn: DrawnRow[] = lines.map((text) => ({ text, marks: [] }));
+    const mark = (line: number, col: number, o: MarkOptions) => {
+      drawn[line]?.marks!.push({ col, opts: o });
+    };
 
-    // Marks are reapplied rather than moved: the buffer was just replaced, so there is nothing to
-    // move, and clearing first keeps a stale highlight from surviving a filter that shortened it.
-    await neosh.ns.clear(ns, buf);
     if (hintLine >= 0) {
-      await neosh.ns.mark(ns, buf, hintLine, 0, {
-        hlGroup: "Sidebar.Dim",
-        endCol: byteLength(lines[hintLine] ?? ""),
-      });
+      mark(hintLine, 0, { hlGroup: "Sidebar.Dim", endCol: byteLength(lines[hintLine] ?? "") });
     }
     const listTop = (opts.title ? 1 : 0) + (filtering ? 1 : 0);
     for (let i = 0; i < window.length; i++) {
@@ -635,14 +638,14 @@ export async function picker<T>(
       const isCursor = row.index === visible[cursor]?.index;
       const eol = byteLength(lines[line] ?? "");
       if (isCursor) {
-        await neosh.ns.mark(ns, buf, line, 0, { hlGroup: "Picker.Selected", endCol: eol });
+        mark(line, 0, { hlGroup: "Picker.Selected", endCol: eol });
       }
       const icon = iconFor(row.item);
       const marker = byteLength(isCursor ? CURSOR_MARKER : BLANK_MARKER);
       // The icon is painted before the match runs, and at no priority: a match highlight over the
       // label is the thing the eye is looking for, and nothing here should be able to outrank it.
       if (row.item.icon && row.item.hl) {
-        await neosh.ns.mark(ns, buf, line, marker, {
+        mark(line, marker, {
           hlGroup: row.item.hl,
           endCol: marker + byteLength(row.item.icon),
         });
@@ -655,22 +658,23 @@ export async function picker<T>(
         // A match position past the label came from `keywords`, which is filtered on but not
         // shown; there is nothing on screen to highlight.
         if (start === undefined || end === undefined) continue;
-        await neosh.ns.mark(ns, buf, line, prefix + start, {
+        mark(line, prefix + start, {
           hlGroup: "Picker.Match",
           endCol: prefix + end,
           priority: 200,
         });
       }
       if (row.item.detail) {
-        await neosh.ns.mark(ns, buf, line, prefix + byteLength(row.item.label), {
+        mark(line, prefix + byteLength(row.item.label), {
           hlGroup: "Picker.Detail",
           endCol: eol,
         });
       }
     }
     if (opts.title) {
-      await neosh.ns.mark(ns, buf, 0, 0, { hlGroup: "Float.Title", endCol: byteLength(opts.title) });
+      mark(0, 0, { hlGroup: "Float.Title", endCol: byteLength(opts.title) });
     }
+    await neosh.buf.render(buf, ns, 0, -1, drawn);
 
     // The caret goes where you are typing. Without this the terminal cursor stays parked at the
     // top-left of the float and the field reads as inert — you type and nothing appears to be
@@ -941,19 +945,20 @@ export async function confirm(
     answers.forEach((a, i) => lines.push(`${i === cursor ? `${CURSOR_MARKER}` : BLANK_MARKER}${a}`));
     lines.push("");
     lines.push(` ${strip}`);
-    await neosh.buf.setLines(buf, 0, -1, lines);
+    // Text and marks together, in one call: this is redrawn on every keystroke, and a repaint the
+    // frontend can draw the middle of is one that flashes — unmarked rows draw in `Normal`. It also
+    // takes care of the older half of the same bug, that a mark whose line was replaced under it
+    // clamps rather than dies, so rows would end up wearing the colours of the ones before.
+    const drawn: DrawnRow[] = lines.map((text) => ({ text, marks: [] }));
+    const mark = (line: number, col: number, o: MarkOptions) => {
+      drawn[line]?.marks!.push({ col, opts: o });
+    };
 
-    // Cleared first: this is redrawn on every keystroke, and a mark whose line was replaced under it
-    // clamps rather than dies — so the rows would end up wearing the colours of the ones before.
-    await neosh.ns.clear(ns, buf);
     for (let i = 0; i < asked.length; i++) {
-      await neosh.ns.mark(ns, buf, i, 0, {
-        hlGroup: "Title",
-        endCol: byteLength(lines[i] ?? ""),
-      });
+      mark(i, 0, { hlGroup: "Title", endCol: byteLength(lines[i] ?? "") });
     }
     for (let i = 0; i < detail.length; i++) {
-      await neosh.ns.mark(ns, buf, detailAt + i, 0, {
+      mark(detailAt + i, 0, {
         hlGroup: "Comment",
         endCol: byteLength(lines[detailAt + i] ?? ""),
       });
@@ -964,19 +969,17 @@ export async function confirm(
       // whatever colour said what it was. A ranged group here would leave the destructive row
       // looking exactly like the safe one for as long as the cursor is on it.
       if (i === cursor) {
-        await neosh.ns.mark(ns, buf, line, 0, { lineHlGroup: "Picker.Selected" });
+        mark(line, 0, { lineHlGroup: "Picker.Selected" });
       }
       if (opts.dangerous && i === 0) {
-        await neosh.ns.mark(ns, buf, line, byteLength(BLANK_MARKER), {
+        mark(line, byteLength(BLANK_MARKER), {
           hlGroup: "Diagnostic.Error",
           endCol: byteLength(lines[line] ?? ""),
         });
       }
     }
-    await neosh.ns.mark(ns, buf, stripAt, 0, {
-      hlGroup: "Sidebar.Dim",
-      endCol: byteLength(lines[stripAt] ?? ""),
-    });
+    mark(stripAt, 0, { hlGroup: "Sidebar.Dim", endCol: byteLength(lines[stripAt] ?? "") });
+    await neosh.buf.render(buf, ns, 0, -1, drawn);
     // The caret marks the answer, since there is nothing here to type into.
     await neosh.win.setCursor(win, answersAt + cursor, 0);
   };
@@ -1608,40 +1611,42 @@ export class CursoredList<T = unknown> {
    * list claims an attention it does not have, and two visible cursors is worse than none.
    */
   async render(opts: { showCursor?: boolean; win?: WindowId } = {}): Promise<void> {
-    await this.neosh.buf.setLines(this.buf, 0, -1, this.rows.map((r) => r.text));
-    await this.neosh.ns.clear(this.ns, this.buf);
-
     const cursorHl = this.opts.cursorHl ?? "Sidebar.Selected";
-    for (let i = 0; i < this.rows.length; i++) {
-      const row = this.rows[i]!;
+    const drawn: DrawnRow[] = this.rows.map((row, i) => {
       const eol = byteLength(row.text);
+      const marks: DrawnMark[] = [];
       if (opts.showCursor !== false && i === this.cursor && eol > 0) {
-        await this.neosh.ns.mark(this.ns, this.buf, i, 0, {
-          hlGroup: cursorHl,
-          endCol: eol,
-          priority: 200,
-        });
+        marks.push({ col: 0, opts: { hlGroup: cursorHl, endCol: eol, priority: 200 } });
       }
       if (row.hl && eol > 0) {
-        await this.neosh.ns.mark(this.ns, this.buf, i, 0, { hlGroup: row.hl, endCol: eol });
+        marks.push({ col: 0, opts: { hlGroup: row.hl, endCol: eol } });
       }
       // Above the row's own highlight, below the cursor's 200: a marker keeps its colour on an
       // ordinary row and yields to the selection, which is the row the eye is already on.
       for (const s of row.spans ?? []) {
         if (s.to <= s.from || s.from >= eol) continue;
-        await this.neosh.ns.mark(this.ns, this.buf, i, s.from, {
-          hlGroup: s.hl,
-          endCol: Math.min(s.to, eol),
-          priority: 100,
+        marks.push({
+          col: s.from,
+          opts: { hlGroup: s.hl, endCol: Math.min(s.to, eol), priority: 100 },
         });
       }
       if (row.right) {
-        await this.neosh.ns.mark(this.ns, this.buf, i, 0, {
-          virtText: [{ text: row.right.text, hlGroup: row.right.hl ?? "Comment" }],
-          virtTextPos: "right",
+        marks.push({
+          col: 0,
+          opts: {
+            virtText: [{ text: row.right.text, hlGroup: row.right.hl ?? "Comment" }],
+            virtTextPos: "right",
+          },
         });
       }
-    }
+      return { text: row.text, marks };
+    });
+
+    // One call, not one per mark. A panel that wrote its text, cleared its namespace and then set
+    // its marks a call at a time was observable halfway through — and a frame landing after the
+    // clear drew every row unmarked, which is `Normal`, which is near-white. That is what a sidebar
+    // full of running agents was flashing.
+    await this.neosh.buf.render(this.buf, this.ns, 0, -1, drawn);
 
     // Keep the cursor on screen without recentring on every keystroke.
     if (opts.win !== undefined && opts.showCursor !== false) {
@@ -2039,15 +2044,17 @@ export async function railPicker<G, T>(
       mark: { from: 0, to: byteLength(lines[lines.length - 1]!), hl: "Sidebar.Dim" },
     });
 
-    await neosh.buf.setLines(buf, 0, -1, lines);
-    await neosh.ns.clear(ns, buf);
+    // The marks were already collected against their rows; they now travel with them. One call
+    // rather than one per mark, so there is no frame in which the text has arrived and the colour
+    // has not — an unmarked row draws in `Normal`, which is near-white.
+    const drawn: DrawnRow[] = lines.map((text) => ({ text, marks: [] }));
     for (const { line, mark } of marks) {
-      await neosh.ns.mark(ns, buf, line, mark.from, {
-        hlGroup: mark.hl,
-        endCol: mark.to,
-        priority: mark.priority ?? 0,
+      drawn[line]?.marks!.push({
+        col: mark.from,
+        opts: { hlGroup: mark.hl, endCol: mark.to, priority: mark.priority ?? 0 },
       });
     }
+    await neosh.buf.render(buf, ns, 0, -1, drawn);
     // The caret belongs where the typing goes. Parked at the origin, the filter reads as inert.
     await neosh.win.setCursor(win, 1, byteLength(`> ${query}`));
   };

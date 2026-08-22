@@ -317,9 +317,83 @@ impl Services {
     /// Goes through the same decision point a built-in tool uses, so `ask` mode means the same
     /// thing on both sides of the plugin boundary. Off the host loop, because asking a human takes
     /// as long as it takes.
+    // ---- what the week went on ------------------------------------------
+
+    /// Scan the vendor CLIs' transcripts for a span and bucket what is there.
+    ///
+    /// On a blocking thread, not merely off the host loop: this is synchronous file I/O over
+    /// thousands of files somebody else wrote, and a `tokio` worker parked in `read_dir` is a
+    /// worker that is not driving anybody's stream.
+    ///
+    /// Prices come from whatever the model cache already holds, plus the configured catalogue for
+    /// anything never discovered. A model with no price still appears — its tokens are counted and
+    /// its cost is not — because dropping it would make the busiest week look like the quietest.
+    pub async fn usage_history(
+        &self,
+        since: i64,
+        until: i64,
+        resolution: neosh_proto::UsageResolution,
+        time_zone: Option<String>,
+    ) -> ApiResult {
+        if until <= since {
+            return Err(ApiError::InvalidArgument {
+                message: "the span ends before it starts".into(),
+            });
+        }
+        let mut models: Vec<neosh_proto::ModelInfo> = {
+            let reg = self.agent.providers();
+            reg.instances().flat_map(|i| i.models.iter().cloned()).collect()
+        };
+        // Discovered models last, so that a live answer's price wins the `HashMap` insert over the
+        // written catalogue's — the catalogue is the fallback for a model nobody has asked about.
+        {
+            let cache = self.model_cache.lock().expect("model cache poisoned");
+            models.extend(cache.values().flatten().cloned());
+        }
+        let prices = crate::usage::price_table(&models);
+        let offset = utc_offset(time_zone.as_deref());
+
+        tokio::task::spawn_blocking(move || {
+            ApiOk::UsageHistory { history: crate::usage::history(since, until, resolution, offset, &prices) }
+        })
+        .await
+        .map_err(|e| ApiError::Internal { message: format!("usage scan: {e}") })
+    }
+
     pub async fn permission_check(&self, capability: neosh_proto::Capability) -> ApiResult {
         let decision = self.agent.decide(&*self.bridge, capability, None).await;
         Ok(ApiOk::Permission { decision })
+    }
+
+    // ---- questions -------------------------------------------------------
+
+    /// Put a question to whoever draws them, and wait.
+    ///
+    /// Through [`neosh_agent::DriverQuestioner`] rather than a second path of its own, so a
+    /// plugin's question and an agent's arrive at the panel identically — which is the test for
+    /// whether the API is the real one or a private door beside it.
+    pub async fn ask_user(&self, questions: Vec<neosh_proto::UserQuestion>) -> ApiResult {
+        use neosh_provider::ask::{QuestionAnswers, QuestionAsker};
+
+        if questions.is_empty() {
+            return Err(ApiError::InvalidArgument {
+                message: "a question with nothing in it".into(),
+            });
+        }
+        let asker = neosh_agent::DriverQuestioner::new(&self.agent, self.bridge.clone());
+        // Read and dropped before the await. The store's guard is not `Send`, and holding one
+        // across a question that may sit unanswered for half an hour would lock the conversation
+        // list for exactly that long.
+        let conversation = self.agent.sessions().active_id().clone();
+        let answers = asker
+            .ask(neosh_provider::ask::QuestionRequest { questions, conversation, cwd: self.cwd.clone() })
+            .await;
+        Ok(ApiOk::Answers {
+            answers: match answers {
+                QuestionAnswers::Answered(a) => Some(a),
+                QuestionAnswers::Cancelled { .. } => None,
+            },
+        })
     }
 
     // ---- generation ------------------------------------------------------
@@ -580,4 +654,42 @@ mod path_tests {
     fn with_no_home_set_a_tilde_is_left_alone_rather_than_becoming_the_root() {
         assert_eq!(with_home("~/src", None), "~/src");
     }
+}
+
+/// Seconds this zone is ahead of UTC, right now.
+///
+/// Named zones are resolved through `TZ`, which is the only lookup available without a tzdata
+/// crate — and it is enough, because the caller that matters is a terminal on the machine whose
+/// clock this is. An unknown zone falls back to the machine's own offset rather than to UTC: being
+/// an hour out is a chart one column wrong, and defaulting to UTC is a chart that is wrong for
+/// everybody who is not in London.
+pub fn utc_offset(time_zone: Option<&str>) -> i64 {
+    match time_zone {
+        // The caller asked for the two things that need no lookup at all.
+        Some("UTC") | Some("Etc/UTC") | Some("Z") => 0,
+        _ => local_offset(),
+    }
+}
+
+/// What `localtime` makes of now, minus `gmtime` of the same instant.
+///
+/// Derived from the difference rather than read out of a field, because that is the one thing the
+/// standard library will tell us without a dependency: formatting the same instant twice and
+/// subtracting is exact, including through a DST change.
+fn local_offset() -> i64 {
+    use std::process::Command;
+    // `date` is on every unix and answers in seconds of offset directly. A failure here is an
+    // offset of zero, which is a chart bucketed in UTC — visibly a little off for some, rather
+    // than absent.
+    let out = Command::new("date").arg("+%z").output().ok();
+    let Some(out) = out.filter(|o| o.status.success()) else { return 0 };
+    let text = String::from_utf8_lossy(&out.stdout);
+    let text = text.trim();
+    if text.len() < 5 {
+        return 0;
+    }
+    let sign = if text.starts_with('-') { -1 } else { 1 };
+    let hours: i64 = text[1..3].parse().unwrap_or(0);
+    let minutes: i64 = text[3..5].parse().unwrap_or(0);
+    sign * (hours * 3_600 + minutes * 60)
 }

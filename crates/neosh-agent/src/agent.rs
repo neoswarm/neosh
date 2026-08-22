@@ -95,6 +95,48 @@ impl AgentEvent {
     }
 }
 
+/// Every view of a workspace gets every event.
+///
+/// A workspace outlives the terminal that opened it, so it can have more than one view — and each
+/// of them has to see the whole stream. A view that missed one `ToolFinished` draws a card that
+/// never stops spinning, and nothing afterwards puts it right.
+///
+/// A list of channels rather than a `broadcast`, whose lagging consumers drop the *oldest* event
+/// and say nothing about it — silently, and exactly under load, which is when a turn is producing
+/// the most. Unbounded for the reason the single channel always was: the alternative is an agent
+/// loop that blocks on the slowest terminal attached to it.
+#[derive(Default)]
+pub struct Fanout {
+    views: std::sync::Mutex<Vec<mpsc::UnboundedSender<AgentEvent>>>,
+}
+
+impl Fanout {
+    /// Everything from here on.
+    ///
+    /// Deliberately not a replay: what a view connecting late needs is the *state*, which is
+    /// [`neosh_core::Editor::republish`]'s job, not a second copy of the deltas that built it.
+    pub fn subscribe(&self) -> mpsc::UnboundedReceiver<AgentEvent> {
+        let (tx, rx) = mpsc::unbounded_channel();
+        self.views.lock().expect("fanout lock poisoned").push(tx);
+        rx
+    }
+
+    /// How many views are listening.
+    ///
+    /// Zero is an ordinary state, not a shutdown: every terminal has been closed and the turns are
+    /// still running. Sending into none of them is what that costs, and it is the point.
+    pub fn views(&self) -> usize {
+        self.views.lock().expect("fanout lock poisoned").len()
+    }
+
+    fn send(&self, ev: AgentEvent) {
+        let mut views = self.views.lock().expect("fanout lock poisoned");
+        // A closed channel is a view that has gone away. Pruning on send is what stops the list
+        // growing for the lifetime of the workspace, and it costs nothing when nobody has left.
+        views.retain(|tx| tx.send(ev.clone()).is_ok());
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct TurnOutcome {
     pub turn: TurnId,
@@ -116,7 +158,7 @@ pub struct Agent {
     /// Swappable, because a config reload can tighten permissions and a layer fixed at launch
     /// would report success while changing nothing.
     permissions: Arc<std::sync::RwLock<Arc<PermissionLayer>>>,
-    events: mpsc::UnboundedSender<AgentEvent>,
+    events: Fanout,
 }
 
 impl Agent {
@@ -125,7 +167,10 @@ impl Agent {
         permissions: Arc<PermissionLayer>,
         providers: ProviderRegistry,
     ) -> (Self, mpsc::UnboundedReceiver<AgentEvent>) {
-        let (tx, rx) = mpsc::unbounded_channel();
+        let events = Fanout::default();
+        // The caller's own stream is an ordinary subscription. There is nothing special about
+        // being first, which is what makes a second view a second call rather than a second shape.
+        let rx = events.subscribe();
         (
             Self {
                 sessions: Arc::new(std::sync::Mutex::new(SessionStore::new(session))),
@@ -133,10 +178,23 @@ impl Agent {
                 hooks: Arc::new(std::sync::RwLock::new(HookRegistry::new())),
                 providers: Arc::new(std::sync::RwLock::new(providers)),
                 permissions: Arc::new(std::sync::RwLock::new(permissions)),
-                events: tx,
+                events,
             },
             rx,
         )
+    }
+
+    /// Another view of this workspace, from now on.
+    ///
+    /// Takes `&self`, so a view can attach while a turn is running — which is the case that
+    /// matters, since a turn running is the reason to open a second window.
+    pub fn subscribe(&self) -> mpsc::UnboundedReceiver<AgentEvent> {
+        self.events.subscribe()
+    }
+
+    /// How many views are listening. Zero while turns run is ordinary. See [`Fanout::views`].
+    pub fn views(&self) -> usize {
+        self.events.views()
     }
 
     // ---- shared state -------------------------------------------------
@@ -199,8 +257,9 @@ impl Agent {
     }
 
     fn emit(&self, ev: AgentEvent) {
-        // A dropped receiver means the host is shutting down; losing UI events then is fine.
-        let _ = self.events.send(ev);
+        // No views is not an error: every terminal may have been closed while this turn runs on.
+        // Dropped receivers are pruned by the send itself.
+        self.events.send(ev);
     }
 
     /// Reach one conversation by id, whether or not it is the one on screen.
@@ -963,6 +1022,85 @@ async fn ask_hooks(
         _ => None,
     };
     (outcome, chosen)
+}
+
+/// Sends an agent driver's *question* to whatever is listening for one.
+///
+/// Deliberately not [`DriverAsker`] with a wider payload, and the difference is one line: **policy
+/// is never consulted.** A permission request asks whether something may happen, which
+/// [`PermissionLayer`] exists to answer without a person; a question asks which of several things
+/// the person wants, and there is no mode, rule or allow-list that knows. Routing questions through
+/// the permission layer is what made `AskUserQuestion` fail silently — the configured default is
+/// full access, so the layer said yes to a question, the driver sent a yes with no answers in it,
+/// and the agent was told its user had ignored it. See ADR 0043.
+///
+/// The other half of the difference is what "no" means. A permission hook that times out is a veto
+/// and the action is refused, because failing open on a permission is unsafe. A question hook that
+/// times out is *nobody answered*, which is not a failure at all — it is a fact the agent is told
+/// in a sentence, and it goes on from there.
+pub struct DriverQuestioner {
+    hooks: Arc<std::sync::RwLock<crate::hooks::HookRegistry>>,
+    bridge: Arc<dyn PluginBridge>,
+}
+
+impl std::fmt::Debug for DriverQuestioner {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("DriverQuestioner")
+    }
+}
+
+impl DriverQuestioner {
+    pub fn new(agent: &Agent, bridge: Arc<dyn PluginBridge>) -> Self {
+        Self { hooks: agent.hooks.clone(), bridge }
+    }
+}
+
+#[async_trait::async_trait]
+impl neosh_provider::ask::QuestionAsker for DriverQuestioner {
+    async fn ask(
+        &self,
+        request: neosh_provider::ask::QuestionRequest,
+    ) -> neosh_provider::ask::QuestionAnswers {
+        use neosh_provider::ask::QuestionAnswers;
+
+        let regs: Vec<_> = {
+            let guard = self.hooks.read().expect("hook lock poisoned");
+            guard.blocking(HookName::AskUser).cloned().collect()
+        };
+        // No panel, no plugin, no terminal attached. Said plainly rather than left to time out: a
+        // turn that hangs for the hook's whole timeout on a workspace nobody is looking at is a
+        // turn that looks wedged, and the honest answer is available immediately.
+        if regs.is_empty() {
+            return QuestionAnswers::nobody();
+        }
+
+        let (outcome, payload) = hooks::run_blocking(
+            regs,
+            self.bridge.as_ref(),
+            HookName::AskUser,
+            HookPayload::AskUser {
+                session: Some(request.conversation),
+                turn: None,
+                cwd: request.cwd.display().to_string(),
+                questions: request.questions,
+                answers: None,
+            },
+        )
+        .await;
+        if let HookOutcome::Veto { reason } = outcome {
+            return QuestionAnswers::Cancelled { reason };
+        }
+        match payload {
+            // The answers come home the way a chosen permission option does: in a `Modify` that
+            // carries the payload back with the field filled in.
+            HookPayload::AskUser { answers: Some(answers), .. } if !answers.is_empty() => {
+                QuestionAnswers::Answered(answers)
+            }
+            // Ran, and answered nothing. Not the same as no hook at all, and the agent is told the
+            // difference: this one was shown to somebody.
+            _ => QuestionAnswers::dismissed(),
+        }
+    }
 }
 
 /// Sends an agent driver's permission request to the same prompt a tool call reaches.

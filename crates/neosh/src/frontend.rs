@@ -24,12 +24,16 @@ pub trait Frontend: Send {
     async fn shutdown(&mut self) -> anyhow::Result<()> {
         Ok(())
     }
-    /// Send the viewer away and keep going.
+    /// Send one viewer away and keep going.
+    ///
+    /// Named, because a workspace can have several and `^Q` means "close *this* terminal". The key
+    /// arrives tagged with the view it was pressed in, so the answer never depends on which
+    /// terminal happened to speak most recently.
     ///
     /// Nothing for a frontend that *is* the process — there is nobody to send away, and the run
-    /// loop is about to end anyway. It means something only for a workspace serving a terminal,
+    /// loop is about to end anyway. It means something only for a workspace serving terminals,
     /// which is the one place `quit` and `stop` are different words.
-    async fn detach(&mut self) -> anyhow::Result<()> {
+    async fn detach(&mut self, _view: crate::views::ViewId) -> anyhow::Result<()> {
         Ok(())
     }
 }

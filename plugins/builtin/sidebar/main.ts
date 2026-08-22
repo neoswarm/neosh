@@ -41,6 +41,7 @@ import type {
   AgentSummary,
   Contribution,
   Disposable,
+  DrawnRow,
   Neosh,
   PluginContext,
   NodeInfo,
@@ -1579,23 +1580,24 @@ async function openRemote(
 
   const redraw = async () => {
     const all = [...header, ...body];
-    await neosh.buf.setLines(buf, 0, -1, all);
-    await neosh.ns.clear(ns, buf);
-    await neosh.ns.mark(ns, buf, 0, 0, {
-      hlGroup: "Title",
-      endCol: byteLength(all[0] ?? ""),
-    });
-    if (all[1]) {
-      await neosh.ns.mark(ns, buf, 1, 0, { hlGroup: "Comment", endCol: byteLength(all[1]) });
-    }
+    // One call. This redraws per token, so a repaint the frontend could draw halfway through — text
+    // written, marks not yet — would be a transcript strobing white for the whole of an answer.
+    const drawn: DrawnRow[] = all.map((text) => ({ text, marks: [] }));
+    const mark = (line: number, hl: string, text: string) => {
+      drawn[line]?.marks!.push({ col: 0, opts: { hlGroup: hl, endCol: byteLength(text) } });
+    };
+
+    mark(0, "Title", all[0] ?? "");
+    if (all[1]) mark(1, "Comment", all[1]);
     for (let i = header.length; i < all.length; i++) {
       const text = all[i] ?? "";
       if (text.startsWith("  › ")) {
-        await neosh.ns.mark(ns, buf, i, 0, { hlGroup: "Accent", endCol: byteLength(text) });
+        mark(i, "Accent", text);
       } else if (text.startsWith("  · ")) {
-        await neosh.ns.mark(ns, buf, i, 0, { hlGroup: "Comment", endCol: byteLength(text) });
+        mark(i, "Comment", text);
       }
     }
+    await neosh.buf.render(buf, ns, 0, -1, drawn);
     // The newest line, not the oldest: a transcript you have just opened should be showing the end
     // of the conversation, which is the part that is still happening.
     await neosh.win.scrollTo(win, Math.max(0, all.length - 24));
@@ -1893,7 +1895,7 @@ async function collect(
   const running = sessions.some((s) => s.active_turn);
   const now = Date.now();
   // One list, favourites first. A separate `FAVORITES` section splits a short list in half and
-  // makes you check two places for the same kind of thing; the heart says which is which without
+  // makes you check two places for the same kind of thing; the star says which is which without
   // costing a heading, a rule and a blank line.
   // What the other computers are running. One call; empty and harmless on a single machine.
   const swarm = await neosh.swarm.agents().catch(() => [] as SwarmAgent[]);
@@ -2061,19 +2063,27 @@ function projectRow(
       ? { text: `${p.sessions.length} `, hl: "Sidebar.Dim" }
       : { text: "" };
 
-  // The heart sits before the fold arrow rather than after the name: it is what you scan the
+  // The star sits before the fold arrow rather than after the name: it is what you scan the
   // column for, and a marker at the ragged right edge is not a column. It gets its own highlight
-  // because a heart is red — a grey one reads as a heart that has stopped.
-  const heart = p.favorite ? (opts.ascii ? "*" : "♥") : " ";
+  // because the world has already decided what colour a favourite is — a grey star is a star you
+  // have to decode.
+  //
+  // A star rather than a heart, and the reason is font fallback: `♥` is U+2665, which Unicode
+  // classifies as an emoji even though its default presentation is text. A terminal that has a
+  // colour-emoji font installed routes it there, and what comes back is somebody else's artwork
+  // at somebody else's weight — commonly an outline, which is what a filled glyph is not. Every
+  // heart codepoint has that problem. `★` is U+2605, `Emoji=No`, so no terminal has any reason to
+  // leave the font it is drawing the rest of the row in.
+  const star = p.favorite ? (opts.ascii ? "*" : "★") : " ";
 
   // Which other computers have this project. The whole reason a project key is a normalised git
   // remote rather than a path: on two machines the path is different and this is the same.
   const elsewhere = opts.hosts.get(p.key) ?? [];
   const name = clip(p.name, Math.max(6, opts.width - 8 - (elsewhere.length ? 8 : 0)));
   return {
-    text: ` ${heart} ${arrow} ${name}`,
+    text: ` ${star} ${arrow} ${name}`,
     hl: here ? "Directory" : "Sidebar.Dim",
-    spans: p.favorite ? [{ from: 1, to: 1 + byteLength(heart), hl: "Sidebar.Favorite" }] : undefined,
+    spans: p.favorite ? [{ from: 1, to: 1 + byteLength(star), hl: "Sidebar.Favorite" }] : undefined,
     right: elsewhere.length > 0
       // The machines take the column the count would have used. A project that is in two places is
       // a more useful thing to know than how many conversations are in it here.
@@ -2166,7 +2176,7 @@ function hints(opts: DrawOptions): ListRow<Target>[] {
     // verb with a row of its own is the one that can afford to give up its place on them.
     ? ["^T projects  ^N new   ^F archive", "^K palette   ^B hide  F1 keys"]
     : kind === "project"
-      ? ["↵ fold   f ♥       JK move", "n new    a archive  ? keys"]
+      ? ["↵ fold   f ★       JK move", "n new    a archive  ? keys"]
       : kind === "session"
         ? ["↵ open   r rename   x archive", "X delete a archive   ? keys"]
         : kind === "browse"

@@ -19,6 +19,9 @@ import type { NodeInfo } from "./NodeInfo";
 import type { OptionEntry } from "./OptionEntry";
 import type { PermissionDecision } from "./PermissionDecision";
 import type { PermissionMode } from "./PermissionMode";
+import type { QuestionAnswer } from "./QuestionAnswer";
+import type { QuotaSample } from "./QuotaSample";
+import type { QuotaSnapshot } from "./QuotaSnapshot";
 import type { RepoStatus } from "./RepoStatus";
 import type { SessionInfo } from "./SessionInfo";
 import type { SurfaceId } from "./SurfaceId";
@@ -26,6 +29,7 @@ import type { SwarmAgent } from "./SwarmAgent";
 import type { SwarmNode } from "./SwarmNode";
 import type { SwarmStranger } from "./SwarmStranger";
 import type { ToolDef } from "./ToolDef";
+import type { UsageHistory } from "./UsageHistory";
 import type { Viewport } from "./Viewport";
 import type { WindowId } from "./WindowId";
 import type { WindowInfo } from "./WindowInfo";
@@ -57,6 +61,7 @@ export type ApiOk =
   | { "ok": "driver_commands"; commands: Array<DriverCommand> }
   | { "ok": "keymaps"; keymaps: Array<KeymapEntry> }
   | { "ok": "permission"; decision: PermissionDecision }
+  | { "ok": "answers"; answers?: Array<QuestionAnswer> | null }
   | { "ok": "permission_mode"; mode: PermissionMode }
   | { "ok": "focused_win"; win: WindowId | null }
   | { "ok": "option"; entry: OptionEntry | null }
@@ -82,4 +87,7 @@ export type ApiOk =
   | { "ok": "swarm_self"; node: NodeInfo | null }
   | { "ok": "swarm_nodes"; nodes: Array<SwarmNode> }
   | { "ok": "swarm_agents"; agents: Array<SwarmAgent> }
-  | { "ok": "swarm_strangers"; strangers: Array<SwarmStranger> };
+  | { "ok": "swarm_strangers"; strangers: Array<SwarmStranger> }
+  | { "ok": "quotas"; quotas: Array<QuotaSnapshot> }
+  | { "ok": "quota_history"; samples: Array<QuotaSample> }
+  | { "ok": "usage_history"; history: UsageHistory };

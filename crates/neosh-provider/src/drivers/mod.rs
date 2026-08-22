@@ -73,4 +73,15 @@ pub trait AgentDriver: Send + Sync {
     /// agent asks its client over the connection it is already on; `claude -p` and `codex exec`
     /// have no such channel, so for them the mode is the whole conversation about permissions.
     fn set_permission_asker(&self, _asker: std::sync::Arc<dyn crate::approval::PermissionAsker>) {}
+
+    /// Give the driver somewhere to send a *question* — see [`crate::ask`].
+    ///
+    /// Separate from the asker above, and not because the plumbing is different. A permission
+    /// request is answerable by policy and this is not: a driver that pointed both at one place
+    /// would be handing "which database should I use?" to a layer whose job is deciding whether to
+    /// prompt about writing a file, and whose configured answer is usually "don't".
+    ///
+    /// Defaulted to doing nothing, for the same reason: a driver with no way to ask has nothing to
+    /// put here.
+    fn set_question_asker(&self, _asker: std::sync::Arc<dyn crate::ask::QuestionAsker>) {}
 }

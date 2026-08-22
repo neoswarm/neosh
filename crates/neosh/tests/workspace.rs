@@ -152,6 +152,10 @@ struct Client {
     /// Why an attach was turned away, when it was.
     refusal: Option<String>,
     stopped: bool,
+    /// How big this terminal says it is. A real frontend resolves layout from the declarative
+    /// geometry it is sent and reports what it arrived at; this reports the whole thing, which is
+    /// all the host needs to know to draw a row that has to fit.
+    size: (u16, u16),
 }
 
 impl Drop for Client {
@@ -162,6 +166,10 @@ impl Drop for Client {
 
 impl Client {
     fn attach(socket: &Path, protocol: u32) -> Self {
+        Self::attach_sized(socket, protocol, 100, 34)
+    }
+
+    fn attach_sized(socket: &Path, protocol: u32, width: u16, height: u16) -> Self {
         let stream = UnixStream::connect(socket).expect("connect");
         let read = stream.try_clone().expect("clone");
         let (tx, rx) = std::sync::mpsc::channel();
@@ -180,9 +188,30 @@ impl Client {
             ended: None,
             refusal: None,
             stopped: false,
+            size: (width, height),
         };
-        c.send(ClientMessage::Attach { protocol_version: protocol, width: 100, height: 34 });
+        c.send(ClientMessage::Attach { protocol_version: protocol, width, height });
         c
+    }
+
+    /// Say goodbye the way `client::run` does when the terminal it was in was closed.
+    fn leave(&mut self) {
+        self.send(ClientMessage::Detach);
+    }
+
+    /// Report resolved geometry, the way a frontend that has just laid itself out does.
+    ///
+    /// Without this the host never learns any size at all and falls back to eighty columns, so a
+    /// test about width would pass or fail for reasons that have nothing to do with the terminals
+    /// in it.
+    fn report_viewports(&mut self) {
+        let (width, height) = self.size;
+        let wins: Vec<_> = self.mirror.windows.keys().copied().collect();
+        for win in wins {
+            self.send(ClientMessage::Input {
+                event: InputEvent::ViewportChanged { win, width, height, top_line: 0 },
+            });
+        }
     }
 
     fn send(&mut self, msg: ClientMessage) {
@@ -370,10 +399,11 @@ fn quitting_a_terminal_leaves_the_workspace_running_and_stop_does_not() {
 }
 
 #[test]
-fn a_second_terminal_takes_over_and_the_first_is_told_why() {
-    // Rather than being refused. A client that died without saying so looks exactly like one that
-    // is merely quiet, so refusing would let a crashed terminal lock you out of your own work.
-    let sb = Sandbox::new("takeover");
+fn a_second_terminal_joins_rather_than_taking_the_workspace_over() {
+    // It used to take over and tell the first why. The reason to open a second window is that a
+    // turn is running in the first, and taking it over is the exact moment you stop being able to
+    // watch that turn.
+    let sb = Sandbox::new("twoviews");
     let ws = sb.serve("hello_turn.jsonl");
 
     let mut first = Client::attach(&ws.socket, neosh_proto::PROTOCOL_VERSION);
@@ -382,8 +412,107 @@ fn a_second_terminal_takes_over_and_the_first_is_told_why() {
     let mut second = Client::attach(&ws.socket, neosh_proto::PROTOCOL_VERSION);
     second.ready();
 
-    first.until("the first to be told", |c| c.ended == Some(DetachReason::TakenOver));
-    assert!(second.ended.is_none(), "and the second is the one attached now");
+    first.pump_once();
+    assert!(first.ended.is_none(), "the first terminal was not sent away");
+    assert!(second.ended.is_none(), "and the second one is here too");
+}
+
+#[test]
+fn what_happens_in_one_terminal_happens_in_the_other() {
+    // "Synced everywhere" is the whole claim: there is one editor, and every terminal is a mirror
+    // of it. A question asked here is a question on screen there, live and without asking for it.
+    let sb = Sandbox::new("mirrored");
+    let ws = sb.serve("hello_turn.jsonl");
+
+    let mut first = Client::attach(&ws.socket, neosh_proto::PROTOCOL_VERSION);
+    first.ready();
+    let mut second = Client::attach(&ws.socket, neosh_proto::PROTOCOL_VERSION);
+    second.ready();
+
+    first.ask("what did you do");
+
+    second.until("the other terminal to show the question", |c| {
+        c.transcript().iter().any(|l| l.contains("what did you do"))
+    });
+    second.until("and the answer it produced", |c| c.shows("All done."));
+    first.until("in the terminal that asked, too", |c| c.shows("All done."));
+}
+
+#[test]
+fn closing_one_terminal_leaves_the_others_alone() {
+    // `^Q` closes *this* window. The workspace carries on, and so does every other view of it —
+    // which was the one thing one-viewer-at-a-time could never be asked.
+    let sb = Sandbox::new("closeone");
+    let ws = sb.serve("hello_turn.jsonl");
+
+    let mut first = Client::attach(&ws.socket, neosh_proto::PROTOCOL_VERSION);
+    first.ready();
+    let mut second = Client::attach(&ws.socket, neosh_proto::PROTOCOL_VERSION);
+    second.ready();
+
+    first.leave();
+    first.until("the terminal that asked to leave to go", |c| c.ended.is_some());
+
+    // The survivor is not merely still connected — it is still being drawn to.
+    second.ask("still here");
+    second.until("the workspace to answer the one that stayed", |c| c.shows("All done."));
+
+    let text = status(&sb);
+    assert!(text.contains("attached"), "somebody is still looking: {text}");
+}
+
+#[test]
+fn the_last_terminal_leaving_makes_the_workspace_idle_not_gone() {
+    let sb = Sandbox::new("allidle");
+    let ws = sb.serve("hello_turn.jsonl");
+
+    let mut first = Client::attach(&ws.socket, neosh_proto::PROTOCOL_VERSION);
+    first.ready();
+    let mut second = Client::attach(&ws.socket, neosh_proto::PROTOCOL_VERSION);
+    second.ready();
+
+    first.leave();
+    first.until("the first to go", |c| c.ended.is_some());
+    // Still attached: one terminal leaving is not "nobody is looking".
+    assert!(status(&sb).contains("attached"));
+
+    second.leave();
+    second.until("the second to go", |c| c.ended.is_some());
+
+    let text = status(&sb);
+    assert!(!text.contains("no workspace"), "it is still running: {text}");
+    let mut ws = ws;
+    assert!(ws.alive(), "an empty workspace is idle, not over");
+}
+
+#[test]
+fn a_narrow_terminal_joining_makes_the_transcript_fit_it() {
+    // Every view lays out its own geometry, but a tool card is one row of buffer *content* and the
+    // content is shared. Measured for the widest terminal, it wraps in the narrow one — and a card
+    // that wraps is the failure `chat_width` exists to prevent. So the smallest one wins.
+    let sb = Sandbox::new("smallest");
+    let ws = sb.serve("wide_card.jsonl");
+
+    let mut wide = Client::attach_sized(&ws.socket, neosh_proto::PROTOCOL_VERSION, 160, 40);
+    wide.ready();
+    wide.report_viewports();
+
+    let mut narrow = Client::attach_sized(&ws.socket, neosh_proto::PROTOCOL_VERSION, 60, 20);
+    narrow.ready();
+    narrow.report_viewports();
+
+    narrow.until("the welcome to be redrawn for the narrow terminal", |c| {
+        c.transcript().iter().all(|l| l.chars().count() <= 60)
+    });
+    wide.ask("how wide");
+    narrow.until("the answer", |c| c.shows("All done."));
+    wide.until("the answer", |c| c.shows("All done."));
+
+    // Identical content, and it is content the narrow terminal can print without wrapping.
+    let rows = wide.transcript();
+    assert_eq!(rows, narrow.transcript(), "two mirrors of one editor disagreed");
+    let widest = rows.iter().map(|l| l.chars().count()).max().unwrap_or(0);
+    assert!(widest <= 60, "a row of {widest} columns does not fit the narrow terminal: {rows:#?}");
 }
 
 #[test]

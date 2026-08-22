@@ -421,6 +421,11 @@ pub fn did(input: &serde_json::Value) -> Option<&'static str> {
     if map.contains_key("url") {
         return Some("Fetched");
     }
+    // A question the model put to *you*. `Asked  Auth method` rather than `AskUserQuestion`, which
+    // is a tool name pretending to be an event. Read off the arguments like every other verb here.
+    if questions_of(input).is_some() {
+        return Some("Asked");
+    }
     // Told apart by which argument the call is *about*, the same question [`subject`] answers:
     // `Read fn header` is not what a grep did.
     if map.contains_key("pattern") || map.contains_key("query") {
@@ -874,6 +879,18 @@ pub fn subject_of(input: &serde_json::Value, root: &std::path::Path, room: usize
     }
 }
 
+/// The `questions` array of a call that asks the user something, if it has one.
+///
+/// By shape and not by tool name, the same way an edit is found: `AskUserQuestion` is what
+/// `claude` calls it, and a plugin that asks the same way should read the same on the card.
+fn questions_of(input: &serde_json::Value) -> Option<&Vec<serde_json::Value>> {
+    let qs = input.as_object()?.get("questions")?.as_array()?;
+    // Every entry has to *be* a question. An array of anything else under that key is somebody
+    // else's argument that happens to share the name.
+    (!qs.is_empty() && qs.iter().all(|q| q.get("question").is_some_and(|t| t.is_string())))
+        .then_some(qs)
+}
+
 /// Which argument a call is about, and what it says.
 ///
 /// What it *searched for* before where it searched. A grep is `{pattern, path}` and the answer to
@@ -884,6 +901,24 @@ pub fn subject_of(input: &serde_json::Value, root: &std::path::Path, room: usize
 fn subject(input: &serde_json::Value) -> Option<(&'static str, String)> {
     const KEYS: &[&str] =
         &["pattern", "query", "command", "url", "path", "file_path", "file", "prompt"];
+    // A question is about its headers — the two or three words the model put over each one — and
+    // several of them fold into `Auth method, Library`. The question text itself is a sentence, and
+    // a column of sentences clipped at forty columns is a column of beginnings.
+    if let Some(qs) = questions_of(input) {
+        let headers: Vec<&str> = qs
+            .iter()
+            .filter_map(|q| {
+                q.get("header")
+                    .or_else(|| q.get("question"))
+                    .and_then(|v| v.as_str())
+                    .map(str::trim)
+                    .filter(|h| !h.is_empty())
+            })
+            .collect();
+        if !headers.is_empty() {
+            return Some(("questions", headers.join(", ")));
+        }
+    }
     let map = input.as_object()?;
     KEYS.iter().find_map(|key| {
         let v = map.get(*key)?.as_str()?;
@@ -1676,6 +1711,45 @@ mod tests {
         assert_eq!(did(&opaque), None);
         let text = header_text(&g(), &head("frobnicate", &opaque, ToolState::Done), &root(), 80);
         assert!(text.starts_with("  frobnicate"), "{text}");
+    }
+
+    #[test]
+    fn a_question_the_model_put_to_you_says_what_it_asked_about() {
+        // `Asked  Auth method, Database` rather than `AskUserQuestion`, which is a tool name
+        // pretending to be an event. By shape and not by name, so a plugin that asks the same way
+        // reads the same on the card.
+        let input = json!({ "questions": [
+            { "question": "Which authentication should the API use?", "header": "Auth method",
+              "options": [{ "label": "OAuth 2.0" }], "multiSelect": false },
+            { "question": "Which database?", "header": "Database",
+              "options": [{ "label": "SQLite" }], "multiSelect": false },
+        ] });
+        assert_eq!(did(&input), Some("Asked"));
+        let text = header_text(&g(), &head("AskUserQuestion", &input, ToolState::Done), &root(), 80);
+        assert!(text.starts_with("  Asked  Auth method, Database"), "{text}");
+    }
+
+    #[test]
+    fn a_question_with_no_header_is_named_by_what_it_asked() {
+        // A header is optional and nothing here invents one — the question itself is the next best
+        // account of what the call was about, and it is the model's own words either way.
+        let input = json!({ "questions": [{ "question": "Tabs or spaces?", "options": [] }] });
+        let text = header_text(&g(), &head("AskUserQuestion", &input, ToolState::Done), &root(), 80);
+        assert!(text.starts_with("  Asked  Tabs or spaces?"), "{text}");
+    }
+
+    #[test]
+    fn a_questions_argument_that_is_not_a_list_of_questions_is_somebody_elses() {
+        // The key is a common enough word that a tool nothing here has heard of may use it for
+        // something else, and renaming that call `Asked` would be exactly the invention ADR 0033
+        // forbids.
+        for input in [
+            json!({ "questions": ["what", "why"] }),
+            json!({ "questions": [] }),
+            json!({ "questions": 3 }),
+        ] {
+            assert_eq!(did(&input), None, "{input}");
+        }
     }
 
     #[test]

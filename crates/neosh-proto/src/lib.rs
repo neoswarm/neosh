@@ -21,6 +21,7 @@ pub mod ids;
 pub mod options;
 pub mod plugin;
 pub mod provider;
+pub mod quota;
 pub mod ui;
 pub mod vcs;
 
@@ -31,6 +32,7 @@ pub use ids::*;
 pub use options::*;
 pub use plugin::*;
 pub use provider::*;
+pub use quota::*;
 pub use ui::*;
 pub use vcs::*;
 
