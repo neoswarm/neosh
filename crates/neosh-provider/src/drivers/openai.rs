@@ -14,6 +14,7 @@ use serde_json::{Value, json};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
+use crate::catalog;
 use crate::drivers::http;
 use crate::{Provider, ProviderError, ProviderStream, resolve_auth, sse};
 
@@ -148,6 +149,40 @@ impl OpenAiCompatProvider {
             .collect()
     }
 
+    /// The knobs an entry in `/models` says it takes.
+    ///
+    /// # Why an aggregator can answer this and a vendor cannot
+    ///
+    /// `GET /v1/models` is barely specified: OpenAI returns four fields and none of them is about
+    /// parameters. An aggregator has to do better, because it fronts hundreds of models from dozens
+    /// of vendors and nobody could otherwise tell which of them reason — so OpenRouter puts
+    /// `supported_parameters` on every row, and that list is the only place in this entire family of
+    /// endpoints where "does this model take a reasoning effort" is a question with a real answer.
+    ///
+    /// So this is discovery where discovery exists, and [`catalog::seed_models`] is the written-down
+    /// answer for the endpoints that will not say. Four hundred OpenRouter models arrive with the
+    /// right ladder each and no catalogue entry between them.
+    ///
+    /// Deliberately narrow: only parameters this driver actually sends are turned into knobs. A
+    /// picker offering a control that goes nowhere is worse than one that is short.
+    fn advertised_knobs(m: &Value) -> Vec<neosh_proto::ProviderOptionDescriptor> {
+        let Some(params) = m.get("supported_parameters").and_then(Value::as_array) else {
+            return Vec::new();
+        };
+        let takes = |name: &str| params.iter().any(|p| p.as_str() == Some(name));
+        let mut out = Vec::new();
+        if takes("reasoning") || takes("reasoning_effort") {
+            // Three rungs, because that is what the aggregator normalises every vendor's ladder
+            // onto before passing it on. A fourth invented here would be translated into one of
+            // these anyway, or rejected.
+            out.push(catalog::effort_levels(&["low", "medium", "high"], "medium"));
+        }
+        if takes("verbosity") {
+            out.push(catalog::verbosity_levels());
+        }
+        out
+    }
+
     pub fn body(request: &TurnRequest) -> Value {
         let mut body = json!({
             "model": request.selection.model.0,
@@ -165,6 +200,12 @@ impl OpenAiCompatProvider {
         }
         if let Some(effort) = request.selection.option_str("effort") {
             body["reasoning_effort"] = json!(effort);
+        }
+        // How long the answer is, which is a separate question from how hard it thought — and the
+        // one people actually reach for. Sent only when a model advertised it, so an endpoint that
+        // has never heard of the parameter never sees it.
+        if let Some(verbosity) = request.selection.option_str("verbosity") {
+            body["verbosity"] = json!(verbosity);
         }
         body
     }
@@ -206,13 +247,14 @@ impl Provider for OpenAiCompatProvider {
                             .get("context_length")
                             .or(m.get("context_window"))
                             .and_then(Value::as_u64);
+                        let descriptors = Self::advertised_knobs(m);
                         info.capabilities = neosh_proto::ModelCapabilities {
                             tools: true,
                             vision: false,
                             streaming: true,
-                            thinking: false,
+                            thinking: descriptors.iter().any(|d| d.id() == "effort"),
                             prompt_caching: false,
-                            option_descriptors: vec![],
+                            option_descriptors: descriptors,
                         };
                         Some(info)
                     })

@@ -95,7 +95,20 @@ impl GoogleProvider {
             gen_cfg["maxOutputTokens"] = json!(max);
         }
         // Ask for reasoning to be surfaced rather than silently discarded.
-        gen_cfg["thinkingConfig"] = json!({"includeThoughts": true});
+        let mut thinking = json!({"includeThoughts": true});
+        // Two spellings of one idea, because the API changed shape between generations: the 3 line
+        // takes a named rung, the 2.5 line takes a token budget where the only number worth a
+        // control is zero. Whichever knob the model advertised is the one that arrives here; a
+        // model that advertised neither sends neither, and gets the endpoint's own default.
+        if let Some(level) = request.selection.option_str("thinking_level") {
+            thinking["thinkingLevel"] = json!(level);
+        }
+        if let Some(on) = request.selection.option_flag("thinking") {
+            // `-1` is "decide for yourself", which is the default and the only honest value for
+            // "on": any fixed budget we chose here would be a guess about a turn we cannot see.
+            thinking["thinkingBudget"] = json!(if on { -1 } else { 0 });
+        }
+        gen_cfg["thinkingConfig"] = thinking;
         body["generationConfig"] = gen_cfg;
         body
     }
@@ -143,13 +156,19 @@ impl Provider for GoogleProvider {
                         );
                         info.context_window = m.get("inputTokenLimit").and_then(Value::as_u64);
                         info.max_output_tokens = m.get("outputTokenLimit").and_then(Value::as_u64);
+                        // Keyed off the id, which is the one thing `models.list` is certain to
+                        // return and the one thing Google's own knob follows from: the 3 line takes
+                        // a thinking *level*, the 2.5 line a *budget*. Done here as well as in the
+                        // catalogue so a model released this morning arrives with its ladder rather
+                        // than waiting for a seed entry to be written for it.
+                        let descriptors = crate::catalog::gemini_knobs(id);
                         info.capabilities = neosh_proto::ModelCapabilities {
                             tools: true,
                             vision: true,
                             streaming: true,
                             thinking: true,
                             prompt_caching: false,
-                            option_descriptors: vec![],
+                            option_descriptors: descriptors,
                         };
                         Some(info)
                     })
