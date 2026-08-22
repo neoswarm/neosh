@@ -5890,14 +5890,17 @@ fn the_plan_strip_is_one_row_until_you_ask_for_more() {
     s.send(&command("planner.publish"));
     s.wait_for("published");
 
-    // `session` is the window the provider marked active, so it is the one that would refuse the
-    // next request — and `weekly` at 40% is not news, so it is not a row.
+    // The row is the account wearing the bar of the window the provider marked active — the one
+    // that would refuse the next request. Its own label waits behind `⇥`: `Session` on a strip
+    // with no account row above it says whose session to nobody. And `weekly` at 40% is not
+    // news, so it is not a row.
     assert!(
-        s.pump(|s| s.sidebar_now().iter().any(|l| l.contains("Session"))),
-        "the limit that binds is on the strip\n{:?}",
+        s.pump(|s| s.sidebar_now().iter().any(|l| l.contains("Planner"))),
+        "the account, wearing the limit that binds\n{:?}",
         s.sidebar_now()
     );
     let strip = s.sidebar_now().join("\n");
+    assert!(!strip.contains("Session"), "the window's own label waits behind ⇥:\n{strip}");
     assert!(!strip.contains("Weekly"), "and a limit at 40% is not news:\n{strip}");
     assert!(!strip.contains("% left ·"), "nor is the sentence that explains it:\n{strip}");
 

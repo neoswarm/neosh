@@ -322,16 +322,24 @@ function section(
       rows.push(accountRow(q, who, glyphs, room));
     }
     const windows = style === "one" ? summarised(q) : q.windows;
+    const cred = who.find((c) => c.instance === q.instance);
     // The mark goes on the bar itself when there is no account row above it to carry it: a row of
     // brand colour with no brand on it is a coloured bar nobody can attribute.
-    const brand = style === "one" ? `${markFor(brandOf(q, who), glyphs)} ` : "";
+    const brand = style === "one" ? `${markFor(cred?.brand, glyphs)} ` : "";
     // A `▸` says which limit binds, and is worth two columns only when there is more than one
     // limit on screen to distinguish it from.
     const marker = windows.length > 1 ? MARKER : 0;
     // Widest label first, so every bar in an account starts in the same column — a bar whose left
     // edge moves from row to row cannot be compared with the one above it, which is the only thing
-    // a stack of bars is for.
-    const labels = windows.map((w) => compactLabel(w, room - cells(brand)));
+    // a stack of bars is for. In `one` the binding row is labelled by the *account* rather than the
+    // window, because `Session` with no account row above it says whose session to nobody, and the
+    // name is what two of these rows are told apart by. The rows a critical window adds keep their
+    // own labels — they sit under a named one.
+    const labels = windows.map((w, i) =>
+      style === "one" && i === 0
+        ? clip(cred?.display_name || q.instance, Math.max(4, room - cells(brand)))
+        : compactLabel(w, room - cells(brand)),
+    );
     const labelWidth = Math.min(
       Math.max(...labels.map(cells), 0),
       Math.max(6, room - cells(brand) - marker - BAR_MIN - PCT - 1),
@@ -347,7 +355,7 @@ function section(
     // value, so a palette that wants a different orange changes it in one place.
     const mark = brand === ""
       ? undefined
-      : [{ from: 0, to: byteLength(brand.trimEnd()), hl: brandOf(q, who)?.hl ?? "Sidebar.Heading" }];
+      : [{ from: 0, to: byteLength(brand.trimEnd()), hl: cred?.brand?.hl ?? "Sidebar.Heading" }];
     for (const [i, w] of windows.entries()) {
       rows.push({
         text: brand + windowRow(w, labels[i] ?? w.label, labelWidth, bar, glyphs.ascii, marker > 0),
@@ -375,11 +383,6 @@ function section(
   // the composer without going to the sidebar first is a different affordance from a row you have
   // to arrive at — and it is the one somebody who has never focused this column will find.
   return { title: "PLAN", hint: "^L", at: "below" as const, rows };
-}
-
-/** The credential this allowance belongs to, for its mark and its colour. */
-function brandOf(q: QuotaSnapshot, who: CredentialInfo[]): Brand | null | undefined {
-  return who.find((c) => c.instance === q.instance)?.brand;
 }
 
 /**
