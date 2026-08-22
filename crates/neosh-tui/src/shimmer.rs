@@ -284,7 +284,82 @@ pub fn animate(
                 })
                 .collect()
         }
+        Animation::Spectrum { .. } => {
+            let clusters: Vec<&str> = text.graphemes(true).collect();
+            if clusters.is_empty() {
+                return Vec::new();
+            }
+            // Measured in clusters like the sweep, and for the same reason: a rainbow timed in
+            // bytes has a different pitch in CJK than in ASCII.
+            //
+            // Two-thirds of a turn across the run, so a short label carries a visible gradient
+            // rather than one flat colour, and a long one does not repeat itself twice over.
+            let spread = 0.66 / clusters.len().max(1) as f32;
+            let lightness = base_rgb(&base).map_or(0.62, luminance);
+            let start = phase(anim.period_ms());
+            clusters
+                .iter()
+                .enumerate()
+                .map(|(i, g)| {
+                    let hue = start + i as f32 * spread;
+                    let colour = if truecolor {
+                        hue_at(hue, lightness)
+                    } else {
+                        let at = ((hue.fract() + 1.0).fract() * 6.0) as usize;
+                        ANSI_HUES[at.min(5)]
+                    };
+                    // Bold as well as coloured: without truecolor the six hues are all there is,
+                    // and the whole point of this animation is that it is impossible to miss.
+                    Span::styled(
+                        (*g).to_string(),
+                        base.fg(colour).remove_modifier(Modifier::DIM).add_modifier(Modifier::BOLD),
+                    )
+                })
+                .collect()
+        }
     }
+}
+
+/// The six ANSI hues, in spectral order, for a terminal that cannot mix its own.
+///
+/// Six rather than the full sixteen: the dim halves of each pair differ by brightness rather than by
+/// hue, and a rainbow that keeps stepping back on itself reads as flicker.
+const ANSI_HUES: [Color; 6] = [
+    Color::LightRed,
+    Color::LightYellow,
+    Color::LightGreen,
+    Color::LightCyan,
+    Color::LightBlue,
+    Color::LightMagenta,
+];
+
+/// How light a colour reads, 0 to 1. Rec. 601 weights, which is what the eye does with green.
+fn luminance((r, g, b): (u8, u8, u8)) -> f32 {
+    (0.299 * r as f32 + 0.587 * g as f32 + 0.114 * b as f32) / 255.0
+}
+
+/// A hue at a given lightness, fully saturated. `hue` wraps, so callers need not normalise.
+///
+/// Lightness is taken from whatever the group was already going to be drawn in, so the same
+/// animation stays readable on a light theme and on a dark one without either being told about the
+/// other.
+fn hue_at(hue: f32, lightness: f32) -> Color {
+    let h = (hue.fract() + 1.0).fract() * 6.0;
+    let l = lightness.clamp(0.25, 0.85);
+    // HSL with S = 1, written out rather than pulled in: one call site, six lines, no dependency.
+    let c = (1.0 - (2.0 * l - 1.0).abs()) * 1.0;
+    let x = c * (1.0 - (h % 2.0 - 1.0).abs());
+    let m = l - c / 2.0;
+    let (r, g, b) = match h as u32 {
+        0 => (c, x, 0.0),
+        1 => (x, c, 0.0),
+        2 => (0.0, c, x),
+        3 => (0.0, x, c),
+        4 => (x, 0.0, c),
+        _ => (c, 0.0, x),
+    };
+    let to8 = |v: f32| ((v + m) * 255.0).round().clamp(0.0, 255.0) as u8;
+    Color::Rgb(to8(r), to8(g), to8(b))
 }
 
 /// Lift a style toward "lit", by `t` in `0.0..1.0`.
@@ -442,6 +517,35 @@ mod tests {
         let ns = NamespaceId(9);
         let lit = (1..=20).filter(|i| first_seen(ns, ExtmarkId(*i)).is_some()).count();
         assert_eq!(lit, BURST, "only the first few of a burst are treated as news");
+    }
+
+    #[test]
+    fn a_spectrum_gives_neighbouring_cells_different_hues() {
+        // The whole point: one colour along the run, not one colour for the run. A gradient that
+        // resolved to the same value everywhere would be an expensive way to draw plain text.
+        let spans = animate("ultrathink", styled(), Animation::Spectrum { period_ms: 4000 }, true, None);
+        assert_eq!(spans.len(), "ultrathink".graphemes(true).count());
+        assert!(spans[0].style.fg != spans[spans.len() - 1].style.fg);
+    }
+
+    #[test]
+    fn a_spectrum_keeps_the_lightness_it_was_given() {
+        // A rainbow at a fixed lightness is a rainbow that vanishes on a light theme. The hue is
+        // the animation's; how bright it is belongs to whoever chose the colour.
+        let dark = animate("abc", Style::default().fg(Color::Rgb(40, 40, 40)), Animation::Spectrum { period_ms: 4000 }, true, None);
+        let light = animate("abc", Style::default().fg(Color::Rgb(220, 220, 220)), Animation::Spectrum { period_ms: 4000 }, true, None);
+        let lum = |s: &Span| match s.style.fg {
+            Some(Color::Rgb(r, g, b)) => luminance((r, g, b)),
+            _ => panic!("truecolor spectrum must produce rgb"),
+        };
+        assert!(lum(&dark[0]) < lum(&light[0]));
+    }
+
+    #[test]
+    fn without_truecolor_a_spectrum_is_six_hues_rather_than_none() {
+        let spans = animate("abcdefgh", styled(), Animation::Spectrum { period_ms: 4000 }, false, None);
+        assert!(spans.iter().all(|s| ANSI_HUES.contains(&s.style.fg.expect("a hue"))));
+        assert!(spans.iter().all(|s| s.style.add_modifier.contains(Modifier::BOLD)));
     }
 
     #[test]

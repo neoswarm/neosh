@@ -36,4 +36,5 @@ export type Animation =
      * How long the lift takes to fall back to nothing.
      */
     ms: number;
-  };
+  }
+  | { "kind": "spectrum"; period_ms: number };
