@@ -178,6 +178,11 @@ export type ApiCall =
      */
     images?: Array<string>;
   }
+  | {
+    "call": "agent_command";
+    session?: SessionId | null;
+    command: AgentCommand;
+  }
   | { "call": "agent_cancel" }
   | { "call": "agent_get_selection" }
   | { "call": "agent_set_selection"; selection: ModelSelection }

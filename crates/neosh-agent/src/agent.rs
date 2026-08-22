@@ -39,6 +39,20 @@ use crate::PluginBridge;
 /// user's budget silently. Hitting it ends the turn with an explicit reason rather than a hang.
 const MAX_TOOL_ROUNDS: usize = 32;
 
+/// How a turn ends when a blocking hook said no.
+///
+/// Not [`StopReason::Cancelled`], which is what `<Esc>` means. The two used to be the same value,
+/// so a turn a policy plugin refused was reported to everything downstream as one the person had
+/// interrupted — which is a different fact with a different remedy, and the reason the plugin gave
+/// was thrown away on the way past. It travels in the explanation, where a transcript can print it
+/// under the question it refused.
+///
+/// `category` says who, because "refused" from a model and "refused" from a budget plugin are
+/// answered by different people.
+fn refused(by: &str, reason: String) -> StopReason {
+    StopReason::Refusal { category: Some(by.to_string()), explanation: Some(reason) }
+}
+
 /// Everything the host needs to render or forward.
 ///
 /// Every variant says which conversation it came from. Turns run per conversation and several can
@@ -565,7 +579,7 @@ impl Agent {
                 level: MessageLevel::Warn,
                 text: format!("turn blocked: {reason}"),
             });
-            return end(self, StopReason::Cancelled, Usage::default());
+            return end(self, refused("a plugin", reason), Usage::default());
         }
         let text = match payload {
             HookPayload::TurnPre { text, .. } => text,
@@ -579,9 +593,55 @@ impl Agent {
         self.emit(AgentEvent::TurnStarted { session: session.clone(), turn: turn.clone() });
         // The hook may have rewritten the words; what was attached is not its business and rides
         // through untouched.
-        self.with(&session, |s| s.push_user(&Prompt { text, images }));
+        self.with(&session, |s| s.push_user(&Prompt { text: text.clone(), images }));
 
+        // --- turn.route: a plugin may say who answers ---------------------
+        //
+        // After the words are settled, because routing on the prompt means routing on the prompt
+        // that will actually be sent; and before the driver is resolved, because that is the last
+        // moment the answer is still a question. See [`HookPayload::TurnRoute`].
         let selection = self.with(&session, |s| s.selection.clone()).flatten();
+        let turn_route: Vec<_> = self.hooks().blocking(HookName::TurnRoute).cloned().collect();
+        let (outcome, payload) = hooks::run_blocking(
+            turn_route,
+            bridge,
+            HookName::TurnRoute,
+            HookPayload::TurnRoute {
+                turn: turn.clone(),
+                text: text.clone(),
+                session: Some(session.clone()),
+                selection: selection.clone(),
+            },
+        )
+        .await;
+        if let HookOutcome::Veto { reason } = outcome {
+            self.with(&session, |s| s.active_turn = None);
+            self.emit(AgentEvent::Notice {
+                session: session.clone(),
+                level: MessageLevel::Warn,
+                text: format!("turn refused by a router: {reason}"),
+            });
+            return end(self, refused("a router", reason), Usage::default());
+        }
+        let selection = match payload {
+            HookPayload::TurnRoute { selection, .. } => selection,
+            _ => selection,
+        };
+        self.observe(bridge, HookName::TurnRoute, HookPayload::TurnRoute {
+            turn: turn.clone(),
+            text,
+            session: Some(session.clone()),
+            selection: selection.clone(),
+        });
+        // Written back, so the rest of the workspace agrees with the turn: the footer, the model
+        // strip and a `^P` opened mid-answer all read the conversation rather than this loop, and a
+        // routed turn that left them saying the old model would be reporting the wrong one for as
+        // long as it ran.
+        if selection != self.with(&session, |s| s.selection.clone()).flatten() {
+            let chosen = selection.clone();
+            self.with(&session, |s| s.selection = chosen);
+        }
+
         let Some(selection) = selection else {
             self.with(&session, |s| s.active_turn = None);
             return end(
@@ -789,7 +849,15 @@ impl Agent {
             }
             // The gap between rounds: the model is about to be asked again anyway, so anything
             // typed since the last one rides along with the tool results.
-            self.take_steering_into(&session, &turn);
+            //
+            // Unless there is no next round. Taking it in here is a promise that the model will
+            // be asked, and a cancelled turn breaks at the top of the loop instead — so this
+            // pushed the message into the conversation, drew it in the transcript as a question,
+            // and then ended without ever putting it to anybody. Left in the queue it is picked
+            // up by the leftover path when the turn ends, which starts a turn that does ask it.
+            if !cancel.is_cancelled() {
+                self.take_steering_into(&session, &turn);
+            }
 
             if round + 1 == MAX_TOOL_ROUNDS {
                 stop = StopReason::Error {
