@@ -25,6 +25,7 @@ pub mod catalog;
 pub mod credentials;
 pub mod drivers;
 pub mod image;
+pub mod injection;
 pub mod quota;
 pub mod registry;
 pub mod sse;
@@ -35,6 +36,7 @@ use futures::Stream;
 use neosh_proto::{InstanceConfig, ModelInfo, ProviderEvent, TurnRequest};
 use tokio_util::sync::CancellationToken;
 
+pub use injection::{inject, prompt_injections};
 pub use registry::ProviderRegistry;
 
 /// A stream of normalized events. Errors are a [`ProviderEvent::Error`] variant rather than a
