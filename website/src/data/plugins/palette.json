@@ -1,0 +1,7 @@
+{
+  "name": "palette",
+  "description": "Every command, one key away",
+  "author": "neosh",
+  "repo": "https://github.com/neoswarm/neosh/tree/main/plugins/builtin/palette",
+  "tags": ["builtin"]
+}

@@ -1,0 +1,807 @@
+<div class="stage">
+  <img class="stage-bg" src="/hero-bg.jpg" alt="" width="1683" height="935" fetchpriority="high" decoding="async" />
+  <div class="term" id="neosh-demo" aria-hidden="true">
+    <div class="term-bar">
+      <span class="dot red"></span>
+      <span class="dot yellow"></span>
+      <span class="dot green"></span>
+      <span class="term-title">neosh</span>
+    </div>
+    <div class="hud" id="hud"></div>
+
+    <div class="term-body">
+      <aside class="side">
+        <div class="srow"><span class="t hd"> PROJECTS</span></div>
+        <div class="srow"><span class="t sep">──────────────────────────────────</span></div>
+        <div class="srow"><span class="t"> <span class="fav">★</span> <span class="acc">▾ neosh</span></span><span class="r" id="sb-proj-r"><span class="cmt">4</span></span></div>
+        <div class="srow"><span class="t acc">    ▾ ⎇ glad-sparrow</span><span class="r" id="sb-wt-r"><span class="cmt">1</span></span></div>
+        <div class="srow"><span class="t">      <span class="g" id="sb-glyph"><span class="acc">▸</span></span> <span id="sb-title" class="acc">make the flaky test…</span></span><span class="r" id="sb-sess-r"><span class="cmt">now</span></span></div>
+        <div class="srow"><span class="t cmt">    ▸ <span class="acc">⎇ </span>fix/ascp-vectors<span class="unread"> ●</span></span><span class="r"><span class="cmt">2</span></span></div>
+        <div class="srow"><span class="t unread">    ● website copy pass</span><span class="r"><span class="unread">12h</span></span></div>
+        <div class="srow"><span class="t">      <span class="live-dim">◍</span> speed up startup…</span><span class="r"><span class="live-fg" id="sb-bench-r">8m 02s</span></span></div>
+        <div class="srow"><span class="t cmt">   ▾ dotfiles</span><span class="r"><span class="cmt">1</span></span></div>
+        <div class="srow"><span class="t">      tidy the zshrc aliases</span><span class="r"><span class="cmt">36h</span></span></div>
+        <div class="srow"><span class="t cmt">   ▸ blog</span><span class="r"><span class="live-fg" id="sb-blog-r">4m 40s</span></span></div>
+        <div class="srow"><span class="t"> </span></div>
+        <div class="srow"><span class="t acc">   + Add project</span></div>
+        <div class="srow"><span class="t cmt">   ┈ Archived</span><span class="r"><span class="cmt">10</span></span></div>
+        <div class="side-fill"></div>
+        <div class="srow"><span class="t"> </span></div>
+        <div class="srow"><span class="t hd"> PLAN</span><span class="r"><span class="cmt">^L</span></span></div>
+        <div class="srow"><span class="t sep">──────────────────────────────────</span></div>
+        <div class="srow"><span class="t hd">   <span class="anthropic">✳</span> Claude ██████░░░  66%</span><span class="r"><span class="cmt">3h</span></span></div>
+        <div class="srow"><span class="t hd">   <span class="openai">⬢</span> Codex  ███░░░░░░  31%</span><span class="r"><span class="cmt">12d</span></span></div>
+        <div class="srow"><span class="t"> </span></div>
+        <div class="srow"><span class="t sep">──────────────────────────────────</span></div>
+        <div class="srow"><span class="t cmt"> ^T projects  ^N new   ^F archive</span></div>
+        <div class="srow"><span class="t cmt"> ^K palette   ^B hide  ^Z keys</span></div>
+      </aside>
+
+      <div class="vrule"></div>
+
+      <div class="main">
+        <div class="chat" id="chat"></div>
+        <div class="composer">
+          <div class="row">&nbsp;</div>
+          <div class="row crule">──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────</div>
+          <div class="row"><span class="prompt">› </span><span id="draft"></span><span class="caret" id="caret"></span><span class="ph" id="ph">Ask anything, or run a command</span></div>
+        </div>
+        <div class="term-status">
+          <span class="t"><span class="cmt"> <span id="st-mode">chat</span>  </span><span class="ok">full access</span><span class="cmt"> </span><span class="key">⇧⇥</span><span class="cmt">  </span><span class="warn">glad-sparrow ●2</span><span class="cmt">  ██░░░░░░ 22% of 1.0M  ↑12.4k ↓3.1k</span></span>
+          <span class="r"><span id="st-turn" class="hidden"><span class="spin" data-spin>⠋</span><span class="live-fg"> </span><span class="live-fg elapsed">0s</span><span>  </span></span><span class="acc">claude-fable-5</span><span> </span><span class="key">^P</span><span class="cmt">  High 1M </span><span class="key">^E</span><span> </span></span>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="mini" aria-hidden="true">
+    <div class="mini-body">
+      <div class="mrow"><span class="prompt">› </span><span class="ph">Pick a model</span></div>
+      <div class="mrow msep">─────────────────────────────────────────────</div>
+      <div class="mcols">
+        <div class="mrail">
+          <div class="mrow mon"> <span class="anthropic">✳</span> Anthropic</div>
+          <div class="mrow cmt"> <span class="openai">⬢</span> OpenAI</div>
+          <div class="mrow cmt"> <span class="google">◆</span> Google</div>
+          <div class="mrow cmt"> <span class="orouter">⬡</span> OpenRouter</div>
+          <div class="mrow cmt"> <span class="ok">▲</span> Ollama</div>
+        </div>
+        <div class="mlist">
+          <div class="mrow mcursor"><span class="t"> claude-fable-5</span><span class="r"><span class="cmt">1M</span></span></div>
+          <div class="mrow"><span class="t"> claude-opus-5</span><span class="r"><span class="cmt">200k</span></span></div>
+          <div class="mrow"><span class="t"> claude-sonnet-5</span><span class="r"><span class="cmt">200k</span></span></div>
+          <div class="mrow"><span class="t"> claude-haiku-4.5</span><span class="r"><span class="cmt">200k</span></span></div>
+        </div>
+      </div>
+      <div class="mrow mhint"><span class="key">↵</span><span class="cmt"> choose   </span><span class="key">^S</span><span class="cmt"> sign in   </span><span class="key">^A</span><span class="cmt"> add a model</span></div>
+    </div>
+  </div>
+</div>
+
+<style is:global>
+  /* Global on purpose: the transcript rows are created by the script at
+     runtime, and Astro's scoped selectors never match them. Everything is
+     prefixed under #neosh-demo (or .stage, which only this component uses). */
+  .stage {
+    /* the exact default palette from neosh-core/src/palette.rs */
+    --fg: #c9ced6;
+    --muted: #8b94a3;
+    --faint: #4b5263;
+    --active: #38bdf8;
+    --attn: #fcd34d;
+    --danger: #fca5a5;
+    --success: #6ee7b7;
+    --accent: #a5b4fc;
+    --fav: #f5a524;
+    --anthropic: #d97a57;
+    --add-bg: #142b1e;
+    --del-bg: #381b1c;
+    --add-gut: #1d3d2a;
+    --del-gut: #4c2426;
+
+    position: relative;
+    border-radius: 8px;
+    overflow: hidden;
+    padding: clamp(24px, 5vw, 76px);
+    background: #22211d;
+    user-select: none;
+    -webkit-user-select: none;
+  }
+
+  .stage-bg {
+    position: absolute;
+    inset: 0;
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+  }
+
+  /* The window — one flat surface, Ghostty-style */
+  #neosh-demo {
+    position: relative;
+    max-width: 1240px;
+    margin: 0 auto;
+    font-family: var(--mono);
+    font-size: 13px;
+    line-height: 1.5;
+    background: #0c0e11;
+    border: 1px solid rgba(255, 255, 255, 0.09);
+    border-radius: 9px;
+    box-shadow: 0 24px 80px rgba(0, 0, 0, 0.55);
+    overflow: hidden;
+    color: var(--fg);
+    user-select: none;
+    -webkit-user-select: none;
+    cursor: default;
+  }
+
+  /* the keys being pressed, like a screencast overlay */
+  .stage .hud {
+    position: absolute;
+    right: 18px;
+    bottom: 58px;
+    display: flex;
+    gap: 6px;
+    z-index: 5;
+    pointer-events: none;
+  }
+  .stage .keycap {
+    display: inline-flex;
+    align-items: center;
+    gap: 7px;
+    font-family: var(--mono);
+    font-size: 12px;
+    line-height: 1;
+    padding: 6px 10px;
+    border-radius: 8px;
+    background: rgba(14, 17, 22, 0.55);
+    backdrop-filter: blur(8px);
+    -webkit-backdrop-filter: blur(8px);
+    border: 1px solid rgba(255, 255, 255, 0.13);
+    color: #f0f2f6;
+    box-shadow: 0 6px 18px rgba(0, 0, 0, 0.3);
+    animation: neosh-cap-in 0.14s ease-out;
+    transition: opacity 0.35s ease, transform 0.35s ease;
+  }
+  .stage .keycap .what {
+    color: var(--muted);
+    font-size: 11.5px;
+  }
+  .stage .keycap.fade {
+    opacity: 0;
+    transform: translateY(5px);
+  }
+  @keyframes neosh-cap-in {
+    from { transform: translateY(7px) scale(0.9); opacity: 0; }
+  }
+
+  /* reading-mode cursor line and visual selection, over any band */
+  .stage .row.cursor { background: #2a303c !important; }
+  .stage .row.vsel { background: #3b455c !important; }
+
+  .stage .term-bar {
+    display: flex;
+    align-items: center;
+    gap: 7px;
+    padding: 12px 14px;
+  }
+
+  .stage .dot {
+    width: 11px;
+    height: 11px;
+    border-radius: 50%;
+  }
+  .stage .red { background: #fc5f57; }
+  .stage .yellow { background: #febc2e; }
+  .stage .green { background: #28c840; }
+
+  .stage .term-title {
+    position: absolute;
+    left: 0;
+    right: 0;
+    text-align: center;
+    color: var(--muted);
+    opacity: 0.6;
+    font-size: 12px;
+    pointer-events: none;
+  }
+
+  /* Layout: the sidebar and its │ rule run the full height of the window;
+     the statusline lives inside the main column, under the composer only */
+  .stage .term-body {
+    display: flex;
+    align-items: stretch;
+    height: 715px;
+  }
+
+  .stage .side {
+    width: 34ch;
+    flex: none;
+    overflow: hidden;
+    padding-top: 2px;
+    display: flex;
+    flex-direction: column;
+  }
+
+  /* The panel's foot: the PLAN section and the key strip sit against the
+     bottom edge, with blank filler rows above them, as the list pins them. */
+  .stage .side-fill {
+    flex: 1;
+  }
+
+  .stage .vrule {
+    flex: none;
+    width: 1ch;
+    position: relative;
+  }
+  .stage .vrule::before {
+    content: "";
+    position: absolute;
+    left: 50%;
+    top: 0;
+    bottom: 0;
+    width: 1px;
+    background: var(--faint);
+    opacity: 0.62;
+  }
+
+  .stage .main {
+    flex: 1;
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+  }
+
+  .stage .chat {
+    flex: 1;
+    min-height: 0;
+    display: flex;
+    flex-direction: column;
+    justify-content: flex-end;
+    overflow: hidden;
+  }
+
+  /* a terminal cell has one height; a fallback-font glyph must not stretch it */
+  .stage .row {
+    white-space: pre;
+    overflow: hidden;
+    flex: none;
+    height: 1.5em;
+  }
+
+  /* Sidebar rows: text left, virtual text flushed right with a trailing space */
+  .stage .srow {
+    display: flex;
+    white-space: pre;
+    overflow: hidden;
+    height: 1.5em;
+  }
+  .stage .srow .t { white-space: pre; }
+  .stage .srow .r { margin-left: auto; padding-right: 1ch; white-space: pre; }
+  .stage .srow .g { display: inline-block; width: 1ch; }
+
+  /* highlight groups */
+  /* terminal bold reads as brightness, not a heavier face */
+  .stage .hd { color: #e9edf3; }
+  .stage .cmt { color: var(--muted); opacity: 0.62; }
+  .stage .faint { color: var(--faint); opacity: 0.62; }
+  .stage .sep { color: var(--faint); opacity: 0.62; }
+  .stage .acc { color: var(--accent); }
+  .stage .key { color: var(--accent);  }
+  .stage .fav { color: var(--fav); }
+  .stage .ok { color: var(--success); }
+  .stage .warn { color: var(--attn); }
+  .stage .err-b { color: var(--danger);  }
+  .stage .dl { color: var(--danger); }
+  .stage .unread { color: var(--attn); }
+  .stage .anthropic { color: var(--anthropic); }
+  .stage .openai { color: #74aa9c; }
+  .stage .google { color: #669df6; }
+  .stage .orouter { color: #8b8ba7; }
+  .stage .live-fg { color: var(--active); }
+  .stage .live-dim { color: var(--active); opacity: 0.55; }
+  .stage .srow.cursor { background: #2a303c; }
+  .stage .spin { color: var(--attn); display: inline-block; width: 1ch; }
+  .stage .spin.blue { color: var(--active); }
+
+  .stage .v-read { color: var(--active); }
+  .stage .v-run { color: var(--attn); }
+  .stage .v-edit { color: var(--success); }
+
+  .stage .k { color: #c68fe6; }
+  .stage .ty { color: #e5c07b; }
+  .stage .fn2 { color: #61afef; }
+  .stage .co { color: #38bdf8; }
+
+  .stage .logo0 { color: #f8fafc; }
+  .stage .logo1 { color: #e2e8f0; }
+  .stage .logo2 { color: #c4ccd8; }
+  .stage .logo3 { color: #a1aab8; }
+  .stage .logo4 { color: #7e8797; }
+  .stage .logo5 { color: #5f6877; }
+
+  /* user bar */
+  .stage .ubar { color: var(--accent);  }
+
+  /* diff bands: background bands the whole row, code keeps its colours */
+  .stage .band-add { background: var(--add-bg); }
+  .stage .band-del { background: var(--del-bg); }
+  .stage .gut { color: var(--muted); }
+  .stage .gut-add { background: var(--add-gut); }
+  .stage .gut-del { background: var(--del-gut); }
+  .stage .sign-add { color: var(--success);  }
+  .stage .sign-del { color: var(--danger);  }
+
+  /* live subject shimmer (Agent.ToolLive, 2s sweep) */
+  .stage .live-subj {
+    color: var(--active);
+    background: linear-gradient(100deg, var(--active) 42%, #d9f2ff 50%, var(--active) 58%);
+    background-size: 220% 100%;
+    -webkit-background-clip: text;
+    background-clip: text;
+    -webkit-text-fill-color: transparent;
+    animation: neosh-sweep 2s linear infinite;
+  }
+
+  @keyframes neosh-sweep {
+    from { background-position: 120% 0; }
+    to { background-position: -120% 0; }
+  }
+
+  /* card landing flash (Agent.ToolLanded, 340ms) */
+  .stage .landed { animation: neosh-land 0.34s ease-out; }
+  @keyframes neosh-land {
+    from { background: rgba(255, 255, 255, 0.14); }
+    to { background: transparent; }
+  }
+
+  /* Status.Pending pulse, 2.6s */
+  .stage .pulse { animation: neosh-pulse 2.6s ease-in-out infinite; }
+  @keyframes neosh-pulse {
+    0%, 100% { opacity: 0.55; }
+    50% { opacity: 1; }
+  }
+
+  /* composer */
+  .stage .crule { color: var(--faint); opacity: 0.62; }
+  .stage .prompt { color: var(--accent);  }
+  .stage .ph { color: var(--faint); opacity: 0.7; }
+  .stage .caret {
+    display: inline-block;
+    width: 1ch;
+    height: 1.15em;
+    vertical-align: text-bottom;
+    background: var(--fg);
+    opacity: 0.85;
+    animation: neosh-blink 1.1s steps(1) infinite;
+  }
+  @keyframes neosh-blink {
+    50% { opacity: 0; }
+  }
+
+  .stage .term-status {
+    display: flex;
+    white-space: pre;
+    overflow: hidden;
+    flex: none;
+    height: 1.5em;
+    margin-bottom: 8px;
+  }
+  .stage .term-status .r { margin-left: auto; white-space: pre; }
+  .stage .hidden { display: none; }
+
+  /* The ^P picker, shown as the float it really is: a rounded border in
+     Float.Border over the workspace, not a window of its own */
+  .stage .mini {
+    position: absolute;
+    top: clamp(18px, 3vw, 52px);
+    right: clamp(12px, 3.2vw, 54px);
+    width: 400px;
+    z-index: 6;
+    font-family: var(--mono);
+    font-size: 12px;
+    line-height: 1.55;
+    background: #0c0e11;
+    border: 1px solid var(--faint);
+    border-radius: 8px;
+    box-shadow: 0 18px 60px rgba(0, 0, 0, 0.55);
+    overflow: hidden;
+    color: var(--fg);
+    cursor: default;
+  }
+  .stage .mini-body { padding: 8px 0 10px; }
+  .stage .mrow {
+    display: flex;
+    white-space: pre;
+    overflow: hidden;
+    height: 1.6em;
+    padding: 0 10px;
+  }
+  .stage .mrow .r { margin-left: auto; white-space: pre; }
+  .stage .msep { color: var(--faint); opacity: 0.62; }
+  .stage .mcols { display: flex; }
+  .stage .mrail { width: 14ch; flex: none; }
+  .stage .mlist { flex: 1; min-width: 0; }
+  .stage .mrail .mrow, .stage .mlist .mrow { padding: 0 6px 0 10px; }
+  .stage .mon { background: #2a303c; }
+  .stage .mcursor { background: #2a303c; }
+  .stage .mhint { margin-top: 4px; }
+
+  @media (max-width: 900px) {
+    .stage .side,
+    .stage .vrule { display: none; }
+    #neosh-demo { font-size: 12px; }
+    .stage .term-body { height: 480px; }
+  }
+
+  @media (max-width: 1250px) {
+    .stage .mini { display: none; }
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    .stage .live-subj,
+    .stage .landed,
+    .stage .pulse,
+    .stage .caret { animation: none; }
+  }
+</style>
+
+<script>
+  const chat = document.getElementById("chat")!;
+  const draft = document.getElementById("draft")!;
+  const caret = document.getElementById("caret")!;
+  const ph = document.getElementById("ph")!;
+  const stTurn = document.getElementById("st-turn")!;
+  const stMode = document.getElementById("st-mode")!;
+  const hud = document.getElementById("hud")!;
+  const sbGlyph = document.getElementById("sb-glyph")!;
+  const sbProjR = document.getElementById("sb-proj-r")!;
+  const sbWtR = document.getElementById("sb-wt-r")!;
+  const sbSessR = document.getElementById("sb-sess-r")!;
+
+  const reduced = matchMedia("(prefers-reduced-motion: reduce)").matches;
+  const BRAILLE = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+
+  // shared spinner clock: cards at 800ms/cycle, sidebar at 100ms/frame
+  if (!reduced) {
+    setInterval(() => {
+      const t = Date.now();
+      const card = BRAILLE[Math.floor(t / 80) % 10];
+      const side = BRAILLE[Math.floor(t / 100) % 10];
+      document.querySelectorAll("[data-spin]").forEach((el) => (el.textContent = card));
+      document.querySelectorAll("[data-spin-side]").forEach((el) => (el.textContent = side));
+    }, 60);
+  }
+
+  let turnStart = 0;
+  let turnTimer: ReturnType<typeof setInterval> | undefined;
+
+  function fmtElapsed(ms: number) {
+    const s = Math.floor(ms / 1000);
+    if (s < 60) return `${s}s`;
+    return `${Math.floor(s / 60)}m ${String(s % 60).padStart(2, "0")}s`;
+  }
+
+  function tickElapsed() {
+    const e = fmtElapsed(Date.now() - turnStart);
+    document.querySelectorAll(".elapsed").forEach((el) => (el.textContent = e));
+  }
+
+  const sleep = (ms: number) => (reduced ? Promise.resolve() : new Promise((r) => setTimeout(r, ms)));
+
+  let working: HTMLElement | null = null;
+
+  function row(html: string, cls = "") {
+    const d = document.createElement("div");
+    d.className = cls ? `row ${cls}` : "row";
+    d.innerHTML = html;
+    return d;
+  }
+
+  function add(html: string, cls = "") {
+    const d = row(html, cls);
+    if (working && working.parentNode === chat) chat.insertBefore(d, working);
+    else chat.appendChild(d);
+    return d;
+  }
+
+  const blank = () => add("&nbsp;");
+
+  function welcome() {
+    add("&nbsp;");
+    add('<span class="logo0">  ███╗   ██╗███████╗ ██████╗ ███████╗██╗  ██╗</span>');
+    add('<span class="logo1">  ████╗  ██║██╔════╝██╔═══██╗██╔════╝██║  ██║</span>');
+    add('<span class="logo2">  ██╔██╗ ██║█████╗  ██║   ██║███████╗███████║</span>');
+    add('<span class="logo3">  ██║╚██╗██║██╔══╝  ██║   ██║╚════██║██╔══██║</span>');
+    add('<span class="logo4">  ██║ ╚████║███████╗╚██████╔╝███████║██║  ██║</span>');
+    add('<span class="logo5">  ╚═╝  ╚═══╝╚══════╝ ╚═════╝ ╚══════╝╚═╝  ╚═╝</span>');
+    add('<span class="cmt">  a terminal-first agent workspace</span>');
+    blank();
+    add('<span class="cmt">  model      </span>anthropic/claude-fable-5<span class="cmt">  ·  max</span>');
+    add('<span class="cmt">  directory  </span>~/projects/neosh/.worktrees/glad-sparrow');
+    blank();
+    add('<span class="key">  ⏎</span><span class="cmt"> send   </span><span class="key">^S</span><span class="cmt"> browse &amp; copy   </span><span class="key">^P</span><span class="cmt"> model   </span><span class="key">^T</span><span class="cmt"> projects   </span><span class="key">^Z</span><span class="cmt"> every key</span>');
+  }
+
+  function showWorking(label: string) {
+    removeWorking();
+    working = row(
+      `<span class="live-subj">✳ ${label}…</span><span class="cmt">  <span class="elapsed">0s</span>  ·  esc to interrupt</span>`,
+    );
+    chat.appendChild(working);
+  }
+
+  function removeWorking() {
+    working?.remove();
+    working = null;
+  }
+
+  function card(verbCls: string, verb: string, subject: string) {
+    const el = add(
+      `<span class="spin" data-spin>⠋</span> <span class="${verbCls}">${verb}</span>  <span class="subj live-subj">${subject}</span>`,
+    );
+    return {
+      el,
+      done(tails: string[], failed = false) {
+        const mark = el.querySelector(".spin")!;
+        if (failed) {
+          mark.removeAttribute("data-spin");
+          mark.textContent = "✗";
+          mark.className = "err-b";
+        } else {
+          mark.removeAttribute("data-spin");
+          mark.textContent = " ";
+          mark.className = "spin";
+        }
+        const subj = el.querySelector(".subj")!;
+        subj.className = "subj cmt";
+        for (const t of tails) el.insertAdjacentHTML("beforeend", `  ${t}`);
+        if (!reduced) el.classList.add("landed");
+      },
+    };
+  }
+
+  // A card's body hangs off a corner: `  └ ` on its first row, plain indent after.
+  function out(text: string, err = false, first = false) {
+    const lead = first ? "  └ " : "    ";
+    return add(err ? `<span class="err-b">${lead}${text}</span>` : `<span class="cmt">${lead}${text}</span>`);
+  }
+
+  function elision(n: number) {
+    return add(`<span class="cmt">    … +${n} lines (^S ⇥ to expand)</span>`);
+  }
+
+  // a pressed key, shown as a keycap with what it did, popping in and fading
+  function press(label: string, what = "") {
+    if (reduced) return;
+    const cap = document.createElement("span");
+    cap.className = "keycap";
+    cap.textContent = label;
+    if (what) {
+      const w = document.createElement("span");
+      w.className = "what";
+      w.textContent = what;
+      cap.appendChild(w);
+    }
+    hud.appendChild(cap);
+    while (hud.children.length > 3) hud.firstElementChild!.remove();
+    setTimeout(() => {
+      cap.classList.add("fade");
+      setTimeout(() => cap.remove(), 400);
+    }, 1300);
+  }
+
+  let cursorRow: HTMLElement | null = null;
+  function cursorTo(el: HTMLElement | null) {
+    cursorRow?.classList.remove("cursor");
+    cursorRow = el;
+    el?.classList.add("cursor");
+  }
+
+  // the rest of the workspace keeps working: two other conversations, elapsed
+  // clocks running, whatever conversation the demo is in
+  const benchR = document.getElementById("sb-bench-r")!;
+  const blogR = document.getElementById("sb-blog-r")!;
+  const parallelStart = Date.now();
+  if (!reduced) {
+    setInterval(() => {
+      const t = Date.now() - parallelStart;
+      benchR.textContent = fmtElapsed(t + 8 * 60_000 + 2000);
+      blogR.textContent = fmtElapsed(t + 4 * 60_000 + 40_000);
+    }, 1000);
+  }
+
+  async function typeMessage(text: string) {
+    ph.classList.add("hidden");
+    for (const ch of text) {
+      draft.textContent += ch;
+      await sleep(24 + Math.random() * 40);
+    }
+    await sleep(420);
+    draft.textContent = "";
+    ph.classList.remove("hidden");
+  }
+
+  function sidebarBusy() {
+    sbGlyph.innerHTML = '<span class="live-fg" data-spin-side>⠋</span>';
+    document.getElementById("sb-title")!.className = "live-fg";
+    sbProjR.innerHTML = '<span class="live-fg elapsed">0s</span>';
+    sbWtR.innerHTML = '<span class="live-fg elapsed">0s</span>';
+    sbSessR.innerHTML = '<span class="live-fg elapsed">0s</span>';
+  }
+
+  function sidebarIdle() {
+    sbGlyph.innerHTML = '<span class="acc">▸</span>';
+    document.getElementById("sb-title")!.className = "acc";
+    sbProjR.innerHTML = '<span class="cmt">3</span>';
+    sbWtR.innerHTML = '<span class="cmt">1</span>';
+    sbSessR.innerHTML = '<span class="cmt">now</span>';
+  }
+
+  function turnOn() {
+    turnStart = Date.now();
+    stTurn.classList.remove("hidden");
+    sidebarBusy();
+    tickElapsed();
+    if (!reduced) turnTimer = setInterval(tickElapsed, 1000);
+  }
+
+  function turnOff() {
+    stTurn.classList.add("hidden");
+    sidebarIdle();
+    if (turnTimer) clearInterval(turnTimer);
+  }
+
+  async function play() {
+    chat.innerHTML = "";
+    welcome();
+
+    await sleep(1200);
+    await typeMessage("make the flaky test in neosh-core deterministic");
+
+    const msgRow = add('<span class="ubar">▌</span> make the flaky test in neosh-core deterministic');
+    blank();
+    turnOn();
+    showWorking("Thinking");
+    await sleep(900);
+
+    // Read card
+    const read = card("v-read", "Read", "crates/neosh-core/src/retry.rs");
+    await sleep(1000);
+    read.done(['<span class="cmt">120 lines</span>']);
+    await sleep(500);
+
+    // failing test run
+    const fail = card("v-run", "Ran", "cargo test -p neosh-core");
+    await sleep(1600);
+    fail.done(['<span class="err-b">exit 101</span>', '<span class="cmt">4.6s</span>'], true);
+    out("   Compiling neosh-core v0.4.2", true, true);
+    elision(212);
+    out("test retry::backs_off_between_attempts ... FAILED", true);
+    out("test result: FAILED. 417 passed; 1 failed", true);
+    await sleep(700);
+
+    // the edit, with its diff
+    const edit = card("v-edit", "Edited", "crates/neosh-core/src/retry.rs");
+    await sleep(1100);
+    edit.done(['<span class="ok">+2</span> <span class="dl">-2</span>']);
+    const diffRows = [
+      add('<span class="cmt">  └ </span><span class="gut">35 </span>  <span class="k">impl</span> <span class="ty">Retry</span> {'),
+      add('    <span class="gut gut-del">36 </span><span class="sign-del">-</span>     <span class="k">fn</span> <span class="fn2">delay</span>(&amp;<span class="k">self</span>) -&gt; <span class="ty">Duration</span> {', "band-del"),
+      add('    <span class="gut gut-add">36 </span><span class="sign-add">+</span>     <span class="k">fn</span> <span class="fn2">delay</span>(&amp;<span class="k">self</span>, clock: &amp;<span class="ty">Clock</span>) -&gt; <span class="ty">Duration</span> {', "band-add"),
+      add('<span class="cmt">    ⋮ 3 unchanged</span>'),
+      add('    <span class="gut gut-del">41 </span><span class="sign-del">-</span>         <span class="fn2">jitter</span>(<span class="ty">Instant</span>::<span class="fn2">now</span>())', "band-del"),
+      add('    <span class="gut gut-add">41 </span><span class="sign-add">+</span>         <span class="fn2">jitter</span>(clock.<span class="fn2">now</span>())', "band-add"),
+      add('    <span class="gut">42 </span>  }'),
+    ];
+    await sleep(800);
+
+    // the run that passes
+    const pass = card("v-run", "Ran", "cargo test -p neosh-core");
+    await sleep(1800);
+    pass.done(['<span class="cmt">8.2s</span>']);
+    out("running 418 tests", false, true);
+    elision(416);
+    out("test retry::backs_off_between_attempts ... ok");
+    out("test result: ok. 418 passed; 0 failed");
+    await sleep(600);
+
+    // the answer streams in above the working line
+    blank();
+    const a1 = add("");
+    const line1 = "The retry loop read the wall clock, so the test raced it.";
+    for (let i = 0; i <= line1.length; i += 3) {
+      a1.textContent = line1.slice(0, i);
+      await sleep(28);
+    }
+    a1.textContent = line1;
+    const a2 = add("");
+    const line2 = ["delay", " takes a ", "Clock", " now, and the test hands it a fake one."];
+    a2.innerHTML = `<span class="co">${line2[0]}</span>${line2[1]}<span class="co">${line2[2]}</span>`;
+    const tail = a2.appendChild(document.createElement("span"));
+    for (let i = 0; i <= line2[3].length; i += 3) {
+      tail.textContent = line2[3].slice(0, i);
+      await sleep(28);
+    }
+    tail.textContent = line2[3];
+
+    removeWorking();
+    turnOff();
+    blank();
+    const sumRow = add('<span class="cmt">  changed 1 file  </span><span class="ok">+2</span> <span class="dl">-2</span>');
+    add('<span class="cmt">    crates/neosh-core/src/retry.rs  </span><span class="ok">+2</span> <span class="dl">-2</span>');
+
+    if (reduced) return;
+
+    // then read what came back: ^S is a mode, and a mode's keys are the mode's keys
+    await sleep(1600);
+    caret.classList.add("hidden");
+    press("^S", "read the transcript");
+    stMode.textContent = "normal";
+    cursorTo(sumRow);
+    await sleep(1000);
+    press("[", "previous turn");
+    cursorTo(msgRow);
+    await sleep(1100);
+    press("}", "next block");
+    cursorTo(read.el);
+    await sleep(750);
+    press("}", "next block");
+    cursorTo(fail.el);
+    await sleep(750);
+    press("}", "next block");
+    cursorTo(edit.el);
+    await sleep(1000);
+    press("⇥", "fold the card");
+    for (const r of diffRows) r.classList.add("hidden");
+    await sleep(1400);
+    press("⇥", "open it back up");
+    for (const r of diffRows) r.classList.remove("hidden");
+    await sleep(1100);
+    press("v", "select");
+    stMode.textContent = "visual";
+    edit.el.classList.add("vsel");
+    await sleep(650);
+    press("j");
+    diffRows[0].classList.add("vsel");
+    await sleep(500);
+    press("j");
+    diffRows[1].classList.add("vsel");
+    await sleep(850);
+    press("y", "copy");
+    stMode.textContent = "chat";
+    for (const r of [edit.el, diffRows[0], diffRows[1]]) r.classList.remove("vsel");
+    cursorTo(null);
+    caret.classList.remove("hidden");
+
+    // and the projects panel is a list you move in too
+    await sleep(1400);
+    const srows = document.querySelectorAll<HTMLElement>("#neosh-demo .side .srow");
+    const hop = (i: number) => {
+      document.querySelectorAll("#neosh-demo .side .srow.cursor").forEach((r) => r.classList.remove("cursor"));
+      srows[i]?.classList.add("cursor");
+    };
+    caret.classList.add("hidden");
+    press("^T", "projects");
+    hop(4);
+    await sleep(900);
+    press("j");
+    hop(5);
+    await sleep(550);
+    press("j");
+    hop(6);
+    await sleep(550);
+    press("j");
+    hop(7);
+    await sleep(1000);
+    press("esc", "back to the composer");
+    document.querySelectorAll("#neosh-demo .side .srow.cursor").forEach((r) => r.classList.remove("cursor"));
+    caret.classList.remove("hidden");
+
+    await sleep(4200);
+    play();
+  }
+
+  play();
+</script>

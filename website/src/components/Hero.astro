@@ -1,0 +1,123 @@
+---
+import Terminal from "./Terminal.astro";
+---
+
+<section class="hero">
+  <div class="glow" aria-hidden="true"></div>
+  <div class="wrap">
+    <p class="eyebrow">Free · Open source · Held by its community</p>
+    <h1>Neovim for<br />controlling AI agents.</h1>
+    <p class="sub">A terminal workspace where every feature is a plugin.<br />Rewire all of it.</p>
+    <div class="cta">
+      <a class="btn primary" href="https://github.com/neoswarm/neosh">Star on GitHub</a>
+      <button class="btn code" id="copy-cmd" title="Copy">
+        <span class="dollar">$</span> cargo run
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
+          <rect x="9" y="9" width="13" height="13" rx="2" />
+          <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1" />
+        </svg>
+      </button>
+    </div>
+    <div class="demo">
+      <Terminal />
+    </div>
+  </div>
+</section>
+
+<style>
+  .hero {
+    padding: 190px 0 110px;
+  }
+
+  .glow {
+    position: absolute;
+    inset: -200px 0 auto;
+    height: 900px;
+    background:
+      radial-gradient(ellipse 55% 45% at 35% 25%, var(--glow-a), transparent 70%),
+      radial-gradient(ellipse 40% 35% at 55% 15%, var(--glow-b), transparent 70%);
+    pointer-events: none;
+    z-index: -1;
+  }
+
+  h1 {
+    font-size: clamp(48px, 6.4vw, 92px);
+    font-weight: 650;
+    letter-spacing: -0.038em;
+    line-height: 1.04;
+    margin: 0 0 26px;
+    background: linear-gradient(180deg, #fff 55%, #a8a8b8);
+    -webkit-background-clip: text;
+    background-clip: text;
+    color: transparent;
+  }
+
+  .sub {
+    color: var(--muted);
+    font-size: 21px;
+    margin: 0 0 40px;
+    max-width: 640px;
+  }
+
+  .cta {
+    display: flex;
+    gap: 14px;
+    flex-wrap: wrap;
+  }
+
+  .btn {
+    display: inline-flex;
+    align-items: center;
+    gap: 9px;
+    height: 50px;
+    padding: 0 24px;
+    border-radius: 11px;
+    font-size: 15.5px;
+    font-weight: 500;
+    cursor: pointer;
+    transition: opacity 0.2s ease, border-color 0.2s ease;
+  }
+
+  .primary {
+    background: var(--fg);
+    color: #0a0a0c;
+  }
+
+  .primary:hover {
+    opacity: 0.85;
+  }
+
+  .code {
+    font-family: var(--mono);
+    font-size: 14.5px;
+    background: transparent;
+    color: var(--fg);
+    border: 1px solid var(--line-strong);
+  }
+
+  .code:hover {
+    border-color: rgba(255, 255, 255, 0.35);
+  }
+
+  .code svg {
+    color: var(--dim);
+  }
+
+  .dollar {
+    color: var(--dim);
+  }
+
+  .demo {
+    margin-top: 72px;
+  }
+</style>
+
+<script>
+  const btn = document.getElementById("copy-cmd")!;
+  btn.addEventListener("click", async () => {
+    await navigator.clipboard.writeText("git clone https://github.com/neoswarm/neosh && cd neosh && cargo run");
+    const prev = btn.innerHTML;
+    btn.innerHTML = '<span class="dollar">$</span> copied';
+    setTimeout(() => (btn.innerHTML = prev), 1400);
+  });
+</script>

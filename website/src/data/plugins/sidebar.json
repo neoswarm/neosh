@@ -1,0 +1,7 @@
+{
+  "name": "sidebar",
+  "description": "Projects, conversations and worktrees in one column",
+  "author": "neosh",
+  "repo": "https://github.com/neoswarm/neosh/tree/main/plugins/builtin/sidebar",
+  "tags": ["builtin"]
+}

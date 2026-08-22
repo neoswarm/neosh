@@ -1,0 +1,7 @@
+{
+  "name": "slash",
+  "description": "Slash commands in the composer",
+  "author": "neosh",
+  "repo": "https://github.com/neoswarm/neosh/tree/main/plugins/builtin/slash",
+  "tags": ["builtin"]
+}

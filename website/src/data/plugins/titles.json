@@ -1,0 +1,7 @@
+{
+  "name": "titles",
+  "description": "Names your conversations for you",
+  "author": "neosh",
+  "repo": "https://github.com/neoswarm/neosh/tree/main/plugins/builtin/titles",
+  "tags": ["builtin"]
+}

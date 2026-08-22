@@ -1,0 +1,296 @@
+<section id="how">
+  <div class="wrap">
+    <p class="eyebrow">How it works</p>
+    <h2>The agent lives in the workspace.<br />You just visit.</h2>
+
+    <div class="step" data-reveal>
+      <div class="text">
+        <h3>One workspace, every terminal</h3>
+        <p>
+          The workspace is a process. Terminals attach to it and mirror it, live.
+          Close one, the turns keep running.
+        </p>
+      </div>
+      <div class="visual card mirrors">
+        <div class="core">workspace</div>
+        <div class="wires" aria-hidden="true">
+          <span class="pulse p1"></span>
+          <span class="pulse p2"></span>
+          <span class="pulse p3"></span>
+        </div>
+        <div class="minis">
+          <div class="mini"><span class="mini-bar"></span><span class="typeline">❯ refactor the parser</span></div>
+          <div class="mini"><span class="mini-bar"></span><span class="typeline">❯ refactor the parser</span></div>
+          <div class="mini"><span class="mini-bar"></span><span class="typeline">❯ refactor the parser</span></div>
+        </div>
+      </div>
+    </div>
+
+    <div class="step flip" data-reveal>
+      <div class="text">
+        <h3>Everything is a plugin</h3>
+        <p>
+          The sidebar, the palette, git, approvals. All written on the public API,
+          and your <code>init.ts</code> gets the same one. Replace anything.
+        </p>
+      </div>
+      <div class="visual card code-card">
+        <div class="code-title">~/.config/neosh/init.ts</div>
+        <pre><code><span class="k">export async function</span> <span class="f">activate</span>({'{'} neosh {'}'}) {'{'}
+  <span class="k">await</span> neosh.keymap.<span class="f">set</span>(<span class="s">"chat"</span>, <span class="s">"&lt;C-g&gt;"</span>, <span class="s">"git.status"</span>);
+  <span class="k">await</span> neosh.opt.<span class="f">set</span>(<span class="s">"agent.model"</span>, <span class="s">"claude-cli/opus"</span>);
+  <span class="k">await</span> neosh.rtp.<span class="f">add</span>(<span class="s">"~/src/my-plugins"</span>);
+{'}'}</code></pre>
+      </div>
+    </div>
+
+    <div class="step" data-reveal>
+      <div class="text">
+        <h3>Any model</h3>
+        <p>
+          423 models before you configure anything. Your <code>claude</code> login
+          works as is. Switch mid turn, the agent thinks the rest with it.
+        </p>
+      </div>
+      <div class="visual card models">
+        <div class="model-window" aria-hidden="true">
+          <div class="model-reel">
+            <span>claude-cli/opus</span>
+            <span>codex/gpt-5.2</span>
+            <span>openrouter/deepseek-v3</span>
+            <span>ollama/llama3.3</span>
+            <span>google/gemini-2.5-pro</span>
+            <span>claude-cli/opus</span>
+          </div>
+        </div>
+        <div class="model-hint">^P picks · ⌥↑ climbs the ladder</div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<style>
+  h2 {
+    margin-bottom: 100px;
+  }
+
+  .step {
+    display: grid;
+    grid-template-columns: 1fr 1.35fr;
+    gap: 90px;
+    align-items: center;
+    margin-bottom: 140px;
+  }
+
+  .step:last-child {
+    margin-bottom: 0;
+  }
+
+  .step.flip {
+    grid-template-columns: 1.35fr 1fr;
+  }
+
+  .step.flip .text {
+    order: 2;
+  }
+
+  h3 {
+    font-size: 30px;
+    font-weight: 600;
+    letter-spacing: -0.015em;
+    margin: 0 0 14px;
+  }
+
+  .text p {
+    color: var(--muted);
+    font-size: 18px;
+    margin: 0;
+  }
+
+  code {
+    font-family: var(--mono);
+    font-size: 0.9em;
+    color: var(--fg);
+  }
+
+  .visual {
+    padding: 44px;
+    min-height: 360px;
+    display: flex;
+    flex-direction: column;
+    justify-content: center;
+  }
+
+  /* Step 1: mirrors */
+  .mirrors {
+    align-items: center;
+    gap: 0;
+  }
+
+  .core {
+    font-family: var(--mono);
+    font-size: 14px;
+    color: var(--muted);
+    border: 1px solid var(--line-strong);
+    border-radius: 9px;
+    padding: 10px 24px;
+    background: var(--bg);
+  }
+
+  .wires {
+    display: flex;
+    gap: 130px;
+    height: 60px;
+  }
+
+  .pulse {
+    width: 1px;
+    background: var(--line-strong);
+    position: relative;
+    overflow: hidden;
+  }
+
+  .pulse::after {
+    content: "";
+    position: absolute;
+    left: -1px;
+    width: 3px;
+    height: 10px;
+    border-radius: 2px;
+    background: var(--accent);
+    animation: drip 1.6s linear infinite;
+  }
+
+  .p2::after { animation-delay: 0.3s; }
+  .p3::after { animation-delay: 0.6s; }
+
+  @keyframes drip {
+    from { top: -12px; }
+    to { top: 64px; }
+  }
+
+  .minis {
+    display: flex;
+    gap: 20px;
+    width: 100%;
+  }
+
+  .mini {
+    flex: 1;
+    background: var(--bg);
+    border: 1px solid var(--line);
+    border-radius: 10px;
+    padding: 12px 14px 16px;
+    overflow: hidden;
+  }
+
+  .mini-bar {
+    display: block;
+    width: 34px;
+    height: 5px;
+    border-radius: 3px;
+    background: var(--line-strong);
+    margin-bottom: 12px;
+  }
+
+  .typeline {
+    display: inline-block;
+    font-family: var(--mono);
+    font-size: 13px;
+    color: var(--muted);
+    white-space: nowrap;
+    overflow: hidden;
+    max-width: 100%;
+    border-right: 5px solid var(--fg);
+    animation: typing 4s steps(20) infinite;
+  }
+
+  @keyframes typing {
+    0% { width: 0; }
+    55% { width: 100%; }
+    90% { width: 100%; }
+    100% { width: 0; }
+  }
+
+  /* Step 2: code */
+  .code-card {
+    padding: 0;
+    font-family: var(--mono);
+    font-size: 15px;
+    line-height: 1.9;
+    justify-content: flex-start;
+  }
+
+  .code-card pre {
+    margin: auto 0;
+  }
+
+  .code-title {
+    padding: 13px 26px;
+    border-bottom: 1px solid var(--line);
+    color: var(--dim);
+    font-size: 13px;
+  }
+
+  pre {
+    margin: 0;
+    padding: 28px 30px;
+    overflow-x: auto;
+  }
+
+  .k { color: var(--accent); }
+  .f { color: #7dd3fc; }
+  .s { color: #86efac; }
+
+  /* Step 3: models */
+  .models {
+    align-items: center;
+    gap: 22px;
+  }
+
+  .model-window {
+    height: 2em;
+    overflow: hidden;
+    font-family: var(--mono);
+    font-size: 24px;
+    mask-image: linear-gradient(transparent, black 30%, black 70%, transparent);
+  }
+
+  .model-reel {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    animation: reel 10s cubic-bezier(0.7, 0, 0.3, 1) infinite;
+  }
+
+  .model-reel span {
+    height: 2em;
+    line-height: 2em;
+  }
+
+  @keyframes reel {
+    0%, 12% { transform: translateY(0); }
+    20%, 32% { transform: translateY(-2em); }
+    40%, 52% { transform: translateY(-4em); }
+    60%, 72% { transform: translateY(-6em); }
+    80%, 92% { transform: translateY(-8em); }
+    100% { transform: translateY(-10em); }
+  }
+
+  .model-hint {
+    font-family: var(--mono);
+    font-size: 13.5px;
+    color: var(--dim);
+  }
+
+  @media (max-width: 760px) {
+    .step {
+      grid-template-columns: 1fr;
+      gap: 24px;
+      margin-bottom: 70px;
+    }
+    .step.flip .text {
+      order: 0;
+    }
+  }
+</style>

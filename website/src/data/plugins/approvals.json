@@ -1,0 +1,7 @@
+{
+  "name": "approvals",
+  "description": "Permission prompts as cards",
+  "author": "neosh",
+  "repo": "https://github.com/neoswarm/neosh/tree/main/plugins/builtin/approvals",
+  "tags": ["builtin"]
+}

@@ -1,0 +1,7 @@
+{
+  "name": "questions",
+  "description": "The agent asks, you answer over the composer",
+  "author": "neosh",
+  "repo": "https://github.com/neoswarm/neosh/tree/main/plugins/builtin/questions",
+  "tags": ["builtin"]
+}

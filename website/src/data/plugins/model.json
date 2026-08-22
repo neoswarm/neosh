@@ -1,0 +1,7 @@
+{
+  "name": "model",
+  "description": "Pick a model mid turn",
+  "author": "neosh",
+  "repo": "https://github.com/neoswarm/neosh/tree/main/plugins/builtin/model",
+  "tags": ["builtin"]
+}
