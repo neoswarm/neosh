@@ -416,3 +416,79 @@ async fn steering_is_taken_by_the_conversation_it_was_typed_in() {
         "taking one conversation's queue must not empty another's"
     );
 }
+
+// ---- several views of one workspace ---------------------------------------
+//
+// The workspace is a process and the terminal is a viewer of it (ADR 0036), so there can be more
+// than one viewer. Each needs the *whole* stream: a view that missed one `ToolFinished` is a view
+// with a card that never stops spinning, and nothing later puts it right.
+
+/// Two views of one workspace see exactly the same turn.
+#[tokio::test]
+async fn every_view_sees_the_whole_turn() {
+    let (agent, mut first) = agent_with_tool_turn();
+    let mut second = agent.subscribe();
+    assert_eq!(agent.views(), 2);
+
+    agent.run_turn(&TestBridge::default(), "say hello").await;
+
+    let a = drain(&mut first);
+    let b = drain(&mut second);
+    assert!(!a.is_empty(), "a turn produced no events at all");
+    assert_eq!(a, b, "two views of one workspace disagreed about what happened");
+}
+
+/// A view that has gone away does not take the others with it, and does not accumulate.
+#[tokio::test]
+async fn a_view_that_closed_does_not_take_the_others_with_it() {
+    let (agent, first) = agent_with_tool_turn();
+    let mut second = agent.subscribe();
+    assert_eq!(agent.views(), 2);
+
+    // The terminal was closed. The workspace, and the turn, carry on.
+    drop(first);
+
+    agent.run_turn(&TestBridge::default(), "say hello").await;
+
+    assert!(!drain(&mut second).is_empty(), "the surviving view saw nothing");
+    assert_eq!(agent.views(), 1, "a closed view is pruned by the send that found it closed");
+}
+
+/// Every terminal being closed is an ordinary state, not a shutdown.
+#[tokio::test]
+async fn a_turn_runs_with_nobody_watching() {
+    let (agent, rx) = agent_with_tool_turn();
+    drop(rx);
+
+    let outcome = agent.run_turn(&TestBridge::default(), "say hello").await;
+
+    assert_eq!(agent.views(), 0);
+    assert_eq!(outcome.stop_reason, StopReason::EndTurn, "the turn ran to the end anyway");
+}
+
+/// A view opened while the workspace is busy gets what happens next, not a replay.
+///
+/// The state it is missing arrives as `Editor::republish`, which is a different question from this
+/// one: a second copy of the deltas that built a transcript would draw it twice.
+#[tokio::test]
+async fn a_view_that_arrives_late_gets_what_happens_next() {
+    let (agent, mut first) = agent_with_script(vec![
+        MockProvider::text_turn(&["before"]),
+        MockProvider::text_turn(&["after"]),
+    ]);
+    let bridge = TestBridge::default();
+
+    agent.run_turn(&bridge, "one").await;
+    let early = drain(&mut first);
+    assert!(!early.is_empty());
+
+    let mut late = agent.subscribe();
+    agent.run_turn(&bridge, "two").await;
+
+    let seen = drain(&mut late);
+    assert_eq!(seen, drain(&mut first), "from the moment it attached, both views agree");
+    assert!(
+        seen.iter().all(|e| !matches!(e, AgentEvent::Token { text, .. } if text == "before")),
+        "a late view was replayed a turn that had already finished"
+    );
+}

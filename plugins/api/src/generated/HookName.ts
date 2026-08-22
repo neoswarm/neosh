@@ -12,4 +12,5 @@ export type HookName =
   | "turn_pre"
   | "turn_post"
   | "buf_pre_change"
-  | "permission_pre";
+  | "permission_pre"
+  | "ask_user";

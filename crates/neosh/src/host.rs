@@ -784,6 +784,8 @@ impl Host {
                 | ApiCall::AgentListModels { .. }
                 | ApiCall::PermissionCheck { .. }
                 | ApiCall::PathComplete { .. }
+                | ApiCall::AskUser { .. }
+                | ApiCall::UsageHistory { .. }
         ) {
             return false;
         }
@@ -2849,8 +2851,14 @@ impl Host {
     ) {
         let asker: Arc<dyn neosh_provider::approval::PermissionAsker> =
             Arc::new(neosh_agent::DriverAsker::new(&self.agent, self.bridge.clone()));
+        // The other half of "a request one of them cannot answer alone": not whether something may
+        // happen, but which of several things you want. Policy has no answer to that one, so it
+        // goes somewhere else entirely — see [`neosh_agent::DriverQuestioner`].
+        let questioner: Arc<dyn neosh_provider::ask::QuestionAsker> =
+            Arc::new(neosh_agent::DriverQuestioner::new(&self.agent, self.bridge.clone()));
         for d in &drivers {
             d.set_permission_asker(asker.clone());
+            d.set_question_asker(questioner.clone());
         }
         self.agent_drivers = drivers;
         self.sync_agent_drivers();
@@ -7203,6 +7211,10 @@ async fn run_slow(svc: Services, call: ApiCall) -> ApiResult {
         // configured provider, and doing it inline freezes typing for as long as it takes.
         ApiCall::AgentListModels { instance, refresh } => svc.list_models(instance, refresh).await,
         ApiCall::PermissionCheck { capability } => svc.permission_check(capability).await,
+        ApiCall::AskUser { questions } => svc.ask_user(questions).await,
+        ApiCall::UsageHistory { since, until, resolution, time_zone } => {
+            svc.usage_history(since, until, resolution, time_zone).await
+        }
         other => Err(ApiError::Internal {
             message: format!("{other:?} is not a background call"),
         }),

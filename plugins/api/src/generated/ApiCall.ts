@@ -253,6 +253,7 @@ export type ApiCall =
   | { "call": "permission_get_mode" }
   | { "call": "permission_set_mode"; mode: PermissionMode }
   | { "call": "permission_check"; capability: Capability }
+  | { "call": "ask_user"; questions: Array<UserQuestion> }
   | { "call": "opt_declare"; spec: OptionSpec }
   | { "call": "opt_set"; name: string; value: OptionValue }
   | { "call": "opt_get"; name: string }

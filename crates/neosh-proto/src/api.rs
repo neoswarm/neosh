@@ -11,8 +11,8 @@ use serde::{Deserialize, Serialize};
 use ts_rs::TS;
 
 use crate::agent::{
-    Capability, HookName, HookPayload, Message, PermissionDecision, PermissionMode, SessionInfo,
-    ToolDef, ToolResult,
+    Capability, HookName, HookPayload, Message, PermissionDecision, PermissionMode, QuestionAnswer,
+    SessionInfo, ToolDef, ToolResult, UserQuestion,
 };
 use crate::ascp::{AgentCommand, AgentSummary, NodeCapabilities, NodeId, NodeInfo, ProjectKey};
 use crate::ids::{
@@ -650,6 +650,22 @@ pub enum ApiCall {
         capability: Capability,
     },
 
+    // ---- questions -----------------------------------------------------
+    /// Ask the person a question, and wait for the answer.
+    ///
+    /// The same door an agent driver's `AskUserQuestion` comes through, and deliberately so: a
+    /// plugin that needs to know which of three things you meant should get the panel the agent
+    /// gets, not a picker of its own that looks nearly like it. Whatever serves the
+    /// [`HookName::AskUser`](crate::HookName::AskUser) hook draws it — the bundled panel by
+    /// default, and whatever loads after it otherwise.
+    ///
+    /// Answers `None` when nobody answered: dismissed, timed out, or no panel at all. That is not
+    /// an error, and a caller that treats it as one is a caller that will report a failure every
+    /// time somebody presses `<Esc>`.
+    AskUser {
+        questions: Vec<UserQuestion>,
+    },
+
     // ---- options -------------------------------------------------------
     /// Declare an option. The built-in options are declared through this same call at startup, so
     /// there is nothing a plugin's settings cannot do that neosh's own can.
@@ -1072,6 +1088,11 @@ pub enum ApiOk {
     DriverCommands { commands: Vec<DriverCommand> },
     Keymaps { keymaps: Vec<KeymapEntry> },
     Permission { decision: PermissionDecision },
+    /// What somebody said to an [`ApiCall::AskUser`]. `None` is "nobody answered".
+    Answers {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        answers: Option<Vec<QuestionAnswer>>,
+    },
     PermissionMode { mode: PermissionMode },
     FocusedWin { win: Option<WindowId> },
     Option { entry: Option<OptionEntry> },

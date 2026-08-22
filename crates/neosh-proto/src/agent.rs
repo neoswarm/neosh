@@ -371,6 +371,69 @@ impl PermissionOptionKind {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Questions
+// ---------------------------------------------------------------------------
+
+/// One thing an agent wants to know before it carries on, and the answers it suggests.
+///
+/// Deliberately not a [`PermissionOption`] list. A permission request asks *may this happen* and
+/// every answer to it is a yes or a no; this asks *which of these* — several times over, sometimes
+/// with more than one answer each, sometimes with an answer nobody listed. Squeezing it into the
+/// permission family would mean a prompt whose "options" are not decisions about the thing being
+/// asked, and a policy layer that could answer `full access` to a question about which database to
+/// use. See ADR 0043.
+#[derive(TS, Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
+#[ts(export)]
+pub struct UserQuestion {
+    /// The question, and its identity.
+    ///
+    /// One field for both on purpose. The `claude` CLI looks an answer up *by the text of the
+    /// question it answers* — the reply is a map keyed on this string — so a generated id would be
+    /// an answer to a question that does not exist, and the turn would come back saying nobody
+    /// answered. Whatever asks, the rule is the same: the question is the key.
+    pub question: String,
+    /// Two or three words over the question — `Auth method`, `Library`, `Approach`. A chip rather
+    /// than a sentence, and it is what a folded card says the question was about.
+    #[serde(default)]
+    pub header: String,
+    pub options: Vec<QuestionOption>,
+    /// Whether more than one option may be taken.
+    #[serde(default)]
+    pub multi_select: bool,
+}
+
+/// One answer on offer.
+#[derive(TS, Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
+#[ts(export)]
+pub struct QuestionOption {
+    /// What the option is called. **This is what is sent back** — the agent matches on the label
+    /// it wrote, not on a position in a list, so a client that reorders the rows still answers the
+    /// question it was asked.
+    pub label: String,
+    /// What taking it would mean. Shown under the label, dimmed; often the part that decides it.
+    #[serde(default)]
+    pub description: String,
+}
+
+/// What somebody said, for one question.
+#[derive(TS, Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
+#[ts(export)]
+pub struct QuestionAnswer {
+    /// Which question this answers, by its [`UserQuestion::question`] text.
+    pub question: String,
+    /// The labels taken, in the order they were taken. Exactly one for a single-select question.
+    ///
+    /// An answer somebody *typed* is one entry that is not any of the offered labels, and that is
+    /// not a special case on the wire: to the agent, "Postgres" and "neither, use what is already
+    /// there" are the same kind of thing — what the user said.
+    pub answers: Vec<String>,
+    /// Whether [`Self::answers`] was typed rather than chosen. Carried so a transcript can draw it
+    /// differently; nothing sent to the agent depends on it.
+    #[serde(default)]
+    pub custom: bool,
+}
+
 #[derive(TS, Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 #[ts(export)]
@@ -400,6 +463,10 @@ pub enum HookName {
     TurnPost,
     BufPreChange,
     PermissionPre,
+    /// Fired when an agent wants an answer from the person, rather than permission from the
+    /// policy. A blocking hook here answers it; a veto — or no blocking hook at all — is "nobody
+    /// answered", which the agent is told plainly rather than being left to time out.
+    AskUser,
 }
 
 #[derive(TS, Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
@@ -446,6 +513,31 @@ pub enum HookPayload {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         #[ts(optional)]
         chosen: Option<String>,
+    },
+    /// An agent is asking the person a question. See [`UserQuestion`].
+    AskUser {
+        /// Which conversation is asking. A workspace runs several turns at once and only one of
+        /// them is on screen, so a panel that assumed "the one in front of you" would put another
+        /// conversation's question over the one you are reading.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        session: Option<SessionId>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        turn: Option<TurnId>,
+        /// Where the turn is running, so a question about a file can be read against the right
+        /// tree.
+        #[serde(default)]
+        cwd: String,
+        questions: Vec<UserQuestion>,
+        /// The answers. Set by the hook, in a [`HookOutcome::Modify`] carrying this payload back —
+        /// the same way [`Self::PermissionPre::chosen`] comes home.
+        ///
+        /// `None` means nobody has answered yet. An empty list is not the same thing and is read as
+        /// a refusal: it is what a hook that ran and declined to ask anybody returns.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        answers: Option<Vec<QuestionAnswer>>,
     },
 }
 

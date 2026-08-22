@@ -32,10 +32,11 @@
 use std::collections::HashMap;
 use std::path::Path;
 
-use neosh_proto::{Capability, PermissionOption, PermissionOptionKind};
+use neosh_proto::{Capability, PermissionOption, PermissionOptionKind, QuestionOption, UserQuestion};
 use serde_json::{Value, json};
 
 use crate::approval::{PermissionAnswer, PermissionRequest};
+use crate::ask::QuestionAnswers;
 
 /// The option id for "yes, this once". Fixed rather than generated: it is neosh's own answer, not
 /// one of the CLI's, and it has to be recognisable on the way back.
@@ -65,6 +66,13 @@ pub fn can_use_tool(v: &Value, cwd: &Path) -> Option<CanUseTool> {
     }
     let req = v.get("request")?;
     if req.get("subtype").and_then(Value::as_str) != Some("can_use_tool") {
+        return None;
+    }
+    // A question is not a permission, and reading one as a permission is how it stops working:
+    // policy answers it — `full access` says yes before anyone is asked — and the bare yes that
+    // comes back carries no answers, so the CLI tells its own model "The user did not answer the
+    // questions". [`ask_user_question`] claims these; this refuses them.
+    if is_question(req) {
         return None;
     }
     let request_id = v.get("request_id").and_then(Value::as_str)?.to_string();
@@ -157,6 +165,155 @@ pub fn response(ask: &CanUseTool, answer: &PermissionAnswer) -> Value {
         if let Some(id) = tool_use_id {
             obj.insert("toolUseID".into(), json!(id));
         }
+    }
+    json!({
+        "type": "control_response",
+        "response": { "subtype": "success", "request_id": ask.request_id, "response": body },
+    })
+}
+
+/// One `can_use_tool` that is really a question, read into something a person can be asked.
+///
+/// The CLI's `AskUserQuestion` arrives down the same pipe as a permission request and is not one.
+/// It is the model asking *you* something — which library, which approach, which of these to
+/// enable — and the reply it wants is not a yes but a map of answers.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AskUser {
+    /// Correlates the answer. Opaque; echoed back untouched.
+    pub request_id: String,
+    pub tool_use_id: Option<String>,
+    pub questions: Vec<UserQuestion>,
+    /// The `questions` array exactly as it arrived.
+    ///
+    /// Handed straight back in `updatedInput` rather than rebuilt from [`Self::questions`]. The CLI
+    /// re-reads that array to render its own record of the exchange, and a round-trip through
+    /// neosh's types would quietly drop any field neosh has not heard of — which is every field
+    /// added to the tool after this was written.
+    pub raw: Value,
+}
+
+/// Whether a `can_use_tool` request is a question rather than a permission.
+///
+/// Both tests, because they fail differently. `requires_user_interaction` is the CLI *saying so*
+/// and is the honest signal — it is set for anything that must reach a person, whatever it ends up
+/// being called. The name is the fallback for an install too old to send the flag, and it is the
+/// one every version has.
+fn is_question(req: &Value) -> bool {
+    req.get("requires_user_interaction").and_then(Value::as_bool).unwrap_or(false)
+        || req.get("tool_name").and_then(Value::as_str) == Some("AskUserQuestion")
+}
+
+/// Read a line from the CLI as a question, or `None` if it is not one.
+///
+/// Anything malformed enough to have no questions in it is `None` as well, and then the ordinary
+/// permission path has it. A request with a `questions` array of nothing is a prompt with no rows,
+/// which is a dialog you cannot answer or dismiss.
+pub fn ask_user_question(v: &Value) -> Option<AskUser> {
+    if v.get("type").and_then(Value::as_str) != Some("control_request") {
+        return None;
+    }
+    let req = v.get("request")?;
+    if req.get("subtype").and_then(Value::as_str) != Some("can_use_tool") || !is_question(req) {
+        return None;
+    }
+    let raw = req.get("input")?.get("questions")?.clone();
+    let questions: Vec<UserQuestion> =
+        raw.as_array()?.iter().filter_map(question).collect();
+    if questions.is_empty() {
+        return None;
+    }
+    Some(AskUser {
+        request_id: v.get("request_id").and_then(Value::as_str)?.to_string(),
+        tool_use_id: req.get("tool_use_id").and_then(Value::as_str).map(str::to_string),
+        questions,
+        raw,
+    })
+}
+
+/// One entry of the `questions` array, if it is one.
+///
+/// The question text is the only field that has to be there: it is what the answer is keyed on, so
+/// a question without one cannot be answered even if it can be drawn. A `header` is optional and
+/// falls back to nothing rather than to an invented one — a chip reading `Question 1` is a chip
+/// that says less than no chip at all.
+fn question(v: &Value) -> Option<UserQuestion> {
+    let text = v.get("question").and_then(Value::as_str).filter(|q| !q.trim().is_empty())?;
+    let options = v
+        .get("options")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|o| {
+            let label = o.get("label").and_then(Value::as_str).filter(|l| !l.is_empty())?;
+            Some(QuestionOption {
+                label: label.to_string(),
+                description: o
+                    .get("description")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+            })
+        })
+        .collect();
+    Some(UserQuestion {
+        question: text.to_string(),
+        header: v.get("header").and_then(Value::as_str).unwrap_or_default().to_string(),
+        options,
+        multi_select: v.get("multiSelect").and_then(Value::as_bool).unwrap_or(false),
+    })
+}
+
+/// The line the CLI is waiting for, once somebody has answered — or not.
+///
+/// Answers go back as `updatedInput`, keyed by the *text* of each question, which is how the CLI
+/// looks them up. A single-select answer is a string and a multi-select one is an array, because
+/// that is what the tool's own schema says and a one-element array where a string was expected
+/// reaches the model as `["Tabs"]`.
+///
+/// Answering *nothing* is a `deny` carrying a sentence rather than an `allow` carrying an empty
+/// map: the empty map is read as "did not answer" and reaches the model as a flat statement with
+/// no reason in it, while a denial's message is passed through verbatim and can say which of the
+/// two kinds of silence this was.
+pub fn answer(ask: &AskUser, answers: &QuestionAnswers) -> Value {
+    let body = match answers {
+        QuestionAnswers::Cancelled { reason } => json!({ "behavior": "deny", "message": reason }),
+        QuestionAnswers::Answered(given) if given.iter().all(|a| a.answers.is_empty()) => {
+            json!({ "behavior": "deny", "message": QuestionAnswers::dismissed_reason() })
+        }
+        QuestionAnswers::Answered(given) => {
+            let mut map = serde_json::Map::new();
+            for a in given.iter().filter(|a| !a.answers.is_empty()) {
+                // Which question it answers is matched against what was asked: a client that
+                // answered something nobody asked would otherwise put a key in `updatedInput` that
+                // the CLI cannot match, and the answer would silently go missing rather than be
+                // reported.
+                let Some(q) = ask.questions.iter().find(|q| q.question == a.question) else {
+                    continue;
+                };
+                map.insert(
+                    q.question.clone(),
+                    if q.multi_select {
+                        Value::Array(a.answers.iter().cloned().map(Value::String).collect())
+                    } else {
+                        Value::String(a.answers[0].clone())
+                    },
+                );
+            }
+            if map.is_empty() {
+                json!({ "behavior": "deny", "message": QuestionAnswers::dismissed_reason() })
+            } else {
+                json!({
+                    "behavior": "allow",
+                    "updatedInput": { "questions": ask.raw, "answers": Value::Object(map) },
+                })
+            }
+        }
+    };
+    let mut body = body;
+    if let Some(obj) = body.as_object_mut()
+        && let Some(id) = &ask.tool_use_id
+    {
+        obj.insert("toolUseID".into(), json!(id));
     }
     json!({
         "type": "control_response",
@@ -308,6 +465,214 @@ fn host_of(url: &str) -> Option<String> {
     let host = host.rsplit_once('@').map(|(_, h)| h).unwrap_or(host);
     let host = host.split_once(':').map(|(h, _)| h).unwrap_or(host);
     (!host.is_empty()).then(|| host.to_string())
+}
+
+#[cfg(test)]
+mod questions {
+    //! The `AskUserQuestion` half, captured from a real `claude 2.1.237`.
+
+    use super::*;
+    use neosh_proto::QuestionAnswer;
+
+    /// A real `can_use_tool` for `AskUserQuestion`, exactly as the CLI sends it.
+    fn asked() -> Value {
+        json!({
+            "type": "control_request",
+            "request_id": "75b794de",
+            "request": {
+                "subtype": "can_use_tool",
+                "tool_name": "AskUserQuestion",
+                "display_name": "AskUserQuestion",
+                "tool_use_id": "toolu_01Eo",
+                "requires_user_interaction": true,
+                "input": { "questions": [
+                    { "question": "Do you prefer tabs or spaces?",
+                      "header": "Indentation",
+                      "options": [
+                          { "label": "Tabs", "description": "Use tab characters" },
+                          { "label": "Spaces", "description": "Use space characters" }],
+                      "multiSelect": false },
+                    { "question": "Which of these should be enabled?",
+                      "header": "Features",
+                      "options": [
+                          { "label": "Logging", "description": "Enable logging" },
+                          { "label": "Metrics", "description": "Enable metrics" },
+                          { "label": "Tracing", "description": "Enable tracing" }],
+                      "multiSelect": true },
+                ] },
+            },
+        })
+    }
+
+    fn read() -> AskUser {
+        ask_user_question(&asked()).expect("a question")
+    }
+
+    fn said(question: &str, answers: &[&str]) -> QuestionAnswer {
+        QuestionAnswer {
+            question: question.into(),
+            answers: answers.iter().map(|a| (*a).to_string()).collect(),
+            custom: false,
+        }
+    }
+
+    #[test]
+    fn a_question_is_never_read_as_a_permission_request() {
+        // The bug this whole path exists for. Read as a permission, policy answers it — and the
+        // configured default is full access — so the CLI got a bare yes with no answers in it and
+        // told its own model "The user did not answer the questions".
+        assert_eq!(can_use_tool(&asked(), Path::new("/w")), None);
+    }
+
+    #[test]
+    fn an_install_too_old_to_flag_it_is_still_recognised_by_name() {
+        let mut v = asked();
+        v["request"].as_object_mut().unwrap().remove("requires_user_interaction");
+        assert!(ask_user_question(&v).is_some());
+        assert_eq!(can_use_tool(&v, Path::new("/w")), None);
+    }
+
+    #[test]
+    fn a_permission_request_is_never_read_as_a_question() {
+        let v = json!({
+            "type": "control_request", "request_id": "r",
+            "request": { "subtype": "can_use_tool", "tool_name": "Bash",
+                         "input": { "command": "ls" } },
+        });
+        assert_eq!(ask_user_question(&v), None);
+        assert!(can_use_tool(&v, Path::new("/w")).is_some());
+    }
+
+    #[test]
+    fn the_questions_come_through_with_their_options_and_which_take_several() {
+        let got = read();
+        assert_eq!(got.request_id, "75b794de");
+        assert_eq!(got.tool_use_id.as_deref(), Some("toolu_01Eo"));
+        assert_eq!(got.questions.len(), 2);
+        assert_eq!(got.questions[0].header, "Indentation");
+        assert!(!got.questions[0].multi_select);
+        assert!(got.questions[1].multi_select);
+        assert_eq!(
+            got.questions[1].options.iter().map(|o| o.label.as_str()).collect::<Vec<_>>(),
+            ["Logging", "Metrics", "Tracing"],
+        );
+        assert_eq!(got.questions[0].options[0].description, "Use tab characters");
+    }
+
+    #[test]
+    fn a_request_with_no_answerable_question_in_it_is_not_one() {
+        // A dialog with no rows is one nobody can answer or dismiss, so it goes down the ordinary
+        // path and is refused like anything else.
+        for input in [json!({ "questions": [] }), json!({ "questions": [{ "header": "x" }] })] {
+            let mut v = asked();
+            v["request"]["input"] = input.clone();
+            assert_eq!(ask_user_question(&v), None, "{input}");
+        }
+    }
+
+    #[test]
+    fn an_answer_is_keyed_by_the_question_it_answers() {
+        // Not by an id of our own: the CLI looks answers up by the text of the question, so a
+        // generated key is an answer to a question that does not exist.
+        let got = read();
+        let r = answer(
+            &got,
+            &QuestionAnswers::Answered(vec![
+                said("Do you prefer tabs or spaces?", &["Spaces"]),
+                said("Which of these should be enabled?", &["Logging", "Tracing"]),
+            ]),
+        );
+        let body = &r["response"]["response"];
+        assert_eq!(body["behavior"], "allow");
+        let answers = &body["updatedInput"]["answers"];
+        // A single-select is a string and a multi-select is an array, because that is what the
+        // tool's schema says — a one-element array reaches the model as `["Spaces"]`.
+        assert_eq!(answers["Do you prefer tabs or spaces?"], "Spaces");
+        assert_eq!(answers["Which of these should be enabled?"], json!(["Logging", "Tracing"]));
+        assert_eq!(body["toolUseID"], "toolu_01Eo");
+        assert_eq!(r["response"]["request_id"], "75b794de");
+    }
+
+    #[test]
+    fn the_questions_go_back_exactly_as_they_arrived() {
+        // Rebuilt from neosh's own types, any field added to the tool after this was written would
+        // be quietly dropped — and the CLI re-reads this array to draw its own record of it.
+        let got = read();
+        let r = answer(
+            &got,
+            &QuestionAnswers::Answered(vec![said("Do you prefer tabs or spaces?", &["Tabs"])]),
+        );
+        assert_eq!(r["response"]["response"]["updatedInput"]["questions"], asked()["request"]["input"]["questions"]);
+    }
+
+    #[test]
+    fn an_answer_nobody_asked_for_is_dropped_rather_than_sent() {
+        let got = read();
+        let r = answer(
+            &got,
+            &QuestionAnswers::Answered(vec![
+                said("Do you prefer tabs or spaces?", &["Tabs"]),
+                said("a question from nowhere", &["yes"]),
+            ]),
+        );
+        let answers = r["response"]["response"]["updatedInput"]["answers"].clone();
+        assert_eq!(answers.as_object().map(|o| o.len()), Some(1));
+    }
+
+    #[test]
+    fn something_typed_is_an_answer_like_any_other() {
+        // "Neither, use whatever the file already uses" is not one of the options and is the whole
+        // reason the panel has a field in it.
+        let got = read();
+        let r = answer(
+            &got,
+            &QuestionAnswers::Answered(vec![QuestionAnswer {
+                question: "Do you prefer tabs or spaces?".into(),
+                answers: vec!["whatever the file already uses".into()],
+                custom: true,
+            }]),
+        );
+        assert_eq!(
+            r["response"]["response"]["updatedInput"]["answers"]["Do you prefer tabs or spaces?"],
+            "whatever the file already uses",
+        );
+    }
+
+    #[test]
+    fn nobody_answering_is_a_denial_with_a_sentence_rather_than_an_empty_yes() {
+        // An `allow` carrying no answers is what the CLI reads as "did not answer", and it tells
+        // the model so in words nobody chose. A denial's message is passed through verbatim.
+        let got = read();
+        for answers in [
+            QuestionAnswers::dismissed(),
+            QuestionAnswers::nobody(),
+            QuestionAnswers::Answered(vec![said("Do you prefer tabs or spaces?", &[])]),
+            QuestionAnswers::Answered(vec![]),
+        ] {
+            let r = answer(&got, &answers);
+            let body = &r["response"]["response"];
+            assert_eq!(body["behavior"], "deny", "{answers:?}");
+            assert!(body["message"].as_str().is_some_and(|m| !m.is_empty()), "{answers:?}");
+            assert!(body.get("updatedInput").is_none(), "{answers:?}");
+        }
+    }
+
+    #[test]
+    fn answering_some_of_them_answers_those() {
+        // A panel walked away from half-done reports what it got. The agent is better off with one
+        // answer and a gap than with neither.
+        let got = read();
+        let r = answer(
+            &got,
+            &QuestionAnswers::Answered(vec![
+                said("Do you prefer tabs or spaces?", &["Tabs"]),
+                said("Which of these should be enabled?", &[]),
+            ]),
+        );
+        let answers = &r["response"]["response"]["updatedInput"]["answers"];
+        assert_eq!(answers["Do you prefer tabs or spaces?"], "Tabs");
+        assert!(answers.get("Which of these should be enabled?").is_none());
+    }
 }
 
 #[cfg(test)]

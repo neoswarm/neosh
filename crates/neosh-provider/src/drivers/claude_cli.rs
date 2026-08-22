@@ -72,6 +72,7 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use crate::approval::{PermissionAnswer, PermissionAsker};
+use crate::ask::{QuestionAnswers, QuestionAsker, QuestionRequest};
 use super::claude_control;
 use crate::{Provider, ProviderError, ProviderStream, catalog, sse};
 
@@ -232,6 +233,9 @@ pub struct ClaudeCliProvider {
     /// Who to ask when the CLI wants permission. `None` in a test or a headless run, and the
     /// prompt tool is then not offered at all.
     asker: Arc<Mutex<Option<Arc<dyn PermissionAsker>>>>,
+    /// Where a question goes. Separate from `asker` because a question is not a permission — see
+    /// [`crate::ask`].
+    questioner: Arc<Mutex<Option<Arc<dyn QuestionAsker>>>>,
 }
 
 impl Default for ClaudeCliProvider {
@@ -248,6 +252,7 @@ impl ClaudeCliProvider {
             live: Arc::default(),
             mode: Arc::new(Mutex::new(PermissionMode::Ask)),
             asker: Arc::default(),
+            questioner: Arc::default(),
         }
     }
 
@@ -451,12 +456,13 @@ impl Provider for ClaudeCliProvider {
         let slot = self.slot(&request.conversation);
         let mode = *self.mode.lock().expect("mode lock poisoned");
         let asker = self.asker.lock().expect("asker lock poisoned").clone();
+        let questioner = self.questioner.lock().expect("questioner lock poisoned").clone();
 
         tokio::spawn(async move {
             // Held for the whole turn. Two turns in one conversation share one process and one
             // stdin, so running them at once would interleave two answers down one pipe.
             let mut guard = slot.live.lock().await;
-            let mut turn = Turn { request, mode, asker };
+            let mut turn = Turn { request, mode, asker, questioner };
             // Retried exactly once, and only for the one failure a retry can fix: the conversation
             // this driver was told to pick up is not there any more — the CLI's own history was
             // cleared, or the project directory moved out from under it. Starting fresh loses what
@@ -491,6 +497,7 @@ struct Turn {
     request: TurnRequest,
     mode: PermissionMode,
     asker: Option<Arc<dyn PermissionAsker>>,
+    questioner: Option<Arc<dyn QuestionAsker>>,
 }
 
 /// How a turn ended, for the one caller that can do something about it.
@@ -514,11 +521,13 @@ async fn run_turn(
     cancel: CancellationToken,
     tx: &mpsc::Sender<ProviderEvent>,
 ) -> Result<Outcome, String> {
-    let Turn { request, mode, asker } = turn;
+    let Turn { request, mode, asker, questioner } = turn;
     // Only offered when somebody can answer it. Passing the flag with nobody behind it would route
     // every decision to a pipe nothing ever writes to, and the turn would hang instead of being
     // refused — worse than the behaviour it replaces.
-    let prompting = asker.is_some();
+    // Either kind of asking needs the hidden flag: without it the CLI has nowhere to send a
+    // permission request *or* a question, and `AskUserQuestion` silently answers itself.
+    let prompting = asker.is_some() || questioner.is_some();
     let launch = Launch::of(&request, mode, prompting);
     let model = model_arg(&request.selection);
 
@@ -669,6 +678,35 @@ async fn run_turn(
                             activity: Activity::Resume { token: id.to_string() },
                         })
                         .await;
+                }
+                // The model asking *you* something. Handled before the permission path and never
+                // by it: policy has no answer to "which of these", and the yes it would give
+                // carries none — which the CLI reads as nobody having answered at all.
+                if let Some(ask) = claude_control::ask_user_question(&v) {
+                    let answers = match &questioner {
+                        Some(q) if !abandoned => {
+                            let req = QuestionRequest {
+                                questions: ask.questions.clone(),
+                                conversation: request.conversation.clone(),
+                                cwd: request.cwd.clone(),
+                            };
+                            tokio::select! {
+                                biased;
+                                // Raced against the cancellation for the same reason a permission
+                                // prompt is: a question on screen with nobody at the keyboard is
+                                // exactly when somebody reaches for `<Esc>`.
+                                () = cancel.cancelled() => QuestionAnswers::dismissed(),
+                                answers = q.ask(req) => answers,
+                            }
+                        }
+                        _ => QuestionAnswers::nobody(),
+                    };
+                    let reply = claude_control::answer(&ask, &answers);
+                    if write_line(&mut live.stdin, &reply).await.is_err() {
+                        *slot = None;
+                        break;
+                    }
+                    continue;
                 }
                 // A question, which the CLI is now blocked on. Answered inline: the turn genuinely
                 // is waiting on a person, and the transcript's spinner says so.
@@ -993,6 +1031,10 @@ impl super::AgentDriver for ClaudeCliProvider {
 
     fn close_conversation(&self, conversation: &SessionId) {
         self.shutdown(conversation);
+    }
+
+    fn set_question_asker(&self, asker: Arc<dyn QuestionAsker>) {
+        *self.questioner.lock().expect("questioner lock poisoned") = Some(asker);
     }
 
     fn set_permission_asker(&self, asker: Arc<dyn PermissionAsker>) {
