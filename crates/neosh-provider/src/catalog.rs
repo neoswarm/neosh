@@ -17,18 +17,80 @@ use neosh_proto::{
 };
 
 /// Reasoning-effort levels available on a given model generation.
+///
+/// `pub` under a longer name because a driver that *discovered* a ladder needs to build the same
+/// descriptor: the picker keys off `"effort"` being the same knob everywhere, and a second spelling
+/// of it invented in a driver is a knob that does not carry over when you switch models.
+pub fn effort_levels(levels: &[&str], default: &str) -> ProviderOptionDescriptor {
+    effort_with(levels, default, &[])
+}
+
 fn effort(levels: &[&str], default: &str) -> ProviderOptionDescriptor {
+    effort_levels(levels, default)
+}
+
+/// A level bought with a word in the prompt rather than with a request parameter.
+///
+/// The id **is** the word. That is what makes injection generic: nothing between here and the
+/// driver has to hold a table of magic strings — the value the picker stored is the thing that gets
+/// written into the message, and a provider plugin that invents its own gets the same treatment
+/// with no host change. See [`crate::prompt_injections`].
+struct Magic {
+    /// Also the word. `"ultrathink"`.
+    id: &'static str,
+    label: &'static str,
+    description: &'static str,
+}
+
+/// A ladder, plus any levels that are spelled rather than sent.
+///
+/// The spelled ones sort last because they are past the top of the scale: `max` is the most a
+/// parameter can ask for, and these are what you say when that was not enough.
+fn effort_with(levels: &[&str], default: &str, magic: &[Magic]) -> ProviderOptionDescriptor {
+    let mut options: Vec<OptionChoice> = levels
+        .iter()
+        .map(|l| OptionChoice {
+            id: (*l).into(),
+            label: level_label(l),
+            description: None,
+            is_default: *l == default,
+        })
+        .collect();
+    options.extend(magic.iter().map(|m| OptionChoice {
+        id: m.id.into(),
+        label: m.label.into(),
+        description: Some(m.description.into()),
+        is_default: false,
+    }));
     ProviderOptionDescriptor::Select {
         id: "effort".into(),
         label: "Effort".into(),
         description: Some("How much reasoning the model spends before answering.".into()),
-        options: levels
+        options,
+        current_value: Some(default.into()),
+        prompt_injected_values: magic.iter().map(|m| m.id.to_string()).collect(),
+    }
+}
+
+/// A select over anything, for the knobs that are not the reasoning ladder.
+fn select(
+    id: &str,
+    label: &str,
+    description: &str,
+    choices: &[(&str, &str, Option<&str>)],
+    default: &str,
+) -> ProviderOptionDescriptor {
+    ProviderOptionDescriptor::Select {
+        id: id.into(),
+        label: label.into(),
+        description: Some(description.into()),
+        options: choices
             .iter()
-            .map(|l| OptionChoice {
-                id: (*l).into(),
-                label: title_case(l),
-                description: None,
-                is_default: *l == default,
+            .map(|(id, label, desc)| OptionChoice {
+                id: (*id).into(),
+                label: (*label).into(),
+                description: desc.map(str::to_string),
+                is_default: *id == default,
             })
             .collect(),
         current_value: Some(default.into()),
@@ -42,10 +104,35 @@ fn boolean(id: &str, label: &str, desc: &str) -> ProviderOptionDescriptor {
         label: label.into(),
         description: Some(desc.into()),
         current_value: false,
+        prompt_injected_word: None,
     }
 }
-/// `low` -> `Low`. Shared so a discovered effort level reads like a written-down one.
 
+/// A switch that is a word in the message rather than a parameter. The id is the word.
+fn spoken(id: &str, label: &str, desc: &str) -> ProviderOptionDescriptor {
+    ProviderOptionDescriptor::Boolean {
+        id: id.into(),
+        label: label.into(),
+        description: Some(desc.into()),
+        current_value: false,
+        prompt_injected_word: Some(id.into()),
+    }
+}
+/// How a reasoning level reads in a list.
+///
+/// Title case for almost all of them, and a lookup for the ones where it is wrong: `xhigh` is a
+/// contraction, and "Xhigh" reads as a typo in a column of English words. Shared with the drivers
+/// that *discover* their ladders, so a level `codex` reported and one written down here are spelled
+/// the same way on screen.
+pub fn level_label(id: &str) -> String {
+    match id {
+        "xhigh" => "X-high".into(),
+        "ultra" => "Ultra".into(),
+        other => title_case(other),
+    }
+}
+
+/// `low` -> `Low`. Shared so a discovered effort level reads like a written-down one.
 pub fn title_case(s: &str) -> String {
     let mut c = s.chars();
     match c.next() {
@@ -74,6 +161,22 @@ pub fn default_options(caps: &ModelCapabilities) -> Vec<OptionSelection> {
 
 const EFFORT_5: &[&str] = &["low", "medium", "high", "xhigh", "max"];
 const EFFORT_46: &[&str] = &["low", "medium", "high", "max"];
+
+/// What `claude` reads out of a message rather than off its command line.
+///
+/// **The harness's words, not the model's**, which is why they are on the CLI's catalogue and not
+/// on Anthropic's. `api.anthropic.com` serves a model: it has `output_config.effort` and no opinion
+/// about English, so a message beginning "ultrathink" is a message beginning with a word. The CLI
+/// is a program wrapped around that model, and these are two of the things it looks for.
+///
+/// Advertising them where they do not work would be worse than not having them: the picker would
+/// offer a level that silently does nothing, on the one provider where the same word does something
+/// real — and "it worked yesterday" would be a difference of instance nobody can see.
+const CLAUDE_WORDS: &[Magic] = &[Magic {
+    id: "ultrathink",
+    label: "Ultrathink",
+    description: "Past the top of the ladder — said in the message, not sent as a level.",
+}];
 
 /// One entry in the Anthropic catalogue.
 ///
@@ -236,7 +339,16 @@ pub fn claude_cli_models() -> Vec<ModelInfo> {
         .map(|(id, name, family, tier, tagline, ctx, efforts, fast, long, legacy)| {
             let mut descriptors = Vec::new();
             if let Some(levels) = efforts {
-                descriptors.push(effort(levels, "high"));
+                descriptors.push(effort_with(levels, "high", CLAUDE_WORDS));
+                // Orchestration rather than depth, so a switch of its own rather than a rung on the
+                // effort ladder: you can want a fleet of sub-agents on a shallow turn, and asking
+                // for one by moving a slider marked "how hard should it think" is a control that
+                // does two things and says one.
+                descriptors.push(spoken(
+                    "ultracode",
+                    "Ultracode",
+                    "Let it orchestrate sub-agents by default. Slower, and thorough.",
+                ));
             } else {
                 descriptors.push(boolean(
                     "thinking",
@@ -278,19 +390,24 @@ pub fn claude_cli_models() -> Vec<ModelInfo> {
 /// `(id, display name, family, tier, tagline, superseded)`.
 type Seed = (&'static str, &'static str, &'static str, ModelTier, &'static str, bool);
 
-/// Turn a seed list into models, with the option knobs every one of these endpoints understands.
-fn seeded(seeds: &[Seed]) -> Vec<ModelInfo> {
+/// Turn a seed list into models, asking `knobs` what each one accepts.
+///
+/// Per model rather than per provider, because that is how the ladders actually differ: one
+/// generation gained a level the one before it rejects, and a small model in the same lineup has no
+/// reasoning knob at all.
+fn seeded(seeds: &[Seed], knobs: fn(&str) -> Vec<ProviderOptionDescriptor>) -> Vec<ModelInfo> {
     seeds
         .iter()
         .map(|(id, name, family, tier, tagline, legacy)| {
+            let descriptors = knobs(id);
             let mut m = ModelInfo::undescribed(*id, *name);
             m.capabilities = ModelCapabilities {
                 tools: true,
                 vision: true,
                 streaming: true,
-                thinking: false,
+                thinking: descriptors.iter().any(|d| is_reasoning(d.id())),
                 prompt_caching: false,
-                option_descriptors: Vec::new(),
+                option_descriptors: descriptors,
             };
             m.family = Some((*family).to_string());
             m.tier = Some(*tier);
@@ -299,6 +416,76 @@ fn seeded(seeds: &[Seed]) -> Vec<ModelInfo> {
             m
         })
         .collect()
+}
+
+/// Whether a knob is about *reasoning* rather than about the shape of the answer.
+///
+/// One list, because three vendors spell the same idea three ways and `ModelCapabilities::thinking`
+/// is a single bit that a picker uses to decide whether a model reasons at all.
+fn is_reasoning(id: &str) -> bool {
+    matches!(id, "effort" | "thinking" | "thinking_level" | "thinking_budget")
+}
+
+/// A model with no seeded knobs. Most endpoints, most of the time — see [`seed_models`].
+fn no_knobs(_: &str) -> Vec<ProviderOptionDescriptor> {
+    Vec::new()
+}
+
+/// Answer length, which every GPT-5-shaped endpoint takes and nothing else does.
+pub fn verbosity_levels() -> ProviderOptionDescriptor {
+    select(
+        "verbosity",
+        "Verbosity",
+        "How much answer to write, independently of how hard it thought.",
+        &[("low", "Low", Some("Terse.")), ("medium", "Medium", None), ("high", "High", Some("Explains itself."))],
+        "medium",
+    )
+}
+
+/// What OpenAI's own endpoint accepts beside the messages.
+///
+/// The ladder is `reasoning_effort`, and it is *not* Anthropic's: it starts at `minimal`, which has
+/// no equivalent there, and the top rung differs by generation. Written down rather than guessed
+/// from the id, because the failure mode of guessing is a 400 on send rather than a knob that reads
+/// slightly wrong — the same reason the Anthropic catalogue is written down at all.
+fn openai_knobs(id: &str) -> Vec<ProviderOptionDescriptor> {
+    let levels: &[&str] = if id.starts_with("gpt-5.6") {
+        &["minimal", "low", "medium", "high", "xhigh"]
+    } else if id.starts_with("gpt-5") {
+        &["minimal", "low", "medium", "high"]
+    } else {
+        return Vec::new();
+    };
+    vec![effort(levels, "medium"), verbosity_levels()]
+}
+
+/// What Gemini accepts, which changed shape between generations.
+///
+/// The 3 line takes `thinkingLevel`, a named rung. The 2.5 line takes `thinkingBudget`, a token
+/// count — and the only value of it worth putting in a picker is "none", because every other number
+/// is a guess about a turn that has not happened yet. So the 2.5 models get a switch and the 3 line
+/// gets a ladder, which is what each of them actually has.
+///
+/// 2.5 Pro is deliberately blank: its budget cannot be set to zero, and offering a switch that the
+/// endpoint rejects is worse than offering nothing.
+pub fn gemini_knobs(id: &str) -> Vec<ProviderOptionDescriptor> {
+    if id.starts_with("gemini-3") {
+        return vec![select(
+            "thinking_level",
+            "Thinking",
+            "How much reasoning the model spends before answering.",
+            &[("low", "Low", None), ("high", "High", None)],
+            "high",
+        )];
+    }
+    if id.starts_with("gemini-2.5") && !id.contains("pro") {
+        let mut on = boolean("thinking", "Thinking", "Let it reason before answering.");
+        if let ProviderOptionDescriptor::Boolean { current_value, .. } = &mut on {
+            *current_value = true;
+        }
+        return vec![on];
+    }
+    Vec::new()
 }
 
 /// What a provider offers, written down, so its models are visible before you have a key.
@@ -319,6 +506,21 @@ fn seeded(seeds: &[Seed]) -> Vec<ModelInfo> {
 /// resolves to something is better than an id that resolves to a 404.
 fn seed_models(instance: &str) -> Vec<ModelInfo> {
     use ModelTier::{Balanced, Fast, Frontier};
+    // Which knobs a seeded model has is a fact about the *vendor*, so it is chosen here rather than
+    // written on every row: an endpoint either takes `reasoning_effort` or it does not, and the
+    // twelve rows below would otherwise repeat the same answer twelve times and disagree on the
+    // thirteenth.
+    let knobs: fn(&str) -> Vec<ProviderOptionDescriptor> = match instance {
+        "openai" => openai_knobs,
+        "google" => gemini_knobs,
+        // Nothing for xAI, DeepSeek or Mistral, and it is not an omission. None of the three
+        // documents a reasoning knob on the models seeded here — Grok's is on the `mini` line only,
+        // DeepSeek's reasoner has no dial at all, and Mistral's models do not reason. A knob
+        // invented for them would be a 400 on the first turn, which is the failure this whole file
+        // is written out longhand to avoid. Where an endpoint *does* say, the driver reads it back:
+        // see `openai_compat`'s discovery.
+        _ => no_knobs,
+    };
     seeded(match instance {
         "openai" => &[
             ("gpt-5.6-sol", "GPT-5.6 Sol", "sol", Frontier, "Frontier agentic coding", false),
@@ -356,7 +558,7 @@ fn seed_models(instance: &str) -> Vec<ModelInfo> {
         // would be wrong faster than it was useful. Discovery is the honest answer there, and the
         // picker says so rather than showing an empty pane with no explanation.
         _ => &[],
-    })
+    }, knobs)
 }
 
 /// Let a discovered list decide what exists, and a seed list decide how it reads.
@@ -383,6 +585,13 @@ pub fn merge(discovered: Vec<ModelInfo>, seeds: &[ModelInfo]) -> Vec<ModelInfo> 
                 out.context_window = m.context_window.or(seed.context_window);
                 out.max_output_tokens = m.max_output_tokens.or(seed.max_output_tokens);
                 out.pricing = m.pricing.clone().or_else(|| seed.pricing.clone());
+                // An endpoint that listed its own parameters has said something the catalogue can
+                // only have guessed, so it wins. One that said nothing leaves the seeds standing —
+                // silence is not a claim that the model has no knobs.
+                if !m.capabilities.option_descriptors.is_empty() {
+                    out.capabilities.option_descriptors = m.capabilities.option_descriptors.clone();
+                    out.capabilities.thinking = m.capabilities.thinking;
+                }
                 described.push(out);
             }
             None => rest.push(m),
@@ -775,6 +984,86 @@ mod tests {
         assert!(has_fast("claude-opus-4-8"));
         assert!(!has_fast("claude-sonnet-5"));
         assert!(!has_fast("claude-haiku-4-5"));
+    }
+
+    /// Every knob a model advertises, as `(id, values)`.
+    fn knobs(m: &ModelInfo) -> Vec<(String, Vec<String>)> {
+        m.capabilities
+            .option_descriptors
+            .iter()
+            .map(|d| match d {
+                ProviderOptionDescriptor::Select { id, options, .. } => {
+                    (id.clone(), options.iter().map(|o| o.id.clone()).collect())
+                }
+                ProviderOptionDescriptor::Boolean { id, .. } => (id.clone(), Vec::new()),
+            })
+            .collect()
+    }
+
+    fn find(models: &[ModelInfo], id: &str) -> ModelInfo {
+        models.iter().find(|m| m.id.0 == id).unwrap_or_else(|| panic!("no {id}")).clone()
+    }
+
+    #[test]
+    fn a_reasoning_ladder_is_not_an_anthropic_privilege() {
+        // The knob existed and only one vendor's models carried it, so `^E` on anything else said
+        // "no options to set" — about models that document a reasoning parameter in their first
+        // paragraph. Each of these is spelled the way its own endpoint spells it.
+        let openai = find(&seed_models("openai"), "gpt-5.6-sol");
+        let effort = knobs(&openai).into_iter().find(|(id, _)| id == "effort").expect("a ladder");
+        assert!(effort.1.contains(&"minimal".to_string()), "OpenAI's starts below low");
+        assert!(!effort.1.contains(&"max".to_string()), "and does not borrow Anthropic's top rung");
+        assert!(knobs(&openai).iter().any(|(id, _)| id == "verbosity"));
+        assert!(openai.capabilities.thinking, "a model with a ladder reasons, by definition");
+
+        // Gemini changed the shape of the question between generations, so the two are different
+        // knobs rather than one knob with a translation layer nobody can see.
+        let three = find(&seed_models("google"), "gemini-3.1-pro-preview");
+        assert_eq!(knobs(&three)[0].0, "thinking_level");
+        let flash = find(&seed_models("google"), "gemini-2.5-flash");
+        assert_eq!(knobs(&flash)[0].0, "thinking");
+    }
+
+    #[test]
+    fn a_word_is_offered_only_where_something_reads_it() {
+        // `ultrathink` is the harness's, not the model's. On the CLI it buys depth; sent to
+        // `api.anthropic.com` as `output_config.effort` it is a 400, and put in a message there it
+        // is a word. So the same lineup has it on one instance and not on the other.
+        let cli = find(&claude_cli_models(), "claude-opus-5");
+        let ProviderOptionDescriptor::Select { options, prompt_injected_values, .. } =
+            &cli.capabilities.option_descriptors[0]
+        else {
+            panic!("expected an effort select");
+        };
+        assert_eq!(prompt_injected_values, &["ultrathink".to_string()]);
+        assert_eq!(options.last().map(|o| o.id.as_str()), Some("ultrathink"), "past the top rung");
+        assert!(
+            cli.capabilities.option_descriptors.iter().any(|d| matches!(
+                d,
+                ProviderOptionDescriptor::Boolean { prompt_injected_word: Some(w), .. } if w == "ultracode"
+            )),
+            "orchestration is a switch of its own, not a rung on the depth ladder"
+        );
+
+        let api = find(&anthropic_models(), "claude-opus-5");
+        for d in &api.capabilities.option_descriptors {
+            if let ProviderOptionDescriptor::Select { prompt_injected_values, .. } = d {
+                assert!(prompt_injected_values.is_empty(), "the API reads no words");
+            }
+        }
+    }
+
+    #[test]
+    fn a_spelled_level_never_becomes_the_value_that_gets_sent() {
+        // `default_options` is what a freshly chosen model starts with. Starting on a level that
+        // has to be rewritten before it can be sent would mean every first turn went through the
+        // injection path, which is the path with the interesting bugs in it.
+        let cli = find(&claude_cli_models(), "claude-opus-5");
+        let opts = default_options(&cli.capabilities);
+        assert_eq!(
+            opts.iter().find(|o| o.id == "effort").map(|o| &o.value),
+            Some(&ProviderOptionValue::Text("high".into()))
+        );
     }
 
     #[test]

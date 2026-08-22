@@ -714,7 +714,7 @@ pub fn codex_model(v: &serde_json::Value) -> Option<ModelInfo> {
                 .iter()
                 .map(|l| OptionChoice {
                     id: (*l).into(),
-                    label: catalog::title_case(l),
+                    label: catalog::level_label(l),
                     // The CLI writes a sentence for each level. It is better than anything we
                     // would invent, and it is per model rather than per ladder.
                     description: v
