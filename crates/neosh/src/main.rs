@@ -25,9 +25,12 @@ mod pstate;
 mod scaffold;
 mod services;
 mod sessions;
+mod quota;
 mod swarm;
 mod trust;
+mod usage;
 mod vars;
+mod views;
 
 use bridge::ScriptBridge;
 use frontend::{Disconnected, Frontend, StdioFrontend, TerminalUi};
@@ -300,11 +303,11 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
                      terminal, use --ui-protocol=stdio."
                 )
             })?;
-            (Box::new(f), rx)
+            (Box::new(f), from_the_only_view(rx))
         }
         (None, UiProtocol::Stdio) => {
             let (f, rx) = StdioFrontend::new();
-            (Box::new(f), rx)
+            (Box::new(f), from_the_only_view(rx))
         }
     };
 
@@ -358,14 +361,33 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
     result
 }
 
+/// Tag a lone frontend's input as coming from the one view there is.
+///
+/// A process that *is* its own terminal has exactly one view and it never goes away, so the tag is
+/// a constant. It exists so that "which terminal was that key pressed in" has the same answer
+/// everywhere rather than being a question only the daemon build knows how to ask.
+fn from_the_only_view(
+    mut rx: tokio::sync::mpsc::UnboundedReceiver<InputEvent>,
+) -> tokio::sync::mpsc::UnboundedReceiver<(views::ViewId, InputEvent)> {
+    let (tx, tagged) = tokio::sync::mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        while let Some(ev) = rx.recv().await {
+            if tx.send((views::ViewId::LOCAL, ev)).is_err() {
+                break;
+            }
+        }
+    });
+    tagged
+}
+
 /// Forward frontend input, and turn SIGINT/SIGTERM into the same `quit` command the key runs.
 ///
 /// Raw mode disables ISIG, so an interactive `<C-c>` arrives as a key rather than a signal — these
 /// are the *other* ways a session ends: `kill`, a closing SSH connection, a supervisor stopping the
 /// service. Reusing the command rather than exiting directly means shutdown has exactly one path.
 fn with_signals(
-    mut from_frontend: tokio::sync::mpsc::UnboundedReceiver<InputEvent>,
-) -> tokio::sync::mpsc::UnboundedReceiver<InputEvent> {
+    mut from_frontend: tokio::sync::mpsc::UnboundedReceiver<(views::ViewId, InputEvent)>,
+) -> tokio::sync::mpsc::UnboundedReceiver<(views::ViewId, InputEvent)> {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
 
     let forward = tx.clone();
@@ -378,7 +400,10 @@ fn with_signals(
     });
 
     tokio::spawn(async move {
-        let quit = InputEvent::Command { name: "quit".into(), args: Vec::new() };
+        // Not from any terminal, so it is tagged with the view that is always the process's
+        // own. In a served workspace that names nobody, which is right: a signal is a reason to
+        // stop the work, not to close one of somebody's windows.
+        let quit = (views::ViewId::LOCAL, InputEvent::Command { name: "quit".into(), args: Vec::new() });
         #[cfg(unix)]
         {
             use tokio::signal::unix::{SignalKind, signal};

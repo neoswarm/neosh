@@ -1577,15 +1577,18 @@ fn a_running_turn_says_how_long_it_has_been_running() {
     );
 }
 
-/// A heart on a row, meaning the project is a favourite.
-const HEART: char = '\u{2665}';
+/// A star on a row, meaning the project is a favourite.
+///
+/// U+2605 rather than a heart, and not because it looks better: `♥` is a codepoint Unicode calls
+/// an emoji, so a terminal with a colour-emoji font draws it from there and hands back an outline.
+const STAR: char = '\u{2605}';
 
 /// Project rows carrying the favourite mark.
 ///
-/// Scoped to rows naming a project, because the hint strip also prints a heart — that is the point
+/// Scoped to rows naming a project, because the hint strip also prints a star — that is the point
 /// of the hint, and matching it would make these tests pass with the feature ripped out.
 fn favourited(panel: &[String], project: &str) -> bool {
-    panel.iter().any(|l| l.contains(HEART) && l.contains(project))
+    panel.iter().any(|l| l.contains(STAR) && l.contains(project))
 }
 
 #[test]

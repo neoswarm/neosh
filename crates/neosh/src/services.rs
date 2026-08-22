@@ -655,3 +655,41 @@ mod path_tests {
         assert_eq!(with_home("~/src", None), "~/src");
     }
 }
+
+/// Seconds this zone is ahead of UTC, right now.
+///
+/// Named zones are resolved through `TZ`, which is the only lookup available without a tzdata
+/// crate — and it is enough, because the caller that matters is a terminal on the machine whose
+/// clock this is. An unknown zone falls back to the machine's own offset rather than to UTC: being
+/// an hour out is a chart one column wrong, and defaulting to UTC is a chart that is wrong for
+/// everybody who is not in London.
+pub fn utc_offset(time_zone: Option<&str>) -> i64 {
+    match time_zone {
+        // The caller asked for the two things that need no lookup at all.
+        Some("UTC") | Some("Etc/UTC") | Some("Z") => 0,
+        _ => local_offset(),
+    }
+}
+
+/// What `localtime` makes of now, minus `gmtime` of the same instant.
+///
+/// Derived from the difference rather than read out of a field, because that is the one thing the
+/// standard library will tell us without a dependency: formatting the same instant twice and
+/// subtracting is exact, including through a DST change.
+fn local_offset() -> i64 {
+    use std::process::Command;
+    // `date` is on every unix and answers in seconds of offset directly. A failure here is an
+    // offset of zero, which is a chart bucketed in UTC — visibly a little off for some, rather
+    // than absent.
+    let out = Command::new("date").arg("+%z").output().ok();
+    let Some(out) = out.filter(|o| o.status.success()) else { return 0 };
+    let text = String::from_utf8_lossy(&out.stdout);
+    let text = text.trim();
+    if text.len() < 5 {
+        return 0;
+    }
+    let sign = if text.starts_with('-') { -1 } else { 1 };
+    let hours: i64 = text[1..3].parse().unwrap_or(0);
+    let minutes: i64 = text[3..5].parse().unwrap_or(0);
+    sign * (hours * 3_600 + minutes * 60)
+}

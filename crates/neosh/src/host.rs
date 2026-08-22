@@ -282,7 +282,17 @@ pub struct Host {
     /// the workspace is a thing you say on purpose, with `neosh stop`.
     on_quit: OnQuit,
     /// Set by `quit` while serving; the run loop sends the viewer away and carries on.
-    detaching: bool,
+    /// The terminal that asked to leave, if one has. `^Q` closes *that* window and no other.
+    ///
+    /// Which view is not a guess from whoever spoke most recently: input arrives already tagged
+    /// with the view it came from, and this is set while that very event is being handled.
+    detaching: Option<crate::views::ViewId>,
+    /// The view whose input is being handled right now.
+    ///
+    /// [`crate::views::ViewId::LOCAL`] between events and in a process that is its own terminal.
+    /// A command run from a plugin or a signal is nobody's key press, and lands here as the local
+    /// view — which in a served workspace names no terminal, and so closes none.
+    from_view: crate::views::ViewId,
     /// Where to report what this workspace is holding, when it is a workspace rather than a
     /// process somebody is watching.
     live: Option<std::sync::Arc<crate::daemon::Live>>,
@@ -689,7 +699,8 @@ impl Host {
             startup: Startup::default(),
             quitting: false,
             on_quit: OnQuit::Stop,
-            detaching: false,
+            detaching: None,
+            from_view: crate::views::ViewId::LOCAL,
             live: None,
             live_at: None,
             live_turns: 0,
@@ -5631,7 +5642,15 @@ impl Host {
                 self.compose(TextEdit::Insert { text });
             }
             InputEvent::ViewportChanged { win, width, height, top_line } => {
+                let was = self.chat_width();
                 self.editor.set_viewport(win, neosh_core::Viewport { width, height, top_line });
+                // This is where the host *learns* a width — `Resize` is the terminal's outer size
+                // and the transcript is some part of it. So anything drawn to a width has to be
+                // drawn again here, or a narrow terminal joining a wide workspace keeps the wide
+                // one's welcome until something unrelated happens to redraw it.
+                if win == self.chat_win && self.chat_width() != was {
+                    self.draw_welcome();
+                }
             }
             InputEvent::Attached { .. } => {
                 // A client that has never seen any of this. Whatever was queued was queued for
@@ -5689,7 +5708,7 @@ impl Host {
         mut self,
         mut script_rx: mpsc::UnboundedReceiver<ScriptOutbound>,
         mut agent_rx: mpsc::UnboundedReceiver<AgentEvent>,
-        mut input_rx: mpsc::UnboundedReceiver<InputEvent>,
+        mut input_rx: mpsc::UnboundedReceiver<(crate::views::ViewId, InputEvent)>,
     ) -> anyhow::Result<()> {
         // Send the initial state before anything else, so the frontend has a screen immediately.
         self.flush().await?;
@@ -5740,7 +5759,7 @@ impl Host {
                     }
                 } => self.on_swarm_event(ev),
                 Some(ev) = agent_rx.recv() => self.handle_agent_event(ev),
-                Some(input) = input_rx.recv() => {
+                Some((view, input)) = input_rx.recv() => {
                     // A repaint changes nothing, so it must not go through the input path: the
                     // frontend is asking to draw the same state again while something on it moves.
                     // Answering with an empty batch is what makes an animation unable to
@@ -5749,7 +5768,12 @@ impl Host {
                         self.frontend.send(vec![UiEvent::Flush]).await?;
                         continue;
                     }
-                    if !self.handle_input(input) {
+                    // Set for the whole of handling, so anything this key reaches — a command, a
+                    // keymap, a plugin — can be answered in the terminal it was pressed in.
+                    self.from_view = view;
+                    let carry_on = self.handle_input(input);
+                    self.from_view = crate::views::ViewId::LOCAL;
+                    if !carry_on {
                         break;
                     }
                 }
@@ -5820,10 +5844,10 @@ impl Host {
             }
             // The viewer asked to leave. The workspace does not: this is the whole difference
             // between closing a window and stopping the work in it.
-            if std::mem::take(&mut self.detaching) {
+            if let Some(view) = self.detaching.take() {
                 self.persist_sessions();
                 self.flush().await?;
-                self.frontend.detach().await?;
+                self.frontend.detach(view).await?;
                 self.report_live_now();
             }
             if std::mem::take(&mut self.keys_touched) {
@@ -6356,14 +6380,23 @@ impl Host {
             "config.reload" => self.reload_config(),
             "quit" => match self.on_quit {
                 OnQuit::Stop => self.quitting = true,
-                OnQuit::Detach => self.detaching = true,
+                OnQuit::Detach => self.detaching = Some(self.from_view),
             },
             "stop" => self.quitting = true,
             "interrupt" => self.interrupt(),
             "chat.scroll_up" => self.scroll_chat(-1),
             "chat.scroll_down" => self.scroll_chat(1),
             "chat.scroll_end" => self.scroll_chat(0),
-            "chat.read" => self.enter_reading(),
+            // A toggle, because it is the door and a door opens both ways. Pressed while already
+            // reading it used to do nothing at all, which for the one key bound in *every* mode is
+            // the wrong answer — that set exists so there is always something that works.
+            "chat.read" => {
+                if self.reading {
+                    self.leave_reading();
+                } else {
+                    self.enter_reading();
+                }
+            }
             // Sending while a turn runs *queues*, which is the right default and is also the one
             // send you cannot take back by pressing anything. Enter is a decision made in half a
             // second about a sentence you were still writing; this is the other half of it.

@@ -282,10 +282,16 @@ impl Editor {
             let Some(b) = self.buffers.get(&buf) else { continue };
             let (name, count) = (b.name.clone(), b.line_count());
             self.push_ui(UiEvent::BufferOpened { buf, name });
-            // `old_end: 0` and not `count`: this is a splice into a mirror that has nothing, so it
-            // is an insertion at the top and not a replacement of rows that are not there.
+            // `old_end: u32::MAX` — "however many rows you have, they are these now". Not `0`,
+            // which would be an insertion at the top: correct for a mirror that has nothing and
+            // silently doubling for one that already has the state. A mirror that already has it
+            // is the ordinary case now that a workspace can have several views: a terminal
+            // joining republishes to *all* of them, which is what brings the ones already here
+            // back into step. Not `count` either, because a mirror can be holding more rows than
+            // the buffer now has. The mirror clamps the range, so this is exactly "replace it all"
+            // at either end.
             let lines = self.buffers[&buf].render_range(0, count);
-            self.push_ui(UiEvent::BufferLines { buf, start: 0, old_end: 0, lines });
+            self.push_ui(UiEvent::BufferLines { buf, start: 0, old_end: u32::MAX, lines });
         }
 
         let mut windows: Vec<WindowId> = self.windows.keys().copied().collect();

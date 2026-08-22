@@ -192,6 +192,34 @@ fn republishing_twice_does_not_double_anything() {
 }
 
 #[test]
+fn republishing_at_a_mirror_that_already_has_everything_changes_nothing() {
+    // A workspace can have several views, and a terminal joining republishes to every one of them
+    // — which is what brings the ones already attached back into step. So "say everything again"
+    // has to mean it: said at a mirror that is already correct, it must leave it correct.
+    //
+    // It did not. Republishing spliced at `old_end: 0`, which is an insertion, so the second
+    // terminal to open doubled every buffer in the first one's screen.
+    let (mut e, chat, _) = a_workspace();
+    let mut watching = Mirror::new();
+    drain_into(&mut e, &mut watching);
+    let before: Vec<String> =
+        watching.buffers[&chat].lines.iter().map(|l| l.text.clone()).collect();
+    let windows: Vec<_> =
+        watching.windows.iter().map(|(id, w)| (*id, w.buf, w.cursor, w.top_line)).collect();
+
+    e.republish();
+    drain_into(&mut e, &mut watching);
+
+    let after: Vec<String> = watching.buffers[&chat].lines.iter().map(|l| l.text.clone()).collect();
+    assert_eq!(after, before, "the transcript was said again and came back twice as long");
+    assert_eq!(
+        watching.windows.iter().map(|(id, w)| (*id, w.buf, w.cursor, w.top_line)).collect::<Vec<_>>(),
+        windows,
+        "and the windows did not move"
+    );
+}
+
+#[test]
 fn what_happened_after_the_republish_still_arrives_as_an_ordinary_delta() {
     // Republishing is a catch-up, not a mode. The stream goes back to being deltas immediately, or
     // the first thing typed after attaching would need a second full send.

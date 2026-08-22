@@ -2061,19 +2061,27 @@ function projectRow(
       ? { text: `${p.sessions.length} `, hl: "Sidebar.Dim" }
       : { text: "" };
 
-  // The heart sits before the fold arrow rather than after the name: it is what you scan the
+  // The star sits before the fold arrow rather than after the name: it is what you scan the
   // column for, and a marker at the ragged right edge is not a column. It gets its own highlight
-  // because a heart is red — a grey one reads as a heart that has stopped.
-  const heart = p.favorite ? (opts.ascii ? "*" : "♥") : " ";
+  // because the world has already decided what colour a favourite is — a grey star is a star you
+  // have to decode.
+  //
+  // A star rather than a heart, and the reason is font fallback: `♥` is U+2665, which Unicode
+  // classifies as an emoji even though its default presentation is text. A terminal that has a
+  // colour-emoji font installed routes it there, and what comes back is somebody else's artwork
+  // at somebody else's weight — commonly an outline, which is what a filled glyph is not. Every
+  // heart codepoint has that problem. `★` is U+2605, `Emoji=No`, so no terminal has any reason to
+  // leave the font it is drawing the rest of the row in.
+  const star = p.favorite ? (opts.ascii ? "*" : "★") : " ";
 
   // Which other computers have this project. The whole reason a project key is a normalised git
   // remote rather than a path: on two machines the path is different and this is the same.
   const elsewhere = opts.hosts.get(p.key) ?? [];
   const name = clip(p.name, Math.max(6, opts.width - 8 - (elsewhere.length ? 8 : 0)));
   return {
-    text: ` ${heart} ${arrow} ${name}`,
+    text: ` ${star} ${arrow} ${name}`,
     hl: here ? "Directory" : "Sidebar.Dim",
-    spans: p.favorite ? [{ from: 1, to: 1 + byteLength(heart), hl: "Sidebar.Favorite" }] : undefined,
+    spans: p.favorite ? [{ from: 1, to: 1 + byteLength(star), hl: "Sidebar.Favorite" }] : undefined,
     right: elsewhere.length > 0
       // The machines take the column the count would have used. A project that is in two places is
       // a more useful thing to know than how many conversations are in it here.
