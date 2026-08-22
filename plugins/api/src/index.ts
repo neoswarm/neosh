@@ -671,6 +671,31 @@ export interface AgentApi {
    */
   send(text: string, opts?: { images?: string[] }): Promise<void>;
   cancel(): Promise<void>;
+  /**
+   * Do something to a conversation by id, rather than to whichever one is on screen.
+   *
+   * The same vocabulary `swarm.command` carries to another machine — steer, interrupt, re-model,
+   * rename, archive, start — pointed at a conversation here. That symmetry is the point: an
+   * orchestrator that fans work out over several conversations and joins the results is one
+   * program whether the conversations are on this laptop or spread over the swarm, and until this
+   * existed it was only writable for the ones that were somewhere else.
+   *
+   * Everything that *watches* a conversation already names one — `onToken`, `onTurnEnd`,
+   * `sessions.messages` — so this is the half that was missing. Without it, driving a second
+   * conversation meant `sessions.switch` first, which moves the screen out from under whoever is
+   * reading it.
+   *
+   * Omit `session` for the conversation on screen. Answers with the conversation the command was
+   * about, which is how `new_session` says what it made.
+   *
+   * ```ts
+   * // Ask three conversations the same thing without touching the screen.
+   * for (const s of await neosh.session.list()) {
+   *   await neosh.agent.command({ command: "send", text: "status?" }, s.id);
+   * }
+   * ```
+   */
+  command(command: AgentCommand, session?: string): Promise<string | null>;
   selection(): Promise<ModelSelection | null>;
   /** Hot-swap the model. Takes effect on the next turn. */
   setSelection(selection: ModelSelection): Promise<void>;
@@ -1977,6 +2002,10 @@ export function __createContext(plugin: string, config: unknown, version: number
       },
       async cancel() {
         await c({ call: "agent_cancel" });
+      },
+      async command(command, session) {
+        const v = await c({ call: "agent_command", session: session ?? null, command });
+        return expect(v, "maybe_session").session;
       },
       async selection() {
         return expect(await c({ call: "agent_get_selection" }), "selection").selection;

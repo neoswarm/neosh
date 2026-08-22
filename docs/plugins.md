@@ -15,7 +15,16 @@ version = "0.1.0"
 entry = "main.ts"
 description = "…"
 
-# Declared up front. Reading git state needs nothing; changing it needs this.
+# Declared up front, and enforced. Reading git state needs nothing; changing it needs this.
+#
+#   tools           register a tool the model can call
+#   providers       register a model provider driver
+#   hooks_blocking  take a hook that can rewrite or veto (an observer needs nothing)
+#   raw_cells       claim a raw cell surface
+#   vcs_write       branch, checkout, stage, commit, worktree
+#
+# Everything else — windows, buffers, keys, floats, options, vars — needs nothing declared: it is
+# no more privileged than what the person sitting there can already do.
 permissions = ["vcs_write"]
 ```
 
@@ -37,6 +46,34 @@ export function deactivate() {}     // optional
 `npx tsc --noEmit` checks against the exact version you have. **Plugins are transpiled, not
 type-checked, at load** — run `tsc` yourself; it is the only thing that catches a type error before
 it becomes a runtime one.
+
+---
+
+## Shipping one, and installing somebody else's
+
+A plugin is published by being a git repository with a `plugin.toml` at its root. There is no
+registry: a URL is already a globally unique name, and it works for a fork, a private repository and
+the branch you are writing.
+
+```sh
+neosh plugin add https://github.com/someone/neosh-thing   # or git@host:someone/thing
+neosh plugin list                                         # everything that loads here
+neosh plugin update                                       # ff-only pull, all of them
+neosh plugin remove thing                                 # asks first
+```
+
+`add` clones, reads the manifest with the same code startup reads it with, and only then moves it
+into place — so a plugin built against another protocol version, or missing the file its `entry`
+names, fails here with a sentence rather than at your next startup as a line in a log.
+
+The directory is named by `name` in the manifest, not by the URL: a plugin's id is that name, and
+two directories claiming one id would make which of them wins depend on how a filesystem happened to
+list them.
+
+**Two places, and they mean different things.** `~/.config/neosh/plugins/` is yours — put a plugin
+you are *writing* there and it is discovered as it is, so every save is live. `neosh plugin remove`
+will not touch it, because `add` did not put it there. Installed plugins live under your data
+directory and are checkouts neosh manages. `plugin_dirs` in `config.toml` adds any other directory.
 
 ---
 
@@ -493,6 +530,44 @@ await neosh.session.archive(id);                     // reversible, keeps everyt
 await neosh.session.archive(id, false);              // back, and to the top of the list
 await neosh.session.close(id);                       // deletes the file. No undo.
 ```
+
+### Driving one you are not looking at
+
+`agent.command` does something *to* a named conversation — the same vocabulary `swarm.command`
+carries to another machine, pointed at one here. Omit the id for the conversation on screen.
+
+```ts
+const id = await neosh.agent.command({ command: "new_session", title: "the tests" });
+await neosh.agent.command({ command: "send", text: "run the suite and report" }, id!);
+await neosh.agent.command({ command: "interrupt" }, id!);
+await neosh.agent.command({ command: "set_model", instance: "anthropic", model: "…" }, id!);
+```
+
+That plus `onTurnEnd` — which says which conversation ended — is an orchestrator: fan work out over
+several conversations, join on their endings, and the screen never moves. `session.switch` before
+each message is the thing this replaced; it works, and it drags the transcript out from under
+whoever is reading it.
+
+### Deciding who answers
+
+`turn.route` fires once a turn knows what it is going to say and before it knows who to say it to.
+A blocking hook there may re-point it, or refuse it with a reason the transcript prints.
+
+```ts
+await neosh.hook.register("turn_route", (p) => {
+  if (p.hook !== "turn_route") return { action: "continue" };
+  if (!p.text.startsWith("quick:")) return { action: "continue" };
+  return {
+    action: "modify",
+    payload: { ...p, selection: { instance: "local", model: "small", options: [] } },
+  };
+}, { blocking: true });
+```
+
+`selection` may be `null` — a conversation with no model chosen is a routable state, not an error,
+so a router may supply one. Needs `hooks_blocking` in the manifest.
+
+---
 
 `archive` and `close` are different verbs on purpose. If you are writing the thing a user presses
 when they are done with a conversation, it is `archive`; `close` is for when they have said they

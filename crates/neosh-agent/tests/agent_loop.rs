@@ -235,7 +235,17 @@ async fn a_turn_can_be_vetoed_before_it_reaches_the_model() {
         Some(HookOutcome::Veto { reason: "rate limited locally".into() });
 
     let outcome = agent.run_turn(&bridge, "do something").await;
-    assert_eq!(outcome.stop_reason, StopReason::Cancelled);
+    // A refusal, not a cancellation. `<Esc>` is what `Cancelled` means, and reporting a policy
+    // veto with the same value told everything downstream that the person had interrupted the
+    // turn — and dropped the reason the plugin gave for stopping it.
+    assert_eq!(
+        outcome.stop_reason,
+        StopReason::Refusal {
+            category: Some("a plugin".into()),
+            explanation: Some("rate limited locally".into()),
+        },
+        "the veto reason travels with the outcome"
+    );
     assert!(agent.session().messages.is_empty(), "nothing should be recorded");
     assert!(drain(&mut rx).iter().any(|e| matches!(e, AgentEvent::Notice { .. })));
 }

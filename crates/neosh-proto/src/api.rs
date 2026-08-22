@@ -521,6 +521,33 @@ pub enum ApiCall {
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         images: Vec<String>,
     },
+    /// Do something to a conversation on *this* machine, named rather than implied.
+    ///
+    /// The same [`AgentCommand`] vocabulary [`ApiCall::SwarmCommand`] carries to a peer, pointed at
+    /// a conversation here — and the reason it exists is that those two were not the same API.
+    /// A plugin could steer, interrupt, re-model, rename, archive and start conversations on every
+    /// *other* machine in the swarm, by id, while on this one it had `AgentSend` and friends, which
+    /// take no session and act on whatever is on screen. Everything that *observes* a conversation
+    /// was already addressed — `PluginEvent::Token`, `ToolFinished` and `TurnEnded` all say which
+    /// one they came from, and `SessionList`/`SessionMessages` read any of them — so the local API
+    /// could watch every conversation in the workspace and drive exactly one of them.
+    ///
+    /// What that cost is the thing this project is for: an orchestrator that fans work out across
+    /// several conversations and joins the results is writable against the swarm and was not
+    /// writable against the machine it runs on. The alternative was `SessionSwitch` before every
+    /// message, which moves the screen out from under whoever is reading it.
+    ///
+    /// `None` means the conversation on screen, so the ordinary single-conversation caller says
+    /// nothing and gets what it always got. Grants no authority a plugin did not already have —
+    /// switching and sending was always allowed — it only stops the screen being the cursor.
+    ///
+    /// Answers with the conversation the command was about, which is how
+    /// [`AgentCommand::NewSession`] says what it made.
+    AgentCommand {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session: Option<SessionId>,
+        command: AgentCommand,
+    },
     AgentCancel,
     AgentGetSelection,
     /// Hot-swap the model mid-session. Takes effect on the next turn.
@@ -1186,6 +1213,12 @@ pub enum ApiOk {
     Sessions { sessions: Vec<SessionInfo> },
     Credentials { credentials: Vec<CredentialInfo> },
     Session { session: SessionInfo },
+    /// Which conversation something was about, when it may have been about none.
+    ///
+    /// An id rather than a [`SessionInfo`]: the caller named the conversation in the first place,
+    /// and the one case that has something to say — [`AgentCommand::NewSession`] — is saying which
+    /// one it just made, not describing it.
+    MaybeSession { session: Option<SessionId> },
     Messages { messages: Vec<Message> },
     // ---- version control ----
     Status { status: RepoStatus },

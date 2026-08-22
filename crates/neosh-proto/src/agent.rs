@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 use ts_rs::TS;
 
 use crate::ids::{SessionId, ToolCallId, TurnId};
+use crate::provider::ModelSelection;
 
 // ---------------------------------------------------------------------------
 // Conversation
@@ -505,6 +506,9 @@ pub enum HookName {
     ToolPre,
     ToolPost,
     TurnPre,
+    /// Fired once a turn knows what it is going to say and before it knows who to say it to. A
+    /// blocking hook here decides **which model answers**. See [`HookPayload::TurnRoute`].
+    TurnRoute,
     TurnPost,
     BufPreChange,
     PermissionPre,
@@ -528,6 +532,39 @@ pub enum HookPayload {
     TurnPre {
         turn: TurnId,
         text: String,
+    },
+    /// Who should answer this turn.
+    ///
+    /// The one decision an orchestrator is *for* and the one the API had no way to express. Every
+    /// other hook is about what happens once a turn is under way — which tool may run, what the
+    /// prompt says, what it cost — and none of them can answer "send this one to the cheap model,
+    /// that one to the big one, and this whole class of work to the machine with the GPU". Routing
+    /// policy could only live in Rust, which for a program whose thesis is that extensibility is
+    /// the product is the wrong place for it.
+    ///
+    /// `selection` is what the conversation would use, and a [`HookOutcome::Modify`] carrying this
+    /// payload back with a different one is how a plugin re-points the turn. It is an `Option`
+    /// because a conversation may have no model chosen at all — that is a routable state, not an
+    /// error, so a hook may *supply* one and turn "no model selected" into an answer.
+    ///
+    /// Once per turn rather than once per round: the selection is read before the tool loop and
+    /// used for every round in it, so this fires exactly where the decision is actually made.
+    /// A hook that wants to change models mid-answer is asking for `set_model`, which exists.
+    ///
+    /// A veto refuses the turn, with the reason shown — which is how a budget plugin says no.
+    TurnRoute {
+        turn: TurnId,
+        /// What is about to be asked, so the decision can be about the work rather than only about
+        /// the conversation.
+        text: String,
+        /// Which conversation it belongs to. A workspace runs several turns at once, and a router
+        /// that assumed the one on screen would send another's work to the wrong place.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        session: Option<SessionId>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        selection: Option<ModelSelection>,
     },
     TurnPost {
         turn: TurnId,

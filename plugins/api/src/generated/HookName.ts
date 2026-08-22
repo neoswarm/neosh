@@ -10,6 +10,7 @@ export type HookName =
   | "tool_pre"
   | "tool_post"
   | "turn_pre"
+  | "turn_route"
   | "turn_post"
   | "buf_pre_change"
   | "permission_pre"

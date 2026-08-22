@@ -23,6 +23,7 @@ import type { QuestionAnswer } from "./QuestionAnswer";
 import type { QuotaSample } from "./QuotaSample";
 import type { QuotaSnapshot } from "./QuotaSnapshot";
 import type { RepoStatus } from "./RepoStatus";
+import type { SessionId } from "./SessionId";
 import type { SessionInfo } from "./SessionInfo";
 import type { SurfaceId } from "./SurfaceId";
 import type { SwarmAgent } from "./SwarmAgent";
@@ -71,6 +72,7 @@ export type ApiOk =
   | { "ok": "sessions"; sessions: Array<SessionInfo> }
   | { "ok": "credentials"; credentials: Array<CredentialInfo> }
   | { "ok": "session"; session: SessionInfo }
+  | { "ok": "maybe_session"; session: SessionId | null }
   | { "ok": "messages"; messages: Array<Message> }
   | { "ok": "status"; status: RepoStatus }
   | { "ok": "branches"; branches: Array<BranchInfo> }

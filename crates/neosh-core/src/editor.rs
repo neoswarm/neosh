@@ -144,6 +144,7 @@ impl Editor {
         !matches!(
             call,
             ApiCall::AgentSend { .. }
+                | ApiCall::AgentCommand { .. }
                 | ApiCall::AgentCancel
                 | ApiCall::AgentGetSelection
                 | ApiCall::AgentSetSelection { .. }

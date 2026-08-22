@@ -6334,3 +6334,241 @@ fn the_row_you_are_in_says_all_of_a_title_the_column_had_to_cut() {
         s.sidebar_now()
     );
 }
+
+/// A plugin can drive a conversation it is not looking at.
+///
+/// The vocabulary for doing something *to* a conversation — steer it, interrupt it, re-model it,
+/// start one — existed only over the swarm: `swarm.command` names a node and a session, so a
+/// plugin could fan work out over every other machine and, on this one, had `agent.send`, which
+/// takes no session and acts on whatever is on screen. Watching was already per-conversation, so
+/// the local API could see every conversation in the workspace and drive exactly one of them.
+///
+/// That is the shape of an orchestrator, so it is asserted as one: two conversations are given
+/// different work by id, and the screen never moves. `sessions.switch` before each message is the
+/// thing this replaced — it works, and it drags the transcript out from under whoever is reading.
+#[test]
+fn a_plugin_can_run_a_conversation_it_is_not_looking_at() {
+    const FANOUT: &str = r#"
+import type { PluginContext } from "@neosh/api";
+
+export async function activate({ neosh }: PluginContext) {
+  await neosh.cmd.register("lab.fanout", async () => {
+    try {
+    const here = (await neosh.session.current()).id;
+    // Started by name, and the answer is the one that was made — not whatever is on screen.
+    const made = await neosh.agent.command({ command: "new_session", title: "over there" });
+    if (!made) { neosh.notify("no session came back"); return; }
+    if (made === here) { neosh.notify("it answered with the conversation on screen"); return; }
+    await neosh.agent.command({ command: "send", text: "work for the second" }, made);
+    await neosh.agent.command({ command: "send", text: "work for the first" }, here);
+    neosh.notify("fanned out");
+    } catch (e) { neosh.notify("fanout failed: " + e); }
+  });
+  neosh.notify("lab ready");
+}
+"#;
+    let sb = Sandbox::new("fanout");
+    let dir = sb.root.join("config/plugins/lab");
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    std::fs::write(
+        dir.join("plugin.toml"),
+        "name = \"lab\"\nversion = \"0.1.0\"\nentry = \"main.ts\"\n",
+    )
+    .expect("manifest");
+    std::fs::write(dir.join("main.ts"), FANOUT).expect("plugin");
+    install_parrot(&sb);
+    sb.write_config("[options]\n\"agent.model\" = \"parrot/parrot\"\n");
+
+    let mut s = sb.start_letting_config_choose();
+    s.wait_for("parrot ready");
+    s.wait_for("lab ready");
+
+    // The conversation on screen, so there is something to have stayed on.
+    s.type_text("first");
+    s.enter();
+    assert!(s.pump(|s| s.saw("asked: first")), "the conversation on screen answers\n{}", s.transcript());
+
+    s.send(&command("lab.fanout"));
+    s.wait_for("fanned out");
+
+    // Both turns ran. The second conversation is not on screen, so its answer is asserted through
+    // the driver rather than the transcript — which is the point: nothing about it was drawn.
+    assert!(
+        s.pump(|s| s.saw("asked: work for the first")),
+        "the conversation on screen was steered by id\n{}",
+        s.transcript()
+    );
+    assert!(
+        s.pump(|s| s.sidebar_now().iter().any(|l| l.contains("over there"))),
+        "the conversation that was started is in the list\n{:?}",
+        s.sidebar_now()
+    );
+    // And the screen never moved: what is in the chat buffer is still the first conversation's.
+    assert!(
+        s.chat_now().iter().any(|l| l.contains("first")),
+        "the transcript on screen is still the one that was there\n{}",
+        s.transcript()
+    );
+    assert!(
+        !s.chat_now().iter().any(|l| l.contains("work for the second")),
+        "the other conversation's work was drawn into this one's transcript\n{}",
+        s.transcript()
+    );
+}
+
+
+/// A plugin decides which model answers.
+///
+/// Every other hook is about a turn already under way — what the prompt says, which tool may run,
+/// what it cost. None of them could answer the question an orchestrator exists to answer: *who
+/// should do this one*. Routing policy could only be written in Rust, in a program whose whole
+/// claim is that a third party could have written the feature.
+///
+/// Asserted through the driver, because that is the only witness that cannot be faked by the UI:
+/// the turn is sent to an instance the conversation was never pointed at.
+#[test]
+fn a_plugin_can_choose_which_model_answers_a_turn() {
+    const ROUTER: &str = r#"
+import type { PluginContext, HookPayload } from "@neosh/api";
+
+export async function activate({ neosh }: PluginContext) {
+  const say = (who: string) => async (_req: unknown, emit: (e: unknown) => void) => {
+    emit({ type: "message_start", model: who, usage: {} });
+    emit({ type: "block_start", index: 0, block: { kind: "text" } });
+    emit({ type: "text_delta", index: 0, text: "answered by " + who });
+    emit({ type: "block_stop", index: 0 });
+    emit({ type: "message_delta", stop_reason: { kind: "end_turn" }, usage: {} });
+    emit({ type: "message_stop" });
+  };
+  await neosh.provider.register("small", [{
+    id: "small", driver: "small", display_name: "Small",
+    models: [{ id: "small", display_name: "Small" }],
+  }], say("small"));
+  await neosh.provider.register("big", [{
+    id: "big", driver: "big", display_name: "Big",
+    models: [{ id: "big", display_name: "Big" }],
+  }], say("big"));
+
+  await neosh.hook.register("turn_route", (p: HookPayload) => {
+    if (p.hook !== "turn_route") return { action: "continue" };
+    if (p.text.includes("too expensive")) {
+      return { action: "veto", reason: "over the budget for today" };
+    }
+    if (!p.text.includes("urgent")) return { action: "continue" };
+    // Re-point this one turn. The conversation was never switched to it.
+    return {
+      action: "modify",
+      payload: { ...p, selection: { instance: "big", model: "big", options: [] } },
+    };
+  }, { blocking: true });
+
+  neosh.notify("router ready");
+}
+"#;
+    let sb = Sandbox::new("router");
+    let dir = sb.root.join("config/plugins/lab");
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    std::fs::write(
+        dir.join("plugin.toml"),
+        "name = \"lab\"\nversion = \"0.1.0\"\nentry = \"main.ts\"\npermissions = [\"providers\", \"hooks_blocking\"]\n",
+    )
+    .expect("manifest");
+    std::fs::write(dir.join("main.ts"), ROUTER).expect("plugin");
+    sb.write_config("[options]\n\"agent.model\" = \"small/small\"\n");
+
+    let mut s = sb.start_letting_config_choose();
+    s.wait_for("router ready");
+
+    // Ordinary work goes where the conversation points.
+    s.type_text("something ordinary");
+    s.enter();
+    assert!(s.pump(|s| s.saw("answered by small")), "the unrouted turn\n{}", s.transcript());
+
+    // And the router sends this one somewhere else, without the conversation being re-pointed by
+    // hand and without anything on screen having been switched.
+    s.type_text("this one is urgent");
+    s.enter();
+    assert!(s.pump(|s| s.saw("answered by big")), "the routed turn\n{}", s.transcript());
+
+    // And a router that says no says why, *in the transcript*, under the question it refused.
+    // A veto used to end the turn as `Cancelled` — the value `<Esc>` produces — so a question a
+    // plugin had blocked was indistinguishable from one the person had interrupted, and the reason
+    // the plugin gave lived for a few seconds in a toast and then nowhere at all.
+    s.type_text("this one is too expensive");
+    s.enter();
+    assert!(
+        s.pump(|s| s.chat_now().iter().any(|l| l.contains("over the budget for today"))),
+        "the reason is in the transcript\n{}",
+        s.transcript()
+    );
+}
+
+/// The rest of the declared permissions are enforced too.
+///
+/// `vcs_write` was the only one ever checked, which made the other seven documentation shaped like
+/// a boundary: `neosh plugins` printed a manifest's permissions, and a plugin that declared none of
+/// them could still register a tool the model calls, take a blocking hook and refuse every turn, or
+/// stand in as a model provider. A workspace that runs other people's code — and, on the swarm,
+/// takes commands from other machines — cannot have a permission list that is only a description.
+///
+/// One plugin, three attempts, nothing declared. Reading and drawing stay free, because they are no
+/// more privileged than what the person sitting there can already do.
+#[test]
+fn a_plugin_that_declared_nothing_cannot_register_a_tool_a_provider_or_a_blocking_hook() {
+    let sb = Sandbox::new("undeclared");
+    let dir = sb.root.join("config/plugins/greedy");
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    std::fs::write(
+        dir.join("plugin.toml"),
+        "name = \"greedy\"\nversion = \"0.1.0\"\nentry = \"main.ts\"\n",
+    )
+    .expect("manifest");
+    std::fs::write(
+        dir.join("main.ts"),
+        r#"
+import type { PluginContext } from "@neosh/api";
+export async function activate({ neosh }: PluginContext) {
+  const tried = async (what: string, f: () => Promise<unknown>) => {
+    try { await f(); neosh.notify(`ALLOWED ${what}`); }
+    catch (e) { neosh.notify(`refused ${what}: ${e}`); }
+  };
+  await tried("tool", () =>
+    neosh.tool.register({ name: "t", description: "d", inputSchema: {} }, async () => ({
+      content: "x", is_error: false,
+    })));
+  await tried("provider", () =>
+    neosh.provider.register("x", [{
+      id: "x", driver: "x", display_name: "X", models: [{ id: "x", display_name: "X" }],
+    }], async () => {}));
+  await tried("blocking hook", () =>
+    neosh.hook.register("turn_pre", () => ({ action: "continue" }), { blocking: true }));
+  // An observer cannot refuse anything, which is exactly what `hooks_blocking` distinguishes — so
+  // this one needs nothing declared and must still work.
+  await tried("observing hook", () =>
+    neosh.hook.register("turn_post", () => ({ action: "continue" })));
+  neosh.notify("greedy done");
+}
+"#,
+    )
+    .expect("plugin");
+
+    let mut s = sb.start();
+    s.wait_for("greedy done");
+    assert!(!s.saw("ALLOWED tool"), "a tool was registered undeclared\n{}", s.transcript());
+    assert!(!s.saw("ALLOWED provider"), "a provider was registered undeclared\n{}", s.transcript());
+    assert!(
+        !s.saw("ALLOWED blocking hook"),
+        "a blocking hook was taken undeclared\n{}",
+        s.transcript()
+    );
+    assert!(
+        s.saw("ALLOWED observing hook"),
+        "an observer needs nothing declared and was refused anyway\n{}",
+        s.transcript()
+    );
+    // And each refusal says the word to put in the manifest, so the fix is one line rather than a
+    // capability name and a guess about where it goes.
+    for want in ["tools", "providers", "hooks_blocking"] {
+        assert!(s.saw(want), "the refusal names {want}\n{}", s.transcript());
+    }
+}

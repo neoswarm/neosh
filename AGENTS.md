@@ -262,6 +262,33 @@ per decision, and records the *reasoning*, not the choice.
   `Status.Unread` must not do — and the queue behind it is in memory while the var is on disk, so it
   is announced once at startup, empty, and that is what clears the one left behind by a workspace
   that stopped mid-question. See ADR 0043.
+- **A question is the last thing in the transcript until something answers it.** A turn's closing
+  rows — its plan, what it left running, what it changed — are about the answer they close, so they
+  splice in *above* a question steered in after that answer rather than at the end of the buffer,
+  where they sat under a message you had just typed. And a question the turn ended without
+  answering says so in a row of its own, out of the stop reason: a bare question reads exactly like
+  one still being thought about, and a toast that has faded is not an answer to "why is nothing
+  happening". A plugin veto is a `Refusal` carrying its reason and never `Cancelled`, which is what
+  `<Esc>` means. **An entry in the running-turns map lives until `TurnEnded` arrives** — `<Esc>`
+  flags it rather than removing it, because removing it early let a message typed in the gap start
+  a *second* turn in one conversation, which the first turn's ending then dismantled. Steering never
+  takes a message it cannot deliver: the tool-gap take is guarded on cancellation, and what stays in
+  the queue becomes the next turn. Leaving the reader goes back to following the newest, and so does
+  sending — whether it starts a turn or joins one. See ADR 0052.
+- **An orchestrator is a plugin, and it drives conversations by name.** `agent.command` carries the
+  same `AgentCommand` vocabulary `swarm.command` does, at a conversation named by id and defaulting
+  to the one on screen; `swarm.command` aimed at this node runs it here rather than dialling itself.
+  Watching was always per-conversation — `Token`, `ToolFinished`, `TurnEnded` all name one — so
+  until this existed the local API could see every conversation in the workspace and drive exactly
+  one of them, and fanning work out meant `SessionSwitch` before every message, which moves the
+  transcript out from under whoever is reading it. **Which model answers is a hook**: `turn.route`
+  fires after the words are settled and before the driver is resolved, may re-point the turn or veto
+  it with a reason, and writes its choice back to the conversation so the footer and `^P` agree with
+  the turn. **The declared permissions are enforced** — a tool, a provider driver, a *blocking* hook
+  and a raw-cell surface each need the word in `plugin.toml`, an observer needs nothing, and drawing
+  and reading stay free. **A plugin arrives as a git clone**: `neosh plugin add <url>`, validated
+  before it is moved into place, named by its manifest, and never able to delete what you put in
+  your own config directory by hand. See ADR 0053.
 - **A card is a row until you ask for more.** A call that only *looked* at something folds to its
   header with the size of what came back on the end of it; a command keeps its output, an edit keeps
   its diff, and a failure always shows. See ADR 0033.
@@ -361,14 +388,26 @@ minute on their own:
 cargo test -p neosh-core -- --test-threads 2
 cargo test -p neosh --test builtin_plugins -- --test-threads 2
 cargo test -p neosh --test workspace -- --test-threads 2
-cargo test -p neosh-proto export_bindings && git diff --exit-code plugins/api/src/generated
+cargo test -p neosh --test plugin_manager -- --test-threads 2
+# ts-rs reads the export directory from the environment, and an exported `TS_RS_EXPORT_DIR`
+# beats `.cargo/config.toml` — so in a worktree this has to say which checkout it means, or
+# the generated files land in another one and the diff below passes having read nothing.
+TS_RS_EXPORT_DIR="$PWD/plugins/api/src/generated" cargo test -p neosh-proto export_bindings \
+  && git diff --exit-code plugins/api/src/generated
 cd plugins/api && npx tsc --noEmit
 ```
 
 `tests/workspace.rs` runs a real `neosh --serve` and talks to it over a real socket, because what it
 asserts is that one process survives another going away. Each sandbox gets its own socket via its
 own `--config-dir` — which is also what stops the suite attaching to *your* workspace and stopping
-it.
+it. `tests/plugin_manager.rs` does the same for installing: a real git repository, a real clone, and
+a real workspace started afterwards to see whether the plugin actually ran — a `--config-dir` **and**
+a `NEOSH_DATA_DIR` of its own, because that is where an install lands.
+
+`tests/builtin_plugins.rs` starts a whole neosh per test and waits on what appears on screen, so it
+is timing-sensitive: under load a handful of unrelated tests fail on a `wait_for` timeout, and a
+different handful each run. A failure there is worth re-running alone (`--test-threads 1 <name>`)
+before believing it.
 
 **Terminal behaviour is checked by driving the real binary**, not by reading the code. `scripts/shot.py`
 runs neosh under a pty and prints what the screen actually looks like:

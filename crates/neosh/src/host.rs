@@ -230,12 +230,15 @@ pub struct Host {
     /// redraws.
     status_segments: std::collections::BTreeMap<String, neosh_proto::StatusSegment>,
 
-    /// One cancellation token per conversation with a turn in flight.
+    /// One entry per conversation with a turn in flight.
     ///
     /// A map rather than an `Option`, because a turn belongs to a conversation and not to the
     /// program. Switching used to be refused while one ran; now switching is just switching, and
     /// `<Esc>` cancels the turn of the conversation you are looking at.
-    turns: std::collections::HashMap<neosh_proto::SessionId, CancellationToken>,
+    ///
+    /// **An entry lives until [`AgentEvent::TurnEnded`] arrives, not until the turn is cancelled.**
+    /// See [`Running::cancelling`] for what removing it early cost.
+    turns: std::collections::HashMap<neosh_proto::SessionId, Running>,
     /// What each conversation with a turn in flight is doing, and what it has said so far in the
     /// round it is in the middle of.
     ///
@@ -334,6 +337,22 @@ pub struct Host {
     /// Highlights for search hits. Its own namespace so clearing them cannot take the transcript's
     /// own colour with it.
     search_ns: neosh_proto::NamespaceId,
+    /// Where a question sits that nothing has answered yet, as the first row of its block.
+    ///
+    /// Set when a question is drawn and cleared by the first thing drawn under it, so it is
+    /// exactly "the transcript ends with something you asked and nothing else". Two things need
+    /// that fact and both of them were bugs.
+    ///
+    /// A turn's *closing* rows — its plan, what it left running, what it changed — are about the
+    /// answer they close. Appended at the end of the buffer they landed **under** a question
+    /// steered in after the last of that answer, so a message you had just typed was not the last
+    /// thing in the transcript: two blocks belonging to the previous exchange sat below it. They
+    /// go here instead, which is where the turn's own output stopped.
+    ///
+    /// And a question still unanswered when the turn ends got no reply at all — which is a thing
+    /// to *say*, because a question with nothing under it is indistinguishable from one still
+    /// being thought about. See [`Host::close_unanswered`].
+    unanswered: Option<u32>,
     /// Set while output is streaming, so chunks append rather than starting a new line.
     streaming: Option<Stream>,
     /// The answer currently being written, and where it sits in the transcript.
@@ -626,6 +645,26 @@ impl Card {
     }
 }
 
+/// A turn the host started and has not yet seen end.
+struct Running {
+    cancel: CancellationToken,
+    /// The turn has been asked to stop — `<Esc>`, or a peer's `Interrupt` — and is winding down.
+    ///
+    /// It is a flag rather than the absence of an entry, and that is the whole point. Cancelling
+    /// used to *remove* the entry, so "is a turn running in this conversation" went false while the
+    /// turn was still ending: a message typed in that gap started a **second** turn in the same
+    /// conversation, and then the first turn's `TurnEnded` — which removes by conversation, having
+    /// no way to tell whose ending it is — tore down the second one's cancellation token and its
+    /// [`Round`]. What that looked like was a turn nothing could interrupt, a spinner frozen at
+    /// whatever second it had reached, and a third `\u{23ce}` starting yet another turn on a vendor
+    /// CLI that keeps one process per conversation.
+    ///
+    /// Kept, the map is exactly "turns the host is waiting to hear the end of", every entry is
+    /// removed by the ending it belongs to, and a message typed while a turn winds down is queued
+    /// and started by that ending — which is what the leftover-steering path already did.
+    cancelling: bool,
+}
+
 /// One thing a running turn has produced, in the order it produced it.
 ///
 /// The same three shapes [`transcript`] draws from a finished conversation, which is the point:
@@ -777,6 +816,7 @@ impl Host {
             searched: String::new(),
             searched_back: false,
             search_ns,
+            unanswered: None,
             streaming: None,
             answer: None,
             startup: Startup::default(),
@@ -946,8 +986,60 @@ impl Host {
         self.refresh_composer();
     }
 
+    /// What a plugin must have declared in its `plugin.toml` to make this call, if anything.
+    ///
+    /// Most of the API needs nothing: drawing a window, reading a buffer and binding a key are no
+    /// more privileged than what the person sitting there can already do. These four are the ones
+    /// that are *about* something other than the screen, and each was already declarable —
+    /// [`neosh_proto::PluginPermission`] has listed them since it existed, `neosh plugins` prints
+    /// them, and a user reading a manifest was entitled to believe them.
+    ///
+    /// They were not checked. Only `vcs_write` ever was, which made the rest documentation that
+    /// looked like a boundary: a plugin declaring nothing could register a tool the model calls,
+    /// take a blocking hook and veto every turn, or stand in as a model provider. That is the wrong
+    /// way round for a workspace that runs other people's code and, on the swarm, takes commands
+    /// from other machines.
+    ///
+    /// A non-blocking hook needs nothing: an observer cannot refuse anything, which is exactly the
+    /// distinction `hooks_blocking` names.
+    fn permission_for(call: &ApiCall) -> Option<neosh_proto::PluginPermission> {
+        use neosh_proto::PluginPermission as P;
+        match call {
+            ApiCall::ToolRegister { .. } => Some(P::Tools),
+            ApiCall::HookRegister { blocking: true, .. } => Some(P::HooksBlocking),
+            ApiCall::ProviderRegisterDriver { .. } => Some(P::Providers),
+            ApiCall::SurfaceClaim { .. } => Some(P::RawCells),
+            _ => None,
+        }
+    }
+
+    /// Whether `plugin` declared `want`.
+    ///
+    /// The host's own calls are not a plugin's and are not gated: `BUILTIN` is the binary drawing
+    /// its own UI, and it has no manifest to declare anything in.
+    fn may(&self, plugin: &PluginId, want: neosh_proto::PluginPermission) -> bool {
+        plugin.0 == BUILTIN
+            || self.plugin_permissions.get(plugin).is_some_and(|p| p.contains(&want))
+    }
+
     /// Route a plugin call: UI-domain calls to the core, agent-domain calls to the agent layer.
     async fn dispatch(&mut self, plugin: &PluginId, call: ApiCall) -> ApiResult {
+        if let Some(want) = Self::permission_for(&call)
+            && !self.may(plugin, want)
+        {
+            let name = serde_json::to_value(want)
+                .ok()
+                .and_then(|v| v.as_str().map(str::to_string))
+                .unwrap_or_else(|| format!("{want:?}"));
+            // Says the fix, not just the refusal. A plugin author reading this in a log has one
+            // line to act on rather than a capability name and a guess about where it goes.
+            return Err(ApiError::NotPermitted {
+                capability: format!(
+                    "{name} (plugin {plugin} did not declare it \u{2014} add \"{name}\" to the \
+                     permissions list in its plugin.toml)"
+                ),
+            });
+        }
         if Editor::handles(&call) {
             let r = self.editor.apply(plugin, call);
             self.drain_effects();
@@ -968,6 +1060,24 @@ impl Host {
                 }
                 self.start_turn(text);
                 Ok(ApiOk::Unit)
+            }
+            ApiCall::AgentCommand { session, command } => {
+                let session = session.unwrap_or_else(|| self.active_session());
+                let session = self
+                    .apply_agent_command(&session, command)
+                    .map_err(|r| match r {
+                        neosh_proto::Refusal::NoSuchAgent => ApiError::NotFound {
+                            what: format!("conversation {session}"),
+                        },
+                        neosh_proto::Refusal::NotPermitted { what } => {
+                            ApiError::Denied { reason: what }
+                        }
+                        neosh_proto::Refusal::Busy { message }
+                        | neosh_proto::Refusal::Failed { message } => {
+                            ApiError::InvalidArgument { message }
+                        }
+                    })?;
+                Ok(ApiOk::MaybeSession { session })
             }
             ApiCall::ChatAttach { path } => {
                 let got = self
@@ -1313,8 +1423,11 @@ impl Host {
                 // Closing is the one case that does stop a turn: there is about to be nowhere to
                 // put its answer, and a stream writing into a conversation that no longer exists is
                 // a subprocess nobody can reach.
+                // Removed rather than marked: the conversation itself is going, so there is
+                // nothing left for its ending to be about and nothing that can start another turn
+                // in it. `TurnEnded` arriving later finds no entry, which is the right no-op.
                 if let Some(t) = self.turns.remove(&session) {
-                    t.cancel();
+                    t.cancel.cancel();
                 }
                 self.rounds.remove(&session);
                 self.driver_commands.remove(&session);
@@ -1600,16 +1713,27 @@ impl Host {
         // Typing while it works is steering, not an error. The old behaviour — refuse, and make you
         // wait with the sentence already written — is the one moment in the program where you know
         // exactly what you want to say and cannot say it.
+        //
+        // A turn that is *winding down* after `<Esc>` counts as running for exactly the same
+        // reason: its process has not finished with the conversation yet, so this is queued and
+        // becomes the next turn through the leftover path in `TurnEnded`. Starting one here
+        // instead would put two turns on a driver that keeps one process per conversation.
         if self.turns.contains_key(&session) {
             self.agent.steer(&session, prompt);
             if on_screen {
+                // Sending is asking to see what happens, whether it starts a turn or joins one.
+                // Without this a message steered in while the transcript was scrolled back — which
+                // is where reading it leaves you — landed below the screen, and what you could
+                // still see was older text with nothing new in it.
+                self.scroll_chat(0);
                 self.draw_working();
                 self.refresh_composer();
             }
             return;
         }
         let token = CancellationToken::new();
-        self.turns.insert(session.clone(), token.clone());
+        self.turns
+            .insert(session.clone(), Running { cancel: token.clone(), cancelling: false });
         // Not random: the turn id would be ideal but is not known yet, and a clock read is the one
         // varying thing already to hand. Per turn, so it does not change under you mid-answer.
         let verb = VERBS
@@ -1649,16 +1773,23 @@ impl Host {
         });
     }
 
-    /// Stop the turn in the conversation on screen, if there is one.
-    fn cancel_turn_here(&mut self) -> bool {
+    /// Ask the turn in the conversation on screen to stop, if there is one.
+    ///
+    /// Answers whether there was a turn to interrupt — which is what tells `<Esc>` it has been
+    /// spent, so a second press does not fall through to clearing the draft. The entry stays until
+    /// the turn actually ends; see [`Running::cancelling`].
+    /// `None` when there was no turn here; `Some(true)` when this press is what stopped it, and
+    /// `Some(false)` when it was already winding down — the key is spent either way, but only one
+    /// of them is news worth saying out loud.
+    fn cancel_turn_here(&mut self) -> Option<bool> {
         let here = self.active_session();
-        match self.turns.remove(&here) {
-            Some(t) => {
-                t.cancel();
-                true
-            }
-            None => false,
+        let t = self.turns.get_mut(&here)?;
+        if t.cancelling {
+            return Some(false);
         }
+        t.cancelling = true;
+        t.cancel.cancel();
+        Some(true)
     }
 
     /// Make sure leaving `session` has somewhere to land, minting a placeholder if it does not.
@@ -1695,11 +1826,29 @@ impl Host {
     /// changing what you are talking to as a side effect of tidying up would be a strange thing to
     /// do.
     fn new_session_in(&mut self, cwd: std::path::PathBuf) -> neosh_proto::SessionId {
+        self.new_session_titled(cwd, None)
+    }
+
+    /// The same, with a name given up front.
+    ///
+    /// A caller that is *making* conversations — a peer over ASCP, an orchestrator plugin fanning
+    /// work out — knows what each one is for at the moment it asks for it, and that is the only
+    /// moment it is cheap to say. The name was accepted on the wire and dropped on the floor, so
+    /// three conversations started by one command came back labelled by whatever their first
+    /// message happened to begin with.
+    fn new_session_titled(
+        &mut self,
+        cwd: std::path::PathBuf,
+        title: Option<String>,
+    ) -> neosh_proto::SessionId {
         let mut session = neosh_agent::Session::new(cwd);
         session.created_at = now_secs();
         session.updated_at = session.created_at;
         session.selection = self.agent.selection();
         session.system = self.agent.session().system.clone();
+        // Blank is not a name. An empty string would render as a row with nothing on it, which is
+        // worse than the label a first message gives it.
+        session.title = title.map(|t| t.trim().to_string()).filter(|t| !t.is_empty());
         let id = session.id.clone();
         self.agent.sessions().insert(session);
         id
@@ -1862,6 +2011,18 @@ impl Host {
         command: neosh_proto::AgentCommand,
         waiting: (PluginId, RequestId),
     ) {
+        // Addressed at this machine, which is a thing to *do* rather than a thing to dial. A
+        // fleet plugin iterating over `swarm.nodes()` reaches its own node like any other, and
+        // sending ourselves a packet to ask ourselves a question would need the swarm to be
+        // running before a plugin could steer the conversation it is sitting in.
+        if self.swarm_self().is_some_and(|me| me.id == node) {
+            let answer = self
+                .apply_agent_command(&session, command)
+                .map(|_| ApiOk::Unit)
+                .map_err(|r| ApiError::Denied { reason: format!("{r:?}") });
+            self.answer_swarm(waiting, answer);
+            return;
+        }
         let Some(handle) = &self.swarm_node else {
             self.answer_swarm(waiting, Err(ApiError::NotFound {
                 what: "the swarm is not running".into(),
@@ -2135,18 +2296,42 @@ impl Host {
         session: neosh_proto::SessionId,
         command: neosh_proto::AgentCommand,
     ) {
+        let result = self.apply_agent_command(&session, command);
+        if let Some(h) = &self.swarm_node {
+            h.send(neosh_swarm::SwarmRequest::Answer { node, id, result });
+        }
+    }
+
+    /// Do one [`neosh_proto::AgentCommand`] to a conversation on this machine.
+    ///
+    /// The single implementation behind both ways of asking: a peer over ASCP, and a plugin here
+    /// through [`ApiCall::AgentCommand`]. It was written for the first and reachable only from it,
+    /// which is how the swarm API came to be able to do things to a conversation that the local
+    /// API could not — see the docs on `ApiCall::AgentCommand`. One body means the two cannot
+    /// drift, and that a refusal is refused for the same reason on both paths.
+    ///
+    /// Answers with the conversation it acted on when that is news, which is only
+    /// [`neosh_proto::AgentCommand::NewSession`].
+    fn apply_agent_command(
+        &mut self,
+        session: &neosh_proto::SessionId,
+        command: neosh_proto::AgentCommand,
+    ) -> Result<Option<neosh_proto::SessionId>, neosh_proto::Refusal> {
         use neosh_proto::AgentCommand as C;
+        let session = session.clone();
         let known = self.agent.sessions().list_with(true).iter().any(|s| s.id == session);
-        let result = match command {
-            C::NewSession { cwd, .. } => {
+        match command {
+            C::NewSession { cwd, title } => {
                 let dir = cwd
                     .map(std::path::PathBuf::from)
                     .unwrap_or_else(|| self.cwd.clone());
                 if dir.is_dir() {
-                    // The one just made, not whatever is on screen here: `new_session_in` inserts
-                    // without switching, so the active id is the conversation this machine happens
-                    // to be looking at and the peer would be handed somebody else's.
-                    Ok(Some(self.new_session_in(dir)))
+                    // The one just made, not whatever is on screen here: `new_session_titled`
+                    // inserts without switching, so the active id is the conversation this machine
+                    // happens to be looking at and the caller would be handed somebody else's.
+                    let id = self.new_session_titled(dir, title);
+                    self.publish_inventory();
+                    Ok(Some(id))
                 } else {
                     Err(neosh_proto::Refusal::Failed {
                         message: format!("{} is not a directory here", dir.display()),
@@ -2161,8 +2346,13 @@ impl Host {
                 Ok(None)
             }
             C::Interrupt => {
-                if let Some(t) = self.turns.get(&session) {
-                    t.cancel();
+                // The same idempotent ask `<Esc>` makes, and for the same reason: the entry stays
+                // until the turn ends, so two peers interrupting once each is one interruption.
+                if let Some(t) = self.turns.get_mut(&session)
+                    && !t.cancelling
+                {
+                    t.cancelling = true;
+                    t.cancel.cancel();
                 }
                 Ok(None)
             }
@@ -2221,13 +2411,6 @@ impl Host {
                 what: "approvals are answered by a plugin on this machine, not over the swarm"
                     .into(),
             }),
-        };
-        if let Some(h) = &self.swarm_node {
-            h.send(neosh_swarm::SwarmRequest::Answer {
-                node,
-                id,
-                result,
-            });
         }
     }
 
@@ -3231,7 +3414,7 @@ impl Host {
             return;
         }
         if key.code == KeyCode::Esc {
-            if self.cancel_turn_here() {
+            if self.cancel_turn_here() == Some(true) {
                 self.editor_message(MessageLevel::Info, "interrupted");
             }
             return;
@@ -3597,6 +3780,15 @@ impl Host {
         });
         let _ = self.editor.apply(&plugin, ApiCall::WinSelect { win: self.chat_win, on: false });
         let _ = self.editor.apply(&plugin, ApiCall::FocusPop);
+        // Back to following the newest, because that is what the composer is the bottom of.
+        //
+        // Reading is a place *in* the transcript and the scroll offset is how it gets there —
+        // `reading_jump` sets it on every motion. Left behind, coming back out put you in the
+        // composer with the window still parked a hundred rows up: the next thing you typed, the
+        // spinner, and the whole answer all arrived below the screen, and what you could still
+        // see was old text that had not changed. Every other way *into* a conversation resets
+        // this for the same reason — see `enter_session`.
+        self.scroll_chat(0);
         self.refresh_status();
         self.refresh_composer();
     }
@@ -4779,6 +4971,10 @@ impl Host {
         // that are on their way out would write into the conversation being left behind.
         self.answer = None;
         self.streaming = None;
+        // A row in the transcript being replaced, so it names nothing after this. The rebuild
+        // below draws the conversation from its messages, where an unanswered question is simply
+        // the last one in the list.
+        self.unanswered = None;
         // Both together: the footer is part of the working line, and a row count left behind from
         // the conversation being left would tell the next `chat_end` to insert inside a buffer
         // that no longer has those rows.
@@ -5122,6 +5318,14 @@ impl Host {
             for c in self.cards.iter_mut().filter(|c| c.row > row) {
                 c.row = (i64::from(c.row) + delta).max(0) as u32;
             }
+            // And the trailing question moves with them. A call can come back *after* something
+            // was steered in — a driver runs them in parallel — and a body opening above the
+            // question shifts it down like every other row below the card. Left unshifted, the
+            // turn's closing rows would be spliced into the middle of the question they belong
+            // above. Not cleared: a tool result landing above it does not answer it.
+            if let Some(u) = self.unanswered.filter(|u| *u > row) {
+                self.unanswered = Some((i64::from(u) + delta).max(0) as u32);
+            }
         }
     }
 
@@ -5156,39 +5360,85 @@ impl Host {
     ///
     /// From the turn's own tool calls rather than from `git diff`, which would count work done
     /// outside this turn — by you, or by a turn in another conversation on the same checkout.
-    fn draw_plan(&mut self, steps: &[neosh_proto::PlanStep]) {
+    fn draw_plan(&mut self, steps: &[neosh_proto::PlanStep], at: Option<u32>) -> u32 {
         if steps.is_empty() || !self.option_bool("chat.show_plan") {
-            return;
+            return 0;
         }
         // Whole. This copy is history — the answer to "what did it decide to do", read back later
         // — and abridging that would leave a transcript with a hole nothing can open.
         let rows = cards::plan(&self.glyphs(), steps, self.chat_width(), None);
-        self.push_block(&rows);
+        self.place_block(at, &rows)
     }
 
     /// What the turn changed, under its answer.
     ///
     /// From the turn's own tool calls rather than from `git diff`, which would count work done
     /// outside this turn — by you, or by a turn in another conversation on the same checkout.
-    fn draw_summary(&mut self, files: &[cards::FileStat]) {
+    fn draw_summary(&mut self, files: &[cards::FileStat], at: Option<u32>) -> u32 {
         if files.is_empty() {
-            return;
+            return 0;
         }
         let root = self.root();
         let width = self.chat_width();
         let rows = cards::summary(files, &root, width);
-        self.push_block(&rows);
+        self.place_block(at, &rows)
     }
 
-    /// Put a block of already-rendered rows at the end of the transcript, with their highlights.
+    /// Say that a question got no reply, when the turn it went into has ended and nothing was
+    /// drawn under it.
+    ///
+    /// `at` is [`Self::unanswered`] as it stands after the turn's closing rows have been placed:
+    /// `None` means something *was* said, and there is nothing to explain.
+    ///
+    /// This is the other half of the bug that put a plan under a message you had just typed.
+    /// Moving the plan above it left the question genuinely last — and genuinely bare, which is
+    /// the state that reads exactly like a turn still thinking. A message can reach a driver at
+    /// the final gap of a turn and be answered by nothing at all: the vendor CLI has already
+    /// emitted its result, the round it starts produces no content, and the turn ends. Silence
+    /// there is the one outcome the transcript must not render as a question hanging in the air.
+    ///
+    /// It is a row of the transcript rather than a notification because it is *about* that
+    /// question, and a toast that has faded is not an answer to "why is nothing happening".
+    fn close_unanswered(&mut self, at: Option<u32>, stop: &neosh_proto::StopReason) {
+        use neosh_proto::StopReason as S;
+        if at.is_none() {
+            return;
+        }
+        let (text, hl) = match stop {
+            // What went wrong, where the question it went wrong on is. A notice says the same
+            // thing for a few seconds and then the transcript is back to saying nothing.
+            S::Error { message } => (message.clone(), "Diagnostic.Error"),
+            S::Refusal { explanation, .. } => (
+                explanation.clone().unwrap_or_else(|| "the model declined to answer".into()),
+                "Diagnostic.Warn",
+            ),
+            // You are the one who stopped it, so this is a note rather than a complaint — but it
+            // is still worth a row: without one, an interrupted question and a question nobody
+            // has got to yet look identical.
+            S::Cancelled => ("interrupted".into(), "Agent.Usage"),
+            S::MaxTokens => ("the reply hit the output limit".into(), "Diagnostic.Warn"),
+            _ => ("no reply \u{2014} the turn ended here".into(), "Diagnostic.Hint"),
+        };
+        // Through the same placement every other block uses, so it gets one blank line above it
+        // and not two — the question already ends with one.
+        self.place_block(None, &[cards::Row::plain(text, hl)]);
+    }
+
+    /// Put a block of already-rendered rows into the transcript, with their highlights, and answer
+    /// with how many rows it took.
+    ///
+    /// `at` is a row to splice above, or `None` for the end. A row rather than always the end
+    /// because a turn's closing rows belong to the answer they close: with a question steered in
+    /// after that answer, the end of the buffer is *below* something nobody has answered yet. See
+    /// [`Self::unanswered`].
     ///
     /// A blank line above unless there already is one, for the same reason a question gets one: two
     /// blank lines reads as a gap somebody forgot to fill, and none reads as one paragraph.
-    fn push_block(&mut self, rows: &[cards::Row]) {
+    fn place_block(&mut self, at: Option<u32>, rows: &[cards::Row]) -> u32 {
         if rows.is_empty() {
-            return;
+            return 0;
         }
-        let end = self.chat_end();
+        let end = at.map_or_else(|| self.chat_end(), i64::from);
         let gap = end > 0
             && self
                 .editor
@@ -5202,10 +5452,43 @@ impl Host {
             lines.push(String::new());
         }
         lines.extend(rows.iter().map(|r| r.text.clone()));
-        let at = self.chat_push(lines) + u32::from(gap);
+        let n = lines.len() as u32;
+        let first = match at {
+            None => self.chat_push(lines),
+            Some(row) => self.chat_splice(row, lines),
+        };
+        let start = first + u32::from(gap);
         for (k, r) in rows.iter().enumerate() {
-            self.chat_row(at + k as u32, r);
+            self.chat_row(start + k as u32, r);
         }
+        n
+    }
+
+    /// Insert lines into the middle of the transcript, moving everything below down.
+    ///
+    /// The registry of card rows moves with them, exactly as it does when a card body opens — a
+    /// row index that is not maintained is a row index that eventually addresses somebody else's
+    /// text.
+    fn chat_splice(&mut self, at: u32, lines: Vec<String>) -> u32 {
+        self.close_answer();
+        let n = lines.len() as u32;
+        if n == 0 {
+            return at;
+        }
+        let _ = self.editor.apply(&PluginId::from(BUILTIN), ApiCall::BufSetLines {
+            buf: self.chat,
+            start: i64::from(at),
+            end: i64::from(at),
+            lines,
+        });
+        for c in self.cards.iter_mut().filter(|c| c.row >= at) {
+            c.row += n;
+        }
+        if let Some(u) = self.unanswered.filter(|u| *u >= at) {
+            self.unanswered = Some(u + n);
+        }
+        self.streaming = None;
+        at
     }
 
     /// Put back what a turn already said, for a conversation that is still mid-turn.
@@ -5269,6 +5552,10 @@ impl Host {
         // Anything else writing into the transcript ends the answer: its rows are addressed by
         // range, and something landing after them would make "the end of the answer" ambiguous.
         self.close_answer();
+        // Something is being said under the last question, so it is not the end of the transcript
+        // any more. `chat_question` sets this again for the question it draws, which is why this
+        // clear is safe to make unconditionally here.
+        self.unanswered = None;
         let plugin = PluginId::from(BUILTIN);
         let at = self.chat_end();
         let _ = self.editor.apply(&plugin, ApiCall::BufSetLines {
@@ -5437,6 +5724,9 @@ impl Host {
     /// spinner stranded above the answer it is producing says the wrong thing about which of them
     /// is still happening.
     fn open_answer_row(&mut self) -> u32 {
+        // An answer is arriving under the question, which is the thing that answers it. Written
+        // directly rather than through `chat_push`, so it has to say this for itself.
+        self.unanswered = None;
         let n = self.chat_end();
         // A blank line between the last thing and the answer — unless there already is one. A tool
         // card butted straight up against the sentence that follows it reads as one paragraph, and
@@ -5501,7 +5791,10 @@ impl Host {
     /// A bar down the left rather than a `>` prefix, because a multi-line question wrapped by the
     /// frontend loses a prefix on every line but the first, and the thing you scan for when
     /// scrolling back is *where the turns start*.
-    fn chat_question(&mut self, prompt: &Prompt) {
+    ///
+    /// Answers with the first row of the block it drew, which is where the turn's closing rows go
+    /// when it turns out nothing was said after it.
+    fn chat_question(&mut self, prompt: &Prompt) -> u32 {
         let text = &prompt.text;
         let glyph = self.glyphs().bar;
         let mut rows = Vec::new();
@@ -5545,6 +5838,11 @@ impl Host {
         for i in 0..body {
             self.chat_mark(first + i, 0, glyph.len(), "Agent.User");
         }
+        // Nothing has answered it yet, by definition — this is the last thing in the transcript.
+        // Whatever is drawn next clears this; if the turn ends and it is still set, the question
+        // got no reply. See [`Self::unanswered`].
+        self.unanswered = Some(at);
+        at
     }
 
     /// Put the working line at the end of the transcript, for the conversation on screen.
@@ -5782,6 +6080,9 @@ impl Host {
 
     fn stream_into_chat_now(&mut self, kind: Stream, text: &str) {
         let plugin = PluginId::from(BUILTIN);
+        // Reasoning under the question is the turn answering it, even when the answer proper has
+        // not started. Another direct writer, so it says so for itself.
+        self.unanswered = None;
         if self.streaming != Some(kind) {
             self.close_answer();
             // Text is appended to the buffer's *last* line, so the working line has to stop being
@@ -5935,13 +6236,29 @@ impl Host {
                     // with the working line — so without this the one case people actually ask
                     // about, "is something still going?", is the one that leaves no trace.
                     let left = self.tasks_left_running(&session);
-                    self.end_working();
-                    self.streaming = None;
-                    self.draw_plan(&plan);
-                    self.push_block(&left);
                     let changes =
                         self.rounds.get(&session).map(|r| r.changes.clone()).unwrap_or_default();
-                    self.draw_summary(&changes);
+                    // Where the turn's own closing rows belong. `None` is the end of the buffer,
+                    // which is right whenever the last thing there is something the turn said.
+                    // When it is a question steered in after that — taken in at the final gap, and
+                    // answered by nothing — the end of the buffer is *below* it, and a plan and a
+                    // diff summary appended there put two blocks of the previous exchange under a
+                    // message you had just typed. Taken rather than read, because these rows are
+                    // what stops it being the last thing in the transcript.
+                    let mut at = self.unanswered.take();
+                    // The working block sits below all of this, so taking it away first moves
+                    // none of the rows named here.
+                    self.end_working();
+                    self.streaming = None;
+                    // One after another, each below the last: every block that lands pushes the
+                    // question — and so the row the next one goes above — further down.
+                    let n = self.draw_plan(&plan, at);
+                    at = at.map(|row| row + n);
+                    let n = self.place_block(at, &left);
+                    at = at.map(|row| row + n);
+                    let n = self.draw_summary(&changes, at);
+                    at = at.map(|row| row + n);
+                    self.close_unanswered(at, &stop_reason);
                 }
                 // Queued after the last gap this turn had. It is a question that was asked and not
                 // yet answered, so it becomes the next turn rather than being quietly dropped.
@@ -6020,6 +6337,9 @@ impl Host {
                     self.chat_question(&prompt);
                     self.draw_working();
                     self.refresh_composer();
+                    // Where it landed is where you should be. It was drawn above the working
+                    // line, which is off the bottom of a transcript you had scrolled back in.
+                    self.scroll_chat(0);
                 }
             }
             AgentEvent::Activity { session, turn, activity } => {
@@ -7204,9 +7524,11 @@ impl Host {
             self.quit_armed = None;
             return;
         }
-        if self.cancel_turn_here() {
+        if let Some(stopped) = self.cancel_turn_here() {
             self.quit_armed = None;
-            self.editor_message(MessageLevel::Info, "interrupted");
+            if stopped {
+                self.editor_message(MessageLevel::Info, "interrupted");
+            }
             return;
         }
         if !self.composer_text().is_empty() {
