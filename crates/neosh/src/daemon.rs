@@ -265,7 +265,6 @@ impl Handle {
             }
         });
 
-        let mut attached = false;
         let mut view: Option<ViewId> = None;
         while let Ok(Some(line)) = lines.next_line().await {
             if line.trim().is_empty() {
@@ -319,7 +318,6 @@ impl Handle {
                         (id, views.size().unwrap_or((width, height)))
                     };
                     view = Some(id);
-                    attached = true;
                     let _ = out.send(ServerMessage::Attached {
                         protocol_version: neosh_proto::PROTOCOL_VERSION,
                     });
