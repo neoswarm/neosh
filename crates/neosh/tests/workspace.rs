@@ -772,3 +772,226 @@ fn asking_again_clears_the_mark_a_killed_turn_left() {
         "a finished turn left the previous turn's mark behind:\n{after}"
     );
 }
+
+/// The whole sequence from the report: interrupt mid-answer, close the terminal, open it again,
+/// ask something else. What comes back must answer the new question and not finish the old one.
+#[test]
+fn what_an_interrupted_turn_was_saying_does_not_arrive_under_the_next_question() {
+    let sb = Sandbox::new("crossed");
+    let ws = sb.serve_paced("two_answers.jsonl", 900);
+
+    let mut first = Client::attach(&ws.socket, neosh_proto::PROTOCOL_VERSION);
+    first.ready();
+    first.ask("question one");
+    first.until("the first answer to start arriving", |c| c.shows("ANSWER"));
+    // `^C` on a running turn interrupts it, which is the first rung of that key and not the last.
+    first.ctrl('c');
+    first.until("the turn to stop", |c| !c.shows("esc to interrupt"));
+    first.leave();
+    first.until("the first terminal to go", |c| c.ended.is_some());
+
+    let mut second = Client::attach(&ws.socket, neosh_proto::PROTOCOL_VERSION);
+    second.ready();
+    second.until("the conversation to come back", |c| c.shows("question one"));
+    second.ask("question two");
+    second.until("an answer to it", |c| c.shows("ANSWER-LATER"));
+    second.until("the turn to be over", |c| !c.shows("esc to interrupt"));
+
+    // Long enough for anything the interrupted turn was still writing to have been written.
+    std::thread::sleep(Duration::from_millis(2000));
+    second.pump_once();
+    let t = second.transcript();
+    let at = t.iter().position(|l| l.contains("question two")).expect("the second question");
+    assert!(
+        !t.iter().skip(at).any(|l| l.contains("ANSWER-ONE")),
+        "the interrupted turn finished itself under the new question: {t:#?}"
+    );
+}
+
+#[test]
+fn reattaching_while_a_turn_runs_shows_it_still_running() {
+    // "I want to see the running ones when I open it again." A terminal that goes away mid-answer
+    // and comes back has to find the turn where it left it — the question, what has been said so
+    // far, and a working line that is still working — rather than a transcript that ends on a
+    // question nothing appears to be answering.
+    let sb = Sandbox::new("stillrunning");
+    let ws = sb.serve_paced("two_answers.jsonl", 900);
+
+    let mut first = Client::attach(&ws.socket, neosh_proto::PROTOCOL_VERSION);
+    first.ready();
+    first.ask("keep at it");
+    first.until("the first answer to start arriving", |c| c.shows("ANSWER"));
+    first.leave();
+    first.until("the first terminal to go", |c| c.ended.is_some());
+
+    let mut second = Client::attach(&ws.socket, neosh_proto::PROTOCOL_VERSION);
+    second.ready();
+    second.until("the question to be back", |c| c.shows("keep at it"));
+    second.until("what it had already said", |c| c.shows("ANSWER-"));
+    second.until("and a turn that still looks like one", |c| c.shows("esc to interrupt"));
+    second.until("which then finishes here", |c| !c.shows("esc to interrupt"));
+}
+
+/// A sandbox whose `claude` is a stand-in that logs every time it is started.
+///
+/// The real failure is a *process* count, so nothing short of a real program on `PATH` can see it:
+/// a mock provider is one object and cannot be spawned twice. Every line it says names the process
+/// that said it, which is what tells one CLI answering twice from two CLIs answering once each.
+const FAKE_CLAUDE: &str = r#"#!/bin/sh
+L="$NEOSH_FAKE_LOG"
+case "$1" in
+  --version) echo "2.2.0 (Claude Code)"; exit 0 ;;
+esac
+echo "`date +%s.%N` $$ $*" >> "$L/spawns"
+n=0
+while IFS= read -r line; do
+  case "$line" in
+    *interrupt*)
+      : > "$L/stop.$$"
+      id=`printf '%s' "$line" | sed 's/.*"request_id":"\([^"]*\)".*/\1/'`
+      printf '{"type":"control_response","response":{"subtype":"success","request_id":"%s","response":{}}}\n' "$id"
+      continue ;;
+    *control_request*)
+      id=`printf '%s' "$line" | sed 's/.*"request_id":"\([^"]*\)".*/\1/'`
+      printf '{"type":"control_response","response":{"subtype":"success","request_id":"%s","response":{"totalTokens":10,"maxTokens":100}}}\n' "$id"
+      continue ;;
+  esac
+  n=`expr $n + 1`
+  rm -f "$L/stop.$$"
+  printf '{"type":"system","subtype":"init","session_id":"s%s","slash_commands":[]}\n' "$$"
+  m=$n
+  p=$$
+  (
+    i=1
+    while [ $i -le 8 ]; do
+      if [ -f "$L/stop.$p" ]; then break; fi
+      printf '{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"<p%s.q%s.%s>"}}}\n' "$p" "$m" "$i"
+      sleep 1
+      i=`expr $i + 1`
+    done
+    printf '{"type":"result","subtype":"success","is_error":false,"session_id":"s%s","result":""}\n' "$p"
+  ) &
+done
+"#;
+
+/// Install the stand-in and start a workspace pointed at it. Returns the workspace and its log.
+fn serve_with_fake_claude(sb: &Sandbox) -> (Workspace, PathBuf) {
+    let bin = sb.root.join("bin");
+    let log = sb.root.join("log");
+    std::fs::create_dir_all(&bin).expect("bin");
+    std::fs::create_dir_all(&log).expect("log");
+    let script = bin.join("claude");
+    // Written by a child, never through a descriptor this process holds open: a writable fd on a
+    // program a sibling test is about to `execve` is how `ETXTBSY` happens.
+    let wrote = Command::new("/bin/sh")
+        .args(["-c", r#"printf '%s' "$1" > "$2" && chmod 755 "$2""#, "neosh-test-write"])
+        .arg(FAKE_CLAUDE)
+        .arg(&script)
+        .status()
+        .expect("a shell to write the stand-in");
+    assert!(wrote.success(), "writing the stand-in failed");
+
+    let child = sb
+        .neosh(&["--serve", "--model", "claude-cli/claude-opus-5"])
+        .env("PATH", format!("{}:{}", bin.display(), std::env::var("PATH").unwrap_or_default()))
+        .env("NEOSH_FAKE_LOG", &log)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn workspace");
+    let socket = sb.socket();
+    let deadline = Instant::now() + PATIENCE;
+    while Instant::now() < deadline && UnixStream::connect(&socket).is_err() {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    (Workspace { child, socket }, log)
+}
+
+/// Every CLI the stand-in was asked to be, as (pid, argv).
+fn spawns(log: &Path) -> Vec<(String, String)> {
+    std::fs::read_to_string(log.join("spawns"))
+        .map(|s| {
+            s.lines()
+                .filter_map(|l| {
+                    let mut parts = l.splitn(3, ' ');
+                    let _when = parts.next()?;
+                    Some((parts.next()?.to_string(), parts.next().unwrap_or("").to_string()))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Which of them are still running. The whole symptom is a process count, so this is the assertion.
+fn still_alive(log: &Path) -> Vec<String> {
+    spawns(log)
+        .into_iter()
+        .map(|(pid, _)| pid)
+        .filter(|pid| {
+            Command::new("kill")
+                .args(["-0", pid])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false)
+        })
+        .collect()
+}
+
+/// Which process said the last thing in the transcript. Every line the stand-in emits names it.
+fn answering_pid(t: &[String], after: &str) -> Option<String> {
+    let at = t.iter().position(|l| l.contains(after))?;
+    let line = t.iter().skip(at + 1).find(|l| l.contains("<p"))?;
+    let start = line.find("<p")? + 2;
+    let end = line[start..].find('.')? + start;
+    Some(line[start..end].to_string())
+}
+
+/// One conversation is one agent, and interrupting it does not start another.
+///
+/// The report this comes from: `^C` mid-answer, quit, reopen, ask again — and two `claude`
+/// processes running under one workspace with one conversation in it. Both halves are here because
+/// they were two separate faults that looked like one: a one-shot generation (the thread's title)
+/// took a slot in the map keyed by conversation and held a whole agent session open forever, and
+/// an interrupt ended by killing the CLI it had already stopped politely.
+#[test]
+fn one_conversation_runs_one_agent_across_an_interrupt() {
+    let sb = Sandbox::new("oneagent");
+    let (ws, log) = serve_with_fake_claude(&sb);
+
+    let mut c = Client::attach(&ws.socket, neosh_proto::PROTOCOL_VERSION);
+    c.ready();
+    c.ask("question one");
+    c.until("the first answer to start arriving", |c| c.shows(".q1.1>"));
+    let first = answering_pid(&c.transcript(), "question one").expect("somebody answered");
+
+    c.ctrl('c');
+    std::thread::sleep(Duration::from_millis(2000));
+    c.leave();
+    c.until("the terminal to go", |c| c.ended.is_some());
+
+    let mut back = Client::attach(&ws.socket, neosh_proto::PROTOCOL_VERSION);
+    back.ready();
+    back.ask("question two");
+    back.until("an answer to the second question", |c| {
+        answering_pid(&c.transcript(), "question two").is_some()
+    });
+    let second = answering_pid(&back.transcript(), "question two").expect("somebody answered");
+    assert_eq!(second, first, "the interrupt threw the conversation's agent away and started another");
+
+    // Everything a one-shot borrowed is given back when it is finished with, so what is left is
+    // the conversation's own agent and nothing else. Waited for rather than sampled: a one-shot is
+    // a turn like any other and takes as long as the model does.
+    let deadline = Instant::now() + PATIENCE;
+    while Instant::now() < deadline && still_alive(&log).len() > 1 {
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert_eq!(
+        still_alive(&log),
+        vec![first],
+        "one conversation, one agent — spawned {:?}",
+        spawns(&log)
+    );
+}

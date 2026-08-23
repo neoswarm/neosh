@@ -628,6 +628,20 @@ pub struct TurnRequest {
     pub max_output_tokens: Option<u64>,
 }
 
+impl TurnRequest {
+    /// Whether this turn belongs to no conversation at all.
+    ///
+    /// A branch name, a commit message, a thread title: the caller borrows the model, takes one
+    /// answer and leaves nothing behind. [`Self::conversation`] says so by being empty, and a
+    /// driver that keeps a process per conversation has to *ask*, because an empty id is an
+    /// ordinary map key and keying by it is how one of these came to hold a whole agent session
+    /// open for the life of the workspace — a second `claude` beside the one you were talking to,
+    /// answering nobody, in a slot nothing ever emptied.
+    pub fn is_one_shot(&self) -> bool {
+        self.conversation.0.is_empty()
+    }
+}
+
 /// How a step of a plan is going.
 #[derive(TS, Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
 #[serde(rename_all = "snake_case")]

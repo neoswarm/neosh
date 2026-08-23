@@ -1,0 +1,36 @@
+{"type": "message_start", "model": "mock", "usage": {}}
+{"type": "block_start", "index": 0, "block": {"kind": "text"}}
+{"type": "text_delta", "index": 0, "text": "ANSWER"}
+{"type": "text_delta", "index": 0, "text": "-"}
+{"type": "text_delta", "index": 0, "text": "ONE"}
+{"type": "block_stop", "index": 0}
+{"type": "message_delta", "stop_reason": {"kind": "end_turn"}, "usage": {"output_tokens": 3}}
+{"type": "message_stop"}
+
+{"type": "message_start", "model": "mock", "usage": {}}
+{"type": "block_start", "index": 0, "block": {"kind": "text"}}
+{"type": "text_delta", "index": 0, "text": "ANSWER-LATER"}
+{"type": "block_stop", "index": 0}
+{"type": "message_delta", "stop_reason": {"kind": "end_turn"}, "usage": {"output_tokens": 3}}
+{"type": "message_stop"}
+
+{"type": "message_start", "model": "mock", "usage": {}}
+{"type": "block_start", "index": 0, "block": {"kind": "text"}}
+{"type": "text_delta", "index": 0, "text": "ANSWER-LATER"}
+{"type": "block_stop", "index": 0}
+{"type": "message_delta", "stop_reason": {"kind": "end_turn"}, "usage": {"output_tokens": 3}}
+{"type": "message_stop"}
+
+{"type": "message_start", "model": "mock", "usage": {}}
+{"type": "block_start", "index": 0, "block": {"kind": "text"}}
+{"type": "text_delta", "index": 0, "text": "ANSWER-LATER"}
+{"type": "block_stop", "index": 0}
+{"type": "message_delta", "stop_reason": {"kind": "end_turn"}, "usage": {"output_tokens": 3}}
+{"type": "message_stop"}
+
+{"type": "message_start", "model": "mock", "usage": {}}
+{"type": "block_start", "index": 0, "block": {"kind": "text"}}
+{"type": "text_delta", "index": 0, "text": "ANSWER-LATER"}
+{"type": "block_stop", "index": 0}
+{"type": "message_delta", "stop_reason": {"kind": "end_turn"}, "usage": {"output_tokens": 3}}
+{"type": "message_stop"}
