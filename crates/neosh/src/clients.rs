@@ -22,20 +22,22 @@
 //! open in two terminals is one transcript with two cursors on it — which is exactly what a window
 //! has always been (`neosh_core::window::Window` holds the cursor, the anchor and the scroll).
 //!
-//! # Size is the size of the smallest one
+//! # Every terminal is its own size again
 //!
 //! A client resolves its own layout (ADR 0006), so two terminals of different sizes each lay out
-//! the declarative geometry they are sent — that part was never the problem. What is shared is the
+//! the declarative geometry they are sent — that part was never the problem. What was, was the
 //! handful of places the *host* draws to a width because the thing being drawn is one row and must
-//! stay one row: a tool card, the welcome. Those are buffer contents, identical in every view.
+//! stay one row: a tool card, the welcome. Those were buffer contents, one copy shared by every
+//! view, so the workspace had to be told the smallest attached size and a wide terminal drew a
+//! narrow transcript.
 //!
-//! So the workspace is told the smallest attached size and every view gets content that fits it.
-//! The alternative is content measured for the widest terminal, which wraps in the narrow one — and
-//! a card that wraps is the exact failure `chat_width` exists to avoid. A large window showing a
-//! narrower transcript is a cost you can see and reason about; a corrupted one is not.
-//!
-//! Sizes are reconciled on every change *including a client leaving*, because a client that never
-//! reports again is one whose old size would otherwise pin the workspace narrow forever.
+//! A transcript is per view now, so there is nothing left to share and nothing to clamp: a card in
+//! the wide window is fitted to the wide window and the same card next door is elided to fit the
+//! narrow one. What is still merged is the geometry of one *window*, because two clients may be
+//! looking at the same view — and there the old reasoning holds exactly, since it is one window and
+//! it has to fit in both. That is reconciled on every change *including a client leaving*, because
+//! a client that never reports again is one whose old size would otherwise pin the window narrow
+//! for as long as the workspace runs.
 
 use std::collections::HashMap;
 
@@ -103,6 +105,10 @@ struct Client {
 #[derive(Default)]
 pub struct Clients {
     next: u32,
+    /// Ids handed to views. Separate from the client counter so that the two never look
+    /// interchangeable in a log, and so that a future "mirror that terminal" can hand out a view
+    /// somebody already has.
+    next_view: u32,
     clients: Vec<(ClientId, Client)>,
     /// The merged viewport last forwarded to the host, per window, so an unchanged merge is not
     /// re-sent. Re-sending is not merely wasteful: `ViewportChanged` arms a redraw, which resolves
@@ -112,10 +118,29 @@ pub struct Clients {
 }
 
 impl Clients {
-    /// Take on a terminal, looking at `view`. Its id is unique for the life of the workspace, so a
-    /// client that leaves and comes back is a different one and cannot be confused with a message
-    /// still in flight for the old one.
+    /// Take on a terminal, with a view of its own. Both ids are unique for the life of the
+    /// workspace, so a client that leaves and comes back is a different one and cannot be confused
+    /// with a message still in flight for the old one.
     pub fn attach(
+        &mut self,
+        out: mpsc::UnboundedSender<ServerMessage>,
+        size: (u16, u16),
+    ) -> Source {
+        self.next += 1;
+        self.next_view += 1;
+        let id = ClientId(self.next);
+        let view = ViewId(self.next_view);
+        self.clients.push((id, Client { out, view, size, viewports: HashMap::new() }));
+        Source { client: id, view }
+    }
+
+    /// Take on a terminal looking at a view that already exists — a mirror of another one.
+    ///
+    /// Nothing calls this yet. It is here because the whole reason a client and a view are two
+    /// ids is that the relationship is not forced to be one to one, and a test that shares one
+    /// proves the routing does not quietly assume otherwise.
+    #[cfg(test)]
+    pub fn attach_to(
         &mut self,
         out: mpsc::UnboundedSender<ServerMessage>,
         size: (u16, u16),
@@ -138,6 +163,12 @@ impl Clients {
     /// Which set of windows a terminal is looking at.
     pub fn view_of(&self, id: ClientId) -> Option<ViewId> {
         self.clients.iter().find(|(c, _)| *c == id).map(|(_, c)| c.view)
+    }
+
+    /// Whether anybody is still looking at a view. A view nothing is attached to is one the host
+    /// can take down.
+    pub fn watching(&self, view: ViewId) -> bool {
+        self.clients.iter().any(|(_, c)| c.view == view)
     }
 
     /// Tell one client something meant only for it — that it has attached, or that it is leaving.
@@ -180,31 +211,25 @@ impl Clients {
         self.clients.is_empty()
     }
 
-    /// The size the workspace should draw for: the smallest of every attached terminal, in each
-    /// dimension independently. A tall narrow window beside a short wide one leaves a workspace
-    /// that is narrow *and* short, which is the only size whose content fits in both.
-    pub fn size(&self) -> Option<(u16, u16)> {
-        self.clients
-            .iter()
-            .map(|(_, c)| c.size)
-            .reduce(|(aw, ah), (bw, bh)| (aw.min(bw), ah.min(bh)))
-    }
-
-    /// Record a client's new size. `Some` if the *workspace's* size changed as a result — a client
-    /// growing while a smaller one is still attached changes nothing anybody has to redraw.
+    /// Record a terminal's new size, and say what to tell the host.
+    ///
+    /// Its own, always. It used to be the smallest of every attached terminal, because a tool card
+    /// was one row of content shared by all of them; a transcript belongs to a view now, so a
+    /// terminal being resized is a fact about that terminal and nobody else's screen has to move.
     pub fn resized(&mut self, id: ClientId, size: (u16, u16)) -> Option<(u16, u16)> {
-        let before = self.size();
-        if let Some((_, c)) = self.clients.iter_mut().find(|(c, _)| *c == id) {
-            c.size = size;
-        }
-        let now = self.size();
-        (now != before).then_some(now).flatten()
+        let Some((_, c)) = self.clients.iter_mut().find(|(c, _)| *c == id) else { return None };
+        c.size = size;
+        Some(size)
     }
 
     /// Record what one client resolved for a window, and return the merged geometry if the merge
-    /// moved. Width and height are the smallest reported; `top_line` comes from the same client as
-    /// the smallest height, because a scroll position paired with somebody else's viewport is a
-    /// number about a screen that does not exist.
+    /// moved.
+    ///
+    /// A window belongs to one view, so nearly always there is one client reporting and the merge
+    /// is a copy. When two terminals are looking at the *same* view they both report it, and then
+    /// it is one window that has to fit in both: width and height are the smallest reported, and
+    /// `top_line` comes from the same client as the smallest height, because a scroll position
+    /// paired with somebody else's viewport is a number about a screen that does not exist.
     pub fn viewport(
         &mut self,
         id: ClientId,
@@ -245,6 +270,7 @@ impl Clients {
                 // The narrowest width, the shortest height, and the `top_line` and row count
                 // belonging to whichever client is shortest — that is the one a row has to be
                 // visible in, and the two of them describe one screen and have to come from it.
+                // Only ever reached by two terminals sharing a view.
                 Some((bw, bh, btop, brows)) => (
                     bw.min(w),
                     bh.min(h),
@@ -271,7 +297,7 @@ mod tests {
         size: (u16, u16),
     ) -> (ClientId, mpsc::UnboundedReceiver<ServerMessage>) {
         let (tx, rx) = mpsc::unbounded_channel();
-        (clients.attach(tx, size, ViewId::LOCAL), rx)
+        (clients.attach(tx, size).client, rx)
     }
 
     fn seeing(
@@ -280,7 +306,7 @@ mod tests {
         view: ViewId,
     ) -> (ClientId, mpsc::UnboundedReceiver<ServerMessage>) {
         let (tx, rx) = mpsc::unbounded_channel();
-        (clients.attach(tx, size, view), rx)
+        (clients.attach_to(tx, size, view), rx)
     }
 
     /// Every event of every batch this terminal was sent.
@@ -317,6 +343,7 @@ mod tests {
         let (_, mut a) = client(&mut clients, (100, 40));
         let (_, mut b) = client(&mut clients, (80, 24));
 
+        // Untagged: a buffer is the workspace's, so it reaches both however far apart they are.
         clients.send(&frame(vec![(None, opened(1))]));
 
         assert_eq!(drew(&mut a).len(), 2);
@@ -369,61 +396,62 @@ mod tests {
     }
 
     #[test]
-    fn a_terminal_knows_which_view_it_is_on_until_it_leaves() {
+    fn a_view_is_watched_until_the_last_terminal_on_it_goes() {
         let mut clients = Clients::default();
         let (a, _a) = seeing(&mut clients, (100, 40), ViewId(1));
-        let (b, _b) = seeing(&mut clients, (80, 24), ViewId(2));
-
-        assert_eq!(clients.view_of(a), Some(ViewId(1)));
-        assert_eq!(clients.view_of(b), Some(ViewId(2)));
+        let (b, _b) = seeing(&mut clients, (80, 24), ViewId(1));
+        let (_c, _crx) = seeing(&mut clients, (80, 24), ViewId(2));
 
         clients.detach(a);
-        assert_eq!(clients.view_of(a), None);
-        assert_eq!(clients.view_of(b), Some(ViewId(2)));
+        assert!(clients.watching(ViewId(1)), "the other terminal is still on it");
+        clients.detach(b);
+        assert!(!clients.watching(ViewId(1)), "and now nobody is");
+        assert!(clients.watching(ViewId(2)));
     }
 
     #[test]
-    fn the_workspace_is_the_size_of_the_smallest_terminal() {
+    fn every_terminal_gets_a_view_of_its_own() {
         let mut clients = Clients::default();
-        let (_, _a) = client(&mut clients, (100, 40));
-        assert_eq!(clients.size(), Some((100, 40)));
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let a = clients.attach(tx, (100, 40));
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let b = clients.attach(tx, (80, 24));
 
-        let (b, _b) = client(&mut clients, (80, 50));
-        assert_eq!(clients.size(), Some((80, 40)), "narrow from one, short from the other");
+        assert_ne!(a.view, b.view, "two terminals are two places");
+        assert_ne!(a.client, b.client);
+        assert_eq!(clients.view_of(a.client), Some(a.view));
 
-        // The one that was pinning the width goes away, and the workspace gets it back. Nobody
-        // reports a size when somebody *else* closes a window, so this has to be recomputed here
-        // or the workspace stays narrow for as long as it runs.
-        assert!(clients.detach(b));
-        assert_eq!(clients.size(), Some((100, 40)));
+        clients.detach(a.client);
+        assert_eq!(clients.view_of(a.client), None);
+        assert_eq!(clients.view_of(b.client), Some(b.view));
     }
 
     #[test]
-    fn a_terminal_growing_beside_a_smaller_one_changes_nothing() {
+    fn a_terminal_is_its_own_size_whoever_else_is_attached() {
+        // It used to be the smallest of all of them, because a card was one row of content every
+        // terminal shared. A transcript belongs to a view now, so a wide window is wide.
         let mut clients = Clients::default();
         let (a, _a) = client(&mut clients, (100, 40));
-        let (_, _b) = client(&mut clients, (80, 24));
+        let (_, _b) = client(&mut clients, (60, 20));
 
-        assert_eq!(clients.resized(a, (200, 90)), None, "still bounded by the small one");
-        assert_eq!(clients.resized(a, (60, 40)), Some((60, 24)), "now it is the small one");
+        assert_eq!(clients.resized(a, (200, 90)), Some((200, 90)), "not clamped to the small one");
+        assert_eq!(clients.resized(a, (60, 40)), Some((60, 40)));
     }
 
     #[test]
-    fn the_last_terminal_closing_leaves_a_workspace_with_no_size_and_no_opinion() {
+    fn a_terminal_that_has_gone_reports_nothing() {
         let mut clients = Clients::default();
         let (a, _a) = client(&mut clients, (100, 40));
         assert!(clients.detach(a));
         assert!(clients.is_empty());
-        // Not `Some((0, 0))`: nobody is looking, so there is no size, and the host keeps whatever
-        // it last drew for. A zero would be a width every card had to defend against.
-        assert_eq!(clients.size(), None);
+        assert_eq!(clients.resized(a, (80, 24)), None);
     }
 
     #[test]
-    fn a_window_is_as_big_as_the_smallest_view_of_it() {
+    fn a_window_two_terminals_share_is_as_big_as_the_smaller_of_them() {
         let mut clients = Clients::default();
-        let (a, _a) = client(&mut clients, (100, 40));
-        let (b, _b) = client(&mut clients, (80, 24));
+        let (a, _a) = seeing(&mut clients, (100, 40), ViewId(1));
+        let (b, _b) = seeing(&mut clients, (80, 24), ViewId(1));
         let win = WindowId(1);
 
         assert_eq!(
@@ -445,8 +473,8 @@ mod tests {
     #[test]
     fn a_terminal_leaving_gives_the_window_back_to_the_survivors() {
         let mut clients = Clients::default();
-        let (a, _a) = client(&mut clients, (100, 40));
-        let (b, _b) = client(&mut clients, (80, 24));
+        let (a, _a) = seeing(&mut clients, (100, 40), ViewId(1));
+        let (b, _b) = seeing(&mut clients, (80, 24), ViewId(1));
         let win = WindowId(1);
         clients.viewport(a, win, (100, 38, 12, 38));
         clients.viewport(b, win, (80, 22, 5, 22));

@@ -36,7 +36,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use neosh_proto::{
-    ClientMessage, DetachReason, InputEvent, RunningTurn, ServerMessage, ViewId, WorkspaceStatus,
+    ClientMessage, DetachReason, InputEvent, RunningTurn, ServerMessage, WorkspaceStatus,
 };
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
@@ -298,27 +298,17 @@ impl Handle {
                         });
                         break;
                     }
-                    // Alongside whoever is already here, rather than instead of them.
-                    //
-                    // Every terminal is put on the same view for now, which is a mirror and is
-                    // what ADR 0042 shipped. A view of its own is what the rest of this is for;
-                    // the id is separate from the client's already so that the change is one
-                    // line here rather than a shape nothing else in the workspace has.
-                    let (from, size) = {
-                        let mut clients = self.clients.lock().await;
-                        let id = clients.attach(out.clone(), (width, height), ViewId::LOCAL);
-                        let view = clients.view_of(id).unwrap_or(ViewId::LOCAL);
-                        (Source { client: id, view }, clients.size().unwrap_or((width, height)))
-                    };
+                    // Alongside whoever is already here, rather than instead of them — and in a
+                    // place of its own rather than as a copy of theirs. The host hears about the
+                    // view on the `Attached` below and builds it a screen.
+                    let from = self.clients.lock().await.attach(out.clone(), (width, height));
                     source = Some(from);
                     let _ = out.send(ServerMessage::Attached {
                         protocol_version: neosh_proto::PROTOCOL_VERSION,
                     });
-                    // The *workspace's* size, which is the smallest attached terminal's and may
-                    // not be this one's. The host says its whole state in reply, and that goes to
-                    // every view — which is what makes a terminal joining a workspace also the
-                    // moment every other terminal is brought back into step with it.
-                    let (width, height) = size;
+                    // Its own size. It used to be the smallest attached terminal's, because every
+                    // view shared one transcript; a view has its own now, so a wide window is
+                    // furnished wide and nobody else's screen is involved.
                     let _ = self.to_host.send((from, InputEvent::Attached { width, height }));
                 }
                 ClientMessage::Input { event } => {
@@ -362,18 +352,22 @@ impl Handle {
         // was closed — the workspace keeps going, and so does every other terminal looking at it.
         // That is the entire point of it being here.
         if let Some(from) = source {
-            let (size, remerged, empty) = {
+            let (remerged, empty, orphaned) = {
                 let mut clients = self.clients.lock().await;
                 // `detach` may already have happened: `^Q` is answered by the host, which lets go
                 // of the view before this connection has finished winding down.
                 clients.detach(from.client);
-                // Nobody reports a size when somebody *else* closes a window, so a workspace that
-                // was pinned narrow by this terminal has to be given its width back from here or
-                // it stays narrow for as long as it runs.
-                (clients.size(), clients.remerge(), clients.is_empty())
+                let orphaned = !clients.watching(from.view);
+                // Nobody reports a size when somebody *else* closes a window, so a view two
+                // terminals were sharing — pinned narrow by the one that has just gone — has to be
+                // given its width back from here or it stays narrow for as long as it runs.
+                (clients.remerge(), clients.is_empty(), orphaned)
             };
-            if let Some((width, height)) = size {
-                let _ = self.to_host.send((from, InputEvent::Resize { width, height }));
+            // Nobody is looking at that screen any more, so the host can take it down. Said from
+            // here because a client cannot know whether it was the last one on its view, and a
+            // client whose socket died says nothing at all.
+            if orphaned {
+                let _ = self.to_host.send((from, InputEvent::Detached));
             }
             for ev in remerged {
                 let _ = self.to_host.send((from, ev));

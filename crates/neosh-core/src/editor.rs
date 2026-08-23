@@ -177,6 +177,24 @@ impl Editor {
         self.views.get(&view)
     }
 
+    /// Hand one view's windows to another id.
+    ///
+    /// For a terminal reattaching to a workspace nobody was watching: the screen it left is still
+    /// there, mid-answer, and giving it to the connection that has just arrived is how it comes
+    /// back to exactly what it was rather than to a transcript rebuilt from messages, which is
+    /// missing everything the running turn has said and not yet committed.
+    pub fn rehome(&mut self, from: ViewId, to: ViewId) {
+        if from == to {
+            return;
+        }
+        for w in self.windows.values_mut().filter(|w| w.view == from) {
+            w.view = to;
+        }
+        if let Some(state) = self.views.remove(&from) {
+            self.views.insert(to, state);
+        }
+    }
+
     /// Forget a view and everything it had open.
     ///
     /// Its windows close — a window belongs to exactly one view, so nothing else is looking at
@@ -383,12 +401,31 @@ impl Editor {
         self.push_ui_in(view, UiEvent::Init { protocol_version: neosh_proto::PROTOCOL_VERSION });
         self.republish_highlights();
 
-        let mut buffers: Vec<BufferId> = self.buffers.keys().copied().collect();
+        // What this terminal can see, and nothing else. Every buffer used to be said to everyone,
+        // which was right when a buffer was the workspace's — and is a transcript, a composer and
+        // a status line per terminal now, so it put the conversation you are reading and the
+        // sentence you are half-way through typing into the mirror of the window next door.
+        //
+        // A buffer with no window anywhere is included: its edits went to every terminal attached
+        // at the time, which this one was not, and a plugin filling a buffer before opening a
+        // window on it is ordinary.
+        let mut buffers: Vec<BufferId> = self
+            .buffers
+            .keys()
+            .copied()
+            .filter(|buf| {
+                let mut windows = self.windows.values().filter(|w| w.buf == *buf);
+                match windows.next() {
+                    None => true,
+                    Some(first) => first.view == view || windows.any(|w| w.view == view),
+                }
+            })
+            .collect();
         buffers.sort_by_key(|b| b.0);
         for buf in buffers {
             let Some(b) = self.buffers.get(&buf) else { continue };
             let (name, count) = (b.name.clone(), b.line_count());
-            self.push_ui(UiEvent::BufferOpened { buf, name });
+            self.push_ui_in(view, UiEvent::BufferOpened { buf, name });
             // `old_end: u32::MAX` — "however many rows you have, they are these now". Not `0`,
             // which would be an insertion at the top: correct for a mirror that has nothing and
             // silently doubling for one that already has the state. A mirror that already has it
@@ -486,6 +523,24 @@ impl Editor {
                     Some((win, _)) => *win,
                     None => return None,
                 }
+            }
+            // A buffer is the workspace's, but with one window on it there is exactly one terminal
+            // that can see it — and a transcript is per view, so that is nearly all of them. Sent
+            // to everybody, every terminal would hold a copy of every other terminal's
+            // conversation, and a frontend looking a buffer up by name would find three called
+            // `[chat]`.
+            //
+            // Zero windows or several, and it goes to everybody: a plugin that fills a buffer
+            // before opening a window on it is ordinary, and a mirror missing the rows it was
+            // filled with would draw an empty panel.
+            UiEvent::BufferOpened { buf, .. }
+            | UiEvent::BufferLines { buf, .. }
+            | UiEvent::BufferClosed { buf } => {
+                let mut showing = self.windows.values().filter(|w| w.buf == *buf);
+                return match (showing.next(), showing.next()) {
+                    (Some(w), None) => Some(w.view),
+                    _ => None,
+                };
             }
             _ => return None,
         };
@@ -612,12 +667,34 @@ impl Editor {
     ) -> WindowId {
         let id = WindowId(self.next_win);
         self.next_win += 1;
+        // Before the window, and to this view alone: a buffer's rows are routed to whoever has a
+        // window on it, so everything written into this one while another terminal was the only
+        // one showing it never came here. Costs one event on a rare path and removes the whole
+        // class of "the panel opened empty in the second window".
+        self.show_buffer_in(view, buf);
         self.windows.insert(id, Window::new(id, view, buf, layout.clone()));
         // Made even if nothing focuses it, so that "which views are there" is answered by the
         // same map whether a terminal has taken a key yet or only been drawn into.
         self.views.entry(view).or_default();
         self.push_ui_in(view, UiEvent::WindowOpened { win: id, buf, layout });
         id
+    }
+
+    /// Say a buffer's whole contents to one terminal, for one that is about to start showing it.
+    ///
+    /// Only when somebody else is already showing it. A buffer with no window has had every one of
+    /// its edits broadcast — that is what [`Editor::about`] does with one nobody can see — so the
+    /// arriving terminal already has them, and saying them again would be a "replace everything"
+    /// for content the mirror is holding correctly.
+    fn show_buffer_in(&mut self, view: ViewId, buf: BufferId) {
+        if !self.windows.values().any(|w| w.buf == buf) {
+            return;
+        }
+        let Some(b) = self.buffers.get(&buf) else { return };
+        let (name, count) = (b.name.clone(), b.line_count());
+        let lines = b.render_range(0, count);
+        self.push_ui_in(view, UiEvent::BufferOpened { buf, name });
+        self.push_ui_in(view, UiEvent::BufferLines { buf, start: 0, old_end: u32::MAX, lines });
     }
 
     /// Record realized geometry reported by the frontend.
@@ -1013,8 +1090,11 @@ impl Editor {
             }
             ApiCall::WinSetBuf { win, buf } => {
                 self.buf(buf)?;
+                let home = self.win(win)?.view;
                 self.win_mut(win)?.buf = buf;
-                self.push_ui(UiEvent::WindowBuffer { win, buf });
+                // Same reason as opening one: this terminal may never have been sent the rows.
+                self.show_buffer_in(home, buf);
+                self.push_ui_in(home, UiEvent::WindowBuffer { win, buf });
                 Ok(ApiOk::Unit)
             }
             ApiCall::WinGetCursor { win } => {

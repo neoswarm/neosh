@@ -333,9 +333,95 @@ struct ViewState {
     quit_armed: Option<std::time::Instant>,
 }
 
+impl ViewState {
+    /// Give a terminal a screen: a transcript, a status line and a field to type in.
+    ///
+    /// One set per view, which is what makes two terminals two places. The buffers are per view
+    /// rather than shared for the reason on [`ViewState`] itself — folding a card open is
+    /// navigation — and the windows have to be, because a window belongs to exactly one view.
+    fn furnish(
+        editor: &mut Editor,
+        view: neosh_proto::ViewId,
+        session: neosh_proto::SessionId,
+    ) -> Self {
+        let chat = editor.create_buffer("[chat]");
+        let chat_win = editor.open_window_in(view, chat, WindowLayout::Docked {
+            dock: Dock::Main,
+            size: None,
+            // A conversation settles against the field you answer it in. Anchored to the top, a
+            // two-line exchange floats at the ceiling with a screen of nothing under it, and the
+            // eye has to travel the whole window between what was said and where you say the next
+            // thing.
+            gravity: Gravity::End,
+            wrap: None,
+        });
+
+        // Docked before the composer, so it takes the bottom-most row and the composer sits above
+        // it. Without a status line the startup screen renders literally nothing — two empty
+        // buffers — and "it opened an empty terminal" is indistinguishable from "it crashed".
+        let status = editor.create_buffer("[status]");
+        editor.open_window_in(view, status, WindowLayout::Docked {
+            dock: Dock::Bottom,
+            size: Some(1),
+            gravity: Gravity::Start,
+            wrap: None,
+        });
+
+        let composer = editor.create_buffer("[composer]");
+        // Four rows at rest: a rule, up to three lines of what you are writing, and the shortcut
+        // row that lives on the last of them as a virtual line. The rule is what makes the
+        // composer read as a field rather than as the last paragraph of the transcript. `wrap` is
+        // what makes a long prompt fold and the window grow to show it, instead of running off the
+        // right edge.
+        let composer_win = editor.open_window_in(view, composer, WindowLayout::Docked {
+            dock: Dock::Bottom,
+            size: Some(4),
+            gravity: Gravity::Start,
+            wrap: Some(true),
+        });
+        editor.set_mode(view, Mode::Chat);
+
+        Self {
+            session,
+            chat,
+            chat_win,
+            chat_top: None,
+            composer,
+            composer_win,
+            status,
+            cards: Vec::new(),
+            welcome_rows: 0,
+            working: false,
+            plan_rows: 0,
+            unanswered: None,
+            streaming: None,
+            answer: None,
+            draft: String::new(),
+            secret: None,
+            mode_before_reading: Mode::Chat,
+            reading: false,
+            reading_pending: None,
+            reading_count: String::new(),
+            reading_shape: SelectShape::Exclusive,
+            reading_goal: None,
+            reading_find: None,
+            reading_last_select: None,
+            search: None,
+            searched: String::new(),
+            searched_back: false,
+            quit_armed: None,
+        }
+    }
+}
+
 pub struct Host {
-    /// This terminal's place. See [`ViewState`].
-    view: ViewState,
+    /// Where each terminal is. See [`ViewState`].
+    ///
+    /// One entry per view somebody is attached to, made when a terminal arrives and taken down
+    /// with its last terminal. Never empty: a workspace nobody is looking at keeps the view of
+    /// whoever left last, because turns keep running and their output has to have somewhere to go
+    /// for the terminal that comes back.
+    views: std::collections::BTreeMap<neosh_proto::ViewId, ViewState>,
     editor: Editor,
     agent: Arc<Agent>,
     bridge: Arc<ScriptBridge>,
@@ -395,6 +481,22 @@ pub struct Host {
     /// Set while a multi-key sequence is half typed, so the loop knows to arm the timeout that
     /// eventually gives up on it.
     keys_pending: bool,
+    /// The one screen a workspace nobody is watching keeps.
+    ///
+    /// Zero views is an ordinary state — closing the last terminal leaves the turns running — but
+    /// it must not mean losing where you were, so the last one is kept rather than taken down and
+    /// handed to the next terminal that attaches. What that buys is the case ADR 0036 was written
+    /// for: leave mid-answer, come back, and the answer is still arriving into the same transcript
+    /// with the same scroll position, instead of a rebuild that is missing everything the turn has
+    /// said and not yet committed.
+    orphan: Option<neosh_proto::ViewId>,
+    /// The last terminal to send anything.
+    ///
+    /// The fallback for work that is nobody's key press and names no window — a plugin drawing on
+    /// a timer, most of all. A guess, and said to be one: what makes it rarely wrong is that a
+    /// plugin acting on its own almost always names a window, and what makes it never the only
+    /// answer is that a plugin can say which view outright.
+    last_input: neosh_proto::ViewId,
     /// Whose half-typed sequence it is.
     ///
     /// The timeout fires from a timer, and a timer is nobody's key press — so by the time it
@@ -825,33 +927,7 @@ impl Host {
         let (unasked_tx, unasked_rx) = tokio::sync::mpsc::unbounded_channel();
         let (image_tx, image_rx) = tokio::sync::mpsc::unbounded_channel();
 
-        let chat = editor.create_buffer("[chat]");
-        let chat_win =
-            editor.open_window(chat, WindowLayout::Docked {
-                dock: Dock::Main,
-                size: None,
-                // A conversation settles against the field you answer it in. Anchored to the top,
-                // a two-line exchange floats at the ceiling with a screen of nothing under it, and
-                // the eye has to travel the whole window between what was said and where you say
-                // the next thing.
-                gravity: Gravity::End,
-                wrap: None,
-            });
-
-        // Docked before the composer, so it takes the bottom-most row and the composer sits above
-        // it. Without a status line the startup screen renders literally nothing — two empty
-        // buffers — and "it opened an empty terminal" is indistinguishable from "it crashed".
-        let status = editor.create_buffer("[status]");
-        editor.open_window(status, WindowLayout::Docked { dock: Dock::Bottom, size: Some(1), gravity: Gravity::Start, wrap: None });
-
-        let composer = editor.create_buffer("[composer]");
-        // Four rows at rest: a rule, up to three lines of what you are writing, and the shortcut
-        // row that lives on the last of them as a virtual line. The rule is what makes the composer
-        // read as a field rather than as the last paragraph of the transcript. `wrap` is what makes
-        // a long prompt fold and the window grow to show it, instead of running off the right edge.
-        let composer_win =
-            editor.open_window(composer, WindowLayout::Docked { dock: Dock::Bottom, size: Some(4), gravity: Gravity::Start, wrap: Some(true) });
-        editor.set_mode(neosh_proto::ViewId::LOCAL, Mode::Chat);
+        let screen = ViewState::furnish(&mut editor, neosh_proto::ViewId::LOCAL, here);
 
         let mut namespace = |name: &str| {
             match editor.apply(&PluginId::from(BUILTIN), ApiCall::NsCreate { name: name.into() }) {
@@ -869,36 +945,7 @@ impl Host {
             agent,
             bridge,
             frontend,
-            view: ViewState {
-                session: here,
-                chat,
-                chat_win,
-                chat_top: None,
-                composer,
-                composer_win,
-                status,
-                cards: Vec::new(),
-                welcome_rows: 0,
-                working: false,
-                plan_rows: 0,
-                unanswered: None,
-                streaming: None,
-                answer: None,
-                draft: String::new(),
-                secret: None,
-                mode_before_reading: Mode::Chat,
-                reading: false,
-                reading_pending: None,
-                reading_count: String::new(),
-                reading_shape: SelectShape::Exclusive,
-                reading_goal: None,
-                reading_find: None,
-                reading_last_select: None,
-                search: None,
-                searched: String::new(),
-                searched_back: false,
-                quit_armed: None,
-            },
+            views: [(neosh_proto::ViewId::LOCAL, screen)].into_iter().collect(),
             status_ns,
             chat_ns,
             composer_ns,
@@ -918,6 +965,12 @@ impl Host {
             detaching: None,
             from: crate::clients::Source::LOCAL,
             keys_view: neosh_proto::ViewId::LOCAL,
+            last_input: neosh_proto::ViewId::LOCAL,
+            // Nothing is attached yet, so the screen just furnished is one nobody is
+            // watching — and the first terminal to arrive should be given it rather than a second
+            // one beside it. In a process that is its own terminal nothing ever adopts it, which
+            // is correct: there is one view and it is this.
+            orphan: Some(neosh_proto::ViewId::LOCAL),
             live: None,
             live_at: None,
             live_turns: 0,
@@ -1048,7 +1101,7 @@ impl Host {
 
     fn composer_text(&self) -> String {
         self.editor
-            .buffer(self.view.composer)
+            .buffer(self.v().composer)
             .map(|b| b.get_lines(0, b.line_count()).join("\n"))
             .unwrap_or_default()
     }
@@ -1056,7 +1109,7 @@ impl Host {
     fn set_composer(&mut self, text: &str) {
         let plugin = PluginId::from(BUILTIN);
         let _ = self.editor.apply(&plugin, ApiCall::BufSetLines {
-            buf: self.view.composer,
+            buf: self.v().composer,
             start: 0,
             end: -1,
             lines: vec![text.to_string()],
@@ -1067,14 +1120,14 @@ impl Host {
         let last = text.lines().count().saturating_sub(1) as u32;
         let col = text.rsplit('\n').next().unwrap_or("").len() as u32;
         let _ = self.editor.apply(&plugin, ApiCall::WinSetCursor {
-            win: self.view.composer_win,
+            win: self.v().composer_win,
             row: last,
             col,
         });
         // A selection over text that no longer exists is a highlight in mid-air.
         let _ = self
             .editor
-            .apply(&plugin, ApiCall::WinSelect { win: self.view.composer_win, on: false });
+            .apply(&plugin, ApiCall::WinSelect { win: self.v().composer_win, on: false });
         // The placeholder appears and disappears with the text, so the chrome has to follow every
         // write and not just every keystroke.
         self.refresh_composer();
@@ -1135,7 +1188,8 @@ impl Host {
             });
         }
         if Editor::handles(&call) {
-            let r = self.editor.apply(plugin, call);
+            let view = self.view_for(&call);
+            let r = self.editor.apply_in(view, plugin, call);
             self.drain_effects();
             return r;
         }
@@ -1490,7 +1544,7 @@ impl Host {
                         .get(&id)
                         .map(|s| s.info())
                         .ok_or_else(|| ApiError::Internal { message: "session vanished".into() })?;
-                    i.is_active = self.view.session == id;
+                    i.is_active = self.v().session == id;
                     i
                 };
                 let info = self.named(info);
@@ -1756,7 +1810,169 @@ impl Host {
     /// and holding the lock across that is how a deadlock is written — which is also why this no
     /// longer reads the store at all. It is a fact about a view.
     fn active_session(&self) -> neosh_proto::SessionId {
-        self.view.session.clone()
+        self.v().session.clone()
+    }
+
+    // ---- which terminal ---------------------------------------------------
+
+    /// The terminal being served right now.
+    ///
+    /// `self.from` is set for the whole of handling one input event, and cleared to
+    /// [`crate::clients::Source::LOCAL`] between them — so anything the host does on nobody's
+    /// behalf (a timer, a signal, an agent event) has to say which terminal it means, which is
+    /// what [`Self::in_view`] is for. The fallback exists because a view can go away between an
+    /// event being queued and being handled, and a panic in the run loop takes the workspace with
+    /// it.
+    fn v(&self) -> &ViewState {
+        self.views
+            .get(&self.from.view)
+            .or_else(|| self.views.values().next())
+            .expect("a workspace always keeps at least one view")
+    }
+
+    fn vm(&mut self) -> &mut ViewState {
+        let id = match self.views.contains_key(&self.from.view) {
+            true => self.from.view,
+            false => *self.views.keys().next().expect("a workspace always keeps at least one view"),
+        };
+        self.views.get_mut(&id).expect("just looked it up")
+    }
+
+    /// Which terminal a plugin's call is about.
+    ///
+    /// A plugin is not a keyboard, so nothing about the call itself says where it should land, and
+    /// with several terminals "the screen" is not an answer. Three rules, in order, and the first
+    /// two are exact:
+    ///
+    /// 1. **A window names its own view.** Anything anchored to one — a float over a panel — goes
+    ///    where that panel is, and a plugin tidying up after a terminal that has gone is the
+    ///    ordinary case rather than a mistake.
+    /// 2. **A buffer shown in exactly one terminal names it.** A picker put over the sidebar's
+    ///    buffer belongs to the sidebar somebody opened.
+    /// 3. **Otherwise, the terminal whose input is being served.** For a command run from a key
+    ///    that is exact; for a plugin acting on its own — a timer, an agent event it subscribed to
+    ///    — it is the last terminal to have pressed anything, which is a guess, and the reason
+    ///    [`neosh_proto::KeyContext::view`] exists is so a plugin never has to rely on it.
+    fn view_for(&self, call: &ApiCall) -> neosh_proto::ViewId {
+        let anchored = match call {
+            ApiCall::FloatOpen { config: neosh_proto::FloatConfig { anchor, .. }, .. } => {
+                match anchor {
+                    neosh_proto::Anchor::Window { win } => self.editor.view_of(*win),
+                    _ => None,
+                }
+            }
+            _ => None,
+        };
+        let by_buffer = || {
+            let buf = match call {
+                ApiCall::WinOpen { buf, .. } | ApiCall::FloatOpen { buf, .. } => *buf,
+                _ => return None,
+            };
+            let mut showing = self.editor.windows().filter(|w| w.buf == buf);
+            match (showing.next(), showing.next()) {
+                (Some(w), None) => Some(w.view),
+                _ => None,
+            }
+        };
+        anchored.or_else(by_buffer).unwrap_or_else(|| self.serving())
+    }
+
+    /// The terminal being served, or the one that spoke most recently when nobody is.
+    ///
+    /// Never a view that has gone. A window opened into one is a window nothing can draw and
+    /// nothing can close — the panel is simply missing, and the buffer behind it looks perfectly
+    /// healthy to anything that inspects buffers rather than screens.
+    fn serving(&self) -> neosh_proto::ViewId {
+        for id in [self.from.view, self.last_input] {
+            if self.views.contains_key(&id) {
+                return id;
+            }
+        }
+        self.views.keys().next_back().copied().unwrap_or(neosh_proto::ViewId::LOCAL)
+    }
+
+    /// Every terminal, in a stable order.
+    fn view_ids(&self) -> Vec<neosh_proto::ViewId> {
+        self.views.keys().copied().collect()
+    }
+
+    /// Give a terminal that has just arrived somewhere to be.
+    ///
+    /// **The most recent conversation nobody else is looking at.** A second terminal is opened
+    /// because the first one is busy, so putting it in the same conversation would make it a copy
+    /// of the thing you were trying to get away from. When every conversation is already on
+    /// somebody's screen — or there is only one — it lands in the most recent, and two views of
+    /// one conversation is a perfectly good thing to be: same transcript, own scroll, own draft.
+    fn open_view(&mut self, view: neosh_proto::ViewId) {
+        // A workspace nobody was watching kept the screen of whoever left last, mid-answer and
+        // all. This is the terminal coming back to it: it gets that screen rather than a
+        // rebuilt-from-messages copy, which would be missing everything the running turn has said
+        // and not yet committed.
+        if let Some(old) = self.orphan.take() {
+            self.editor.rehome(old, view);
+            if let Some(state) = self.views.remove(&old) {
+                self.views.insert(view, state);
+            }
+            return;
+        }
+        let taken: Vec<_> = self.views.values().map(|v| v.session.clone()).collect();
+        let session = {
+            let store = self.agent.sessions();
+            store
+                .list()
+                .into_iter()
+                .map(|s| s.id)
+                .find(|id| !taken.contains(id))
+                .or_else(|| taken.first().cloned())
+                .unwrap_or_else(|| store.current_id().clone())
+        };
+        let screen = ViewState::furnish(&mut self.editor, view, session.clone());
+        self.views.insert(view, screen);
+        // Drawn as an arrival rather than left empty: the transcript is rebuilt from the
+        // conversation's messages, the mark is cleared, and the composer says what `\u{23ce}` does.
+        self.in_view(view, |me| {
+            me.enter_session();
+            me.refresh_status();
+            me.refresh_composer();
+        });
+    }
+
+    /// Take down a terminal's screen when its last client goes.
+    ///
+    /// Its windows close with it — a window belongs to exactly one view, so nothing else is
+    /// looking at them — and its buffers go too, because a transcript is per view. The
+    /// conversation is untouched: what the agent produced is the workspace's, and the turn in it
+    /// keeps running whether or not anybody is watching.
+    ///
+    /// Never the last one. A workspace with no views is a workspace where a turn ending has
+    /// nowhere to draw and nothing to remember about where you were, so the view of whoever left
+    /// last is kept and the next terminal to attach is given it.
+    fn close_view(&mut self, view: neosh_proto::ViewId) {
+        if !self.views.contains_key(&view) {
+            return;
+        }
+        if self.views.len() <= 1 {
+            self.orphan = Some(view);
+            return;
+        }
+        self.editor.close_view(view);
+        self.views.remove(&view);
+        self.orphan = self.orphan.filter(|o| *o != view);
+    }
+
+    /// Do something as though the key had been pressed in `view`.
+    ///
+    /// The mechanism for everything the host does that is not a key press: a turn producing
+    /// output, a clock ticking, a plugin's call. Each of those is about some set of terminals and
+    /// has to say which, and swapping `from` for the duration means the several dozen places that
+    /// already ask "where am I" keep working unchanged and are correct for whichever one is being
+    /// drawn.
+    fn in_view<R>(&mut self, view: neosh_proto::ViewId, f: impl FnOnce(&mut Self) -> R) -> R {
+        let was = self.from;
+        self.from.view = view;
+        let out = f(self);
+        self.from = was;
+        out
     }
 
     /// Put this terminal in a conversation. What *moves*; [`Self::enter_session`] is what draws.
@@ -1770,7 +1986,7 @@ impl Host {
     ) -> Result<(), neosh_agent::StoreError> {
         let leaving = self.abandoning(session);
         self.agent.sessions().enter(session, leaving.as_ref())?;
-        self.view.session = session.clone();
+        self.vm().session = session.clone();
         Ok(())
     }
 
@@ -1779,7 +1995,7 @@ impl Host {
         &self,
         going_to: &neosh_proto::SessionId,
     ) -> Option<neosh_proto::SessionId> {
-        let leaving = self.view.session.clone();
+        let leaving = self.v().session.clone();
         if leaving == *going_to {
             return None;
         }
@@ -1801,7 +2017,22 @@ impl Host {
     /// The question that replaced "is this the one on screen". A turn's output goes to whoever is
     /// looking at it, which may be nobody and may be two people.
     fn views_showing(&self, session: &neosh_proto::SessionId) -> Vec<neosh_proto::ViewId> {
-        (self.view.session == *session).then_some(neosh_proto::ViewId::LOCAL).into_iter().collect()
+        self.views
+            .iter()
+            .filter(|(_, v)| v.session == *session)
+            .map(|(id, _)| *id)
+            .collect()
+    }
+
+    /// Do something in every terminal showing this conversation, which may be none.
+    fn each_view_showing(
+        &mut self,
+        session: &neosh_proto::SessionId,
+        f: impl Fn(&mut Self),
+    ) {
+        for view in self.views_showing(session) {
+            self.in_view(view, |me| f(me));
+        }
     }
 
     /// Send what is in the composer: the words, and whatever is on the attachment row.
@@ -1962,13 +2193,12 @@ impl Host {
         }
     }
 
-    /// Start a turn in a named conversation, drawing it only if it is the one on screen.
+    /// Start a turn in a named conversation, drawing it in whichever terminals are showing it.
     ///
     /// Named rather than implied, because the caller is not always the keyboard: a turn that ends
     /// with something still queued starts the next one, and by then you may be reading something
-    /// else entirely.
+    /// else entirely — or somebody at the terminal next door may be reading it instead.
     fn start_turn_in(&mut self, session: neosh_proto::SessionId, prompt: Prompt) {
-        let on_screen = self.active_session() == session;
         // Typing while it works is steering, not an error. The old behaviour — refuse, and make you
         // wait with the sentence already written — is the one moment in the program where you know
         // exactly what you want to say and cannot say it.
@@ -1979,15 +2209,15 @@ impl Host {
         // instead would put two turns on a driver that keeps one process per conversation.
         if self.turns.contains_key(&session) {
             self.agent.steer(&session, prompt);
-            if on_screen {
+            self.each_view_showing(&session, |me| {
                 // Sending is asking to see what happens, whether it starts a turn or joins one.
                 // Without this a message steered in while the transcript was scrolled back — which
                 // is where reading it leaves you — landed below the screen, and what you could
                 // still see was older text with nothing new in it.
-                self.scroll_chat(0);
-                self.draw_working();
-                self.refresh_composer();
-            }
+                me.scroll_chat(0);
+                me.draw_working();
+                me.refresh_composer();
+            });
             return;
         }
         let token = CancellationToken::new();
@@ -2015,21 +2245,21 @@ impl Host {
         if let Some(s) = self.agent.sessions().get_mut(&session) {
             s.turn_started_at = Some(now_secs());
         }
-        if on_screen {
+        self.each_view_showing(&session, |me| {
             // Asking a question means you want to see the answer: scrolled-back state does not
             // survive sending, or the reply arrives somewhere off screen.
-            self.scroll_chat(0);
+            me.scroll_chat(0);
             // Unless nothing was asked. A turn opened to hold something the agent had already
             // started saying has an answer and no question, and a blank question row above it is
             // a message the transcript claims you sent. See [`Self::hear_out`].
             if !prompt.text.is_empty() || !prompt.images.is_empty() {
-                self.chat_question(&prompt);
+                me.chat_question(&prompt);
             }
-            self.begin_working();
+            me.begin_working();
             // `\u{23ce}` steers from here until the turn is over, and the empty field is where that
             // has to be said — it is the one thing on screen you are looking at when you press it.
-            self.refresh_composer();
-        }
+            me.refresh_composer();
+        });
 
         let agent = self.agent.clone();
         let bridge = self.bridge.clone();
@@ -2095,7 +2325,7 @@ impl Host {
     /// Call it *before* the conversation leaves the store: afterwards this view names something
     /// that is not there.
     fn step_out_of(&mut self, going: &neosh_proto::SessionId) -> bool {
-        if self.view.session != *going {
+        if self.v().session != *going {
             return false;
         }
         self.ensure_somewhere_to_go(going);
@@ -2800,7 +3030,7 @@ impl Host {
     fn status_width(&self) -> usize {
         self.editor
             .windows()
-            .find(|w| w.buf == self.view.status)
+            .find(|w| w.buf == self.v().status)
             .and_then(|w| w.viewport.map(|v| v.width as usize))
             .unwrap_or(0)
     }
@@ -2818,17 +3048,17 @@ impl Host {
     fn refresh_status(&mut self) {
         // Reading is not a `Mode` — it is a place the keyboard is, and the whole reason it shows
         // here is that a key doing something different needs to say so before you press it.
-        let mode = if self.view.secret.is_some() {
+        let mode = if self.v().secret.is_some() {
             // Named in the status line because it is the one state where a keystroke does not do
             // what it usually does, and you should be able to see that before you press one.
             "key"
-        } else if self.view.reading {
+        } else if self.v().reading {
             // And which *kind* of reading. A selection is the one state here where the same key
             // does a different thing — `y` copies rows rather than characters, `esc` gives the
             // selection up rather than the mode — and Vim says so in the same place for the same
             // reason. `reading` when there is none, because that is the mode, not the absence of
             // a selection.
-            match (self.chat_anchored(), self.view.reading_shape) {
+            match (self.chat_anchored(), self.v().reading_shape) {
                 (true, SelectShape::Line) => "visual line",
                 (true, _) => "visual",
                 _ => "reading",
@@ -2963,21 +3193,21 @@ impl Host {
 
         let plugin = PluginId::from(BUILTIN);
         let _ = self.editor.apply(&plugin, ApiCall::BufSetLines {
-            buf: self.view.status,
+            buf: self.v().status,
             start: 0,
             end: -1,
             lines: vec![text.clone()],
         });
         let _ = self.editor.apply(&plugin, ApiCall::MarkClear {
             ns: self.status_ns,
-            buf: self.view.status,
+            buf: self.v().status,
             start: None,
             end: None,
         });
         for (from, to, hl) in marks {
             let _ = self.editor.apply(&plugin, ApiCall::MarkSet {
                 ns: self.status_ns,
-                buf: self.view.status,
+                buf: self.v().status,
                 row: 0,
                 col: from as u32,
                 opts: neosh_proto::ExtmarkOpts {
@@ -3003,7 +3233,7 @@ impl Host {
         let plugin = PluginId::from(BUILTIN);
         let _ = self.editor.apply(&plugin, ApiCall::MarkClear {
             ns: self.composer_ns,
-            buf: self.view.composer,
+            buf: self.v().composer,
             start: None,
             end: None,
         });
@@ -3018,15 +3248,15 @@ impl Host {
         // into this buffer, and what is in it then is *not* the draft — the `/` that starts a
         // search is a search, and a completion menu that opened on top of it would take the
         // keyboard away from the thing the user had just started.
-        let borrowed = self.view.secret.is_some() || self.view.search.is_some();
-        if self.view.draft != text && !borrowed {
-            self.view.draft.clone_from(&text);
+        let borrowed = self.v().secret.is_some() || self.v().search.is_some();
+        if self.v().draft != text && !borrowed {
+            self.vm().draft.clone_from(&text);
             self.bridge.broadcast(PluginEvent::ComposerChanged { text: text.clone() });
         }
-        let lines = self.editor.buffer(self.view.composer).map(|b| b.line_count()).unwrap_or(1).max(1);
+        let lines = self.editor.buffer(self.v().composer).map(|b| b.line_count()).unwrap_or(1).max(1);
         let width = self
             .editor
-            .window(self.view.composer_win)
+            .window(self.v().composer_win)
             .and_then(|w| w.viewport.map(|v| v.width as usize))
             .unwrap_or(80);
 
@@ -3120,7 +3350,7 @@ impl Host {
         //
         // The rule stays because it is the layout. Dropping it moves every row of the transcript
         // by one the moment you press `/`, which is the moment you least want the screen to jump.
-        if self.view.secret.is_some() || self.view.search.is_some() {
+        if self.v().secret.is_some() || self.v().search.is_some() {
             return;
         }
 
@@ -3152,7 +3382,7 @@ impl Host {
         // keys mean something different here, they are not written down anywhere else, and the
         // composer is not being typed into — so the row is free and the question it answers is
         // live.
-        if self.view.reading {
+        if self.v().reading {
             let mut v = vec![chunk(pad, "Composer.Hint")];
             v.extend(self.reading_hints(width.saturating_sub(indent)));
             self.composer_mark(row, VirtTextPos::Below, v);
@@ -3179,11 +3409,11 @@ impl Host {
         // The card under the cursor, if it is one that has something to open.
         let card = self
             .card_at(self.chat_cursor().0)
-            .map(|i| &self.view.cards[i])
+            .map(|i| &self.v().cards[i])
             .filter(|c| c.settled())
             .map(|c| c.expanded);
         let tab = self.glyphs().tab;
-        let mut pairs: Vec<(&str, &str)> = match self.view.reading_pending {
+        let mut pairs: Vec<(&str, &str)> = match self.v().reading_pending {
             Some(Pending::Yank) => vec![
                 ("y", "line"),
                 ("c", "code block"),
@@ -3205,7 +3435,7 @@ impl Host {
             None if self.chat_anchored() => vec![
                 ("y", "copy"),
                 ("hjkl", "extend"),
-                match self.view.reading_shape {
+                match self.v().reading_shape {
                     SelectShape::Line => ("v", "characters"),
                     _ => ("V", "whole lines"),
                 },
@@ -3224,7 +3454,7 @@ impl Host {
             ],
         };
         // First, because it is about the row you are on and the others are about everywhere.
-        if self.view.reading_pending.is_none()
+        if self.v().reading_pending.is_none()
             && !self.chat_anchored()
             && let Some(open) = card
         {
@@ -3232,7 +3462,7 @@ impl Host {
         }
         let mut out: Vec<neosh_proto::VirtChunk> = Vec::new();
         let mut used = 0usize;
-        if self.view.reading_pending.is_some() {
+        if self.v().reading_pending.is_some() {
             let head = "waiting…  ";
             used += display_width(head);
             out.push(chunk(head, "Status.Pending"));
@@ -3240,13 +3470,13 @@ impl Host {
         // A count that has been typed and not yet spent. It goes first because it is about the key
         // you are in the middle of pressing, and without it the digit is a press with no effect —
         // which is indistinguishable from a key that does nothing.
-        if !self.view.reading_count.is_empty() {
-            let head = format!("{}  ", self.view.reading_count);
+        if !self.v().reading_count.is_empty() {
+            let head = format!("{}  ", self.v().reading_count);
             used += display_width(&head);
             out.push(chunk(head, "Accent"));
         }
         for (keys, label) in pairs {
-            let gap = if out.len() > usize::from(self.view.reading_pending.is_some()) { 2 } else { 0 };
+            let gap = if out.len() > usize::from(self.v().reading_pending.is_some()) { 2 } else { 0 };
             let cost = gap + display_width(keys) + 1 + display_width(label);
             if used + cost > width {
                 break;
@@ -3265,7 +3495,7 @@ impl Host {
     fn composer_mark(&mut self, row: u32, pos: VirtTextPos, virt_text: Vec<neosh_proto::VirtChunk>) {
         let _ = self.editor.apply(&PluginId::from(BUILTIN), ApiCall::MarkSet {
             ns: self.composer_ns,
-            buf: self.view.composer,
+            buf: self.v().composer,
             row,
             col: 0,
             opts: neosh_proto::ExtmarkOpts {
@@ -3322,14 +3552,14 @@ impl Host {
         // the one blank line a buffer always has, which is not the same as no lines at all.
         let blank = self
             .editor
-            .buffer(self.view.chat)
+            .buffer(self.v().chat)
             .map(|b| b.line_count() <= 1 && b.get_lines(0, 1).iter().all(|l| l.is_empty()))
             .unwrap_or(true);
-        let n = self.editor.buffer(self.view.chat).map(|b| b.line_count()).unwrap_or(0) as usize;
-        if !blank && n != self.view.welcome_rows {
+        let n = self.editor.buffer(self.v().chat).map(|b| b.line_count()).unwrap_or(0) as usize;
+        if !blank && n != self.v().welcome_rows {
             return;
         }
-        let replacing = if blank { n as i64 } else { self.view.welcome_rows as i64 };
+        let replacing = if blank { n as i64 } else { self.v().welcome_rows as i64 };
 
         let selection = self.agent.selection();
         let account = selection.as_ref().and_then(|s| {
@@ -3447,17 +3677,17 @@ impl Host {
         let plugin = PluginId::from(BUILTIN);
         let _ = self.editor.apply(&plugin, ApiCall::MarkClear {
             ns: self.chat_ns,
-            buf: self.view.chat,
+            buf: self.v().chat,
             start: Some(0),
             end: Some(replacing.max(0) as u32),
         });
         let _ = self.editor.apply(&plugin, ApiCall::BufSetLines {
-            buf: self.view.chat,
+            buf: self.v().chat,
             start: 0,
             end: replacing,
             lines: rows.clone(),
         });
-        self.view.welcome_rows = rows.len();
+        self.vm().welcome_rows = rows.len();
         self.draw_marks(&marks, 0);
     }
 
@@ -3701,7 +3931,7 @@ impl Host {
     /// `<Esc>` always interrupts, in every mode, because a key that stops the thing that is running
     /// must not depend on where you happen to be.
     fn handle_unbound_key(&mut self, key: neosh_proto::KeyPress, mode: Mode) {
-        if self.view.reading {
+        if self.v().reading {
             self.reading_key(key);
             return;
         }
@@ -3780,27 +4010,27 @@ impl Host {
 
     fn compose(&mut self, edit: TextEdit) {
         let _ = self.editor.apply(&PluginId::from(BUILTIN), ApiCall::WinEdit {
-            win: self.view.composer_win,
+            win: self.v().composer_win,
             edit,
         });
     }
 
     fn move_composer(&mut self, motion: CursorMotion, select: bool) {
         let _ = self.editor.apply(&PluginId::from(BUILTIN), ApiCall::WinMotion {
-            win: self.view.composer_win,
+            win: self.v().composer_win,
             motion,
             select,
         });
     }
 
     fn composer_cursor(&self) -> (u32, u32) {
-        self.editor.window(self.view.composer_win).map(|w| w.cursor).unwrap_or((0, 0))
+        self.editor.window(self.v().composer_win).map(|w| w.cursor).unwrap_or((0, 0))
     }
 
     fn composer_at_last_line(&self) -> bool {
         let last = self
             .editor
-            .buffer(self.view.composer)
+            .buffer(self.v().composer)
             .map(|b| b.line_count().saturating_sub(1))
             .unwrap_or(0);
         self.composer_cursor().0 >= last
@@ -3820,7 +4050,7 @@ impl Host {
     /// there is not — which is the behaviour every terminal has and the reason this key can carry
     /// both jobs without ever being ambiguous.
     fn copy_selection(&mut self, cut: bool) -> bool {
-        let win = if self.view.reading { self.view.chat_win } else { self.view.composer_win };
+        let win = if self.v().reading { self.v().chat_win } else { self.v().composer_win };
         let text = self.selection(win);
         if text.is_empty() {
             return false;
@@ -3828,7 +4058,7 @@ impl Host {
         let lines = text.lines().count();
         let plugin = PluginId::from(BUILTIN);
         let _ = self.editor.apply(&plugin, ApiCall::ClipboardWrite { text });
-        if cut && !self.view.reading {
+        if cut && !self.v().reading {
             let _ = self.editor.apply(&plugin, ApiCall::WinEdit {
                 win,
                 edit: TextEdit::DeleteSelection,
@@ -3856,7 +4086,7 @@ impl Host {
         replace: bool,
         waiting: Option<(PluginId, RequestId)>,
     ) -> Result<(), ApiError> {
-        if self.view.secret.is_some() {
+        if self.v().secret.is_some() {
             return Err(ApiError::Busy { message: "a key is already being entered".into() });
         }
         let (label, accepts, present) = {
@@ -3886,7 +4116,7 @@ impl Host {
         // Leave the transcript first, so the caret is where the bullets are.
         self.leave_reading();
         let draft = self.composer_text();
-        self.view.secret = Some(SecretPrompt { instance, label, value: String::new(), draft, waiting });
+        self.vm().secret = Some(SecretPrompt { instance, label, value: String::new(), draft, waiting });
         self.chat_line("");
         self.chat_line("Paste or type the key, then Enter. Esc cancels. Nothing is echoed.");
         self.render_secret();
@@ -3900,7 +4130,7 @@ impl Host {
     /// failure people actually hit. Bullets rather than the value, because this line is a buffer
     /// and a buffer is sent to the frontend.
     fn render_secret(&mut self) {
-        let Some(p) = self.view.secret.as_ref() else { return };
+        let Some(p) = self.v().secret.as_ref() else { return };
         let n = p.value.graphemes(true).count();
         // Capped: a 200-character key would push the label off a narrow composer. The overflow
         // count is what tells you a long paste landed.
@@ -3918,7 +4148,7 @@ impl Host {
     /// Deliberately reached *before* the keymaps: while this prompt is up no binding fires, so a
     /// stray `n` in the middle of a pasted key cannot start a conversation.
     fn secret_key(&mut self, key: neosh_proto::KeyPress) {
-        let Some(p) = self.view.secret.as_mut() else { return };
+        let Some(p) = self.vm().secret.as_mut() else { return };
         match key.code {
             KeyCode::Esc => {
                 self.finish_secret(false);
@@ -3952,14 +4182,14 @@ impl Host {
     /// Surrounding whitespace is stripped: a key copied out of a web page brings a newline with it,
     /// and a trailing newline in a bearer token is a 401 that looks exactly like a wrong key.
     fn secret_paste(&mut self, text: &str) {
-        let Some(p) = self.view.secret.as_mut() else { return };
+        let Some(p) = self.vm().secret.as_mut() else { return };
         p.value.push_str(text.trim());
         self.render_secret();
     }
 
     /// Store what was typed, or throw it away, and give the composer back.
     fn finish_secret(&mut self, submit: bool) {
-        let Some(mut p) = self.view.secret.take() else { return };
+        let Some(mut p) = self.vm().secret.take() else { return };
         let mut stored = false;
         if submit {
             let value = std::mem::take(&mut p.value);
@@ -4015,13 +4245,13 @@ impl Host {
     /// rather than types — and pretending otherwise is how modeless editors end up with twelve
     /// chords nobody remembers.
     fn enter_reading(&mut self) {
-        if self.view.reading {
+        if self.v().reading {
             return;
         }
-        self.view.reading = true;
-        self.view.reading_pending = None;
-        self.view.reading_shape = SelectShape::Exclusive;
-        self.view.reading_goal = None;
+        self.vm().reading = true;
+        self.vm().reading_pending = None;
+        self.vm().reading_shape = SelectShape::Exclusive;
+        self.vm().reading_goal = None;
         // And the keymap has to be told, or the sentence above is only true of the keys nobody
         // else wanted. Reading's keys arrive through [`Self::handle_unbound_key`], which is the
         // *last* thing consulted — so `^D` scrolled half a screen only until the git plugin bound
@@ -4034,11 +4264,11 @@ impl Host {
         // set the host puts in *every* mode — `^C`, `^Q`, `^R`, `^S` — which is exactly the set you
         // want to keep working somewhere you did not intend to be. A plugin that wants a key while
         // reading binds it in `normal`, which needs nothing new.
-        self.view.mode_before_reading = self.editor.mode(self.from.view);
+        self.vm().mode_before_reading = self.editor.mode(self.from.view);
         self.editor.set_mode(self.from.view, Mode::Normal);
         let plugin = PluginId::from(BUILTIN);
-        let _ = self.editor.apply(&plugin, ApiCall::FocusPush { win: self.view.chat_win });
-        let _ = self.editor.apply(&plugin, ApiCall::WinSelect { win: self.view.chat_win, on: false });
+        let _ = self.editor.apply(&plugin, ApiCall::FocusPush { win: self.v().chat_win });
+        let _ = self.editor.apply(&plugin, ApiCall::WinSelect { win: self.v().chat_win, on: false });
         // Start at the newest thing said rather than at line one: you came here to take something
         // out of the answer you are looking at.
         let lines = self.chat_lines();
@@ -4046,7 +4276,7 @@ impl Host {
         // A block, because the cursor is now *on* a character rather than between two and every
         // key is a verb. It is also the only thing on screen that says so before you press one.
         let _ = self.editor.apply(&plugin, ApiCall::WinCursorShape {
-            win: self.view.chat_win,
+            win: self.v().chat_win,
             shape: neosh_proto::CursorShape::Block,
         });
         self.reading_jump((last, vim::first_non_blank(lines.last().map(String::as_str).unwrap_or(""))));
@@ -4055,22 +4285,22 @@ impl Host {
     }
 
     fn leave_reading(&mut self) {
-        if !self.view.reading {
+        if !self.v().reading {
             return;
         }
-        self.view.reading = false;
-        self.view.reading_pending = None;
-        self.view.reading_count.clear();
-        self.view.reading_shape = SelectShape::Exclusive;
-        self.view.reading_goal = None;
-        self.editor.set_mode(self.from.view, self.view.mode_before_reading);
+        self.vm().reading = false;
+        self.vm().reading_pending = None;
+        self.vm().reading_count.clear();
+        self.vm().reading_shape = SelectShape::Exclusive;
+        self.vm().reading_goal = None;
+        self.editor.set_mode(self.from.view, self.v().mode_before_reading);
         self.clear_matches();
         let plugin = PluginId::from(BUILTIN);
         let _ = self.editor.apply(&plugin, ApiCall::WinCursorShape {
-            win: self.view.chat_win,
+            win: self.v().chat_win,
             shape: neosh_proto::CursorShape::Bar,
         });
-        let _ = self.editor.apply(&plugin, ApiCall::WinSelect { win: self.view.chat_win, on: false });
+        let _ = self.editor.apply(&plugin, ApiCall::WinSelect { win: self.v().chat_win, on: false });
         let _ = self.editor.apply(&plugin, ApiCall::FocusPop);
         // Back to following the newest, because that is what the composer is the bottom of.
         //
@@ -4093,7 +4323,7 @@ impl Host {
     /// selection with one end on the cursor contains. Motion extends a running selection without
     /// being told to, which is what makes `v` and then three `j`s three lines.
     fn reading_key(&mut self, key: neosh_proto::KeyPress) {
-        if self.view.search.is_some() {
+        if self.v().search.is_some() {
             self.search_key(key);
             return;
         }
@@ -4105,11 +4335,11 @@ impl Host {
         // `f`, `F`, `t` and `T` take the next keystroke as a *character* rather than as a command:
         // `f5` finds a five and `fj` finds a `j`. Before the count and before every table below,
         // each of which would otherwise claim it first.
-        if let Some(Pending::Find { till, back }) = self.view.reading_pending {
-            self.view.reading_pending = None;
+        if let Some(Pending::Find { till, back }) = self.v().reading_pending {
+            self.vm().reading_pending = None;
             let count = self.take_reading_count().unwrap_or(1);
             if let Some(c) = ch.chars().next() {
-                self.view.reading_find = Some((c, till, back));
+                self.vm().reading_find = Some((c, till, back));
                 self.reading_motion(vim::Motion::Find { ch: c, till, back }, count);
             }
             self.refresh_composer();
@@ -4122,12 +4352,12 @@ impl Host {
         if !key.mods.ctrl
             && !key.mods.alt
             && let Some(d) = ch.chars().next().filter(char::is_ascii_digit)
-            && !(d == '0' && self.view.reading_count.is_empty())
+            && !(d == '0' && self.v().reading_count.is_empty())
         {
             // Three digits is already more rows than any transcript has on screen, and it is what
             // stops a leant-on key growing a string without end.
-            if self.view.reading_count.len() < 3 {
-                self.view.reading_count.push(d);
+            if self.v().reading_count.len() < 3 {
+                self.vm().reading_count.push(d);
             }
             self.refresh_composer();
             return;
@@ -4180,7 +4410,7 @@ impl Host {
 
         // A pending first key consumes exactly one more press, whatever it is. Anything else and a
         // mistyped `y` would sit there waiting to eat an unrelated keystroke later.
-        if let Some(first) = self.view.reading_pending.take() {
+        if let Some(first) = self.vm().reading_pending.take() {
             self.refresh_composer();
             self.reading_pair(first, ch, typed);
             return;
@@ -4208,11 +4438,11 @@ impl Host {
             _ => None,
         };
         if let Some(p) = opener {
-            self.view.reading_pending = Some(p);
+            self.vm().reading_pending = Some(p);
             // Put the count back for the key that finishes the pair. `5gg` is one motion with a
             // number in front of it, and the first `g` is not the thing that spends it.
             if let Some(n) = typed {
-                self.view.reading_count = n.to_string();
+                self.vm().reading_count = n.to_string();
             }
             self.refresh_composer();
             return;
@@ -4246,8 +4476,8 @@ impl Host {
             (_, "%") => Some(M::MatchPair),
             // `;` repeats the last `f`/`t` and `,` repeats it the other way. Nothing to repeat is
             // not an error — it is a key pressed before the one it belongs to.
-            (_, ";") => self.view.reading_find.map(|(c, till, back)| M::Find { ch: c, till, back }),
-            (_, ",") => self.view.reading_find.map(|(c, till, back)| M::Find { ch: c, till, back: !back }),
+            (_, ";") => self.v().reading_find.map(|(c, till, back)| M::Find { ch: c, till, back }),
+            (_, ",") => self.v().reading_find.map(|(c, till, back)| M::Find { ch: c, till, back: !back }),
             _ => None,
         };
         if let Some(m) = motion {
@@ -4314,8 +4544,8 @@ impl Host {
             // outright there is a keystroke that undoes the wrong amount: the transcript is the
             // thing you were still reading.
             (KeyCode::Esc, _) if self.chat_anchored() => self.drop_selection(),
-            (KeyCode::Esc, _) if !self.view.searched.is_empty() => {
-                self.view.searched.clear();
+            (KeyCode::Esc, _) if !self.v().searched.is_empty() => {
+                self.vm().searched.clear();
                 self.clear_matches();
                 self.refresh_composer();
             }
@@ -4361,7 +4591,7 @@ impl Host {
             (Pending::Yank, "c") => self.yank_code(),
             (Pending::Yank, "m" | "t") => self.yank_turn(),
             (Pending::Yank, "a") => {
-                self.select_all(self.view.chat_win);
+                self.select_all(self.v().chat_win);
                 if self.copy_selection(false) {
                     self.leave_reading();
                 }
@@ -4370,7 +4600,7 @@ impl Host {
             // is documented, bound and older than this — so `yaw` is the one shape of this that
             // cannot be had, and `viwy` is how you get it.
             (Pending::Yank, "i") => {
-                self.view.reading_pending = Some(Pending::Object { around: false, yank: true });
+                self.vm().reading_pending = Some(Pending::Object { around: false, yank: true });
                 self.refresh_composer();
             }
             // `y` over a motion: `yw`, `y$`, `y5j`, `yG`. Whatever the motion covers, from where
@@ -4419,7 +4649,7 @@ impl Host {
             "G" => M::BufEnd,
             "%" => M::MatchPair,
             ";" => {
-                let (c, till, back) = self.view.reading_find?;
+                let (c, till, back) = self.v().reading_find?;
                 M::Find { ch: c, till, back }
             }
             _ => return None,
@@ -4434,7 +4664,7 @@ impl Host {
     /// on a row of its own, which is worse than saying less.
     fn chat_width(&self) -> usize {
         self.editor
-            .window(self.view.chat_win)
+            .window(self.v().chat_win)
             .and_then(|w| w.viewport.map(|v| v.width as usize))
             .unwrap_or(80)
             .max(24)
@@ -4442,7 +4672,7 @@ impl Host {
 
     fn chat_height(&self) -> u32 {
         self.editor
-            .window(self.view.chat_win)
+            .window(self.v().chat_win)
             .and_then(|w| w.viewport.map(|v| v.height as u32))
             .unwrap_or(20)
             .max(1)
@@ -4451,14 +4681,14 @@ impl Host {
     /// The transcript, as plain rows.
     fn chat_lines(&self) -> Vec<String> {
         self.editor
-            .buffer(self.view.chat)
+            .buffer(self.v().chat)
             .map(|b| b.lines().iter().map(|l| l.text.clone()).collect())
             .unwrap_or_default()
     }
 
     /// Go to a place in the transcript, extending a running selection over what was jumped.
     fn reading_jump(&mut self, at: (u32, u32)) {
-        self.view.reading_goal = None;
+        self.vm().reading_goal = None;
         self.place_cursor(at);
     }
 
@@ -4467,12 +4697,12 @@ impl Host {
     /// `None` rather than `1` for "nobody typed one", because the two are different keys: `G` is
     /// the end of the transcript and `1G` is its first row.
     fn take_reading_count(&mut self) -> Option<u32> {
-        let typed = std::mem::take(&mut self.view.reading_count);
+        let typed = std::mem::take(&mut self.vm().reading_count);
         typed.parse::<u32>().ok().filter(|n| *n > 0)
     }
 
     fn chat_cursor(&self) -> (u32, u32) {
-        self.editor.window(self.view.chat_win).map(|w| w.cursor).unwrap_or((0, 0))
+        self.editor.window(self.v().chat_win).map(|w| w.cursor).unwrap_or((0, 0))
     }
 
     /// Put the cursor somewhere, keeping everything that follows it in step.
@@ -4484,7 +4714,7 @@ impl Host {
     fn place_cursor(&mut self, at: (u32, u32)) {
         let at = vim::clamp(&self.chat_lines(), at);
         let _ = self.editor.apply(&PluginId::from(BUILTIN), ApiCall::WinSetCursor {
-            win: self.view.chat_win,
+            win: self.v().chat_win,
             row: at.0,
             col: at.1,
         });
@@ -4501,7 +4731,7 @@ impl Host {
     fn reading_motion(&mut self, m: vim::Motion, count: u32) {
         let lines = self.chat_lines();
         let mut at = self.chat_cursor();
-        let mut goal = self.view.reading_goal;
+        let mut goal = self.v().reading_goal;
         // `$` is the third motion that leaves a column behind: it remembers "the end of the row",
         // so `$jj` walks down the right-hand edge of the text the way it does in Vim.
         let vertical = matches!(m, vim::Motion::Up | vim::Motion::Down | vim::Motion::LineEnd);
@@ -4518,7 +4748,7 @@ impl Host {
         }
         // Cleared by anything horizontal, kept by `j` and `k`. Without it, going down past a short
         // row and back up leaves the cursor at that row's width and it never finds its place again.
-        self.view.reading_goal = vertical.then_some(goal).flatten();
+        self.vm().reading_goal = vertical.then_some(goal).flatten();
         self.place_cursor(at);
     }
 
@@ -4542,9 +4772,9 @@ impl Host {
         let last = self.chat_lines().len().saturating_sub(1) as i64;
         let page = self.reading_page() as i64;
         let next = (self.chat_showing() as i64 + delta).clamp(0, last.max(0));
-        self.view.chat_top = Some(next as u32);
+        self.vm().chat_top = Some(next as u32);
         let _ = self.editor.apply(&PluginId::from(BUILTIN), ApiCall::WinScrollTo {
-            win: self.view.chat_win,
+            win: self.v().chat_win,
             top_line: Some(next as u32),
         });
         let row = self.chat_cursor().0 as i64;
@@ -4563,7 +4793,7 @@ impl Host {
         let page = self.reading_page();
         let row = self.chat_showing().saturating_add(offset.min(page.saturating_sub(1))).min(last);
         let col = vim::first_non_blank(lines.get(row as usize).map(String::as_str).unwrap_or(""));
-        self.view.reading_goal = None;
+        self.vm().reading_goal = None;
         self.place_cursor((row, col));
     }
 
@@ -4575,7 +4805,7 @@ impl Host {
     /// what this used to do unconditionally.
     fn reading_page(&self) -> u32 {
         self.editor
-            .window(self.view.chat_win)
+            .window(self.v().chat_win)
             .and_then(|w| w.viewport)
             .map(|v| v.rows)
             .filter(|r| *r > 0)
@@ -4585,9 +4815,9 @@ impl Host {
 
     /// The first buffer row on the screen right now.
     fn chat_showing(&self) -> u32 {
-        self.view.chat_top.unwrap_or_else(|| {
+        self.v().chat_top.unwrap_or_else(|| {
             self.editor
-                .window(self.view.chat_win)
+                .window(self.v().chat_win)
                 .and_then(|w| w.viewport)
                 .map(|v| v.top_line)
                 .unwrap_or(0)
@@ -4600,9 +4830,9 @@ impl Host {
         let Some(word) = vim::word_under(&lines, self.chat_cursor()) else {
             return self.editor_message(MessageLevel::Info, "no word under the cursor");
         };
-        self.view.searched = word;
-        self.view.searched_back = !forward;
-        let query = self.view.searched.clone();
+        self.vm().searched = word;
+        self.vm().searched_back = !forward;
+        let query = self.v().searched.clone();
         self.highlight_matches(&query);
         match self.find_from(&query, self.chat_cursor(), forward, false) {
             Some(at) => self.reading_jump(at),
@@ -4675,9 +4905,9 @@ impl Host {
     fn place_cursor_line(&mut self, at: u32) {
         let row = self.chat_cursor().0;
         let top = row.saturating_sub(at);
-        self.view.chat_top = Some(top);
+        self.vm().chat_top = Some(top);
         let _ = self.editor.apply(&PluginId::from(BUILTIN), ApiCall::WinScrollTo {
-            win: self.view.chat_win,
+            win: self.v().chat_win,
             top_line: Some(top),
         });
     }
@@ -4689,7 +4919,7 @@ impl Host {
     /// hand expects, and having `V` restart from one line instead would throw away the four you had
     /// just extended over.
     fn select_as(&mut self, shape: SelectShape) {
-        match (self.chat_anchored(), self.view.reading_shape == shape) {
+        match (self.chat_anchored(), self.v().reading_shape == shape) {
             (true, true) => self.drop_selection(),
             // Between the two shapes, keeping both ends: `v` narrows a linewise selection back to
             // where the cursor actually is, and `V` widens the one you have to whole lines.
@@ -4702,15 +4932,15 @@ impl Host {
     /// Anchor a selection of this shape where the cursor is.
     fn begin_select(&mut self, shape: SelectShape) {
         let plugin = PluginId::from(BUILTIN);
-        let _ = self.editor.apply(&plugin, ApiCall::WinSelect { win: self.view.chat_win, on: true });
+        let _ = self.editor.apply(&plugin, ApiCall::WinSelect { win: self.v().chat_win, on: true });
         self.set_shape(shape);
     }
 
     fn set_shape(&mut self, shape: SelectShape) {
-        self.view.reading_shape = shape;
+        self.vm().reading_shape = shape;
         let _ = self
             .editor
-            .apply(&PluginId::from(BUILTIN), ApiCall::WinSelectShape { win: self.view.chat_win, shape });
+            .apply(&PluginId::from(BUILTIN), ApiCall::WinSelectShape { win: self.v().chat_win, shape });
     }
 
     /// Give up the selection, keeping it for `gv`.
@@ -4718,21 +4948,21 @@ impl Host {
     /// Kept rather than forgotten because `Esc` is the cheap key here: you drop a selection to look
     /// at something and want it back, and one you have to make again is one you do not drop.
     fn drop_selection(&mut self) {
-        if let Some(w) = self.editor.window(self.view.chat_win)
+        if let Some(w) = self.editor.window(self.v().chat_win)
             && let Some(anchor) = w.anchor
         {
-            self.view.reading_last_select = Some((anchor, w.cursor, self.view.reading_shape));
+            self.vm().reading_last_select = Some((anchor, w.cursor, self.vm().reading_shape));
         }
-        self.view.reading_shape = SelectShape::Exclusive;
+        self.vm().reading_shape = SelectShape::Exclusive;
         let _ = self
             .editor
-            .apply(&PluginId::from(BUILTIN), ApiCall::WinSelect { win: self.view.chat_win, on: false });
+            .apply(&PluginId::from(BUILTIN), ApiCall::WinSelect { win: self.v().chat_win, on: false });
         self.refresh_composer();
     }
 
     /// `gv`: the selection you last gave up, back where it was.
     fn reselect(&mut self) {
-        let Some((anchor, cursor, shape)) = self.view.reading_last_select else {
+        let Some((anchor, cursor, shape)) = self.v().reading_last_select else {
             return self.editor_message(MessageLevel::Info, "nothing selected here yet");
         };
         let lines = self.chat_lines();
@@ -4743,9 +4973,9 @@ impl Host {
 
     /// `o`: the anchor becomes the cursor and the cursor the anchor.
     fn swap_ends(&mut self) {
-        let Some(w) = self.editor.window(self.view.chat_win) else { return };
+        let Some(w) = self.editor.window(self.v().chat_win) else { return };
         let (Some(anchor), cursor) = (w.anchor, w.cursor) else { return };
-        self.select_between(cursor, anchor, self.view.reading_shape);
+        self.select_between(cursor, anchor, self.v().reading_shape);
     }
 
     /// Put a selection of `shape` between two positions, cursor at the second.
@@ -4755,13 +4985,13 @@ impl Host {
     fn select_between(&mut self, anchor: (u32, u32), cursor: (u32, u32), shape: SelectShape) {
         let plugin = PluginId::from(BUILTIN);
         let _ = self.editor.apply(&plugin, ApiCall::WinSetCursor {
-            win: self.view.chat_win,
+            win: self.v().chat_win,
             row: anchor.0,
             col: anchor.1,
         });
-        let _ = self.editor.apply(&plugin, ApiCall::WinSelect { win: self.view.chat_win, on: true });
+        let _ = self.editor.apply(&plugin, ApiCall::WinSelect { win: self.v().chat_win, on: true });
         self.set_shape(shape);
-        self.view.reading_goal = None;
+        self.vm().reading_goal = None;
         self.place_cursor(cursor);
     }
 
@@ -4882,7 +5112,7 @@ impl Host {
     }
 
     fn code_block_at(&self, row: u32) -> Option<std::ops::Range<u32>> {
-        let buf = self.editor.buffer(self.view.chat)?;
+        let buf = self.editor.buffer(self.v().chat)?;
         let count = buf.line_count();
         if row >= count {
             return None;
@@ -4938,10 +5168,10 @@ impl Host {
 
     /// Start typing a search, borrowing the composer for it.
     fn begin_search(&mut self, back: bool) {
-        if self.view.search.is_some() {
+        if self.v().search.is_some() {
             return;
         }
-        self.view.search = Some(SearchPrompt {
+        self.vm().search = Some(SearchPrompt {
             query: String::new(),
             back,
             from: self.chat_cursor(),
@@ -4952,13 +5182,13 @@ impl Host {
     }
 
     fn render_search(&mut self) {
-        let Some(p) = self.view.search.as_ref() else { return };
+        let Some(p) = self.v().search.as_ref() else { return };
         let line = format!("{}{}", if p.back { "?" } else { "/" }, p.query);
         self.set_composer(&line);
     }
 
     fn search_key(&mut self, key: neosh_proto::KeyPress) {
-        let Some(p) = self.view.search.as_mut() else { return };
+        let Some(p) = self.vm().search.as_mut() else { return };
         match key.code {
             KeyCode::Esc => return self.finish_search(false),
             KeyCode::Enter => return self.finish_search(true),
@@ -4981,7 +5211,7 @@ impl Host {
         // Incremental: the hits light up as you type, so a search that was going to find nothing
         // says so before you have finished typing it.
         let (query, back, from) = {
-            let p = self.view.search.as_ref().expect("checked above");
+            let p = self.v().search.as_ref().expect("checked above");
             (p.query.clone(), p.back, p.from)
         };
         self.highlight_matches(&query);
@@ -4991,11 +5221,11 @@ impl Host {
     }
 
     fn finish_search(&mut self, submit: bool) {
-        let Some(p) = self.view.search.take() else { return };
+        let Some(p) = self.vm().search.take() else { return };
         self.set_composer(&p.draft);
         if submit && !p.query.is_empty() {
-            self.view.searched = p.query.clone();
-            self.view.searched_back = p.back;
+            self.vm().searched = p.query.clone();
+            self.vm().searched_back = p.back;
             self.highlight_matches(&p.query);
             match self.find_from(&p.query, p.from, !p.back, true) {
                 Some(at) => self.reading_jump(at),
@@ -5011,15 +5241,15 @@ impl Host {
 
     /// `n` and `N`: on to the next hit for whatever was last searched for.
     fn search_step(&mut self, same_direction: bool) {
-        if self.view.searched.is_empty() {
+        if self.v().searched.is_empty() {
             self.editor_message(MessageLevel::Info, "nothing to search for yet — `/` starts one");
             return;
         }
-        let query = self.view.searched.clone();
+        let query = self.v().searched.clone();
         // `n` is *onwards*, not forwards: after `?foo` it goes on up the transcript and `N` comes
         // back down it. Fixed at `forward` either way, `?` found one match and then walked away
         // from every other one.
-        let forward = same_direction != self.view.searched_back;
+        let forward = same_direction != self.v().searched_back;
         match self.find_from(&query, self.chat_cursor(), forward, false) {
             Some(at) => self.reading_jump(at),
             None => self.editor_message(MessageLevel::Warn, format!("no more matches for {query:?}")),
@@ -5104,7 +5334,7 @@ impl Host {
                 let from = at + i;
                 let _ = self.editor.apply(&plugin, ApiCall::MarkSet {
                     ns: self.search_ns,
-                    buf: self.view.chat,
+                    buf: self.v().chat,
                     row: row as u32,
                     col: from as u32,
                     opts: neosh_proto::ExtmarkOpts {
@@ -5129,14 +5359,14 @@ impl Host {
     fn clear_matches(&mut self) {
         let _ = self.editor.apply(&PluginId::from(BUILTIN), ApiCall::MarkClear {
             ns: self.search_ns,
-            buf: self.view.chat,
+            buf: self.v().chat,
             start: None,
             end: None,
         });
     }
 
     fn chat_anchored(&self) -> bool {
-        self.editor.window(self.view.chat_win).is_some_and(|w| w.anchor.is_some())
+        self.editor.window(self.v().chat_win).is_some_and(|w| w.anchor.is_some())
     }
 
     fn select_all(&mut self, win: WindowId) {
@@ -5159,7 +5389,7 @@ impl Host {
     /// ours: the cursor moving out of the viewport with nothing following it is how a reader gets
     /// lost in their own transcript.
     fn follow_cursor(&mut self) {
-        let Some(w) = self.editor.window(self.view.chat_win) else { return };
+        let Some(w) = self.editor.window(self.v().chat_win) else { return };
         let row = w.cursor.0;
         let Some(v) = w.viewport else { return };
         // Buffer rows on the screen, which after wrapping is not the window's height — the
@@ -5171,13 +5401,13 @@ impl Host {
         // this is for is naming the right *region* — a cursor five hundred rows up is not
         // something the drawing end should be asked to walk to.
         let rows = if v.rows > 0 { v.rows } else { (v.height as u32).max(1) };
-        let lines = self.editor.buffer(self.view.chat).map(|b| b.line_count()).unwrap_or(0);
+        let lines = self.editor.buffer(self.v().chat).map(|b| b.line_count()).unwrap_or(0);
         // `None` means "following the tail", which is a different place from line zero — and the
         // first row of the transcript is a place the reader arrives at, so it has to be sayable.
         // Sent as a bare `0` it was read as "follow" instead, and `^U` up to the top of a long
         // answer put the window back at the bottom of it, cursor off screen, with nothing on the
         // way there to say what had happened.
-        let showing = self.view.chat_top.unwrap_or_else(|| lines.saturating_sub(rows));
+        let showing = self.v().chat_top.unwrap_or_else(|| lines.saturating_sub(rows));
         let next = if row < showing {
             row
         } else if row >= showing + rows {
@@ -5185,9 +5415,9 @@ impl Host {
         } else {
             return;
         };
-        self.view.chat_top = Some(next);
+        self.vm().chat_top = Some(next);
         let _ = self.editor.apply(&PluginId::from(BUILTIN), ApiCall::WinScrollTo {
-            win: self.view.chat_win,
+            win: self.v().chat_win,
             top_line: Some(next),
         });
     }
@@ -5227,12 +5457,12 @@ impl Host {
         // rows that happen to survive.
         let _ = self.editor.apply(&plugin, ApiCall::MarkClear {
             ns: self.chat_ns,
-            buf: self.view.chat,
+            buf: self.v().chat,
             start: None,
             end: None,
         });
         let _ = self.editor.apply(&plugin, ApiCall::BufSetLines {
-            buf: self.view.chat,
+            buf: self.v().chat,
             start: 0,
             end: -1,
             lines,
@@ -5260,18 +5490,18 @@ impl Host {
         }
         // Not closed: the buffer is about to be replaced wholesale, so settling an answer into rows
         // that are on their way out would write into the conversation being left behind.
-        self.view.answer = None;
-        self.view.streaming = None;
+        self.vm().answer = None;
+        self.vm().streaming = None;
         // A row in the transcript being replaced, so it names nothing after this. The rebuild
         // below draws the conversation from its messages, where an unanswered question is simply
         // the last one in the list.
-        self.view.unanswered = None;
+        self.vm().unanswered = None;
         // Both together: the footer is part of the working line, and a row count left behind from
         // the conversation being left would tell the next `chat_end` to insert inside a buffer
         // that no longer has those rows.
-        self.view.working = false;
-        self.view.plan_rows = 0;
-        self.view.chat_top = None;
+        self.vm().working = false;
+        self.vm().plan_rows = 0;
+        self.vm().chat_top = None;
         let ascii = self.option_bool("ui.ascii_only");
         let limits = self.limits();
         let width = self.chat_width();
@@ -5291,12 +5521,12 @@ impl Host {
         let plugin = PluginId::from(BUILTIN);
         let _ = self.editor.apply(&plugin, ApiCall::MarkClear {
             ns: self.chat_ns,
-            buf: self.view.chat,
+            buf: self.v().chat,
             start: None,
             end: None,
         });
         let _ = self.editor.apply(&plugin, ApiCall::BufSetLines {
-            buf: self.view.chat,
+            buf: self.v().chat,
             start: 0,
             end: -1,
             lines,
@@ -5315,21 +5545,21 @@ impl Host {
         // shorter one.
         let _ = self
             .editor
-            .apply(&plugin, ApiCall::WinScrollTo { win: self.view.chat_win, top_line: None });
+            .apply(&plugin, ApiCall::WinScrollTo { win: self.v().chat_win, top_line: None });
         let _ = self
             .editor
-            .apply(&plugin, ApiCall::WinSetCursor { win: self.view.chat_win, row: 0, col: 0 });
-        let _ = self.editor.apply(&plugin, ApiCall::WinSelect { win: self.view.chat_win, on: false });
+            .apply(&plugin, ApiCall::WinSetCursor { win: self.v().chat_win, row: 0, col: 0 });
+        let _ = self.editor.apply(&plugin, ApiCall::WinSelect { win: self.v().chat_win, on: false });
         let _ = self.editor.apply(&plugin, ApiCall::BufSetName {
-            buf: self.view.chat,
+            buf: self.v().chat,
             name: format!("[chat] {label}"),
         });
         // Nothing of the previous conversation's welcome survives into this one: the buffer was
         // just replaced wholesale, so what `welcome_rows` remembered is about text that is gone.
-        self.view.welcome_rows = 0;
+        self.vm().welcome_rows = 0;
         // The rows the redraw just put the cards on. Everything recorded before the switch
         // addressed a buffer that no longer exists.
-        self.view.cards = cards;
+        self.vm().cards = cards;
         self.ensure_usable_selection();
         // The mode belongs to the conversation, and a driver holds one mode for its whole process
         // rather than one per conversation — so arriving somewhere has to say which. Without it, a
@@ -5385,11 +5615,11 @@ impl Host {
         // and anything at all having been drawn since — a sentence, a body, another kind of call —
         // means the reader has been told something else and the run is over.
         if let Some(i) = self.open_run()
-            && self.view.cards[i].takes(&call.input)
+            && self.v().cards[i].takes(&call.input)
         {
-            self.view.cards[i].legs.push(leg);
-            let row = self.view.cards[i].row;
-            if self.view.cards[i].body > 0 {
+            self.vm().cards[i].legs.push(leg);
+            let row = self.v().cards[i].row;
+            if self.v().cards[i].body > 0 {
                 // A stack of commands shows the *last* one's output, and the call that just
                 // started has not printed one yet — so its predecessor's rows come off here.
                 self.redraw_card(i);
@@ -5421,14 +5651,14 @@ impl Host {
         // a command are different kinds of thing; two commands are not.
         let row = self.chat_push(vec![card.text.clone()]);
         self.chat_row(row, &card);
-        self.view.cards.push(Card::new(leg, row));
+        self.vm().cards.push(Card::new(leg, row));
         Some(row)
     }
 
     /// The card a new call could join: the last one drawn, if nothing has been drawn since.
     fn open_run(&self) -> Option<usize> {
-        let i = self.view.cards.len().checked_sub(1)?;
-        let c = &self.view.cards[i];
+        let i = self.v().cards.len().checked_sub(1)?;
+        let c = &self.v().cards[i];
         (i64::from(c.row + c.body + 1) == self.chat_end()).then_some(i)
     }
 
@@ -5440,12 +5670,12 @@ impl Host {
         // the shortest label it ever had.
         let _ = self.editor.apply(&plugin, ApiCall::MarkClear {
             ns: self.chat_ns,
-            buf: self.view.chat,
+            buf: self.v().chat,
             start: Some(row),
             end: Some(row + 1),
         });
         let _ = self.editor.apply(&plugin, ApiCall::BufSetLines {
-            buf: self.view.chat,
+            buf: self.v().chat,
             start: row as i64,
             end: row as i64 + 1,
             lines: vec![r.text.clone()],
@@ -5464,7 +5694,7 @@ impl Host {
     /// about noise, not about hiding failures.
     fn finish_card(&mut self, id: &neosh_proto::ToolCallId, result: &neosh_proto::ToolResult) {
         let found = self
-            .view
+            .v()
             .cards
             .iter()
             .enumerate()
@@ -5485,10 +5715,10 @@ impl Host {
         };
         // Already answered. A replay can meet the same result twice — once in the messages and
         // once in the round's own record — and a second body would say it happened twice.
-        if self.view.cards[i].legs[k].result.is_some() {
+        if self.v().cards[i].legs[k].result.is_some() {
             return;
         }
-        let leg = &mut self.view.cards[i].legs[k];
+        let leg = &mut self.vm().cards[i].legs[k];
         leg.took = leg.started.map(|s| s.elapsed());
         leg.exit = result.is_error.then(|| cards::exit_code(&result.content)).flatten();
         leg.result = Some(result.clone());
@@ -5531,7 +5761,7 @@ impl Host {
         let g = self.glyphs();
         let root = self.root();
         let width = self.chat_width();
-        let heads = Self::card_heads(&self.view.cards[i]);
+        let heads = Self::card_heads(&self.v().cards[i]);
         match heads.as_slice() {
             [one] => cards::header(&g, one, &root, width),
             many => cards::group_header(&g, many, &root, width),
@@ -5546,7 +5776,7 @@ impl Host {
     /// arriving.
     fn tick_cards(&mut self) {
         let live: Vec<usize> = self
-            .view
+            .v()
             .cards
             .iter()
             .enumerate()
@@ -5557,7 +5787,7 @@ impl Host {
             .collect();
         for i in live {
             let card = self.card_header(i);
-            let row = self.view.cards[i].row;
+            let row = self.v().cards[i].row;
             self.replace_row(row, &card);
         }
     }
@@ -5568,10 +5798,10 @@ impl Host {
         let g = self.glyphs();
         let width = self.chat_width();
         let limits = self.limits();
-        let (row, old_body) = (self.view.cards[i].row, self.view.cards[i].body);
+        let (row, old_body) = (self.v().cards[i].row, self.v().cards[i].body);
         let header = self.card_header(i);
         let root = self.root();
-        let card = &self.view.cards[i];
+        let card = &self.v().cards[i];
         let body = match card.legs.as_slice() {
             // One call: whatever it came back with, folded or opened.
             [leg] => match &leg.result {
@@ -5589,18 +5819,18 @@ impl Host {
         // open answer is always below every card — it was opened after them — so settling it
         // moves nothing recorded here.
         self.close_answer();
-        self.view.streaming = None;
+        self.vm().streaming = None;
         let plugin = PluginId::from(BUILTIN);
         let _ = self.editor.apply(&plugin, ApiCall::MarkClear {
             ns: self.chat_ns,
-            buf: self.view.chat,
+            buf: self.v().chat,
             start: Some(row),
             end: Some(row + 1 + old_body),
         });
         let mut lines = vec![header.text.clone()];
         lines.extend(body.iter().map(|r| r.text.clone()));
         let _ = self.editor.apply(&plugin, ApiCall::BufSetLines {
-            buf: self.view.chat,
+            buf: self.v().chat,
             start: row as i64,
             end: (row + 1 + old_body) as i64,
             lines,
@@ -5615,15 +5845,15 @@ impl Host {
         // has never seen — which is exactly what it keys the one-shot from. Guarded by `flashed`
         // rather than by "is this the first time we settled", because the two are the same fact and
         // only one of them survives a card being opened and folded again.
-        if self.view.cards[i].settled() && !self.view.cards[i].flashed {
-            self.view.cards[i].flashed = true;
+        if self.v().cards[i].settled() && !self.v().cards[i].flashed {
+            self.vm().cards[i].flashed = true;
             self.chat_band(row, "Agent.ToolLanded");
         }
         let new_body = body.len() as u32;
-        self.view.cards[i].body = new_body;
+        self.vm().cards[i].body = new_body;
         let delta = i64::from(new_body) - i64::from(old_body);
         if delta != 0 {
-            for c in self.view.cards.iter_mut().filter(|c| c.row > row) {
+            for c in self.vm().cards.iter_mut().filter(|c| c.row > row) {
                 c.row = (i64::from(c.row) + delta).max(0) as u32;
             }
             // And the trailing question moves with them. A call can come back *after* something
@@ -5631,15 +5861,15 @@ impl Host {
             // question shifts it down like every other row below the card. Left unshifted, the
             // turn's closing rows would be spliced into the middle of the question they belong
             // above. Not cleared: a tool result landing above it does not answer it.
-            if let Some(u) = self.view.unanswered.filter(|u| *u > row) {
-                self.view.unanswered = Some((i64::from(u) + delta).max(0) as u32);
+            if let Some(u) = self.v().unanswered.filter(|u| *u > row) {
+                self.vm().unanswered = Some((i64::from(u) + delta).max(0) as u32);
             }
         }
     }
 
     /// The card whose header or body is on `row`.
     fn card_at(&self, row: u32) -> Option<usize> {
-        self.view.cards.iter().position(|c| row >= c.row && row <= c.row + c.body)
+        self.v().cards.iter().position(|c| row >= c.row && row <= c.row + c.body)
     }
 
     /// Open or fold the card under the cursor, while reading the transcript.
@@ -5653,13 +5883,13 @@ impl Host {
             self.editor_message(MessageLevel::Info, "the cursor is not on a tool call");
             return;
         };
-        if !self.view.cards[i].settled() {
+        if !self.v().cards[i].settled() {
             self.editor_message(MessageLevel::Info, "still running \u{2014} nothing to show yet");
             return;
         }
-        self.view.cards[i].expanded = !self.view.cards[i].expanded;
+        self.vm().cards[i].expanded = !self.vm().cards[i].expanded;
         self.redraw_card(i);
-        let row = self.view.cards[i].row;
+        let row = self.v().cards[i].row;
         self.reading_jump((row, 0));
         self.refresh_composer();
     }
@@ -5750,7 +5980,7 @@ impl Host {
         let gap = end > 0
             && self
                 .editor
-                .buffer(self.view.chat)
+                .buffer(self.v().chat)
                 .map(|b| {
                     b.get_lines((end - 1) as u32, end as u32).iter().any(|l| !l.trim().is_empty())
                 })
@@ -5784,18 +6014,18 @@ impl Host {
             return at;
         }
         let _ = self.editor.apply(&PluginId::from(BUILTIN), ApiCall::BufSetLines {
-            buf: self.view.chat,
+            buf: self.v().chat,
             start: i64::from(at),
             end: i64::from(at),
             lines,
         });
-        for c in self.view.cards.iter_mut().filter(|c| c.row >= at) {
+        for c in self.vm().cards.iter_mut().filter(|c| c.row >= at) {
             c.row += n;
         }
-        if let Some(u) = self.view.unanswered.filter(|u| *u >= at) {
-            self.view.unanswered = Some(u + n);
+        if let Some(u) = self.v().unanswered.filter(|u| *u >= at) {
+            self.vm().unanswered = Some(u + n);
         }
-        self.view.streaming = None;
+        self.vm().streaming = None;
         at
     }
 
@@ -5830,7 +6060,7 @@ impl Host {
                     // it in `cards`. Drawing a second card would say it happened twice — and for a
                     // model driver it always does, because the call lands in the messages the
                     // moment the stream closes and the tool starts running after that.
-                    if !self.view.cards.iter().any(|c| c.leg_of(&call.id).is_some()) {
+                    if !self.v().cards.iter().any(|c| c.leg_of(&call.id).is_some()) {
                         self.draw_tool_card(call, ToolState::Running);
                     }
                     // Whether the card came from the messages or was just drawn, a result the
@@ -5863,16 +6093,16 @@ impl Host {
         // Something is being said under the last question, so it is not the end of the transcript
         // any more. `chat_question` sets this again for the question it draws, which is why this
         // clear is safe to make unconditionally here.
-        self.view.unanswered = None;
+        self.vm().unanswered = None;
         let plugin = PluginId::from(BUILTIN);
         let at = self.chat_end();
         let _ = self.editor.apply(&plugin, ApiCall::BufSetLines {
-            buf: self.view.chat,
+            buf: self.v().chat,
             start: at,
             end: at,
             lines,
         });
-        self.view.streaming = None;
+        self.vm().streaming = None;
         at.max(0) as u32
     }
 
@@ -5882,7 +6112,7 @@ impl Host {
         let blank = at <= 0
             || self
                 .editor
-                .buffer(self.view.chat)
+                .buffer(self.v().chat)
                 .map(|b| b.get_lines((at - 1) as u32, at as u32).iter().all(|l| l.trim().is_empty()))
                 .unwrap_or(true);
         if !blank {
@@ -5892,24 +6122,24 @@ impl Host {
 
     /// Where new content goes: the end, or the line above the working line when there is one.
     fn chat_end(&self) -> i64 {
-        let n = self.editor.buffer(self.view.chat).map(|b| b.line_count() as i64).unwrap_or(0);
-        if self.view.working { (n - i64::from(self.working_rows())).max(0) } else { n }
+        let n = self.editor.buffer(self.v().chat).map(|b| b.line_count() as i64).unwrap_or(0);
+        if self.v().working { (n - i64::from(self.working_rows())).max(0) } else { n }
     }
 
     /// How many rows the working line and everything under it take, blank line included.
     fn working_rows(&self) -> u32 {
-        if !self.view.working {
+        if !self.v().working {
             return 0;
         }
         // The gap above, the line itself, and the footer under it.
-        u32::from(self.view.plan_rows > 0) + 1 + self.view.plan_rows
+        u32::from(self.v().plan_rows > 0) + 1 + self.v().plan_rows
     }
 
     /// Highlight a span of one transcript row.
     fn chat_mark(&mut self, row: u32, from: usize, to: usize, hl: &str) {
         let _ = self.editor.apply(&PluginId::from(BUILTIN), ApiCall::MarkSet {
             ns: self.chat_ns,
-            buf: self.view.chat,
+            buf: self.v().chat,
             row,
             col: from as u32,
             opts: neosh_proto::ExtmarkOpts {
@@ -5941,7 +6171,7 @@ impl Host {
     fn chat_band(&mut self, row: u32, hl: &str) {
         let _ = self.editor.apply(&PluginId::from(BUILTIN), ApiCall::MarkSet {
             ns: self.chat_ns,
-            buf: self.view.chat,
+            buf: self.v().chat,
             row,
             col: 0,
             opts: neosh_proto::ExtmarkOpts {
@@ -5981,33 +6211,33 @@ impl Host {
             // Raw mode appends to the buffer's *last* line, so the working line has to stop being
             // it. It goes back underneath as soon as the chunk has landed.
             self.below_working(|me| {
-                if me.view.streaming != Some(Stream::Text) {
+                if me.v().streaming != Some(Stream::Text) {
                     me.open_answer_row();
-                    me.view.streaming = Some(Stream::Text);
+                    me.vm().streaming = Some(Stream::Text);
                 }
-                let buf = me.view.chat;
+                let buf = me.v().chat;
                 let _ =
                     me.editor.apply(&plugin, ApiCall::BufAppendText { buf, text: text.into() });
             });
             return;
         }
 
-        if self.view.answer.is_none() {
+        if self.v().answer.is_none() {
             let start = self.open_answer_row();
-            self.view.answer = Some(Answer { md: crate::markdown::Md::new(), start, rows: 1 });
+            self.vm().answer = Some(Answer { md: crate::markdown::Md::new(), start, rows: 1 });
         }
-        let Some(mut a) = self.view.answer.take() else { return };
+        let Some(mut a) = self.vm().answer.take() else { return };
         let patch = a.md.push(text);
         self.apply_patch(&mut a, patch);
-        self.view.answer = Some(a);
+        self.vm().answer = Some(a);
     }
 
     /// The answer is over: settle its last block and stop treating the tail as provisional.
     fn close_answer(&mut self) {
-        let Some(mut a) = self.view.answer.take() else { return };
+        let Some(mut a) = self.vm().answer.take() else { return };
         let patch = a.md.finish();
         self.apply_patch(&mut a, patch);
-        self.view.streaming = None;
+        self.vm().streaming = None;
     }
 
     /// Do something that appends to the last line of the transcript, with the working line taken
@@ -6016,7 +6246,7 @@ impl Host {
     /// `BufAppendText` means "the last line" by definition, so anything using it has to own that
     /// line for the duration. Everything else writes at [`Self::chat_end`] and needs none of this.
     fn below_working(&mut self, f: impl FnOnce(&mut Self)) {
-        let had = self.view.working;
+        let had = self.v().working;
         if had {
             self.end_working();
         }
@@ -6034,7 +6264,7 @@ impl Host {
     fn open_answer_row(&mut self) -> u32 {
         // An answer is arriving under the question, which is the thing that answers it. Written
         // directly rather than through `chat_push`, so it has to say this for itself.
-        self.view.unanswered = None;
+        self.vm().unanswered = None;
         let n = self.chat_end();
         // A blank line between the last thing and the answer — unless there already is one. A tool
         // card butted straight up against the sentence that follows it reads as one paragraph, and
@@ -6042,12 +6272,12 @@ impl Host {
         let blank_above = n <= 0
             || self
                 .editor
-                .buffer(self.view.chat)
+                .buffer(self.v().chat)
                 .map(|b| b.get_lines((n - 1) as u32, n as u32).iter().all(|l| l.trim().is_empty()))
                 .unwrap_or(true);
         let rows = if blank_above { 1 } else { 2 };
         let _ = self.editor.apply(&PluginId::from(BUILTIN), ApiCall::BufSetLines {
-            buf: self.view.chat,
+            buf: self.v().chat,
             start: n,
             end: n,
             lines: vec![String::new(); rows],
@@ -6066,7 +6296,7 @@ impl Host {
         // a wasted frame — and `finish` does exactly this at the end of every answer.
         let unchanged = self
             .editor
-            .buffer(self.view.chat)
+            .buffer(self.v().chat)
             .map(|b| b.get_lines(at, end.max(at)) == patch.lines)
             .unwrap_or(false);
         if unchanged {
@@ -6078,12 +6308,12 @@ impl Host {
         // run ends up colouring the wrong words for the rest of the answer.
         let _ = self.editor.apply(&plugin, ApiCall::MarkClear {
             ns: self.chat_ns,
-            buf: self.view.chat,
+            buf: self.v().chat,
             start: Some(at),
             end: Some(end.max(at)),
         });
         let _ = self.editor.apply(&plugin, ApiCall::BufSetLines {
-            buf: self.view.chat,
+            buf: self.v().chat,
             start: at as i64,
             end: end.max(at) as i64,
             lines: patch.lines,
@@ -6116,7 +6346,7 @@ impl Host {
         let gap = end > 0
             && self
                 .editor
-                .buffer(self.view.chat)
+                .buffer(self.v().chat)
                 .map(|b| {
                     b.get_lines((end - 1) as u32, end as u32)
                         .iter()
@@ -6149,7 +6379,7 @@ impl Host {
         // Nothing has answered it yet, by definition — this is the last thing in the transcript.
         // Whatever is drawn next clears this; if the turn ends and it is still set, the question
         // got no reply. See [`Self::unanswered`].
-        self.view.unanswered = Some(at);
+        self.vm().unanswered = Some(at);
         at
     }
 
@@ -6169,7 +6399,7 @@ impl Host {
     /// checklist grows a step. The rows above it are the transcript, which is settled, so the
     /// first row of the block is the one place in the buffer that stays put.
     fn begin_working(&mut self) {
-        if self.view.working {
+        if self.v().working {
             return;
         }
         let rows = self.footer();
@@ -6186,13 +6416,13 @@ impl Host {
         lines.push(String::new());
         lines.extend(rows.iter().map(|r| r.text.clone()));
         let _ = self.editor.apply(&PluginId::from(BUILTIN), ApiCall::BufSetLines {
-            buf: self.view.chat,
+            buf: self.v().chat,
             start: at,
             end: at,
             lines,
         });
-        self.view.plan_rows = rows.len() as u32;
-        self.view.working = true;
+        self.vm().plan_rows = rows.len() as u32;
+        self.vm().working = true;
         let first = at as u32 + u32::from(gap) + 1;
         for (k, r) in rows.iter().enumerate() {
             self.chat_row(first + k as u32, r);
@@ -6358,7 +6588,7 @@ impl Host {
     /// Torn down and rebuilt rather than patched, which is what [`Self::below_working`] already
     /// does for anything that writes into the transcript while a turn runs.
     fn redraw_footer(&mut self) {
-        if !self.view.working {
+        if !self.v().working {
             return;
         }
         self.below_working(|_| {});
@@ -6371,7 +6601,7 @@ impl Host {
     /// here at all — the shimmer is the frontend's, running at its own rate over whatever this
     /// last wrote.
     fn draw_working(&mut self) {
-        if !self.view.working {
+        if !self.v().working {
             return;
         }
         let here = self.active_session();
@@ -6397,7 +6627,7 @@ impl Host {
 
         let plugin = PluginId::from(BUILTIN);
         let _ = self.editor.apply(&plugin, ApiCall::BufSetLines {
-            buf: self.view.chat,
+            buf: self.v().chat,
             start: row as i64,
             end: row as i64 + 1,
             lines: vec![text.clone()],
@@ -6410,7 +6640,7 @@ impl Host {
         // grey of finished text, not moving, exactly like a hang.
         let _ = self.editor.apply(&plugin, ApiCall::MarkClear {
             ns: self.chat_ns,
-            buf: self.view.chat,
+            buf: self.v().chat,
             start: Some(row),
             end: Some(row + 1),
         });
@@ -6432,23 +6662,23 @@ impl Host {
     /// Removed rather than blanked: it was never content, and a transcript that accumulates one
     /// empty row per turn is a transcript with a growing hole in it.
     fn end_working(&mut self) {
-        if !self.view.working {
+        if !self.v().working {
             return;
         }
         let row = self.working_row();
-        let first = row.saturating_sub(u32::from(self.view.plan_rows > 0));
-        let last = row + self.view.plan_rows;
-        self.view.working = false;
-        self.view.plan_rows = 0;
+        let first = row.saturating_sub(u32::from(self.v().plan_rows > 0));
+        let last = row + self.v().plan_rows;
+        self.vm().working = false;
+        self.vm().plan_rows = 0;
         let plugin = PluginId::from(BUILTIN);
         let _ = self.editor.apply(&plugin, ApiCall::MarkClear {
             ns: self.chat_ns,
-            buf: self.view.chat,
+            buf: self.v().chat,
             start: Some(first),
             end: Some(last + 1),
         });
         let _ = self.editor.apply(&plugin, ApiCall::BufSetLines {
-            buf: self.view.chat,
+            buf: self.v().chat,
             start: first as i64,
             end: last as i64 + 1,
             lines: vec![],
@@ -6461,8 +6691,8 @@ impl Host {
     /// buffer: the block is always the last rows of it, and the working line is the first row of
     /// the block that is not the blank above it.
     fn working_row(&self) -> u32 {
-        let n = self.editor.buffer(self.view.chat).map(|b| b.line_count()).unwrap_or(0);
-        n.saturating_sub(1 + self.view.plan_rows)
+        let n = self.editor.buffer(self.v().chat).map(|b| b.line_count()).unwrap_or(0);
+        n.saturating_sub(1 + self.v().plan_rows)
     }
 
     fn stream_into_chat(&mut self, kind: Stream, text: &str) {
@@ -6473,23 +6703,23 @@ impl Host {
         let plugin = PluginId::from(BUILTIN);
         // Reasoning under the question is the turn answering it, even when the answer proper has
         // not started. Another direct writer, so it says so for itself.
-        self.view.unanswered = None;
-        if self.view.streaming != Some(kind) {
+        self.vm().unanswered = None;
+        if self.v().streaming != Some(kind) {
             self.close_answer();
             // Text is appended to the buffer's *last* line, so the working line has to stop being
             // it before anything streams. This is the one rule that keeps the invariant true.
             self.end_working();
-            let n = self.editor.buffer(self.view.chat).map(|b| b.line_count() as i64).unwrap_or(0);
+            let n = self.editor.buffer(self.v().chat).map(|b| b.line_count() as i64).unwrap_or(0);
             let _ = self.editor.apply(&plugin, ApiCall::BufSetLines {
-                buf: self.view.chat,
+                buf: self.v().chat,
                 start: n,
                 end: n,
                 lines: vec![String::new()],
             });
-            self.view.streaming = Some(kind);
+            self.vm().streaming = Some(kind);
         }
         let _ = self.editor.apply(&plugin, ApiCall::BufAppendText {
-            buf: self.view.chat,
+            buf: self.v().chat,
             text: text.to_string(),
         });
     }
@@ -6502,7 +6732,10 @@ impl Host {
     /// are looking at. That split is what lets several turns run at once without one of them
     /// writing into another's transcript.
     fn handle_agent_event(&mut self, ev: AgentEvent) {
-        let on_screen = &self.active_session() == ev.session();
+        // Whether *anybody* is looking. It used to be "is this the conversation on screen", which
+        // had one answer because there was one screen; now it is a question about every terminal,
+        // and the drawing that follows is done once in each of the ones that says yes.
+        let seen = !self.views_showing(ev.session()).is_empty();
         match ev {
             AgentEvent::TurnStarted { session, turn } => {
                 // Write down that a turn is in flight, and clear whatever the last one left. This
@@ -6526,8 +6759,8 @@ impl Host {
                 // here rather than when the message was pushed because everything up to and
                 // including the new question is in `messages` by now and nothing of the answer has
                 // been drawn yet, which is the one moment a rebuild costs nothing.
-                if was_cut_off && on_screen {
-                    self.redraw_transcript();
+                if was_cut_off {
+                    self.each_view_showing(&session, |me| me.redraw_transcript());
                 }
                 // Out to anybody watching from another machine, before the local broadcast: the
                 // two are independent, and a watcher waiting on a plugin round trip would see the
@@ -6556,9 +6789,7 @@ impl Host {
                         _ => r.said.push(Said::Text(text.clone())),
                     }
                 }
-                if on_screen {
-                    self.answer_text(&text);
-                }
+                self.each_view_showing(&session, |me| me.answer_text(&text));
                 if self.watched(&session) {
                     self.stream_out(&session, neosh_proto::StreamEvent::Token {
                         turn: turn.0.clone(),
@@ -6571,8 +6802,10 @@ impl Host {
                 // Not accumulated, for the same reason `transcript` does not replay it: reasoning
                 // is shown live and reprinting it on a switch would bury the answer under the
                 // working out.
-                if on_screen && self.option_bool("chat.show_thinking") {
-                    self.stream_into_chat(Stream::Thinking, &text);
+                if self.option_bool("chat.show_thinking") {
+                    self.each_view_showing(&session, |me| {
+                        me.stream_into_chat(Stream::Thinking, &text)
+                    });
                 }
                 if self.watched(&session) {
                     self.stream_out(&session, neosh_proto::StreamEvent::Thinking {
@@ -6588,12 +6821,12 @@ impl Host {
                     r.note_is_wait = false;
                     r.said.push(Said::Tool { call: call.clone(), result: None });
                 }
-                if on_screen {
-                    self.draw_tool_card(&call, ToolState::Running);
+                self.each_view_showing(&session, |me| {
+                    me.draw_tool_card(&call, ToolState::Running);
                     // The tool is what the turn is doing now, so the working line should say so
                     // rather than keep claiming the model is thinking.
-                    self.draw_working();
-                }
+                    me.draw_working();
+                });
                 self.bridge.broadcast(PluginEvent::ToolStarted { session, turn, call });
             }
             AgentEvent::ToolFinished { session, turn, call, result } => {
@@ -6618,28 +6851,28 @@ impl Host {
                 {
                     cards::tally(&mut r.changes, &cards::edits_of(&call.input));
                 }
-                if on_screen {
-                    self.finish_card(&call.id, &result);
-                    self.draw_working();
-                }
+                self.each_view_showing(&session, |me| {
+                    me.finish_card(&call.id, &result);
+                    me.draw_working();
+                });
                 self.bridge.broadcast(PluginEvent::ToolFinished { session, turn, call, result });
             }
             AgentEvent::TurnEnded { session, turn, stop_reason, usage } => {
-                if on_screen {
-                    self.close_answer();
+                self.each_view_showing(&session, |me| {
+                    me.close_answer();
                     // Read before the footer goes away with the working line, and drawn again
                     // after: the footer is state, and this is the copy that stays. What the turn
                     // set out to do and how much of it it got through is the one thing a finished
                     // turn leaves behind that its answer usually does not say.
                     let plan =
-                        self.rounds.get(&session).map(|r| r.plan.clone()).unwrap_or_default();
+                        me.rounds.get(&session).map(|r| r.plan.clone()).unwrap_or_default();
                     // Anything the turn is walking away from. A backgrounded sub-agent is still
                     // running when the answer arrives, and the footer it was listed in goes away
                     // with the working line — so without this the one case people actually ask
                     // about, "is something still going?", is the one that leaves no trace.
-                    let left = self.tasks_left_running(&session);
+                    let left = me.tasks_left_running(&session);
                     let changes =
-                        self.rounds.get(&session).map(|r| r.changes.clone()).unwrap_or_default();
+                        me.rounds.get(&session).map(|r| r.changes.clone()).unwrap_or_default();
                     // Where the turn's own closing rows belong. `None` is the end of the buffer,
                     // which is right whenever the last thing there is something the turn said.
                     // When it is a question steered in after that — taken in at the final gap, and
@@ -6647,21 +6880,21 @@ impl Host {
                     // diff summary appended there put two blocks of the previous exchange under a
                     // message you had just typed. Taken rather than read, because these rows are
                     // what stops it being the last thing in the transcript.
-                    let mut at = self.view.unanswered.take();
+                    let mut at = me.vm().unanswered.take();
                     // The working block sits below all of this, so taking it away first moves
                     // none of the rows named here.
-                    self.end_working();
-                    self.view.streaming = None;
+                    me.end_working();
+                    me.vm().streaming = None;
                     // One after another, each below the last: every block that lands pushes the
                     // question — and so the row the next one goes above — further down.
-                    let n = self.draw_plan(&plan, at);
+                    let n = me.draw_plan(&plan, at);
                     at = at.map(|row| row + n);
-                    let n = self.place_block(at, &left);
+                    let n = me.place_block(at, &left);
                     at = at.map(|row| row + n);
-                    let n = self.draw_summary(&changes, at);
+                    let n = me.draw_summary(&changes, at);
                     at = at.map(|row| row + n);
-                    self.close_unanswered(at, &stop_reason);
-                }
+                    me.close_unanswered(at, &stop_reason);
+                });
                 // Queued after the last gap this turn had. It is a question that was asked and not
                 // yet answered, so it becomes the next turn rather than being quietly dropped.
                 let leftover = self.agent.take_steering(&session);
@@ -6678,7 +6911,7 @@ impl Host {
                     // attached, because reattaching lands you in that conversation with the answer
                     // already in it. Anywhere else, the row is the only thing that will ever
                     // mention it, so it has to say so until you go there. See ADR 0042.
-                    s.unread = !on_screen;
+                    s.unread = !seen;
                 }
                 self.persist_sessions();
                 if self.watched(&session) {
@@ -6730,19 +6963,19 @@ impl Host {
                 }
                 self.persist_session(&session);
             }
-            AgentEvent::Steered { prompt, .. } => {
+            AgentEvent::Steered { session, prompt, .. } => {
                 // Drawn now rather than when it was typed: until the model has been told, a
                 // transcript showing the question is a transcript that is lying about what was
                 // asked. Off screen it needs no drawing at all — it is in the conversation's
                 // messages, which is what a switch back rebuilds from.
-                if on_screen {
-                    self.chat_question(&prompt);
-                    self.draw_working();
-                    self.refresh_composer();
+                self.each_view_showing(&session, |me| {
+                    me.chat_question(&prompt);
+                    me.draw_working();
+                    me.refresh_composer();
                     // Where it landed is where you should be. It was drawn above the working
                     // line, which is off the bottom of a transcript you had scrolled back in.
-                    self.scroll_chat(0);
-                }
+                    me.scroll_chat(0);
+                });
             }
             AgentEvent::Activity { session, turn, activity } => {
                 // A driver's account of its own loop, carried separately from `Token` here for the
@@ -6753,7 +6986,7 @@ impl Host {
                         activity: activity.clone(),
                     });
                 }
-                self.handle_activity(session, turn, activity, on_screen);
+                self.handle_activity(session, turn, activity);
             }
             AgentEvent::Notice { level, text, .. } => self.editor_message(level, text),
         }
@@ -6773,7 +7006,6 @@ impl Host {
         session: neosh_proto::SessionId,
         turn: neosh_proto::TurnId,
         activity: neosh_proto::Activity,
-        on_screen: bool,
     ) {
         use neosh_proto::{Activity, TaskStatus};
         // Out to plugins before it is drawn, and whatever it is. A meter, a plan view and a status
@@ -6791,9 +7023,9 @@ impl Host {
                     return;
                 }
                 r.plan = steps;
-                if on_screen {
-                    self.redraw_footer();
-                }
+                self.each_view_showing(&session, |me| {
+                    me.redraw_footer();
+                });
             }
             // Announced twice on purpose by the driver — once as a snapshot of what is running,
             // once when this turn's own call starts one — so this is written to be idempotent.
@@ -6824,9 +7056,9 @@ impl Host {
                         status,
                     }),
                 }
-                if on_screen {
-                    self.redraw_footer();
-                }
+                self.each_view_showing(&session, |me| {
+                    me.redraw_footer();
+                });
             }
             // What it is up to, in the line that is already on screen for it. Nothing is inserted:
             // a sub-agent that reports every few seconds would otherwise push the answer it is
@@ -6837,9 +7069,9 @@ impl Host {
                 if let Some(text) = summary.or(last_tool) {
                     t.title = text;
                 }
-                if on_screen {
-                    self.redraw_footer();
-                }
+                self.each_view_showing(&session, |me| {
+                    me.redraw_footer();
+                });
             }
             // The whole set, whole, and therefore *replacing* the whole set. Not merged into the
             // turn's own list of sub-agents: that one is edges — what this turn started and is
@@ -6868,9 +7100,9 @@ impl Host {
                 // means the conversation you are *in* changed, and borrowing it to say "a row's
                 // state moved" would have every listener refreshing a footer about a conversation
                 // nobody switched to.
-                if on_screen {
-                    self.redraw_footer();
-                }
+                self.each_view_showing(&session, |me| {
+                    me.redraw_footer();
+                });
             }
             Activity::TaskEnded { task, status, .. } => {
                 let Some(r) = self.rounds.get_mut(&session) else { return };
@@ -6879,9 +7111,9 @@ impl Host {
                     return;
                 }
                 t.status = status;
-                if on_screen {
-                    self.redraw_footer();
-                }
+                self.each_view_showing(&session, |me| {
+                    me.redraw_footer();
+                });
             }
             // Not answering, and now the line says why.
             //
@@ -6897,9 +7129,9 @@ impl Host {
                     Some(ms) => format!("{what} \u{b7} in {}s", ms.div_ceil(1000).max(1)),
                     None => what,
                 });
-                if on_screen {
-                    self.draw_working();
-                }
+                self.each_view_showing(&session, |me| {
+                    me.draw_working();
+                });
             }
             // The several seconds where the driver answers nothing at all. Without this it is
             // indistinguishable from a hang, which is exactly what `/compact` looked like.
@@ -6909,9 +7141,9 @@ impl Host {
                     // Ended by `Compacted`, which is a real event, so it is not a self-ending wait.
                     r.note_is_wait = false;
                 }
-                if on_screen {
-                    self.draw_working();
-                }
+                self.each_view_showing(&session, |me| {
+                    me.draw_working();
+                });
             }
             Activity::Compacted { before, after } => {
                 if let Some(r) = self.rounds.get_mut(&session) {
@@ -6939,13 +7171,13 @@ impl Host {
                     }
                     self.persist_sessions();
                 }
-                if on_screen {
-                    let r = cards::compaction(&self.glyphs(), before, after);
-                    let row = self.chat_push(vec![r.text.clone()]);
-                    self.chat_row(row, &r);
-                    self.redraw_footer();
-                    self.draw_working();
-                }
+                self.each_view_showing(&session, |me| {
+                    let r = cards::compaction(&me.glyphs(), before, after);
+                    let row = me.chat_push(vec![r.text.clone()]);
+                    me.chat_row(row, &r);
+                    me.redraw_footer();
+                    me.draw_working();
+                });
             }
             Activity::Commands { commands } => {
                 self.remember_commands(&session, &commands);
@@ -7201,7 +7433,7 @@ impl Host {
         // A key being typed in takes the keyboard whole, bindings included. Routing it through the
         // keymaps first would mean a key containing `n` — every base64 key does — firing whatever
         // `n` is bound to, halfway through the paste.
-        if self.view.secret.is_some() {
+        if self.v().secret.is_some() {
             match input {
                 InputEvent::Key { key } => self.secret_key(key),
                 InputEvent::Paste { text } => self.secret_paste(&text),
@@ -7211,16 +7443,16 @@ impl Host {
         }
         // A search being typed takes the keyboard the same way, and for a milder version of the
         // same reason: `n` is a letter in most words and it is also the key for "next match".
-        if self.view.search.is_some() {
+        if self.v().search.is_some() {
             match input {
                 InputEvent::Key { key } => self.search_key(key),
                 InputEvent::Paste { text } => {
-                    if let Some(p) = self.view.search.as_mut() {
+                    if let Some(p) = self.vm().search.as_mut() {
                         p.query.push_str(text.trim());
                     }
                     self.render_search();
                     let (query, back, from) = {
-                        let p = self.view.search.as_ref().expect("checked above");
+                        let p = self.v().search.as_ref().expect("checked above");
                         (p.query.clone(), p.back, p.from)
                     };
                     self.highlight_matches(&query);
@@ -7253,7 +7485,7 @@ impl Host {
             InputEvent::Paste { text } => {
                 // At the cursor, replacing whatever is selected — the same edit typing performs,
                 // because a paste that always lands at the end is not a paste.
-                if self.view.reading {
+                if self.v().reading {
                     self.leave_reading();
                 }
                 // Unless it is a picture. Dragging a file onto a terminal window pastes its path,
@@ -7282,18 +7514,26 @@ impl Host {
                 // scroll had to bend to keep its cursor on screen is showing a different first row.
                 // Taking it back means the next page starts from where the screen is rather than
                 // from where the core last guessed, which with wrapped rows are different places.
-                if win == self.view.chat_win && self.view.chat_top.is_some() {
-                    self.view.chat_top = Some(top_line);
+                if win == self.v().chat_win && self.v().chat_top.is_some() {
+                    self.vm().chat_top = Some(top_line);
                 }
                 // This is where the host *learns* a width — `Resize` is the terminal's outer size
                 // and the transcript is some part of it. So anything drawn to a width has to be
                 // drawn again here, or a narrow terminal joining a wide workspace keeps the wide
                 // one's welcome until something unrelated happens to redraw it.
-                if win == self.view.chat_win && self.chat_width() != was {
+                if win == self.v().chat_win && self.chat_width() != was {
                     self.draw_welcome();
                 }
             }
             InputEvent::Attached { .. } => {
+                let arriving = self.from.view;
+                // A terminal we have never met gets a screen of its own, in a conversation nobody
+                // else is reading. That is the whole of what a second window is for: you opened it
+                // because something is running in the first one, so landing you in the same place
+                // would be the one thing guaranteed not to help.
+                if !self.views.contains_key(&arriving) {
+                    self.open_view(arriving);
+                }
                 // A client that has never seen any of this. Whatever was queued for *this view*
                 // was queued for whoever was looking before — and nobody may have been — so it is
                 // dropped rather than sent to a mirror it makes no sense against, and the whole
@@ -7302,7 +7542,6 @@ impl Host {
                 // Only this view's share, and the workspace's: a frame half-built for the terminal
                 // next door is a frame that terminal is still waiting for, and throwing all of it
                 // away because somebody else opened a window is how a view goes quiet.
-                let arriving = self.from.view;
                 let held: Vec<_> = self
                     .editor
                     .drain_ui()
@@ -7323,7 +7562,7 @@ impl Host {
                 // A resize changes nothing the core owns; the frontend re-lays-out from the
                 // declarative geometry it already has. Redraw so it takes effect.
                 let _ = self.editor.apply(&PluginId::from(BUILTIN), ApiCall::WinScrollTo {
-                    win: self.view.composer_win,
+                    win: self.v().composer_win,
                     top_line: Some(0),
                 });
                 // Except the welcome, which is drawn to a width: the word at the top of it has to
@@ -7342,6 +7581,9 @@ impl Host {
                 self.editor.exec_command(&name, args);
                 self.drain_effects();
             }
+            // The last terminal on a view has gone. Its screen goes with it; the conversation it
+            // was reading, and any turn running in that conversation, do not.
+            InputEvent::Detached => self.close_view(self.from.view),
             // Answered in the run loop, which is the only place with a frontend to draw to.
             InputEvent::Repaint => {}
             InputEvent::Disconnected => return false,
@@ -7461,6 +7703,12 @@ impl Host {
                     // keymap, a plugin — can be answered in the terminal it was pressed in.
                     self.from = from;
                     let carry_on = self.handle_input(input);
+                    // The fallback for anything that is nobody's key press and names no window.
+                    // See `Host::view_for`. Written down *after* handling, because the event that
+                    // makes a view exist at all is the one that arrives before it does.
+                    if self.views.contains_key(&from.view) {
+                        self.last_input = from.view;
+                    }
                     self.from = crate::clients::Source::LOCAL;
                     if !carry_on {
                         break;
@@ -7472,9 +7720,17 @@ impl Host {
                 }
                 () = &mut clock, if ticking => {
                     ticking = false;
-                    self.draw_working();
-                    self.tick_cards();
-                    self.tick_footer();
+                    // A clock is nobody's key press, so it has to say which terminal it means —
+                    // and it means all of them. Each has its own transcript with its own spinner
+                    // row and its own cards, and a tick that only reached whichever view happened
+                    // to be in `from` would leave the others frozen mid-turn.
+                    for view in self.view_ids() {
+                        self.in_view(view, |me| {
+                            me.draw_working();
+                            me.tick_cards();
+                            me.tick_footer();
+                        });
+                    }
                     self.report_live();
                 }
                 () = &mut keys, if waiting => {
@@ -7567,7 +7823,7 @@ impl Host {
                     keys.as_mut().reset(Instant::now() + Duration::from_millis(ms));
                 }
             }
-            if self.view.working && !ticking {
+            if self.v().working && !ticking {
                 clock.as_mut().reset(Instant::now() + Duration::from_secs(1));
                 ticking = true;
             }
@@ -7653,7 +7909,7 @@ impl Host {
             landed
         };
         if let Some(id) = landed {
-            self.view.session = id;
+            self.vm().session = id;
             let _ = self.agent.sessions().remove(&placeholder);
         }
         // Every restored conversation may live in a different checkout — that is what makes a
@@ -8118,16 +8374,16 @@ impl Host {
         // because the two cases cannot both be true. Without this the key that means "copy"
         // everywhere else in your day means "throw away what you were writing" here.
         if self.copy_selection(false) {
-            self.view.quit_armed = None;
+            self.vm().quit_armed = None;
             return;
         }
-        if self.view.reading {
+        if self.v().reading {
             self.leave_reading();
-            self.view.quit_armed = None;
+            self.vm().quit_armed = None;
             return;
         }
         if let Some(stopped) = self.cancel_turn_here() {
-            self.view.quit_armed = None;
+            self.vm().quit_armed = None;
             if stopped {
                 self.editor_message(MessageLevel::Info, "interrupted");
             }
@@ -8135,15 +8391,15 @@ impl Host {
         }
         if !self.composer_text().is_empty() {
             self.set_composer("");
-            self.view.quit_armed = None;
+            self.vm().quit_armed = None;
             return;
         }
-        let armed = self.view.quit_armed.is_some_and(|at| at.elapsed() < ARM_WINDOW);
+        let armed = self.v().quit_armed.is_some_and(|at| at.elapsed() < ARM_WINDOW);
         if armed {
             self.leave();
             return;
         }
-        self.view.quit_armed = Some(std::time::Instant::now());
+        self.vm().quit_armed = Some(std::time::Instant::now());
         self.editor_message(MessageLevel::Info, match self.on_quit {
             OnQuit::Stop => "press ^C again to quit, or ^Q",
             OnQuit::Detach => "press ^C again to close this terminal, or ^Q",
@@ -8173,8 +8429,8 @@ impl Host {
     /// back at the end, one page short of the beginning every time.
     fn scroll_chat(&mut self, direction: i32) {
         let plugin = PluginId::from(BUILTIN);
-        let lines = self.editor.buffer(self.view.chat).map(|b| b.line_count() as u32).unwrap_or(0);
-        let win = self.view.chat_win;
+        let lines = self.editor.buffer(self.v().chat).map(|b| b.line_count() as u32).unwrap_or(0);
+        let win = self.v().chat_win;
         let page = self
             .editor
             .window(win)
@@ -8182,7 +8438,7 @@ impl Host {
             .map(|v| v.height as u32)
             .unwrap_or(10)
             .max(1);
-        let current = self.view.chat_top;
+        let current = self.v().chat_top;
 
         let top = match direction {
             0 => None,
@@ -8202,7 +8458,7 @@ impl Host {
                 }
             },
         };
-        self.view.chat_top = top;
+        self.vm().chat_top = top;
         let _ = self.editor.apply(&plugin, ApiCall::WinScrollTo { win, top_line: top });
     }
 
@@ -8219,7 +8475,7 @@ impl Host {
             // reading it used to do nothing at all, which for the one key bound in *every* mode is
             // the wrong answer — that set exists so there is always something that works.
             "chat.read" => {
-                if self.view.reading {
+                if self.v().reading {
                     self.leave_reading();
                 } else {
                     self.enter_reading();
@@ -8285,7 +8541,7 @@ impl Host {
                 self.refresh_composer();
             }
             "chat.toggle_card" => {
-                if self.view.reading {
+                if self.v().reading {
                     self.toggle_card_here();
                 } else {
                     self.editor_message(MessageLevel::Info, "^S first: cards open while reading");
@@ -8302,7 +8558,7 @@ impl Host {
                 }
             }
             "edit.select_all" => {
-                let win = if self.view.reading { self.view.chat_win } else { self.view.composer_win };
+                let win = if self.v().reading { self.v().chat_win } else { self.v().composer_win };
                 self.select_all(win);
             }
             "edit.newline" => self.compose(TextEdit::Insert { text: "\n".into() }),
