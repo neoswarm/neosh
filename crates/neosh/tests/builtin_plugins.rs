@@ -5,6 +5,14 @@
 //! it would show up here as a call these tests cannot make.
 //!
 //! Everything is asserted on rendered text and emitted UI events — what a user would actually see.
+//!
+//! **The mock plugins here announce themselves from `neosh.ready`, never from the end of their own
+//! `activate`**, and every `wait_for("… ready")` below is relying on that. A plugin's own
+//! activation is the wrong moment to type at: the ten bundled plugins are still loading alongside
+//! it, so `^E`, `^L` and `^T` are keys nothing has bound yet, `session.new` is a name nothing
+//! answers to, and a configured `agent.model` naming this very plugin may still be held. A test
+//! that pressed a key there was racing ten module loads — which is a race an idle laptop wins and
+//! a busy CI runner loses, and losing it is what turned twenty of these red at once.
 
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
@@ -457,7 +465,7 @@ export async function activate({ neosh }: PluginContext) {
       { id: "other-2", display_name: "Other Two" },
     ],
   }], async (_req, emit) => { emit({ type: "message_stop" }); });
-  neosh.notify("other ready");
+  neosh.event.on("neosh.ready", () => neosh.notify("other ready"));
 }
 "#;
 
@@ -1054,7 +1062,7 @@ export async function activate({ neosh }: PluginContext) {
     const sel = await neosh.agent.selection();
     neosh.notify(`selection: ${sel?.instance}/${sel?.model} ${JSON.stringify(sel?.options ?? [])}`);
   });
-  neosh.notify("lab ready");
+  neosh.event.on("neosh.ready", () => neosh.notify("lab ready"));
 }
 "#;
 
@@ -1101,7 +1109,7 @@ export async function activate({ neosh }: PluginContext) {
     emit({ type: "message_delta", stop_reason: { kind: "end_turn" }, usage: {} });
     emit({ type: "message_stop" });
   });
-  neosh.notify("spoken ready");
+  neosh.event.on("neosh.ready", () => neosh.notify("spoken ready"));
 }
 "#;
 
@@ -1142,7 +1150,7 @@ export async function activate({ neosh }: PluginContext) {
     const sel = await neosh.agent.selection();
     neosh.notify(`selection: ${sel?.instance}/${sel?.model}`);
   });
-  neosh.notify("ladder ready");
+  neosh.event.on("neosh.ready", () => neosh.notify("ladder ready"));
 }
 "#;
 
@@ -1810,7 +1818,7 @@ export async function activate({ neosh }: PluginContext) {
     blocking: true,
     timeoutMs: 25000,
   });
-  neosh.notify("staller ready");
+  neosh.event.on("neosh.ready", () => neosh.notify("staller ready"));
 }
 "#,
     )
@@ -2043,6 +2051,12 @@ fn a_worktree_is_removed_by_its_path_without_a_picker() {
     s.wait_for("PROJECTS");
 
     s.send(&command("git.worktree.new.inside"));
+    // Waited for by the notification the verb ends with, not by the directory appearing. Those are
+    // the two halves of it: `git worktree add` puts the checkout on disk, and the conversation is
+    // created in it afterwards. The refusal asserted below is about the second half — so a test
+    // that moved as soon as the directory existed was asking to remove a tree nothing was standing
+    // in yet, which is a removal that succeeds.
+    assert!(s.pump(|s| s.saw("branched ")), "the tree was made and entered\n{}", s.transcript());
     let under = sb.work().join(".worktrees");
     assert!(
         s.pump(|_| std::fs::read_dir(&under).is_ok_and(|d| d.count() > 0)),
@@ -3413,7 +3427,7 @@ export async function activate({ neosh }: PluginContext) {
     emit({ type: "message_start", model: "stall", usage: {} });
     // Nothing else, ever. The turn stays in flight.
   });
-  neosh.notify("stall ready");
+  neosh.event.on("neosh.ready", () => neosh.notify("stall ready"));
 }
 "#;
 
@@ -3432,7 +3446,7 @@ export async function activate({ neosh }: PluginContext) {
     emit({ type: "text_delta", index: 0, text: "Here is what I found so far." });
     // And then nothing, ever. The turn stays in flight with an answer already on screen.
   });
-  neosh.notify("half ready");
+  neosh.event.on("neosh.ready", () => neosh.notify("half ready"));
 }
 "#;
 
@@ -3469,7 +3483,7 @@ export async function activate({ neosh }: PluginContext) {
     emit({ type: "message_delta", stop_reason: { kind: "end_turn" }, usage: {} });
     emit({ type: "message_stop" });
   });
-  neosh.notify("chatty ready");
+  neosh.event.on("neosh.ready", () => neosh.notify("chatty ready"));
 }
 "#;
 
@@ -3511,7 +3525,7 @@ export async function activate({ neosh }: PluginContext) {
     emit({ type: "message_delta", stop_reason: { kind: "end_turn" }, usage: {} });
     emit({ type: "message_stop" });
   });
-  neosh.notify("editor ready");
+  neosh.event.on("neosh.ready", () => neosh.notify("editor ready"));
 }
 "#;
 
@@ -3559,7 +3573,7 @@ export async function activate({ neosh }: PluginContext) {
     emit({ type: "message_delta", stop_reason: { kind: "end_turn" }, usage: {} });
     emit({ type: "message_stop" });
   });
-  neosh.notify("looker ready");
+  neosh.event.on("neosh.ready", () => neosh.notify("looker ready"));
 }
 "#;
 
@@ -3796,7 +3810,7 @@ export async function activate({ neosh }: PluginContext) {
     });
     emit({ type: "message_stop" });
   });
-  neosh.notify("wide ready");
+  neosh.event.on("neosh.ready", () => neosh.notify("wide ready"));
 }
 "#;
 
@@ -3824,7 +3838,7 @@ export async function activate({ neosh }: PluginContext) {
     emit({ type: "message_delta", stop_reason: { kind: "end_turn" }, usage: {} });
     emit({ type: "message_stop" });
   }, { agentLoop: true });
-  neosh.notify("compactor ready");
+  neosh.event.on("neosh.ready", () => neosh.notify("compactor ready"));
 }
 "#;
 
@@ -3908,7 +3922,7 @@ export async function activate({ neosh }: PluginContext) {
     seen.push(`draft<${text}>`);
     void neosh.buf.setLines(buf, 0, -1, seen);
   });
-  neosh.notify("watcher ready");
+  neosh.event.on("neosh.ready", () => neosh.notify("watcher ready"));
 }
 "#;
 
@@ -4112,7 +4126,7 @@ export async function activate({ neosh }: PluginContext) {
     emit({ type: "message_delta", stop_reason: { kind: "end_turn" }, usage: {} });
     emit({ type: "message_stop" });
   }, { agentLoop: true });
-  neosh.notify("reporter ready");
+  neosh.event.on("neosh.ready", () => neosh.notify("reporter ready"));
 }
 "#;
 
@@ -4434,7 +4448,7 @@ export async function activate({ neosh }: PluginContext) {
     emit({ type: "message_start", model: "sealed", usage: {} });
     emit({ type: "message_stop" });
   });
-  neosh.notify("vault ready");
+  neosh.event.on("neosh.ready", () => neosh.notify("vault ready"));
 }
 "#;
 
@@ -4468,7 +4482,7 @@ export async function activate({ neosh }: PluginContext) {
       },
     });
   });
-  neosh.notify("slow ready");
+  neosh.event.on("neosh.ready", () => neosh.notify("slow ready"));
 }
 "#;
 
@@ -4735,7 +4749,7 @@ export async function activate({ neosh }: PluginContext) {
     emit({ type: "message_delta", stop_reason: { kind: "end_turn" }, usage: {} });
     emit({ type: "message_stop" });
   });
-  neosh.notify("parrot ready");
+  neosh.event.on("neosh.ready", () => neosh.notify("parrot ready"));
 }
 "#;
 
@@ -4879,7 +4893,7 @@ export async function activate({ neosh }: PluginContext) {
     if (found) await neosh.session.switch(found.id);
     else neosh.notify(`no conversation in ${args[0]}`, "warn");
   }, { desc: "switch to the conversation in a directory" });
-  neosh.notify("where ready");
+  neosh.event.on("neosh.ready", () => neosh.notify("where ready"));
 }
 "#;
 
@@ -5445,7 +5459,7 @@ export async function activate({ neosh, subscriptions }: PluginContext) {
     on: "any",
   }));
 
-  neosh.notify("acme ready");
+  neosh.event.on("neosh.ready", () => neosh.notify("acme ready"));
 }
 "#;
 
@@ -5816,7 +5830,7 @@ export async function activate({ neosh }: PluginContext) {
     neosh.notify("published");
   });
 
-  neosh.notify("planner ready");
+  neosh.event.on("neosh.ready", () => neosh.notify("planner ready"));
 }
 "#;
 
@@ -6153,7 +6167,7 @@ export async function activate({ neosh }: PluginContext) {
       neosh.notify(`liar refused: ${e}`);
     }
   });
-  neosh.notify("liar ready");
+  neosh.event.on("neosh.ready", () => neosh.notify("liar ready"));
 }
 "#;
     let sb = Sandbox::new("planliar");
@@ -6206,7 +6220,7 @@ export async function activate({ neosh }: PluginContext) {
     if (other) await neosh.session.switch(other.id);
     else await neosh.session.create({ activate: true });
   });
-  neosh.notify("asker ready");
+  neosh.event.on("neosh.ready", () => neosh.notify("asker ready"));
 }
 "#;
     let sb = Sandbox::new("asking-row");
@@ -6364,7 +6378,7 @@ export async function activate({ neosh }: PluginContext) {
     neosh.notify("fanned out");
     } catch (e) { neosh.notify("fanout failed: " + e); }
   });
-  neosh.notify("lab ready");
+  neosh.event.on("neosh.ready", () => neosh.notify("lab ready"));
 }
 "#;
     let sb = Sandbox::new("fanout");
@@ -6462,7 +6476,7 @@ export async function activate({ neosh }: PluginContext) {
     };
   }, { blocking: true });
 
-  neosh.notify("router ready");
+  neosh.event.on("neosh.ready", () => neosh.notify("router ready"));
 }
 "#;
     let sb = Sandbox::new("router");

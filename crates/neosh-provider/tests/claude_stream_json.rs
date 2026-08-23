@@ -24,6 +24,8 @@ use neosh_proto::{
 };
 use tokio_util::sync::CancellationToken;
 
+mod support;
+
 /// A `claude --print --input-format stream-json` that answers in two halves.
 ///
 /// The gap is the point. The first turn says `FIRST-HEAD`, pauses long enough to be abandoned, and
@@ -78,10 +80,7 @@ impl Fake {
         let dir = std::env::temp_dir().join(format!("neosh-claude-{}-{name}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("sandbox");
-        let script = dir.join("claude");
-        std::fs::write(&script, FAKE).expect("script");
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        support::write_executable(&dir.join("claude"), FAKE);
         Self { dir }
     }
 

@@ -46,6 +46,9 @@ const COALESCE: Duration = Duration::from_millis(16);
 /// would be missing something.
 const BUILTIN: &str = "neosh";
 
+/// Broadcast once every plugin has loaded. See [`Host::announce_ready`].
+const READY_EVENT: &str = "neosh.ready";
+
 /// What the host is streaming into the chat buffer right now.
 ///
 /// Distinguishing the two matters because switching between them has to break the line; appending
@@ -112,6 +115,14 @@ struct Startup {
     /// Held and retried, then reported only if it still does not resolve once everything has loaded
     /// — the same shape as a held option value.
     pending_model: Option<String>,
+    /// Commands a frontend asked for before anything had registered them.
+    ///
+    /// Held for the same reason `deferred` and `reload_pending` are: a command belongs to a plugin,
+    /// plugins load in parallel with the terminal becoming usable, and for the first moment of a
+    /// session `session.new` is a name nothing answers to. "No such command" is a wrong answer to
+    /// a right question — and once startup has settled, a name still nobody claims is genuinely
+    /// unknown and is reported exactly as before.
+    commands: Vec<(String, Vec<String>)>,
     /// A reload asked for while something was still loading.
     ///
     /// Queued rather than refused. Startup is asynchronous and now involves several bundled plugins,
@@ -1592,6 +1603,13 @@ impl Host {
                 // Remembered so unloading the plugin takes its driver with it. A driver whose
                 // plugin is gone answers every request with a dead channel.
                 self.plugin_drivers.entry(plugin.clone()).or_default().push(driver);
+                // An `agent.model` held for this instance is applied *now*, not when the last
+                // plugin finishes loading. The two are not the same moment: a plugin that has
+                // registered its provider is a plugin whose model can be talked to, and every
+                // other plugin still starting up is beside the point. Between them the selection
+                // is the fallback — so a turn sent in that gap was answered by a model the user
+                // did not choose, and nothing on screen said so.
+                self.apply_pending_model_if_servable();
                 Ok(ApiOk::Unit)
             }
             ApiCall::ProviderEmit { stream, event } => {
@@ -6842,6 +6860,12 @@ impl Host {
                 self.draw_welcome();
             }
             InputEvent::Command { name, args } => {
+                // Not yet registered, and something is still loading: held rather than refused.
+                // See `Startup::commands`.
+                if self.startup_in_flight() && !self.editor.has_command(&name) {
+                    self.startup.commands.push((name, args));
+                    return true;
+                }
                 // Through the core's registry, so an unknown name reports "no such command" in the
                 // UI exactly as a bad keybinding does.
                 self.editor.exec_command(&name, args);
@@ -8191,8 +8215,73 @@ impl Host {
             if self.startup.loading == 0 {
                 self.retry_pending_model();
                 self.report_unknown_options();
+                self.run_held_commands();
+                // Before a queued reload, which tears all of this down and builds it again — and
+                // says so a second time when *it* settles.
+                self.announce_ready();
                 self.run_pending_reload();
             }
+        }
+    }
+
+    /// Whether anything is still being loaded — a config script or a plugin.
+    fn startup_in_flight(&self) -> bool {
+        self.startup.active.is_some() || self.startup.loading > 0 || !self.startup.discovered
+    }
+
+    /// Run the commands that arrived before anything had registered them.
+    ///
+    /// In the order they were asked for, which is the only order that can be right: two of them
+    /// are a person pressing two keys.
+    fn run_held_commands(&mut self) {
+        for (name, args) in std::mem::take(&mut self.startup.commands) {
+            self.editor.exec_command(&name, args);
+            self.drain_effects();
+        }
+    }
+
+    /// Say that the workspace is up.
+    ///
+    /// A plugin's own `activate` returning is not this: the other plugins are still loading
+    /// alongside it, so a key `^E` is bound to is a key nothing has bound yet, a contribution
+    /// point another plugin fills is still empty, and an `agent.model` naming a provider nobody
+    /// has registered is still held. Anything that depends on the *rest* of the workspace waits
+    /// for `neosh.ready` instead of guessing.
+    ///
+    /// An ordinary event on the ordinary bus rather than a new wire type — a plugin listens for it
+    /// with the same `neosh.event.on` it uses for anything else, and `from` is `neosh` because the
+    /// host is what said it. It is announced again after a reload, which is the same fact about the
+    /// same workspace being true a second time.
+    fn announce_ready(&mut self) {
+        self.bridge.broadcast(PluginEvent::Event {
+            name: READY_EVENT.to_string(),
+            data: None,
+            from: BUILTIN.to_string(),
+        });
+    }
+
+    /// Apply a held `agent.model` the moment something can serve it.
+    ///
+    /// Not a replacement for [`Self::retry_pending_model`], which is where a spec that nothing
+    /// *ever* serves is finally reported and where the fallback is chosen. This one only ever
+    /// succeeds: it is called on every provider registration, and a spec that still resolves to
+    /// nothing is left held for the end of startup exactly as before.
+    fn apply_pending_model_if_servable(&mut self) {
+        let Some(spec) = self.startup.pending_model.clone() else { return };
+        // The read guard is released at the end of this statement, before `apply_option` takes
+        // `&mut self`.
+        let servable = Config::parse_model(&spec).is_some_and(|(instance, model)| {
+            self.agent
+                .providers()
+                .resolve(&neosh_proto::ModelSelection {
+                    instance: instance.into(),
+                    model: neosh_proto::ModelId::from(model),
+                    options: Vec::new(),
+                })
+                .is_some()
+        });
+        if servable {
+            self.apply_option("agent.model", &OptionValue::Str(spec));
         }
     }
 
@@ -8328,6 +8417,8 @@ impl Host {
         if self.startup.loading == 0 {
             self.retry_pending_model();
             self.report_unknown_options();
+            self.run_held_commands();
+            self.announce_ready();
             // Nothing to wait for — a reload queued during config activation runs now.
             self.run_pending_reload();
         }
