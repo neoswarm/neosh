@@ -232,9 +232,11 @@ they are trees of.
 The rest of a worktree's life is on its sidebar row: `y` copies its path for the shell you are
 about to `cd` in, `p` pulls its repository from the remote and says what git said, and `d` removes
 the checkout from disk — the branch stays, it asks first, and it tells you how many conversations
-go with it. `⌥Y` in the chat copies the *current* conversation's directory, which in a worktree is
-the worktree. `p` and `d` are contributions from the git plugin (`sidebar.action`), so they follow
-it when it is disabled, and a sidebar of your own inherits them for free.
+go with it. `⌥Y` in the chat and `yp` in the reader (`^S`) copy the *current* conversation's
+directory, which in a worktree is the worktree; `session.copy.path` is the same thing by name from
+`^K` or `/copy`.
+`p` and `d` are contributions from the git plugin (`sidebar.action`), so they follow it when it is
+disabled, and a sidebar of your own inherits them for free.
 
 Conversations are saved as you go — one file each under `~/.local/state/neosh/sessions/` — and
 restored at startup, in the one you were last in. `--clean` neither reads nor writes them.
@@ -332,7 +334,10 @@ that depends on a setting you have to go and find. In practice that rules out th
   Mac could not press. The key list is `^Z`.
 - **Option / Alt.** macOS treats Option as a compose key: `⌥p` is `π`, not `Alt+p`, unless the
   terminal has been told otherwise. The model ladder was `⌥↑`/`⌥↓` and now has no default key at
-  all; taking an attached image back off was `⌥V` and is now `⌫` on an empty composer.
+  all; taking an attached image back off was `⌥V` and is now `⌫` on an empty composer. The one
+  Alt chord that ships is `⌥Y`, and it ships on the terms arrows do: copying the conversation's
+  directory is also `yp` in the reader, `y` in the project panel and `session.copy.path` from
+  `^K`, so a terminal that sends `¥` has lost nothing.
 - **Ctrl with punctuation.** In a plain terminal `Ctrl+/` and `Ctrl+7` are the same byte. Neither
   is a key worth binding — see enhanced keys, below.
 

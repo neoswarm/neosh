@@ -87,7 +87,9 @@ per decision, and records the *reasoning*, not the choice.
   key in a `ui.keys.*` list is the chord: the first one is what a hint row prints, and a legend is
   a promise about a keyboard. A capability that runs out of chords loses its key and keeps its
   command — `^K` runs it by name and `init.ts` can bind it — because inventing a prefix layer for
-  one verb costs every user a concept to save one of them a keystroke. See ADR 0048.
+  one verb costs every user a concept to save one of them a keystroke. Alt is bound on the terms
+  arrows are: only where a terminal-sendable route to the same thing already exists, so `⌥Y`
+  copies the directory in chat and `yp` does it in the reader. See ADR 0048.
 - **The cursor is on a character, and the frontend is the only thing that knows where that is.**
   Reading the transcript is a normal mode, so `$` is the last character rather than the space after
   it, `h` at column zero stays on its row, nothing parks past the end of one, and a selection
@@ -605,7 +607,7 @@ only way to do anything. See ADR 0048.
 | `^G` | Git status |
 | `^D` | Show what changed |
 | `^S` | Read the transcript — see below |
-| `⌥Y` | Copy this conversation's directory — in a worktree, the worktree's path |
+| `⌥Y` | Copy this conversation's directory — in a worktree, the worktree's path. The one Alt chord that ships, because it is never the only way: `yp` in the reader, `y` in the project panel, `^K` by name |
 | `^A` `^X` | Select everything, cut the selection |
 | `^C` | Copy the selection, or clear the draft, or (twice) quit |
 | `PgUp` `PgDn` `^End` | Scroll, and back to the newest message |
@@ -621,7 +623,10 @@ Composer editing is a text field: `←`/`→` by character and `^←`/`^→` by 
 `^Home`/`^End` for the ends, shift with any of them to select, `^W` and `^U` to delete a word or
 back to the start of the line. The capability ladder — `model.upgrade`, `model.downgrade` — has no
 default key: it had `⌥↑`/`⌥↓`, which is not a key every terminal sends, and `^K` runs both by
-name.
+name. Copying this conversation's directory — `session.copy.path`, which in a worktree is the
+worktree's path — keeps `⌥Y` on the terms arrows are bound on: a key that means something where it
+arrives and is never the only way — `^K` or `/copy` here, `y` on any row of the project panel, and
+`yp` in the reader.
 
 ## Reading the transcript — `^S`
 
@@ -677,6 +682,7 @@ on it, which after wrapping is not the window's height. See ADR 0051.
 | `yi` + an object | Copy one without selecting it first — `yiw`, `yi"` |
 | `yc` | Copy the **code block** the cursor is in, without its indent or language line |
 | `ym` | Copy the whole **turn** — the question and everything it produced |
+| `yp` | Copy this conversation's **directory** — in a worktree, the worktree's path. The one `y` that is not a piece of the transcript |
 | `ya` | Copy the entire transcript. Which is why `ya`*w* is the one thing here that is not Vim's — `viwy` is |
 | `i` `a` `o` `⏎` | Back to the composer. While selecting, `i` and `a` open a text object and `o` swaps ends |
 | `^S` | And back out, the way you came in |
