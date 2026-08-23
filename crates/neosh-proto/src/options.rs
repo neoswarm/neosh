@@ -119,6 +119,13 @@ impl OptionValue {
             _ => None,
         }
     }
+
+    pub fn as_list(&self) -> Option<&[String]> {
+        match self {
+            Self::List(v) => Some(v.as_slice()),
+            _ => None,
+        }
+    }
 }
 
 /// What a declaration says.

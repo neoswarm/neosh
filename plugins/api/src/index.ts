@@ -402,8 +402,53 @@ export interface Neosh {
   readonly path: PathApi;
   readonly timer: TimerApi;
   readonly log: Logger;
-  /** Transient UI message. Never enters conversation history. */
+  /**
+   * Say something in the corner, as a reply to a key the user just pressed.
+   *
+   * The default and by far the commonest case: feedback for a keystroke. It does not stack — a
+   * second one replaces the first, because two keys pressed quickly are two keys and the reply
+   * you want is the one for the second — it lives about six seconds, and it never leaves the
+   * terminal.
+   *
+   * What it is *not* for is the thing the user can already see. `favourited ~/proj` next to a row
+   * that just grew a pin is the same fact printed twice, and a corner that is usually saying
+   * something you did not need is a corner people stop reading. See ADR 0057, and
+   * {@link Neosh.progress} and {@link Neosh.alert} for the two things that are not this.
+   */
   notify(message: string, level?: MessageLevel): void;
+  /**
+   * Say what is happening, in a row that gets replaced rather than stacked.
+   *
+   * Keyed: writing the same key again replaces the row, and {@link Neosh.done} takes it away. This
+   * is what `pulling…` should have been — it was pushed onto the message stack, and so was the
+   * `up to date` that superseded it, which is how one pull drew two rows.
+   *
+   * A row nobody finishes is dropped after a minute, so a plugin that crashes mid-operation cannot
+   * leave a permanent claim on screen. Relying on that is a row that lies for up to a minute.
+   */
+  progress(key: string, message: string): void;
+  /** Take a progress row off, because the thing it was about has finished. */
+  done(key: string): void;
+  /**
+   * News: something happened that the user did not ask for.
+   *
+   * Drawn in the corner like a message, and — if the host works out that nobody is looking —
+   * raised outside the terminal as well, as an escape sequence the terminal turns into a real
+   * notification. Whether that happens is the host's decision and not yours: only it knows which
+   * conversation is on screen, which terminals are attached and whether any has focus.
+   *
+   * Needs `notify` in `plugin.toml`, because a plugin that can interrupt somebody who is in
+   * another application is a capability rather than a way of drawing. Rejected with
+   * `not permitted` otherwise.
+   *
+   * @param session Which conversation this is about, if it is about one. The test for "can they
+   * see this already" is asked against it; an alert about no conversation is never on screen.
+   */
+  alert(
+    title: string,
+    message: string,
+    opts?: { level?: MessageLevel; session?: SessionId },
+  ): Promise<void>;
   /** Ask the host whether a side effect is allowed. */
   permit(capability: Capability): Promise<PermissionDecision>;
   /**
@@ -1563,7 +1608,25 @@ export function __createContext(plugin: string, config: unknown, version: number
   const api: Neosh = {
     version,
     notify(message, level) {
-      n({ call: "notify", level: level ?? "info", message });
+      n({ call: "notify", level: level ?? "info", message, kind: "reply" });
+    },
+    progress(key, message) {
+      n({ call: "notify", level: "info", message, kind: "progress", key });
+    },
+    done(key) {
+      n({ call: "notify_done", key });
+    },
+    async alert(title, message, opts) {
+      // Awaited rather than fired and forgotten, unlike the three above: this is the one that can
+      // be refused — for want of `notify` in the manifest — and a capability error nobody sees is
+      // a plugin that silently never notifies.
+      await c({
+        call: "alert",
+        level: opts?.level ?? "info",
+        title,
+        message,
+        session: opts?.session,
+      });
     },
     async permit(capability) {
       return expect(await c({ call: "permission_check", capability }), "permission").decision;

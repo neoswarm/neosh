@@ -8,8 +8,8 @@
 use std::collections::BTreeMap;
 
 use neosh_proto::{
-    BufferId, HighlightDef, LineRender, Rect, SurfaceCell, SurfaceId, UiEvent, WindowId,
-    WindowLayout,
+    BufferId, HighlightDef, LineRender, NoticeKind, Rect, SurfaceCell, SurfaceId, UiEvent,
+    WindowId, WindowLayout,
 };
 
 #[derive(Debug, Clone, Default)]
@@ -36,6 +36,20 @@ pub struct MirrorSurface {
     pub cells: Vec<SurfaceCell>,
 }
 
+/// One thing the corner is saying, and when it started saying it.
+#[derive(Debug, Clone)]
+pub struct Notice {
+    pub level: neosh_proto::MessageLevel,
+    pub kind: NoticeKind,
+    pub text: String,
+    pub at: std::time::Instant,
+    /// How many times this same text has arrived in a row.
+    ///
+    /// A burst of one message repeated is one row with a count, not five rows of the same
+    /// sentence. Drawn only above one, so the ordinary case reads exactly as it always did.
+    pub repeats: u32,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct Mirror {
     pub protocol_version: u32,
@@ -51,7 +65,22 @@ pub struct Mirror {
     /// The protocol carries no timestamp — a message is a message, and a frontend that never shows
     /// them has no use for one. The clock is stamped here, on receipt, so expiry is the frontend's
     /// business and the wire stays clock-free.
-    pub messages: Vec<(neosh_proto::MessageLevel, String, std::time::Instant)>,
+    ///
+    /// Only [`NoticeKind::Reply`] and [`NoticeKind::Alert`] are in here; progress lives in its own
+    /// map because it is replaced rather than appended. See ADR 0057.
+    pub messages: Vec<Notice>,
+    /// Progress rows, by the key that owns each one.
+    ///
+    /// A map rather than a list because the whole point is that writing the same key twice is one
+    /// row that changed, not two rows. Ordered by key so the rows do not shuffle between frames:
+    /// two operations running at once must not swap places every time one of them ticks.
+    pub progress: BTreeMap<String, (String, std::time::Instant)>,
+    /// Alerts the host has decided nobody can see, waiting to be raised outside the terminal.
+    ///
+    /// Taken by the frontend when it next draws, exactly like [`Mirror::clipboard`] and for the
+    /// same reason: the mirror owns no terminal, and writing an escape sequence is the one thing
+    /// this type must not do if it is to stay testable without a tty. See ADR 0057.
+    pub alerts: Vec<(neosh_proto::MessageLevel, String, String)>,
     /// Text the core asked us to put on the clipboard, taken by the renderer when it next draws.
     ///
     /// Queued rather than written here because the mirror owns no terminal — this type is pure
@@ -161,12 +190,47 @@ impl Mirror {
             UiEvent::FocusChanged { win } => {
                 self.focus = win;
             }
-            UiEvent::Message { level, text } => {
-                self.messages.push((level, text, std::time::Instant::now()));
+            UiEvent::Message { level, text, kind, key } => {
+                let now = std::time::Instant::now();
+                if kind == NoticeKind::Progress {
+                    // A row that is replaced in place. No expiry stamped forward: the clock is
+                    // reset on every write so that a long operation which keeps reporting stays
+                    // on screen, and one that stops reporting eventually falls off by itself.
+                    if let Some(key) = key {
+                        self.progress.insert(key, (text, now));
+                    }
+                    return false;
+                }
+                // The same sentence arriving again is that sentence happening again, not a second
+                // thing to read. Only against the newest, so two messages alternating are two
+                // rows — which is what they are.
+                if let Some(last) = self.messages.last_mut()
+                    && last.text == text
+                    && last.level == level
+                    && last.kind == kind
+                {
+                    last.repeats += 1;
+                    last.at = now;
+                    return false;
+                }
+                // A reply is feedback for the key you just pressed, so the previous reply is
+                // feedback for a key you have already moved on from. One at a time. An alert is
+                // news and stays: it is not answering anything, so nothing supersedes it.
+                if kind == NoticeKind::Reply {
+                    self.messages.retain(|m| m.kind != NoticeKind::Reply);
+                }
+                self.messages.push(Notice { level, kind, text, at: now, repeats: 1 });
                 // Keep the log bounded; a long agent session would otherwise grow it forever.
                 if self.messages.len() > 200 {
                     self.messages.drain(..self.messages.len() - 200);
                 }
+            }
+            UiEvent::ProgressDone { key } => {
+                self.progress.remove(&key);
+            }
+            UiEvent::Alert { title, body, level } => {
+                self.alerts.push((level, title, body));
+                return true;
             }
             UiEvent::Clipboard { text } => {
                 self.clipboard = Some(text);
@@ -369,16 +433,122 @@ mod tests {
         assert_eq!(s.cells.iter().find(|c| c.col == 1).unwrap().grapheme, "B");
     }
 
+    /// An alert, which is the kind that accumulates. A reply would replace the one before it,
+    /// which is exactly what makes it the wrong thing to test a bound with.
+    fn news(text: &str) -> UiEvent {
+        UiEvent::Message {
+            level: neosh_proto::MessageLevel::Info,
+            text: text.into(),
+            kind: NoticeKind::Alert,
+            key: None,
+        }
+    }
+
+    fn reply(text: &str) -> UiEvent {
+        UiEvent::Message {
+            level: neosh_proto::MessageLevel::Info,
+            text: text.into(),
+            kind: NoticeKind::Reply,
+            key: None,
+        }
+    }
+
     #[test]
     fn the_message_log_stays_bounded() {
         let mut m = Mirror::new();
         for i in 0..500 {
-            m.apply(UiEvent::Message {
-                level: neosh_proto::MessageLevel::Info,
-                text: format!("{i}"),
-            });
+            m.apply(news(&i.to_string()));
         }
         assert_eq!(m.messages.len(), 200);
-        assert_eq!(m.messages.last().unwrap().1, "499");
+        assert_eq!(m.messages.last().unwrap().text, "499");
+    }
+
+    /// Two keys pressed quickly are two keys, and the answer you want is the one for the second.
+    /// The three-high stack was the corner trying to be a log. See ADR 0057.
+    #[test]
+    fn a_reply_replaces_the_reply_before_it() {
+        let mut m = Mirror::new();
+        m.apply(reply("copied /a"));
+        m.apply(reply("copied /b"));
+        assert_eq!(m.messages.len(), 1);
+        assert_eq!(m.messages[0].text, "copied /b");
+    }
+
+    /// News is not answering anything, so nothing supersedes it — and a reply arriving must not
+    /// push it off either.
+    #[test]
+    fn news_is_kept_when_a_reply_lands_on_top_of_it() {
+        let mut m = Mirror::new();
+        m.apply(news("a node went away"));
+        m.apply(reply("copied /a"));
+        assert_eq!(m.messages.len(), 2);
+        assert_eq!(m.messages[0].text, "a node went away");
+    }
+
+    /// One sentence arriving five times is that sentence happening five times, not five things to
+    /// read.
+    #[test]
+    fn the_same_message_twice_is_one_row_with_a_count() {
+        let mut m = Mirror::new();
+        for _ in 0..5 {
+            m.apply(news("could not reach the endpoint"));
+        }
+        assert_eq!(m.messages.len(), 1);
+        assert_eq!(m.messages[0].repeats, 5);
+    }
+
+    /// The whole point of `Progress`: writing the same key again is one row that changed, which is
+    /// what `pulling…` then `up to date` should always have been.
+    #[test]
+    fn progress_replaces_in_place_and_is_taken_away_by_name() {
+        let mut m = Mirror::new();
+        let step = |text: &str| UiEvent::Message {
+            level: neosh_proto::MessageLevel::Info,
+            text: text.into(),
+            kind: NoticeKind::Progress,
+            key: Some("git.pull".into()),
+        };
+        m.apply(step("pulling…"));
+        m.apply(step("still pulling…"));
+        assert_eq!(m.progress.len(), 1, "one row, not two");
+        assert_eq!(m.progress["git.pull"].0, "still pulling…");
+        // And it never lands in the message list, where it would expire on a timer.
+        assert!(m.messages.is_empty());
+
+        m.apply(UiEvent::ProgressDone { key: "git.pull".into() });
+        assert!(m.progress.is_empty());
+    }
+
+    /// Two operations at once are two rows, each ended by whichever finishes.
+    #[test]
+    fn two_operations_are_two_progress_rows() {
+        let mut m = Mirror::new();
+        let step = |key: &str, text: &str| UiEvent::Message {
+            level: neosh_proto::MessageLevel::Info,
+            text: text.into(),
+            kind: NoticeKind::Progress,
+            key: Some(key.into()),
+        };
+        m.apply(step("git.pull", "pulling…"));
+        m.apply(step("image:1", "fetching example.com…"));
+        assert_eq!(m.progress.len(), 2);
+        m.apply(UiEvent::ProgressDone { key: "git.pull".into() });
+        assert_eq!(m.progress.len(), 1);
+        assert!(m.progress.contains_key("image:1"));
+    }
+
+    /// An alert is the host having already decided nobody can see the thing it is about, so the
+    /// frontend takes it and writes an escape. Queued rather than acted on here, exactly like the
+    /// clipboard, because this type owns no terminal.
+    #[test]
+    fn an_alert_is_queued_for_the_frontend_to_raise() {
+        let mut m = Mirror::new();
+        m.apply(UiEvent::Alert {
+            title: "fix/the-login".into(),
+            body: "finished".into(),
+            level: neosh_proto::MessageLevel::Info,
+        });
+        assert_eq!(m.alerts.len(), 1);
+        assert_eq!(m.alerts[0].1, "fix/the-login");
     }
 }

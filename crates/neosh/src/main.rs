@@ -10,6 +10,7 @@ use neosh_provider::ProviderRegistry;
 use neosh_script::ScriptRuntime;
 
 mod markdown;
+mod notify;
 mod bridge;
 mod client;
 mod daemon;

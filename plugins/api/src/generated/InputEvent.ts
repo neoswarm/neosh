@@ -26,4 +26,5 @@ export type InputEvent =
   }
   | { "type": "command"; name: string; args: Array<string> }
   | { "type": "repaint" }
+  | { "type": "focus"; on: boolean }
   | { "type": "disconnected" };

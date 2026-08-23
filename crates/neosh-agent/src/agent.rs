@@ -511,7 +511,12 @@ impl Agent {
                         reason: "needs approval, and nothing is able to ask".into(),
                     };
                 }
-                crate::tools::Approver::ask(&HookApprover { hooks, bridge, turn }, capability).await
+                let session = Some(self.sessions().active_id().clone());
+                crate::tools::Approver::ask(
+                    &HookApprover { hooks, bridge, turn, session },
+                    capability,
+                )
+                .await
             }
             other => other,
         }
@@ -977,6 +982,9 @@ impl Agent {
                         hooks: self.hooks().blocking(HookName::PermissionPre).cloned().collect(),
                         bridge,
                         turn: Some(call.turn.clone()),
+                        // The conversation this turn belongs to, not whichever is on screen —
+                        // the same rule `permissions_for` below is following.
+                        session: Some(session.clone()),
                     };
                     let ctx = ToolCtx {
                         // Rooted at the conversation this turn belongs to, not at whichever one is
@@ -1081,6 +1089,9 @@ struct HookApprover<'a> {
     /// Which turn is asking, so a prompt can say what it is for. `None` when a plugin asked
     /// outside a turn.
     turn: Option<TurnId>,
+    /// And which conversation, so a prompt waiting in one you are not looking at can say which
+    /// one it is. See ADR 0057.
+    session: Option<neosh_proto::SessionId>,
 }
 
 #[async_trait::async_trait]
@@ -1091,6 +1102,7 @@ impl crate::tools::Approver for HookApprover<'_> {
             self.bridge,
             HookPayload::PermissionPre {
                 turn: self.turn.clone(),
+                session: self.session.clone(),
                 capability,
                 title: None,
                 // A built-in tool offers none: the question is "may this happen", and the answers
@@ -1265,6 +1277,7 @@ impl neosh_provider::approval::PermissionAsker for DriverAsker {
             self.bridge.as_ref(),
             HookPayload::PermissionPre {
                 turn: None,
+                session: request.conversation.clone(),
                 capability: request.capability,
                 title: Some(request.title),
                 options: request.options,

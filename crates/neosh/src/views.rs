@@ -60,6 +60,16 @@ struct View {
     out: mpsc::UnboundedSender<ServerMessage>,
     /// What it said it was when it attached, and after every resize.
     size: (u16, u16),
+    /// Whether this terminal is the window its user is looking at.
+    ///
+    /// `None` is *cannot say* rather than *no*: only a terminal implementing mode 1004 ever reports
+    /// this, and treating silence as focused would mean everyone on a terminal that cannot report
+    /// gets no notifications at all. Unknown falls back to [`View::last_input`]. See ADR 0057.
+    focused: Option<bool>,
+    /// When a key last arrived from this view, which is the fallback for a terminal that cannot say
+    /// whether it has focus. Stamped on attach so a terminal that has just opened is not instantly
+    /// idle.
+    last_input: std::time::Instant,
     /// The geometry it resolved, per window, as last reported.
     ///
     /// Kept per view rather than merged on arrival because the merge has to be recomputed when a
@@ -86,8 +96,53 @@ impl Views {
     pub fn attach(&mut self, out: mpsc::UnboundedSender<ServerMessage>, size: (u16, u16)) -> ViewId {
         self.next += 1;
         let id = ViewId(self.next);
-        self.views.push((id, View { out, size, viewports: HashMap::new() }));
+        self.views.push((id, View {
+            out,
+            size,
+            focused: None,
+            last_input: std::time::Instant::now(),
+            viewports: HashMap::new(),
+        }));
         id
+    }
+
+    /// A terminal said whether it has focus.
+    pub fn focused(&mut self, id: ViewId, on: bool) {
+        if let Some((_, v)) = self.views.iter_mut().find(|(v, _)| *v == id) {
+            v.focused = Some(on);
+        }
+    }
+
+    /// A key arrived from this terminal, so somebody is at it.
+    ///
+    /// The fallback for terminals that cannot report focus, and it is also a correction for ones
+    /// that can: a terminal you are typing into is a terminal you are looking at, whatever it last
+    /// said about mode 1004. Terminals do get this wrong — a window manager that never sends the
+    /// focus-in on the way back from a workspace switch leaves the view stuck reporting `false`,
+    /// and then every notification is one for something you are staring at.
+    pub fn typed(&mut self, id: ViewId) {
+        if let Some((_, v)) = self.views.iter_mut().find(|(v, _)| *v == id) {
+            v.last_input = std::time::Instant::now();
+            if v.focused == Some(false) {
+                v.focused = Some(true);
+            }
+        }
+    }
+
+    /// Whether nobody is looking at this workspace.
+    ///
+    /// A workspace is away only when *every* attached terminal is: two windows open and one of them
+    /// in front means the thing is on a screen somebody can see. Nothing attached is not away — it
+    /// is [`Views::is_empty`], which is a different answer with a different channel, because there
+    /// is no terminal to write an escape to. See ADR 0057.
+    pub fn away(&self, idle_after: std::time::Duration) -> bool {
+        !self.views.is_empty()
+            && self.views.iter().all(|(_, v)| match v.focused {
+                Some(on) => !on,
+                // A terminal that cannot say. Idleness is the honest proxy: the person who last
+                // pressed a key ten minutes ago is not watching this scroll past.
+                None => v.last_input.elapsed() >= idle_after,
+            })
     }
 
     /// Let one go. `false` if it had already gone, which is ordinary: a client whose socket died

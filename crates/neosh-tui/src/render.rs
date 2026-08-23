@@ -929,43 +929,107 @@ fn inline_before(line: Option<&LineRender>, col: usize) -> u16 {
     u16::try_from(shift).unwrap_or(u16::MAX)
 }
 
-/// How long a notification stays on screen.
+/// How long a message stays on screen.
 ///
 /// There is no frame loop, so nothing repaints purely to expire one: a message outlives its welcome
 /// until the next real mutation. That is the honest trade for having no timer — and in a session
 /// where anything at all is happening, the next frame is milliseconds away.
 const NOTIFICATION_TTL: std::time::Duration = std::time::Duration::from_secs(6);
 
-/// The most recent notifications, above the bottom-most content.
+/// How long news stays, which is longer than a reply.
 ///
-/// Without this every `neosh.notify` — including the host's own "press ^C again to quit" — is
-/// collected, capped, and never shown. A program whose only feedback channel is invisible is a
-/// program that appears not to respond.
+/// A reply is about the key you just pressed and you were looking at the screen when you pressed
+/// it. An alert is about something you did not do, so the six seconds start from a moment nobody
+/// chose — and if you looked away for one sentence you have missed it entirely.
+const ALERT_TTL: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// When a progress row is given up on.
+///
+/// Progress has no timer of its own: it lives until `notify.done` takes it away, because that is
+/// the whole difference between a state and a message. This is only the backstop for a plugin that
+/// crashed between the two — without it, one failed pull leaves `pulling…` on screen until restart.
+const PROGRESS_ABANDONED: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// What is happening and what just happened, above the bottom-most content.
+///
+/// Two lists in one corner, because they are two different claims and only one of them is about to
+/// stop being true. Progress sits above — it is what the program is *doing*, and it will change on
+/// its own — and messages below it, nearest the composer, because they are answers to a key. See
+/// ADR 0057.
 fn draw_notifications(frame: &mut Frame, area: Rect, mirror: &Mirror, theme: &Theme) {
+    /// At most one reply and two alerts. The stack used to be three of anything, which meant a
+    /// burst of replies could push the one piece of news off the top of it.
     const MAX: usize = 3;
 
-    let live: Vec<_> = mirror
-        .messages
-        .iter()
-        .rev()
-        .filter(|(_, _, at)| at.elapsed() < NOTIFICATION_TTL)
-        .take(MAX)
+    let ttl = |n: &crate::mirror::Notice| match n.kind {
+        neosh_proto::NoticeKind::Alert => ALERT_TTL,
+        _ => NOTIFICATION_TTL,
+    };
+    let live: Vec<&crate::mirror::Notice> =
+        mirror.messages.iter().rev().filter(|n| n.at.elapsed() < ttl(n)).take(MAX).collect();
+    // Progress in insertion-independent key order, so two operations running at once do not swap
+    // rows every time one of them ticks.
+    let running: Vec<&str> = mirror
+        .progress
+        .values()
+        .filter(|(_, at)| at.elapsed() < PROGRESS_ABANDONED)
+        .map(|(text, _)| text.as_str())
         .collect();
-    if live.is_empty() || area.height == 0 {
+    if (live.is_empty() && running.is_empty()) || area.height == 0 {
         return;
+    }
+
+    // Newest at the bottom, older above it and dimmed — the same ordering as the toast stack it
+    // replaces, without the choreography. A repeat is a count on the end rather than a second row.
+    let mut lines: Vec<Line> = Vec::with_capacity(running.len() + live.len());
+    for text in &running {
+        lines.push(Line::from(Span::styled(
+            format!(" {text} "),
+            theme.style("Status.Pending").add_modifier(ratatui::style::Modifier::DIM),
+        )));
+    }
+    let count = live.len();
+    for (i, n) in live.iter().rev().enumerate() {
+        let group = match n.level {
+            neosh_proto::MessageLevel::Error => "Diagnostic.Error",
+            neosh_proto::MessageLevel::Warn => "Diagnostic.Warn",
+            neosh_proto::MessageLevel::Info => "Diagnostic.Info",
+        };
+        let mut style = theme.style(group);
+        if i + 1 < count {
+            style = style.add_modifier(ratatui::style::Modifier::DIM);
+        }
+        let text = match n.repeats {
+            0 | 1 => format!(" {} ", n.text),
+            r => format!(" {} ×{r} ", n.text),
+        };
+        lines.push(Line::from(Span::styled(text, style)));
     }
 
     // Right-aligned, hugging the bottom, so it overlays chrome rather than reflowing it: a message
     // that pushed the composer down would move the thing the user is typing into.
-    let rows = (live.len() as u16).min(area.height);
-    let widest = live
+    let rows = (lines.len() as u16).min(area.height);
+    let widest = lines
         .iter()
-        .map(|(_, text, _)| width(text) + 2)
+        .map(|l| l.spans.iter().map(|s| width(&s.content)).sum::<usize>())
         .max()
         .unwrap_or(0)
         .min(area.width as usize) as u16;
     if widest == 0 {
         return;
+    }
+    // Measured before truncating, then truncated to what fits, so every row is the same width and
+    // the block reads as one panel rather than a ragged edge.
+    for line in &mut lines {
+        for span in &mut line.spans {
+            let fitted = truncate_to_width(&span.content, widest as usize).to_string();
+            span.content = fitted.into();
+        }
+    }
+    // Only the last `rows` fit. Dropping from the front keeps the newest, which is the one that
+    // matters — and progress is at the front, so a screen too short for both shows the answers.
+    if lines.len() > rows as usize {
+        lines.drain(..lines.len() - rows as usize);
     }
     let rect = Rect {
         x: area.x + area.width.saturating_sub(widest),
@@ -975,28 +1039,6 @@ fn draw_notifications(frame: &mut Frame, area: Rect, mirror: &Mirror, theme: &Th
     };
 
     frame.render_widget(ratatui::widgets::Clear, rect);
-    // Newest at the bottom, older above it and dimmed — the same ordering as the toast stack it
-    // replaces, without the choreography.
-    let lines: Vec<Line> = live
-        .iter()
-        .rev()
-        .enumerate()
-        .map(|(i, (level, text, _))| {
-            let group = match level {
-                neosh_proto::MessageLevel::Error => "Diagnostic.Error",
-                neosh_proto::MessageLevel::Warn => "Diagnostic.Warn",
-                neosh_proto::MessageLevel::Info => "Diagnostic.Info",
-            };
-            let mut style = theme.style(group);
-            if i + 1 < live.len() {
-                style = style.add_modifier(ratatui::style::Modifier::DIM);
-            }
-            Line::from(Span::styled(
-                format!(" {} ", truncate_to_width(text, widest.saturating_sub(2) as usize)),
-                style,
-            ))
-        })
-        .collect();
     frame.render_widget(Paragraph::new(lines), rect);
 }
 

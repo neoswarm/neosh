@@ -26,7 +26,7 @@ use crate::provider::{
 use crate::quota::{QuotaSample, QuotaSnapshot, UsageHistory, UsageResolution};
 use crate::ui::{
     CursorMotion, CursorShape, ExtmarkInfo, ExtmarkOpts, FloatConfig, HighlightDef, KeyPress,
-    LineDraw, MessageLevel, Rect, SelectShape, SurfaceCell, TextEdit, WindowLayout,
+    LineDraw, MessageLevel, NoticeKind, Rect, SelectShape, SurfaceCell, TextEdit, WindowLayout,
 };
 use crate::vcs::{BranchInfo, CommitInfo, DiffTarget, RepoStatus, WorktreeInfo};
 
@@ -1180,9 +1180,44 @@ pub enum ApiCall {
         message: String,
     },
     /// Transient message in the UI. Not a buffer, so it never enters conversation history.
+    ///
+    /// Free, like every other kind of drawing. What is *not* free is [`ApiCall::Alert`], which can
+    /// interrupt somebody who is not looking at neosh at all.
     Notify {
         level: MessageLevel,
         message: String,
+        /// Whether the user asked for this. See ADR 0057; `Reply` is the default and is what a
+        /// bare `neosh.notify` has always meant.
+        #[serde(default)]
+        kind: NoticeKind,
+        /// Which progress row to write, for [`NoticeKind::Progress`]. Ignored otherwise.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        key: Option<String>,
+    },
+    /// Take a progress row off, because the thing it was about has finished.
+    NotifyDone {
+        key: String,
+    },
+    /// News: something happened that the user did not ask for.
+    ///
+    /// Drawn in the corner like a message, and *additionally* raised outside the terminal if the
+    /// host works out that nobody is looking — which is the host's decision and not the caller's,
+    /// because only the host knows which conversation is on screen and whether any view has focus.
+    ///
+    /// Needs `notify` in `plugin.toml`. A plugin that can put a notification on your desktop
+    /// unprompted is a plugin that can interrupt you, which is exactly the kind of thing the
+    /// manifest exists to make you agree to.
+    Alert {
+        level: MessageLevel,
+        /// What this is about, in a few words.
+        title: String,
+        message: String,
+        /// Which conversation this is about, if it is about one.
+        ///
+        /// The test for "can they see it already" is asked against this. An alert with no
+        /// conversation is about the workspace, and is never on screen by definition.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session: Option<SessionId>,
     },
 }
 

@@ -129,6 +129,9 @@ pub fn can_use_tool(v: &Value, cwd: &Path) -> Option<CanUseTool> {
             capability: capability(tool_name, &input),
             options,
             cwd: cwd.to_path_buf(),
+            // Filled in by the caller, which is the only thing here that knows which conversation
+            // this driver is running.
+            conversation: None,
         },
         rules,
     })

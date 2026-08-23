@@ -31,6 +31,17 @@ import { picker } from "@neosh/api/ui";
 /** How long the user has. Past this the hook times out, which the host reads as a refusal. */
 const ASK_TIMEOUT_MS = 120_000;
 
+/**
+ * The conversations blocked on an approval, as a workspace var.
+ *
+ * The same shape and the same reasoning as `question.asking` (ADR 0043): being blocked on a person
+ * is a fact about the *conversation*, not about whichever panel happened to draw the prompt, so it
+ * goes somewhere everything can read it. The host reads it to decide whether the person is worth
+ * interrupting for — see ADR 0057 — and a panel that wants to mark the row can read the same thing
+ * without this plugin knowing it exists.
+ */
+const VAR_ASKING = "permission.asking";
+
 /** One row of the prompt: what it says, and what answering it means. */
 type Choice = {
   label: string;
@@ -52,6 +63,29 @@ export async function activate({ neosh, subscriptions }: PluginContext) {
   // rendered description rather than the object so `read_file` of two different paths are two
   // different decisions.
   const allowed = new Set<string>();
+
+  // Which conversations are waiting on an answer, and how many prompts each has open. A count
+  // rather than a set, because two tool calls in one turn can both be blocked and answering the
+  // first must not say the conversation is free.
+  const waiting = new Map<string, number>();
+  /**
+   * `null` to start rather than an empty string, so the first call writes whatever the map is —
+   * including the empty one, which is how a var left behind by a workspace that stopped with a
+   * prompt open is cleared. See the questions plugin, which has the same shape for the same reason.
+   */
+  let announced: string | null = null;
+  const announce = async () => {
+    const ids = [...waiting.entries()].filter(([, n]) => n > 0).map(([id]) => id).sort();
+    const next = ids.join("\u0000");
+    // Written only when the set actually changed. The host tells the difference between a newly
+    // blocked conversation and one that already was, and rewriting an unchanged list would make
+    // every answer look like a new question in the ones still open.
+    if (announced === next) return;
+    announced = next;
+    await (ids.length === 0
+      ? neosh.vars.remove({ scope: "global" }, VAR_ASKING)
+      : neosh.vars.set({ scope: "global" }, VAR_ASKING, ids)).catch(() => {});
+  };
 
   // What the agent may do without asking, in the footer, with the key that changes it. On screen
   // the whole time, in every mode: it is a per-conversation setting now, so "what am I in" is a
@@ -109,11 +143,26 @@ export async function activate({ neosh, subscriptions }: PluginContext) {
         const remember = (await neosh.opt.get<boolean>("approvals.remember")) ?? true;
         const choices = offered(payload.options, remember);
 
-        const answer = await picker(neosh, choices, {
-          title: key,
-          width: Math.max(40, Math.min(88, key.length + 8)),
-          height: choices.length,
-        });
+        // Said before the picker opens and taken back in `finally`, so a prompt that is escaped,
+        // times out or throws does not leave a conversation marked as waiting forever.
+        const asking = payload.session;
+        if (asking) {
+          waiting.set(asking, (waiting.get(asking) ?? 0) + 1);
+          await announce();
+        }
+        let answer: Choice["value"] | null;
+        try {
+          answer = await picker(neosh, choices, {
+            title: key,
+            width: Math.max(40, Math.min(88, key.length + 8)),
+            height: choices.length,
+          });
+        } finally {
+          if (asking) {
+            waiting.set(asking, Math.max(0, (waiting.get(asking) ?? 1) - 1));
+            await announce();
+          }
+        }
 
         // Dismissing is a no. A prompt you can escape into an allow is not a prompt.
         if (answer === null) return { action: "veto", reason: "not approved" };
@@ -139,6 +188,20 @@ export async function activate({ neosh, subscriptions }: PluginContext) {
       { blocking: true, timeoutMs: ASK_TIMEOUT_MS },
     ),
   );
+
+  // Once, empty, at startup. The queue is in memory and the var is on disk, so a workspace that
+  // stopped with a prompt open left a conversation marked as waiting on an answer nothing is
+  // going to ask for again — and this is what takes the mark off. Same reasoning as the questions
+  // plugin's own announcement; see ADR 0043.
+  await announce();
+
+  subscriptions.push({
+    dispose: () => {
+      // Unloading this plugin vetoes every prompt it was holding, so a conversation still marked
+      // as waiting would be one nothing is ever going to ask about again.
+      void neosh.vars.remove({ scope: "global" }, VAR_ASKING).catch(() => {});
+    },
+  });
 }
 
 /** Whether an option is one of the ways of saying yes. */

@@ -676,6 +676,8 @@ pub fn permission_request(params: &Value, cwd: &std::path::Path) -> PermissionRe
             .map(|o| o.iter().filter_map(permission_option).collect())
             .unwrap_or_default(),
         cwd: cwd.to_path_buf(),
+        // A parser sees a JSON-RPC line, not a workspace. Filled in by the caller.
+        conversation: None,
     }
 }
 
@@ -804,6 +806,9 @@ impl Provider for AcpProvider {
             let mut on_note = {
                 let notes = notes.clone();
                 let workdir = workdir.clone();
+                // Which conversation is blocked, so a prompt waiting in one you are not looking at
+                // can say which one it is. See ADR 0057.
+                let conversation = request.conversation.clone();
                 move |method: &str, params: &Value| -> Note {
                     match method {
                         "session/update" => {
@@ -812,9 +817,10 @@ impl Provider for AcpProvider {
                         }
                         // Handed to the pump rather than answered here: answering means asking a
                         // person, asking a person means awaiting, and a closure cannot await.
-                        "session/request_permission" => {
-                            Note::Ask(permission_request(params, &workdir))
-                        }
+                        "session/request_permission" => Note::Ask(PermissionRequest {
+                            conversation: Some(conversation.clone()),
+                            ..permission_request(params, &workdir)
+                        }),
                         // Everything else the agent might ask a client for — reading files, running
                         // terminals — was declined in `clientCapabilities`, so an answer of
                         // "nothing" is consistent rather than surprising.
