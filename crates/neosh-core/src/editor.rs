@@ -603,6 +603,15 @@ impl Editor {
         }
     }
 
+    /// Whether anything has registered this name.
+    ///
+    /// Asked by the host before it decides that a command nothing answers to is *unknown* rather
+    /// than merely not loaded yet — plugins register theirs as they activate, and for the first
+    /// moment of a session most of them have not.
+    pub fn has_command(&self, name: &str) -> bool {
+        self.commands.contains_key(name)
+    }
+
     /// Run a registered command by name, as a frontend's menu or palette entry does.
     ///
     /// Public because a frontend that can only send keys cannot have a button — every entry in a

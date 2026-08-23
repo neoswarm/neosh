@@ -24,6 +24,8 @@ use neosh_proto::{
 use neosh_provider::Provider;
 use tokio_util::sync::CancellationToken;
 
+mod support;
+
 /// A `codex app-server` that answers, in the order a real one would.
 ///
 /// Request ids are not matched, they are counted: neosh numbers them from one in a fixed order, so
@@ -86,14 +88,7 @@ impl Fake {
         let dir = std::env::temp_dir().join(format!("neosh-codex-{}-{name}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("sandbox");
-        let script = dir.join("codex");
-        std::fs::write(&script, FAKE).expect("script");
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
-                .expect("chmod");
-        }
+        support::write_executable(&dir.join("codex"), FAKE);
         Self { dir }
     }
 

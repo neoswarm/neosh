@@ -1610,14 +1610,22 @@ mod tests {
     #[tokio::test]
     async fn the_child_is_started_in_the_conversations_directory() {
         use futures::StreamExt;
-        use std::os::unix::fs::PermissionsExt;
 
         let dir = std::env::temp_dir().join(format!("neosh-cwd-{}", std::process::id()));
         let work = dir.join("work");
         std::fs::create_dir_all(&work).expect("dirs");
         let script = dir.join("fake-claude");
-        std::fs::write(&script, "#!/bin/sh\npwd > \"$(dirname \"$0\")/where\"\n").expect("script");
-        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        // Written by a child rather than by us, and the reason is the whole of
+        // `tests/support/mod.rs`: a descriptor this process holds open for writing is a descriptor
+        // a sibling test's `spawn` forks a copy of, and the `execve` here then fails with
+        // `ETXTBSY`. Nothing we never opened can be inherited.
+        let wrote = std::process::Command::new("/bin/sh")
+            .args(["-c", r#"printf '%s' "$1" > "$2" && chmod 755 "$2""#, "neosh-test-write"])
+            .arg("#!/bin/sh\npwd > \"$(dirname \"$0\")/where\"\n")
+            .arg(&script)
+            .status()
+            .expect("a shell to write the script");
+        assert!(wrote.success(), "writing the stand-in failed: {wrote}");
 
         let p = ClaudeCliProvider::new(script.display().to_string());
         let mut req = req("claude-opus-5");

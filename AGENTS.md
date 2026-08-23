@@ -359,7 +359,7 @@ per decision, and records the *reasoning*, not the choice.
   a turn opened to hold an answer has no question above it. **A turn still ends on its own
   `result`** — `init` opens one and `result` closes one for their turns as much as ours, so a prompt
   queued behind one has two endings to wait for, and ending on the first is how a message that had
-  not been read yet came back as `{"type":"thinking","text":""}`. See ADR 0055.
+  not been read yet came back as `{"type":"thinking","text":""}`. See ADR 0056.
 - **A vendor CLI outlives the turn, so an abandoned turn has to be *drained*.** `Live::lines` is
   per conversation. A turn that is walked away from — `<Esc>`, a switch — leaves the CLI mid-answer
   with the rest of it in the pipe, and the next turn reads it as its own: someone else's reply, and

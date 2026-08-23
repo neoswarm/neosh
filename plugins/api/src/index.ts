@@ -1208,6 +1208,13 @@ export interface ExtensionApi {
  * Fire and forget by construction. There is no reply and no way to be blocked, because an emitter
  * that could be is an emitter every listener is on the critical path of, which is how one slow
  * plugin wedges a panel. When you need an answer, register a command or read a contribution point.
+ *
+ * The host emits one of its own: **`neosh.ready`**, `from: "neosh"`, once every plugin has loaded.
+ * Your `activate` returning is not that moment — the others are still loading alongside you, so a
+ * command you would call is a name nothing answers to yet, a contribution point somebody else
+ * fills is still empty, and a model a plugin registers is not selectable. Anything that depends on
+ * the *rest* of the workspace goes in a `neosh.ready` listener rather than at the end of
+ * `activate`. It is said again after `^R`, which is the same fact being true a second time.
  */
 export interface EventApi {
   emit(name: string, data?: unknown): Promise<void>;

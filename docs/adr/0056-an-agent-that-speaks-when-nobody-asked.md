@@ -1,4 +1,4 @@
-# 0055 — An agent that speaks when nobody asked
+# 0056 — An agent that speaks when nobody asked
 
 **Status:** accepted
 
