@@ -619,10 +619,10 @@ await neosh.status.set("model", { text: "opus", keys: "^P", align: "right", prio
 ```
  PLAN
 ─────────────────────────────────
-   ██████░░  75% Session      27m
-   ████████  96% Weekly        8h
-   ████████ 100% Weekly ·…     8h
-   extra usage off
+ ██████░░  75% Session        27m
+ ████████  96% Weekly          8h
+ ████████ 100% Weekly ·…       8h
+ extra usage off
 ```
 
 At the foot of the sidebar, because unlike the context meter it is not about the conversation you
@@ -780,10 +780,10 @@ A conversation that is working says so wherever it appears. In the panel it carr
 its turn has been running; the one you are in gets the spinner:
 
 ```
- ★ ▾ neosh                        3
-     ▸ the flaky test in ci     1m 4s
-       ◍ rename the extmark api    22s
-       a question from yesterday   3h
+ ▾ neosh ★                       3
+   ▸ the flaky test in ci     1m 4s
+   ◍ rename the extmark api      22s
+   a question from yesterday      3h
 ```
 
 Switching back puts you in the middle of the answer rather than before it: what the turn has already
