@@ -852,6 +852,28 @@ pub fn tasks(g: &Glyphs, rows: &[TaskRow], width: usize) -> Vec<Row> {
         .collect()
 }
 
+/// The header over what a finished turn walked away from.
+///
+/// The one line the user asked for and the transcript could not say. A turn ends, the working line
+/// goes away with the footer that was listing what was out, and the answer sitting there reads as
+/// *done* — while the shell the agent detached two minutes ago is still building. The rows under
+/// this say what those things are; this says that they are, and that the turn ending was not them
+/// finishing.
+///
+/// It wears `Status.Unread` rather than anything that moves. `Status.Pending` pulses because a
+/// question ends the moment you answer it and the motion is asking you to; this ends when it ends,
+/// and a transcript that throbs at you over work you were told to ignore is the version of this
+/// nobody wants. See ADR 0045 on why motion means "act now".
+pub fn still_running(g: &Glyphs, n: usize) -> Vec<Row> {
+    let what = if n == 1 { "1 thing".to_string() } else { format!("{n} things") };
+    let text = format!("{} Still running in the background \u{b7} {what}", g.elbow);
+    let mark = g.elbow.len();
+    vec![Row::new(text.clone(), vec![
+        (0, mark, "Agent.Usage"),
+        (mark, text.len(), "Status.Unread"),
+    ])]
+}
+
 /// A compaction, once it has landed, as the one row it leaves behind.
 ///
 /// Worth a row of its own rather than a note that disappears: the conversation the agent is holding

@@ -3417,6 +3417,137 @@ export async function activate({ neosh }: PluginContext) {
 }
 "#;
 
+/// A provider that reports it is waiting and then never finishes — the shape of a vendor CLI sitting
+/// in retry backoff after a 529.
+///
+/// The reason this needs a test at all is that the failure mode is *nothing on screen*: several
+/// minutes with no tokens, no card and no card body, which is indistinguishable from a wedged
+/// process and is what sends people to `^C` on a turn that was about to come back.
+const WAITER: &str = r#"
+import type { PluginContext } from "@neosh/api";
+
+export async function activate({ neosh }: PluginContext) {
+  await neosh.provider.register("waiter", [{
+    id: "waiter", driver: "waiter", display_name: "Waiter",
+    models: [{ id: "waiter", display_name: "Waiter" }],
+  }], async (_req, emit) => {
+    emit({ type: "message_start", model: "waiter", usage: {} });
+    emit({ type: "activity", activity: {
+      kind: "waiting",
+      what: "Retrying after 529 · attempt 2 of 5",
+      retry_in_ms: 4200,
+    } });
+    // And then nothing. The wait is the whole turn.
+  });
+  neosh.notify("waiter ready");
+}
+"#;
+
+fn install_waiter(sb: &Sandbox) {
+    let dir = sb.root.join("config/plugins/waiter");
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    std::fs::write(
+        dir.join("plugin.toml"),
+        "name = \"waiter\"\nversion = \"0.1.0\"\nentry = \"main.ts\"\npermissions = [\"providers\"]\n",
+    )
+    .expect("manifest");
+    std::fs::write(dir.join("main.ts"), WAITER).expect("plugin");
+}
+
+#[test]
+fn a_turn_that_is_waiting_says_what_it_is_waiting_for() {
+    // "Working… 4m" and "Retrying after 529 · attempt 2 of 5 · in 5s … 4m" are the same turn. Only
+    // one of them is a reason to keep waiting rather than to interrupt. See ADR 0051.
+    let sb = Sandbox::new("waiting");
+    install_waiter(&sb);
+    sb.write_config("[options]\n\"agent.model\" = \"waiter/waiter\"\n");
+    let mut s = sb.start_letting_config_choose();
+    s.wait_for("waiter ready");
+
+    s.type_text("go");
+    s.enter();
+    assert!(
+        s.pump(|s| s.chat_now().iter().any(|l| l.contains("Retrying after 529")
+            && l.contains("attempt 2 of 5")
+            && l.contains("esc to interrupt"))),
+        "the working line says why nothing is happening\n{:?}",
+        s.chat_now()
+    );
+    // Rounded up rather than truncated: a wait reported as `in 0s` reads as a lie.
+    assert!(
+        s.chat_now().iter().any(|l| l.contains("in 5s")),
+        "and how long it expects to be\n{:?}",
+        s.chat_now()
+    );
+}
+
+/// A provider that backgrounds something, answers, and ends — the shape of `run_in_background`.
+const LEAVER: &str = r#"
+import type { PluginContext } from "@neosh/api";
+
+export async function activate({ neosh }: PluginContext) {
+  await neosh.provider.register("leaver", [{
+    id: "leaver", driver: "leaver", display_name: "Leaver",
+    models: [{ id: "leaver", display_name: "Leaver" }],
+  }], async (_req, emit) => {
+    emit({ type: "message_start", model: "leaver", usage: {} });
+    emit({ type: "activity", activity: { kind: "background", tasks: [
+      { id: "bg1", title: "npm run build", kind: "local_bash" },
+    ] } });
+    emit({ type: "block_start", index: 0, block: { kind: "text" } });
+    emit({ type: "text_delta", index: 0, text: "Started the build." });
+    emit({ type: "block_stop", index: 0 });
+    emit({ type: "message_delta", stop_reason: { kind: "end_turn" }, usage: {} });
+    emit({ type: "message_stop" });
+  });
+  neosh.notify("leaver ready");
+}
+"#;
+
+fn install_leaver(sb: &Sandbox) {
+    let dir = sb.root.join("config/plugins/leaver");
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    std::fs::write(
+        dir.join("plugin.toml"),
+        "name = \"leaver\"\nversion = \"0.1.0\"\nentry = \"main.ts\"\npermissions = [\"providers\"]\n",
+    )
+    .expect("manifest");
+    std::fs::write(dir.join("main.ts"), LEAVER).expect("plugin");
+}
+
+#[test]
+fn a_finished_turn_says_what_it_walked_away_from() {
+    // The turn ends and the footer listing what was out goes away with the working line. Without
+    // this the one case people actually ask about — "it says it is done, is it?" — is the one that
+    // leaves no trace at all. See ADR 0051.
+    let sb = Sandbox::new("leftrunning");
+    install_leaver(&sb);
+    sb.write_config("[options]\n\"agent.model\" = \"leaver/leaver\"\n");
+    let mut s = sb.start_letting_config_choose();
+    s.wait_for("leaver ready");
+
+    s.type_text("build it");
+    s.enter();
+    s.wait_for("Started the build.");
+    assert!(
+        s.pump(|s| s.chat_now().iter().any(|l| l.contains("Still running in the background"))),
+        "the answer does not get to be the last word\n{:?}",
+        s.chat_now()
+    );
+    assert!(
+        s.chat_now().iter().any(|l| l.contains("npm run build") && l.contains("local_bash")),
+        "and it says what, in the driver's own words for the kind of thing it is\n{:?}",
+        s.chat_now()
+    );
+    // The conversation is what carries this, not the turn — so the row in the panel knows too, and
+    // knows it after the turn that started it is over.
+    assert!(
+        s.pump(|s| s.sidebar_now().iter().any(|l| l.contains("\u{25cb} build it"))),
+        "the panel marks a conversation that is still doing something\n{:?}",
+        s.sidebar_now()
+    );
+}
+
 /// A provider that says something and then never finishes — the shape of a real turn that has
 /// written a sentence and gone off to run tools.
 const HALFWAY: &str = r#"

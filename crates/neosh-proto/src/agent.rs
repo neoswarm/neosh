@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 use ts_rs::TS;
 
 use crate::ids::{SessionId, ToolCallId, TurnId};
+use crate::provider::BackgroundTask;
 
 // ---------------------------------------------------------------------------
 // Conversation
@@ -222,6 +223,19 @@ pub struct SessionInfo {
     /// conversation with the answer in it.
     #[serde(default)]
     pub unread: bool,
+    /// What is still running here that no turn is waiting for.
+    ///
+    /// The other half of [`Self::unread`]. That one says a turn *finished* somewhere you were not
+    /// looking; this says one did not finish everything it started — a shell the agent put in the
+    /// background, a sub-agent it let go of — and that the conversation is still doing something
+    /// even though it has told you it is done.
+    ///
+    /// A level: whatever the driver last said is running, verbatim, and empty means nothing is.
+    /// Kept on the conversation rather than the turn because the turn is over — that is the case
+    /// it exists for — and because there is more than one list that has to agree about it. See
+    /// [`crate::Activity::Background`], including why it is never persisted.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub background: Vec<BackgroundTask>,
     /// Put away rather than thrown away.
     ///
     /// An archived conversation keeps every message and can be brought back; it is simply not in

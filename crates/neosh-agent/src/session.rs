@@ -95,6 +95,13 @@ pub struct Session {
     /// there is more than one list: the panel, a status segment and a picker all have to agree,
     /// and a second panel deriving it from timestamps would disagree with the first.
     pub unread: bool,
+    /// What is still running here that no turn is waiting for.
+    ///
+    /// See [`neosh_proto::SessionInfo::background`]. Held on the conversation for the same reason
+    /// `unread` is — several lists have to agree about it — and, unlike `unread`, deliberately not
+    /// written down: the driver only reports this while its process is up, and a workspace that
+    /// restarted would otherwise report a shell that died with it.
+    pub background: Vec<neosh_proto::BackgroundTask>,
     /// Put away, not thrown away: still on disk, still openable, just not in the everyday list.
     pub archived: bool,
     /// When it was put away, in seconds since the epoch. Set by whoever archives it, for the same
@@ -131,6 +138,7 @@ impl Session {
             created_at: 0,
             updated_at: 0,
             unread: false,
+            background: Vec::new(),
             archived: false,
             archived_at: None,
             permission_mode: None,
@@ -271,6 +279,7 @@ impl Session {
             // Filled in by the store, which is the only thing that knows.
             is_active: false,
             unread: self.unread,
+            background: self.background.clone(),
             archived: self.archived,
             archived_at: self.archived_at,
             permission_mode: self.permission_mode,
