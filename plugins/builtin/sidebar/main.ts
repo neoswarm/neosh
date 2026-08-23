@@ -1650,9 +1650,13 @@ async function deleteSession(neosh: Neosh, session: string): Promise<boolean> {
  * still in it, removing the project is deleting every one of them, so it asks as the delete it is
  * and says how many and where they would otherwise go.
  *
- * The conversations go first and the project only goes if they all did. The store refuses to delete
- * the very last conversation in the workspace — there has to be somewhere for the next message to
- * land — and a project removed anyway would take a row that still had something in it off the list.
+ * The conversations go first and the project only goes if they all did: a project removed anyway
+ * would take a row that still had something in it off the list.
+ *
+ * Removing the *last* project used to be the one case this could not finish: the store refused to
+ * delete the very last conversation in the workspace. It no longer does — what you land in is a
+ * placeholder, which is in no list and so in no project — so `X` here can leave the panel with
+ * nothing but `+ Add project` on it. See ADR 0039.
  */
 async function removeProject(
   neosh: Neosh,
@@ -2669,21 +2673,31 @@ function projectRow(
   // A question in there outranks it, and for the same reason it does on the conversation's own row:
   // one of them is news that will keep, and the other is a turn that has stopped until you answer.
   // Only one mark, because there is one column and two would be a puzzle rather than a summary.
-  const unseen = folded && !waiting
+  // A third thing the fold can be hiding, and it sits between the other two: a question stops the
+  // workspace until you answer, a killed turn lost work, and an unread answer is waiting patiently.
+  const cut = folded && !waiting
+    ? within.filter((s) => !s.active_turn && s.interrupted).length
+    : 0;
+  const unseen = folded && !waiting && cut === 0
     ? within.filter((s) => !s.active_turn && s.unread).length
     : 0;
-  // Last rung of the same ladder: a folded project hiding a conversation that is still running
-  // something says so, and only when it is hiding nothing louder. Counted over the whole group,
-  // conversations included, because folded is exactly the state where the rows that know are the
-  // ones you cannot see.
-  const busyBg = folded && !waiting && unseen === 0
+  // Fourth and last rung: a folded project hiding a conversation that is still running something.
+  // Below all three, because a question stops the workspace, a killed turn lost work, an unread
+  // answer is waiting — and this is none of those. Counted over the whole group, conversations
+  // included, because folded is exactly the state where the rows that know are the ones you
+  // cannot see.
+  const busyBg = folded && !waiting && cut === 0 && unseen === 0
     ? within.filter((s) => !s.active_turn && (s.background?.length ?? 0) > 0).length
     : 0;
-  // Whichever of the two is being reported, drawn the same way and told apart by the glyph: solid
-  // for news, hollow for work. One column, one mark — two would be a puzzle rather than a summary.
-  const [count, dot] = unseen > 0
-    ? [unseen, opts.ascii ? "!" : "●"]
-    : [busyBg, opts.ascii ? "o" : "○"];
+  // Whichever rung is being reported, drawn the same way and told apart by the glyph and the
+  // colour. One column, one mark — two would be a puzzle rather than a summary.
+  const [count, dot, dotHl] = cut > 0
+    ? [cut, opts.ascii ? "x" : "✗", "Diagnostic.Error"]
+    : unseen > 0
+    ? [unseen, opts.ascii ? "!" : "●", "Status.Unread"]
+    // Hollow where the other two are solid: the difference between something here for you and
+    // something here still happening.
+    : [busyBg, opts.ascii ? "o" : "○", "Status.Monitoring"];
   const mark = folded && waiting
     ? " ?"
     : count === 0
@@ -2691,11 +2705,7 @@ function projectRow(
     : count === 1
     ? ` ${dot}`
     : ` ${dot}${count}`;
-  const markHl = folded && waiting
-    ? "Status.Pending"
-    : unseen > 0
-    ? "Status.Unread"
-    : "Status.Monitoring";
+  const markHl = folded && waiting ? "Status.Pending" : dotHl;
 
   const name = clip(
     p.name,
@@ -2749,10 +2759,17 @@ function worktreeRow(
     : p.sessions.length > 0
       ? { text: `${p.sessions.length} `, hl: "Sidebar.Dim" }
       : { text: "" };
-  const unseen = folded ? p.sessions.filter((s) => !s.active_turn && s.unread).length : 0;
-  const mark = unseen === 0 ? "" : unseen === 1
-    ? opts.ascii ? " !" : " ●"
-    : opts.ascii ? ` !${unseen}` : ` ●${unseen}`;
+  const cut = folded ? p.sessions.filter((s) => !s.active_turn && s.interrupted).length : 0;
+  const unseen = folded && cut === 0
+    ? p.sessions.filter((s) => !s.active_turn && s.unread).length
+    : 0;
+  const mark = cut > 0
+    ? cut === 1
+      ? opts.ascii ? " x" : " ✗"
+      : opts.ascii ? ` x${cut}` : ` ✗${cut}`
+    : unseen === 0 ? "" : unseen === 1
+      ? opts.ascii ? " !" : " ●"
+      : opts.ascii ? ` !${unseen}` : ` ●${unseen}`;
   // The branch glyph, in the branch colour — what says "this row is a checkout" at a glance, so
   // the name can be just the branch. No ASCII stand-in earns its column, so ASCII goes without.
   const glyph = opts.ascii ? "" : "⎇ ";
@@ -2768,7 +2785,11 @@ function worktreeRow(
   }
   if (mark !== "") {
     const at = byteLength(`${pad}${arrow} ${glyph}${name}`);
-    spans.push({ from: at, to: at + byteLength(mark), hl: "Status.Unread" });
+    spans.push({
+      from: at,
+      to: at + byteLength(mark),
+      hl: cut > 0 ? "Diagnostic.Error" : "Status.Unread",
+    });
   }
   return {
     text: `${pad}${arrow} ${glyph}${name}${mark}`,
@@ -2831,13 +2852,18 @@ function sessionRow(
   // something, so it is the one row that gets the attention colour — and it does not move, because
   // it is not going to stop being true on its own and a mark that pulses forever is a mark you
   // learn to look past. It goes away by being opened. See ADR 0042.
-  const unread = !working && !asking && s.unread;
+  const unread = !working && !asking && !s.interrupted && s.unread;
+  // The turn that was running here never ended, because the workspace it was running in stopped:
+  // the machine was shut down, the process was killed. It outranks `unread` — a turn that finished
+  // while you were away and a turn that was killed are both news, and only one of them lost work —
+  // and it does not move, because nothing is happening here: it already happened.
+  const interrupted = !working && !asking && s.interrupted;
   // Something the agent started and stopped waiting for — a shell it put in the background, a
-  // sub-agent it let go of. Last in the order on purpose: every state above it is either a block
-  // or news, and this is neither. It is the answer to "it said it was done, is it?", which is only
-  // a question once nothing louder is true.
-  const running = !working && !asking && !unread && s.background !== undefined &&
-    s.background.length > 0;
+  // sub-agent it let go of. Last in the order on purpose: every state above it is a block or news
+  // — and a killed turn is both — while this is neither. It is the answer to "it said it was done,
+  // is it?", which is only a question once nothing louder is true.
+  const running = !working && !asking && !interrupted && !unread &&
+    (s.background?.length ?? 0) > 0;
   const glyph = asking
     // A question mark, in both alphabets. Every other glyph here has an ASCII understudy because
     // the Unicode one is prettier; this one is already the character that means what it means, and
@@ -2847,6 +2873,10 @@ function sessionRow(
       ? s.is_active
         ? spinnerFrame()
         : opts.ascii ? "*" : "◍"
+      // The same mark a tool call that failed wears, and for the same reason: this did not finish.
+      // A conversation is the largest thing in the workspace that can fail to finish.
+      : interrupted
+        ? opts.ascii ? "x" : "✗"
       : unread
         ? opts.ascii ? "!" : "●"
         : running
@@ -2896,6 +2926,11 @@ function sessionRow(
       ? "Status.Pending"
       : working
         ? s.is_active && pulseBright() ? "Status.Working" : "Status.Monitoring"
+        // Red, and the palette's red for something that went wrong rather than a status colour of
+        // its own: work was lost here. The whole row again, for the reason the unread mark takes
+        // the whole row.
+        : interrupted
+          ? "Diagnostic.Error"
         : unread
           // The whole row, not only the dot: a single coloured character five columns in is findable
           // if you already know it is there, which is the one thing you cannot assume about the
@@ -2916,7 +2951,9 @@ function sessionRow(
         ? "Status.Pending"
         : working
           ? "Status.Working"
-          : unread
+          : interrupted
+            ? "Diagnostic.Error"
+            : unread
             ? "Status.Unread"
             : running ? "Status.Monitoring" : "Sidebar.Dim",
     },

@@ -233,6 +233,20 @@ impl Git {
         self.git(["switch", rev]).await.map(|_| ())
     }
 
+    /// Move a branch to another name, keeping everything on it.
+    ///
+    /// `git branch -m` writes one ref and leaves the working tree alone, which is what makes it
+    /// safe to run on the branch a worktree currently has checked out — including while an agent
+    /// is editing files in that worktree. Renaming is therefore not a checkout: nothing is
+    /// stashed, nothing is rewritten, and a half-finished edit survives it.
+    ///
+    /// Fails rather than clobbers when `new` is taken. `-M` would overwrite the other branch, and
+    /// silently discarding somebody's work to give a generated name its first choice is not a
+    /// trade worth making — the caller has the branch list and can pick a free name.
+    pub async fn rename_branch(&self, old: &str, new: &str) -> Result<(), VcsError> {
+        self.git(["branch", "-m", old, new]).await.map(|_| ())
+    }
+
     pub async fn stage(&self, paths: &[String]) -> Result<(), VcsError> {
         let mut args = vec!["add".to_string(), "--".to_string()];
         if paths.is_empty() {

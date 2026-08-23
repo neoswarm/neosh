@@ -13,11 +13,15 @@ cargo test --workspace
 # without the generated TypeScript being regenerated, the plugin ecosystem is now compiling against
 # a lie — so that is a build failure, not a warning.
 step "TypeScript bindings are in sync with the Rust types"
-cargo test -p neosh-proto --quiet >/dev/null
+# Pinned to *this* checkout. ts-rs reads the directory from the environment, and an exported
+# `TS_RS_EXPORT_DIR` beats `.cargo/config.toml` — so in a git worktree the export lands in whichever
+# checkout that variable happens to name, and the diff below then compares files nothing wrote to.
+# A drift check that passes because it looked at the wrong tree is worse than no drift check.
+TS_RS_EXPORT_DIR="$PWD/plugins/api/src/generated" cargo test -p neosh-proto --quiet >/dev/null
 if ! git diff --exit-code -- plugins/api/src/generated; then
   echo
   echo "error: generated TypeScript is out of date with the Rust types."
-  echo "       run 'cargo test -p neosh-proto' and commit plugins/api/src/generated."
+  echo "       run 'TS_RS_EXPORT_DIR=\"$PWD/plugins/api/src/generated\" cargo test -p neosh-proto'"
   exit 1
 fi
 

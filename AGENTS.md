@@ -88,6 +88,22 @@ per decision, and records the *reasoning*, not the choice.
   a promise about a keyboard. A capability that runs out of chords loses its key and keeps its
   command — `^K` runs it by name and `init.ts` can bind it — because inventing a prefix layer for
   one verb costs every user a concept to save one of them a keystroke. See ADR 0048.
+- **The cursor is on a character, and the frontend is the only thing that knows where that is.**
+  Reading the transcript is a normal mode, so `$` is the last character rather than the space after
+  it, `h` at column zero stays on its row, nothing parks past the end of one, and a selection
+  contains the character the cursor is on — `v` then `y` copies a letter instead of reporting an
+  empty selection. That last one is `SelectShape` on the window (`exclusive` / `inclusive` / `line`),
+  not an invariant the caller re-establishes after every motion, because a motion that forgets to is
+  a frame with the wrong rows lit. The motions are `crate::vim`, over plain rows, and deliberately
+  not a second set of answers in `CursorMotion`: that vocabulary is the composer's and every text
+  field's, and one `h` that means two things is a call whose behaviour depends on who is asking.
+  **And the caret is placed from the rows that were drawn**, never from `cursor_row - top_line`:
+  the transcript wraps, one buffer row is four screen rows, and the two counts agree until the
+  first long paragraph and then diverge by one row per wrap — far enough in, the caret was off the
+  window and therefore not drawn at all, which is a mode with no cursor in it. A window bends its
+  own scroll to keep its cursor on screen and reports back what it actually drew, including `rows`,
+  the buffer rows on the screen — which is what `^D` and `H`/`M`/`L` are counted in and is not the
+  height. See ADR 0051.
 - **A list is a place you move in.** Anywhere there is a cursor over rows and no text field — the
   project panel, the transcript reader — the motions are Vim's and they take a count: `5j` is five
   rows you can *land on*, `^D`/`^U` are half of the panel's real height, `12G` is a row rather than
@@ -216,6 +232,23 @@ per decision, and records the *reasoning*, not the choice.
   no `<repo>` level, nothing else's trees can land there — and `add_worktree` writes the directory
   into the repository's `.gitignore` (tracked, so every clone gets it; skipped when already
   ignored), or every `git status` reads as one giant untracked directory. See ADR 0046.
+- **A branch is named by what you asked for, once you have asked.** A worktree you did not name
+  starts on `wily-nimbus`, because naming a branch before the work is a decision made at the worst
+  possible moment — and the first message sent in it *is* that decision, arriving on its own, so
+  the branch is renamed from it and never touched again. Only a name nobody chose: the mark is a
+  session var written by whoever generated it (`git.branch.scratch`), never a pattern match on the
+  shape of the name, which cannot tell `brisk-otter` we picked from `brisk-otter` you typed. At
+  turn *start*, because the panel is drawn all through a turn — `git branch -m` is one ref write,
+  so it is safe under a running agent and safe on uncommitted work. **One attempt, ever**: the mark
+  is spent before the model is asked, or a cheap model's hiccup becomes a request per message. The
+  *type* is the model's — `feature/`, `fix/`, `chore/` — so `git.branch.prefix` applies only to a
+  name that arrived without one, or you get `feature/fix/the-login` under a type that is now wrong.
+  `git.branch.model` is unset by default and the plugin sends **no selection at all** rather than a
+  guess, so the fallback stays the host's: `gen.model`, then the model you are already talking to.
+  And the host has to put *its own* label right — `ProjectFacts` is asked once per directory and
+  read on every redraw, so `GitRenameBranch` is the one git write handled on the host loop, which
+  is what makes the sidebar row follow instead of saying `wily-nimbus` until restart. The directory
+  keeps the old name on purpose: moving it would invalidate the conversation's `cwd`. See ADR 0051.
 - **A project outlives the conversations in it.** The panel's list is written down (`sidebar.projects`,
   a workspace var) rather than worked out from where the conversations happen to be — derived, it
   deleted the directory you had worked in all month the moment you cleared out the last thread in
@@ -246,14 +279,50 @@ per decision, and records the *reasoning*, not the choice.
   `Status.Unread` must not do — and the queue behind it is in memory while the var is on disk, so it
   is announced once at startup, empty, and that is what clears the one left behind by a workspace
   that stopped mid-question. See ADR 0043.
+- **A question is the last thing in the transcript until something answers it.** A turn's closing
+  rows — its plan, what it left running, what it changed — are about the answer they close, so they
+  splice in *above* a question steered in after that answer rather than at the end of the buffer,
+  where they sat under a message you had just typed. And a question the turn ended without
+  answering says so in a row of its own, out of the stop reason: a bare question reads exactly like
+  one still being thought about, and a toast that has faded is not an answer to "why is nothing
+  happening". A plugin veto is a `Refusal` carrying its reason and never `Cancelled`, which is what
+  `<Esc>` means. **An entry in the running-turns map lives until `TurnEnded` arrives** — `<Esc>`
+  flags it rather than removing it, because removing it early let a message typed in the gap start
+  a *second* turn in one conversation, which the first turn's ending then dismantled. Steering never
+  takes a message it cannot deliver: the tool-gap take is guarded on cancellation, and what stays in
+  the queue becomes the next turn. Leaving the reader goes back to following the newest, and so does
+  sending — whether it starts a turn or joins one. See ADR 0052.
+- **An orchestrator is a plugin, and it drives conversations by name.** `agent.command` carries the
+  same `AgentCommand` vocabulary `swarm.command` does, at a conversation named by id and defaulting
+  to the one on screen; `swarm.command` aimed at this node runs it here rather than dialling itself.
+  Watching was always per-conversation — `Token`, `ToolFinished`, `TurnEnded` all name one — so
+  until this existed the local API could see every conversation in the workspace and drive exactly
+  one of them, and fanning work out meant `SessionSwitch` before every message, which moves the
+  transcript out from under whoever is reading it. **Which model answers is a hook**: `turn.route`
+  fires after the words are settled and before the driver is resolved, may re-point the turn or veto
+  it with a reason, and writes its choice back to the conversation so the footer and `^P` agree with
+  the turn. **The declared permissions are enforced** — a tool, a provider driver, a *blocking* hook
+  and a raw-cell surface each need the word in `plugin.toml`, an observer needs nothing, and drawing
+  and reading stay free. **A plugin arrives as a git clone**: `neosh plugin add <url>`, validated
+  before it is moved into place, named by its manifest, and never able to delete what you put in
+  your own config directory by hand. See ADR 0053.
 - **A card is a row until you ask for more.** A call that only *looked* at something folds to its
-  header with the size of what came back on the end of it; a command keeps its output, an edit keeps
-  its diff, and a failure always shows. See ADR 0033.
-- **A run of calls that only looked at things is one row**, naming as many of them as fit and
-  counting the rest — a turn that read six files reads as one. A run is calls with *nothing drawn
-  between them*, asked the same way by the live path and the replay, or switching away and back
-  re-folds the conversation. Only a mark that is news gets drawn: `▸` while a call is out, `✗` if it
-  failed, and nothing at all when it worked. See ADR 0040.
+  header with the size of what came back on the end of it; a command keeps its output — a stack of
+  them keeps the last one's — an edit keeps its diff, and a failure always shows. See ADR 0033.
+- **A run of calls of one kind is one row**, naming as many of them as fit and counting the rest —
+  a turn that read six files reads as one, and so does a stretch of it spent on `git add`, `git
+  commit`, `git push`. Reads with reads and commands with commands, never one of each, and never an
+  edit. A run is calls with *nothing drawn between them*, asked the same way by the live path and
+  the replay, or switching away and back re-folds the conversation. A stack of commands keeps the
+  **last one's output** — what a command printed is the answer, and the ones before it are how you
+  got there — names each command by what it *is* rather than how it was spelled (`cargo test`, not
+  `cargo test -p neosh-core -- --test-threads 2`), and gives every command back in full, with what
+  it said, on `⇥`. A run **never continues past a failure**, so a failed command is the last call
+  on its card and its output is the one showing. While a run is still going the row is fitted from
+  the *end*: then it is a report of what is happening rather than an account of what happened, and
+  the call being waited on is the one name that must never be the name that did not fit. Only a
+  mark that is news gets drawn: `▸` while a call is out, `✗` if it failed, and nothing at all when
+  it worked. See ADR 0040 and ADR 0051.
 - **A card says what happened, not which tool did it.** `Ran cargo test`, not `Bash cargo test` —
   read off the arguments, like the colour. A call nothing here classifies keeps the name its author
   gave it, so a plugin's tool is never renamed. **A command's output folds from the middle**: the
@@ -265,12 +334,19 @@ per decision, and records the *reasoning*, not the choice.
 - **A terminal cannot paste a picture, so pasting one is a key.** Bracketed paste is a text
   protocol: a screenshot arrives as nothing, and a dragged file arrives as its path. `^V` asks the
   system clipboard through whichever of `wl-paste`/`xclip`/`pngpaste`/`osascript`/`powershell` is
-  there; a pasted line that is unambiguously a path to an image becomes that image. An attachment
-  is a **chip above the field**, never a token in it — the message you send is the message you
-  typed. `ContentBlock::Image` carries a *path*, not bytes: a transcript that is mostly base64 is
-  one nothing can read back, so the bytes live once in the state directory and a driver reads them
-  when it builds its request. The media type is read off the bytes, because a `.png` that is really
-  a JPEG fails the turn. See ADR 0041.
+  there; a pasted line that is unambiguously a path to an image becomes that image. A clipboard is
+  **asked what it holds, not told**: the best picture type *on offer* is the one requested, because
+  asking for `image/png` and nothing else reads a JPEG, a WebP and a BMP as an empty clipboard. And
+  a picture copied off a page is often not on the clipboard at all — what a browser leaves is an
+  address (`text/uri-list`, an `<img src>` in `text/html`, a `data:` URI, a plain URL), so
+  `from_clipboard` answers with bytes *or* a `Remote` to go and get. That fetch is spawned rather
+  than awaited on the loop, carries the conversation it was asked in, and is the one attachment
+  that says something on the way. A photograph too busy to fit as a PNG is sent as a JPEG rather
+  than refused over an encoding. See ADR 0051. An attachment is a **chip above the field**, never a
+  token in it — the message you send is the message you typed. `ContentBlock::Image` carries a
+  *path*, not bytes: a transcript that is mostly base64 is one nothing can read back, so the bytes
+  live once in the state directory and a driver reads them when it builds its request. The media
+  type is read off the bytes, because a `.png` that is really a JPEG fails the turn. See ADR 0041.
 - **A vendor CLI outlives the turn, so an abandoned turn has to be *drained*.** `Live::lines` is
   per conversation. A turn that is walked away from — `<Esc>`, a switch — leaves the CLI mid-answer
   with the rest of it in the pipe, and the next turn reads it as its own: someone else's reply, and
@@ -345,14 +421,26 @@ minute on their own:
 cargo test -p neosh-core -- --test-threads 2
 cargo test -p neosh --test builtin_plugins -- --test-threads 2
 cargo test -p neosh --test workspace -- --test-threads 2
-cargo test -p neosh-proto export_bindings && git diff --exit-code plugins/api/src/generated
+cargo test -p neosh --test plugin_manager -- --test-threads 2
+# ts-rs reads the export directory from the environment, and an exported `TS_RS_EXPORT_DIR`
+# beats `.cargo/config.toml` — so in a worktree this has to say which checkout it means, or
+# the generated files land in another one and the diff below passes having read nothing.
+TS_RS_EXPORT_DIR="$PWD/plugins/api/src/generated" cargo test -p neosh-proto export_bindings \
+  && git diff --exit-code plugins/api/src/generated
 cd plugins/api && npx tsc --noEmit
 ```
 
 `tests/workspace.rs` runs a real `neosh --serve` and talks to it over a real socket, because what it
 asserts is that one process survives another going away. Each sandbox gets its own socket via its
 own `--config-dir` — which is also what stops the suite attaching to *your* workspace and stopping
-it.
+it. `tests/plugin_manager.rs` does the same for installing: a real git repository, a real clone, and
+a real workspace started afterwards to see whether the plugin actually ran — a `--config-dir` **and**
+a `NEOSH_DATA_DIR` of its own, because that is where an install lands.
+
+`tests/builtin_plugins.rs` starts a whole neosh per test and waits on what appears on screen, so it
+is timing-sensitive: under load a handful of unrelated tests fail on a `wait_for` timeout, and a
+different handful each run. A failure there is worth re-running alone (`--test-threads 1 <name>`)
+before believing it.
 
 **Terminal behaviour is checked by driving the real binary**, not by reading the code. `scripts/shot.py`
 runs neosh under a pty and prints what the screen actually looks like:
@@ -399,7 +487,7 @@ only way to do anything. See ADR 0048.
 | `⏎` | Send. While a turn is running, **steer** it: the message is held and taken in at the next gap. |
 | `⇧⏎` | Newline, so a pasted snippet stays one message |
 | `^Y` | Take the last thing you queued back into the composer, to change it or drop it. Readline's yank: `^U`/`^W` kill, `^Y` brings it back |
-| `^V` | Attach the image on the clipboard. A key rather than a paste, because a terminal's paste can only ever hand over text |
+| `^V` | Attach the image on the clipboard — the picture itself, or the one it only names: a page's `<img>`, a URL, a file. A key rather than a paste, because a terminal's paste can only ever hand over text |
 | `⌫` | On an empty composer, take the last attached image back off |
 | `^P` | Pick a model. Mid-turn too — the running agent is told, and thinks the rest with it |
 | `^E` | Everything this model can be told, on one panel: effort, thinking, fast mode, context, and whatever a driver invented. `h`/`l` along a row, `j`/`k` between them, arrows too, and it applies as you move. Nothing else reaches the keyboard while it is open; `^E` again closes it |
@@ -407,7 +495,7 @@ only way to do anything. See ADR 0048.
 | `^T` | Projects and conversations. Switching is never refused — turns keep running where they are |
 | `^J` | The computers in this workspace. Add one by its address, allow one that is asking, or open what it is running |
 | `^F` | What you have archived. Filter it, put one back, or finally throw it away |
-| `^N` | New conversation. In a repository it asks where: here, a worktree you need not name, one kept inside the project, one you do name, an existing one, another machine, elsewhere |
+| `^N` | New conversation. In a repository it asks where: here, a worktree you need not name, one kept inside the project, one you do name, an existing one, another machine, elsewhere. A worktree you did not name is named by your first message — `fix/composer-paste-truncation`, not `wily-nimbus` |
 | `^O` | Add a project |
 | `^B` | Toggle the sidebar |
 | `^K` | Command palette |
@@ -452,29 +540,49 @@ Two corollaries, both of which were bugs:
 - **A key another mode claimed never arrives.** Reading's keys come through the *unbound* path,
   which is the last thing consulted — so `^D` was whatever the git plugin bound it to.
 
+**The cursor is on a character, not between two.** Which is why the caret is a *block* here and a
+bar in the composer, why `$` is the last character rather than the space after it, why `h` at column
+zero stops rather than going to the row above, and why `v` then `y` copies the character you were
+looking at instead of saying there is nothing there. A screen is counted in the buffer rows actually
+on it, which after wrapping is not the window's height. See ADR 0051.
+
 | Key | Does |
 |---|---|
 | `hjkl`, arrows | Move. A count first does it that many times: `5j` |
-| `w` `b` | By word |
-| `0` `$` | Ends of the line |
+| `w` `b` `e` `ge` | By word. `W` `B` `E` by **WORD** — everything that is not a space |
+| `0` `^` `$` `g_` | The start of the line, its first non-blank, its last character, its last non-blank |
+| `f` `F` `t` `T` then `;` `,` | To a character on this line, or just before it. `;` again, `,` the other way |
+| `%` | The bracket matching the one under the cursor, however many rows away |
 | `gg` `G` | Ends of the transcript. With a count it is a row: `12G`, `12gg` |
 | `^D` `^U` | Half a screen, or that many of them |
 | `^F` `^B`, `PgUp`/`PgDn` | A screen |
+| `^E` `^Y` | Scroll a line without moving the cursor — until it would go off the edge |
+| `H` `M` `L` | The top, middle and bottom row **of the window** |
 | `zz` `zt` `zb` | Put the cursor's line in the middle, at the top, at the bottom |
 | `[` `]` | Previous / next **turn** |
 | `{` `}` | Previous / next **block** |
 | `⇥` `za` | Open or fold the **tool card** under the cursor — the whole diff, the whole output |
-| `/` `?` then `n` `N` | Search, and step through the matches |
+| `/` `?` then `n` `N` | Search, and step through the matches. `n` is *onwards*, so after `?` it goes up |
+| `*` `#` | Search for the word under the cursor, forwards or back |
 | `v` | Start a selection that motions extend. Again, or on a `V` selection, gives it up |
 | `V` | The same by whole lines — both ways, so extending upwards keeps the line you started on |
+| `o` | While selecting: the other end of what you have, so you can fix the end you got wrong |
+| `gv` | The selection you last gave up, back where it was |
+| `iw` `aw` `ip` `ap` `i"` `i(` `i[` `i{` … | While selecting: the word, paragraph, string or brackets the cursor is in. `a` takes the delimiters |
 | `y` | Copy the selection, and leave |
 | `yy` `Y` | Copy the line |
+| `y` + a motion | Copy what it covers: `yw`, `y$`, `y5j`, `yG`. Whole lines when it crosses rows |
+| `yi` + an object | Copy one without selecting it first — `yiw`, `yi"` |
 | `yc` | Copy the **code block** the cursor is in, without its indent or language line |
 | `ym` | Copy the whole **turn** — the question and everything it produced |
-| `ya` | Copy the entire transcript |
-| `i` `a` `o` `⏎` | Back to the composer |
+| `ya` | Copy the entire transcript. Which is why `ya`*w* is the one thing here that is not Vim's — `viwy` is |
+| `i` `a` `o` `⏎` | Back to the composer. While selecting, `i` and `a` open a text object and `o` swaps ends |
 | `^S` | And back out, the way you came in |
 | `Esc` | One thing per press: the selection, then the search highlight, then the mode |
+
+There is no `^V`: a blockwise selection is a rectangle rather than a range, and every consumer of a
+selection would have to grow a case for it. The key says so rather than doing nothing. Nothing here
+edits, either — no `d`, `c`, `x` or `p`. The transcript is an artefact you take pieces out of.
 
 ## Answering a question — the panel over the composer
 

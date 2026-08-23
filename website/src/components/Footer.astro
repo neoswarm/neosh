@@ -1,43 +1,38 @@
----
-import Logo from "./Logo.astro";
----
-
 <footer>
-  <div class="wrap row">
-    <Logo />
+  <div class="wrap">
     <div class="links">
-      <a href="https://github.com/neoswarm/neosh">GitHub</a>
-      <a href="https://github.com/neoswarm/neosh/tree/main/docs">Docs</a>
-      <a href="https://github.com/neoswarm/neosh/blob/main/website/src/data/plugins/README.md">Add a plugin</a>
+      <a target="_blank" rel="noopener" href="https://github.com/neoswarm/neosh">GitHub</a>
+      <a target="_blank" rel="noopener" href="https://github.com/neoswarm/neosh/tree/main/docs">Docs</a>
+      <a href="/plugins">Plugins</a>
+      <a target="_blank" rel="noopener" href="https://github.com/neoswarm/neosh/blob/main/website/src/data/plugins/README.md">Add a plugin</a>
     </div>
-  </div>
-  <div class="wrap fine">
-    <span>
-      MIT licensed. Not affiliated with the Neovim project. The mark is derived from the
-      <a href="https://github.com/neovim/neovim.github.io">Neovim logo</a> by Jason Long, CC BY 3.0.
-    </span>
+    <p class="fine">
+      MIT licensed. Not affiliated with the Neovim project, though that's my favorite code editor.
+    </p>
+    <p class="fine made">
+      Made with <span class="heart">♥</span> by <a target="_blank" rel="noopener" href="https://x.com/meszmatew">meszmate</a>
+    </p>
   </div>
 </footer>
 
 <style>
   footer {
-    border-top: 1px solid var(--line);
     padding: 40px 0 32px;
-  }
-
-  .row {
-    display: flex;
-    justify-content: space-between;
-    align-items: center;
-    flex-wrap: wrap;
-    gap: 16px;
   }
 
   .links {
     display: flex;
-    gap: 24px;
-    font-size: 14px;
+    flex-wrap: wrap;
+    gap: 32px;
+    font-family: var(--mono);
+    font-size: 13px;
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
     color: var(--muted);
+  }
+
+  .links a {
+    transition: color 0.2s ease;
   }
 
   .links a:hover {
@@ -45,8 +40,25 @@ import Logo from "./Logo.astro";
   }
 
   .fine {
-    margin-top: 24px;
+    margin: 24px 0 0;
     font-size: 12.5px;
     color: var(--dim);
+  }
+
+  .fine a {
+    text-decoration: underline;
+    text-underline-offset: 3px;
+  }
+
+  .fine a:hover {
+    color: var(--muted);
+  }
+
+  .made {
+    margin-top: 8px;
+  }
+
+  .heart {
+    color: #f87171;
   }
 </style>

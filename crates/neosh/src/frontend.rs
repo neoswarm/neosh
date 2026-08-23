@@ -50,7 +50,7 @@ pub struct TerminalUi {
     ///
     /// Only *changes* are sent. Emitting one per window per draw is a feedback loop: the event arms
     /// the redraw deadline, which draws, which emits the event again, forever.
-    reported: std::collections::HashMap<neosh_proto::WindowId, (u16, u16, u32)>,
+    reported: std::collections::HashMap<neosh_proto::WindowId, (u16, u16, u32, u32)>,
 }
 
 impl TerminalUi {
@@ -161,27 +161,29 @@ impl TerminalUi {
     }
 
     /// Tell the core where each window ended up, but only when it moved.
-    fn report_geometry(&mut self, geometry: &[(neosh_proto::WindowId, neosh_proto::Rect)]) {
-        for (win, rect) in geometry {
-            // Unscrolled reports as zero: what the frontend chose for a tail-following window is
-            // a *rendered* row, and the core counts in buffer rows — there is no honest number to
-            // put here, and every plugin reading it wants "the top of what is drawn".
-            let top = self.mirror.windows.get(win).and_then(|w| w.top_line).unwrap_or(0);
-            let now = (rect.width, rect.height, top);
-            if self.reported.get(win) == Some(&now) {
+    fn report_geometry(&mut self, geometry: &[neosh_tui::Geometry]) {
+        for g in geometry {
+            // The first buffer row that was *drawn*, which the frontend is the only thing that
+            // knows. It used to report back whatever the core had asked for, with a zero standing
+            // in for a tail-following window — but a rendered row does come from a buffer row, and
+            // a window whose scroll bent to keep its cursor on screen is showing a row nobody
+            // asked for. Everything paging by a screenful reads this number.
+            let now = (g.rect.width, g.rect.height, g.top_line, g.rows);
+            if self.reported.get(&g.win) == Some(&now) {
                 continue;
             }
-            self.reported.insert(*win, now);
+            self.reported.insert(g.win, now);
             let _ = self.input.send(InputEvent::ViewportChanged {
-                win: *win,
-                width: rect.width,
-                height: rect.height,
-                top_line: top,
+                win: g.win,
+                width: g.rect.width,
+                height: g.rect.height,
+                top_line: g.top_line,
+                rows: g.rows,
             });
         }
         // A window that closed should not keep a stale entry, or reopening it at the same size
         // would report nothing and leave every plugin with the old geometry.
-        self.reported.retain(|win, _| geometry.iter().any(|(w, _)| w == win));
+        self.reported.retain(|win, _| geometry.iter().any(|g| g.win == *win));
     }
 }
 

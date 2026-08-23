@@ -1,4 +1,4 @@
-# 0051 — A turn can end while its work does not, and a turn that is waiting should say so
+# 0054 — A turn can end while its work does not, and a turn that is waiting should say so
 
 **Status:** accepted
 

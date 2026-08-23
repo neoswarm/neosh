@@ -10,6 +10,10 @@ A terminal workspace where every feature is a plugin.
 
 [Quick start](#quick-start) · [How it works](#how-it-works) · [Plugins](#plugins) · [Docs](docs/) · [Community](#community)
 
+<br />
+
+<img src="docs/demo.gif" width="100%" alt="neosh running two conversations at once: a turn fixing a flaky test, switching sessions mid-turn, the finished turn going unread, and the transcript read in normal mode" />
+
 </div>
 
 <br />

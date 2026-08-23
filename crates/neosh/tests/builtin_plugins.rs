@@ -873,6 +873,155 @@ fn a_branch_name_is_generated_slugged_and_prefixed_from_config() {
     s.wait_for("feature/fix-the-login-redirect");
 }
 
+/// A prefix the user configured and a type the model chose are the same decision, made twice.
+///
+/// The built-in prompt asks for `fix/`, `feature/`, `chore/` and the rest, so a
+/// `git.branch.prefix` bolted on unconditionally reads `feature/fix/the-login-redirect` — a
+/// namespace nobody meant, under a type that is now wrong. The prefix is for a name that arrived
+/// without one, which is what it does here and what it still does in the test above.
+#[test]
+fn a_configured_prefix_does_not_stack_on_a_type_the_model_chose() {
+    if !have_git() {
+        return;
+    }
+    let sb = Sandbox::new("branchtyped");
+    sb.git_init();
+    sb.write_config("[options]\n\"git.branch.prefix\" = \"feature/\"\n");
+
+    let mut s = sb.start_with(
+        &Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/branch_name_typed.jsonl"),
+    );
+    s.wait_for("PROJECTS");
+
+    s.send(&command("git.branch.new"));
+    s.wait_for("What are you about to work on?");
+    s.type_text("the login page bounces");
+    s.special("enter");
+
+    s.wait_for("fix/the-login-redirect");
+    assert!(
+        !s.saw("feature/fix/the-login-redirect"),
+        "and the configured prefix was not stacked on top of it\n{}",
+        s.transcript()
+    );
+}
+
+/// `git.branch.model` is a model, and an unset one is the fallback rather than a guess.
+///
+/// The option is `instance/model`, parsed in the plugin and handed to `gen.complete` as a
+/// selection — so a malformed or absent one has to mean "you decide" all the way down to the host,
+/// which then tries `gen.model` and finally the conversation's own. A plugin that filled in a
+/// default here would be a third place the precedence is written, and the first to disagree.
+#[test]
+fn the_model_that_names_a_branch_is_a_setting() {
+    if !have_git() {
+        return;
+    }
+    let sb = Sandbox::new("branchmodel");
+    sb.git_init();
+    sb.write_config("[options]\n\"git.branch.model\" = \"mock/mock\"\n");
+
+    let mut s = sb.start_with(&branch_fixture());
+    s.wait_for("PROJECTS");
+
+    s.send(&command("git.branch.new"));
+    s.wait_for("What are you about to work on?");
+    s.type_text("the login page bounces");
+    s.special("enter");
+
+    // Named at all is the assertion: a selection the host could not resolve fails the call, and
+    // the plugin says so instead of proposing a name.
+    s.wait_for("fix-the-login-redirect");
+}
+
+/// A scratch worktree is named by the first thing asked in it, and the panel says so.
+///
+/// The whole shape of this: `git.worktree.new.inside` gives you `brisk-otter` because naming a
+/// branch before the work is a decision made at the worst possible moment — and the first message
+/// *is* that decision, arriving on its own. Three things have to happen and the third is the one
+/// that was missing: git renames the branch, the host notices that the label it wrote down when it
+/// first saw the directory is now wrong, and the sidebar row — which is that label — redraws.
+#[test]
+fn a_scratch_worktree_is_named_by_the_first_message_and_the_sidebar_follows() {
+    if !have_git() {
+        return;
+    }
+    let sb = Sandbox::new("branchauto");
+    sb.git_init();
+
+    let mut s = sb.start_with(
+        &Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/branch_name_typed.jsonl"),
+    );
+    s.wait_for("PROJECTS");
+
+    s.send(&command("git.worktree.new.inside"));
+    let under = sb.work().join(".worktrees");
+    assert!(
+        s.pump(|_| std::fs::read_dir(&under).is_ok_and(|d| d.count() > 0)),
+        "the worktree exists, on a name nobody chose"
+    );
+    let tree = std::fs::read_dir(&under)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .next()
+        .expect("one worktree");
+
+    // Whatever two words it landed on. Named for us, which is exactly what makes it replaceable.
+    let scratch = head_of(&tree);
+    assert!(scratch.contains('-'), "a two-word scratch name, not {scratch:?}");
+
+    // Waited for rather than assumed: creating the tree also starts a conversation in it and
+    // switches to it, and a test that types before that lands is typing into the conversation in
+    // the *main* checkout — where there is no scratch branch and nothing to rename.
+    let row_says = |s: &Session, want: &str| s.sidebar_now().iter().any(|l| l.contains(want));
+    let named_scratch = scratch.clone();
+    assert!(
+        s.pump(move |s| row_says(s, &named_scratch)),
+        "the worktree is a row in the panel, under the name nobody chose\n{:?}",
+        s.sidebar_now()
+    );
+
+    // The first thing asked in it. The turn and the naming call both read the same fixture, so
+    // which of them the mock answers first does not decide the test.
+    s.type_text("the login page bounces");
+    s.special("enter");
+
+    assert!(
+        s.pump(|_| head_of(&tree) == "fix/the-login-redirect"),
+        "git renamed the branch — it is on {:?}\n{}",
+        head_of(&tree),
+        s.transcript()
+    );
+    // And the row followed. Without the host putting right the label it wrote down the first time
+    // it saw this directory, the panel says the scratch name until the workspace restarts.
+    //
+    // Matched on the start of the name, because the row is a branch in a narrow column and the
+    // panel elides the end of it — `⎇ fix/the-login-redire…`. Asserting the whole string would be
+    // asserting the sidebar's width.
+    assert!(
+        s.pump(move |s| row_says(s, "⎇ fix/the-login")),
+        "the sidebar row followed it\n{:?}",
+        s.sidebar_now()
+    );
+    let gone = scratch.clone();
+    assert!(
+        !s.sidebar_now().iter().any(|l| l.contains(&gone)),
+        "and the scratch name is not still a row beside it\n{:?}",
+        s.sidebar_now()
+    );
+}
+
+/// Which branch a checkout is on, asked of git rather than of anything under test.
+fn head_of(dir: &Path) -> String {
+    let out = Command::new("git")
+        .current_dir(dir)
+        .args(["rev-parse", "--abbrev-ref", "HEAD"])
+        .output()
+        .expect("git runs");
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
 #[test]
 fn the_generated_name_is_editable_before_the_branch_is_created() {
     if !have_git() {
@@ -3457,7 +3606,7 @@ fn install_waiter(sb: &Sandbox) {
 #[test]
 fn a_turn_that_is_waiting_says_what_it_is_waiting_for() {
     // "Working… 4m" and "Retrying after 529 · attempt 2 of 5 · in 5s … 4m" are the same turn. Only
-    // one of them is a reason to keep waiting rather than to interrupt. See ADR 0051.
+    // one of them is a reason to keep waiting rather than to interrupt. See ADR 0054.
     let sb = Sandbox::new("waiting");
     install_waiter(&sb);
     sb.write_config("[options]\n\"agent.model\" = \"waiter/waiter\"\n");
@@ -3519,7 +3668,7 @@ fn install_leaver(sb: &Sandbox) {
 fn a_finished_turn_says_what_it_walked_away_from() {
     // The turn ends and the footer listing what was out goes away with the working line. Without
     // this the one case people actually ask about — "it says it is done, is it?" — is the one that
-    // leaves no trace at all. See ADR 0051.
+    // leaves no trace at all. See ADR 0054.
     let sb = Sandbox::new("leftrunning");
     install_leaver(&sb);
     sb.write_config("[options]\n\"agent.model\" = \"leaver/leaver\"\n");
@@ -5382,6 +5531,150 @@ fn calls_that_only_looked_at_things_share_one_row_and_open_into_several() {
     );
 }
 
+/// A provider that runs three commands in one turn, and a `run` tool with canned output for each.
+///
+/// The shell neosh does not have: what matters to a card is that the call was handed a `command`,
+/// which is how a card decides what a call is in the first place — off the arguments, never off a
+/// list of tool names.
+const RUNNER: &str = r#"
+import type { PluginContext } from "@neosh/api";
+
+const SAID: Record<string, string> = {
+  "git add -A": "",
+  "git commit -m 'stack the cards'": "[main 6759f10] stack the cards\n 3 files changed",
+  "git push origin main": "To github.com:neoswarm/neosh\n   6759f10..c280938  main -> main",
+};
+
+export async function activate({ neosh }: PluginContext) {
+  await neosh.tool.register(
+    { name: "run", description: "Run", inputSchema: { type: "object" } },
+    async (input) => ({ content: SAID[(input as { command: string }).command] ?? "ran" }),
+  );
+  let turn = 0;
+  await neosh.provider.register("runner", [{
+    id: "runner", driver: "runner", display_name: "Runner",
+    models: [{ id: "runner", display_name: "Runner" }],
+  }], async (_req, emit) => {
+    emit({ type: "message_start", model: "runner", usage: {} });
+    turn += 1;
+    if (turn === 1) {
+      Object.keys(SAID).forEach((command, i) => {
+        emit({ type: "block_start", index: i, block: { kind: "tool_use", id: `r${i}`, name: "run" } });
+        emit({ type: "tool_input_delta", index: i, partial_json: JSON.stringify({ command }) });
+        emit({ type: "block_stop", index: i });
+      });
+      emit({ type: "message_delta", stop_reason: { kind: "tool_use" }, usage: {} });
+      emit({ type: "message_stop" });
+      return;
+    }
+    emit({ type: "block_start", index: 0, block: { kind: "text" } });
+    emit({ type: "text_delta", index: 0, text: "Pushed." });
+    emit({ type: "block_stop", index: 0 });
+    emit({ type: "message_delta", stop_reason: { kind: "end_turn" }, usage: {} });
+    emit({ type: "message_stop" });
+  });
+  neosh.notify("runner ready");
+}
+"#;
+
+fn install_runner(sb: &Sandbox) {
+    let dir = sb.root.join("config/plugins/runner");
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    std::fs::write(
+        dir.join("plugin.toml"),
+        "name = \"runner\"\nversion = \"0.1.0\"\nentry = \"main.ts\"\npermissions = [\"providers\", \"tools\"]\n",
+    )
+    .expect("manifest");
+    std::fs::write(dir.join("main.ts"), RUNNER).expect("plugin");
+}
+
+/// ADR 0051. A stretch of a turn spent running things is one row, and the answer is the last one's.
+#[test]
+fn a_run_of_commands_is_one_row_that_keeps_the_last_answer() {
+    let sb = Sandbox::new("stack");
+    install_runner(&sb);
+    sb.write_config(
+        "[options]\n\"agent.model\" = \"runner/runner\"\n\"ui.confirm_destructive\" = false\n",
+    );
+    let mut s = sb.start_letting_config_choose();
+    // The splash names the active model, and the model the config asked for only becomes active
+    // once the plugin that provides it has finished loading. "runner ready" is the plugin saying
+    // it registered; this is the host saying it took.
+    s.wait_for("runner/runner");
+    s.type_text("go");
+    s.enter();
+    assert!(
+        s.pump(|s| {
+            let rows = s.chat_now();
+            rows.iter().any(|l| l.contains("Pushed."))
+                && !rows.iter().any(|l| l.contains("esc to interrupt"))
+        }),
+        "the turn finished\n{:?}",
+        s.chat_now()
+    );
+    let rows = s.chat_now();
+    let run = rows
+        .iter()
+        .position(|l| l.starts_with("  Ran  "))
+        .unwrap_or_else(|| panic!("the stack is one row\n{rows:?}"));
+    assert_eq!(
+        rows[run], "  Ran  git add, git commit, git push origin",
+        "each command named by what it is rather than how it was spelled\n{rows:?}"
+    );
+    // The last one's output, because that is the one the other two were getting to.
+    assert!(
+        rows.iter().any(|l| l.contains("6759f10..c280938")),
+        "the answer is under it\n{rows:?}"
+    );
+    assert!(
+        !rows.iter().any(|l| l.contains("3 files changed")),
+        "and the ones before it folded into their names\n{rows:?}"
+    );
+
+    // Opened, every command in full with the whole of what it printed.
+    s.ctrl("s");
+    s.key("g");
+    s.key("g");
+    for _ in 0..run {
+        s.key("j");
+    }
+    s.special("tab");
+    assert!(
+        s.pump(|s| s.chat_now().iter().any(|l| l.contains("3 files changed"))),
+        "open, nothing the fold hid is out of reach\n{:?}",
+        s.chat_now()
+    );
+    let open = s.chat_now();
+    assert!(
+        open.iter().any(|l| l.contains("Ran  git commit -m 'stack the cards'")),
+        "and every command is there in full\n{open:?}"
+    );
+    assert_eq!(open[run], rows[run], "the header did not move or change\n{open:?}");
+
+    // And the replay folds it exactly as the live stream did, which is the whole reason the two
+    // go through one renderer.
+    s.special("tab");
+    s.special("esc");
+    s.send(&command("session.new"));
+    assert!(s.pump(|s| !s.chat_now().iter().any(|l| l.contains("Pushed."))), "somewhere else");
+    s.send(&command("session.close"));
+    assert!(
+        s.pump(|s| s.chat_now().iter().any(|l| l.contains("Pushed."))),
+        "and back\n{:?}",
+        s.chat_now()
+    );
+    let back = s.chat_now();
+    assert!(
+        back.iter().any(|l| l == "  Ran  git add, git commit, git push origin"),
+        "one row again\n{back:?}"
+    );
+    assert!(
+        back.iter().any(|l| l.contains("6759f10..c280938"))
+            && !back.iter().any(|l| l.contains("3 files changed")),
+        "with the last answer and no other\n{back:?}"
+    );
+}
+
 #[test]
 fn a_folded_card_opens_with_tab_while_reading_and_folds_again() {
     // A card shows enough to know what happened. The whole of it is one key away, in the place
@@ -6081,7 +6374,7 @@ fn the_plan_row_keeps_the_providers_own_colour() {
     s.send(&command("planner.publish"));
     s.wait_for("published");
     assert!(
-        s.pump(|s| s.sidebar_now().iter().any(|l| l.contains("Session"))),
+        s.pump(|s| s.sidebar_now().iter().any(|l| l.contains("Planner"))),
         "the strip is drawn\n{:?}",
         s.sidebar_now()
     );
@@ -6090,7 +6383,7 @@ fn the_plan_row_keeps_the_providers_own_colour() {
     let at = s
         .sidebar_now()
         .iter()
-        .position(|l| l.contains("Session"))
+        .position(|l| l.contains("Planner"))
         .expect("the row with the binding limit on it");
     let groups = s.groups_of(buf);
     let on_row = groups.get(at).cloned().unwrap_or_default();
@@ -6464,4 +6757,242 @@ fn the_row_you_are_in_says_all_of_a_title_the_column_had_to_cut() {
         "and folds back when the cursor leaves\n{:?}",
         s.sidebar_now()
     );
+}
+
+/// A plugin can drive a conversation it is not looking at.
+///
+/// The vocabulary for doing something *to* a conversation — steer it, interrupt it, re-model it,
+/// start one — existed only over the swarm: `swarm.command` names a node and a session, so a
+/// plugin could fan work out over every other machine and, on this one, had `agent.send`, which
+/// takes no session and acts on whatever is on screen. Watching was already per-conversation, so
+/// the local API could see every conversation in the workspace and drive exactly one of them.
+///
+/// That is the shape of an orchestrator, so it is asserted as one: two conversations are given
+/// different work by id, and the screen never moves. `sessions.switch` before each message is the
+/// thing this replaced — it works, and it drags the transcript out from under whoever is reading.
+#[test]
+fn a_plugin_can_run_a_conversation_it_is_not_looking_at() {
+    const FANOUT: &str = r#"
+import type { PluginContext } from "@neosh/api";
+
+export async function activate({ neosh }: PluginContext) {
+  await neosh.cmd.register("lab.fanout", async () => {
+    try {
+    const here = (await neosh.session.current()).id;
+    // Started by name, and the answer is the one that was made — not whatever is on screen.
+    const made = await neosh.agent.command({ command: "new_session", title: "over there" });
+    if (!made) { neosh.notify("no session came back"); return; }
+    if (made === here) { neosh.notify("it answered with the conversation on screen"); return; }
+    await neosh.agent.command({ command: "send", text: "work for the second" }, made);
+    await neosh.agent.command({ command: "send", text: "work for the first" }, here);
+    neosh.notify("fanned out");
+    } catch (e) { neosh.notify("fanout failed: " + e); }
+  });
+  neosh.notify("lab ready");
+}
+"#;
+    let sb = Sandbox::new("fanout");
+    let dir = sb.root.join("config/plugins/lab");
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    std::fs::write(
+        dir.join("plugin.toml"),
+        "name = \"lab\"\nversion = \"0.1.0\"\nentry = \"main.ts\"\n",
+    )
+    .expect("manifest");
+    std::fs::write(dir.join("main.ts"), FANOUT).expect("plugin");
+    install_parrot(&sb);
+    sb.write_config("[options]\n\"agent.model\" = \"parrot/parrot\"\n");
+
+    let mut s = sb.start_letting_config_choose();
+    s.wait_for("parrot ready");
+    s.wait_for("lab ready");
+
+    // The conversation on screen, so there is something to have stayed on.
+    s.type_text("first");
+    s.enter();
+    assert!(s.pump(|s| s.saw("asked: first")), "the conversation on screen answers\n{}", s.transcript());
+
+    s.send(&command("lab.fanout"));
+    s.wait_for("fanned out");
+
+    // Both turns ran. The second conversation is not on screen, so its answer is asserted through
+    // the driver rather than the transcript — which is the point: nothing about it was drawn.
+    assert!(
+        s.pump(|s| s.saw("asked: work for the first")),
+        "the conversation on screen was steered by id\n{}",
+        s.transcript()
+    );
+    assert!(
+        s.pump(|s| s.sidebar_now().iter().any(|l| l.contains("over there"))),
+        "the conversation that was started is in the list\n{:?}",
+        s.sidebar_now()
+    );
+    // And the screen never moved: what is in the chat buffer is still the first conversation's.
+    assert!(
+        s.chat_now().iter().any(|l| l.contains("first")),
+        "the transcript on screen is still the one that was there\n{}",
+        s.transcript()
+    );
+    assert!(
+        !s.chat_now().iter().any(|l| l.contains("work for the second")),
+        "the other conversation's work was drawn into this one's transcript\n{}",
+        s.transcript()
+    );
+}
+
+
+/// A plugin decides which model answers.
+///
+/// Every other hook is about a turn already under way — what the prompt says, which tool may run,
+/// what it cost. None of them could answer the question an orchestrator exists to answer: *who
+/// should do this one*. Routing policy could only be written in Rust, in a program whose whole
+/// claim is that a third party could have written the feature.
+///
+/// Asserted through the driver, because that is the only witness that cannot be faked by the UI:
+/// the turn is sent to an instance the conversation was never pointed at.
+#[test]
+fn a_plugin_can_choose_which_model_answers_a_turn() {
+    const ROUTER: &str = r#"
+import type { PluginContext, HookPayload } from "@neosh/api";
+
+export async function activate({ neosh }: PluginContext) {
+  const say = (who: string) => async (_req: unknown, emit: (e: unknown) => void) => {
+    emit({ type: "message_start", model: who, usage: {} });
+    emit({ type: "block_start", index: 0, block: { kind: "text" } });
+    emit({ type: "text_delta", index: 0, text: "answered by " + who });
+    emit({ type: "block_stop", index: 0 });
+    emit({ type: "message_delta", stop_reason: { kind: "end_turn" }, usage: {} });
+    emit({ type: "message_stop" });
+  };
+  await neosh.provider.register("small", [{
+    id: "small", driver: "small", display_name: "Small",
+    models: [{ id: "small", display_name: "Small" }],
+  }], say("small"));
+  await neosh.provider.register("big", [{
+    id: "big", driver: "big", display_name: "Big",
+    models: [{ id: "big", display_name: "Big" }],
+  }], say("big"));
+
+  await neosh.hook.register("turn_route", (p: HookPayload) => {
+    if (p.hook !== "turn_route") return { action: "continue" };
+    if (p.text.includes("too expensive")) {
+      return { action: "veto", reason: "over the budget for today" };
+    }
+    if (!p.text.includes("urgent")) return { action: "continue" };
+    // Re-point this one turn. The conversation was never switched to it.
+    return {
+      action: "modify",
+      payload: { ...p, selection: { instance: "big", model: "big", options: [] } },
+    };
+  }, { blocking: true });
+
+  neosh.notify("router ready");
+}
+"#;
+    let sb = Sandbox::new("router");
+    let dir = sb.root.join("config/plugins/lab");
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    std::fs::write(
+        dir.join("plugin.toml"),
+        "name = \"lab\"\nversion = \"0.1.0\"\nentry = \"main.ts\"\npermissions = [\"providers\", \"hooks_blocking\"]\n",
+    )
+    .expect("manifest");
+    std::fs::write(dir.join("main.ts"), ROUTER).expect("plugin");
+    sb.write_config("[options]\n\"agent.model\" = \"small/small\"\n");
+
+    let mut s = sb.start_letting_config_choose();
+    s.wait_for("router ready");
+
+    // Ordinary work goes where the conversation points.
+    s.type_text("something ordinary");
+    s.enter();
+    assert!(s.pump(|s| s.saw("answered by small")), "the unrouted turn\n{}", s.transcript());
+
+    // And the router sends this one somewhere else, without the conversation being re-pointed by
+    // hand and without anything on screen having been switched.
+    s.type_text("this one is urgent");
+    s.enter();
+    assert!(s.pump(|s| s.saw("answered by big")), "the routed turn\n{}", s.transcript());
+
+    // And a router that says no says why, *in the transcript*, under the question it refused.
+    // A veto used to end the turn as `Cancelled` — the value `<Esc>` produces — so a question a
+    // plugin had blocked was indistinguishable from one the person had interrupted, and the reason
+    // the plugin gave lived for a few seconds in a toast and then nowhere at all.
+    s.type_text("this one is too expensive");
+    s.enter();
+    assert!(
+        s.pump(|s| s.chat_now().iter().any(|l| l.contains("over the budget for today"))),
+        "the reason is in the transcript\n{}",
+        s.transcript()
+    );
+}
+
+/// The rest of the declared permissions are enforced too.
+///
+/// `vcs_write` was the only one ever checked, which made the other seven documentation shaped like
+/// a boundary: `neosh plugins` printed a manifest's permissions, and a plugin that declared none of
+/// them could still register a tool the model calls, take a blocking hook and refuse every turn, or
+/// stand in as a model provider. A workspace that runs other people's code — and, on the swarm,
+/// takes commands from other machines — cannot have a permission list that is only a description.
+///
+/// One plugin, three attempts, nothing declared. Reading and drawing stay free, because they are no
+/// more privileged than what the person sitting there can already do.
+#[test]
+fn a_plugin_that_declared_nothing_cannot_register_a_tool_a_provider_or_a_blocking_hook() {
+    let sb = Sandbox::new("undeclared");
+    let dir = sb.root.join("config/plugins/greedy");
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    std::fs::write(
+        dir.join("plugin.toml"),
+        "name = \"greedy\"\nversion = \"0.1.0\"\nentry = \"main.ts\"\n",
+    )
+    .expect("manifest");
+    std::fs::write(
+        dir.join("main.ts"),
+        r#"
+import type { PluginContext } from "@neosh/api";
+export async function activate({ neosh }: PluginContext) {
+  const tried = async (what: string, f: () => Promise<unknown>) => {
+    try { await f(); neosh.notify(`ALLOWED ${what}`); }
+    catch (e) { neosh.notify(`refused ${what}: ${e}`); }
+  };
+  await tried("tool", () =>
+    neosh.tool.register({ name: "t", description: "d", inputSchema: {} }, async () => ({
+      content: "x", is_error: false,
+    })));
+  await tried("provider", () =>
+    neosh.provider.register("x", [{
+      id: "x", driver: "x", display_name: "X", models: [{ id: "x", display_name: "X" }],
+    }], async () => {}));
+  await tried("blocking hook", () =>
+    neosh.hook.register("turn_pre", () => ({ action: "continue" }), { blocking: true }));
+  // An observer cannot refuse anything, which is exactly what `hooks_blocking` distinguishes — so
+  // this one needs nothing declared and must still work.
+  await tried("observing hook", () =>
+    neosh.hook.register("turn_post", () => ({ action: "continue" })));
+  neosh.notify("greedy done");
+}
+"#,
+    )
+    .expect("plugin");
+
+    let mut s = sb.start();
+    s.wait_for("greedy done");
+    assert!(!s.saw("ALLOWED tool"), "a tool was registered undeclared\n{}", s.transcript());
+    assert!(!s.saw("ALLOWED provider"), "a provider was registered undeclared\n{}", s.transcript());
+    assert!(
+        !s.saw("ALLOWED blocking hook"),
+        "a blocking hook was taken undeclared\n{}",
+        s.transcript()
+    );
+    assert!(
+        s.saw("ALLOWED observing hook"),
+        "an observer needs nothing declared and was refused anyway\n{}",
+        s.transcript()
+    );
+    // And each refusal says the word to put in the manifest, so the fix is one line rather than a
+    // capability name and a guess about where it goes.
+    for want in ["tools", "providers", "hooks_blocking"] {
+        assert!(s.saw(want), "the refusal names {want}\n{}", s.transcript());
+    }
 }

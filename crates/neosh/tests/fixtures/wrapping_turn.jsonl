@@ -1,0 +1,13 @@
+{"type": "message_start", "model": "mock", "usage": {}}
+{"type": "block_start", "index": 0, "block": {"kind": "text"}}
+{"type": "text_delta", "index": 0, "text": "## A long answer\n\n"}
+{"type": "text_delta", "index": 0, "text": "Paragraph 1. This sentence is deliberately long enough that the terminal has to wrap it across several rows of the screen, which is the whole point of the fixture: a buffer row that is three or four screen rows is what the caret arithmetic used to get wrong, and what a page of scrolling has to be counted in.\n\n"}
+{"type": "text_delta", "index": 0, "text": "Paragraph 2. This sentence is deliberately long enough that the terminal has to wrap it across several rows of the screen, which is the whole point of the fixture: a buffer row that is three or four screen rows is what the caret arithmetic used to get wrong, and what a page of scrolling has to be counted in.\n\n"}
+{"type": "text_delta", "index": 0, "text": "Paragraph 3. This sentence is deliberately long enough that the terminal has to wrap it across several rows of the screen, which is the whole point of the fixture: a buffer row that is three or four screen rows is what the caret arithmetic used to get wrong, and what a page of scrolling has to be counted in.\n\n"}
+{"type": "text_delta", "index": 0, "text": "Paragraph 4. This sentence is deliberately long enough that the terminal has to wrap it across several rows of the screen, which is the whole point of the fixture: a buffer row that is three or four screen rows is what the caret arithmetic used to get wrong, and what a page of scrolling has to be counted in.\n\n"}
+{"type": "text_delta", "index": 0, "text": "Paragraph 5. This sentence is deliberately long enough that the terminal has to wrap it across several rows of the screen, which is the whole point of the fixture: a buffer row that is three or four screen rows is what the caret arithmetic used to get wrong, and what a page of scrolling has to be counted in.\n\n"}
+{"type": "text_delta", "index": 0, "text": "Paragraph 6. This sentence is deliberately long enough that the terminal has to wrap it across several rows of the screen, which is the whole point of the fixture: a buffer row that is three or four screen rows is what the caret arithmetic used to get wrong, and what a page of scrolling has to be counted in.\n\n"}
+{"type": "text_delta", "index": 0, "text": "```rust\nfn quoted(s: &str) -> String {\n    format!(\"[{s}]\")\n}\n```\n\n"}
+{"type": "text_delta", "index": 0, "text": "That is all.\n"}
+{"type": "block_stop", "index": 0}
+{"type": "message_stop", "stop": "end_turn"}

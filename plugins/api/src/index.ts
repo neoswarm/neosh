@@ -30,6 +30,8 @@ import type { Brand } from "./generated/Brand";
 import type { CredentialInfo } from "./generated/CredentialInfo";
 import type { CredentialSource } from "./generated/CredentialSource";
 import type { CursorMotion } from "./generated/CursorMotion";
+import type { CursorShape } from "./generated/CursorShape";
+import type { SelectShape } from "./generated/SelectShape";
 import type { DiffTarget } from "./generated/DiffTarget";
 import type { Dock } from "./generated/Dock";
 import type { Gravity } from "./generated/Gravity";
@@ -125,7 +127,7 @@ import type { WorktreeInfo } from "./generated/WorktreeInfo";
 export type {
   AccountKind, Activity, ApiError, BranchInfo, Brand, BufferId, Capability, CommandEntry, CommitInfo,
   AgentCommand, AgentState, AgentSummary,
-  Contribution, CredentialInfo, CredentialSource, DiffTarget, Dock, CursorMotion, ExtmarkId, ExtmarkInfo, ExtmarkOpts, FileChange, FileState, FloatConfig,
+  Contribution, CredentialInfo, CredentialSource, CursorShape, DiffTarget, Dock, CursorMotion, ExtmarkId, ExtmarkInfo, ExtmarkOpts, FileChange, FileState, FloatConfig,
   Gravity, HighlightDef, HighlightSpec, Hint, HookName, HookOutcome, HookPayload, InstanceConfig, KeyContext,
   AttachmentInfo,
   KeymapEntry, KeymapScope, MessageLevel, Mode, ModelEntry, ModelInfo, ModelSelection, ModelTier, NamespaceId,
@@ -135,7 +137,7 @@ export type {
   QuestionAnswer, QuestionOption, UserQuestion,
   CostBasis, QuotaCredits, QuotaSample, QuotaSeverity, QuotaSnapshot, QuotaSource, QuotaWindow,
   UsageBucket, UsageHistory, UsageResolution, UsageScanSource,
-  Rect, RepoInfo, RepoStatus, SessionId, SessionInfo, StatusAlign, StatusSegment, StopReason,
+  Rect, RepoInfo, RepoStatus, SelectShape, SessionId, SessionInfo, StatusAlign, StatusSegment, StopReason,
   SurfaceCell, SurfaceId, TextEdit, ToolCall, ToolDef, ToolResult, TurnRequest, Usage,
   NodeCapabilities, NodeId, NodeInfo, ProjectKey, RemoteProject, StreamEvent,
   SwarmAgent, SwarmNode, SwarmStranger,
@@ -563,6 +565,22 @@ export interface EditApi {
   apply(win: WindowId, edit: TextEdit): Promise<void>;
   /** Anchor a selection where the cursor is, or drop the one there is. */
   select(win: WindowId, on: boolean): Promise<void>;
+  /**
+   * What the two ends of the selection *mean*.
+   *
+   * `"exclusive"` is a text field's: the cursor sits between characters and the one it is on is
+   * not selected. `"inclusive"` is a normal mode's — the cursor is *on* a character and that
+   * character is in — and `"line"` takes whole rows in whichever direction the selection runs.
+   * Dropping a selection puts this back to `"exclusive"`.
+   */
+  selectShape(win: WindowId, shape: SelectShape): Promise<void>;
+  /**
+   * What the caret looks like here: a bar between two characters, or a block on one.
+   *
+   * The one thing on screen that says whether keys are being typed or obeyed, before any of them
+   * is pressed.
+   */
+  cursorShape(win: WindowId, shape: CursorShape): Promise<void>;
   /** What is selected. `""` when nothing is. */
   selection(win: WindowId): Promise<string>;
   /**
@@ -653,6 +671,31 @@ export interface AgentApi {
    */
   send(text: string, opts?: { images?: string[] }): Promise<void>;
   cancel(): Promise<void>;
+  /**
+   * Do something to a conversation by id, rather than to whichever one is on screen.
+   *
+   * The same vocabulary `swarm.command` carries to another machine — steer, interrupt, re-model,
+   * rename, archive, start — pointed at a conversation here. That symmetry is the point: an
+   * orchestrator that fans work out over several conversations and joins the results is one
+   * program whether the conversations are on this laptop or spread over the swarm, and until this
+   * existed it was only writable for the ones that were somewhere else.
+   *
+   * Everything that *watches* a conversation already names one — `onToken`, `onTurnEnd`,
+   * `sessions.messages` — so this is the half that was missing. Without it, driving a second
+   * conversation meant `sessions.switch` first, which moves the screen out from under whoever is
+   * reading it.
+   *
+   * Omit `session` for the conversation on screen. Answers with the conversation the command was
+   * about, which is how `new_session` says what it made.
+   *
+   * ```ts
+   * // Ask three conversations the same thing without touching the screen.
+   * for (const s of await neosh.session.list()) {
+   *   await neosh.agent.command({ command: "send", text: "status?" }, s.id);
+   * }
+   * ```
+   */
+  command(command: AgentCommand, session?: string): Promise<string | null>;
   selection(): Promise<ModelSelection | null>;
   /** Hot-swap the model. Takes effect on the next turn. */
   setSelection(selection: ModelSelection): Promise<void>;
@@ -862,6 +905,20 @@ export interface GitApi {
   /** What this branch would merge into: `origin/HEAD`, else `main`/`master`. */
   defaultBranch(): Promise<string | null>;
   createBranch(name: string, opts?: { from?: string }): Promise<void>;
+  /**
+   * Move a branch to another name — `git branch -m`.
+   *
+   * One ref write. The working tree is untouched, so this is safe on a branch that is checked out
+   * and safe while an agent is editing files against it — which is the case it exists for: naming
+   * a worktree's branch from the first message, once there is a message to name it from.
+   *
+   * `cwd` is the checkout the branch belongs to, and you almost always want it: the worktree being
+   * renamed is very often not the one the active conversation is standing in.
+   *
+   * Fails if `next` is taken — a generated name does not get to overwrite somebody's branch. Ask
+   * `branches()` and pick a free one.
+   */
+  renameBranch(name: string, next: string, opts?: { cwd?: string }): Promise<void>;
   checkout(rev: string): Promise<void>;
   /** Empty `paths` stages everything, like `git add .` from the repository root. */
   stage(paths?: string[]): Promise<void>;
@@ -1544,6 +1601,12 @@ export function __createContext(plugin: string, config: unknown, version: number
       async select(win, on) {
         await c({ call: "win_select", win, on });
       },
+      async selectShape(win, shape) {
+        await c({ call: "win_select_shape", win, shape });
+      },
+      async cursorShape(win, shape) {
+        await c({ call: "win_cursor_shape", win, shape });
+      },
       async selection(win) {
         return expect(await c({ call: "win_selection", win }), "text").text;
       },
@@ -1954,6 +2017,10 @@ export function __createContext(plugin: string, config: unknown, version: number
       async cancel() {
         await c({ call: "agent_cancel" });
       },
+      async command(command, session) {
+        const v = await c({ call: "agent_command", session: session ?? null, command });
+        return expect(v, "maybe_session").session;
+      },
       async selection() {
         return expect(await c({ call: "agent_get_selection" }), "selection").selection;
       },
@@ -2107,6 +2174,9 @@ export function __createContext(plugin: string, config: unknown, version: number
       },
       async createBranch(name, opts) {
         await c({ call: "git_create_branch", name, from: opts?.from ?? null });
+      },
+      async renameBranch(name, next, opts) {
+        await c({ call: "git_rename_branch", old: name, new: next, cwd: opts?.cwd ?? null });
       },
       async checkout(rev) {
         await c({ call: "git_checkout", rev });

@@ -25,8 +25,8 @@ use crate::provider::{
 };
 use crate::quota::{QuotaSample, QuotaSnapshot, UsageHistory, UsageResolution};
 use crate::ui::{
-    CursorMotion, ExtmarkInfo, ExtmarkOpts, FloatConfig, HighlightDef, KeyPress, LineDraw,
-    MessageLevel, Rect, SurfaceCell, TextEdit, WindowLayout,
+    CursorMotion, CursorShape, ExtmarkInfo, ExtmarkOpts, FloatConfig, HighlightDef, KeyPress,
+    LineDraw, MessageLevel, Rect, SelectShape, SurfaceCell, TextEdit, WindowLayout,
 };
 use crate::vcs::{BranchInfo, CommitInfo, DiffTarget, RepoStatus, WorktreeInfo};
 
@@ -350,6 +350,30 @@ pub enum ApiCall {
         /// `false` clears. `true` anchors here even if something was already selected.
         on: bool,
     },
+    /// What the two ends of this window's selection *mean*.
+    ///
+    /// A selection is two positions and nothing else, so the shape is the only thing that can say
+    /// whether the character the cursor is on is in it. A text field's is not — the cursor sits
+    /// between characters there, and a selection that swallowed the one to its right would delete
+    /// a letter nobody highlighted. A normal-mode selection's is: the cursor is *on* a character,
+    /// and `v` followed immediately by `y` copies that character rather than nothing at all.
+    ///
+    /// Kept here rather than re-established by the caller after every motion, which is what a
+    /// linewise selection used to be: three API calls to move an anchor that is only settable by
+    /// standing on it, run again after every key, and wrong in between.
+    WinSelectShape {
+        win: WindowId,
+        shape: SelectShape,
+    },
+    /// What the caret looks like in this window.
+    ///
+    /// A bar sits between two characters and a block sits on one, which is the difference between
+    /// a field you are typing in and a mode where every key is a verb — so it is the one thing on
+    /// screen that says which of those you are in before you press anything.
+    WinCursorShape {
+        win: WindowId,
+        shape: CursorShape,
+    },
     /// What is selected in this window. Empty when nothing is.
     WinSelection {
         win: WindowId,
@@ -496,6 +520,33 @@ pub enum ApiCall {
         /// plugin that has produced an image of its own rather than one somebody pasted.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         images: Vec<String>,
+    },
+    /// Do something to a conversation on *this* machine, named rather than implied.
+    ///
+    /// The same [`AgentCommand`] vocabulary [`ApiCall::SwarmCommand`] carries to a peer, pointed at
+    /// a conversation here — and the reason it exists is that those two were not the same API.
+    /// A plugin could steer, interrupt, re-model, rename, archive and start conversations on every
+    /// *other* machine in the swarm, by id, while on this one it had `AgentSend` and friends, which
+    /// take no session and act on whatever is on screen. Everything that *observes* a conversation
+    /// was already addressed — `PluginEvent::Token`, `ToolFinished` and `TurnEnded` all say which
+    /// one they came from, and `SessionList`/`SessionMessages` read any of them — so the local API
+    /// could watch every conversation in the workspace and drive exactly one of them.
+    ///
+    /// What that cost is the thing this project is for: an orchestrator that fans work out across
+    /// several conversations and joins the results is writable against the swarm and was not
+    /// writable against the machine it runs on. The alternative was `SessionSwitch` before every
+    /// message, which moves the screen out from under whoever is reading it.
+    ///
+    /// `None` means the conversation on screen, so the ordinary single-conversation caller says
+    /// nothing and gets what it always got. Grants no authority a plugin did not already have —
+    /// switching and sending was always allowed — it only stops the screen being the cursor.
+    ///
+    /// Answers with the conversation the command was about, which is how
+    /// [`AgentCommand::NewSession`] says what it made.
+    AgentCommand {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session: Option<SessionId>,
+        command: AgentCommand,
     },
     AgentCancel,
     AgentGetSelection,
@@ -1021,6 +1072,21 @@ pub enum ApiCall {
     GitCheckout {
         rev: String,
     },
+    /// Move a branch to another name — `git branch -m`.
+    ///
+    /// One ref write, so it is safe on the branch a worktree has checked out and safe while an
+    /// agent is mid-turn in that worktree: nothing about the files changes. What *does* change is
+    /// the label every project list is drawing, which is why the host refreshes what it knows
+    /// about the directory here rather than leaving a panel to say the old name until restart.
+    GitRenameBranch {
+        old: String,
+        new: String,
+        /// The checkout the branch belongs to. `git branch -m` runs *inside* a repository, and a
+        /// caller renaming the branch of a worktree other than the active conversation's has to
+        /// say which — the same reason [`Self::GitAddWorktree`] takes one.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cwd: Option<String>,
+    },
     /// Empty `paths` stages everything, matching `git add .` from the root.
     GitStage {
         #[serde(default)]
@@ -1162,6 +1228,12 @@ pub enum ApiOk {
     Sessions { sessions: Vec<SessionInfo> },
     Credentials { credentials: Vec<CredentialInfo> },
     Session { session: SessionInfo },
+    /// Which conversation something was about, when it may have been about none.
+    ///
+    /// An id rather than a [`SessionInfo`]: the caller named the conversation in the first place,
+    /// and the one case that has something to say — [`AgentCommand::NewSession`] — is saying which
+    /// one it just made, not describing it.
+    MaybeSession { session: Option<SessionId> },
     Messages { messages: Vec<Message> },
     // ---- version control ----
     Status { status: RepoStatus },
@@ -1269,6 +1341,8 @@ pub struct Viewport {
     pub width: u16,
     pub height: u16,
     pub top_line: u32,
+    /// Buffer rows actually on the screen, which on a wrapping window is fewer than `height`.
+    pub rows: u32,
     /// Lines in the buffer, so a caller can page without a second round trip.
     pub line_count: u32,
 }

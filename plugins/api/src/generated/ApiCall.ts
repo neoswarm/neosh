@@ -3,6 +3,7 @@ import type { AgentCommand } from "./AgentCommand";
 import type { BufferId } from "./BufferId";
 import type { Capability } from "./Capability";
 import type { CursorMotion } from "./CursorMotion";
+import type { CursorShape } from "./CursorShape";
 import type { DiffTarget } from "./DiffTarget";
 import type { DriverKind } from "./DriverKind";
 import type { ExtmarkId } from "./ExtmarkId";
@@ -27,6 +28,7 @@ import type { ProjectKey } from "./ProjectKey";
 import type { ProviderEvent } from "./ProviderEvent";
 import type { QuotaSnapshot } from "./QuotaSnapshot";
 import type { Rect } from "./Rect";
+import type { SelectShape } from "./SelectShape";
 import type { SessionId } from "./SessionId";
 import type { StatusSegment } from "./StatusSegment";
 import type { StreamId } from "./StreamId";
@@ -106,6 +108,8 @@ export type ApiCall =
      */
     on: boolean;
   }
+  | { "call": "win_select_shape"; win: WindowId; shape: SelectShape }
+  | { "call": "win_cursor_shape"; win: WindowId; shape: CursorShape }
   | { "call": "win_selection"; win: WindowId }
   | { "call": "clipboard_write"; text: string }
   | { "call": "float_open"; buf: BufferId; config: FloatConfig }
@@ -173,6 +177,11 @@ export type ApiCall =
      * plugin that has produced an image of its own rather than one somebody pasted.
      */
     images?: Array<string>;
+  }
+  | {
+    "call": "agent_command";
+    session?: SessionId | null;
+    command: AgentCommand;
   }
   | { "call": "agent_cancel" }
   | { "call": "agent_get_selection" }
@@ -363,6 +372,17 @@ export type ApiCall =
   | { "call": "git_default_branch" }
   | { "call": "git_create_branch"; name: string; from?: string | null }
   | { "call": "git_checkout"; rev: string }
+  | {
+    "call": "git_rename_branch";
+    old: string;
+    new: string;
+    /**
+     * The checkout the branch belongs to. `git branch -m` runs *inside* a repository, and a
+     * caller renaming the branch of a worktree other than the active conversation's has to
+     * say which — the same reason [`Self::GitAddWorktree`] takes one.
+     */
+    cwd?: string | null;
+  }
   | { "call": "git_stage"; paths: Array<string> }
   | { "call": "git_unstage"; paths: Array<string> }
   | { "call": "git_commit"; message: string }

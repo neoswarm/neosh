@@ -144,6 +144,14 @@ fn len(text: &str) -> u32 {
     text.len() as u32
 }
 
+/// The byte offset one grapheme past `col`, or the end of the line if there is none.
+///
+/// What "the character the cursor is on" ends at, which is the whole of the difference between an
+/// inclusive selection and an exclusive one.
+pub fn after(text: &str, col: u32) -> u32 {
+    next_grapheme(text, col).unwrap_or_else(|| len(text))
+}
+
 fn prev_grapheme(text: &str, col: u32) -> Option<u32> {
     text.grapheme_indices(true).map(|(i, _)| i as u32).rfind(|i| *i < col)
 }

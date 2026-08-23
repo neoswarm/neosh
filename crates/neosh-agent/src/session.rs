@@ -95,12 +95,28 @@ pub struct Session {
     /// there is more than one list: the panel, a status segment and a picker all have to agree,
     /// and a second panel deriving it from timestamps would disagree with the first.
     pub unread: bool,
+    /// A turn was in flight here when this conversation was last written to disk.
+    ///
+    /// Seconds since the epoch, stamped when the turn began. Persisted, and that is the entire
+    /// point: nothing running in a process can tell you that a *previous* process died, so the only
+    /// way to know a turn was cut off is to have written down that one had started and to find the
+    /// note still there. Cleared when the turn ends, however it ends — an interrupt and an error
+    /// are both endings, and neither is what this is for.
+    pub running_since: Option<i64>,
+    /// The workspace stopped while a turn was running here.
+    ///
+    /// See [`neosh_proto::SessionInfo::interrupted`]. Derived once, where it can be: at load, from
+    /// a `running_since` that outlived the process that set it.
+    pub interrupted: bool,
     /// What is still running here that no turn is waiting for.
     ///
     /// See [`neosh_proto::SessionInfo::background`]. Held on the conversation for the same reason
-    /// `unread` is — several lists have to agree about it — and, unlike `unread`, deliberately not
-    /// written down: the driver only reports this while its process is up, and a workspace that
-    /// restarted would otherwise report a shell that died with it.
+    /// `unread` is — several lists have to agree about it — and, unlike `unread` and unlike
+    /// `interrupted` above, deliberately *not* written down. The two are opposite halves of one
+    /// question and want opposite treatment: a turn cut off by a dead process can only be known
+    /// from a note that outlived it, and a background shell can only be known from a driver that is
+    /// still up to report it. Persisting this would mean a workspace coming back reporting a shell
+    /// that died with it, forever.
     pub background: Vec<neosh_proto::BackgroundTask>,
     /// Put away, not thrown away: still on disk, still openable, just not in the everyday list.
     pub archived: bool,
@@ -118,6 +134,20 @@ pub struct Session {
     /// See [`neosh_proto::TurnRequest::resume`]. Held here rather than in the driver because the
     /// driver is a process and this is not: the whole point of the value is that it survives one.
     pub resume: Option<String>,
+    /// A place to type, minted because there was nowhere else — not a conversation you started.
+    ///
+    /// The store always has an active session: there has to be somewhere for the next message to
+    /// go. That invariant is what used to make "the last session cannot be closed" a rule, and a
+    /// workspace you have just cleared out is exactly when you want the opposite. So closing or
+    /// archiving the last one lands you in one of these instead: it is the active session, the
+    /// composer types into it and the transcript shows the welcome — but it is not in
+    /// [`list`](crate::store::SessionStore::list) and it is never written to disk, because nobody
+    /// asked for it and an empty workspace should look empty.
+    ///
+    /// It stops being one the moment anything is said in it, which is the only thing that makes a
+    /// conversation a conversation. From then on it is an ordinary session: it appears in the
+    /// panel, in its project, and is saved with the rest.
+    pub ephemeral: bool,
 }
 
 impl Session {
@@ -138,11 +168,14 @@ impl Session {
             created_at: 0,
             updated_at: 0,
             unread: false,
+            running_since: None,
+            interrupted: false,
             background: Vec::new(),
             archived: false,
             archived_at: None,
             permission_mode: None,
             resume: None,
+            ephemeral: false,
         }
     }
 
@@ -184,6 +217,11 @@ impl Session {
 
     /// What was said, with whatever came with it.
     pub fn push_user(&mut self, prompt: &Prompt) {
+        // Saying something in a placeholder is what makes it a conversation. Here rather than at
+        // any of the call sites because there is more than one way to speak into a session — the
+        // composer, a steering message taken in mid-turn, a peer on another machine — and the one
+        // that forgot would leave a conversation with messages in it that no list ever shows.
+        self.ephemeral = false;
         self.messages.push(Message { role: Role::User, content: prompt.blocks() });
     }
 
@@ -279,6 +317,7 @@ impl Session {
             // Filled in by the store, which is the only thing that knows.
             is_active: false,
             unread: self.unread,
+            interrupted: self.interrupted,
             background: self.background.clone(),
             archived: self.archived,
             archived_at: self.archived_at,

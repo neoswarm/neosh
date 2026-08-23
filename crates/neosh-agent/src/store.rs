@@ -80,6 +80,11 @@ impl SessionStore {
     }
 
     /// Make `id` the active session, parking the current one.
+    ///
+    /// A placeholder is not parked, it is dropped. It exists only because the workspace had to
+    /// have somewhere to type; the moment you are somewhere else it is an empty conversation
+    /// nobody asked for, invisible in every list, and keeping it would mean `step_away` could
+    /// later land you in a months-old one instead of in something real.
     pub fn switch(&mut self, id: &SessionId) -> Result<(), StoreError> {
         if &self.active.id == id {
             self.active.unread = false;
@@ -91,7 +96,11 @@ impl SessionStore {
         // saying "new" in the status line you did not happen to be looking at.
         next.unread = false;
         let previous = std::mem::replace(&mut self.active, next);
-        self.idle.insert(previous.id.clone(), previous);
+        if previous.ephemeral {
+            self.order.retain(|x| x != &previous.id);
+        } else {
+            self.idle.insert(previous.id.clone(), previous);
+        }
         // Move to the front rather than re-sorting: "most recently active" is a history, and a
         // history is something you append to.
         self.order.retain(|x| x != id);
@@ -211,27 +220,43 @@ impl SessionStore {
     }
 
     /// Every session, most recently active first, with the active one flagged.
+    ///
+    /// A placeholder is never in it, archived or not: it is somewhere to type rather than
+    /// something you started, and a workspace you have just cleared out should read as empty.
+    /// See [`Session::ephemeral`](crate::session::Session::ephemeral).
     pub fn list_with(&self, include_archived: bool) -> Vec<SessionInfo> {
         let mut seen: Vec<SessionInfo> = Vec::with_capacity(self.len());
         for id in &self.order {
-            if let Some(s) = self.get(id) {
+            if let Some(s) = self.get(id).filter(|s| !s.ephemeral) {
                 seen.push(self.info(s));
             }
         }
         // Anything inserted without touching `order` still has to appear; a session you cannot see
         // is a session you cannot get back to.
         for (id, s) in &self.idle {
-            if !self.order.contains(id) {
+            if !self.order.contains(id) && !s.ephemeral {
                 seen.push(self.info(s));
             }
         }
-        if !self.order.contains(&self.active.id) {
+        if !self.order.contains(&self.active.id) && !self.active.ephemeral {
             seen.insert(0, self.info(&self.active));
         }
         if !include_archived {
             seen.retain(|s| !s.archived);
         }
         seen
+    }
+
+    /// Whether there is a conversation you could go to, as opposed to somewhere to start one.
+    ///
+    /// The same question [`list`](Self::list) answers, asked without building the list. Archived
+    /// ones do not count: what you have put away is not in any list you work from, so a workspace
+    /// with nothing but an archive in it reads as empty — and the way back to that archive is one
+    /// of the things an empty workspace has to say. A placeholder does not count either, which is
+    /// the whole of what a placeholder is.
+    pub fn any_open(&self) -> bool {
+        let open = |s: &Session| !s.ephemeral && !s.archived;
+        open(&self.active) || self.idle.values().any(open)
     }
 
     /// Every session, for persistence.
@@ -290,6 +315,37 @@ mod tests {
         assert_ne!(s.active_id(), &a);
         assert!(!s.active().archived);
         assert!(s.list().iter().all(|i| i.id != a));
+    }
+
+    #[test]
+    fn a_placeholder_is_in_no_list_and_is_dropped_the_moment_you_are_somewhere_else() {
+        // Somewhere to type after you have cleared the workspace out, and nothing more than that.
+        // In a list it would be a conversation you never started, in a project you had just
+        // emptied; parked on a switch it would be one more of them every time.
+        let (mut s, _a, b, _c) = store();
+        let here = s.active_id().clone();
+        s.active_mut().ephemeral = true;
+        assert!(s.list().iter().all(|i| i.id != here), "not in the everyday list");
+        assert!(s.list_with(true).iter().all(|i| i.id != here), "nor in the one with the archive");
+        assert!(s.any_open(), "the real conversations are still there");
+
+        s.switch(&b).expect("switches");
+        assert!(s.get(&here).is_none(), "gone rather than parked");
+        assert_eq!(s.len(), 2, "and not counted either");
+    }
+
+    #[test]
+    fn a_workspace_of_a_placeholder_and_an_archive_has_nothing_open() {
+        // What `^F` is for on the empty transcript: everything archived reads as empty, because
+        // what you have put away is not in the list you work from.
+        let mut s = SessionStore::new(Session::new("/tmp"));
+        s.active_mut().ephemeral = true;
+        let away = Session::new("/tmp");
+        let id = away.id.clone();
+        s.insert(away);
+        s.archive(&id, true, 1).expect("archives");
+        assert!(!s.any_open());
+        assert!(s.list_with(true).iter().any(|i| i.id == id), "still there to go back to");
     }
 
     #[test]

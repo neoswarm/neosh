@@ -21,6 +21,7 @@ mod images;
 mod frontend;
 mod host;
 mod paths;
+mod plugins;
 mod pstate;
 mod scaffold;
 mod services;
@@ -30,6 +31,7 @@ mod swarm;
 mod trust;
 mod usage;
 mod vars;
+mod vim;
 mod views;
 
 use bridge::ScriptBridge;
@@ -120,12 +122,45 @@ enum Cmd {
     Trust(TrustArgs),
     /// Print where neosh reads and writes, and whether each of those exists.
     Paths,
+    /// Install, list, update and remove plugins.
+    ///
+    /// A plugin arrives as a git clone, because a URL is already a globally unique name that works
+    /// for a fork, a private repository and the branch you are writing. Bundled and hand-managed
+    /// plugins are listed too — what loads is one question, and it should have one answer.
+    #[command(subcommand)]
+    Plugin(PluginCmd),
     /// Print this machine's swarm identity, and the line to paste on the other computers.
     ///
     /// A node is named by its public key, so joining two machines means each one having the
     /// other's. There is no way to read a public key out of the private one by looking at it, and
     /// a swarm you cannot join without writing a script is a swarm nobody joins.
     SwarmId,
+}
+
+#[derive(Subcommand, Debug)]
+enum PluginCmd {
+    /// Clone a plugin and make it load next time.
+    Add {
+        /// Anything `git clone` takes: an https URL, an `scp`-style SSH remote, a local bare repo.
+        source: String,
+    },
+    /// Every plugin this machine would load, and where each came from.
+    List,
+    /// Pull an installed plugin, or all of them.
+    Update {
+        /// The plugin's name from its manifest. Omit for all of them.
+        name: Option<String>,
+    },
+    /// Delete an installed plugin.
+    ///
+    /// Irreversible, so it asks — unless `--yes`, or unless nobody is there to answer, in which
+    /// case it refuses rather than guessing.
+    Remove {
+        name: String,
+        /// Do not ask.
+        #[arg(long, short = 'y')]
+        yes: bool,
+    },
 }
 
 #[derive(Args, Debug)]
@@ -215,6 +250,7 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
         Some(Cmd::Init(args)) => return run_init(&paths, &cwd, args),
         Some(Cmd::Trust(args)) => return run_trust(&paths, &cwd, args),
         Some(Cmd::Paths) => return run_paths(&paths, &cwd),
+        Some(Cmd::Plugin(cmd)) => return run_plugin(&paths, cmd),
         Some(Cmd::SwarmId) => return run_swarm_id(&paths),
         Some(Cmd::Status) => return run_status(&paths).await,
         Some(Cmd::Stop) => return run_stop(&paths).await,
@@ -400,10 +436,14 @@ fn with_signals(
     });
 
     tokio::spawn(async move {
-        // Not from any terminal, so it is tagged with the view that is always the process's
-        // own. In a served workspace that names nobody, which is right: a signal is a reason to
-        // stop the work, not to close one of somebody's windows.
-        let quit = (views::ViewId::LOCAL, InputEvent::Command { name: "quit".into(), args: Vec::new() });
+        // `stop` rather than `quit`, because a signal is a reason to stop the work and not to
+        // close one of somebody's windows — and in a served workspace `quit` is exactly "close
+        // one of somebody's windows". Tagged with the process's own view, which in a workspace
+        // names nobody: `quit` therefore detached a view that was not there, so a `kill` on a
+        // workspace did nothing at all and the `SIGKILL` behind it was what actually stopped it,
+        // with whatever had not been written to disk still in memory. This is also the path a
+        // machine shutting down takes.
+        let quit = (views::ViewId::LOCAL, InputEvent::Command { name: "stop".into(), args: Vec::new() });
         #[cfg(unix)]
         {
             use tokio::signal::unix::{SignalKind, signal};
@@ -578,6 +618,96 @@ fn run_init(paths: &Paths, cwd: &std::path::Path, args: &InitArgs) -> anyhow::Re
 /// The first question of any config problem — and of any bug report — is "which files did you
 /// read?". Neovim answers it with `stdpath()`; without an equivalent the only way to find out is to
 /// read this source.
+/// `neosh plugin ...`.
+///
+/// Every one of these prints what it did rather than exiting quietly. Installing something that
+/// runs in your editor is exactly the moment to say what it is called, what version it is, and what
+/// it declared it may do — the permissions list is enforced, so it is a promise the user can hold
+/// neosh to rather than a description.
+fn run_plugin(paths: &Paths, cmd: &PluginCmd) -> anyhow::Result<()> {
+    match cmd {
+        PluginCmd::Add { source } => {
+            let m = plugins::add(paths, source)?;
+            say!("installed {} {}", m.name, m.version);
+            if m.permissions.is_empty() {
+                say!("  it declared no permissions: no tools, no providers, no blocking hooks.");
+            } else {
+                let names: Vec<String> =
+                    m.permissions.iter().map(|p| permission_name(*p)).collect();
+                say!("  it may: {}", names.join(", "));
+            }
+            say!("\nIt loads when a workspace next starts. `neosh stop` ends the running one.");
+        }
+        PluginCmd::List => {
+            let all = plugins::list(paths);
+            if all.is_empty() {
+                say!("no plugins.");
+                return Ok(());
+            }
+            for e in &all {
+                let perms: Vec<String> =
+                    e.permissions.iter().map(|p| permission_name(*p)).collect();
+                let perms =
+                    if perms.is_empty() { String::new() } else { format!("  [{}]", perms.join(" ")) };
+                say!("{:<20} {:<10} {}{}", e.name, e.version, e.origin.label(), perms);
+                // Where it is, and where it came from. A bundled one has neither and needs
+                // neither; for everything else these are the two questions somebody reading this
+                // list is about to ask — which copy is loading, and whether `update` can move it.
+                if let Some(d) = &e.dir {
+                    say!("{:<20} {}", "", d.display());
+                }
+                if let Some(r) = &e.remote {
+                    say!("{:<20} {r}", "");
+                }
+            }
+        }
+        PluginCmd::Update { name } => {
+            let moved = plugins::update(paths, name.as_deref())?;
+            if moved.is_empty() {
+                say!("already up to date.");
+            } else {
+                for (n, range) in moved {
+                    say!("{n}  {range}");
+                }
+                say!("\nThe running workspace has the old copy. `neosh stop` to pick these up.");
+            }
+        }
+        PluginCmd::Remove { name, yes } => {
+            // Irreversible, so it asks — and says what is at stake before it does. See ADR 0039.
+            if !yes {
+                let dir = paths.installed_plugin_dir().join(name);
+                if !std::io::IsTerminal::is_terminal(&std::io::stdin()) {
+                    anyhow::bail!(
+                        "removing {name} deletes {} and cannot be undone.\n\
+                         Nobody is here to ask, so pass --yes if you meant it.",
+                        dir.display()
+                    );
+                }
+                eprint!("Delete {} and everything in it? [y/N] ", dir.display());
+                use std::io::Write;
+                let _ = std::io::stderr().flush();
+                let mut answer = String::new();
+                std::io::stdin().read_line(&mut answer)?;
+                if !matches!(answer.trim(), "y" | "Y" | "yes") {
+                    say!("left alone.");
+                    return Ok(());
+                }
+            }
+            let dir = plugins::remove(paths, name)?;
+            say!("removed {name} ({})", dir.display());
+        }
+    }
+    Ok(())
+}
+
+/// The word a permission is spelled with in `plugin.toml`, so a refusal and a listing agree.
+fn permission_name(p: neosh_proto::PluginPermission) -> String {
+    serde_json::to_value(p)
+        .ok()
+        .and_then(|v| v.as_str().map(str::to_string))
+        .unwrap_or_else(|| format!("{p:?}"))
+}
+
 fn run_paths(paths: &Paths, cwd: &std::path::Path) -> anyhow::Result<()> {
     fn row(label: &str, path: &std::path::Path, note: &str) {
         let mark = if path.exists() { "" } else { "  (does not exist)" };

@@ -15,7 +15,16 @@ version = "0.1.0"
 entry = "main.ts"
 description = "…"
 
-# Declared up front. Reading git state needs nothing; changing it needs this.
+# Declared up front, and enforced. Reading git state needs nothing; changing it needs this.
+#
+#   tools           register a tool the model can call
+#   providers       register a model provider driver
+#   hooks_blocking  take a hook that can rewrite or veto (an observer needs nothing)
+#   raw_cells       claim a raw cell surface
+#   vcs_write       branch, checkout, stage, commit, worktree
+#
+# Everything else — windows, buffers, keys, floats, options, vars — needs nothing declared: it is
+# no more privileged than what the person sitting there can already do.
 permissions = ["vcs_write"]
 ```
 
@@ -37,6 +46,34 @@ export function deactivate() {}     // optional
 `npx tsc --noEmit` checks against the exact version you have. **Plugins are transpiled, not
 type-checked, at load** — run `tsc` yourself; it is the only thing that catches a type error before
 it becomes a runtime one.
+
+---
+
+## Shipping one, and installing somebody else's
+
+A plugin is published by being a git repository with a `plugin.toml` at its root. There is no
+registry: a URL is already a globally unique name, and it works for a fork, a private repository and
+the branch you are writing.
+
+```sh
+neosh plugin add https://github.com/someone/neosh-thing   # or git@host:someone/thing
+neosh plugin list                                         # everything that loads here
+neosh plugin update                                       # ff-only pull, all of them
+neosh plugin remove thing                                 # asks first
+```
+
+`add` clones, reads the manifest with the same code startup reads it with, and only then moves it
+into place — so a plugin built against another protocol version, or missing the file its `entry`
+names, fails here with a sentence rather than at your next startup as a line in a log.
+
+The directory is named by `name` in the manifest, not by the URL: a plugin's id is that name, and
+two directories claiming one id would make which of them wins depend on how a filesystem happened to
+list them.
+
+**Two places, and they mean different things.** `~/.config/neosh/plugins/` is yours — put a plugin
+you are *writing* there and it is discovered as it is, so every save is live. `neosh plugin remove`
+will not touch it, because `add` did not put it there. Installed plugins live under your data
+directory and are checkouts neosh manages. `plugin_dirs` in `config.toml` adds any other directory.
 
 ---
 
@@ -312,6 +349,26 @@ and without it the selection is dropped. That is shift-and-arrow, in one call.
 Selection is drawn as an extmark in a namespace the core reserves, linked to `Visual`, so your theme
 already styles it and no rendering code had to learn a new concept.
 
+A selection is two positions, and the *shape* is what says whether the character the cursor is on is
+in it:
+
+```ts
+await neosh.edit.selectShape(win, "inclusive"); // the cursor is on a character, and it is selected
+await neosh.edit.selectShape(win, "line");      // whole rows, in whichever direction it runs
+await neosh.edit.cursorShape(win, "block");     // and the caret says so before any key is pressed
+```
+
+`exclusive` is the default and is what a text field wants: the cursor sits *between* two characters,
+so one that swallowed the character to its right would delete a letter nobody highlighted. A normal
+mode wants the other answer — `v` then `y` copies a letter rather than reporting an empty selection
+— and a `line` selection snaps both ends to whole rows, including when it is extended upwards.
+Dropping a selection puts the shape back to `exclusive`.
+
+`cursorShape` is per window. A block caret is painted by the frontend over the character it is on
+(reverse video unless a theme defines `Cursor`) *and* asked of the terminal, which is what a screen
+reader follows. Give it back when your mode ends: a shell that inherits a block cursor because
+something exited mid-mode is a terminal that looks broken.
+
 `copy` goes out as OSC 52 through the frontend, which is the only thing holding a terminal. That is
 also why it works over SSH, where a clipboard library would be talking to the wrong machine.
 
@@ -473,6 +530,44 @@ await neosh.session.archive(id);                     // reversible, keeps everyt
 await neosh.session.archive(id, false);              // back, and to the top of the list
 await neosh.session.close(id);                       // deletes the file. No undo.
 ```
+
+### Driving one you are not looking at
+
+`agent.command` does something *to* a named conversation — the same vocabulary `swarm.command`
+carries to another machine, pointed at one here. Omit the id for the conversation on screen.
+
+```ts
+const id = await neosh.agent.command({ command: "new_session", title: "the tests" });
+await neosh.agent.command({ command: "send", text: "run the suite and report" }, id!);
+await neosh.agent.command({ command: "interrupt" }, id!);
+await neosh.agent.command({ command: "set_model", instance: "anthropic", model: "…" }, id!);
+```
+
+That plus `onTurnEnd` — which says which conversation ended — is an orchestrator: fan work out over
+several conversations, join on their endings, and the screen never moves. `session.switch` before
+each message is the thing this replaced; it works, and it drags the transcript out from under
+whoever is reading it.
+
+### Deciding who answers
+
+`turn.route` fires once a turn knows what it is going to say and before it knows who to say it to.
+A blocking hook there may re-point it, or refuse it with a reason the transcript prints.
+
+```ts
+await neosh.hook.register("turn_route", (p) => {
+  if (p.hook !== "turn_route") return { action: "continue" };
+  if (!p.text.startsWith("quick:")) return { action: "continue" };
+  return {
+    action: "modify",
+    payload: { ...p, selection: { instance: "local", model: "small", options: [] } },
+  };
+}, { blocking: true });
+```
+
+`selection` may be `null` — a conversation with no model chosen is a routable state, not an error,
+so a router may supply one. Needs `hooks_blocking` in the manifest.
+
+---
 
 `archive` and `close` are different verbs on purpose. If you are writing the thing a user presses
 when they are done with a conversation, it is `archive`; `close` is for when they have said they

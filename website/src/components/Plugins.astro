@@ -19,23 +19,27 @@ const GUIDE = "https://github.com/neoswarm/neosh/blob/main/website/src/data/plug
 <section id="plugins">
   <div class="wrap">
     <p class="eyebrow">Plugins</p>
-    <h2>Made by people like you.</h2>
+    <h2>The ones everyone runs.</h2>
     <p class="lede">
-      Every plugin here arrived as a pull request. Yours can too.
+      Most starred first, straight from GitHub. Every plugin here arrived as a pull request — yours can too.
     </p>
-    <div class="grid">
+    <div class="grid" id="plugin-grid">
       {
         plugins.map((p, i) => (
-          <a class="card plug" href={p.repo} data-reveal style={`transition-delay:${(i % 3) * 60}ms`}>
+          <a class="card plug" target="_blank" rel="noopener" href={p.repo} data-repo={p.repo} data-reveal style={`transition-delay:${(i % 3) * 60}ms`}>
             <div class="head">
               <span class="name">{p.name}</span>
               <span class="author">{p.author}</span>
             </div>
             <p>{p.description}</p>
+            <div class="foot">
+              <span class="tags">{p.tags.join(" · ")}</span>
+              <span class="stars" hidden></span>
+            </div>
           </a>
         ))
       }
-      <a class="card plug add" href={GUIDE} data-reveal>
+      <a class="card plug add" target="_blank" rel="noopener" href={GUIDE} data-reveal>
         <span class="plus">+</span>
         <span>Add yours</span>
         <p>One file, one pull request</p>
@@ -56,6 +60,8 @@ const GUIDE = "https://github.com/neoswarm/neosh/blob/main/website/src/data/plug
   }
 
   .plug {
+    display: flex;
+    flex-direction: column;
     padding: 32px 34px;
     transition:
       opacity 0.7s ease,
@@ -93,9 +99,21 @@ const GUIDE = "https://github.com/neoswarm/neosh/blob/main/website/src/data/plug
     margin: 0;
   }
 
-  .add {
+  .foot {
     display: flex;
-    flex-direction: column;
+    justify-content: space-between;
+    align-items: baseline;
+    margin-top: 18px;
+    font-family: var(--mono);
+    font-size: 12.5px;
+    color: var(--dim);
+  }
+
+  .stars {
+    color: var(--muted);
+  }
+
+  .add {
     align-items: center;
     justify-content: center;
     gap: 4px;
@@ -126,3 +144,57 @@ const GUIDE = "https://github.com/neoswarm/neosh/blob/main/website/src/data/plug
     }
   }
 </style>
+
+<script>
+  // Popularity is the plugin repo's own star count. Builtins live inside
+  // neoswarm/neosh (a /tree/ URL), and the host repo's stars say nothing
+  // about one plugin in it — those cards keep their tags and no badge.
+  const grid = document.getElementById("plugin-grid")!;
+  const cards = [...grid.querySelectorAll<HTMLElement>("[data-repo]")];
+
+  const fmt = (n: number) =>
+    n >= 10_000 ? `${Math.round(n / 1000)}k` : n >= 1000 ? `${(n / 1000).toFixed(1)}k` : `${n}`;
+
+  const bySlug = new Map<string, HTMLElement[]>();
+  for (const card of cards) {
+    const m = card.dataset.repo!.match(/^https:\/\/github\.com\/([^/]+\/[^/]+?)\/?$/);
+    if (!m) continue;
+    const list = bySlug.get(m[1]) ?? [];
+    list.push(card);
+    bySlug.set(m[1], list);
+  }
+
+  async function stars(slug: string): Promise<number | null> {
+    const key = `gh-stars:${slug}`;
+    const cached = sessionStorage.getItem(key);
+    if (cached !== null) return Number(cached);
+    try {
+      const r = await fetch(`https://api.github.com/repos/${slug}`);
+      if (!r.ok) return null;
+      const n = (await r.json()).stargazers_count;
+      if (typeof n !== "number") return null;
+      sessionStorage.setItem(key, String(n));
+      return n;
+    } catch {
+      return null;
+    }
+  }
+
+  Promise.all(
+    [...bySlug].map(async ([slug, list]) => {
+      const n = await stars(slug);
+      if (n === null) return;
+      for (const card of list) {
+        card.dataset.stars = String(n);
+        const badge = card.querySelector<HTMLElement>(".stars")!;
+        badge.textContent = `★ ${fmt(n)}`;
+        badge.hidden = false;
+      }
+    }),
+  ).then(() => {
+    const add = grid.querySelector(".add");
+    [...cards]
+      .sort((a, b) => Number(b.dataset.stars ?? -1) - Number(a.dataset.stars ?? -1))
+      .forEach((card) => grid.insertBefore(card, add));
+  });
+</script>

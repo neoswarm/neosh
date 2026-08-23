@@ -665,6 +665,15 @@ pub enum UiEvent {
         row: u32,
         col: u32,
     },
+    /// What the caret in this window looks like. See [`crate::ApiCall::WinCursorShape`].
+    ///
+    /// Kept by the editor and said again on reattach, because a terminal that joins a workspace
+    /// whose transcript is being read has to draw a block cursor without having seen the key that
+    /// asked for one. A value that is only forwarded is a value that comes back wrong.
+    CursorShapeChanged {
+        win: WindowId,
+        shape: CursorShape,
+    },
     /// Scroll position requested by the core (e.g. follow streaming output).
     ///
     /// `None` is *unscrolled*, which is not the same place as row zero: a transcript that has never
@@ -727,6 +736,35 @@ pub enum UiEvent {
 // ---------------------------------------------------------------------------
 // Text editing
 // ---------------------------------------------------------------------------
+
+/// What the two ends of a selection mean. See [`crate::ApiCall::WinSelectShape`].
+#[derive(TS, Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Hash, Debug, Default)]
+#[serde(rename_all = "snake_case")]
+#[ts(export)]
+pub enum SelectShape {
+    /// The cursor is between characters and the one it is on is not selected. What a text field
+    /// wants, and the default.
+    #[default]
+    Exclusive,
+    /// The cursor is on a character and that character is selected. Vim's charwise visual.
+    Inclusive,
+    /// Whole rows, in whichever direction the selection now runs. Vim's linewise visual.
+    Line,
+}
+
+/// What the caret looks like. See [`crate::ApiCall::WinCursorShape`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS, Default)]
+#[serde(rename_all = "snake_case")]
+#[ts(export)]
+pub enum CursorShape {
+    /// Between two characters. A text field.
+    #[default]
+    Bar,
+    /// On a character. A mode where keys are verbs.
+    Block,
+    /// Under a character.
+    Underline,
+}
 
 /// Where the cursor goes.
 ///
@@ -851,6 +889,14 @@ pub enum InputEvent {
         width: u16,
         height: u16,
         top_line: u32,
+        /// How many *buffer* rows are on the screen, which on a wrapping window is not the height.
+        ///
+        /// The frontend is the only thing that can answer it, and everything that pages by a
+        /// screenful needs it: a transcript of paragraphs draws six buffer rows in thirty cells of
+        /// height, so half a screen counted as `height / 2` is four screens of scrolling and a
+        /// cursor that lands somewhere nobody asked for.
+        #[serde(default)]
+        rows: u32,
     },
     /// Run a registered command by name.
     ///

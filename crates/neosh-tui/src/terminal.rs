@@ -11,6 +11,7 @@ use crossterm::event::{
     KeyEventKind, KeyModifiers, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags,
     PushKeyboardEnhancementFlags,
 };
+use crossterm::cursor::SetCursorStyle;
 use crossterm::terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode};
 use crossterm::{execute, ExecutableCommand};
 use neosh_proto::{InputEvent, KeyCode, KeyMods, KeyPress};
@@ -88,6 +89,9 @@ pub struct TerminalFrontend {
     /// terminal and waits for a reply, and doing that while tearing down — possibly on a panic
     /// path, possibly after the terminal has gone away — is how an exit hangs.
     enhanced: bool,
+    /// The shape last asked of the terminal, so the escape goes out when it changes and not on
+    /// every frame.
+    cursor_shape: neosh_proto::CursorShape,
 }
 
 /// Ask the terminal for unambiguous keys, if it knows how.
@@ -129,7 +133,12 @@ impl TerminalFrontend {
         execute!(stdout, EnterAlternateScreen, EnableBracketedPaste)?;
         let enhanced = enable_enhanced_keys(&mut stdout);
         let terminal = Terminal::new(CrosstermBackend::new(stdout))?;
-        Ok(Self { terminal, theme: Theme::new(ColorDepth::detect()), enhanced })
+        Ok(Self {
+            terminal,
+            theme: Theme::new(ColorDepth::detect()),
+            enhanced,
+            cursor_shape: Default::default(),
+        })
     }
 
     pub fn size(&self) -> io::Result<(u16, u16)> {
@@ -142,32 +151,64 @@ impl TerminalFrontend {
     /// The geometry goes back to the core as `ViewportChanged`. Without it a plugin cannot learn
     /// how wide its pane is, and therefore cannot size a meter, decide what to drop at 60 columns,
     /// or page by a screenful — all of which are the frontend's knowledge, not the core's.
-    pub fn draw(
-        &mut self,
-        mirror: &Mirror,
-    ) -> io::Result<Vec<(neosh_proto::WindowId, neosh_proto::Rect)>> {
+    pub fn draw(&mut self, mirror: &Mirror) -> io::Result<Vec<crate::Geometry>> {
         self.theme.sync(&mirror.highlights);
         let theme = self.theme.clone();
-        let mut caret = None;
+        let mut drawn = render::Drawn::default();
         let mut geometry = Vec::new();
         self.terminal.draw(|f| {
             geometry = render::resolve_layout(mirror, f.area());
-            caret = render::draw(f, mirror, &theme);
+            drawn = render::draw(f, mirror, &theme);
         })?;
         // Placed after the draw, because ratatui hides the cursor for each frame it paints.
-        match caret {
+        match drawn.caret {
             Some((x, y)) => {
                 self.terminal.show_cursor()?;
                 self.terminal.set_cursor_position((x, y))?;
             }
             None => self.terminal.hide_cursor()?,
         }
+        // And what shape it is. A bar sits between two characters and a block sits on one, which
+        // is the difference between a field you are typing into and a mode where `d` is a verb —
+        // the one thing on screen that answers "what will this key do" before you press it.
+        // Steady rather than blinking: a transcript is something you read.
+        let shape = drawn
+            .caret_win
+            .and_then(|w| mirror.windows.get(&w))
+            .map(|w| w.cursor_shape)
+            .unwrap_or_default();
+        if self.cursor_shape != shape {
+            self.cursor_shape = shape;
+            let _ = self.terminal.backend_mut().execute(match shape {
+                neosh_proto::CursorShape::Block => SetCursorStyle::SteadyBlock,
+                neosh_proto::CursorShape::Underline => SetCursorStyle::SteadyUnderScore,
+                neosh_proto::CursorShape::Bar => SetCursorStyle::SteadyBar,
+            });
+        }
         // Handed back as the protocol's own rectangle, not ratatui's: the binary wires the
         // frontend to the core and has no business depending on a rendering library.
+        //
+        // The top line comes off the frame rather than out of the mirror: a window whose scroll
+        // was bent to keep its cursor on screen is showing a different first row than it was
+        // asked to, and that is the number anything paging by a screenful has to page from.
         Ok(geometry
             .into_iter()
-            .map(|(win, r): (neosh_proto::WindowId, Rect)| {
-                (win, neosh_proto::Rect { row: r.y, col: r.x, width: r.width, height: r.height })
+            .map(|(win, r): (neosh_proto::WindowId, Rect)| crate::Geometry {
+                win,
+                rect: neosh_proto::Rect { row: r.y, col: r.x, width: r.width, height: r.height },
+                top_line: drawn
+                    .tops
+                    .iter()
+                    .find(|(w, _)| *w == win)
+                    .map(|(_, (t, _))| *t)
+                    .or_else(|| mirror.windows.get(&win).and_then(|w| w.top_line))
+                    .unwrap_or(0),
+                rows: drawn
+                    .tops
+                    .iter()
+                    .find(|(w, _)| *w == win)
+                    .map(|(_, (_, n))| *n)
+                    .unwrap_or(0),
             })
             .collect())
     }
@@ -209,6 +250,9 @@ impl TerminalFrontend {
         if self.enhanced {
             let _ = self.terminal.backend_mut().execute(PopKeyboardEnhancementFlags);
         }
+        // The caret shape is the terminal's, not ours: a shell inheriting a block cursor because
+        // neosh happened to exit while reading is a terminal that looks broken.
+        self.terminal.backend_mut().execute(SetCursorStyle::DefaultUserShape)?;
         self.terminal.backend_mut().execute(DisableBracketedPaste)?;
         self.terminal.backend_mut().execute(LeaveAlternateScreen)?;
         self.terminal.show_cursor()?;

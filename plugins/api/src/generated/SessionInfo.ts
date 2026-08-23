@@ -96,6 +96,24 @@ export type SessionInfo = {
    */
   unread: boolean;
   /**
+   * The workspace stopped while a turn was running here, and nothing ended that turn.
+   *
+   * The one thing a conversation cannot notice about itself: a process that is killed does not
+   * get to write down that it was. So a turn writes down that it *started* and clears the note
+   * when it ends, and a note still there when the conversation is next loaded says the process
+   * that made it never got to the end — the machine was shut down, the workspace was `SIGKILL`ed,
+   * the OOM killer chose it. Whatever the agent had already done is in `messages`; what it was
+   * in the middle of is gone, and this is the only thing that will ever say so.
+   *
+   * Deliberately *not* the same kind of mark as [`Self::unread`], which is news and is cleared
+   * by arriving. This is a fact about the conversation's last turn, and arriving does not change
+   * it: at startup you land in the conversation you were last in, which is usually the one that
+   * was cut off, and a mark that cleared on arrival would clear exactly the one that mattered
+   * most before you had read it. It goes when a new turn starts here, because that is the point
+   * at which the last turn stops being the last turn.
+   */
+  interrupted: boolean;
+  /**
    * What is still running here that no turn is waiting for.
    *
    * The other half of [`Self::unread`]. That one says a turn *finished* somewhere you were not
