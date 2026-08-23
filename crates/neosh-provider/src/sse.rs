@@ -13,8 +13,8 @@
 use std::collections::{BTreeMap, HashMap};
 
 use neosh_proto::{
-    Activity, BlockStartKind, DriverCommand, PlanState, PlanStep, ProviderEvent, StopReason, TaskId,
-    TaskStatus, ToolCallId, Usage,
+    Activity, BackgroundTask, BlockStartKind, DriverCommand, PlanState, PlanStep, ProviderEvent,
+    StopReason, TaskId, TaskStatus, ToolCallId, Usage,
 };
 use serde_json::Value;
 
@@ -366,6 +366,7 @@ fn system_line(v: &Value, state: &mut ClaudeState) -> Vec<ProviderEvent> {
                 role: str_at("subagent_type"),
                 parent_call: str_at("tool_use_id").map(ToolCallId),
                 model: str_at("model"),
+                backgrounded: v.get("is_backgrounded").and_then(Value::as_bool).unwrap_or(false),
             })]
         }
         Some("task_progress") => {
@@ -408,32 +409,61 @@ fn system_line(v: &Value, state: &mut ClaudeState) -> Vec<ProviderEvent> {
                 summary: str_at("summary"),
             })]
         }
-        // A snapshot of what is running unattended. Redundant with `task_started` for anything this
-        // stream watched begin — and not redundant at all for a task that was already running when
-        // the conversation was resumed, which is the case where "is something still going?" is a
-        // question somebody actually has. Announcing them is safe: a receiver keys by task id.
-        Some("background_tasks_changed") => v
-            .get("tasks")
-            .and_then(Value::as_array)
-            .map(|tasks| {
-                tasks
-                    .iter()
-                    .filter_map(|t| {
-                        Some(activity(Activity::TaskStarted {
-                            task: TaskId(t.get("task_id").and_then(Value::as_str)?.to_string()),
-                            title: t
-                                .get("description")
-                                .and_then(Value::as_str)
-                                .unwrap_or("sub-agent")
-                                .to_string(),
-                            role: t.get("task_type").and_then(Value::as_str).map(str::to_string),
-                            parent_call: None,
-                            model: None,
-                        }))
+        // Everything running unattended, whole, whenever the set changes — a start, a completion, a
+        // kill, a foreground sub-agent being let go of.
+        //
+        // A **level**, and it is read as one: the whole set replaces the whole set. The CLI says so
+        // itself, and says why — a consumer that only wants "is background work running" must not
+        // pair the `task_started`/`task_notification` bookends, because a missed bookend wedges a
+        // running indicator that nothing will ever put right. Which is not hypothetical here: the
+        // turn stops being read at its `result`, and a shell that was backgrounded keeps running
+        // long after that. This was read as a fan-out of `TaskStarted` — additive, so an empty
+        // `tasks` produced no events at all and the one payload that means "nothing is running any
+        // more" was the one that did nothing.
+        //
+        // An absent `tasks` is not an empty one: a line we cannot read says nothing rather than
+        // claiming the set is empty.
+        Some("background_tasks_changed") => {
+            let Some(tasks) = v.get("tasks").and_then(Value::as_array) else { return Vec::new() };
+            let tasks = tasks
+                .iter()
+                .filter_map(|t| {
+                    Some(BackgroundTask {
+                        id: TaskId(t.get("task_id").and_then(Value::as_str)?.to_string()),
+                        title: t
+                            .get("description")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .to_string(),
+                        kind: t.get("task_type").and_then(Value::as_str).map(str::to_string),
                     })
-                    .collect()
-            })
-            .unwrap_or_default(),
+                })
+                .collect();
+            vec![activity(Activity::Background { tasks })]
+        }
+        // A request that failed with something retryable, and the wait before it is tried again.
+        //
+        // The single worst-looking thing a vendor CLI does: a 529 costs several silent minutes with
+        // no tokens, no card and nothing on screen, and the only way to tell it apart from a wedged
+        // process is to wait longer than anybody does. The CLI has always said so on this line.
+        //
+        // Read from the CLI's own schema rather than from a capture — a retry is not something a
+        // test can arrange on demand — so it is written to survive being wrong about the shape:
+        // every field is optional, and a line with none of them still produces the one thing worth
+        // saying, which is that it is waiting rather than stuck.
+        Some("api_retry") => {
+            let n = |k: &str| v.get(k).and_then(Value::as_u64);
+            let mut what = match v.get("error_status").and_then(Value::as_u64) {
+                Some(status) => format!("Retrying after {status}"),
+                // Null for a connection error that never got an HTTP response, which the CLI says
+                // is exactly what it means by absent here.
+                None => "Retrying after a connection error".to_string(),
+            };
+            if let (Some(attempt), Some(max)) = (n("attempt"), n("max_retries")) {
+                what.push_str(&format!(" \u{b7} attempt {attempt} of {max}"));
+            }
+            vec![activity(Activity::Waiting { what, retry_in_ms: n("retry_delay_ms") })]
+        }
         // `status` is the CLI narrating itself. `requesting` is every turn and says nothing;
         // `compacting` is the several seconds where it answers nothing at all, which without this
         // is indistinguishable from a hang.
@@ -1122,14 +1152,15 @@ mod tests {
 
         assert_eq!(
             tasks[0],
-            &Activity::TaskStarted {
-                task: id.clone(),
-                title: "Say hello".into(),
-                role: Some("local_agent".into()),
-                parent_call: None,
-                model: None,
+            &Activity::Background {
+                tasks: vec![BackgroundTask {
+                    id: id.clone(),
+                    title: "Say hello".into(),
+                    kind: Some("local_agent".into()),
+                }],
             },
-            "the background snapshot announces it, for the resumed conversation that never saw it start"
+            "the live set, said whole — which is also how a resumed conversation hears about work \
+             it never saw start"
         );
         assert_eq!(
             tasks[1],
@@ -1141,6 +1172,7 @@ mod tests {
                 // beside the transcript rather than part of it.
                 parent_call: Some(ToolCallId("toolu_01VERa8BPA1ye6fSEenrQ1AB".into())),
                 model: None,
+                backgrounded: false,
             }
         );
         assert_eq!(
@@ -1156,6 +1188,97 @@ mod tests {
                 summary: Some("hello".into()),
             },
             "and the report, which is the one that says what it concluded"
+        );
+    }
+
+    /// A shell the agent put in the background, captured on `claude 2.1.240` — the whole life of
+    /// one, in the order it actually arrives.
+    ///
+    /// The last three lines are on the far side of the turn's `result`. That is not an artefact of
+    /// how this was captured: a backgrounded shell outlives the turn that started it by definition,
+    /// so the only place it can report is after the turn has ended.
+    const REAL_BACKGROUND_SHELL: &[&str] = &[
+        r#"{"type":"system","subtype":"background_tasks_changed","tasks":[{"task_id":"bcuwuj1ft","task_type":"local_bash","description":"Sleep for 60 seconds then echo done"}]}"#,
+        r#"{"type":"system","subtype":"task_started","task_id":"bcuwuj1ft","tool_use_id":"toolu_01Hp7uCzHCMEknR27ZAyyrYE","description":"Sleep for 60 seconds then echo done","is_backgrounded":true,"task_type":"local_bash"}"#,
+        r#"{"type":"result","subtype":"success","duration_ms":3463}"#,
+        r#"{"type":"system","subtype":"background_tasks_changed","tasks":[]}"#,
+        r#"{"type":"system","subtype":"task_updated","task_id":"bcuwuj1ft","patch":{"status":"completed","end_time":1787457600637}}"#,
+        r#"{"type":"system","subtype":"task_notification","task_id":"bcuwuj1ft","status":"completed","summary":"Sleep for 60 seconds then echo done"}"#,
+    ];
+
+    #[test]
+    fn the_live_set_is_a_level_and_an_empty_one_says_nothing_is_running() {
+        let events = cli(REAL_BACKGROUND_SHELL);
+        let sets: Vec<&Vec<BackgroundTask>> = only_activity(&events)
+            .into_iter()
+            .filter_map(|a| match a {
+                Activity::Background { tasks } => Some(tasks),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(sets.len(), 2, "both payloads are events, including the empty one");
+        assert_eq!(sets[0].len(), 1);
+        assert_eq!(sets[0][0].id, TaskId("bcuwuj1ft".into()));
+        assert_eq!(sets[0][0].kind.as_deref(), Some("local_bash"));
+        // The one that used to produce nothing at all. Read as a fan-out of starts it was purely
+        // additive, so the payload whose entire meaning is "the set is now empty" was silent — and
+        // an indicator switched on by the first line had nothing that could ever switch it off.
+        assert!(sets[1].is_empty(), "an empty set is a value, not an absence of news");
+    }
+
+    #[test]
+    fn a_shell_that_was_launched_detached_says_so_at_the_start() {
+        // The later move to the background arrives as a status patch and was already read. This is
+        // the commoner half — `run_in_background: true` — and it is only ever said here.
+        let events = cli(REAL_BACKGROUND_SHELL);
+        let started = only_activity(&events)
+            .into_iter()
+            .find_map(|a| match a {
+                Activity::TaskStarted { backgrounded, .. } => Some(*backgrounded),
+                _ => None,
+            })
+            .expect("the start is reported");
+        assert!(started, "nothing is waiting on it, from the first frame it is drawn in");
+    }
+
+    #[test]
+    fn a_line_that_does_not_say_what_is_running_does_not_claim_nothing_is() {
+        // Absent is not empty. A payload we cannot read has to be silent, or one malformed line
+        // clears a mark that was telling the truth.
+        let events = cli(&[r#"{"type":"system","subtype":"background_tasks_changed"}"#]);
+        assert!(
+            only_activity(&events).into_iter().all(|a| !matches!(a, Activity::Background { .. })),
+            "no tasks field is no news"
+        );
+    }
+
+    #[test]
+    fn a_retry_says_what_it_is_waiting_for_and_how_long() {
+        let events = cli(&[
+            r#"{"type":"system","subtype":"api_retry","error_status":529,"attempt":2,"max_retries":5,"retry_delay_ms":4200}"#,
+        ]);
+        assert_eq!(
+            only_activity(&events).first().copied(),
+            Some(&Activity::Waiting {
+                what: "Retrying after 529 \u{b7} attempt 2 of 5".into(),
+                retry_in_ms: Some(4200),
+            }),
+        );
+    }
+
+    #[test]
+    fn a_retry_that_says_almost_nothing_still_says_it_is_waiting() {
+        // Read out of the CLI's schema rather than off a capture, so the shape is not something
+        // this can be certain of. The one thing worth saying survives every field being missing:
+        // a null `error_status` is the CLI's own way of spelling "no HTTP response at all".
+        let events = cli(&[r#"{"type":"system","subtype":"api_retry"}"#]);
+        assert_eq!(
+            only_activity(&events).first().copied(),
+            Some(&Activity::Waiting {
+                what: "Retrying after a connection error".into(),
+                retry_in_ms: None,
+            }),
+            "a wait nobody can describe is still not a hang"
         );
     }
 

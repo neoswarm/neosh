@@ -461,11 +461,20 @@ pub struct Host {
     ///
     /// Out of band, like the quota poll and for the same reason: it is news from a driver that
     /// arrives when no turn is running, so there is no stream for it to come back on. See
-    /// [`neosh_provider::drivers::Unasked`] and ADR 0054.
+    /// [`neosh_provider::drivers::Unasked`] and ADR 0055.
     unasked_rx: Option<tokio::sync::mpsc::UnboundedReceiver<neosh_proto::SessionId>>,
     unasked_tx: tokio::sync::mpsc::UnboundedSender<neosh_proto::SessionId>,
     /// Set by a turn ending, cleared by the poll that follows it. See [`crate::quota::AFTER_TURN`].
     quota_due: bool,
+    /// Where a picture that had to be fetched comes back to.
+    ///
+    /// Same reason as the quota channel above: what is on the clipboard is sometimes only the
+    /// *address* of a picture, and going to get one is a round trip to a machine we have never met.
+    /// The key press cannot wait for it on the host loop, and the conversation it belongs to is the
+    /// one that was on screen when the key was pressed rather than whichever one is by the time it
+    /// lands.
+    image_tx: tokio::sync::mpsc::UnboundedSender<Fetched>,
+    image_rx: Option<tokio::sync::mpsc::UnboundedReceiver<Fetched>>,
     /// Repositories by directory, discovered on demand.
     ///
     /// Keyed rather than singular because the *conversation* decides which repository is in play:
@@ -526,6 +535,14 @@ struct Round {
     started: std::time::Instant,
     /// What it is waiting on, when that is something other than the model.
     note: Option<String>,
+    /// Whether [`Self::note`] is a *wait* rather than a running tool.
+    ///
+    /// They end differently and only one of them ends by itself. A tool's note is cleared by the
+    /// tool coming back; a wait has no matching event and is cleared by being overtaken — the next
+    /// token is the usual way. Without telling them apart, an agent driver that says something
+    /// while a command is still running wipes `Running cargo test` off the line and puts the
+    /// generic verb back, which is the label flicker ADR 0033 chose a fixed verb to avoid.
+    note_is_wait: bool,
     /// Everything this turn has produced that the conversation does not hold yet.
     ///
     /// Cleared the moment the turn's messages land in the conversation, because from then on the
@@ -603,11 +620,11 @@ struct Leg {
 /// finished when the call comes back — without going looking for the call in the conversation,
 /// which for a running agent turn does not hold it yet.
 ///
-/// Usually one call. A *run* of calls that only looked at things — reads, greps, listings, one
-/// after another with nothing drawn between them — shares a card, and the card is one row saying
-/// what they all looked at. See [`cards::group_header`]. Nothing else ever shares: a command's
-/// output and an edit's diff are the answer, and there is no summarising them into a list of
-/// names.
+/// Usually one call. A *run* of calls of one kind, one after another with nothing drawn between
+/// them, shares a card: reads, greps and listings fold to one row saying what they all looked at,
+/// and commands fold to one row naming them with the last one's output under it. See
+/// [`cards::group_header`] and [`cards::groups_with`]. An edit never shares — its diff is the
+/// answer, and there is no summarising a diff into a list of names.
 struct Card {
     /// One, or a run of read-only calls, in the order they were made.
     legs: Vec<Leg>,
@@ -643,11 +660,17 @@ impl Card {
 
     /// Whether a call `input` could join this card.
     ///
-    /// Both sides have to be calls that only looked at something, and the card has to have room
-    /// for the idea — a card whose body is already on screen is a card the reader has opened, and
-    /// growing it under them would move what they were reading.
+    /// Both sides have to be the same kind of call — reads with reads, commands with commands —
+    /// and the card has to have room for the idea: a card whose body is already on screen is a
+    /// card the reader has opened, and growing it under them would move what they were reading.
+    ///
+    /// **A run does not continue past a failure.** A stack of commands shows the last one's
+    /// output, so a failed call that is not the last one is a failure whose output folded away —
+    /// and the fold is about noise. Ending the run there gives the failure its own card with its
+    /// own body, which is what it would have had alone.
     fn takes(&self, input: &serde_json::Value) -> bool {
         !self.expanded
+            && !self.legs.iter().any(|l| l.result.as_ref().is_some_and(|r| r.is_error))
             && self.legs.last().is_some_and(|l| cards::groups_with(&l.input, input))
     }
 }
@@ -735,6 +758,17 @@ impl Drop for SecretPrompt {
     }
 }
 
+/// A picture that had to be fetched, arriving after the key press that asked for it.
+///
+/// Carries the conversation rather than reading one on arrival: switching conversations while a
+/// server takes its time is an ordinary thing to do, and the picture belongs to the one you were
+/// in when you pressed the key. `waiting` is a plugin owed an answer, if a plugin is what asked.
+struct Fetched {
+    session: neosh_proto::SessionId,
+    waiting: Option<(PluginId, RequestId)>,
+    result: Result<crate::images::Attachment, String>,
+}
+
 impl Host {
     pub fn new(
         agent: Arc<Agent>,
@@ -744,6 +778,7 @@ impl Host {
         let mut editor = Editor::new();
         let (quota_tx, quota_rx) = tokio::sync::mpsc::unbounded_channel();
         let (unasked_tx, unasked_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (image_tx, image_rx) = tokio::sync::mpsc::unbounded_channel();
 
         let chat = editor.create_buffer("[chat]");
         let chat_win =
@@ -857,6 +892,8 @@ impl Host {
             unasked_rx: Some(unasked_rx),
             unasked_tx,
             quota_due: false,
+            image_tx,
+            image_rx: Some(image_rx),
             repos: Default::default(),
             cwd: std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
             projects: Default::default(),
@@ -1064,7 +1101,7 @@ impl Host {
                 // A plugin's own images go on the row first, so they travel with whatever is
                 // already there and in the order they were added — the send is one message.
                 for path in &images {
-                    if let Err(e) = self.attach(Some(std::path::Path::new(path))) {
+                    if let Err(e) = self.attach(std::path::Path::new(path)) {
                         return Err(ApiError::InvalidArgument { message: e });
                     }
                 }
@@ -1090,8 +1127,17 @@ impl Host {
                 Ok(ApiOk::MaybeSession { session })
             }
             ApiCall::ChatAttach { path } => {
+                // `None` means the clipboard, and the clipboard is sometimes only the *address* of
+                // a picture — so it is taken over before dispatch, where the request id still is,
+                // and the plugin is answered when the fetch lands. Anything arriving here names a
+                // file and is read now.
+                let Some(path) = path else {
+                    return Err(ApiError::Internal {
+                        message: "the clipboard is answered off the loop".to_string(),
+                    });
+                };
                 let got = self
-                    .attach(path.as_deref().map(std::path::Path::new))
+                    .attach(std::path::Path::new(&path))
                     .map_err(|message| ApiError::InvalidArgument { message })?;
                 Ok(ApiOk::Attachments { attachments: vec![info_of(&got)] })
             }
@@ -1690,21 +1736,113 @@ impl Host {
         }
     }
 
-    /// Put an image on the composer's attachment row.
+    /// Put an image from a file on the composer's attachment row.
     ///
-    /// `path` names a file; `None` is the clipboard. Answers with what it attached, so the caller
-    /// can say so — a chip appearing at the bottom of the screen is not enough on its own when the
-    /// thing you pressed might equally have found nothing.
-    fn attach(&mut self, path: Option<&std::path::Path>) -> Result<crate::images::Attachment, String> {
+    /// Answers with what it attached, so the caller can say so — a chip appearing at the bottom of
+    /// the screen is not enough on its own when the thing you pressed might equally have found
+    /// nothing.
+    fn attach(&mut self, path: &std::path::Path) -> Result<crate::images::Attachment, String> {
         let store = self.image_store();
-        let got = match path {
-            Some(p) => crate::images::from_path(&store, p),
-            None => crate::images::from_clipboard(&store),
-        }?;
+        let got = crate::images::from_path(&store, path)?;
         let here = self.active_session();
-        self.attached.entry(here).or_default().push(got.clone());
-        self.refresh_composer();
+        self.hold(&here, got.clone());
         Ok(got)
+    }
+
+    /// Put an attachment on a conversation's row, redrawing the chips if that is the one on screen.
+    fn hold(&mut self, session: &neosh_proto::SessionId, got: crate::images::Attachment) {
+        self.attached.entry(session.clone()).or_default().push(got);
+        if *session == self.active_session() {
+            self.refresh_composer();
+        }
+    }
+
+    /// `^V`, and `chat.attach` with nothing named: attach the picture the clipboard is holding.
+    ///
+    /// Two shapes of answer, because a clipboard has two ways of holding a picture. Bytes are here
+    /// and the chip appears in the same breath, silently — the chip *is* the report. An address is
+    /// a round trip to somebody else's server, which cannot happen on this loop and cannot be
+    /// silent either: a key press with nothing on screen after it is a key press that did nothing,
+    /// so it says where it has gone and says again when it arrives.
+    fn begin_paste(&mut self, waiting: Option<(PluginId, RequestId)>) {
+        let store = self.image_store();
+        let session = self.active_session();
+        match crate::images::from_clipboard(&store) {
+            Err(e) => self.finish_paste(session, waiting, Err(e), true),
+            Ok(crate::images::Clipped::Image(got)) => {
+                self.finish_paste(session, waiting, Ok(got), false)
+            }
+            Ok(crate::images::Clipped::Remote(url)) => {
+                let where_ = short_url(&url);
+                self.editor_message(MessageLevel::Info, format!("fetching {where_}\u{2026}"));
+                let tx = self.image_tx.clone();
+                tokio::spawn(async move {
+                    let result = crate::images::from_url(&store, &url).await;
+                    let _ = tx.send(Fetched { session, waiting, result });
+                });
+            }
+        }
+    }
+
+    /// A picture that was asked for has arrived, or has not.
+    ///
+    /// `announce` is whether this one owes a sentence: a fetch already said "fetching…", and a line
+    /// left saying that about a picture which is now on screen is the kind of stale that makes
+    /// people stop reading the line at all.
+    fn finish_paste(
+        &mut self,
+        session: neosh_proto::SessionId,
+        waiting: Option<(PluginId, RequestId)>,
+        result: Result<crate::images::Attachment, String>,
+        announce: bool,
+    ) {
+        match &result {
+            Ok(got) => {
+                let elsewhere = session != self.active_session();
+                // The conversation may have been archived or deleted while a server took its time.
+                // A row on one that is gone is a row nothing will ever draw or send.
+                if self.agent.sessions().get(&session).is_none() {
+                    self.editor_message(
+                        MessageLevel::Warn,
+                        format!("{} arrived after its conversation went", got.label()),
+                    );
+                } else {
+                    self.hold(&session, got.clone());
+                    if announce || elsewhere {
+                        // Named when it landed somewhere you are not looking, because the chip that
+                        // usually does the reporting is on a screen you cannot see.
+                        let where_ = match elsewhere {
+                            true => format!(" in {}", self.session_name(&session)),
+                            false => String::new(),
+                        };
+                        self.editor_message(
+                            MessageLevel::Info,
+                            format!("attached {}{where_}", got.label()),
+                        );
+                    }
+                }
+            }
+            Err(e) => self.editor_message(MessageLevel::Warn, e.clone()),
+        }
+        if let Some((plugin, id)) = waiting {
+            let response: ApiResponse = result
+                .map(|got| ApiOk::Attachments { attachments: vec![info_of(&got)] })
+                .map_err(|message| ApiError::InvalidArgument { message })
+                .into();
+            let _ = self.bridge.script().send(ScriptInbound::Plugin {
+                plugin,
+                msg: PluginInbound::Response { id, response },
+            });
+        }
+    }
+
+    /// What to call a conversation in a sentence about it.
+    fn session_name(&self, session: &neosh_proto::SessionId) -> String {
+        self.agent
+            .sessions()
+            .get(session)
+            .and_then(|s| s.title.clone())
+            .unwrap_or_else(|| "another conversation".to_string())
     }
 
     /// Whether the conversation on screen has an image attached that has not been sent.
@@ -1768,6 +1906,7 @@ impl Host {
             verb,
             started: std::time::Instant::now(),
             note: None,
+            note_is_wait: false,
             said: Vec::new(),
             changes: Vec::new(),
             plan: Vec::new(),
@@ -5130,8 +5269,16 @@ impl Host {
         {
             self.cards[i].legs.push(leg);
             let row = self.cards[i].row;
-            let header = self.card_header(i);
-            self.replace_row(row, &header);
+            if self.cards[i].body > 0 {
+                // A stack of commands shows the *last* one's output, and the call that just
+                // started has not printed one yet — so its predecessor's rows come off here.
+                self.redraw_card(i);
+            } else {
+                // A run of reads has no body at all, and rewriting the header in place is what
+                // keeps a run from costing rows while it happens.
+                let header = self.card_header(i);
+                self.replace_row(row, &header);
+            }
             return Some(row);
         }
         let g = self.glyphs();
@@ -5144,6 +5291,7 @@ impl Host {
             took: None,
             exit: None,
             output: None,
+            result: None,
         };
         let card = cards::header(&g, &head, &root, width);
         // No blank row above it. Air used to go between one action and the next on the argument
@@ -5251,6 +5399,8 @@ impl Host {
                 took: leg.took.or_else(|| leg.started.map(|s| s.elapsed())),
                 exit: leg.exit,
                 output: leg.result.as_ref().map(|r| lines_in(&r.content)),
+                // Only a stack of commands draws one, and only that reads it back.
+                result: leg.result.as_ref(),
             })
             .collect()
     }
@@ -5306,10 +5456,11 @@ impl Host {
                 Some(r) => cards::body(&g, &leg.input, r, limits, card.expanded, width),
                 None => Vec::new(),
             },
-            // A run: nothing until it is opened, and then a row per call. What the fold exists to
-            // keep out of the transcript is the *contents* of the six files, so opening a run
-            // gives back the six names in full and stops there.
-            _ => cards::group_body(&g, &Self::card_heads(card), &root, card.expanded, width),
+            // A run of reads: nothing until it is opened, and then a row per call. What the fold
+            // exists to keep out of the transcript is the *contents* of the six files, so opening
+            // a run gives back the six names in full and stops there. A run of *commands* keeps
+            // the last one's output, because what a command printed is the answer — see ADR 0051.
+            _ => cards::group_body(&g, &Self::card_heads(card), &root, limits, card.expanded, width),
         };
         // Anything else writing into the transcript ends the answer: its rows are addressed by
         // range, and rows moving underneath it would make "the end of the answer" ambiguous. An
@@ -5942,7 +6093,7 @@ impl Host {
         } else {
             Vec::new()
         };
-        let out: Vec<cards::TaskRow> = r
+        let mut out: Vec<cards::TaskRow> = r
             .tasks
             .iter()
             .filter(|t| t.listed())
@@ -5953,6 +6104,47 @@ impl Host {
                 live: t.status == neosh_proto::TaskStatus::Running,
             })
             .collect();
+        // And whatever else is running that this turn never started — a shell backgrounded two
+        // turns ago is not in any round, and the footer is the one surface that is on screen while
+        // you wait. Keyed by task id against what the round already has, since the level and the
+        // edges describe the same things and a task in both would otherwise be two rows.
+        //
+        // No clock on these: the level says what is running, never since when, and a duration
+        // counted from the moment this process first heard of it would be a number about neosh
+        // rather than about the work. `live: false` for the same reason it is on the block a
+        // finished turn leaves behind — nothing is waiting on them.
+        //
+        // The id is read *first* and on its own line. `active_session` locks the session store, and
+        // the store's mutex is not reentrant — written as `sessions().get(&self.active_session())`
+        // the receiver takes the lock and then the argument asks for it again, and the host loop
+        // stops dead with the panel frozen on whatever it last drew.
+        let seen: Vec<&neosh_proto::TaskId> = r.tasks.iter().map(|t| &t.id).collect();
+        let here = self.active_session();
+        let extra: Vec<(String, Option<String>)> = self
+            .agent
+            .sessions()
+            .get(&here)
+            .map(|s| {
+                s.background
+                    .iter()
+                    .filter(|t| !seen.contains(&&t.id))
+                    .map(|t| {
+                        let title = if t.title.is_empty() {
+                            "background task".to_string()
+                        } else {
+                            t.title.clone()
+                        };
+                        (title, t.kind.clone())
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        out.extend(extra.iter().map(|(title, kind)| cards::TaskRow {
+            title,
+            role: kind.as_deref(),
+            since: None,
+            live: false,
+        }));
         if !out.is_empty() {
             rows.extend(cards::tasks(&g, &out, width));
         }
@@ -5961,24 +6153,66 @@ impl Host {
 
     /// What is still out when the turn stops waiting for it, as rows to leave behind.
     fn tasks_left_running(&self, session: &neosh_proto::SessionId) -> Vec<cards::Row> {
-        let Some(r) = self.rounds.get(session) else { return Vec::new() };
-        let left: Vec<cards::TaskRow> = r
-            .tasks
+        // The level first, and the turn's own bookends only when there is no level to be had.
+        //
+        // A driver that reports the whole live set is telling us the answer; the turn's list is a
+        // reconstruction of it from edges, and the two disagree exactly where reconstructions do —
+        // a shell backgrounded three turns ago is in the level and in no round at all. Codex has no
+        // level signal, so the edges are all there is there, and dropping them would trade one
+        // driver's accuracy for another's silence.
+        //
+        // Copied out rather than borrowed: `sessions()` is a lock guard, and a `TaskRow` borrows
+        // the strings it names.
+        let level: Vec<(String, Option<String>)> = self
+            .agent
+            .sessions()
+            .get(session)
+            .map(|s| {
+                s.background
+                    .iter()
+                    .map(|t| {
+                        let title = if t.title.is_empty() {
+                            "background task".to_string()
+                        } else {
+                            t.title.clone()
+                        };
+                        (title, t.kind.clone())
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let level: Vec<cards::TaskRow> = level
             .iter()
-            .filter(|t| t.listed())
-            .map(|t| cards::TaskRow {
-                title: &t.title,
-                role: t.role.as_deref(),
+            .map(|(title, kind)| cards::TaskRow {
+                title,
+                role: kind.as_deref(),
                 // No clock. It is still running and this row is not: a frozen number beside
                 // something that is still going is worse than no number.
                 since: None,
                 live: false,
             })
             .collect();
+        let left = if level.is_empty() {
+            let Some(r) = self.rounds.get(session) else { return Vec::new() };
+            r.tasks
+                .iter()
+                .filter(|t| t.listed())
+                .map(|t| cards::TaskRow {
+                    title: &t.title,
+                    role: t.role.as_deref(),
+                    since: None,
+                    live: false,
+                })
+                .collect()
+        } else {
+            level
+        };
         if left.is_empty() {
             return Vec::new();
         }
-        cards::tasks(&self.glyphs(), &left, self.chat_width())
+        let mut rows = cards::still_running(&self.glyphs(), left.len());
+        rows.extend(cards::tasks(&self.glyphs(), &left, self.chat_width()));
+        rows
     }
 
     /// Move the clock on anything in the footer that has one.
@@ -6186,6 +6420,15 @@ impl Host {
             }
             AgentEvent::Token { session, turn, text } => {
                 if let Some(r) = self.rounds.get_mut(&session) {
+                    // Whatever it was waiting for, it is not waiting any more — the model is
+                    // talking. There is no event for a wait *ending*: a driver that has stopped
+                    // waiting simply gets on with the thing it was waiting to do, and this is it.
+                    // Cheap to leave in the hot path because it only writes when there is something
+                    // to clear, which is almost never.
+                    if r.note_is_wait {
+                        r.note = None;
+                        r.note_is_wait = false;
+                    }
                     match r.said.last_mut() {
                         Some(Said::Text(t)) => t.push_str(&text),
                         _ => r.said.push(Said::Text(text.clone())),
@@ -6220,6 +6463,7 @@ impl Host {
             AgentEvent::ToolStarted { session, turn, call } => {
                 if let Some(r) = self.rounds.get_mut(&session) {
                     r.note = Some(format!("Running {}", call.name));
+                    r.note_is_wait = false;
                     r.said.push(Said::Tool { call: call.clone(), result: None });
                 }
                 if on_screen {
@@ -6233,6 +6477,7 @@ impl Host {
             AgentEvent::ToolFinished { session, turn, call, result } => {
                 if let Some(r) = self.rounds.get_mut(&session) {
                     r.note = None;
+                    r.note_is_wait = false;
                     // The call this answers, so a replay of the round draws the pair rather than a
                     // dot that is still pulsing over a tool that came back minutes ago.
                     for said in r.said.iter_mut().rev() {
@@ -6432,13 +6677,21 @@ impl Host {
             // once when this turn's own call starts one — so this is written to be idempotent.
             // The second telling knows more (which call it belongs to, which kind of agent it is)
             // and is allowed to fill in what the first could not.
-            Activity::TaskStarted { task, title, role, .. } => {
+            Activity::TaskStarted { task, title, role, backgrounded, .. } => {
                 let Some(r) = self.rounds.get_mut(&session) else { return };
+                // Let go of at the moment it started — a detached shell, a sub-agent spawned into
+                // the background — is not something this turn is waiting on, and the footer draws
+                // it still rather than live from the first frame it appears in.
+                let status =
+                    if backgrounded { TaskStatus::Backgrounded } else { TaskStatus::Running };
                 match r.tasks.iter_mut().find(|t| t.id == task) {
                     Some(t) => {
                         t.title = title;
                         if role.is_some() {
                             t.role = role;
+                        }
+                        if backgrounded {
+                            t.status = status;
                         }
                     }
                     None => r.tasks.push(Task {
@@ -6446,7 +6699,7 @@ impl Host {
                         title,
                         role,
                         since: std::time::Instant::now(),
-                        status: TaskStatus::Running,
+                        status,
                     }),
                 }
                 if on_screen {
@@ -6466,6 +6719,37 @@ impl Host {
                     self.redraw_footer();
                 }
             }
+            // The whole set, whole, and therefore *replacing* the whole set. Not merged into the
+            // turn's own list of sub-agents: that one is edges — what this turn started and is
+            // waiting on — and this is a level, said by the driver precisely so that a receiver
+            // which only wants "is anything still running" cannot wedge on a bookend it never got.
+            // See `Activity::Background`.
+            //
+            // On the conversation and not the round, which is the entire point: the round is thrown
+            // away when the turn ends, and a shell that was put in the background is still running
+            // after that.
+            Activity::Background { tasks } => {
+                // `if let` and not `let ... else`: the temporary `sessions()` hands back does not
+                // outlive a `let`-else, and the borrow it yields is what is being written through.
+                let changed = if let Some(s) = self.agent.sessions().get_mut(&session) {
+                    let changed = s.background != tasks;
+                    s.background = tasks;
+                    changed
+                } else {
+                    return;
+                };
+                if !changed {
+                    return;
+                }
+                // Nothing else is broadcast here: the activity itself already went out to every
+                // plugin above, and that is the signal that means what it means. `SessionChanged`
+                // means the conversation you are *in* changed, and borrowing it to say "a row's
+                // state moved" would have every listener refreshing a footer about a conversation
+                // nobody switched to.
+                if on_screen {
+                    self.redraw_footer();
+                }
+            }
             Activity::TaskEnded { task, status, .. } => {
                 let Some(r) = self.rounds.get_mut(&session) else { return };
                 let Some(t) = r.tasks.iter_mut().find(|t| t.id == task) else { return };
@@ -6477,11 +6761,31 @@ impl Host {
                     self.redraw_footer();
                 }
             }
+            // Not answering, and now the line says why.
+            //
+            // Straight onto the working line rather than into the transcript: it is a state and not
+            // an event, it is over in seconds or minutes, and a row about it would still be sitting
+            // in the conversation a week later saying nothing anybody wants. The clock beside it is
+            // the turn's own and keeps running, which is the half that makes a wait bearable.
+            Activity::Waiting { what, retry_in_ms } => {
+                let Some(r) = self.rounds.get_mut(&session) else { return };
+                r.note_is_wait = true;
+                r.note = Some(match retry_in_ms {
+                    // Rounded up, because a wait reported as `0s` is a wait that reads as a lie.
+                    Some(ms) => format!("{what} \u{b7} in {}s", ms.div_ceil(1000).max(1)),
+                    None => what,
+                });
+                if on_screen {
+                    self.draw_working();
+                }
+            }
             // The several seconds where the driver answers nothing at all. Without this it is
             // indistinguishable from a hang, which is exactly what `/compact` looked like.
             Activity::Compacting => {
                 if let Some(r) = self.rounds.get_mut(&session) {
                     r.note = Some("Compacting the conversation".into());
+                    // Ended by `Compacted`, which is a real event, so it is not a self-ending wait.
+                    r.note_is_wait = false;
                 }
                 if on_screen {
                     self.draw_working();
@@ -6490,6 +6794,7 @@ impl Host {
             Activity::Compacted { before, after } => {
                 if let Some(r) = self.rounds.get_mut(&session) {
                     r.note = None;
+                    r.note_is_wait = false;
                     // The plan was built from calls the driver can no longer see. Keeping it would
                     // be a checklist for work nothing is going to pick up.
                     r.plan.clear();
@@ -6708,6 +7013,13 @@ impl Host {
                     // replied to exactly once, so this settles — unless the peer has gone, which
                     // the swarm reports as a disconnect and which settles it too.
                     // Dials an address that may not answer, so it cannot run on the loop.
+                    // Answered when the picture is here rather than now: what is on the
+                    // clipboard is sometimes a URL, and going to get one is somebody else's server
+                    // taking as long as it likes.
+                    if let ApiCall::ChatAttach { path: None } = &call {
+                        self.begin_paste(Some((plugin.clone(), id.clone())));
+                        return;
+                    }
                     if let ApiCall::SwarmProbe { addr } = &call {
                         self.begin_swarm_probe(addr.clone(), (plugin.clone(), id.clone()));
                         return;
@@ -6731,6 +7043,10 @@ impl Host {
                     });
                 }
                 PluginOutbound::Notify { call } => {
+                    if let ApiCall::ChatAttach { path: None } = &call {
+                        self.begin_paste(None);
+                        return;
+                    }
                     if let ApiCall::ProviderSetCredential { instance, replace } = &call {
                         if let Err(e) = self.begin_secret(instance.clone(), *replace, None) {
                             tracing::warn!(%plugin, "{e}");
@@ -6820,7 +7136,7 @@ impl Host {
                 // is not all four of those is text, because swallowing something somebody meant
                 // to type is much worse than making them press a key.
                 if let Some(path) = crate::images::pasted_path(&text) {
-                    match self.attach(Some(&path)) {
+                    match self.attach(&path) {
                         // Nothing said about it. The chip that just appeared above the field *is*
                         // the report, and a line saying the same words in the same glance is the
                         // kind of noise that teaches people not to read either one.
@@ -6892,9 +7208,10 @@ impl Host {
     /// Open a turn to hold something the agent has already started saying.
     ///
     /// A backgrounded command finishing is a message `claude` enqueues to itself and answers, and
-    /// the answer is this conversation's. With nothing reading it, the whole turn was invisible
-    /// until you next typed — and then it arrived all at once as though it were the reply to what
-    /// you had just sent, whose own answer never came. See ADR 0054.
+    /// the answer is this conversation's. ADR 0054 stopped that turn being read as the reply to
+    /// whatever you typed next, by dropping it; this is where it gets somewhere to go instead. The
+    /// agent said it would report back when the build landed, and it did — silence on the screen
+    /// until you happen to ask is indistinguishable from a hang. See ADR 0055.
     ///
     /// The turn says nothing: [`AgentDriver::listen_only`] is what tells the driver that, and it is
     /// set here rather than carried on the wire because it is true of exactly the turn about to
@@ -6968,6 +7285,7 @@ impl Host {
         // sitting there is one nobody knows exists.
         let mut quota_rx = self.quota_rx.take();
         let mut unasked_rx = self.unasked_rx.take();
+        let mut image_rx = self.image_rx.take();
         let plan = tokio::time::sleep(crate::quota::AFTER_TURN);
         tokio::pin!(plan);
         // How many times in a row a poll has come back with nothing. Doubles the wait each time.
@@ -7059,6 +7377,20 @@ impl Host {
                             plan.as_mut().reset(Instant::now() + wait);
                         }
                     }
+                }
+                Some(fetched) = async {
+                    match image_rx.as_mut() {
+                        Some(rx) => rx.recv().await,
+                        // Never ready, rather than ready-with-nothing: the latter would spin.
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    self.finish_paste(
+                        fetched.session,
+                        fetched.waiting,
+                        fetched.result,
+                        true,
+                    );
                 }
                 () = &mut plan => {
                     self.refresh_quota(None);
@@ -7787,11 +8119,7 @@ impl Host {
             // Only the failure is worth a line: a chip appearing above the composer says the
             // other thing better than a sentence could. "Nothing on the clipboard" has nothing to
             // show for itself, and is the answer people actually need explaining.
-            "chat.image.paste" => {
-                if let Err(e) = self.attach(None) {
-                    self.editor_message(MessageLevel::Warn, e);
-                }
-            }
+            "chat.image.paste" => self.begin_paste(None),
             "chat.image.drop" => self.drop_attachment(),
             "chat.image.clear" => {
                 let here = self.active_session();
@@ -8749,6 +9077,35 @@ fn transcript(
             lines.insert(row as usize, r.text);
         }
     }
+    // What is under card `i`, replaced. A card acquires and loses a body while the conversation is
+    // being read — a stack of commands shows the last one's output, so every command that joins it
+    // takes the previous one's rows back off the screen — and the rows below it, the marks and the
+    // other cards all move with it.
+    #[allow(clippy::items_after_statements)]
+    fn set_body(
+        lines: &mut Vec<String>,
+        marks: &mut Vec<Mark>,
+        cards: &mut Vec<Card>,
+        i: usize,
+        rows: Vec<cards::Row>,
+    ) {
+        let at = cards[i].row + 1;
+        let old = cards[i].body;
+        if old > 0 {
+            lines.drain(at as usize..(at + old) as usize);
+            marks.retain(|m| m.row < at || m.row >= at + old);
+            for m in marks.iter_mut().filter(|m| m.row >= at + old) {
+                m.row -= old;
+            }
+            for c in cards.iter_mut().filter(|c| c.row >= at + old) {
+                c.row -= old;
+            }
+            cards[i].body = 0;
+        }
+        let n = rows.len() as u32;
+        insert(lines, marks, cards, at, rows);
+        cards[i].body = n;
+    }
     // A card's header, from what the conversation says about every call on it.
     //
     // The results are read out of `answered` rather than off the legs: a result block always comes
@@ -8761,7 +9118,20 @@ fn transcript(
         root: &std::path::Path,
         width: usize,
     ) -> cards::Row {
-        let heads: Vec<cards::Head> = card
+        let heads = heads_of(card, answered);
+        match heads.as_slice() {
+            [one] => cards::header(g, one, root, width),
+            many => cards::group_header(g, many, root, width),
+        }
+    }
+    // Every call on a card, as the renderer wants them. The live path's `card_heads`, for a card
+    // built out of the conversation rather than watched happening.
+    #[allow(clippy::items_after_statements)]
+    fn heads_of<'a>(
+        card: &'a Card,
+        answered: &std::collections::HashMap<&neosh_proto::ToolCallId, (bool, Option<i64>, usize)>,
+    ) -> Vec<cards::Head<'a>> {
+        card
             .legs
             .iter()
             .map(|leg| {
@@ -8777,12 +9147,29 @@ fn transcript(
                     took: None,
                     exit,
                     output,
+                    result: leg.result.as_ref(),
                 }
             })
-            .collect();
-        match heads.as_slice() {
-            [one] => cards::header(g, one, root, width),
-            many => cards::group_header(g, many, root, width),
+            .collect()
+    }
+    // What goes under a card, folded, from what the conversation says: one call's answer, or a
+    // stack's. The live path's [`Host::redraw_card`] arm, asked the same way — the two have to
+    // produce the same rows, or switching away and back re-draws the conversation.
+    #[allow(clippy::items_after_statements)]
+    fn body_of(
+        g: &Glyphs,
+        card: &Card,
+        answered: &std::collections::HashMap<&neosh_proto::ToolCallId, (bool, Option<i64>, usize)>,
+        root: &std::path::Path,
+        limits: cards::Limits,
+        width: usize,
+    ) -> Vec<cards::Row> {
+        match card.legs.as_slice() {
+            [leg] => match &leg.result {
+                Some(r) => cards::body(g, &leg.input, r, limits, false, width),
+                None => Vec::new(),
+            },
+            _ => cards::group_body(g, &heads_of(card, answered), root, limits, false, width),
         }
     }
     // A gap, unless there already is one: what came before was often a tool card, which has no
@@ -8886,6 +9273,12 @@ fn transcript(
                     let at = if open {
                         let i = cards.len() - 1;
                         cards[i].legs.push(leg);
+                        // A card that was one command with its output under it is now a stack of
+                        // them, and a stack shows the *last* one's output — which this call has
+                        // not produced yet. So its predecessor's rows come off the screen here,
+                        // exactly as the live path takes them off when it redraws the card.
+                        let rows = body_of(&g, &cards[i], &answered, root, limits, width);
+                        set_body(&mut lines, &mut marks, &mut cards, i, rows);
                         cards[i].row
                     } else {
                         // No gap, exactly as the live path draws it: the two have to produce the
@@ -8922,18 +9315,12 @@ fn transcript(
                             if !*is_error {
                                 cards::tally(&mut changes, &cards::edits_of(&cards[i].legs[k].input));
                             }
-                            // A run holds its calls' answers and shows none of them: it is one row
-                            // until somebody opens it, exactly as it is live.
-                            let rows = if cards[i].legs.len() > 1 {
-                                Vec::new()
-                            } else {
-                                cards::body(&g, &cards[i].legs[k].input, &result, limits, false, width)
-                            };
-                            let n = rows.len() as u32;
-                            let at = cards[i].row + 1;
-                            insert(&mut lines, &mut marks, &mut cards, at, rows);
+                            // The answer goes on the leg first, because what a card shows is a
+                            // question about the whole card: a run of reads shows none of them, a
+                            // stack of commands shows the last one's, and one call shows its own.
                             cards[i].legs[k].result = Some(result);
-                            cards[i].body = n;
+                            let rows = body_of(&g, &cards[i], &answered, root, limits, width);
+                            set_body(&mut lines, &mut marks, &mut cards, i, rows);
                         }
                         // No card to go under — cards are off and this is an error — so at the
                         // end, which is where the live path puts it too.
@@ -9105,6 +9492,16 @@ fn image_row(path: &str, media_type: &str) -> String {
 }
 
 /// What the API says about an attachment.
+/// A URL as much of itself as fits in a line about it: the host, and the last thing in the path.
+fn short_url(url: &str) -> String {
+    let Ok(parsed) = url::Url::parse(url) else { return url.to_string() };
+    let host = parsed.host_str().unwrap_or("").to_string();
+    match parsed.path_segments().and_then(|s| s.filter(|p| !p.is_empty()).next_back()) {
+        Some(last) if last.len() <= 40 => format!("{host}/{last}"),
+        _ => host,
+    }
+}
+
 fn info_of(a: &crate::images::Attachment) -> neosh_proto::AttachmentInfo {
     neosh_proto::AttachmentInfo {
         path: a.path.display().to_string(),

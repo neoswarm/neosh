@@ -419,6 +419,16 @@ export async function activate({ neosh, subscriptions }: PluginContext) {
   subscriptions.push(neosh.agent.onTurnEnd(() => void draw()));
   subscriptions.push(neosh.agent.onToolStart(() => void draw()));
   subscriptions.push(neosh.session.onChange(() => void draw()));
+  // What a conversation is still running after its turn ended. The only state on these rows that
+  // moves without a turn starting or ending — that is the whole point of it — so nothing else this
+  // panel already listens to would ever bring it. Filtered to the one kind, because a driver
+  // reports its context size every few seconds and redrawing the column for that is a column that
+  // redraws for nothing.
+  subscriptions.push(
+    neosh.agent.onActivity((e) => {
+      if (e.activity.kind === "background") void draw();
+    }),
+  );
   // Somebody pinned, folded or tagged a project — possibly us, possibly a plugin that has never
   // heard of this one. Both arrive here, and the arrangement takes them in the same way.
   subscriptions.push(
@@ -2671,18 +2681,31 @@ function projectRow(
   const unseen = folded && !waiting && cut === 0
     ? within.filter((s) => !s.active_turn && s.unread).length
     : 0;
+  // Fourth and last rung: a folded project hiding a conversation that is still running something.
+  // Below all three, because a question stops the workspace, a killed turn lost work, an unread
+  // answer is waiting — and this is none of those. Counted over the whole group, conversations
+  // included, because folded is exactly the state where the rows that know are the ones you
+  // cannot see.
+  const busyBg = folded && !waiting && cut === 0 && unseen === 0
+    ? within.filter((s) => !s.active_turn && (s.background?.length ?? 0) > 0).length
+    : 0;
+  // Whichever rung is being reported, drawn the same way and told apart by the glyph and the
+  // colour. One column, one mark — two would be a puzzle rather than a summary.
+  const [count, dot, dotHl] = cut > 0
+    ? [cut, opts.ascii ? "x" : "✗", "Diagnostic.Error"]
+    : unseen > 0
+    ? [unseen, opts.ascii ? "!" : "●", "Status.Unread"]
+    // Hollow where the other two are solid: the difference between something here for you and
+    // something here still happening.
+    : [busyBg, opts.ascii ? "o" : "○", "Status.Monitoring"];
   const mark = folded && waiting
     ? " ?"
-    : cut > 0
-      ? cut === 1
-        ? opts.ascii ? " x" : " ✗"
-        : opts.ascii ? ` x${cut}` : ` ✗${cut}`
-      : unseen === 0 ? "" : unseen === 1
-        ? opts.ascii ? " !" : " ●"
-        : opts.ascii ? ` !${unseen}` : ` ●${unseen}`;
-  const markHl = folded && waiting
-    ? "Status.Pending"
-    : cut > 0 ? "Diagnostic.Error" : "Status.Unread";
+    : count === 0
+    ? ""
+    : count === 1
+    ? ` ${dot}`
+    : ` ${dot}${count}`;
+  const markHl = folded && waiting ? "Status.Pending" : dotHl;
 
   const name = clip(
     p.name,
@@ -2835,6 +2858,12 @@ function sessionRow(
   // while you were away and a turn that was killed are both news, and only one of them lost work —
   // and it does not move, because nothing is happening here: it already happened.
   const interrupted = !working && !asking && s.interrupted;
+  // Something the agent started and stopped waiting for — a shell it put in the background, a
+  // sub-agent it let go of. Last in the order on purpose: every state above it is a block or news
+  // — and a killed turn is both — while this is neither. It is the answer to "it said it was done,
+  // is it?", which is only a question once nothing louder is true.
+  const running = !working && !asking && !interrupted && !unread &&
+    (s.background?.length ?? 0) > 0;
   const glyph = asking
     // A question mark, in both alphabets. Every other glyph here has an ASCII understudy because
     // the Unicode one is prettier; this one is already the character that means what it means, and
@@ -2850,9 +2879,14 @@ function sessionRow(
         ? opts.ascii ? "x" : "✗"
       : unread
         ? opts.ascii ? "!" : "●"
-        : s.is_active
-          ? opts.ascii ? ">" : "▸"
-          : " ";
+        : running
+          // Hollow where unread is solid: the same size of mark, and the difference between them
+          // is the difference between "there is something here for you" and "there is something
+          // here still happening".
+          ? opts.ascii ? "o" : "○"
+          : s.is_active
+            ? opts.ascii ? ">" : "▸"
+            : " ";
   // The clock, and it keeps running while the question sits there: one asked four minutes ago and
   // one asked while you were reading this row are not the same news. Off the turn rather than off
   // `working`, because a question can be raised by a plugin with no turn behind it at all — and
@@ -2902,9 +2936,14 @@ function sessionRow(
           // if you already know it is there, which is the one thing you cannot assume about the
           // conversation you have forgotten you started.
           ? "Status.Unread"
-          : s.is_active
-            ? "Accent"
-            : undefined,
+          : running
+            // The colour the panel already uses for work happening somewhere you are not, dimmed
+            // and — the whole point — still. Motion here would be a promise that you have to do
+            // something, and you do not: it finishes whether or not you look. See ADR 0045.
+            ? "Status.Monitoring"
+            : s.is_active
+              ? "Accent"
+              : undefined,
     // A trailing space so the age does not sit flush against the panel's edge rule.
     right: {
       text: right === "" ? "" : `${right} `,
@@ -2914,7 +2953,9 @@ function sessionRow(
           ? "Status.Working"
           : interrupted
             ? "Diagnostic.Error"
-            : unread ? "Status.Unread" : "Sidebar.Dim",
+            : unread
+            ? "Status.Unread"
+            : running ? "Status.Monitoring" : "Sidebar.Dim",
     },
     value: { kind: "session", id: s.id, cwd: s.cwd },
   };
