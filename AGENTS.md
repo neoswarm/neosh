@@ -340,6 +340,19 @@ per decision, and records the *reasoning*, not the choice.
   (`└`) at a four-column indent rather than a rule down the whole left side. Air between every two
   actions and a wall beside every diff were both structure said twice — the header is at column
   zero, the body is indented, and that is already a list. See ADR 0040 and ADR 0050.
+- **A turn is something you can watch, not only something you read back.** A command is named by
+  what it *does* and never by how it got there: a leading `cd /home/you/projects/thing &&` is the
+  one part of that row you already knew — the conversation has a directory — and clipped to a
+  header it is the only part that fits, so it comes off before the command is named and a stack of
+  six folds to what was run rather than to `cd, cd, cd`. Reading is a place, and a turn writes
+  below it: parked on the **last row** you are carried along with what arrives, anywhere else you
+  stay exactly where you are, and neither happens while a selection or a search is holding two
+  positions. And **the card the cursor is in is open** — ADR 0049's rule one surface along, bounded
+  by `chat.preview_lines` because nine hundred rows appearing under `j` is what the fold exists to
+  prevent, and never fewer rows than the folded card showed. `⇥` stops meaning "open this" and
+  starts meaning "keep it", `c`/`C` step call to call because `[`/`]` is a whole turn and `{`/`}`
+  is one block for a run of nine cards, and a preview never fires while the tail is carrying you:
+  following is watching, and a redraw settles the answer streaming above it. See ADR 0057.
 - **A terminal cannot paste a picture, so pasting one is a key.** Bracketed paste is a text
   protocol: a screenshot arrives as nothing, and a dragged file arrives as its path. `^V` asks the
   system clipboard through whichever of `wl-paste`/`xclip`/`pngpaste`/`osascript`/`powershell` is
@@ -582,8 +595,9 @@ on it, which after wrapping is not the window's height. See ADR 0051.
 | `H` `M` `L` | The top, middle and bottom row **of the window** |
 | `zz` `zt` `zb` | Put the cursor's line in the middle, at the top, at the bottom |
 | `[` `]` | Previous / next **turn** |
+| `c` `C` | Next / previous **tool call**. A count first: `3c`. The card you land on opens itself |
 | `{` `}` | Previous / next **block** |
-| `⇥` `za` | Open or fold the **tool card** under the cursor — the whole diff, the whole output |
+| `⇥` `za` | *Keep* the **tool card** under the cursor open — all of it, and it stays that way when you move off |
 | `/` `?` then `n` `N` | Search, and step through the matches. `n` is *onwards*, so after `?` it goes up |
 | `*` `#` | Search for the word under the cursor, forwards or back |
 | `v` | Start a selection that motions extend. Again, or on a `V` selection, gives it up |
@@ -604,7 +618,14 @@ on it, which after wrapping is not the window's height. See ADR 0051.
 
 There is no `^V`: a blockwise selection is a rectangle rather than a range, and every consumer of a
 selection would have to grow a case for it. The key says so rather than doing nothing. Nothing here
-edits, either — no `d`, `c`, `x` or `p`. The transcript is an artefact you take pieces out of.
+edits, either — no `d`, `x` or `p`, and `c` is a motion here rather than a change. The transcript
+is an artefact you take pieces out of.
+
+**The card you are standing on is open.** Everything a fold hides, up to `chat.preview_lines`, for
+as long as the cursor is in it — so `c c c` walks a turn's work one call at a time and the rows go
+back as you leave. `⇥` is how you keep one. And **reading the last row keeps reading it**: a turn
+still running writes below you, and if you are parked at the end you are carried along with it.
+Anywhere else you stay exactly where you are — `G` starts following again. See ADR 0057.
 
 ## Answering a question — the panel over the composer
 

@@ -5756,13 +5756,20 @@ fn a_run_of_commands_is_one_row_that_keeps_the_last_answer() {
     );
 }
 
+/// The three states a card can be in, and the two things that move it between them. See ADR 0057.
+///
+/// Folded is what a card costs when nobody is looking at it. The card the *cursor* is in shows
+/// more — bounded, because nine hundred rows appearing under `j` is what the fold exists to
+/// prevent — and `\u{21e5}` is all of it. The trailer says which key at every step where something
+/// is still being held back.
 #[test]
-fn a_folded_card_opens_with_tab_while_reading_and_folds_again() {
-    // A card shows enough to know what happened. The whole of it is one key away, in the place
-    // you go to read — and the trailer says which key.
+fn a_card_opens_as_the_cursor_arrives_and_folds_as_it_leaves() {
     let sb = Sandbox::new("cardfold");
     install_editor(&sb);
-    sb.write_config("[options]\n\"agent.model\" = \"editor/editor\"\n\"chat.diff_lines\" = 2\n");
+    sb.write_config(
+        "[options]\n\"agent.model\" = \"editor/editor\"\n\"chat.diff_lines\" = 2\n\
+         \"chat.preview_lines\" = 4\n",
+    );
     let mut s = sb.start_letting_config_choose();
     s.wait_for("editor ready");
     s.type_text("go");
@@ -5779,13 +5786,24 @@ fn a_folded_card_opens_with_tab_while_reading_and_folds_again() {
     assert!(!rows.iter().any(|l| l.ends_with("+ i")), "the end of the diff is folded away\n{rows:?}");
     let header = rows.iter().position(|l| l.starts_with("  Edited  ")).expect("the header");
 
-    // Into the transcript, to the top, and down onto the card.
+    // Into the transcript, to the top, and down onto the card. Arriving is what opens it — no key.
     s.ctrl("s");
     s.key("g");
     s.key("g");
     for _ in 0..header {
         s.key("j");
     }
+    assert!(
+        s.pump(|s| s.chat_now().iter().any(|l| l.contains("+4 lines"))),
+        "the card the cursor is in is worth more rows, and still bounded\n{:?}",
+        s.chat_now()
+    );
+    assert!(
+        !s.chat_now().iter().any(|l| l.ends_with("+ i")),
+        "a preview is a budget, not an opening\n{:?}",
+        s.chat_now()
+    );
+
     s.special("tab");
     assert!(
         s.pump(|s| s.chat_now().iter().any(|l| l.ends_with("+ i"))),
@@ -5799,10 +5817,20 @@ fn a_folded_card_opens_with_tab_while_reading_and_folds_again() {
         "what was below the card is still below it\n{rows:?}"
     );
 
+    // `\u{21e5}` again gives back what the cursor was already buying — never less than that, which
+    // would be a key that answers "show me more" with a smaller card.
     s.special("tab");
     assert!(
+        s.pump(|s| s.chat_now().iter().any(|l| l.contains("+4 lines"))),
+        "back to the preview\n{:?}",
+        s.chat_now()
+    );
+
+    // And off the card entirely, which is the only thing that folds it.
+    s.key("k");
+    assert!(
         s.pump(|s| s.chat_now().iter().any(|l| l.contains("+6 lines"))),
-        "and it folds again\n{:?}",
+        "the rows go back when the cursor does\n{:?}",
         s.chat_now()
     );
 }
