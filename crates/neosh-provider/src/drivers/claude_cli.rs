@@ -933,6 +933,16 @@ async fn run_turn(
                     }
                     continue;
                 }
+                // Anything else the CLI asked for and is now waiting on. Last, so every handler
+                // above has had its go, and unconditional, so there is no line it can send that
+                // leaves the turn hanging. See [`claude_control::unhandled`].
+                if let Some(reply) = claude_control::unhandled(&v) {
+                    if write_line(&mut live.stdin, &reply).await.is_err() {
+                        *slot = None;
+                        break;
+                    }
+                    continue;
+                }
                 // How full the context is. Matched by *shape* rather than by request id: several
                 // of these are asked over a long turn, they all answer the same question, and the
                 // only one that matters is the newest.

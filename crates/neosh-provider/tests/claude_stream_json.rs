@@ -280,3 +280,79 @@ async fn a_turn_that_walked_away_from_a_shell_is_told_when_the_shell_finishes() 
     );
     assert!(said.contains("SECOND"), "and this turn's own answer never arrived\n{said:?}");
 }
+
+/// A `claude` that asks something and *waits*, which is what the control protocol always was.
+///
+/// The CLI blocks on every `control_request` it sends until a `control_response` carrying that id
+/// comes back, so this stand-in does too: it says nothing more until it is answered, and the turn
+/// only ends because something answered it.
+///
+/// Two requests, and neither of them is `AskUserQuestion`. The first is `ExitPlanMode`, captured
+/// off `claude 2.1.237` — `requires_user_interaction`, and a `plan` where a question path would
+/// look for `questions`. The second is a subtype that does not exist, standing in for the one the
+/// next release invents.
+const WAITING: &str = r##"#!/bin/sh
+n=0
+say() { printf '%s\n' "$1"; }
+finish() {
+  say '{"type":"stream_event","session_id":"s","event":{"type":"message_start","message":{"model":"m","usage":{}}}}'
+  say '{"type":"stream_event","session_id":"s","event":{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}}'
+  say "{\"type\":\"stream_event\",\"session_id\":\"s\",\"event\":{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"$1\"}}}"
+  say '{"type":"stream_event","session_id":"s","event":{"type":"content_block_stop","index":0}}'
+  say '{"type":"stream_event","session_id":"s","event":{"type":"message_stop"}}'
+  say "{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"result\":\"$1\",\"session_id\":\"s\"}"
+}
+while IFS= read -r line; do
+  case "$line" in
+    *'"subtype":"get_context_usage"'*)
+      say '{"type":"control_response","response":{"subtype":"success","request_id":"x","response":{"totalTokens":10,"maxTokens":100}}}' ;;
+    *'"type":"control_response"'*)
+      case "$line" in
+        *'"request_id":"plan-1"'*) finish ANSWERED-PLAN ;;
+        *'"request_id":"odd-1"'*) finish ANSWERED-ODD ;;
+      esac ;;
+    *'"type":"user"'*)
+      n=$((n+1))
+      if [ "$n" = 1 ]; then
+        say '{"type":"control_request","request_id":"plan-1","request":{"subtype":"can_use_tool","tool_name":"ExitPlanMode","display_name":"ExitPlanMode","input":{"plan":"# A plan\n","planFilePath":"/tmp/p.md"},"tool_use_id":"toolu_plan","requires_user_interaction":true}}'
+      else
+        say '{"type":"control_request","request_id":"odd-1","request":{"subtype":"something_invented_later"}}'
+      fi ;;
+  esac
+done
+"##;
+
+/// The timeout is the assertion. A request nothing answers is not a turn that ends badly, it is a
+/// turn that does not end — which on screen is a spinner over an empty conversation for as long as
+/// the workspace is up, and in a test is a run that hangs rather than fails.
+async fn answered(p: &ClaudeCliProvider, fake: &Fake, text: &str) -> String {
+    let stream = p.stream(&inst(), req(&fake.dir, text), CancellationToken::new());
+    let turn = stream.collect::<Vec<_>>();
+    let got = tokio::time::timeout(std::time::Duration::from_secs(20), turn)
+        .await
+        .expect("the turn never ended: the CLI asked something nothing replied to");
+    text_of(&got)
+}
+
+#[tokio::test]
+async fn a_request_to_leave_plan_mode_is_answered_rather_than_dropped() {
+    // The hang, end to end. `requires_user_interaction` was read as "this is a question", so the
+    // permission path stood aside; the question path wanted a `questions` array `ExitPlanMode`
+    // does not have, so it stood aside too. Nothing wrote a line back, and the CLI is entitled to
+    // wait forever — 94 minutes, in the conversation this was found in.
+    let fake = Fake::running("waiting", WAITING);
+    // One provider for both turns, because one `claude` holds one conversation: a second provider
+    // would be a second process, back at its first question.
+    let p = ClaudeCliProvider::new(fake.program());
+    assert!(
+        answered(&p, &fake, "one").await.contains("ANSWERED-PLAN"),
+        "nothing replied to the CLI's plan-mode request"
+    );
+
+    // And the backstop under it, for the subtype this was not written against. A refusal ends the
+    // turn badly; silence does not end it at all.
+    assert!(
+        answered(&p, &fake, "two").await.contains("ANSWERED-ODD"),
+        "a control request nothing understood was dropped instead of refused"
+    );
+}

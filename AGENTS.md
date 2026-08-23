@@ -225,6 +225,19 @@ per decision, and records the *reasoning*, not the choice.
   so a generated id is an answer to nothing — and **nobody answering is a denial with a sentence in
   it**, never an `allow` with an empty map, because the empty map is what the agent reads as
   "ignored me". See ADR 0043.
+- **A request nobody answers is a turn that never ends.** The control protocol blocks: the CLI waits
+  for a `control_response` carrying the id it sent, for as long as that takes. So the two
+  classifiers over one pipe must never both stand aside — `can_use_tool` asks *"would
+  `ask_user_question` claim this?"* rather than testing the flag itself, because
+  `requires_user_interaction` says *somebody has to see this*, not *this is a question*.
+  `ExitPlanMode` sets it and carries a **plan**, so the permission path stood aside for the question
+  path and the question path declined it for want of a question, and a conversation sat under
+  `Running ExitPlanMode… 93m 15s` — a spinner nothing on screen could tell from work. Leaving plan
+  mode is an ordinary permission, asked even under `--dangerously-skip-permissions`, and full access
+  says yes to it. The other half is that a line reaching the bottom of the reader is **refused out
+  loud** by request id rather than dropped: a refusal ends a turn badly and in the transcript,
+  silence does not end it at all, and only one of the two is recoverable from the keyboard. See ADR
+  0057.
 - **Everything irreversible asks, and nothing reversible does.** No exceptions on either side: a
   dialog that appears for some deletes and not others is a key whose behaviour you cannot predict
   from the row it is pointed at, and one charged for an action you can undo is what teaches people
