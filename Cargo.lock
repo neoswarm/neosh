@@ -2363,6 +2363,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "base64",
  "clap",
  "crossterm",
  "directories",
@@ -2378,6 +2379,7 @@ dependencies = [
  "neosh-syntax",
  "neosh-tui",
  "neosh-vcs",
+ "reqwest",
  "secrecy",
  "serde",
  "serde_json",
