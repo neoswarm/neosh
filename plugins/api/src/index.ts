@@ -1054,8 +1054,13 @@ export interface SessionApi {
   archive(session: SessionId, archived?: boolean): Promise<void>;
   /** The conversation itself, for a transcript view that renders rather than replays. */
   messages(session?: SessionId): Promise<Message[]>;
-  /** Fires whenever the active conversation changes — switched, created, or closed. */
-  onChange(cb: (e: { session: SessionId }) => void): Disposable;
+  /**
+   * Fires whenever a terminal is looking at a different conversation — switched, created, closed.
+   *
+   * `view` is which terminal moved. A workspace can have several and each is somewhere, so
+   * "the active conversation" is a question with as many answers as there are screens.
+   */
+  onChange(cb: (e: { session: SessionId; view: ViewId }) => void): Disposable;
 }
 
 /**
@@ -1486,7 +1491,7 @@ interface Registered {
   /// The protocol version this plugin was handed, kept so a namespace can be rebuilt for a
   /// view long after `__createContext` returned.
   version: number;
-  sessionListeners: Array<(e: { session: SessionId }) => void>;
+  sessionListeners: Array<(e: { session: SessionId; view: ViewId }) => void>;
   viewOpenListeners: Array<(view: ViewId) => void>;
   viewCloseListeners: Array<(view: ViewId) => void>;
   selectionListeners: Array<(e: { selection: ModelSelection }) => void>;
@@ -2569,7 +2574,7 @@ export async function __dispatch(plugin: string, msg: Record<string, unknown>): 
         for (const cb of r.optionListeners) cb({ name: ev.name, value: ev.value });
         break;
       case "session_changed":
-        for (const cb of r.sessionListeners) cb({ session: ev.session });
+        for (const cb of r.sessionListeners) cb({ session: ev.session, view: ev.view });
         break;
       case "view_attached":
         for (const cb of r.viewOpenListeners) cb(ev.view);

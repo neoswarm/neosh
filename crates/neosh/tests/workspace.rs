@@ -322,6 +322,16 @@ impl Client {
         self.text().iter().any(|l| l.contains(needle))
     }
 
+    /// Whether a buffer whose name contains `name` is actually *on screen* here.
+    ///
+    /// Not the same question as [`Self::shows`], which reads buffer contents: a panel that has been
+    /// hidden still has its buffer, and a buffer with no window is a buffer nothing draws.
+    fn windowed(&self, name: &str) -> bool {
+        self.mirror.windows.values().any(|w| {
+            self.mirror.buffers.get(&w.buf).is_some_and(|b| b.name.contains(name))
+        })
+    }
+
     /// Wait until the workspace is actually ready to be typed at.
     ///
     /// Not the welcome screen, which is drawn before the plugins are up — the sidebar's heading,
@@ -528,6 +538,71 @@ fn typing_in_one_terminal_stays_in_that_terminal() {
     assert!(
         !second.shows("half a sentence"),
         "somebody else's draft turned up in this terminal\n{:#?}",
+        second.text()
+    );
+}
+
+#[test]
+fn a_turn_running_in_one_terminal_is_visible_from_the_other() {
+    // The whole point of the second window: you opened it because something is running in the
+    // first. So what is *happening* has to reach it — the panel lists every conversation in the
+    // workspace, whoever is reading them — while what you are reading does not.
+    let sb = Sandbox::new("watching");
+    let ws = sb.serve_paced("two_answers.jsonl", 700);
+
+    let mut first = Client::attach(&ws.socket, neosh_proto::PROTOCOL_VERSION);
+    first.ready();
+    first.ask("the quiet one");
+
+    // A second conversation, and a turn running in it. The first terminal is now the one reading
+    // that, which leaves the quiet conversation for whoever attaches next.
+    first.send(ClientMessage::Input {
+        event: InputEvent::Command { name: "session.new".into(), args: Vec::new() },
+    });
+    first.until("the new conversation to be empty", |c| {
+        !c.transcript().iter().any(|l| l.contains("the quiet one"))
+    });
+    first.ask("go and do the thing");
+
+    let mut second = Client::attach(&ws.socket, neosh_proto::PROTOCOL_VERSION);
+    second.ready();
+    second.until("the quiet conversation here", |c| {
+        c.transcript().iter().any(|l| l.contains("the quiet one"))
+    });
+
+    // The working conversation is in this terminal's panel, and not in its transcript.
+    second.until("the working conversation listed in the panel", |c| {
+        c.shows("go and do the thing")
+    });
+    assert!(
+        !second.transcript().iter().any(|l| l.contains("go and do the thing")),
+        "the second terminal is reading the first one's conversation\n{:#?}",
+        second.transcript()
+    );
+    // And the turn finishes where it started.
+    first.until("the answer, in the terminal that asked", |c| c.shows("ANSWER-LATER"));
+}
+
+#[test]
+fn each_terminal_has_a_panel_of_its_own() {
+    // A dock exists once per terminal or it exists in one of them. `^B` hides the column in front
+    // of you and says nothing about anybody else's.
+    let sb = Sandbox::new("twopanels");
+    let ws = sb.serve("two_conversations.jsonl");
+
+    let mut first = Client::attach(&ws.socket, neosh_proto::PROTOCOL_VERSION);
+    first.ready();
+    let mut second = Client::attach(&ws.socket, neosh_proto::PROTOCOL_VERSION);
+    second.ready();
+
+    assert!(first.windowed("sidebar"), "no panel to hide");
+    first.ctrl('b');
+    first.until("the panel to go here", |c| !c.windowed("sidebar"));
+
+    second.pump_once();
+    assert!(
+        second.windowed("sidebar"),
+        "hiding one terminal's panel hid the other's\n{:#?}",
         second.text()
     );
 }

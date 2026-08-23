@@ -57,7 +57,7 @@ export type PluginEvent =
   | { "type": "hook_observed"; hook: HookName; payload: HookPayload }
   | { "type": "focus_changed"; win?: WindowId | null }
   | { "type": "option_changed"; name: string; value: OptionValue }
-  | { "type": "session_changed"; session: SessionId }
+  | { "type": "session_changed"; session: SessionId; view: ViewId }
   | { "type": "selection_changed"; selection: ModelSelection }
   | { "type": "activity"; session: SessionId; turn: TurnId; activity: Activity }
   | { "type": "composer_changed"; text: string }

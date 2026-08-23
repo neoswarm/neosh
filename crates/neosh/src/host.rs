@@ -5616,6 +5616,7 @@ impl Host {
         self.refresh_status();
         self.bridge.broadcast(PluginEvent::SessionChanged {
             session: self.active_session(),
+            view: self.from.view,
         });
     }
 
@@ -8158,6 +8159,7 @@ impl Host {
         // signal a thread list already listens to for "the conversations are not what you drew".
         self.bridge.broadcast(PluginEvent::SessionChanged {
             session: self.active_session(),
+            view: self.from.view,
         });
         self.refresh_status();
     }

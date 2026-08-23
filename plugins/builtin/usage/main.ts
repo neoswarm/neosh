@@ -38,6 +38,7 @@ import type {
   UsageBucket,
   UsageHistory,
   UsageResolution,
+  ViewId,
 } from "@neosh/api";
 import { byteLength } from "@neosh/api";
 import {
@@ -685,6 +686,15 @@ const WINDOWS = [1, 7, 30, 90];
 async function installPanel({ neosh, subscriptions }: PluginContext) {
   let buf: number | null = null;
   let win: number | null = null;
+  /**
+   * Which terminal the panel is on.
+   *
+   * One panel, moved rather than duplicated. A plan meter is a thing you glance at and dismiss, and
+   * a second copy of it in another window is one more thing to close — so `^L` in a terminal that
+   * is not showing it takes it there. What it must not do is what a single window handle did
+   * before views existed: push focus onto somebody else's screen and leave this one blank.
+   */
+  let on: ViewId | null = null;
   let ns: number | null = null;
   let list: CursoredList<null> | null = null;
   const view: View = {
@@ -740,11 +750,14 @@ async function installPanel({ neosh, subscriptions }: PluginContext) {
     await list.render({ win: win ?? undefined });
   };
 
-  const open = async () => {
-    if (win !== null) {
+  const open = async (where?: ViewId) => {
+    if (win !== null && (where === undefined || on === where)) {
       await neosh.focus.push(win);
       return;
     }
+    // Asked for from a terminal that is not the one it is on. Taken there rather than opened twice.
+    if (win !== null) await close();
+    on = where ?? null;
     // The span it opens on is a setting, snapped to one the keys can also reach — otherwise `]`
     // from a configured 45 days lands on whichever of the four it decides is next, and the number
     // you set is one you can never get back to.
@@ -757,7 +770,9 @@ async function installPanel({ neosh, subscriptions }: PluginContext) {
     // A float rather than the main dock. Taking the dock would put the transcript away to show a
     // chart, and this is a thing you glance at between turns — not a place you go and come back
     // from. Wide, because a chart narrower than its span is a chart with columns missing.
-    win = await neosh.float.open(buf, {
+    // Named rather than derived: the buffer is reused between openings, so "the terminal showing
+    // it" is the one it was last on rather than the one asking for it now.
+    win = await (on === null ? neosh : neosh.view.at(on)).float.open(buf, {
       anchor: { kind: "screen" },
       width: { kind: "max", n: 104 },
       height: { kind: "max", n: 34 },
@@ -780,6 +795,7 @@ async function installPanel({ neosh, subscriptions }: PluginContext) {
     if (win === null) return;
     const w = win;
     win = null;
+    on = null;
     list = null;
     await neosh.focus.pop().catch(() => {});
     await neosh.win.close(w).catch(() => {});
@@ -791,7 +807,11 @@ async function installPanel({ neosh, subscriptions }: PluginContext) {
     subscriptions.push(await neosh.cmd.register(`${NS}.${name}`, fn, { desc }));
   };
 
-  await cmd("panel", "What the plan has left, and where the week went", open);
+  subscriptions.push(
+    await neosh.cmd.register(`${NS}.panel`, (_args, key) => open(key?.view), {
+      desc: "What the plan has left, and where the week went",
+    }),
+  );
   await cmd("panel.close", "Close the usage panel", close);
   await cmd("panel.refresh", "Ask the provider again", async () => {
     await neosh.quota.refresh().catch(() => {});

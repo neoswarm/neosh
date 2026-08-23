@@ -179,12 +179,19 @@ pub enum PluginEvent {
         name: String,
         value: OptionValue,
     },
-    /// The active conversation changed — switched, created, or the previous one closed.
+    /// A terminal is looking at a different conversation — switched, created, or the previous one
+    /// closed.
     ///
     /// Broadcast, because a thread list, a status line and a usage meter all need to know, and none
     /// of them is the one that caused it.
+    ///
+    /// **Which terminal**, because "the active conversation" is not one thing any more: a
+    /// workspace can have several and each is somewhere. A plugin that has to put something in
+    /// front of the person reading a particular conversation — a question waiting to be answered —
+    /// needs to know which screen that is.
     SessionChanged {
         session: SessionId,
+        view: ViewId,
     },
     /// The model this conversation will use changed, whoever changed it.
     ///
