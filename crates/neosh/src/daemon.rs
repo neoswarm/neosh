@@ -95,6 +95,9 @@ impl Live {
             true => 0,
             false => now.saturating_sub(self.detached_at.load(Ordering::Relaxed)),
         };
+        // Captured at startup, so this is the build that is running rather than the one on disk —
+        // which after a rebuild is a different program with the same path.
+        s.build = crate::build::capture().clone();
         s
     }
 }
@@ -136,6 +139,19 @@ impl Frontend for Viewer {
         // end a turn.
         self.clients.lock().await.send(&frame);
         Ok(())
+    }
+
+    /// Nothing attached is `Detached`, which is a different answer from `Away` and needs a
+    /// different channel: there is no stream to write an escape to. See ADR 0057.
+    async fn presence(&mut self, idle_after: std::time::Duration) -> crate::frontend::Presence {
+        let clients = self.clients.lock().await;
+        if clients.is_empty() {
+            return crate::frontend::Presence::Detached;
+        }
+        match clients.away(idle_after) {
+            true => crate::frontend::Presence::Away,
+            false => crate::frontend::Presence::Watching,
+        }
     }
 }
 
@@ -285,7 +301,7 @@ impl Handle {
                     ));
                     break;
                 }
-                ClientMessage::Attach { protocol_version, width, height } => {
+                ClientMessage::Attach { protocol_version, width, height, build } => {
                     if protocol_version != neosh_proto::PROTOCOL_VERSION {
                         let _ = out.send(ServerMessage::Refused {
                             reason: format!(
@@ -303,8 +319,20 @@ impl Handle {
                     // view on the `Attached` below and builds it a screen.
                     let from = self.clients.lock().await.attach(out.clone(), (width, height));
                     source = Some(from);
+                    // Ours, whatever the terminal's turned out to be. Which of the two is
+                    // behind is the terminal's to work out and to say — it is the thing with a
+                    // screen, and it is the one that can still be rebuilt without anybody having
+                    // to stop what is running here.
+                    if !build.same_as(crate::build::capture()) {
+                        tracing::info!(
+                            workspace = ?crate::build::capture(),
+                            terminal = ?build,
+                            "a terminal attached from a different build"
+                        );
+                    }
                     let _ = out.send(ServerMessage::Attached {
                         protocol_version: neosh_proto::PROTOCOL_VERSION,
+                        build: crate::build::capture().clone(),
                     });
                     // Its own size. It used to be the smallest attached terminal's, because every
                     // view shared one transcript; a view has its own now, so a wide window is
@@ -317,12 +345,22 @@ impl Handle {
                         continue;
                     };
                     let id = from.client;
-                    // Two events are about *this terminal's* shape rather than about the
-                    // workspace, and several terminals have several answers. They are reconciled
-                    // here and forwarded as one, so the host goes on believing there is one screen
-                    // — which is exactly what it can still assume, because every view is a mirror
-                    // of the same one.
+                    // Whether somebody is at *this* terminal, which the workspace is away only if
+                    // every terminal says no to. Recorded here beside the other per-client facts,
+                    // and not forwarded: the host asks the frontend the merged question rather
+                    // than tracking a set of terminals it cannot see. See ADR 0057.
+                    if let InputEvent::Key { .. } | InputEvent::Paste { .. } = event {
+                        self.clients.lock().await.typed(id);
+                    }
+                    // A resize is about this terminal's shape and nobody else's, now that a
+                    // transcript belongs to a view — so it is recorded and forwarded as its own.
                     let forward = match event {
+                        InputEvent::Focus { on } => {
+                            self.clients.lock().await.focused(id, on);
+                            // Nothing downstream acts on it, and forwarding it would arm a redraw
+                            // for an event that changes not one cell.
+                            None
+                        }
                         InputEvent::Resize { width, height } => {
                             match self.clients.lock().await.resized(id, (width, height)) {
                                 Some((width, height)) => Some(InputEvent::Resize { width, height }),

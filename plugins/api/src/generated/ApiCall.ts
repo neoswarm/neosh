@@ -21,6 +21,7 @@ import type { Mode } from "./Mode";
 import type { ModelSelection } from "./ModelSelection";
 import type { NamespaceId } from "./NamespaceId";
 import type { NodeId } from "./NodeId";
+import type { NoticeKind } from "./NoticeKind";
 import type { OptionSpec } from "./OptionSpec";
 import type { OptionValue } from "./OptionValue";
 import type { PermissionMode } from "./PermissionMode";
@@ -471,4 +472,34 @@ export type ApiCall =
   | { "call": "hint_set"; key: string; hint: Hint }
   | { "call": "hint_clear"; key: string }
   | { "call": "log"; level: MessageLevel; message: string }
-  | { "call": "notify"; level: MessageLevel; message: string };
+  | {
+    "call": "notify";
+    level: MessageLevel;
+    message: string;
+    /**
+     * Whether the user asked for this. See ADR 0057; `Reply` is the default and is what a
+     * bare `neosh.notify` has always meant.
+     */
+    kind: NoticeKind;
+    /**
+     * Which progress row to write, for [`NoticeKind::Progress`]. Ignored otherwise.
+     */
+    key?: string | null;
+  }
+  | { "call": "notify_done"; key: string }
+  | {
+    "call": "alert";
+    level: MessageLevel;
+    /**
+     * What this is about, in a few words.
+     */
+    title: string;
+    message: string;
+    /**
+     * Which conversation this is about, if it is about one.
+     *
+     * The test for "can they see it already" is asked against this. An alert with no
+     * conversation is about the workspace, and is never on screen by definition.
+     */
+    session?: SessionId | null;
+  };

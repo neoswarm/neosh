@@ -493,6 +493,50 @@ a contribution point. `from` is stamped by the host and cannot be forged.
 
 ---
 
+## Saying something to the person
+
+Three different things, and they are three calls rather than three levels of one. `MessageLevel`
+says how bad something is; which of these you reach for says whether the user asked for it, which is
+what decides where it goes and how long it lives. See ADR 0057.
+
+```ts
+neosh.notify("copied /home/me/proj");            // a reply to a key they just pressed
+neosh.progress("acme.index", "indexing…");       // a state, replaced in place
+neosh.done("acme.index");                        // …and taken away when it finishes
+await neosh.alert("acme", "index is stale", { session });  // news they did not ask for
+```
+
+**`notify` is a reply.** Feedback for the keystroke that caused it. It does not stack — a second
+replaces the first, because two keys pressed quickly are two keys and the answer you want is the one
+for the second — it lives about six seconds, and it never leaves the terminal.
+
+The commonest mistake is using it for something already on screen. If the row moved, the panel
+closed or the footer changed, the user can see it; saying so in the corner is the same fact twice,
+and a corner that usually restates something visible is a corner people stop reading. If the fact
+has a place on screen, put it right there instead — that is what the git plugin does with the branch
+segment rather than announcing every checkout.
+
+**`progress` is a state, not a message.** Keyed, so writing the same key again replaces the row and
+`done` takes it away. `pulling…` used to be pushed onto the message stack and so was the `up to
+date` that superseded it, which is how one pull drew two rows. Put `done` in a `finally` — a row
+nobody finishes is dropped after a minute, and relying on that is a row that lies for a minute.
+
+**`alert` is news.** Drawn in the corner *and*, if the host works out that nobody is looking, raised
+outside the terminal as a real notification. Whether that second part happens is the host's decision
+and never yours: only it knows which conversation is on screen, which terminals are attached and
+whether any of them has focus. Pass `session` when it is about one — that is what the "can they see
+this already" test is asked against.
+
+It needs `notify` in your `plugin.toml`, and is rejected with `not permitted` otherwise. Drawing in
+the corner stays free, like every other kind of drawing; being able to interrupt somebody who is in
+another application is a capability.
+
+```toml
+permissions = ["notify"]
+```
+
+---
+
 ## Keys, and the one thing you cannot do
 
 Your plugin can find out whether a provider is authenticated, and can ask for a key to be entered.

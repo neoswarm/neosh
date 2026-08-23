@@ -14,4 +14,5 @@ export type PluginPermission =
   | "fs_write"
   | "network"
   | "raw_cells"
-  | "vcs_write";
+  | "vcs_write"
+  | "notify";

@@ -31,6 +31,14 @@ pub struct PermissionRequest {
     /// Where the turn is running, so a relative path in the capability resolves against the right
     /// tree. Several conversations can be mid-turn in different projects at once.
     pub cwd: PathBuf,
+    /// Which conversation is blocked on this.
+    ///
+    /// What [`crate::ask::QuestionRequest`] has always carried, and for the same reason: a
+    /// workspace runs several turns at once, only one of them is on screen, and "somebody is
+    /// waiting on you" is a fact about a conversation rather than about whichever panel drew the
+    /// prompt. `None` where a plugin asked outside any turn. See ADR 0057.
+    #[doc(alias = "session")]
+    pub conversation: Option<neosh_proto::SessionId>,
 }
 
 /// What came back.

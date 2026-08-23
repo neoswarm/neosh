@@ -44,7 +44,7 @@ async fn activate(
         match next(rx).await {
             ScriptOutbound::Loaded { error, .. } => return (calls, error),
             ScriptOutbound::Plugin { msg, .. } => match msg {
-                PluginOutbound::Call { id, call } => {
+                PluginOutbound::Call { id, call, .. } => {
                     let value = answer(&call);
                     calls.push(call);
                     rt.send(ScriptInbound::Plugin {
@@ -53,7 +53,7 @@ async fn activate(
                     })
                     .unwrap();
                 }
-                PluginOutbound::Notify { call } => calls.push(call),
+                PluginOutbound::Notify { call, .. } => calls.push(call),
                 other => panic!("unexpected outbound message {other:?}"),
             },
             ScriptOutbound::Log { level, message } => {

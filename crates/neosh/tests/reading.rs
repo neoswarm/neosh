@@ -249,6 +249,53 @@ impl Session {
     fn buffer(&self, name: &str) -> Vec<String> {
         self.buffer_named(name).map(|b| self.lines_of(b)).unwrap_or_default()
     }
+
+    /// How many rows of the transcript are lines of `file`, which is what a read's card shows
+    /// when it is showing anything at all.
+    fn showing(&self, file: &str) -> usize {
+        self.chat().iter().filter(|l| l.contains(&format!("{file} line "))).count()
+    }
+}
+
+/// A conversation with two tool cards in it, with an answer between them so they are two cards
+/// rather than one run of reads.
+impl Sandbox {
+    fn with_cards(&self) -> Session {
+        self.cards_at(None)
+    }
+
+    /// The same, with the mock answering slowly enough that the turn is still going while keys
+    /// are being pressed — which is the only way to arrange "something arrived while you were
+    /// reading" without a real model and a real wait.
+    fn with_slow_cards(&self) -> Session {
+        self.cards_at(Some("120"))
+    }
+
+    fn cards_at(&self, pace: Option<&str>) -> Session {
+        for (name, n) in [("one.txt", 40), ("two.txt", 40)] {
+            let body: String =
+                (1..=n).map(|i| format!("{name} line {i}\n")).collect::<Vec<_>>().concat();
+            std::fs::write(self.root.join("work").join(name), body).expect("fixture file");
+        }
+        let fixture =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/tool_cards.jsonl");
+        let child = Command::new(env!("CARGO_BIN_EXE_neosh"))
+            .args(["--ui-protocol", "stdio"])
+            .arg("--config-dir")
+            .arg(self.root.join("config"))
+            .arg("--cwd")
+            .arg(self.root.join("work"))
+            .args(["--mock-script", &fixture.display().to_string()])
+            .args(["--model", "mock/mock"])
+            .env("NEOSH_STATE_DIR", self.root.join("state"))
+            .envs(pace.map(|ms| ("NEOSH_MOCK_DELAY_MS", ms)))
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("start");
+        Session::wrap(child)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1392,4 +1439,175 @@ impl Session {
             self.chat_cursor()
         );
     }
+}
+
+
+// ---------------------------------------------------------------------------
+// Watching what a turn did — ADR 0057
+// ---------------------------------------------------------------------------
+
+/// `c` steps to the next tool call, and the card you land on opens itself.
+///
+/// The transcript's third structure, after the turn and the block: `[`/`]` is a whole turn and
+/// `{`/`}` is one block for a whole run of cards, so before this there was no way to walk what a
+/// turn *did* one call at a time. And a card the cursor is in shows what came back — ADR 0049's
+/// rule, one surface along — so `c c c` reads the work rather than the headers over it.
+#[test]
+fn c_steps_call_to_call_and_the_card_you_are_on_opens_itself() {
+    let sb = Sandbox::new("cards-step");
+    let mut s = sb.with_cards();
+    s.ready();
+    s.keys("go");
+    s.special("enter");
+    assert!(
+        s.pump(|s| s.chat().iter().any(|l| l.contains("All done."))),
+        "the whole turn landed\n{:?}",
+        s.chat()
+    );
+    s.press(json!({"kind": "char", "c": "s"}), &["ctrl"]);
+    assert!(s.pump(|s| s.buffer("[status]").iter().any(|l| l.contains("reading"))));
+
+    // Folded, a read is its header and the count on it. Nothing of either file is on screen.
+    assert_eq!((s.showing("one.txt"), s.showing("two.txt")), (0, 0), "{:?}", s.chat());
+
+    // `C` goes back to the last card, which is the second one.
+    s.ch("C");
+    assert!(
+        s.pump(|s| s.showing("two.txt") > 0),
+        "the card the cursor arrived in shows what came back\n{:?}",
+        s.chat()
+    );
+    assert_eq!(s.showing("one.txt"), 0, "and only that one — the cursor is what asks");
+
+    // And back one more, which folds the one it left.
+    s.ch("C");
+    assert!(
+        s.pump(|s| s.showing("one.txt") > 0 && s.showing("two.txt") == 0),
+        "stepping off gives the rows back\n{:?}",
+        s.chat()
+    );
+}
+
+/// A preview is bounded, and `⇥` is how you say you want the rest of it — and want to keep it.
+///
+/// The two halves are one decision: before this, `⇥` was the only way to see a body at all, so
+/// "show me" and "keep it" could not be told apart. Now the cursor says the first and the key says
+/// the second.
+#[test]
+fn tab_keeps_a_card_open_after_the_cursor_has_gone() {
+    let sb = Sandbox::new("cards-pin");
+    let mut s = sb.with_cards();
+    s.ready();
+    s.keys("go");
+    s.special("enter");
+    assert!(s.pump(|s| s.chat().iter().any(|l| l.contains("All done."))));
+    s.press(json!({"kind": "char", "c": "s"}), &["ctrl"]);
+    assert!(s.pump(|s| s.buffer("[status]").iter().any(|l| l.contains("reading"))));
+
+    s.ch("C");
+    assert!(s.pump(|s| s.showing("two.txt") > 0), "{:?}", s.chat());
+    let previewed = s.showing("two.txt");
+    assert!(previewed < 40, "a preview is bounded: {previewed} of 40 rows");
+
+    s.special("tab");
+    assert!(
+        s.pump(|s| s.showing("two.txt") == 40),
+        "and Tab is all of it: {}\n{:?}",
+        s.showing("two.txt"),
+        s.chat()
+    );
+
+    // Off it, and it stays. That is what pinning is for.
+    s.ch("C");
+    assert!(
+        s.pump(|s| s.showing("one.txt") > 0),
+        "the first card opened on arrival\n{:?}",
+        s.chat()
+    );
+    assert_eq!(s.showing("two.txt"), 40, "and the pinned one is still open behind us");
+}
+
+/// Leaving reading folds what the cursor was previewing, and keeps what you pinned.
+///
+/// A preview is the cursor's, and there is no cursor in the composer.
+#[test]
+fn leaving_reading_folds_the_preview_and_keeps_the_pin() {
+    let sb = Sandbox::new("cards-leave");
+    let mut s = sb.with_cards();
+    s.ready();
+    s.keys("go");
+    s.special("enter");
+    assert!(s.pump(|s| s.chat().iter().any(|l| l.contains("All done."))));
+    s.press(json!({"kind": "char", "c": "s"}), &["ctrl"]);
+    assert!(s.pump(|s| s.buffer("[status]").iter().any(|l| l.contains("reading"))));
+
+    s.ch("C");
+    assert!(s.pump(|s| s.showing("two.txt") > 0));
+    s.special("esc");
+    assert!(
+        s.pump(|s| s.showing("two.txt") == 0),
+        "the rows go back when the cursor does\n{:?}",
+        s.chat()
+    );
+}
+
+
+/// A turn writes below where you are reading, and reading the last row means reading what arrives.
+///
+/// Reading is a place *in* the transcript — the scroll offset is pinned by every motion — so
+/// before this an answer produced while `^S` was on landed off the bottom of the window with
+/// nothing saying so, and watching a turn meant leaving reading and coming back for every call.
+/// See ADR 0057.
+#[test]
+fn reading_the_last_row_keeps_reading_it() {
+    let sb = Sandbox::new("cards-tail");
+    let mut s = sb.with_slow_cards();
+    s.ready();
+    s.keys("go");
+    s.special("enter");
+    // In while the turn is still going: `^S` starts at the newest row, which is the end.
+    assert!(
+        s.pump(|s| s.chat().iter().any(|l| l.contains("Looking at the first one"))),
+        "the turn started\n{:?}",
+        s.chat()
+    );
+    s.press(json!({"kind": "char", "c": "s"}), &["ctrl"]);
+    assert!(s.pump(|s| s.buffer("[status]").iter().any(|l| l.contains("reading"))));
+
+    assert!(
+        s.pump(|s| s.chat().iter().any(|l| l.contains("All done."))),
+        "the rest of it arrived\n{:?}",
+        s.chat()
+    );
+    let last = s.chat().len().saturating_sub(1) as u64;
+    assert!(
+        s.pump(|s| s.chat_cursor() == Some(s.chat().len().saturating_sub(1) as u64)),
+        "the reader was carried to the end: at {:?} of {last}",
+        s.chat_cursor()
+    );
+    assert!(s.buffer("[status]").iter().any(|l| l.contains("reading")), "and is still reading");
+}
+
+/// And reading anywhere else does not move, however much arrives below it.
+///
+/// The other half, and the one that makes the first half safe: half way up a diff you are reading
+/// is exactly where you must still be when the next tool call lands.
+#[test]
+fn reading_anywhere_else_stays_exactly_where_it_is() {
+    let sb = Sandbox::new("cards-anchor");
+    let mut s = sb.with_slow_cards();
+    s.ready();
+    s.keys("go");
+    s.special("enter");
+    assert!(s.pump(|s| s.chat().iter().any(|l| l.contains("Looking at the first one"))));
+    s.press(json!({"kind": "char", "c": "s"}), &["ctrl"]);
+    assert!(s.pump(|s| s.buffer("[status]").iter().any(|l| l.contains("reading"))));
+    s.to_top();
+
+    assert!(
+        s.pump(|s| s.chat().iter().any(|l| l.contains("All done."))),
+        "the rest of it arrived\n{:?}",
+        s.chat()
+    );
+    assert_eq!(s.chat_cursor(), Some(0), "and it left the reader where the reader was");
 }

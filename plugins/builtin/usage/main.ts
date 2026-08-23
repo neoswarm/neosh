@@ -306,9 +306,9 @@ function section(
   style: Style,
 ) {
   const rows: StripRow[] = [];
-  // What the sidebar leaves for the text (`   ` and its own margin), less the widest countdown and
-  // a space to keep it off the label.
-  const room = Math.max(14, width - 6 - 5);
+  // What the sidebar leaves for the text (its one-column margin at each edge), less the widest
+  // countdown and a space to keep it off the label.
+  const room = Math.max(14, width - 2 - 5);
   const accounts = quotas.filter((q) => q.windows.length > 0);
 
   for (const q of accounts) {

@@ -10,7 +10,9 @@
 //! is the thing being asserted about, and the mirror is the frontend's.
 
 use neosh_core::Editor;
-use neosh_proto::{ApiCall, BufferId, Dock, ExtmarkOpts, Gravity, PluginId, UiEvent, WindowLayout};
+use neosh_proto::{
+    ApiCall, BufferId, Dock, ExtmarkOpts, Gravity, PluginId, UiEvent, ViewId, WindowLayout,
+};
 use neosh_tui::Mirror;
 
 fn plugin() -> PluginId {
@@ -81,6 +83,7 @@ fn a_workspace() -> (Editor, BufferId, neosh_proto::WindowId) {
             gravity: Gravity::End,
             wrap: Some(true),
         },
+        view: None,
     }) {
         Ok(neosh_proto::ApiOk::Win { win }) => win,
         other => panic!("{other:?}"),
@@ -93,6 +96,7 @@ fn a_workspace() -> (Editor, BufferId, neosh_proto::WindowId) {
             gravity: Gravity::Start,
             wrap: Some(true),
         },
+        view: None,
     }) {
         Ok(neosh_proto::ApiOk::Win { win }) => win,
         other => panic!("{other:?}"),
@@ -105,8 +109,10 @@ fn a_workspace() -> (Editor, BufferId, neosh_proto::WindowId) {
 }
 
 /// Fold everything the editor has queued into a mirror, as a frontend would.
+///
+/// Untagged: this is one terminal, so its share of a frame is the whole of it.
 fn drain_into(e: &mut Editor, m: &mut Mirror) {
-    for ev in e.drain_ui() {
+    for ev in e.drain_events() {
         m.apply(ev);
     }
     m.apply(UiEvent::Flush);
@@ -121,7 +127,7 @@ fn a_client_attaching_late_ends_up_with_the_mirror_it_would_have_had_all_along()
     drain_into(&mut e, &mut early);
 
     // And one that connects now, to a workspace mid-conversation.
-    e.republish();
+    e.republish(ViewId::LOCAL);
     let mut late = Mirror::new();
     drain_into(&mut e, &mut late);
 
@@ -155,7 +161,7 @@ fn the_marks_come_back_with_their_lines_and_not_a_frame_later() {
     // Text and its annotations travel in one payload — the protocol has no way to send one without
     // the other, and republishing must not be the exception that invents one.
     let (mut e, chat, _) = a_workspace();
-    e.republish();
+    e.republish(ViewId::LOCAL);
     let mut late = Mirror::new();
     drain_into(&mut e, &mut late);
 
@@ -183,7 +189,7 @@ fn republishing_twice_does_not_double_anything() {
     let before = m.buffers[&chat].lines.len();
 
     for _ in 0..2 {
-        e.republish();
+        e.republish(ViewId::LOCAL);
         let mut fresh = Mirror::new();
         drain_into(&mut e, &mut fresh);
         assert_eq!(fresh.buffers[&chat].lines.len(), before);
@@ -207,7 +213,7 @@ fn republishing_at_a_mirror_that_already_has_everything_changes_nothing() {
     let windows: Vec<_> =
         watching.windows.iter().map(|(id, w)| (*id, w.buf, w.cursor, w.top_line)).collect();
 
-    e.republish();
+    e.republish(ViewId::LOCAL);
     drain_into(&mut e, &mut watching);
 
     let after: Vec<String> = watching.buffers[&chat].lines.iter().map(|l| l.text.clone()).collect();
@@ -224,7 +230,7 @@ fn what_happened_after_the_republish_still_arrives_as_an_ordinary_delta() {
     // Republishing is a catch-up, not a mode. The stream goes back to being deltas immediately, or
     // the first thing typed after attaching would need a second full send.
     let (mut e, chat, _) = a_workspace();
-    e.republish();
+    e.republish(ViewId::LOCAL);
     let mut late = Mirror::new();
     drain_into(&mut e, &mut late);
 

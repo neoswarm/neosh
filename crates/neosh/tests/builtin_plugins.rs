@@ -230,7 +230,7 @@ impl Session {
         let virt = self.sidebar_virt_now();
         text.iter()
             .zip(virt.iter())
-            .filter(|(l, v)| l.starts_with("    ") && !v.trim().is_empty())
+            .filter(|(l, v)| l.starts_with(CONVERSATION_INDENT) && !v.trim().is_empty())
             .count()
     }
 
@@ -1117,7 +1117,10 @@ fn the_generated_name_is_editable_before_the_branch_is_created() {
     s.ctrl("u");
     s.type_text("my-own-name");
     s.special("enter");
-    s.wait_for("on my-own-name");
+    // The footer, which is where the branch lives. It used to be a toast saying the same thing,
+    // and a message restating what is already on screen is exactly what ADR 0057 took away — so
+    // the branch segment is now refreshed on the spot instead, and this waits on that.
+    s.wait_for("my-own-name  mock");
 
     let branch = Command::new("git")
         .current_dir(sb.work())
@@ -1731,7 +1734,8 @@ fn a_model_answer_git_would_reject_is_made_into_a_legal_refname() {
     s.special("enter");
     s.wait_for("fix/the-login");
     s.special("enter");
-    s.wait_for("on fix/the-login");
+    // The footer rather than a toast — see ADR 0057.
+    s.wait_for("fix/the-login  mock");
 
     // The real proof: git accepted it.
     let branch = Command::new("git")
@@ -2072,6 +2076,12 @@ fn a_running_turn_says_how_long_it_has_been_running() {
 /// U+2605 rather than a heart, and not because it looks better: `♥` is a codepoint Unicode calls
 /// an emoji, so a terminal with a colour-emoji font draws it from there and hands back an outline.
 const STAR: char = '\u{2605}';
+
+/// What a conversation's row is indented by, and therefore what tells one from a project's.
+///
+/// A project sits one column in and a conversation three, which is the same two-column step a
+/// worktree takes from the repository it is a tree of.
+const CONVERSATION_INDENT: &str = "   ";
 
 /// Project rows carrying the favourite mark.
 ///
@@ -2424,7 +2434,11 @@ fn a_worktree_nests_under_the_repository_it_belongs_to() {
             match (repo, tree) {
                 // Below its repository, indented past the repository's own arrow, and the branch
                 // alone — `work · sideline` is the flat list this replaced.
-                (Some(r), Some(t)) => t > r && rows[t].starts_with("    ") && !rows[t].contains('\u{b7}'),
+                (Some(r), Some(t)) => {
+                    t > r
+                        && rows[t].starts_with(CONVERSATION_INDENT)
+                        && !rows[t].contains('\u{b7}')
+                }
                 _ => false,
             }
         }),
@@ -2474,7 +2488,7 @@ fn an_emptied_worktree_is_still_inside_its_repository() {
             let repo = rows.iter().position(|l| l.contains("work") && !l.contains("sideline"));
             let tree = rows.iter().position(|l| l.contains("sideline"));
             match (repo, tree) {
-                (Some(r), Some(t)) => t > r && rows[t].starts_with("    "),
+                (Some(r), Some(t)) => t > r && rows[t].starts_with(CONVERSATION_INDENT),
                 _ => false,
             }
         }),
@@ -5756,13 +5770,20 @@ fn a_run_of_commands_is_one_row_that_keeps_the_last_answer() {
     );
 }
 
+/// The three states a card can be in, and the two things that move it between them. See ADR 0057.
+///
+/// Folded is what a card costs when nobody is looking at it. The card the *cursor* is in shows
+/// more — bounded, because nine hundred rows appearing under `j` is what the fold exists to
+/// prevent — and `\u{21e5}` is all of it. The trailer says which key at every step where something
+/// is still being held back.
 #[test]
-fn a_folded_card_opens_with_tab_while_reading_and_folds_again() {
-    // A card shows enough to know what happened. The whole of it is one key away, in the place
-    // you go to read — and the trailer says which key.
+fn a_card_opens_as_the_cursor_arrives_and_folds_as_it_leaves() {
     let sb = Sandbox::new("cardfold");
     install_editor(&sb);
-    sb.write_config("[options]\n\"agent.model\" = \"editor/editor\"\n\"chat.diff_lines\" = 2\n");
+    sb.write_config(
+        "[options]\n\"agent.model\" = \"editor/editor\"\n\"chat.diff_lines\" = 2\n\
+         \"chat.preview_lines\" = 4\n",
+    );
     let mut s = sb.start_letting_config_choose();
     s.wait_for("editor ready");
     s.type_text("go");
@@ -5779,13 +5800,24 @@ fn a_folded_card_opens_with_tab_while_reading_and_folds_again() {
     assert!(!rows.iter().any(|l| l.ends_with("+ i")), "the end of the diff is folded away\n{rows:?}");
     let header = rows.iter().position(|l| l.starts_with("  Edited  ")).expect("the header");
 
-    // Into the transcript, to the top, and down onto the card.
+    // Into the transcript, to the top, and down onto the card. Arriving is what opens it — no key.
     s.ctrl("s");
     s.key("g");
     s.key("g");
     for _ in 0..header {
         s.key("j");
     }
+    assert!(
+        s.pump(|s| s.chat_now().iter().any(|l| l.contains("+4 lines"))),
+        "the card the cursor is in is worth more rows, and still bounded\n{:?}",
+        s.chat_now()
+    );
+    assert!(
+        !s.chat_now().iter().any(|l| l.ends_with("+ i")),
+        "a preview is a budget, not an opening\n{:?}",
+        s.chat_now()
+    );
+
     s.special("tab");
     assert!(
         s.pump(|s| s.chat_now().iter().any(|l| l.ends_with("+ i"))),
@@ -5799,10 +5831,20 @@ fn a_folded_card_opens_with_tab_while_reading_and_folds_again() {
         "what was below the card is still below it\n{rows:?}"
     );
 
+    // `\u{21e5}` again gives back what the cursor was already buying — never less than that, which
+    // would be a key that answers "show me more" with a smaller card.
     s.special("tab");
     assert!(
+        s.pump(|s| s.chat_now().iter().any(|l| l.contains("+4 lines"))),
+        "back to the preview\n{:?}",
+        s.chat_now()
+    );
+
+    // And off the card entirely, which is the only thing that folds it.
+    s.key("k");
+    assert!(
         s.pump(|s| s.chat_now().iter().any(|l| l.contains("+6 lines"))),
-        "and it folds again\n{:?}",
+        "the rows go back when the cursor does\n{:?}",
         s.chat_now()
     );
 }

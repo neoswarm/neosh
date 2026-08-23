@@ -94,6 +94,16 @@ struct Client {
     view: ViewId,
     /// What it said it was when it attached, and after every resize.
     size: (u16, u16),
+    /// Whether this terminal is the window its user is looking at.
+    ///
+    /// `None` is *cannot say* rather than *no*: only a terminal implementing mode 1004 ever reports
+    /// this, and treating silence as focused would mean everyone on a terminal that cannot report
+    /// gets no notifications at all. Unknown falls back to [`Client::last_input`]. See ADR 0057.
+    focused: Option<bool>,
+    /// When a key last arrived from this terminal, which is the fallback for one that cannot say
+    /// whether it has focus. Stamped on attach so a terminal that has just opened is not instantly
+    /// idle.
+    last_input: std::time::Instant,
     /// The geometry it resolved, per window, as last reported.
     ///
     /// Kept per client rather than merged on arrival because the merge has to be recomputed when a
@@ -130,7 +140,14 @@ impl Clients {
         self.next_view += 1;
         let id = ClientId(self.next);
         let view = ViewId(self.next_view);
-        self.clients.push((id, Client { out, view, size, viewports: HashMap::new() }));
+        self.clients.push((id, Client {
+            out,
+            view,
+            size,
+            focused: None,
+            last_input: std::time::Instant::now(),
+            viewports: HashMap::new(),
+        }));
         Source { client: id, view }
     }
 
@@ -148,7 +165,14 @@ impl Clients {
     ) -> ClientId {
         self.next += 1;
         let id = ClientId(self.next);
-        self.clients.push((id, Client { out, view, size, viewports: HashMap::new() }));
+        self.clients.push((id, Client {
+            out,
+            view,
+            size,
+            focused: None,
+            last_input: std::time::Instant::now(),
+            viewports: HashMap::new(),
+        }));
         id
     }
 
@@ -163,6 +187,45 @@ impl Clients {
     /// Which set of windows a terminal is looking at.
     pub fn view_of(&self, id: ClientId) -> Option<ViewId> {
         self.clients.iter().find(|(c, _)| *c == id).map(|(_, c)| c.view)
+    }
+
+    /// A terminal said whether it has focus.
+    pub fn focused(&mut self, id: ClientId, on: bool) {
+        if let Some((_, c)) = self.clients.iter_mut().find(|(c, _)| *c == id) {
+            c.focused = Some(on);
+        }
+    }
+
+    /// A key arrived from this terminal, so somebody is at it.
+    ///
+    /// The fallback for terminals that cannot report focus, and it is also a correction for ones
+    /// that can: a terminal you are typing into is a terminal you are looking at, whatever it last
+    /// said about mode 1004. Terminals do get this wrong — a window manager that never sends the
+    /// focus-in on the way back from a workspace switch leaves the client stuck reporting `false`,
+    /// and then every notification is one for something you are staring at.
+    pub fn typed(&mut self, id: ClientId) {
+        if let Some((_, c)) = self.clients.iter_mut().find(|(c, _)| *c == id) {
+            c.last_input = std::time::Instant::now();
+            if c.focused == Some(false) {
+                c.focused = Some(true);
+            }
+        }
+    }
+
+    /// Whether nobody is looking at this workspace.
+    ///
+    /// A workspace is away only when *every* attached terminal is: two windows open and one of them
+    /// in front means the thing is on a screen somebody can see. Nothing attached is not away — it
+    /// is [`Clients::is_empty`], which is a different answer with a different channel, because
+    /// there is no terminal to write an escape to. See ADR 0057.
+    pub fn away(&self, idle_after: std::time::Duration) -> bool {
+        !self.clients.is_empty()
+            && self.clients.iter().all(|(_, c)| match c.focused {
+                Some(on) => !on,
+                // A terminal that cannot say. Idleness is the honest proxy: the person who last
+                // pressed a key ten minutes ago is not watching this scroll past.
+                None => c.last_input.elapsed() >= idle_after,
+            })
     }
 
     /// Whether anybody is still looking at a view. A view nothing is attached to is one the host

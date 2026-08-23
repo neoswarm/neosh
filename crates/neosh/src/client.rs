@@ -10,7 +10,10 @@
 
 use std::path::{Path, PathBuf};
 
-use neosh_proto::{ClientMessage, DetachReason, InputEvent, ServerMessage, UiEvent};
+use neosh_proto::{
+    BuildId, ClientMessage, DetachReason, InputEvent, MessageLevel, NoticeKind, ServerMessage,
+    UiEvent,
+};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
 
@@ -176,6 +179,7 @@ async fn run(
             protocol_version: neosh_proto::PROTOCOL_VERSION,
             width,
             height,
+            build: crate::build::capture().clone(),
         })?)
         .await?;
     write.flush().await?;
@@ -222,13 +226,70 @@ async fn run(
                     }
                     Ok(ServerMessage::Detached { reason }) => return Ok(Ended::Detached(reason)),
                     Ok(ServerMessage::Refused { reason, .. }) => anyhow::bail!("{reason}"),
-                    Ok(ServerMessage::Attached { .. }) | Ok(ServerMessage::Status { .. }) => {}
+                    Ok(ServerMessage::Attached { build, .. }) => {
+                        // The one moment both builds are known. Said here rather than by the
+                        // workspace because the workspace cannot know it is the stale one — it is
+                        // running the only code it has ever had.
+                        if let Some(text) = stale(&build, crate::build::capture()) {
+                            // Untagged, like everything else arriving here: this process is one
+                            // terminal, so its share of a frame is the whole of it.
+                            ui.send(vec![
+                                (None, UiEvent::Message {
+                                    level: MessageLevel::Warn,
+                                    text,
+                                    // News rather than a reply, for the reason `ALERT_TTL` gives:
+                                    // six seconds would start here from a moment nobody chose,
+                                    // and this one is while the screen is still filling in. It
+                                    // stays in the terminal either way — leaving it is
+                                    // `UiEvent::Alert`, which is the host's to send, not this.
+                                    kind: NoticeKind::Alert,
+                                    key: None,
+                                }),
+                                (None, UiEvent::Flush),
+                            ])
+                            .await?;
+                        }
+                    }
+                    Ok(ServerMessage::Status { .. }) => {}
                     Err(e) => tracing::warn!("ignoring unparseable workspace message: {e}"),
                 }
             }
             else => return Ok(Ended::Stopped),
         }
     }
+}
+
+/// What to say when the terminal and the workspace are not the same program, or `None` when
+/// they are.
+///
+/// The case worth a sentence is the workspace being the older of the two, because that is the
+/// one where something you did had no effect and nothing on screen says why: every plugin runs
+/// in the workspace, so a rebuilt sidebar, palette or panel is drawn by whatever build the
+/// workspace started with. It survives its own binary being replaced — `cargo run` unlinks
+/// `target/debug` and writes a new one — so "I am in the right repository and I ran it" is
+/// entirely true and entirely beside the point.
+///
+/// The other direction is rarer and milder but not nothing: an old terminal against a new
+/// workspace is a screen that is not this binary's either, which is worth knowing before you go
+/// looking for the change in the wrong process.
+///
+/// One row, and never wrapped — `draw_notifications` puts each notice on a `Line` of its own and
+/// lets the edge clip it. So this says the two things that cannot be worked out from the screen,
+/// how far behind and what to do about it, and `neosh status` carries the paragraph.
+fn stale(workspace: &BuildId, terminal: &BuildId) -> Option<String> {
+    if workspace.same_as(terminal) {
+        return None;
+    }
+    if let Some(behind) = workspace.behind(terminal) {
+        let behind = crate::friendly(behind);
+        return Some(format!("workspace is {behind} behind this build — `neosh stop` to restart it"));
+    }
+    if let Some(behind) = terminal.behind(workspace) {
+        let behind = crate::friendly(behind);
+        return Some(format!("this terminal is {behind} behind the workspace it attached to"));
+    }
+    let (t, w) = (&terminal.version, &workspace.version);
+    Some(format!("terminal is neosh {t}, workspace is neosh {w}"))
 }
 
 /// The arguments a workspace we start should be given.
@@ -261,4 +322,56 @@ pub fn workspace_args(
         out.push(m.display().to_string());
     }
     out
+}
+
+#[cfg(test)]
+mod stale_tests {
+    use super::{BuildId, stale};
+
+    fn at(written: u64) -> BuildId {
+        BuildId { version: "0.1.0".into(), written }
+    }
+
+    /// A notice is one `Line` and nothing wraps it, so anything that does not fit the narrowest
+    /// terminal anyone uses is a sentence the reader gets the first two thirds of.
+    fn fits(said: &str) -> bool {
+        said.chars().count() <= 72
+    }
+
+    #[test]
+    fn nothing_to_say_when_they_are_the_same_program() {
+        assert_eq!(stale(&at(100), &at(100)), None);
+    }
+
+    #[test]
+    fn a_workspace_older_than_the_terminal_names_the_fix() {
+        // The whole point: `cargo run` in the right repository, attaching to the workspace that
+        // has been up since before the change was written.
+        let said = stale(&at(100), &at(100 + 4 * 3600 + 46 * 60)).expect("a warning");
+        assert!(said.contains("4h 46m"), "{said}");
+        assert!(said.contains("neosh stop"), "{said}");
+        assert!(fits(&said), "{} chars: {said}", said.chars().count());
+    }
+
+    #[test]
+    fn a_terminal_older_than_the_workspace_says_so_the_other_way_round() {
+        let said = stale(&at(1000), &at(400)).expect("a warning");
+        assert!(said.contains("this terminal is"), "{said}");
+        assert!(said.contains("10m"), "{said}");
+        assert!(fits(&said), "{} chars: {said}", said.chars().count());
+    }
+
+    #[test]
+    fn an_unknown_stamp_says_nothing() {
+        assert_eq!(stale(&at(0), &at(100)), None);
+        assert_eq!(stale(&at(100), &at(0)), None);
+    }
+
+    #[test]
+    fn two_builds_of_one_moment_fall_back_to_their_versions() {
+        let workspace = BuildId { version: "0.2.0".into(), written: 100 };
+        let said = stale(&workspace, &at(100)).expect("a warning");
+        assert!(said.contains("0.1.0") && said.contains("0.2.0"), "{said}");
+        assert!(fits(&said), "{} chars: {said}", said.chars().count());
+    }
 }

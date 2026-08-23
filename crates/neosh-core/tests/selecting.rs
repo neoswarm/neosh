@@ -58,6 +58,7 @@ impl Screen {
                     gravity: Gravity::Start,
                     wrap: None,
                 },
+                view: None,
             })
             .expect("window")
         else {

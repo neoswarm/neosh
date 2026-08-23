@@ -10,7 +10,9 @@ use neosh_provider::ProviderRegistry;
 use neosh_script::ScriptRuntime;
 
 mod markdown;
+mod notify;
 mod bridge;
+mod build;
 mod client;
 mod clients;
 mod daemon;
@@ -239,6 +241,12 @@ fn init_logging(path: Option<&std::path::Path>) -> Option<std::fs::File> {
 }
 
 async fn run(cli: Cli) -> anyhow::Result<()> {
+    // Before anything else, and deliberately not where it is first needed. A workspace outlives
+    // the file it was loaded from: `cargo run` unlinks `target/debug/neosh` and writes a new one
+    // at the same path, and from then on this process cannot stat its own executable. Asked now
+    // the answer is the truth; asked at the first attach, hours later, there is nothing to read.
+    build::capture();
+
     let paths = Paths::resolve(cli.config_dir.clone(), cli.clean);
     // Canonicalised, because it is displayed and grouped on: `--cwd .` is a perfectly ordinary
     // thing to type, and a project called "." tells the user nothing. Falls back to the literal
@@ -523,6 +531,20 @@ async fn run_status(paths: &Paths) -> anyhow::Result<()> {
         word(s.conversations, "conversation"),
         if s.attached { "a terminal is attached".to_string() } else { format!("nobody watching for {}", friendly(s.idle_secs)) }
     );
+    // The build it is *running*, which after any rebuild is not the build at the end of the
+    // path it was started from. Only worth a row when the two differ — otherwise it is a version
+    // string nobody asked for.
+    if !s.build.same_as(build::capture()) {
+        let mine = build::capture();
+        match s.build.behind(mine) {
+            Some(behind) => say!(
+                "         ·  running a build {} older than this one — `neosh stop` to restart it \
+                 on yours",
+                friendly(behind)
+            ),
+            None => say!("         ·  running neosh {}, and this is neosh {}", s.build.version, mine.version),
+        }
+    }
     if s.running.is_empty() {
         say!("nothing running");
         return Ok(());
@@ -535,7 +557,7 @@ async fn run_status(paths: &Paths) -> anyhow::Result<()> {
 }
 
 /// A duration a person would say out loud.
-fn friendly(secs: u64) -> String {
+pub(crate) fn friendly(secs: u64) -> String {
     match secs {
         0..=59 => format!("{secs}s"),
         60..=3599 => format!("{}m", secs / 60),

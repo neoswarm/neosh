@@ -1,4 +1,4 @@
-# 0057 — A terminal is a place you are, not a copy of somebody else's screen
+# 0059 — A terminal is a place you are, not a copy of somebody else's screen
 
 **Status:** accepted
 

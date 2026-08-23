@@ -606,6 +606,15 @@ pub enum HookPayload {
     PermissionPre {
         capability: Capability,
         turn: Option<TurnId>,
+        /// Which conversation is blocked on this.
+        ///
+        /// What [`HookPayload::AskUser`] already carries, and for the same reason: a workspace
+        /// runs several turns at once, only one of them is on screen, and a prompt drawn over
+        /// whichever conversation you happen to be reading is a prompt about somebody else's work.
+        /// `None` when a plugin asked outside any turn. See ADR 0057.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        session: Option<SessionId>,
         /// What the asker said it was about to do, in its own words, when that is more than the
         /// capability can carry. An agent driver's `Run cargo test --workspace` is one line the
         /// user can act on; `Exec` plus a truncated command is not.

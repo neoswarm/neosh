@@ -169,6 +169,19 @@ per decision, and records the *reasoning*, not the choice.
   delta stream, so anything a client needs on reattach has to be *kept* by the editor and said again
   by `Editor::republish`; a value that is only forwarded is a value that comes back wrong. See ADR
   0036.
+- **The workspace you are looking at is not necessarily the binary you just built.** `cargo run`
+  unlinks `target/debug/neosh`, writes a new one and then *attaches to the workspace already
+  serving this config directory* — which goes on executing the inode it started with, now marked
+  `(deleted)`. Every plugin runs there, the sidebar included, so a rebuilt panel is drawn by
+  last night's code and nothing on screen says why: the change is what gets debugged, and the
+  change was never the problem. `PROTOCOL_VERSION` refuses the pair that cannot talk; `BuildId`
+  is the pair that can and should not both be trusted. It is a **notice, never a refusal** —
+  everything works, and locking somebody out of their own running turns because a file changed
+  is the worse answer — it is **captured at startup** or there is nothing left to stat by the
+  time it is asked for, and the **terminal** is what says it, because a stale workspace is
+  running the only code it has ever had and cannot know it is behind. An unreadable stamp is
+  *unknown* rather than old, or the warning fires every time and stops meaning anything. See ADR
+  0058.
 - **What the agent produced is the workspace's; where you are looking is yours.** Attaching joins,
   it does not take over, and it does not make a copy: every terminal has a **view** of its own —
   its own conversation on screen, transcript, scroll, cursor, folded cards, composer and panels —
@@ -188,7 +201,7 @@ per decision, and records the *reasoning*, not the choice.
   returning find the answer still arriving. **The smallest-terminal rule is gone** — it existed
   because a card was shared content — and what is still merged is one window two terminals share.
   `republish` says only what the arriving view can see and has to stay idempotent, and
-  `ViewportChanged` is still where the host learns a width. See ADR 0057, and ADR 0042 for the
+  `ViewportChanged` is still where the host learns a width. See ADR 0059, and ADR 0042 for the
   connection half.
 - **A plugin says which terminal it is drawing into, and almost never has to.** Three rules in
   order: a float anchored to a window goes where that window is; a buffer only one terminal shows
@@ -202,7 +215,7 @@ per decision, and records the *reasoning*, not the choice.
   `here.win.open(...)` lands where the person pressing the key is looking. `SessionChanged` names
   the terminal that moved, because "the active conversation" has as many answers as there are
   screens; a question waits until some terminal is reading its conversation and opens there.
-  See ADR 0057.
+  See ADR 0059.
 - **Every view gets every event.** `Agent` fans its stream out to one queue per view. Never a
   `broadcast` channel: lagging consumers drop the oldest, silently, under load — and a view that
   missed one `ToolFinished` has a card that spins forever with nothing to put it right.
@@ -245,6 +258,19 @@ per decision, and records the *reasoning*, not the choice.
   so a generated id is an answer to nothing — and **nobody answering is a denial with a sentence in
   it**, never an `allow` with an empty map, because the empty map is what the agent reads as
   "ignored me". See ADR 0043.
+- **A request nobody answers is a turn that never ends.** The control protocol blocks: the CLI waits
+  for a `control_response` carrying the id it sent, for as long as that takes. So the two
+  classifiers over one pipe must never both stand aside — `can_use_tool` asks *"would
+  `ask_user_question` claim this?"* rather than testing the flag itself, because
+  `requires_user_interaction` says *somebody has to see this*, not *this is a question*.
+  `ExitPlanMode` sets it and carries a **plan**, so the permission path stood aside for the question
+  path and the question path declined it for want of a question, and a conversation sat under
+  `Running ExitPlanMode… 93m 15s` — a spinner nothing on screen could tell from work. Leaving plan
+  mode is an ordinary permission, asked even under `--dangerously-skip-permissions`, and full access
+  says yes to it. The other half is that a line reaching the bottom of the reader is **refused out
+  loud** by request id rather than dropped: a refusal ends a turn badly and in the transcript,
+  silence does not end it at all, and only one of the two is recoverable from the keyboard. See ADR
+  0057.
 - **Everything irreversible asks, and nothing reversible does.** No exceptions on either side: a
   dialog that appears for some deletes and not others is a key whose behaviour you cannot predict
   from the row it is pointed at, and one charged for an action you can undo is what teaches people
@@ -290,6 +316,26 @@ per decision, and records the *reasoning*, not the choice.
   things you are finished with is the only part of that column that is never the answer, and it
   grows forever. One row with a count, `a` in the panel or `^F` anywhere, and it opens as a picker
   you can filter — because a flat list of dim rows is not a way to find anything. See ADR 0039.
+- **A notification is for something you did not ask for and cannot see.** Both halves, and a
+  message that fails either is not one. `MessageLevel` says how *bad* a thing is and never whether
+  you need to know about it, which is how one channel ended up carrying a hundred and seventy call
+  sites sorted by nothing: `favourited ~/proj` beside a row that had just grown a pin, `pulling…`
+  stacked *above* the `up to date` that superseded it, and — the part that matters — no
+  notification at all for the two events that stop a turn dead. So `NoticeKind` is the other axis:
+  a **reply** is feedback for the key you pressed and does not stack, because two keys pressed
+  quickly are two keys; **progress** is keyed and replaced in place, because it is a state and not
+  a message; an **alert** is news, and the only kind that may leave the terminal. Where it goes is
+  decided by where *you* are — nothing leaves the terminal about a conversation you are looking at,
+  and that one line is what kills the noise. **And the raise belongs to the terminal, not the
+  workspace**: it is an OSC the view writes on the stream the UI is already drawn on, for exactly
+  the reason `Clipboard` is OSC 52 rather than a clipboard library — a coding agent runs on the big
+  machine and you are sitting at a laptop, so anything the workspace raises itself is raised on the
+  wrong computer. The desktop fallback is *only* for nothing being attached, when there is no
+  stream and no wrong machine to be on. Away is focus (mode 1004) and, on a terminal that cannot
+  say, idleness — never "assume focused", which is the one wrong answer that means a whole class of
+  terminal never notifies. A turn shorter than `notify.min_turn` finished while you were still
+  looking at the key that started it. And `unread` stays the *record*: this points at it once and
+  gets out of the way. See ADR 0057.
 - **A turn that finished while you were elsewhere is news until you go and look.** The panel says
   what is *happening* and stops the moment it stops, so an answer that arrived while you were in
   another conversation looks exactly like an answer you read yesterday. `SessionInfo::unread` is set
@@ -360,6 +406,19 @@ per decision, and records the *reasoning*, not the choice.
   (`└`) at a four-column indent rather than a rule down the whole left side. Air between every two
   actions and a wall beside every diff were both structure said twice — the header is at column
   zero, the body is indented, and that is already a list. See ADR 0040 and ADR 0050.
+- **A turn is something you can watch, not only something you read back.** A command is named by
+  what it *does* and never by how it got there: a leading `cd /home/you/projects/thing &&` is the
+  one part of that row you already knew — the conversation has a directory — and clipped to a
+  header it is the only part that fits, so it comes off before the command is named and a stack of
+  six folds to what was run rather than to `cd, cd, cd`. Reading is a place, and a turn writes
+  below it: parked on the **last row** you are carried along with what arrives, anywhere else you
+  stay exactly where you are, and neither happens while a selection or a search is holding two
+  positions. And **the card the cursor is in is open** — ADR 0049's rule one surface along, bounded
+  by `chat.preview_lines` because nine hundred rows appearing under `j` is what the fold exists to
+  prevent, and never fewer rows than the folded card showed. `⇥` stops meaning "open this" and
+  starts meaning "keep it", `c`/`C` step call to call because `[`/`]` is a whole turn and `{`/`}`
+  is one block for a run of nine cards, and a preview never fires while the tail is carrying you:
+  following is watching, and a redraw settles the answer streaming above it. See ADR 0057.
 - **A terminal cannot paste a picture, so pasting one is a key.** Bracketed paste is a text
   protocol: a screenshot arrives as nothing, and a dragged file arrives as its path. `^V` asks the
   system clipboard through whichever of `wl-paste`/`xclip`/`pngpaste`/`osascript`/`powershell` is
@@ -602,8 +661,9 @@ on it, which after wrapping is not the window's height. See ADR 0051.
 | `H` `M` `L` | The top, middle and bottom row **of the window** |
 | `zz` `zt` `zb` | Put the cursor's line in the middle, at the top, at the bottom |
 | `[` `]` | Previous / next **turn** |
+| `c` `C` | Next / previous **tool call**. A count first: `3c`. The card you land on opens itself |
 | `{` `}` | Previous / next **block** |
-| `⇥` `za` | Open or fold the **tool card** under the cursor — the whole diff, the whole output |
+| `⇥` `za` | *Keep* the **tool card** under the cursor open — all of it, and it stays that way when you move off |
 | `/` `?` then `n` `N` | Search, and step through the matches. `n` is *onwards*, so after `?` it goes up |
 | `*` `#` | Search for the word under the cursor, forwards or back |
 | `v` | Start a selection that motions extend. Again, or on a `V` selection, gives it up |
@@ -624,7 +684,14 @@ on it, which after wrapping is not the window's height. See ADR 0051.
 
 There is no `^V`: a blockwise selection is a rectangle rather than a range, and every consumer of a
 selection would have to grow a case for it. The key says so rather than doing nothing. Nothing here
-edits, either — no `d`, `c`, `x` or `p`. The transcript is an artefact you take pieces out of.
+edits, either — no `d`, `x` or `p`, and `c` is a motion here rather than a change. The transcript
+is an artefact you take pieces out of.
+
+**The card you are standing on is open.** Everything a fold hides, up to `chat.preview_lines`, for
+as long as the cursor is in it — so `c c c` walks a turn's work one call at a time and the rows go
+back as you leave. `⇥` is how you keep one. And **reading the last row keeps reading it**: a turn
+still running writes below you, and if you are parked at the end you are carried along with it.
+Anywhere else you stay exactly where you are — `G` starts following again. See ADR 0057.
 
 ## Answering a question — the panel over the composer
 

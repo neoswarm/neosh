@@ -93,13 +93,13 @@ grows instead, which is a failure you can see.
 
 ## What this still does not do
 
-Superseded by [0057](0057-a-terminal-is-a-place-you-are.md), which is the rest of it: a view per
+Superseded by [0059](0059-a-terminal-is-a-place-you-are.md), which is the rest of it: a view per
 terminal, so a second window is somewhere else rather than a copy. Three things were named here as
 what it would take, and all three are what that ADR did — `Host` split into what the workspace owns
 and what a terminal owns, "the conversation on screen" moved out of the session store, and an
 `ApiCall` that names the view it draws into.
 
-Two claims of this ADR did not survive it, and 0057 says why: **the views share a cursor** (they do
+Two claims of this ADR did not survive it, and 0059 says why: **the views share a cursor** (they do
 not; a window has always been where a cursor lives, and a window belongs to a view), and **the
 workspace is the size of the smallest attached terminal** (it is not; that existed because a tool
 card was one row of content every view shared, and a transcript belongs to a view now).
