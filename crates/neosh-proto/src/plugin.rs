@@ -32,11 +32,32 @@ pub enum PluginOutbound {
     /// letting a stale plugin half-work.
     Ready { protocol_version: u32 },
     /// A call that wants an answer.
-    Call { id: RequestId, call: ApiCall },
+    ///
+    /// `view` is which terminal it is about, when the plugin means a particular one — and it means
+    /// a particular one whenever the answer would differ between screens, which is most of the
+    /// interesting calls: what conversation is on screen, what is in the composer, where to put a
+    /// window. On the envelope rather than in the call because it is the same fact for all of
+    /// them, exactly as "which terminal was that key pressed in" is: a call comes *from*
+    /// somewhere.
+    ///
+    /// `None` is "wherever this ought to go", which the host works out — from the window a call
+    /// names, from the buffer only one terminal is showing, and otherwise from the terminal being
+    /// served. That is what makes a plugin written before views existed still land in the right
+    /// place.
+    Call {
+        id: RequestId,
+        call: ApiCall,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        view: Option<ViewId>,
+    },
     /// Fire-and-forget. Used for mutations on the streaming path so a plugin appending tokens is
     /// not round-trip bound. Ordering is still guaranteed: calls from one plugin apply in the
     /// order issued.
-    Notify { call: ApiCall },
+    Notify {
+        call: ApiCall,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        view: Option<ViewId>,
+    },
     /// Answering a [`PluginInbound::Request`].
     Response { id: RequestId, response: PluginResponse },
 }

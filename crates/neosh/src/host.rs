@@ -1496,7 +1496,17 @@ impl Host {
             }
             // ---- sessions ----------------------------------------------
             ApiCall::SessionList { include_archived } => {
-                let list = self.agent.sessions().list_with(include_archived);
+                let mut list = self.agent.sessions().list_with(include_archived);
+                // Whose screen the answer is about. The store's guess is the most recently arrived
+                // in anywhere, which was the same thing when there was one terminal and is a row
+                // marked in the wrong panel now: `▸` in this column means "the conversation this
+                // window is reading" and every window has its own answer.
+                let here = self.active_session();
+                let seen: Vec<_> = self.views.values().map(|v| v.session.clone()).collect();
+                for info in &mut list {
+                    info.is_active = info.id == here;
+                    info.on_screen = seen.contains(&info.id);
+                }
                 Ok(ApiOk::Sessions {
                     sessions: list.into_iter().map(|s| self.named(s)).collect(),
                 })
@@ -1510,6 +1520,7 @@ impl Host {
                         .map(|s| s.info())
                         .ok_or_else(|| ApiError::NotFound { what: format!("session {here}") })?;
                     i.is_active = true;
+                    i.on_screen = true;
                     i
                 };
                 Ok(ApiOk::Session { session: self.named(info) })
@@ -1545,6 +1556,7 @@ impl Host {
                         .map(|s| s.info())
                         .ok_or_else(|| ApiError::Internal { message: "session vanished".into() })?;
                     i.is_active = self.v().session == id;
+                    i.on_screen = self.views.values().any(|v| v.session == id);
                     i
                 };
                 let info = self.named(info);
@@ -7391,75 +7403,22 @@ impl Host {
             },
             ScriptOutbound::Plugin { plugin, msg } => match msg {
                 PluginOutbound::Ready { .. } => {}
-                PluginOutbound::Call { id, call } => {
-                    // Answered when the prompt closes rather than now: the host has to read the
-                    // keyboard before it knows whether a key was entered, and the plugin is
-                    // waiting to hear exactly that.
-                    if let ApiCall::ProviderSetCredential { instance, replace } = &call {
-                        let waiting = Some((plugin.clone(), id.clone()));
-                        if let Err(e) =
-                            self.begin_secret(instance.clone(), *replace, waiting)
-                        {
-                            let response: ApiResponse = Err(e).into();
-                            let _ = self.bridge.script().send(ScriptInbound::Plugin {
-                                plugin,
-                                msg: PluginInbound::Response { id, response },
-                            });
-                        }
-                        return;
-                    }
-                    // Answered when the owning machine answers, not now. Every ASCP command is
-                    // replied to exactly once, so this settles — unless the peer has gone, which
-                    // the swarm reports as a disconnect and which settles it too.
-                    // Dials an address that may not answer, so it cannot run on the loop.
-                    // Answered when the picture is here rather than now: what is on the
-                    // clipboard is sometimes a URL, and going to get one is somebody else's server
-                    // taking as long as it likes.
-                    if let ApiCall::ChatAttach { path: None } = &call {
-                        self.begin_paste(Some((plugin.clone(), id.clone())));
-                        return;
-                    }
-                    if let ApiCall::SwarmProbe { addr } = &call {
-                        self.begin_swarm_probe(addr.clone(), (plugin.clone(), id.clone()));
-                        return;
-                    }
-                    if let ApiCall::SwarmCommand { node, session, command } = &call {
-                        self.begin_swarm_command(
-                            node.clone(),
-                            session.clone(),
-                            command.clone(),
-                            (plugin.clone(), id.clone()),
-                        );
-                        return;
-                    }
-                    if self.spawn_slow(&plugin, Some(id.clone()), &call) {
-                        return;
-                    }
-                    let response: ApiResponse = self.dispatch(&plugin, call).await.into();
-                    let _ = self.bridge.script().send(ScriptInbound::Plugin {
-                        plugin,
-                        msg: PluginInbound::Response { id, response },
-                    });
+                PluginOutbound::Call { id, call, view } => {
+                    // Which terminal this call is about, for the whole of answering it. A plugin
+                    // acting on a bound namespace has said which; one that has not is put wherever
+                    // the call ought to go, which for a command run from a key press is the
+                    // terminal it was pressed in. Put back afterwards, because between calls the
+                    // host is nobody's.
+                    let was = self.from;
+                    self.from.view = view.unwrap_or_else(|| self.view_for(&call));
+                    self.plugin_call(plugin, id, call).await;
+                    self.from = was;
                 }
-                PluginOutbound::Notify { call } => {
-                    if let ApiCall::ChatAttach { path: None } = &call {
-                        self.begin_paste(None);
-                        return;
-                    }
-                    if let ApiCall::ProviderSetCredential { instance, replace } = &call {
-                        if let Err(e) = self.begin_secret(instance.clone(), *replace, None) {
-                            tracing::warn!(%plugin, "{e}");
-                        }
-                        return;
-                    }
-                    if self.spawn_slow(&plugin, None, &call) {
-                        return;
-                    }
-                    if let Err(e) = self.dispatch(&plugin, call).await {
-                        // Fire-and-forget calls have nowhere to return an error, so surface it
-                        // rather than letting it vanish.
-                        tracing::warn!(%plugin, "{e}");
-                    }
+                PluginOutbound::Notify { call, view } => {
+                    let was = self.from;
+                    self.from.view = view.unwrap_or_else(|| self.view_for(&call));
+                    self.plugin_notify(plugin, call).await;
+                    self.from = was;
                 }
                 PluginOutbound::Response { id, response } => match response {
                     PluginResponse::Tool { result } => self.bridge.resolve_tool(&id, result),
@@ -7471,6 +7430,81 @@ impl Host {
                     }
                 },
             },
+        }
+    }
+
+    /// One plugin call, answered. Split out so the terminal it is about can be set for the whole
+    /// of it and put back afterwards, however many ways out of it there are.
+    async fn plugin_call(&mut self, plugin: PluginId, id: RequestId, call: ApiCall) {
+        // Answered when the prompt closes rather than now: the host has to read the
+        // keyboard before it knows whether a key was entered, and the plugin is
+        // waiting to hear exactly that.
+        if let ApiCall::ProviderSetCredential { instance, replace } = &call {
+            let waiting = Some((plugin.clone(), id.clone()));
+            if let Err(e) =
+                self.begin_secret(instance.clone(), *replace, waiting)
+            {
+                let response: ApiResponse = Err(e).into();
+                let _ = self.bridge.script().send(ScriptInbound::Plugin {
+                    plugin,
+                    msg: PluginInbound::Response { id, response },
+                });
+            }
+            return;
+        }
+        // Answered when the owning machine answers, not now. Every ASCP command is
+        // replied to exactly once, so this settles — unless the peer has gone, which
+        // the swarm reports as a disconnect and which settles it too.
+        // Dials an address that may not answer, so it cannot run on the loop.
+        // Answered when the picture is here rather than now: what is on the
+        // clipboard is sometimes a URL, and going to get one is somebody else's server
+        // taking as long as it likes.
+        if let ApiCall::ChatAttach { path: None } = &call {
+            self.begin_paste(Some((plugin.clone(), id.clone())));
+            return;
+        }
+        if let ApiCall::SwarmProbe { addr } = &call {
+            self.begin_swarm_probe(addr.clone(), (plugin.clone(), id.clone()));
+            return;
+        }
+        if let ApiCall::SwarmCommand { node, session, command } = &call {
+            self.begin_swarm_command(
+                node.clone(),
+                session.clone(),
+                command.clone(),
+                (plugin.clone(), id.clone()),
+            );
+            return;
+        }
+        if self.spawn_slow(&plugin, Some(id.clone()), &call) {
+            return;
+        }
+        let response: ApiResponse = self.dispatch(&plugin, call).await.into();
+        let _ = self.bridge.script().send(ScriptInbound::Plugin {
+            plugin,
+            msg: PluginInbound::Response { id, response },
+        });
+    }
+
+    /// The same, for a call that wants no answer.
+    async fn plugin_notify(&mut self, plugin: PluginId, call: ApiCall) {
+        if let ApiCall::ChatAttach { path: None } = &call {
+            self.begin_paste(None);
+            return;
+        }
+        if let ApiCall::ProviderSetCredential { instance, replace } = &call {
+            if let Err(e) = self.begin_secret(instance.clone(), *replace, None) {
+                tracing::warn!(%plugin, "{e}");
+            }
+            return;
+        }
+        if self.spawn_slow(&plugin, None, &call) {
+            return;
+        }
+        if let Err(e) = self.dispatch(&plugin, call).await {
+            // Fire-and-forget calls have nowhere to return an error, so surface it
+            // rather than letting it vanish.
+            tracing::warn!(%plugin, "{e}");
         }
     }
 

@@ -80,7 +80,23 @@ export type SessionInfo = {
    * agent itself would have said `8%`.
    */
   context_window?: number | null;
+  /**
+   * Whether this is the conversation on screen **in the terminal that asked**.
+   *
+   * A workspace can have several terminals and each is somewhere, so this is a question with as
+   * many answers as there are screens and the host stamps in the one for whoever is asking. A
+   * panel drawing a list marks its own conversation with it; use [`Self::on_screen`] for "is
+   * anybody looking at this".
+   */
   is_active: boolean;
+  /**
+   * Whether *some* terminal is reading this conversation.
+   *
+   * The workspace-wide half of the question above, and the one an unread mark turns on: a turn
+   * that ends where nobody could see it is news, and where nobody could see it means every
+   * screen.
+   */
+  on_screen: boolean;
   /**
    * A turn finished here while you were looking at something else.
    *

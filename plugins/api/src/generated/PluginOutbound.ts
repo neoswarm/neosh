@@ -2,9 +2,10 @@
 import type { ApiCall } from "./ApiCall";
 import type { PluginResponse } from "./PluginResponse";
 import type { RequestId } from "./RequestId";
+import type { ViewId } from "./ViewId";
 
 export type PluginOutbound =
   | { "type": "ready"; protocol_version: number }
-  | { "type": "call"; id: RequestId; call: ApiCall }
-  | { "type": "notify"; call: ApiCall }
+  | { "type": "call"; id: RequestId; call: ApiCall; view?: ViewId | null }
+  | { "type": "notify"; call: ApiCall; view?: ViewId | null }
   | { "type": "response"; id: RequestId; response: PluginResponse };

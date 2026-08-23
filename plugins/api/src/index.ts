@@ -258,17 +258,17 @@ function send(msg: unknown): void {
  * Calls from one plugin are applied by the host in the order they were issued, so a caller that
  * fires several mutations without awaiting cannot race itself.
  */
-function call(plugin: string, c: ApiCall): Promise<ApiOk> {
+function call(plugin: string, c: ApiCall, view?: ViewId): Promise<ApiOk> {
   const id = `${plugin}#${++seq}`;
   return new Promise<ApiOk>((resolve, reject) => {
     pending.set(id, { resolve, reject });
-    send({ type: "plugin", plugin, msg: { type: "call", id, call: c } });
+    send({ type: "plugin", plugin, msg: { type: "call", id, call: c, view } });
   });
 }
 
 /** Fire-and-forget. Used on the streaming path so appending a token is not round-trip bound. */
-function notify(plugin: string, c: ApiCall): void {
-  send({ type: "plugin", plugin, msg: { type: "notify", call: c } });
+function notify(plugin: string, c: ApiCall, view?: ViewId): void {
+  send({ type: "plugin", plugin, msg: { type: "notify", call: c, view } });
 }
 
 function settle(id: string, response: ApiResponse): void {
@@ -1606,14 +1606,6 @@ function markOpts(o: MarkOptions = {}): ExtmarkOpts {
 }
 
 /**
- * Which calls are about a *place* rather than about a thing.
- *
- * Everything else — every buffer call, every mark, every option — would give the same answer
- * whichever terminal asked, so binding a namespace to a view changes nothing about them.
- */
-const PLACED = new Set(["win_open", "float_open", "session_switch"]);
-
-/**
  * Build the whole `neosh` namespace over one pair of call functions.
  *
  * Called once per plugin with calls that say nothing about where they land, which is the ordinary
@@ -1628,10 +1620,12 @@ function build(
   r: ReturnType<typeof reg>,
   view: ViewId | null,
 ): Neosh {
-  const at = (x: ApiCall): ApiCall =>
-    view === null || !PLACED.has(x.call) ? x : ({ ...x, view } as ApiCall);
-  const c = (x: ApiCall) => call(plugin, at(x));
-  const n = (x: ApiCall) => notify(plugin, at(x));
+  // On the envelope rather than in each call: a call comes *from* a terminal, exactly as a key
+  // press does, and it is the same fact for all of them. It matters for far more than opening a
+  // window — which conversation is on screen, what is in the composer, what `session.list` marks
+  // as the one you are in are all questions with an answer per terminal.
+  const c = (x: ApiCall) => call(plugin, x, view ?? undefined);
+  const n = (x: ApiCall) => notify(plugin, x, view ?? undefined);
 
   const api: Neosh = {
     version,
