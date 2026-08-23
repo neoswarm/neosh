@@ -2469,7 +2469,7 @@ async function collect(
       p.sessions.length === 0 && p.worktrees.length === 0 &&
       (remote.get(p.key) ?? []).length === 0
     ) {
-      rows.push({ text: "       nothing here yet", hl: "Sidebar.Dim", inert: true });
+      rows.push({ text: "     nothing here yet", hl: "Sidebar.Dim", inert: true });
     }
   }
 
@@ -2480,7 +2480,7 @@ async function collect(
     const first = list[0];
     if (!first) continue;
     rows.push({
-      text: `   ${opts.ascii ? "~" : "▹"} ${clip(first.agent.project_name, opts.width - 12)}`,
+      text: ` ${opts.ascii ? "~" : "▹"} ${clip(first.agent.project_name, opts.width - 10)}`,
       hl: "Sidebar.Remote",
       right: { text: `${clip((hosts.get(key) ?? []).join(" "), 12)} `, hl: "Sidebar.Remote" },
       inert: true,
@@ -2490,7 +2490,7 @@ async function collect(
 
   rows.push(blank());
   rows.push({
-    text: "   + Add project",
+    text: " + Add project",
     hl: "Accent",
     value: { kind: "add" },
   });
@@ -2501,7 +2501,7 @@ async function collect(
   // that it goes away; a door is the most this panel should spend on saying where.
   if (archived.length > 0) {
     rows.push({
-      text: `   ${opts.ascii ? "-" : "┈"} Archived`,
+      text: ` ${opts.ascii ? "-" : "┈"} Archived`,
       hl: "Sidebar.Dim",
       right: { text: `${archived.length} `, hl: "Sidebar.Dim" },
       value: { kind: "browse", count: archived.length },
@@ -2546,20 +2546,24 @@ function sectionRows(
         ...heading(clip(c.item.title, opts.width - 2), opts.width, hint),
       );
     }
+    // One column, the same as this panel's own headings and top-level rows — a section is a
+    // section, not something indented under one. The three it used to be were three columns of a
+    // gauge, on every row of the strip, saying nothing.
+    const margin = " ";
     for (const r of contributed) {
       if (typeof r?.text !== "string") continue;
-      const text = `   ${clip(r.text, Math.max(4, opts.width - 6))}`;
+      const text = `${margin}${clip(r.text, Math.max(4, opts.width - 2 - margin.length))}`;
       rows.push({
         text,
         // A third party's row gets the same treatment ours do: we have no idea how long its text
         // is, and a plugin's row cut at our column is our bug rather than theirs.
-        full: `   ${r.text}`,
-        indent: 3,
+        full: `${margin}${r.text}`,
+        indent: margin.length,
         hl: typeof r.hl === "string" ? r.hl : undefined,
         // Shifted by our indent and clamped to what survived the clip. Checked rather than
         // trusted, like every other field here: a span running off the end of a row this panel
         // shortened is a mark on a column that is not there.
-        spans: shift(r.spans, byteLength("   "), byteLength(text)),
+        spans: shift(r.spans, byteLength(margin), byteLength(text)),
         right: typeof r.right?.text === "string"
           ? { text: `${r.right.text} `, hl: r.right.hl }
           : undefined,
@@ -2646,10 +2650,14 @@ function projectRow(
       ? { text: `${within.length} `, hl: "Sidebar.Dim" }
       : { text: "" };
 
-  // The star sits before the fold arrow rather than after the name: it is what you scan the
-  // column for, and a marker at the ragged right edge is not a column. It gets its own highlight
-  // because the world has already decided what colour a favourite is — a grey star is a star you
-  // have to decode.
+  // The star sits directly after the name, and costs nothing on a project that has not got one.
+  // It used to be a fixed column *before* the fold arrow, which meant every project name in the
+  // narrowest panel in the workspace paid two columns, permanently, for a mark on three or four
+  // rows — and the right-hand edge is not the answer either: that column already belongs to the
+  // count and the elapsed time, which is a number you read against the rows above and below it.
+  // Attached to the name it is a property of the thing it is beside, which is what it is. It keeps
+  // its own highlight because the world has already decided what colour a favourite is — a grey
+  // star is a star you have to decode.
   //
   // A star rather than a heart, and the reason is font fallback: `♥` is U+2665, which Unicode
   // classifies as an emoji even though its default presentation is text. A terminal that has a
@@ -2657,7 +2665,7 @@ function projectRow(
   // at somebody else's weight — commonly an outline, which is what a filled glyph is not. Every
   // heart codepoint has that problem. `★` is U+2605, `Emoji=No`, so no terminal has any reason to
   // leave the font it is drawing the rest of the row in.
-  const star = p.favorite ? (opts.ascii ? "*" : "★") : " ";
+  const star = p.favorite ? (opts.ascii ? " *" : " ★") : "";
 
   // Which other computers have this project. The whole reason a project key is a normalised git
   // remote rather than a path: on two machines the path is different and this is the same.
@@ -2707,24 +2715,33 @@ function projectRow(
     : ` ${dot}${count}`;
   const markHl = folded && waiting ? "Status.Pending" : dotHl;
 
+  // The star's two columns come off the name that is about to carry it, so a favourite and the
+  // project under it still end in the same place — clipping the name is what a panel this narrow
+  // does, and letting the mark run two columns past everything else is not.
   const name = clip(
     p.name,
-    Math.max(6, opts.width - 8 - byteLength(mark) - (elsewhere.length ? 8 : 0)),
+    Math.max(
+      6,
+      opts.width - 8 - byteLength(mark) - byteLength(star) - (elsewhere.length ? 8 : 0),
+    ),
   );
   const spans: Array<{ from: number; to: number; hl: string }> = [];
-  if (p.favorite) spans.push({ from: 1, to: 1 + byteLength(star), hl: "Sidebar.Favorite" });
+  if (star !== "") {
+    const from = byteLength(` ${arrow} ${name}`);
+    spans.push({ from, to: from + byteLength(star), hl: "Sidebar.Favorite" });
+  }
   if (mark !== "") {
-    const from = byteLength(` ${star} ${arrow} ${name}`);
+    const from = byteLength(` ${arrow} ${name}${star}`);
     spans.push({ from, to: from + byteLength(mark), hl: markHl });
   }
   return {
-    text: ` ${star} ${arrow} ${name}${mark}`,
+    text: ` ${arrow} ${name}${star}${mark}`,
     // A project's name is a directory name, and directory names are long. Clipped it is the same
     // eight characters as the three others you have open beside it, which is the panel failing at
-    // the one thing it is for. The unread dot is left off deliberately: it survived the clip and
-    // is already on the row.
-    full: ` ${star} ${arrow} ${p.name}`,
-    indent: 5,
+    // the one thing it is for. The star and the unread dot are left off deliberately: they
+    // survived the clip and are already on the row.
+    full: ` ${arrow} ${p.name}`,
+    indent: 3,
     hl: here ? "Directory" : "Sidebar.Dim",
     spans: spans.length > 0 ? spans : undefined,
     right: elsewhere.length > 0
@@ -2773,10 +2790,13 @@ function worktreeRow(
   // The branch glyph, in the branch colour — what says "this row is a checkout" at a glance, so
   // the name can be just the branch. No ASCII stand-in earns its column, so ASCII goes without.
   const glyph = opts.ascii ? "" : "⎇ ";
-  const pad = "    ";
+  // One step in from its repository's arrow, and the step is two columns — the same one a
+  // conversation takes from the project it is in. Three, when the star was on the left, made the
+  // nesting read as two levels where there is one.
+  const pad = "   ";
   const name = clip(
     p.name,
-    Math.max(6, opts.width - 9 - byteLength(glyph) - byteLength(mark)),
+    Math.max(6, opts.width - 8 - byteLength(glyph) - byteLength(mark)),
   );
   const spans: Array<{ from: number; to: number; hl: string }> = [];
   if (glyph !== "") {
@@ -2818,9 +2838,9 @@ function remoteRow(r: SwarmAgent, opts: DrawOptions, now: number): ListRow<Targe
     const host = clip(r.node.name, 12);
     const width = Math.max(8, opts.width - 8 - host.length);
     return {
-      text: `    ${glyph} ${clip(r.agent.label, width)}`,
-      full: `    ${glyph} ${r.agent.label}`,
-      indent: 6,
+      text: `   ${glyph} ${clip(r.agent.label, width)}`,
+      full: `   ${glyph} ${r.agent.label}`,
+      indent: 5,
       hl: working ? "Status.Monitoring" : "Sidebar.Remote",
       right: { text: `${host} `, hl: "Sidebar.Remote" },
       value: {
@@ -2896,7 +2916,7 @@ function sessionRow(
     : s.updated_at > 0 ? ago(now / 1000 - s.updated_at) : "";
   // Two more columns per level: a conversation inside a worktree sits inside the worktree's row
   // the way the worktree sits inside its repository's.
-  const pad = "    " + "  ".repeat(depth);
+  const pad = "   " + "  ".repeat(depth);
   // What is left for the title, counted rather than guessed at. The indent, the glyph and the
   // space after it come off the front; the age column and the space keeping it off the panel edge
   // come off the end, plus one column of air so a title cannot run into a timestamp. The old
