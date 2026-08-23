@@ -673,8 +673,12 @@ struct Card {
     row: u32,
     /// How many rows the body takes under it.
     body: u32,
-    /// Whether the body is the whole of it or the first few rows.
-    expanded: bool,
+    /// How much of the body is on screen: folded, previewed under the cursor, or opened.
+    ///
+    /// Two of the three are the *cursor's*, not the card's — see [`cards::Open`] and
+    /// [`Host::refresh_preview`]. Kept here anyway, because this is what draws the card and
+    /// because a run must not grow into a card somebody is looking at.
+    open: cards::Open,
     /// Whether this card has already had its moment.
     ///
     /// A landing is an event, and an event happens once. Without this the row would light up again
@@ -686,7 +690,7 @@ struct Card {
 
 impl Card {
     fn new(leg: Leg, row: u32) -> Self {
-        Self { legs: vec![leg], row, body: 0, expanded: false, flashed: false }
+        Self { legs: vec![leg], row, body: 0, open: cards::Open::Folded, flashed: false }
     }
 
     /// Whether this card holds a call answering to `id`, and which one.
@@ -710,7 +714,7 @@ impl Card {
     /// and the fold is about noise. Ending the run there gives the failure its own card with its
     /// own body, which is what it would have had alone.
     fn takes(&self, input: &serde_json::Value) -> bool {
-        !self.expanded
+        self.open == cards::Open::Folded
             && !self.legs.iter().any(|l| l.result.as_ref().is_some_and(|r| r.is_error))
             && self.legs.last().is_some_and(|l| cards::groups_with(&l.input, input))
     }
@@ -3439,7 +3443,7 @@ impl Host {
             .card_at(self.chat_cursor().0)
             .map(|i| &self.cards[i])
             .filter(|c| c.settled())
-            .map(|c| c.expanded);
+            .map(|c| c.open == cards::Open::Full);
         let tab = self.glyphs().tab;
         let mut pairs: Vec<(&str, &str)> = match self.reading_pending {
             Some(Pending::Yank) => vec![
@@ -3476,6 +3480,7 @@ impl Host {
                 ("v", "select"),
                 ("[ ]", "turn"),
                 ("{ }", "block"),
+                ("c", "call"),
                 ("/", "find"),
                 ("i", "write"),
                 ("esc", "leave"),
@@ -3486,7 +3491,9 @@ impl Host {
             && !self.chat_anchored()
             && let Some(open) = card
         {
-            pairs.insert(0, (tab, if open { "fold" } else { "expand" }));
+            // `\u{21e5}` no longer *opens* a card the cursor is already in — the cursor did that.
+            // What it does is keep it: all of it, and still there when you move off.
+            pairs.insert(0, (tab, if open { "fold" } else { "keep open" }));
         }
         let mut out: Vec<neosh_proto::VirtChunk> = Vec::new();
         let mut used = 0usize;
@@ -4317,6 +4324,7 @@ impl Host {
             return;
         }
         self.reading = false;
+        self.drop_preview();
         self.reading_pending = None;
         self.reading_count.clear();
         self.reading_shape = SelectShape::Exclusive;
@@ -4526,6 +4534,11 @@ impl Host {
             (_, "[") => self.reading_to_turn(-1),
             (_, "}") => self.reading_to_block(1),
             (_, "{") => self.reading_to_block(-1),
+            // And the third: what the turn actually did. `c` rather than a bracket pair because
+            // both of those are spent, and it is free here — nothing in this mode edits, so Vim's
+            // `c` has nothing to collide with. The card opens as you land on it.
+            (_, "c") => self.reading_to_card(1, count),
+            (_, "C") => self.reading_to_card(-1, count),
 
             // Where the window is, rather than where the text is.
             (_, "H") => self.reading_screen_row(count.saturating_sub(1)),
@@ -4746,6 +4759,12 @@ impl Host {
             row: at.0,
             col: at.1,
         });
+        // The card the cursor arrived in opens, and the one it left folds. Not while selecting: a
+        // selection is two positions with rows between them, and a body appearing in the middle of
+        // it would change what `y` copies without anything on screen having been aimed at.
+        if !self.chat_anchored() {
+            self.refresh_preview();
+        }
         self.follow_cursor();
         // The hint row says what the row under the cursor can do, so it moves with it.
         self.refresh_composer();
@@ -5605,6 +5624,7 @@ impl Host {
         cards::Limits {
             diff_lines: self.option_usize("chat.diff_lines"),
             output_lines: self.option_usize("chat.tool_output_lines"),
+            preview_lines: self.option_usize("chat.preview_lines"),
         }
     }
 
@@ -5730,7 +5750,8 @@ impl Host {
                 let g = self.glyphs();
                 let limits = self.limits();
                 let width = self.chat_width();
-                let rows = cards::body(&g, &serde_json::Value::Null, result, limits, false, width);
+                let nothing = serde_json::Value::Null;
+                let rows = cards::body(&g, &nothing, result, limits, cards::Open::Folded, width);
                 for r in rows {
                     let row = self.chat_push(vec![r.text.clone()]);
                     self.chat_row(row, &r);
@@ -5829,14 +5850,14 @@ impl Host {
         let body = match card.legs.as_slice() {
             // One call: whatever it came back with, folded or opened.
             [leg] => match &leg.result {
-                Some(r) => cards::body(&g, &leg.input, r, limits, card.expanded, width),
+                Some(r) => cards::body(&g, &leg.input, r, limits, card.open, width),
                 None => Vec::new(),
             },
             // A run of reads: nothing until it is opened, and then a row per call. What the fold
             // exists to keep out of the transcript is the *contents* of the six files, so opening
             // a run gives back the six names in full and stops there. A run of *commands* keeps
             // the last one's output, because what a command printed is the answer — see ADR 0051.
-            _ => cards::group_body(&g, &Self::card_heads(card), &root, limits, card.expanded, width),
+            _ => cards::group_body(&g, &Self::card_heads(card), &root, limits, card.open, width),
         };
         // Anything else writing into the transcript ends the answer: its rows are addressed by
         // range, and rows moving underneath it would make "the end of the answer" ambiguous. An
@@ -5911,11 +5932,122 @@ impl Host {
             self.editor_message(MessageLevel::Info, "still running \u{2014} nothing to show yet");
             return;
         }
-        self.cards[i].expanded = !self.cards[i].expanded;
+        // Between "all of it, and it stays" and whatever the cursor was already buying. Folding a
+        // card the cursor is still in back to nothing would be answering `\u{21e5}` with a card
+        // that shows *less* than it did before anybody pressed anything.
+        self.cards[i].open = match self.cards[i].open {
+            cards::Open::Full => cards::Open::Preview,
+            _ => cards::Open::Full,
+        };
         self.redraw_card(i);
         let row = self.cards[i].row;
         self.reading_jump((row, 0));
         self.refresh_composer();
+    }
+
+    /// Open the card the cursor is in, and fold the one it has left.
+    ///
+    /// [ADR 0049](../../../docs/adr/0049-a-list-is-a-place-you-move-in.md)'s rule, on the
+    /// transcript: the row you are *in* stays unfolded, and only ever one row — the cursor is what
+    /// asks, everywhere else. A turn that ran nine commands is nine rows you walk down, each one
+    /// showing what it printed as you arrive and giving the rows back as you leave, and none of it
+    /// is a key you have to know about.
+    ///
+    /// Only when the card actually changes, which is what makes this safe to call on every motion:
+    /// moving *within* a card redraws nothing, and a redraw is not free — it settles the answer
+    /// that is streaming above it.
+    ///
+    /// A card pinned open with `\u{21e5}` is left alone in both directions. That is what pinning
+    /// is for: you opened it to keep it, and walking off it is not changing your mind.
+    fn refresh_preview(&mut self) {
+        if !self.reading {
+            return;
+        }
+        let (mut row, col) = self.chat_cursor();
+        let want = self.card_at(row).filter(|i| self.cards[*i].settled());
+        let leaving: Vec<usize> = self
+            .cards
+            .iter()
+            .enumerate()
+            .filter(|(i, c)| c.open == cards::Open::Preview && Some(*i) != want)
+            .map(|(i, _)| i)
+            .collect();
+        for i in leaving {
+            let (at, before) = (self.cards[i].row, self.cards[i].body);
+            self.cards[i].open = cards::Open::Folded;
+            self.redraw_card(i);
+            // Everything below a card that just lost rows moved up, and the cursor is one of the
+            // things below it: stepping off the bottom of a nine-row body lands you on the row
+            // after it, and that row is now nine higher than where the cursor is pointing.
+            if row > at {
+                row = row.saturating_sub(before.saturating_sub(self.cards[i].body));
+            }
+        }
+        if let Some(i) = want.filter(|i| self.cards[*i].open == cards::Open::Folded) {
+            self.cards[i].open = cards::Open::Preview;
+            self.redraw_card(i);
+        }
+        if row != self.chat_cursor().0 {
+            let at = vim::clamp(&self.chat_lines(), (row, col));
+            let _ = self.editor.apply(&PluginId::from(BUILTIN), ApiCall::WinSetCursor {
+                win: self.chat_win,
+                row: at.0,
+                col: at.1,
+            });
+            self.follow_cursor();
+        }
+    }
+
+    /// Fold whatever the cursor was previewing, without moving it.
+    ///
+    /// What leaving reading has to do: a preview is the cursor's, and there is no cursor once you
+    /// are back in the composer. A card pinned with `\u{21e5}` stays open, because that one is
+    /// yours rather than the cursor's.
+    fn drop_preview(&mut self) {
+        let previewed: Vec<usize> = self
+            .cards
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| c.open == cards::Open::Preview)
+            .map(|(i, _)| i)
+            .collect();
+        for i in previewed {
+            self.cards[i].open = cards::Open::Folded;
+            self.redraw_card(i);
+        }
+    }
+
+    /// `c` and `C`: the next tool call, or the one before it.
+    ///
+    /// The transcript's own structure, which neither of the other two stepping keys can find.
+    /// `[`/`]` is a whole turn — far too coarse to inspect what a turn *did* — and `{`/`}` is a
+    /// blank-line block, which since ADR 0050 took the blank row off the top of a card means a run
+    /// of nine cards is one block. So walking
+    /// what happened, one call at a time, was nine presses of `j` per row of body and no way to
+    /// skip a long one.
+    ///
+    /// The cursor lands on the header, which is where a card opens from — and the card opens
+    /// itself on arrival, so `c c c` is the whole of a turn's work read one call at a time. A
+    /// count works like every other motion here: `3c` is three calls on.
+    fn reading_to_card(&mut self, dir: i32, count: u32) {
+        let from = self.chat_cursor().0;
+        for _ in 0..count.max(1) {
+            let here = self.chat_cursor().0;
+            // By header row alone, so `C` from half way down a body goes to the top of the card
+            // you are in before it goes to the one before it — which is what every other backwards
+            // motion here does, and the row you would have to reach anyway to fold it.
+            let next = match dir > 0 {
+                true => self.cards.iter().map(|c| c.row).filter(|r| *r > here).min(),
+                false => self.cards.iter().map(|c| c.row).filter(|r| *r < here).max(),
+            };
+            match next {
+                Some(row) => self.reading_jump((row, 0)),
+                None => break,
+            }
+        }
+        if self.chat_cursor().0 == from && self.cards.is_empty() {
+            self.editor_message(MessageLevel::Info, "nothing in this conversation ran a tool");
+        }
     }
 
     /// What the turn changed, under its answer.
@@ -6755,7 +6887,66 @@ impl Host {
     /// whatever is on screen. *Drawing* happens only when the event came from the conversation you
     /// are looking at. That split is what lets several turns run at once without one of them
     /// writing into another's transcript.
+    /// Whatever the agent just said, and then the reader taken along with it if it was at the end.
+    ///
+    /// A turn that is still going writes rows below wherever you are reading, and reading is a
+    /// place *in* the transcript: the scroll offset is pinned by every motion, so an answer
+    /// arriving while `^S` is on lands off the bottom of the window. Which made watching a turn a
+    /// matter of leaving reading, seeing what had happened, and going back in — for every call.
+    ///
+    /// **At the end means following, anywhere else means anchored.** The same distinction the
+    /// unscrolled window makes and for the same reason: parked on the last row you are watching,
+    /// and half way up a diff you are reading, and the second one must not be dragged away from
+    /// what it is looking at. Nothing to turn on, and one `G` to start following again.
+    ///
+    /// Not while selecting or searching — both of those are two positions, and moving one of them
+    /// on the agent's behalf changes what the reader is holding.
     fn handle_agent_event(&mut self, ev: AgentEvent) {
+        let following = self.reading_at_tail();
+        self.on_agent_event(ev);
+        if following {
+            self.reading_follow();
+        }
+    }
+
+    /// Whether the reader is parked on the last row of the transcript.
+    fn reading_at_tail(&self) -> bool {
+        self.reading
+            && self.search.is_none()
+            && !self.chat_anchored()
+            && self.chat_cursor().0 + 1 >= self.chat_len()
+    }
+
+    /// How many rows the transcript has, without copying every one of them to find out.
+    fn chat_len(&self) -> u32 {
+        self.editor.buffer(self.chat).map(|b| b.lines().len() as u32).unwrap_or(0)
+    }
+
+    /// Take the reader down to the newest row.
+    ///
+    /// Deliberately not [`Self::place_cursor`]: following is *watching*, and a card that opened
+    /// itself under a cursor the agent is dragging is a body nobody aimed at — several of them a
+    /// second, each one settling the answer streaming above it. Arriving somewhere by yourself is
+    /// what asks a card to open.
+    fn reading_follow(&mut self) {
+        let lines = self.chat_lines();
+        let last = lines.len().saturating_sub(1) as u32;
+        if self.chat_cursor().0 == last {
+            return;
+        }
+        let col = vim::first_non_blank(lines.last().map(String::as_str).unwrap_or(""));
+        let at = vim::clamp(&lines, (last, col));
+        self.reading_goal = None;
+        let _ = self.editor.apply(&PluginId::from(BUILTIN), ApiCall::WinSetCursor {
+            win: self.chat_win,
+            row: at.0,
+            col: at.1,
+        });
+        self.follow_cursor();
+        self.refresh_composer();
+    }
+
+    fn on_agent_event(&mut self, ev: AgentEvent) {
         let on_screen = &self.active_session() == ev.session();
         match ev {
             AgentEvent::TurnStarted { session, turn } => {
@@ -8729,6 +8920,18 @@ impl Host {
                 ),
             },
             OptionSpec {
+                name: "chat.preview_lines".into(),
+                ty: OptionType::Int { min: Some(0), max: Some(500) },
+                default: OptionValue::Int(16),
+                description: Some(
+                    "How much of a tool card the cursor is in shows while reading the transcript \
+                     with `^S`. The card opens as you arrive and folds as you leave, so this is a \
+                     budget per card rather than per transcript. Never less than the folded card \
+                     showed. Tab opens one all the way and keeps it open."
+                        .into(),
+                ),
+            },
+            OptionSpec {
                 name: "chat.diff_lines".into(),
                 ty: OptionType::Int { min: Some(0), max: Some(500) },
                 default: OptionValue::Int(12),
@@ -9750,10 +9953,10 @@ fn transcript(
     ) -> Vec<cards::Row> {
         match card.legs.as_slice() {
             [leg] => match &leg.result {
-                Some(r) => cards::body(g, &leg.input, r, limits, false, width),
+                Some(r) => cards::body(g, &leg.input, r, limits, card.open, width),
                 None => Vec::new(),
             },
-            _ => cards::group_body(g, &heads_of(card, answered), root, limits, false, width),
+            _ => cards::group_body(g, &heads_of(card, answered), root, limits, card.open, width),
         }
     }
     // A gap, unless there already is one: what came before was often a tool card, which has no
@@ -9914,7 +10117,7 @@ fn transcript(
                                 &serde_json::Value::Null,
                                 &result,
                                 limits,
-                                false,
+                                cards::Open::Folded,
                                 width,
                             );
                             for r in rows {

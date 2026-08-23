@@ -183,6 +183,60 @@ pub struct Limits {
     pub diff_lines: usize,
     /// Lines of any other result.
     pub output_lines: usize,
+    /// Rows the card the cursor is in gets instead, while reading. See [`Open::Preview`].
+    pub preview_lines: usize,
+}
+
+/// How much of a card's body is on screen, and why.
+///
+/// Three states rather than two, because the two answers a transcript needs are not the same
+/// question. *How much does a card cost when nobody is looking at it* is a setting — the
+/// [`Limits`] — and the answer has to be small, or a turn that read six files fills a screen with
+/// the parts of them nobody asked about. *How much does the card I am looking at right now show*
+/// is the cursor's question, it is asked about exactly one card, and the answer costs nothing that
+/// moving off the card does not give straight back.
+///
+/// Which is [ADR 0049](../../../docs/adr/0049-a-list-is-a-place-you-move-in.md)'s rule, one surface
+/// along: the row you are *in* stays unfolded, and only ever one row. A transcript is a list you
+/// move in as much as the project panel is.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum Open {
+    /// What every card is when the cursor is somewhere else: the header, and whatever a fold
+    /// keeps under it — an edit's diff, the last output of a stack of commands.
+    #[default]
+    Folded,
+    /// The card the cursor is in. Everything a fold hides, up to [`Limits::preview_lines`].
+    ///
+    /// Bounded on purpose. A card that read a nine-hundred-line file would otherwise drop nine
+    /// hundred rows under the cursor on the way past, and `j` would stop being a key you can
+    /// predict — which is the whole reason the fold exists.
+    Preview,
+    /// All of it, and it stays that way when the cursor leaves. `\u{21e5}`.
+    Full,
+}
+
+impl Limits {
+    /// How many rows of a result a card in this state pays for. [`usize::MAX`] is all of them.
+    ///
+    /// Never *fewer* than the folded card showed. A preview is what the cursor buys you and a
+    /// setting is the floor it buys on top of: with `chat.tool_output_lines = 40`, stepping onto a
+    /// card must not take thirty rows away.
+    fn output(self, open: Open) -> usize {
+        match open {
+            Open::Folded => self.output_lines,
+            Open::Preview => self.preview_lines.max(self.output_lines),
+            Open::Full => usize::MAX,
+        }
+    }
+
+    /// The same, for the rows of a diff.
+    fn diff(self, open: Open) -> usize {
+        match open {
+            Open::Folded => self.diff_lines,
+            Open::Preview => self.preview_lines.max(self.diff_lines),
+            Open::Full => usize::MAX,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -774,14 +828,17 @@ pub fn group_body(
     heads: &[Head],
     root: &std::path::Path,
     limits: Limits,
-    expanded: bool,
+    open: Open,
     width: usize,
 ) -> Vec<Row> {
     // A stack of commands is the other kind of run, and it keeps an output. See [`run_body`].
     if heads.first().is_some_and(|h| runs_a_command(h.input)) {
-        return run_body(g, heads, root, limits, expanded, width);
+        return run_body(g, heads, root, limits, open, width);
     }
-    if !expanded {
+    // A preview is the same as an opening here, and deliberately: what this fold keeps out of the
+    // transcript is the *contents* of the six files, and the names it gives back instead are one
+    // row each however you asked for them.
+    if open == Open::Folded {
         return Vec::new();
     }
     let margin = g.margin();
@@ -838,9 +895,16 @@ fn run_body(
     heads: &[Head],
     root: &std::path::Path,
     limits: Limits,
-    expanded: bool,
+    open: Open,
     width: usize,
 ) -> Vec<Row> {
+    // **A preview is a bigger budget, not an opening.** Opening a stack means a row per command
+    // *and* an output under each one, and at `preview_lines` apiece a nine-command stack would
+    // drop a hundred and fifty rows under the cursor on the way past — which is exactly what the
+    // bound exists to prevent. So the cursor buys more of the one output that was already showing,
+    // and `\u{21e5}` is what buys the other eight. A run of reads is not this: a row per call is
+    // one row per call, and that is bounded by the card. See ADR 0057.
+    let opened = open == Open::Full;
     let margin = g.margin();
     let deeper = format!("{margin}    ");
     let mut rows: Vec<Row> = Vec::new();
@@ -849,12 +913,12 @@ fn run_body(
     // failed, wherever it is in the stack: a run does not usually continue past a failure, but
     // calls made in parallel land in whatever order they land in, and a fold is about noise.
     let shown: Vec<usize> = (0..heads.len())
-        .filter(|&i| expanded || i + 1 == heads.len() || heads[i].state == ToolState::Failed)
+        .filter(|&i| opened || i + 1 == heads.len() || heads[i].state == ToolState::Failed)
         .collect();
     // Whose output this is only has to be said when more than one of them is saying anything.
     // Folded to the last command alone, the stack above it is the header's list and a row naming
     // it again is a row spent repeating the line above.
-    let named = expanded || shown.len() > 1;
+    let named = opened || shown.len() > 1;
     let room = width.saturating_sub(margin.chars().count()).max(8);
 
     for i in shown {
@@ -871,7 +935,7 @@ fn run_body(
         }
         if let Some(result) = h.result {
             let under = if named { &deeper } else { &margin };
-            rows.extend(result_rows(g, result, limits.output_lines, expanded, width, under));
+            rows.extend(result_rows(g, result, limits.output(open), width, under));
         }
     }
     attach(g, &mut rows);
@@ -1085,9 +1149,64 @@ fn subject(input: &serde_json::Value) -> Option<(&'static str, String)> {
     let map = input.as_object()?;
     KEYS.iter().find_map(|key| {
         let v = map.get(*key)?.as_str()?;
+        // A command is named by what it does, never by how it got there.
+        let v = if *key == "command" { without_leading_cd(v) } else { v };
         let one = v.lines().next().unwrap_or(v).trim();
         (!one.is_empty()).then(|| (*key, one.to_string()))
     })
+}
+
+/// A command with the getting-there taken off the front.
+///
+/// A vendor CLI that cannot keep a working directory between calls writes every one of them as
+/// `cd /home/you/projects/thing && cargo test`, and the card is then forty columns of the one
+/// part you already knew: the conversation has a directory, the sidebar says which, and every
+/// path on every other card is drawn relative to it. Clipped to the row a header actually has,
+/// it is *all* you can see — a column of `Ran  cd /home/you/projects/th\u{2026}`, six of them in a
+/// row, saying nothing about the six different things that were run. Folded into a stack it is
+/// worse: [`short_command`] stops at the `&&`, so `cd, cd, cd` is the summary of a stretch of the
+/// turn.
+///
+/// So the name is whatever comes after. Only a leading `cd` with one argument and a `&&` or a `;`
+/// behind it — that shape is unambiguously somebody arriving somewhere, and it repeats, because
+/// `cd a && cd b && make` is the same sentence said twice. Everything else is the command: `cd
+/// src` on its own is genuinely a `cd` and says so, `cd x || y` is a decision rather than a
+/// preamble, and a `cd` anywhere but the front is part of what was run.
+///
+/// The whole line is never lost — an opened stack gives every command back in full, which is
+/// where you go when the question is *which* directory.
+fn without_leading_cd(command: &str) -> &str {
+    let mut rest = command;
+    while let Some(after) = strip_cd(rest) {
+        rest = after;
+    }
+    rest
+}
+
+/// One `cd <somewhere> &&` off the front, or `None` if that is not what this starts with.
+fn strip_cd(command: &str) -> Option<&str> {
+    let after_cd = command.trim_start().strip_prefix("cd")?;
+    // `cdrom/build.sh` is not a `cd`. The word has to end.
+    if !after_cd.starts_with([' ', '\t']) {
+        return None;
+    }
+    let arg = after_cd.trim_start();
+    // The directory: one word, or one quoted run. Anything cleverer — a `$(…)`, a glob — is not
+    // the shape this is here for, and guessing at it is how a `cd` that mattered disappears.
+    // Sliced at the delimiter rather than split on it, and the delimiter kept: `cd /work;make`
+    // and `cd /work && make` are the same sentence with different spacing, and a `split_once` that
+    // eats the first `&` leaves a separator that no longer reads as one. An empty argument —
+    // `cd && make` — falls out of this for free, at index zero.
+    let after_arg = match arg.chars().next()? {
+        q @ ('"' | '\'') => arg[1..].find(q).map(|i| &arg[i + 2..])?,
+        _ => &arg[arg.find([' ', '\t', ';', '&', '|']).unwrap_or(arg.len())..],
+    };
+    let sep = after_arg.trim_start();
+    // `&&` and never a bare `&`: one is "and then", the other backgrounds what came before it.
+    let rest = sep.strip_prefix("&&").or_else(|| sep.strip_prefix(';'))?;
+    let rest = rest.trim_start();
+    // A `cd` with nothing behind it is the whole command, whatever the separator promised.
+    (!rest.is_empty()).then_some(rest)
 }
 
 /// What a call is about, in as little room as a list of them can spare.
@@ -1220,16 +1339,16 @@ pub fn body(
     input: &serde_json::Value,
     result: &neosh_proto::ToolResult,
     limits: Limits,
-    expanded: bool,
+    open: Open,
     width: usize,
 ) -> Vec<Row> {
     let mut rows = if !result.is_error && !edits_of(input).is_empty() {
-        diff_rows(g, &edits_of(input), limits.diff_lines, expanded, width)
-    } else if !result.is_error && !expanded && looks_at_something(input) {
+        diff_rows(g, &edits_of(input), limits.diff(open), open == Open::Full, width)
+    } else if !result.is_error && open == Open::Folded && looks_at_something(input) {
         // Folded to the header alone. The count is already on it, and `⇥` opens this.
         Vec::new()
     } else {
-        result_rows(g, result, limits.output_lines, expanded, width, &g.margin())
+        result_rows(g, result, limits.output(open), width, &g.margin())
     };
     attach(g, &mut rows);
     rows
@@ -1298,7 +1417,6 @@ fn result_rows(
     g: &Glyphs,
     result: &neosh_proto::ToolResult,
     limit: usize,
-    expanded: bool,
     width: usize,
     margin: &str,
 ) -> Vec<Row> {
@@ -1312,13 +1430,9 @@ fn result_rows(
 
     let all: Vec<&str> = body.lines().collect();
     let total = all.len();
-    let limit = if expanded {
-        total
-    } else if result.is_error {
-        limit.max(1)
-    } else {
-        limit
-    };
+    // An error ignores a limit of zero: a failure nobody can see is a debugging session, and the
+    // setting is about noise rather than about hiding failures.
+    let limit = if result.is_error { limit.max(1) } else { limit };
     if limit == 0 {
         let word = if total == 1 { "line" } else { "lines" };
         return vec![Row::plain(format!("{margin}{total} {word}"), hl)];
@@ -1395,7 +1509,7 @@ fn diff_rows(
     g: &Glyphs,
     changes: &[Change],
     limit: usize,
-    expanded: bool,
+    full: bool,
     width: usize,
 ) -> Vec<Row> {
     // The rows to show: every line of every change, with the unchanged stretches folded away
@@ -1405,7 +1519,7 @@ fn diff_rows(
         if c > 0 {
             pieces.push(Piece::Break);
         }
-        if expanded {
+        if full {
             pieces.extend((0..change.diff.lines.len()).map(|at| Piece::Line { change: c, at }));
             continue;
         }
@@ -1430,10 +1544,10 @@ fn diff_rows(
             }
         }
     }
-    if !expanded && limit == 0 {
+    if limit == 0 {
         return Vec::new();
     }
-    let shown = if expanded { pieces.len() } else { limit.min(pieces.len()) };
+    let shown = limit.min(pieces.len());
 
     let painted: Vec<Option<Vec<neosh_syntax::Spans>>> = changes.iter().map(paint).collect();
     // One width for the whole card, from every change in it, so the sign column does not step
@@ -1664,6 +1778,12 @@ mod tests {
 
     fn g() -> Glyphs {
         Glyphs::new(false)
+    }
+
+    /// A `Limits` for a test that is not about the preview: the cursor's budget is the folded
+    /// one, so `Open::Folded` and `Open::Preview` draw the same rows and the test can say either.
+    fn caps(diff_lines: usize, output_lines: usize) -> Limits {
+        Limits { diff_lines, output_lines, preview_lines: output_lines }
     }
 
     fn root() -> std::path::PathBuf {
@@ -1917,12 +2037,12 @@ mod tests {
             Head { output: Some(120), ..head("Read", &a, ToolState::Done) },
             Head { output: Some(3), ..head("Grep", &b, ToolState::Done) },
         ];
-        let limits = Limits { diff_lines: 12, output_lines: 3 };
+        let limits = caps(12, 3);
         assert!(
-            group_body(&g(), &heads, &root(), limits, false, 80).is_empty(),
+            group_body(&g(), &heads, &root(), limits, Open::Folded, 80).is_empty(),
             "folded, it is one row"
         );
-        let rows = group_body(&g(), &heads, &root(), limits, true, 80);
+        let rows = group_body(&g(), &heads, &root(), limits, Open::Full, 80);
         // Opened, every call gets its own row with the *whole* subject: the short names on the
         // folded row are the loose answer, and this is where it is exact.
         assert_eq!(texts(&rows), vec![
@@ -1934,7 +2054,7 @@ mod tests {
     /// A stretch of a turn spent running things is one row, and the answer is the last one's.
     #[test]
     fn a_stack_of_commands_keeps_the_last_answer() {
-        let limits = Limits { diff_lines: 12, output_lines: 3 };
+        let limits = caps(12, 3);
         let add = json!({ "command": "git add -A" });
         let commit = json!({ "command": "git commit -m 'fix the thing'" });
         let push = json!({ "command": "git push" });
@@ -1952,7 +2072,7 @@ mod tests {
             "  Ran  git add, git commit, git push"
         );
         // And under it the last one's output, and nothing from the two that got there.
-        assert_eq!(texts(&group_body(&g(), &heads, &root(), limits, false, 80)), vec![
+        assert_eq!(texts(&group_body(&g(), &heads, &root(), limits, Open::Folded, 80)), vec![
             "  \u{2514} To github.com:neoswarm/neosh",
             "       6759f10..c280938",
         ]);
@@ -1961,7 +2081,7 @@ mod tests {
     /// The fold is a summary and the key is the detail — for a command that means its output.
     #[test]
     fn an_opened_stack_is_every_command_in_full_with_what_it_printed() {
-        let limits = Limits { diff_lines: 12, output_lines: 1 };
+        let limits = caps(12, 1);
         let fmt = json!({ "command": "cargo fmt --check" });
         let test = json!({ "command": "cargo test -p neosh-core -- --test-threads 2" });
         let ok = neosh_proto::ToolResult::ok("all good");
@@ -1972,7 +2092,7 @@ mod tests {
         ];
         // Every one of them, the whole command line, and the whole of what it said — one indent
         // deeper, or the next command's name reads as another line of the output above it.
-        assert_eq!(texts(&group_body(&g(), &heads, &root(), limits, true, 80)), vec![
+        assert_eq!(texts(&group_body(&g(), &heads, &root(), limits, Open::Full, 80)), vec![
             "  \u{2514} Ran  cargo fmt --check",
             "        all good",
             "    Ran  cargo test -p neosh-core -- --test-threads 2",
@@ -1984,7 +2104,7 @@ mod tests {
     /// A fold is about noise, and a failure is not noise — wherever in the stack it landed.
     #[test]
     fn a_stack_never_folds_a_failure_away() {
-        let limits = Limits { diff_lines: 12, output_lines: 3 };
+        let limits = caps(12, 3);
         let build = json!({ "command": "cargo build" });
         let test = json!({ "command": "cargo test" });
         let broke = neosh_proto::ToolResult::error("error[E0308]: mismatched types");
@@ -1995,7 +2115,7 @@ mod tests {
         ];
         // Two outputs, so each says whose it is. `Card::takes` is what makes this rare — a run
         // does not continue past a failure — but calls made in parallel land in any order.
-        assert_eq!(texts(&group_body(&g(), &heads, &root(), limits, false, 80)), vec![
+        assert_eq!(texts(&group_body(&g(), &heads, &root(), limits, Open::Folded, 80)), vec![
             "  \u{2514} Ran  cargo build",
             "        error[E0308]: mismatched types",
             "    Ran  cargo test",
@@ -2037,8 +2157,9 @@ mod tests {
             ("NEOSH_STATE_DIR=/tmp/x cargo run", "cargo run"),
             ("ls -la /tmp", "ls"),
             ("./scripts/shot.py --cols 110", "./scripts/shot.py"),
+            // Getting there is not what it did. See [`without_leading_cd`].
+            ("cd crates && cargo test", "cargo test"),
             // Where it stops being one command, the name stops with it.
-            ("cd crates && cargo test", "cd crates"),
             ("grep -rn foo | wc -l", "grep"),
             ("for f in *.rs; do echo $f; done", "for f in"),
             // And something with no name in it at all is itself, as much as fits.
@@ -2048,6 +2169,94 @@ mod tests {
             let input = json!({ "command": command });
             assert_eq!(short_subject_of(&input, &root()), want, "{command}");
         }
+    }
+
+    /// A vendor CLI that cannot keep a working directory writes one on the front of every command
+    /// it runs, and the card is then forty columns of the directory the conversation is already
+    /// in. The name is what comes *after* it.
+    #[test]
+    fn a_command_is_named_by_what_it_did_and_not_by_how_it_got_there() {
+        for (command, want) in [
+            ("cd /work && cargo test -p neosh-core", "cargo test -p neosh-core"),
+            ("cd /work; cargo test", "cargo test"),
+            // Said twice is still one preamble.
+            ("cd /work && cd crates && make", "make"),
+            ("cd '/work/my project' && ls", "ls"),
+            ("cd \"/work/my project\" && ls", "ls"),
+            // Not a `cd`, and each for its own reason: a word that only starts with one, a
+            // decision rather than a preamble, one in the middle of what was run, and a `cd`
+            // that really is the whole of what happened.
+            ("cdrom/mount.sh && ls", "cdrom/mount.sh && ls"),
+            ("cd /work || exit 1", "cd /work || exit 1"),
+            ("make && cd /out && ls", "make && cd /out && ls"),
+            ("cd /work", "cd /work"),
+            ("cd /work &&", "cd /work &&"),
+        ] {
+            let input = json!({ "command": command });
+            assert_eq!(subject_of(&input, &root(), 200), want, "{command}");
+        }
+        // And the same answer on the row a folded stack gets, which is where it was worst: three
+        // commands under one `cd` used to fold to `cd /work, cd /work, cd /work`.
+        assert_eq!(
+            short_subject_of(&json!({ "command": "cd /work && cargo test -p neosh" }), &root()),
+            "cargo test"
+        );
+    }
+
+    /// The cursor's card shows more than a folded one and less than an opened one — and never
+    /// fewer rows than the folded card it replaced, whatever the settings say. See ADR 0057.
+    #[test]
+    fn the_card_the_cursor_is_in_is_worth_more_rows_than_the_ones_it_is_not() {
+        let input = json!({ "file_path": "/work/a.rs" });
+        let result = neosh_proto::ToolResult::ok(
+            (1..=40).map(|n| format!("line {n}")).collect::<Vec<_>>().join("\n"),
+        );
+        let limits = Limits { diff_lines: 12, output_lines: 3, preview_lines: 10 };
+        assert!(
+            body(&g(), &input, &result, limits, Open::Folded, 80).is_empty(),
+            "a read nobody is looking at is its header and the count on it"
+        );
+        // Ten lines of it and the row that says how many were left out.
+        let rows = body(&g(), &input, &result, limits, Open::Preview, 80);
+        let preview = texts(&rows);
+        assert_eq!(preview.len(), 11, "the cursor buys `preview_lines` of it: {preview:?}");
+        assert!(preview[1].contains("+30 lines"), "and says what it is still holding back");
+        assert_eq!(
+            body(&g(), &input, &result, limits, Open::Full, 80).len(),
+            40,
+            "and Tab buys all of it, with no trailer left to press"
+        );
+        // A stack of commands previews *more of the last output*, not every output: nine commands
+        // at `preview_lines` apiece is the flood the bound exists to stop. `\u{21e5}` is what opens
+        // the stack.
+        let one = neosh_proto::ToolResult::ok("first");
+        let two = neosh_proto::ToolResult::ok("second");
+        let (fmt, test) = (json!({ "command": "cargo fmt" }), json!({ "command": "cargo test" }));
+        let heads = [
+            Head { result: Some(&one), ..head("Bash", &fmt, ToolState::Done) },
+            Head { result: Some(&two), ..head("Bash", &test, ToolState::Done) },
+        ];
+        let rows = group_body(&g(), &heads, &root(), limits, Open::Preview, 80);
+        let stack = texts(&rows);
+        assert!(
+            stack.iter().any(|r| r.contains("second")) && !stack.iter().any(|r| r.contains("first")),
+            "the last one's output, with more room: {stack:?}"
+        );
+        let rows = group_body(&g(), &heads, &root(), limits, Open::Full, 80);
+        let stack = texts(&rows);
+        assert!(
+            stack.iter().any(|r| r.contains("first")),
+            "and Tab is every command in it: {stack:?}"
+        );
+
+        // A preview is a floor on top of the setting, never a ceiling under it.
+        let generous = Limits { diff_lines: 12, output_lines: 25, preview_lines: 10 };
+        let ran = json!({ "command": "cargo test" });
+        assert_eq!(
+            body(&g(), &ran, &result, generous, Open::Preview, 80).len(),
+            body(&g(), &ran, &result, generous, Open::Folded, 80).len(),
+            "stepping onto a card must not take rows away from it"
+        );
     }
 
     /// Reads with reads and commands with commands. A run is a row saying what a stretch of the
@@ -2140,7 +2349,7 @@ mod tests {
                    test cards::header ... ok\n\ntest result: ok. 12 passed";
         let result = neosh_proto::ToolResult::ok(out);
         let input = json!({ "command": "cargo test" });
-        let rows = body(&g(), &input, &result, Limits { diff_lines: 12, output_lines: 3 }, false, 90);
+        let rows = body(&g(), &input, &result, caps(12, 3), Open::Folded, 90);
         let t = texts(&rows);
         assert!(t[0].ends_with("Compiling neosh v0.1.0"), "one line of head: {t:?}");
         assert!(t[1].contains("\u{2026} +"), "then what was dropped: {t:?}");
@@ -2188,7 +2397,7 @@ mod tests {
         let new = old.replace("l10\n", "L10\n");
         let input = json!({ "file_path": "/work/a.rs", "old_string": old, "new_string": new });
         let result = neosh_proto::ToolResult::ok("ok");
-        let rows = body(&g(), &input, &result, Limits { diff_lines: 12, output_lines: 3 }, false, 80);
+        let rows = body(&g(), &input, &result, caps(12, 3), Open::Folded, 80);
         let t = texts(&rows);
         assert_eq!(t[0], "  \u{2514}   l8", "context first, no gap row at the top: {t:?}");
         assert!(t.iter().any(|r| r.ends_with("- l10")), "{t:?}");
@@ -2202,7 +2411,7 @@ mod tests {
         assert_eq!(rows.iter().filter(|r| r.band.is_some()).count(), 2, "context is not banded");
 
         // Cut by the limit, and the trailer counts exactly what the limit cut.
-        let rows = body(&g(), &input, &result, Limits { diff_lines: 3, output_lines: 3 }, false, 80);
+        let rows = body(&g(), &input, &result, caps(3, 3), Open::Folded, 80);
         let t = texts(&rows);
         assert_eq!(t.len(), 4, "{t:?}");
         assert!(t[3].contains("+3 lines"), "{t:?}");
@@ -2215,11 +2424,11 @@ mod tests {
         let new = old.replace("l5\n", "L5\n").replace("l25\n", "L25\n");
         let input = json!({ "file_path": "/work/a.rs", "old_string": old, "new_string": new });
         let result = neosh_proto::ToolResult::ok("ok");
-        let rows = body(&g(), &input, &result, Limits { diff_lines: 50, output_lines: 3 }, false, 80);
+        let rows = body(&g(), &input, &result, caps(50, 3), Open::Folded, 80);
         let t = texts(&rows);
         assert!(t.iter().any(|r| r.ends_with("\u{22ee} 15 unchanged")), "{t:?}");
         // Folded at the first change: the gap and everything after it are what is left.
-        let rows = body(&g(), &input, &result, Limits { diff_lines: 5, output_lines: 3 }, false, 80);
+        let rows = body(&g(), &input, &result, caps(5, 3), Open::Folded, 80);
         let t = texts(&rows);
         assert!(t.last().unwrap().contains("+22 lines"), "{t:?}");
     }
@@ -2230,7 +2439,7 @@ mod tests {
         let new = old.replace("l10\n", "L10\n");
         let input = json!({ "file_path": "/work/a.rs", "old_string": old, "new_string": new });
         let result = neosh_proto::ToolResult::ok("ok");
-        let rows = body(&g(), &input, &result, Limits { diff_lines: 2, output_lines: 3 }, true, 80);
+        let rows = body(&g(), &input, &result, caps(2, 3), Open::Full, 80);
         assert_eq!(rows.len(), 21, "{:?}", texts(&rows));
         assert!(!texts(&rows).iter().any(|r| r.contains("lines")));
     }
@@ -2239,7 +2448,7 @@ mod tests {
     fn a_short_edit_body_fits_and_says_nothing_about_more() {
         let input = json!({ "file_path": "/work/a.rs", "old_string": "a\nb", "new_string": "a\nc" });
         let result = neosh_proto::ToolResult::ok("ok");
-        let rows = body(&g(), &input, &result, Limits { diff_lines: 12, output_lines: 3 }, false, 80);
+        let rows = body(&g(), &input, &result, caps(12, 3), Open::Folded, 80);
         assert_eq!(texts(&rows), vec!["  \u{2514}   a", "    - b", "    + c"]);
     }
 
@@ -2247,7 +2456,7 @@ mod tests {
     fn a_failed_edit_shows_its_error_not_a_diff() {
         let input = json!({ "file_path": "/work/a.rs", "old_string": "a", "new_string": "b" });
         let result = neosh_proto::ToolResult::error("old_string not found");
-        let rows = body(&g(), &input, &result, Limits { diff_lines: 12, output_lines: 0 }, false, 80);
+        let rows = body(&g(), &input, &result, caps(12, 0), Open::Folded, 80);
         assert_eq!(texts(&rows), vec!["  \u{2514} old_string not found"]);
         assert_eq!(rows[0].spans[0].2, "Agent.ToolError");
     }
@@ -2256,7 +2465,7 @@ mod tests {
     fn a_result_folds_to_the_limit_and_expands_past_it() {
         let result = neosh_proto::ToolResult::ok("one\ntwo\nthree\nfour");
         let input = json!({ "command": "seq" });
-        let folded = body(&g(), &input, &result, Limits { diff_lines: 12, output_lines: 2 }, false, 80);
+        let folded = body(&g(), &input, &result, caps(12, 2), Open::Folded, 80);
         let t = texts(&folded);
         // One line of head, then what was dropped, then the end — which for a command is the
         // answer. Folding from the end would keep `one` and `two` and throw away the result.
@@ -2265,7 +2474,7 @@ mod tests {
             "    \u{2026} +2 lines (^S \u{21e5} to expand)",
             "    four",
         ]);
-        let open = body(&g(), &input, &result, Limits { diff_lines: 12, output_lines: 2 }, true, 80);
+        let open = body(&g(), &input, &result, caps(12, 2), Open::Full, 80);
         assert_eq!(texts(&open).len(), 4);
     }
 
@@ -2279,7 +2488,7 @@ mod tests {
             "new_string": "// two\nlet x = \"two\";",
         });
         let result = neosh_proto::ToolResult::ok("ok");
-        let rows = body(&g(), &input, &result, Limits { diff_lines: 12, output_lines: 3 }, false, 80);
+        let rows = body(&g(), &input, &result, caps(12, 3), Open::Folded, 80);
         let groups: Vec<&str> = rows.iter().flat_map(|r| &r.spans).map(|s| s.2).collect();
         assert!(groups.contains(&"Syntax.Keyword"), "`let` is a keyword: {groups:?}");
         assert!(groups.contains(&"Syntax.Comment"), "`// two` is a comment: {groups:?}");
@@ -2299,7 +2508,7 @@ mod tests {
                 json!({ "file_path": path, "old_string": "alpha", "new_string": "beta" });
             let result = neosh_proto::ToolResult::ok("ok");
             let rows =
-                body(&g(), &input, &result, Limits { diff_lines: 12, output_lines: 3 }, false, 80);
+                body(&g(), &input, &result, caps(12, 3), Open::Folded, 80);
             let t = texts(&rows);
             assert!(t.iter().any(|r| r.ends_with("- alpha")), "{path:?}: {t:?}");
             assert!(t.iter().any(|r| r.ends_with("+ beta")), "{path:?}: {t:?}");
@@ -2313,7 +2522,7 @@ mod tests {
             "diff": "@@ -142,3 +142,3 @@\n fn f() {\n-    let x = 1;\n+    let x = 2;\n",
         });
         let result = neosh_proto::ToolResult::ok("ok");
-        let rows = body(&g(), &patch, &result, Limits { diff_lines: 12, output_lines: 3 }, false, 80);
+        let rows = body(&g(), &patch, &result, caps(12, 3), Open::Folded, 80);
         let t = texts(&rows);
         assert!(t.iter().any(|r| r.contains("142   fn f() {")), "{t:?}");
         assert!(t.iter().any(|r| r.contains("143 - ")), "the removed line is numbered in the old file: {t:?}");
@@ -2327,7 +2536,7 @@ mod tests {
             "new_string": "    let x = 2;",
         });
         let rows =
-            body(&g(), &strings, &result, Limits { diff_lines: 12, output_lines: 3 }, false, 80);
+            body(&g(), &strings, &result, caps(12, 3), Open::Folded, 80);
         assert_eq!(texts(&rows), vec!["  \u{2514} -     let x = 1;", "    +     let x = 2;"]);
     }
 
@@ -2338,7 +2547,7 @@ mod tests {
         let long = format!("let s = \"{}\";", "x".repeat(120));
         let input = json!({ "file_path": "/work/a.rs", "old_string": "", "new_string": long });
         let result = neosh_proto::ToolResult::ok("ok");
-        let rows = body(&g(), &input, &result, Limits { diff_lines: 12, output_lines: 3 }, true, 60);
+        let rows = body(&g(), &input, &result, caps(12, 3), Open::Full, 60);
         assert!(rows.len() > 1, "it wrapped: {:?}", texts(&rows));
         assert!(rows.iter().all(|r| r.band == Some("Diff.AddLine")), "every row of it is added");
         assert!(rows.iter().all(|r| r.text.chars().count() <= 60), "{:?}", texts(&rows));
@@ -2363,7 +2572,7 @@ mod tests {
         let line = "    /// Run one turn to completion, steering it if a message arrives here.";
         let input = json!({ "file_path": "/work/a.rs", "old_string": "", "new_string": line });
         let result = neosh_proto::ToolResult::ok("ok");
-        let rows = body(&g(), &input, &result, Limits { diff_lines: 12, output_lines: 3 }, true, 50);
+        let rows = body(&g(), &input, &result, caps(12, 3), Open::Full, 50);
         let t = texts(&rows);
         assert!(t.len() > 1, "{t:?}");
         for row in &t[..t.len() - 1] {
@@ -2380,7 +2589,7 @@ mod tests {
         // Opened, because a read folds to its header alone and the body under test is the part you
         // get by pressing `⇥`.
         let rows = body(&g(), &json!({"file_path": "/work/a.rs"}), &result,
-            Limits { diff_lines: 12, output_lines: 3 }, true, 80);
+            caps(12, 3), Open::Full, 80);
         assert_eq!(texts(&rows), vec!["  \u{2514}      1    impl Session {"]);
     }
 
@@ -2389,9 +2598,9 @@ mod tests {
     fn a_call_that_only_looked_at_something_folds_to_its_header_and_says_how_much() {
         let input = json!({"file_path": "/work/a.rs"});
         let result = neosh_proto::ToolResult::ok("one\ntwo\nthree\nfour\n");
-        let limits = Limits { diff_lines: 12, output_lines: 3 };
+        let limits = caps(12, 3);
         assert!(
-            body(&g(), &input, &result, limits, false, 80).is_empty(),
+            body(&g(), &input, &result, limits, Open::Folded, 80).is_empty(),
             "nothing under it"
         );
         // The count is what says there is anything to open, and it counts what a person would:
@@ -2400,7 +2609,7 @@ mod tests {
         assert!(header_text(&g(), &head, &root(), 80).ends_with("  4 lines"));
 
         // And `⇥` still gives you the whole thing.
-        let open = body(&g(), &input, &result, limits, true, 80);
+        let open = body(&g(), &input, &result, limits, Open::Full, 80);
         assert_eq!(open.len(), 4, "{:?}", texts(&open));
     }
 
@@ -2409,7 +2618,7 @@ mod tests {
     fn a_look_that_failed_still_shows_what_it_said() {
         let input = json!({"path": "/work/gone.rs"});
         let result = neosh_proto::ToolResult::error("no such file");
-        let rows = body(&g(), &input, &result, Limits { diff_lines: 12, output_lines: 3 }, false, 80);
+        let rows = body(&g(), &input, &result, caps(12, 3), Open::Folded, 80);
         assert_eq!(texts(&rows), vec!["  \u{2514} no such file"]);
     }
 
@@ -2419,7 +2628,7 @@ mod tests {
     fn a_command_keeps_what_it_printed() {
         let input = json!({"command": "cargo test"});
         let result = neosh_proto::ToolResult::ok("running 2 tests\nok\nok");
-        let rows = body(&g(), &input, &result, Limits { diff_lines: 12, output_lines: 3 }, false, 80);
+        let rows = body(&g(), &input, &result, caps(12, 3), Open::Folded, 80);
         assert_eq!(rows.len(), 3, "{:?}", texts(&rows));
         let head = Head { output: Some(3), ..head("Bash", &input, ToolState::Done) };
         let text = header_text(&g(), &head, &root(), 80);
@@ -2429,10 +2638,10 @@ mod tests {
     #[test]
     fn a_limit_of_zero_counts_a_result_and_hides_a_diff() {
         let result = neosh_proto::ToolResult::ok("one\ntwo");
-        let rows = body(&g(), &json!({}), &result, Limits { diff_lines: 0, output_lines: 0 }, false, 80);
+        let rows = body(&g(), &json!({}), &result, caps(0, 0), Open::Folded, 80);
         assert_eq!(texts(&rows), vec!["  \u{2514} 2 lines"]);
         let input = json!({ "file_path": "/work/a.rs", "old_string": "a", "new_string": "b" });
-        let rows = body(&g(), &input, &result, Limits { diff_lines: 0, output_lines: 3 }, false, 80);
+        let rows = body(&g(), &input, &result, caps(0, 3), Open::Folded, 80);
         assert!(rows.is_empty(), "the header already has the stats: {:?}", texts(&rows));
     }
 
@@ -2527,7 +2736,7 @@ mod tests {
     fn ascii_glyphs_name_the_key_in_words() {
         let g = Glyphs::new(true);
         let result = neosh_proto::ToolResult::ok("one\ntwo");
-        let rows = body(&g, &json!({}), &result, Limits { diff_lines: 12, output_lines: 1 }, false, 80);
+        let rows = body(&g, &json!({}), &result, caps(12, 1), Open::Folded, 80);
         assert_eq!(texts(&rows), vec!["  \\ ... +1 line (^S Tab to expand)", "    two"]);
     }
 }
