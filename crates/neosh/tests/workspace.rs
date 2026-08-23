@@ -200,7 +200,15 @@ impl Client {
             stopped: false,
             size: (width, height),
         };
-        c.send(ClientMessage::Attach { protocol_version: protocol, width, height });
+        c.send(ClientMessage::Attach {
+            protocol_version: protocol,
+            width,
+            height,
+            // The build this test binary is, which is not the workspace's — the workspace is the
+            // real `neosh` under test. Left as the default so the two compare equal and no test
+            // here has to care: an unknown stamp is not a difference. See `BuildId::same_as`.
+            build: Default::default(),
+        });
         c
     }
 

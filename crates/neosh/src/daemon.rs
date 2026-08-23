@@ -95,6 +95,9 @@ impl Live {
             true => 0,
             false => now.saturating_sub(self.detached_at.load(Ordering::Relaxed)),
         };
+        // Captured at startup, so this is the build that is running rather than the one on disk —
+        // which after a rebuild is a different program with the same path.
+        s.build = crate::build::capture().clone();
         s
     }
 }
@@ -298,7 +301,7 @@ impl Handle {
                     ));
                     break;
                 }
-                ClientMessage::Attach { protocol_version, width, height } => {
+                ClientMessage::Attach { protocol_version, width, height, build } => {
                     if protocol_version != neosh_proto::PROTOCOL_VERSION {
                         let _ = out.send(ServerMessage::Refused {
                             reason: format!(
@@ -318,8 +321,20 @@ impl Handle {
                         (id, views.size().unwrap_or((width, height)))
                     };
                     view = Some(id);
+                    // Ours, whatever the terminal's turned out to be. Which of the two is
+                    // behind is the terminal's to work out and to say — it is the thing with a
+                    // screen, and it is the one that can still be rebuilt without anybody having
+                    // to stop what is running here.
+                    if !build.same_as(crate::build::capture()) {
+                        tracing::info!(
+                            workspace = ?crate::build::capture(),
+                            terminal = ?build,
+                            "a terminal attached from a different build"
+                        );
+                    }
                     let _ = out.send(ServerMessage::Attached {
                         protocol_version: neosh_proto::PROTOCOL_VERSION,
+                        build: crate::build::capture().clone(),
                     });
                     // The *workspace's* size, which is the smallest attached terminal's and may
                     // not be this one's. The host says its whole state in reply, and that goes to

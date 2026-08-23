@@ -169,6 +169,19 @@ per decision, and records the *reasoning*, not the choice.
   delta stream, so anything a client needs on reattach has to be *kept* by the editor and said again
   by `Editor::republish`; a value that is only forwarded is a value that comes back wrong. See ADR
   0036.
+- **The workspace you are looking at is not necessarily the binary you just built.** `cargo run`
+  unlinks `target/debug/neosh`, writes a new one and then *attaches to the workspace already
+  serving this config directory* — which goes on executing the inode it started with, now marked
+  `(deleted)`. Every plugin runs there, the sidebar included, so a rebuilt panel is drawn by
+  last night's code and nothing on screen says why: the change is what gets debugged, and the
+  change was never the problem. `PROTOCOL_VERSION` refuses the pair that cannot talk; `BuildId`
+  is the pair that can and should not both be trusted. It is a **notice, never a refusal** —
+  everything works, and locking somebody out of their own running turns because a file changed
+  is the worse answer — it is **captured at startup** or there is nothing left to stat by the
+  time it is asked for, and the **terminal** is what says it, because a stale workspace is
+  running the only code it has ever had and cannot know it is behind. An unreadable stamp is
+  *unknown* rather than old, or the warning fires every time and stops meaning anything. See ADR
+  0058.
 - **However many terminals you open, you see everything.** Attaching joins; it does not take over.
   Every attached terminal is a mirror of one `Editor` — same transcript, same composer, live — and
   `^Q` closes the one it was pressed in. Which one is read off the tag input arrives with, never

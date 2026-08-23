@@ -1029,6 +1029,12 @@ pub enum ClientMessage {
         protocol_version: u32,
         width: u16,
         height: u16,
+        /// Which build the terminal is, so the workspace's answer can be compared against it.
+        ///
+        /// Defaulted, because a client older than this field is one that cannot be told apart
+        /// from the workspace anyway, and refusing it would be a worse answer than saying nothing.
+        #[serde(default)]
+        build: BuildId,
     },
     Input {
         #[serde(flatten)]
@@ -1048,7 +1054,15 @@ pub enum ClientMessage {
 #[ts(export)]
 pub enum ServerMessage {
     /// The attach was accepted. Everything needed to draw follows immediately.
-    Attached { protocol_version: u32 },
+    ///
+    /// `build` is the workspace's own, which is not necessarily the one that asked: the terminal
+    /// compares them and says so, and the comparison lives there because being out of step is a
+    /// fact about the pair rather than about the workspace.
+    Attached {
+        protocol_version: u32,
+        #[serde(default)]
+        build: BuildId,
+    },
     /// It was not, and this is why. The connection closes after this.
     Refused { reason: String, protocol_version: u32 },
     /// One coalesced batch, ending in [`UiEvent::Flush`] — the same batch a frontend in the same
@@ -1074,6 +1088,53 @@ pub enum DetachReason {
     Stopping,
 }
 
+/// Which build of neosh a process is running.
+///
+/// [`PROTOCOL_VERSION`] answers "can these two talk at all", and a mismatch there is refused. This
+/// answers the question underneath it, which has no wrong answer and therefore cannot be refused:
+/// *are they the same program*. A workspace outlives the terminals that look at it and outlives
+/// the file it was loaded from, so the ordinary way to develop neosh — change a plugin, rebuild,
+/// run it — produces two processes speaking one protocol, where the older one is the only one
+/// whose code is actually doing anything. Nothing about that is visible on screen without this.
+#[derive(TS, Serialize, Deserialize, Clone, PartialEq, Eq, Debug, Default)]
+#[ts(export)]
+pub struct BuildId {
+    /// What this build calls itself. Equal across every build of one release, so never enough on
+    /// its own — during development it is the same string for months.
+    pub version: String,
+    /// When the executable was written, in seconds since the epoch. Zero when it could not be
+    /// read, which is *unknown* rather than old — see [`BuildId::behind`].
+    #[ts(type = "number")]
+    pub written: u64,
+}
+
+impl BuildId {
+    /// Whether this is the same build as `other`.
+    ///
+    /// An unknown stamp on either side is not a difference. The two processes are on one machine —
+    /// a Unix socket does not reach off it — so their clocks are the same clock and the stamps are
+    /// comparable; what is not comparable is a stamp nobody could read.
+    pub fn same_as(&self, other: &Self) -> bool {
+        if self.written == 0 || other.written == 0 {
+            return true;
+        }
+        self == other
+    }
+
+    /// How far behind `other` this build is, in seconds, or `None` if it is not behind one.
+    ///
+    /// Not the inverse of [`same_as`](Self::same_as): two builds can differ with neither behind
+    /// the other, which is what an installed neosh and a `target/debug` one written in the same
+    /// second look like. Being *behind* is the case worth a sentence, because it is the one where
+    /// there is something newer you meant to be running.
+    pub fn behind(&self, other: &Self) -> Option<u64> {
+        if self.same_as(other) || self.written >= other.written {
+            return None;
+        }
+        Some(other.written - self.written)
+    }
+}
+
 /// What a workspace is holding, for `neosh status`.
 #[derive(TS, Serialize, Deserialize, Clone, PartialEq, Debug, Default)]
 #[ts(export)]
@@ -1088,6 +1149,10 @@ pub struct WorkspaceStatus {
     pub conversations: usize,
     /// One line per conversation with a turn in flight: what it is called and what it is doing.
     pub running: Vec<RunningTurn>,
+    /// The build the workspace is running, which is the one that started it however many times
+    /// the binary has been replaced since.
+    #[serde(default)]
+    pub build: BuildId,
 }
 
 #[derive(TS, Serialize, Deserialize, Clone, PartialEq, Debug)]
@@ -1099,4 +1164,53 @@ pub struct RunningTurn {
     pub cwd: String,
     #[ts(type = "number")]
     pub elapsed_secs: u64,
+}
+
+#[cfg(test)]
+mod build_id_tests {
+    use super::BuildId;
+
+    fn at(written: u64) -> BuildId {
+        BuildId { version: "0.1.0".into(), written }
+    }
+
+    #[test]
+    fn one_build_is_the_same_as_itself() {
+        assert!(at(100).same_as(&at(100)));
+        assert_eq!(at(100).behind(&at(100)), None);
+    }
+
+    #[test]
+    fn a_rebuild_is_a_different_build_and_the_old_one_is_behind() {
+        let old = at(100);
+        let new = at(160);
+        assert!(!old.same_as(&new));
+        assert_eq!(old.behind(&new), Some(60));
+        // And only one of them is behind. This is the case the warning exists for: the workspace
+        // is `old`, the terminal is `new`, and nothing on screen is the terminal's.
+        assert_eq!(new.behind(&old), None);
+    }
+
+    #[test]
+    fn an_unreadable_stamp_is_unknown_rather_than_ancient() {
+        // Zero is "could not stat the executable", which every build predates. Treated as a
+        // difference it would warn on every attach on a platform that cannot read it, which is
+        // the fastest way to teach somebody to ignore the message.
+        let unknown = at(0);
+        assert!(unknown.same_as(&at(160)));
+        assert!(at(160).same_as(&unknown));
+        assert_eq!(unknown.behind(&at(160)), None);
+        assert_eq!(at(160).behind(&unknown), None);
+    }
+
+    #[test]
+    fn same_stamp_and_a_different_version_still_differ() {
+        // Two builds written in the same second is what an installed neosh beside a `target/debug`
+        // one looks like. Neither is behind the other, and they are still not the same program.
+        let a = BuildId { version: "0.1.0".into(), written: 100 };
+        let b = BuildId { version: "0.2.0".into(), written: 100 };
+        assert!(!a.same_as(&b));
+        assert_eq!(a.behind(&b), None);
+        assert_eq!(b.behind(&a), None);
+    }
 }
