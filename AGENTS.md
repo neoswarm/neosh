@@ -270,6 +270,26 @@ per decision, and records the *reasoning*, not the choice.
   things you are finished with is the only part of that column that is never the answer, and it
   grows forever. One row with a count, `a` in the panel or `^F` anywhere, and it opens as a picker
   you can filter — because a flat list of dim rows is not a way to find anything. See ADR 0039.
+- **A notification is for something you did not ask for and cannot see.** Both halves, and a
+  message that fails either is not one. `MessageLevel` says how *bad* a thing is and never whether
+  you need to know about it, which is how one channel ended up carrying a hundred and seventy call
+  sites sorted by nothing: `favourited ~/proj` beside a row that had just grown a pin, `pulling…`
+  stacked *above* the `up to date` that superseded it, and — the part that matters — no
+  notification at all for the two events that stop a turn dead. So `NoticeKind` is the other axis:
+  a **reply** is feedback for the key you pressed and does not stack, because two keys pressed
+  quickly are two keys; **progress** is keyed and replaced in place, because it is a state and not
+  a message; an **alert** is news, and the only kind that may leave the terminal. Where it goes is
+  decided by where *you* are — nothing leaves the terminal about a conversation you are looking at,
+  and that one line is what kills the noise. **And the raise belongs to the terminal, not the
+  workspace**: it is an OSC the view writes on the stream the UI is already drawn on, for exactly
+  the reason `Clipboard` is OSC 52 rather than a clipboard library — a coding agent runs on the big
+  machine and you are sitting at a laptop, so anything the workspace raises itself is raised on the
+  wrong computer. The desktop fallback is *only* for nothing being attached, when there is no
+  stream and no wrong machine to be on. Away is focus (mode 1004) and, on a terminal that cannot
+  say, idleness — never "assume focused", which is the one wrong answer that means a whole class of
+  terminal never notifies. A turn shorter than `notify.min_turn` finished while you were still
+  looking at the key that started it. And `unread` stays the *record*: this points at it once and
+  gets out of the way. See ADR 0057.
 - **A turn that finished while you were elsewhere is news until you go and look.** The panel says
   what is *happening* and stops the moment it stops, so an answer that arrived while you were in
   another conversation looks exactly like an answer you read yesterday. `SessionInfo::unread` is set

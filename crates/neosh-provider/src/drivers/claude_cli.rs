@@ -71,7 +71,7 @@ use tokio::process::Command;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-use crate::approval::{PermissionAnswer, PermissionAsker};
+use crate::approval::{PermissionAnswer, PermissionAsker, PermissionRequest};
 use crate::ask::{QuestionAnswers, QuestionAsker, QuestionRequest};
 use super::claude_control;
 use crate::{Provider, ProviderError, ProviderStream, catalog, sse};
@@ -916,7 +916,10 @@ async fn run_turn(
                         Some(a) if !abandoned => tokio::select! {
                             biased;
                             () = cancel.cancelled() => PermissionAnswer::Deny,
-                            answer = a.ask(ask.request.clone()) => answer,
+                            answer = a.ask(PermissionRequest {
+                                conversation: Some(request.conversation.clone()),
+                                ..ask.request.clone()
+                            }) => answer,
                         },
                         _ => PermissionAnswer::Deny,
                     };

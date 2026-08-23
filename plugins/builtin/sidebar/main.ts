@@ -964,8 +964,10 @@ async function registerCommands(w: Wiring): Promise<void> {
     const inside = (await neosh.session.list().catch(() => [] as SessionInfo[]))
       .find((s) => s.cwd === cwd && s.repo_root && s.repo_root !== s.cwd);
     if (inside?.repo_root) cwd = inside.repo_root;
-    const now = await arrangement.toggleFavorite(cwd);
-    neosh.notify(now ? `favourited ${short(cwd)}` : `unfavourited ${short(cwd)}`, "info");
+    // No message. The row moves to the top of the column and gains a pin, in the panel the cursor
+    // is already in — saying so in the corner as well is the same fact twice, and a corner that is
+    // usually restating something visible is one people stop reading. See ADR 0057.
+    await arrangement.toggleFavorite(cwd);
   });
 
   // Shift moves the thing rather than the cursor — the one convention every list that can be
@@ -1467,8 +1469,9 @@ async function newConversation(neosh: Neosh, base?: string): Promise<void> {
         .catch((e: unknown) => neosh.notify(String(e), "warn"));
       return;
     case "tree":
+      // No message: creating a conversation switches to it, so the transcript is empty, the
+      // composer has the keyboard and the sidebar row is selected. All three say it already.
       await neosh.session.create({ cwd: chosen.path });
-      neosh.notify(`new conversation in ${chosen.label}`);
       return;
     case "host":
       // Started *there*. The agent will run on that machine, against that machine's files, which
@@ -2196,7 +2199,8 @@ async function addComputer(neosh: Neosh): Promise<void> {
 
   let found;
   try {
-    neosh.notify(`asking ${target}…`);
+    // A state that stops being true the moment the far end answers or does not.
+    neosh.progress("swarm.probe", `asking ${target}…`);
     found = await neosh.swarm.probe(target);
   } catch (e) {
     // `String(e)` here would read `NeoshError: not found: …: swarm i/o: Connection refused (os
@@ -2210,6 +2214,8 @@ async function addComputer(neosh: Neosh): Promise<void> {
     );
     neosh.log.warn(`swarm probe of ${target} failed: ${String(e)}`);
     return;
+  } finally {
+    neosh.done("swarm.probe");
   }
 
   const ok = await confirm(neosh, `Add ${found.name}?`, {

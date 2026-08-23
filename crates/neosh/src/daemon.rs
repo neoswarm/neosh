@@ -137,6 +137,19 @@ impl Frontend for Viewer {
         self.views.lock().await.send(batch);
         Ok(())
     }
+
+    /// Nothing attached is `Detached`, which is a different answer from `Away` and needs a
+    /// different channel: there is no stream to write an escape to. See ADR 0057.
+    async fn presence(&mut self, idle_after: std::time::Duration) -> crate::frontend::Presence {
+        let views = self.views.lock().await;
+        if views.is_empty() {
+            return crate::frontend::Presence::Detached;
+        }
+        match views.away(idle_after) {
+            true => crate::frontend::Presence::Away,
+            false => crate::frontend::Presence::Watching,
+        }
+    }
 }
 
 /// A workspace listening for viewers.
@@ -327,7 +340,20 @@ impl Handle {
                     // here and forwarded as one, so the host goes on believing there is one screen
                     // — which is exactly what it can still assume, because every view is a mirror
                     // of the same one.
+                    // Whether somebody is at *this* terminal, which the workspace is away only if
+                    // every terminal says no to. Recorded here beside the other per-view facts,
+                    // and not forwarded: the host asks the frontend the merged question rather
+                    // than tracking a set of terminals it cannot see. See ADR 0057.
+                    if let InputEvent::Key { .. } | InputEvent::Paste { .. } = event {
+                        self.views.lock().await.typed(id);
+                    }
                     let forward = match event {
+                        InputEvent::Focus { on } => {
+                            self.views.lock().await.focused(id, on);
+                            // Nothing downstream acts on it, and forwarding it would arm a redraw
+                            // for an event that changes not one cell.
+                            None
+                        }
                         InputEvent::Resize { width, height } => {
                             match self.views.lock().await.resized(id, (width, height)) {
                                 Some((width, height)) => Some(InputEvent::Resize { width, height }),

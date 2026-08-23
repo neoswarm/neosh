@@ -80,6 +80,9 @@ fn request(capability: Capability) -> PermissionRequest {
             },
         ],
         cwd: std::env::temp_dir().join("neosh-driver-approvals"),
+        // Nobody in particular. What this carries is checked where it matters — a prompt waiting
+        // in a conversation you are not looking at — and none of these tests is about that.
+        conversation: None,
     }
 }
 
@@ -120,6 +123,7 @@ async fn the_option_the_person_picked_is_the_one_that_goes_back() {
         payload: serde_json::to_value(HookPayload::PermissionPre {
             capability: exec(),
             turn: None,
+            session: None,
             title: Some("Run cargo test --workspace".into()),
             options: vec![],
             chosen: Some("yes-always".into()),

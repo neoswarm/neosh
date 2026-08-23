@@ -15,8 +15,8 @@ use std::collections::{HashMap, HashSet};
 use neosh_proto::{
     ApiCall, ApiError, ApiOk, ApiResult, BufferId, Contribution, ExtmarkId, ExtmarkOpts,
     FloatConfig, KeyContext, KeyPress, KeymapEntry, KeymapScope, MessageLevel, Mode, NamespaceId,
-    OnDelete, OptionValue, PluginId, Rect, SelectShape, SurfaceId, TextEdit, UiEvent, VirtTextPos,
-    WindowId, WindowLayout,
+    NoticeKind, OnDelete, OptionValue, PluginId, Rect, SelectShape, SurfaceId, TextEdit, UiEvent,
+    VirtTextPos, WindowId, WindowLayout,
 };
 
 use crate::buffer::{Buffer, LineEdit};
@@ -232,6 +232,12 @@ impl Editor {
                 | ApiCall::QuotaReport { .. }
                 | ApiCall::QuotaHistory { .. }
                 | ApiCall::UsageHistory { .. }
+                // Whether an alert may leave the terminal depends on which conversation is on
+                // screen, which views are attached and whether any of them has focus. The core
+                // knows none of those: a view is a socket and focus is a fact about somebody
+                // else's window manager. It draws the corner and the host decides the rest.
+                // See ADR 0057.
+                | ApiCall::Alert { .. }
         )
     }
 
@@ -629,9 +635,12 @@ impl Editor {
                 args,
                 key,
             }),
+            // A key you pressed, and the answer is that it is bound to nothing that exists.
             None => self.push_ui(UiEvent::Message {
                 level: MessageLevel::Error,
                 text: format!("no such command: {name}"),
+                kind: NoticeKind::Reply,
+                key: None,
             }),
         }
     }
@@ -1195,8 +1204,20 @@ impl Editor {
                 }
                 Ok(ApiOk::Unit)
             }
-            ApiCall::Notify { level, message } => {
-                self.push_ui(UiEvent::Message { level, text: message });
+            ApiCall::Notify { level, message, kind, key } => {
+                // A progress row without a key is a row nothing can ever replace or take away,
+                // which is the one failure mode `Progress` exists to remove. Demoted rather than
+                // refused: the caller had something to say and the corner is still the place for
+                // it. See ADR 0057.
+                let kind = match (kind, &key) {
+                    (NoticeKind::Progress, None) => NoticeKind::Reply,
+                    (k, _) => k,
+                };
+                self.push_ui(UiEvent::Message { level, text: message, kind, key });
+                Ok(ApiOk::Unit)
+            }
+            ApiCall::NotifyDone { key } => {
+                self.push_ui(UiEvent::ProgressDone { key });
                 Ok(ApiOk::Unit)
             }
 

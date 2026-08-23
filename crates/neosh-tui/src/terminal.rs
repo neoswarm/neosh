@@ -7,9 +7,9 @@
 use std::io::{self, Stdout};
 
 use crossterm::event::{
-    DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode as CtCode, KeyEvent,
-    KeyEventKind, KeyModifiers, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags,
-    PushKeyboardEnhancementFlags,
+    DisableBracketedPaste, DisableFocusChange, EnableBracketedPaste, EnableFocusChange, Event,
+    KeyCode as CtCode, KeyEvent, KeyEventKind, KeyModifiers, KeyboardEnhancementFlags,
+    PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
 use crossterm::cursor::SetCursorStyle;
 use crossterm::terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode};
@@ -76,6 +76,12 @@ pub fn to_input_event(ev: Event) -> Option<InputEvent> {
         // pasted `<Esc>` cannot interrupt the agent.
         Event::Paste(text) => Some(InputEvent::Paste { text }),
         Event::Resize(width, height) => Some(InputEvent::Resize { width, height }),
+        // Whether this terminal is the window the user is looking at, which is the one thing that
+        // decides whether a notification is worth raising outside it. Only terminals that
+        // implement mode 1004 send these, so silence here means "cannot say" rather than "no" —
+        // see `InputEvent::Focus`.
+        Event::FocusGained => Some(InputEvent::Focus { on: true }),
+        Event::FocusLost => Some(InputEvent::Focus { on: false }),
         _ => None,
     }
 }
@@ -130,7 +136,10 @@ impl TerminalFrontend {
     pub fn enter() -> io::Result<Self> {
         enable_raw_mode()?;
         let mut stdout = io::stdout();
-        execute!(stdout, EnterAlternateScreen, EnableBracketedPaste)?;
+        // Focus reporting is requested unconditionally. A terminal that does not implement it
+        // never replies, which is exactly the state the host reads as "cannot say" and falls back
+        // to idleness for — so there is nothing to detect and nothing to degrade.
+        execute!(stdout, EnterAlternateScreen, EnableBracketedPaste, EnableFocusChange)?;
         let enhanced = enable_enhanced_keys(&mut stdout);
         let terminal = Terminal::new(CrosstermBackend::new(stdout))?;
         Ok(Self {
@@ -237,6 +246,69 @@ impl TerminalFrontend {
         out.flush()
     }
 
+    /// Raise a notification outside the terminal, via whichever OSC this one speaks.
+    ///
+    /// The escape rather than a notification library, for the reason OSC 52 is the escape rather
+    /// than a clipboard library and it is the same reason: a library talks to the D-Bus or
+    /// NSUserNotificationCenter of the machine the *process* is on, and a coding agent runs on the
+    /// big machine while you sit at a laptop somewhere else. This travels back up the stream the UI
+    /// is drawn on, so it comes out where the person is. See ADR 0057.
+    ///
+    /// Terminals that implement none of these ignore all of them silently, which is the honest
+    /// failure: there is no capability query for this, and refusing to notify on the chance it will
+    /// not land is worse than a sequence that does nothing. `notify.desktop = "always"` is the way
+    /// out for someone whose terminal is one of those.
+    pub fn alert(&mut self, osc: AlertOsc, bell: bool, title: &str, body: &str) -> io::Result<()> {
+        use std::io::Write;
+        let title = sanitize_alert(title);
+        let body = sanitize_alert(body);
+        // Everything was control characters. Raising an empty notification is a notification that
+        // says nothing, which is worse than the one we failed to describe.
+        if title.is_empty() && body.is_empty() {
+            return Ok(());
+        }
+        let seq = alert_sequence(osc, &title, &body);
+        let mut out = io::stdout().lock();
+        if !seq.is_empty() {
+            write!(out, "{}", through_multiplexer(&seq))?;
+        }
+        // Off by default and deliberately last: a bell is the crudest possible version of this —
+        // it says something happened and never which thing — but it is also the only one some
+        // terminals have, and many turn it into a mark on the tab.
+        if bell {
+            write!(out, "\x07")?;
+        }
+        out.flush()
+    }
+}
+
+/// The escape itself, so it can be checked without a terminal to write it to.
+fn alert_sequence(osc: AlertOsc, title: &str, body: &str) -> String {
+        match osc {
+            AlertOsc::None => String::new(),
+            // One field, so the title has to be folded into it. An em dash rather than a newline:
+            // OSC 9 implementations differ on whether the body wraps, and none of them agree on
+            // what a newline in it means.
+            AlertOsc::Osc9 => {
+                let text =
+                    if title.is_empty() || body.is_empty() {
+                        format!("{title}{body}")
+                    } else {
+                        format!("{title} \u{2014} {body}")
+                    };
+                format!("\x1b]9;{text}\x07")
+            }
+            AlertOsc::Osc777 => format!("\x1b]777;notify;{title};{body}\x07"),
+            // Kitty's, which is the only one with a grammar. Two chunks because title and body are
+            // separate payloads: `d=0` says more is coming, `p=body` says what the second one is.
+            AlertOsc::Osc99 => format!(
+                "\x1b]99;i=neosh:d=0;{title}\x1b\\\x1b]99;i=neosh:d=1:p=body;{body}\x1b\\"
+            ),
+        }
+}
+
+impl TerminalFrontend {
+
     /// Hand the terminal back.
     ///
     /// Called explicitly on shutdown *and* from `Drop`, because a panic that skipped this would
@@ -254,10 +326,209 @@ impl TerminalFrontend {
         // neosh happened to exit while reading is a terminal that looks broken.
         self.terminal.backend_mut().execute(SetCursorStyle::DefaultUserShape)?;
         self.terminal.backend_mut().execute(DisableBracketedPaste)?;
+        self.terminal.backend_mut().execute(DisableFocusChange)?;
         self.terminal.backend_mut().execute(LeaveAlternateScreen)?;
         self.terminal.show_cursor()?;
         Ok(())
     }
+}
+
+/// Which escape a terminal understands as "raise a notification".
+///
+/// There is no way to ask. Terminals do not answer a capability query for this, so the choice is
+/// made from the environment and can be overridden by `notify.osc` when the guess is wrong — which
+/// it will sometimes be, because `$TERM` is routinely a lie told by a multiplexer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum AlertOsc {
+    /// `OSC 9` — one string, no title. iTerm2, WezTerm, Windows Terminal, foot, ConEmu.
+    ///
+    /// The default when nothing is recognised, because it is the widest-supported of the three and
+    /// an unrecognised OSC is discarded rather than printed.
+    #[default]
+    Osc9,
+    /// `OSC 777;notify` — title and body. urxvt, foot, WezTerm, and most things that grew this
+    /// from urxvt's extension.
+    Osc777,
+    /// `OSC 99` — kitty's, which is the only one of the three with a specified grammar.
+    Osc99,
+    /// Raise nothing. Not the same as the feature being off: this is a terminal we have been told
+    /// cannot do it, and the desktop fallback is what covers that case.
+    None,
+}
+
+impl AlertOsc {
+    /// Guess from the environment.
+    ///
+    /// Ordered most-specific first. A multiplexer sets `$TERM` to its own thing, so the variables
+    /// the *outer* terminal set are the more reliable evidence and are checked before it.
+    ///
+    /// `NEOSH_NOTIFY_OSC` overrides the guess, and is an environment variable for the same reason
+    /// `NEOSH_NO_ENHANCED_KEYS` is: this is a fact about the terminal, and in a workspace being
+    /// viewed over SSH the terminal is a process on another machine that has never read — and must
+    /// not read — the workspace's configuration. `notify.osc` in `config.toml` reaches the terminal
+    /// a `--no-daemon` neosh owns itself, which is the case where the two are the same machine.
+    pub fn detect() -> Self {
+        let env = |k: &str| std::env::var(k).unwrap_or_default();
+        if let Some(named) = Self::parse_named(&env("NEOSH_NOTIFY_OSC")) {
+            return named;
+        }
+        if !env("KITTY_WINDOW_ID").is_empty() || env("TERM").contains("kitty") {
+            return Self::Osc99;
+        }
+        match env("TERM_PROGRAM").as_str() {
+            // All three implement OSC 9. WezTerm also does 777, but doing both would raise two.
+            "iTerm.app" | "WezTerm" | "vscode" | "Hyper" => return Self::Osc9,
+            _ => {}
+        }
+        if !env("WT_SESSION").is_empty() {
+            return Self::Osc9;
+        }
+        let term = env("TERM");
+        if term.contains("foot") || term.contains("rxvt") {
+            return Self::Osc777;
+        }
+        Self::Osc9
+    }
+
+    /// The named sequences, without `auto` — which cannot be here because `detect` calls this and
+    /// `auto` would be a guess that asks to be guessed again.
+    fn parse_named(s: &str) -> Option<Self> {
+        match s {
+            "9" => Some(Self::Osc9),
+            "777" => Some(Self::Osc777),
+            "99" => Some(Self::Osc99),
+            "off" | "none" => Some(Self::None),
+            _ => None,
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "auto" => Some(Self::detect()),
+            other => Self::parse_named(other),
+        }
+    }
+}
+
+/// Strip everything that could end the escape sequence early.
+///
+/// This text comes from an agent, a driver, a plugin or a filename, and none of those is trusted to
+/// contain no control characters. An unescaped `BEL` or `ESC` in the middle of an OSC terminates it
+/// there and dumps the remainder onto the screen as literal text — which corrupts the frame, and on
+/// a terminal that acts on what follows is considerably worse than that. Semicolons go too, because
+/// `OSC 777` separates its fields with them and a title containing one would move the body.
+///
+/// Length is capped for the same reason a clipboard payload is: notification daemons truncate, and
+/// a truncated escape is a frame with the tail of a sentence in it.
+fn sanitize_alert(s: &str) -> String {
+    const LIMIT: usize = 256;
+    let mut out = String::with_capacity(s.len().min(LIMIT));
+    for c in s.chars() {
+        if out.chars().count() >= LIMIT {
+            out.push('\u{2026}');
+            break;
+        }
+        match c {
+            // Newlines become spaces rather than vanishing: a two-line message that becomes one
+            // word is worse than one that reads as a sentence.
+            '\n' | '\r' | '\t' => out.push(' '),
+            ';' => out.push(','),
+            c if c.is_control() => {}
+            c => out.push(c),
+        }
+    }
+    out.trim().to_string()
+}
+
+/// Wrap an escape so it survives a multiplexer.
+///
+/// tmux eats any sequence it does not understand rather than forwarding it, so an OSC written from
+/// inside tmux reaches tmux and stops. The passthrough hands it on verbatim — with every `ESC` in
+/// the payload doubled, which is how the wrapper knows where the payload ends.
+///
+/// It needs `allow-passthrough on` in the user's tmux configuration, which we cannot set and do not
+/// try to. Unset, this is a sequence tmux discards, which is the same outcome as not sending it.
+fn through_multiplexer(seq: &str) -> String {
+    if std::env::var_os("TMUX").is_some() {
+        return wrap_tmux(seq);
+    }
+    // GNU screen has the same problem and a simpler wrapper, and identifies itself the same way
+    // tmux does not: by owning `$TERM` outright.
+    if std::env::var("TERM").unwrap_or_default().starts_with("screen")
+        && std::env::var_os("TMUX").is_none()
+        && std::env::var_os("STY").is_some()
+    {
+        return format!("\x1bP{seq}\x1b\\");
+    }
+    seq.to_string()
+}
+
+#[cfg(test)]
+mod alert_tests {
+    use super::*;
+
+    /// An escape that ends early dumps the rest of itself onto the screen as literal text. This
+    /// text comes from an agent, a driver or a filename, so none of it is trusted.
+    #[test]
+    fn a_message_cannot_end_the_escape_it_travels_in() {
+        let nasty = "done\u{1b}[2J\u{7}rm -rf /";
+        let clean = sanitize_alert(nasty);
+        assert!(!clean.contains('\u{1b}'), "no ESC: {clean:?}");
+        assert!(!clean.contains('\u{7}'), "no BEL: {clean:?}");
+        assert_eq!(clean, "done[2Jrm -rf /");
+    }
+
+    /// `OSC 777` separates title from body with a semicolon, so one in the title would move the
+    /// body. Nothing else in the pipeline can put it back.
+    #[test]
+    fn a_semicolon_cannot_move_the_body_into_the_title() {
+        assert_eq!(sanitize_alert("a;b"), "a,b");
+    }
+
+    /// A newline becomes a space rather than vanishing: a two-line message that becomes one word
+    /// is worse than one that reads as a sentence.
+    #[test]
+    fn newlines_become_spaces_and_the_whole_thing_is_bounded() {
+        assert_eq!(sanitize_alert("one\ntwo"), "one two");
+        let long = "x".repeat(1000);
+        let out = sanitize_alert(&long);
+        assert!(out.chars().count() <= 257, "{} chars", out.chars().count());
+        assert!(out.ends_with('\u{2026}'));
+    }
+
+    #[test]
+    fn each_terminal_gets_the_shape_it_understands() {
+        // OSC 9 has one field, so the title is folded into it.
+        assert_eq!(alert_sequence(AlertOsc::Osc9, "fix/login", "finished"), "\u{1b}]9;fix/login — finished\u{7}");
+        assert_eq!(alert_sequence(AlertOsc::Osc777, "fix/login", "finished"), "\u{1b}]777;notify;fix/login;finished\u{7}");
+        assert!(alert_sequence(AlertOsc::Osc99, "fix/login", "finished").starts_with("\u{1b}]99;i=neosh:d=0;fix/login\u{1b}\\"));
+        assert_eq!(alert_sequence(AlertOsc::None, "fix/login", "finished"), "");
+    }
+
+    /// tmux forwards nothing it does not understand, so an OSC written from inside it reaches tmux
+    /// and stops. The wrapper doubles every ESC in the payload, which is how it knows where the
+    /// payload ends.
+    #[test]
+    fn a_multiplexer_gets_the_escape_handed_through_it() {
+        let wrapped = wrap_tmux("\u{1b}]9;hi\u{7}");
+        assert_eq!(wrapped, "\u{1b}Ptmux;\u{1b}\u{1b}]9;hi\u{7}\u{1b}\\");
+    }
+
+    /// Guessing is all there is — no terminal answers a capability query for this — so the
+    /// override has to win, and `auto` must not resolve to itself.
+    #[test]
+    fn a_named_sequence_beats_the_guess() {
+        assert_eq!(AlertOsc::parse("777"), Some(AlertOsc::Osc777));
+        assert_eq!(AlertOsc::parse("off"), Some(AlertOsc::None));
+        assert_eq!(AlertOsc::parse("nonsense"), None);
+        assert!(AlertOsc::parse("auto").is_some());
+    }
+}
+
+/// The tmux passthrough itself, split out because the environment is not something a test can set
+/// without racing every other test in the process.
+fn wrap_tmux(seq: &str) -> String {
+    format!("\x1bPtmux;{}\x1b\\", seq.replace('\x1b', "\x1b\x1b"))
 }
 
 /// Put the terminal back, from anywhere — including a panic hook.
@@ -269,6 +540,7 @@ pub fn restore_terminal() {
     let _ = disable_raw_mode();
     let mut out = io::stdout();
     let _ = out.execute(DisableBracketedPaste);
+    let _ = out.execute(DisableFocusChange);
     let _ = out.execute(LeaveAlternateScreen);
     let _ = out.execute(crossterm::cursor::Show);
 }

@@ -10,17 +10,46 @@
 
 use std::io::Write;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::sync::atomic::{AtomicBool, AtomicI8, AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 use neosh_proto::{InputEvent, UiEvent};
 use neosh_tui::{Mirror, TerminalFrontend, to_input_event};
 use tokio::sync::mpsc;
 
+/// Whether anybody can see this workspace, which is what decides how a notification is delivered.
+///
+/// Three states rather than a boolean, because the two ways of not being seen need different
+/// channels: a terminal that exists but is behind another window can be written an escape
+/// sequence, and one that does not exist cannot. See ADR 0057.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Presence {
+    /// A terminal is attached and in front of somebody. Nothing needs to leave it.
+    Watching,
+    /// Attached, but no terminal has focus — or none has seen a keystroke in long enough that we
+    /// assume nobody is at it. The view raises the notification itself.
+    Away,
+    /// Nothing is attached at all. There is no stream to write to, so the workspace's own machine
+    /// is the only place left to raise it.
+    Detached,
+}
+
 #[async_trait::async_trait]
 pub trait Frontend: Send {
     /// Deliver one coalesced batch. The batch always ends with [`UiEvent::Flush`].
     async fn send(&mut self, batch: Vec<UiEvent>) -> anyhow::Result<()>;
+
+    /// Whether anybody is looking.
+    ///
+    /// Asked of the frontend because the frontend is the only thing that knows: focus is a fact
+    /// about somebody else's window manager, reported by a terminal that may or may not implement
+    /// mode 1004, and a workspace serving several has to consider all of them.
+    ///
+    /// `idle_after` is the fallback for a terminal that cannot report focus — how long without a
+    /// keystroke counts as nobody being there.
+    async fn presence(&mut self, _idle_after: Duration) -> Presence {
+        Presence::Watching
+    }
     async fn shutdown(&mut self) -> anyhow::Result<()> {
         Ok(())
     }
@@ -36,12 +65,70 @@ pub trait Frontend: Send {
     async fn detach(&mut self, _view: crate::views::ViewId) -> anyhow::Result<()> {
         Ok(())
     }
+
+    /// Tell a terminal we own how to raise a notification.
+    ///
+    /// Only means anything for a frontend the workspace *is* — a `--no-daemon` neosh, where the
+    /// terminal and the configuration are on one machine. A client terminal detects its own and is
+    /// overridden by `NEOSH_NOTIFY_OSC`, because a workspace's configuration is its own and a
+    /// second terminal is a viewer rather than a second opinion.
+    fn configure_alerts(&mut self, _osc: neosh_tui::terminal::AlertOsc, _bell: bool) {}
+}
+
+/// Whether somebody is at this terminal, shared with the task that reads its events.
+///
+/// Atomics rather than a lock: it is written from the reader task on every keystroke and read from
+/// the host loop, and a mutex between those two for two integers is a lock nobody needs. Focus is a
+/// tri-state — see [`Watch::focused`].
+#[derive(Debug, Default)]
+struct Watch {
+    /// `1` focused, `0` not, `-1` never said — which is what a terminal without mode 1004 leaves
+    /// it at, and is why this is not a `bool`. See ADR 0057.
+    focused: AtomicI8,
+    /// Milliseconds since the process started, at the last keystroke.
+    ///
+    /// Relative to a fixed origin rather than an `Instant`, because an `Instant` is not something
+    /// two threads can share in an atomic and the only question asked of it is a difference.
+    typed_at: AtomicU64,
+}
+
+impl Watch {
+    fn typed(&self, origin: Instant) {
+        self.typed_at.store(origin.elapsed().as_millis() as u64, Ordering::Relaxed);
+        // A terminal being typed into is a terminal somebody is looking at, whatever it last said
+        // about focus. Window managers do drop the focus-in coming back from a workspace switch,
+        // and a view stuck on `false` is one that notifies about things you are staring at.
+        if self.focused.load(Ordering::Relaxed) == 0 {
+            self.focused.store(1, Ordering::Relaxed);
+        }
+    }
+
+    fn away(&self, origin: Instant, idle_after: Duration) -> bool {
+        match self.focused.load(Ordering::Relaxed) {
+            1 => false,
+            0 => true,
+            // Cannot say. Idleness is the honest proxy.
+            _ => {
+                let last = Duration::from_millis(self.typed_at.load(Ordering::Relaxed));
+                origin.elapsed().saturating_sub(last) >= idle_after
+            }
+        }
+    }
 }
 
 /// Renders to the terminal.
 pub struct TerminalUi {
     inner: TerminalFrontend,
     mirror: Mirror,
+    /// Whether somebody is at this terminal.
+    watch: Arc<Watch>,
+    /// What `Watch`'s millisecond counts are measured from.
+    origin: Instant,
+    /// Which escape this terminal understands as "raise a notification", and whether to ring the
+    /// bell as well. Guessed at startup; `notify.osc` and `notify.bell` replace it once the
+    /// configuration has loaded, which is long after the terminal has to be in the right mode.
+    alert_osc: neosh_tui::terminal::AlertOsc,
+    alert_bell: bool,
     /// Where input events go, so resolved geometry can be reported back as `ViewportChanged`.
     input: mpsc::UnboundedSender<InputEvent>,
     /// Whether a repaint ticker is running, and the switch that stops it.
@@ -69,14 +156,31 @@ impl TerminalUi {
         let (tx, rx) = mpsc::unbounded_channel();
         let _ = tx.send(InputEvent::Ready { width: w, height: h });
         let tx_geometry = tx.clone();
+        let watch = Arc::new(Watch::default());
+        // `-1` is "this terminal has never said". `Default` gives zero, which is the one value
+        // that means something else — not focused — so it has to be set rather than assumed.
+        watch.focused.store(-1, Ordering::Relaxed);
+        let origin = Instant::now();
+        let seen = watch.clone();
 
         tokio::spawn(async move {
             use futures::StreamExt;
             let mut events = crossterm::event::EventStream::new();
             while let Some(Ok(ev)) = events.next().await {
-                if let Some(input) = to_input_event(ev)
-                    && tx.send(input).is_err()
-                {
+                let Some(input) = to_input_event(ev) else { continue };
+                // Recorded here rather than at the host, because a frontend that *is* the process
+                // has no view id to be tagged with and the host would have nowhere to put it.
+                match &input {
+                    InputEvent::Focus { on } => {
+                        seen.focused.store(i8::from(*on), Ordering::Relaxed);
+                        // Nothing downstream acts on it, and forwarding it would arm a redraw for
+                        // an event that changes not one cell.
+                        continue;
+                    }
+                    InputEvent::Key { .. } | InputEvent::Paste { .. } => seen.typed(origin),
+                    _ => {}
+                }
+                if tx.send(input).is_err() {
                     break;
                 }
             }
@@ -87,6 +191,10 @@ impl TerminalUi {
             Self {
                 inner,
                 mirror: Mirror::new(),
+                watch,
+                origin,
+                alert_osc: neosh_tui::terminal::AlertOsc::detect(),
+                alert_bell: false,
                 input: tx_geometry,
                 reported: Default::default(),
                 animating: Arc::new(AtomicBool::new(false)),
@@ -110,12 +218,31 @@ impl Frontend for TerminalUi {
             // shutdown path and not worth failing a redraw over.
             let _ = self.inner.copy(&text);
         }
+        // The host only ever sends one of these once it has established nobody can see the thing
+        // it is about, so there is nothing left to decide here — just which escape this terminal
+        // speaks, which is the one part of it the host cannot know. See ADR 0057.
+        for (level, title, body) in std::mem::take(&mut self.mirror.alerts) {
+            let _ = self.inner.alert(self.alert_osc, self.alert_bell, &title, &body);
+            let _ = level;
+        }
         if redraw && !self.mirror.shutdown {
             let geometry = self.inner.draw(&self.mirror)?;
             self.report_geometry(&geometry);
             self.follow_motion(neosh_tui::shimmer::take_drew_animation());
         }
         Ok(())
+    }
+
+    async fn presence(&mut self, idle_after: Duration) -> Presence {
+        match self.watch.away(self.origin, idle_after) {
+            true => Presence::Away,
+            false => Presence::Watching,
+        }
+    }
+
+    fn configure_alerts(&mut self, osc: neosh_tui::terminal::AlertOsc, bell: bool) {
+        self.alert_osc = osc;
+        self.alert_bell = bell;
     }
 
     async fn shutdown(&mut self) -> anyhow::Result<()> {

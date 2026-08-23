@@ -947,7 +947,10 @@ async fn run_turn(
                         Some(a) => tokio::select! {
                             biased;
                             () = cancel.cancelled() => PermissionAnswer::Deny,
-                            answer = a.ask(ask.request.clone()) => answer,
+                            answer = a.ask(PermissionRequest {
+                                conversation: Some(request.conversation.clone()),
+                                ..ask.request.clone()
+                            }) => answer,
                         },
                         None => PermissionAnswer::Deny,
                     };
@@ -1070,6 +1073,9 @@ pub fn approval_request(v: &Value, cwd: &std::path::Path) -> Option<Approval> {
             capability,
             options,
             cwd: cwd.to_path_buf(),
+            // Filled in by the caller, which is the only thing here that knows which conversation
+            // this driver is running.
+            conversation: None,
         },
     })
 }

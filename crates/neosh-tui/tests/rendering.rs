@@ -740,27 +740,64 @@ fn a_notification_is_actually_drawn() {
     // collected, capped at 200, and never rendered. A program whose only feedback channel is
     // invisible is a program that appears not to respond.
     let mut m = main_window_with(vec!["hello"]);
-    m.apply(UiEvent::Message {
-        level: neosh_proto::MessageLevel::Info,
-        text: "press ^C again to quit".into(),
-    });
+    m.apply(notice("press ^C again to quit", neosh_proto::NoticeKind::Reply));
     let rows = rows_of(&m, 40, 6).join("\n");
     assert!(rows.contains("press ^C again to quit"), "got:\n{rows}");
 }
 
+/// One message, whatever kind it is, with the clock stamped on receipt.
+fn notice(text: &str, kind: neosh_proto::NoticeKind) -> UiEvent {
+    UiEvent::Message {
+        level: neosh_proto::MessageLevel::Info,
+        text: text.into(),
+        kind,
+        key: None,
+    }
+}
+
 #[test]
 fn only_the_most_recent_notifications_are_shown() {
+    // News, which is the kind that stacks. A reply replaces the one before it — see below — so
+    // six of those would be one row and this would be asserting the wrong thing.
     let mut m = main_window_with(vec!["hello"]);
     for i in 0..6 {
-        m.apply(UiEvent::Message {
-            level: neosh_proto::MessageLevel::Info,
-            text: format!("message {i}"),
-        });
+        m.apply(notice(&format!("message {i}"), neosh_proto::NoticeKind::Alert));
     }
     let rows = rows_of(&m, 40, 8).join("\n");
     assert!(rows.contains("message 5"), "the newest is shown:\n{rows}");
     assert!(rows.contains("message 3"), "and a couple before it:\n{rows}");
     assert!(!rows.contains("message 0"), "but not all six:\n{rows}");
+}
+
+/// Feedback for a key you pressed is about *that* key, so the previous one is about a key you have
+/// already moved on from. See ADR 0057.
+#[test]
+fn a_reply_does_not_stack_on_the_reply_before_it() {
+    let mut m = main_window_with(vec!["hello"]);
+    m.apply(notice("copied /a", neosh_proto::NoticeKind::Reply));
+    m.apply(notice("copied /b", neosh_proto::NoticeKind::Reply));
+    let rows = rows_of(&m, 40, 8).join("\n");
+    assert!(rows.contains("copied /b"), "the answer to the key you just pressed:\n{rows}");
+    assert!(!rows.contains("copied /a"), "and not the one before it:\n{rows}");
+}
+
+/// Progress draws above the answers, because it is what the program is *doing* and it will change
+/// on its own. It has no timer: it lives until something takes it away.
+#[test]
+fn progress_is_drawn_and_is_taken_away_by_name() {
+    let mut m = main_window_with(vec!["hello"]);
+    m.apply(UiEvent::Message {
+        level: neosh_proto::MessageLevel::Info,
+        text: "pulling\u{2026}".into(),
+        kind: neosh_proto::NoticeKind::Progress,
+        key: Some("git.pull".into()),
+    });
+    let rows = rows_of(&m, 40, 8).join("\n");
+    assert!(rows.contains("pulling"), "got:\n{rows}");
+
+    m.apply(UiEvent::ProgressDone { key: "git.pull".into() });
+    let rows = rows_of(&m, 40, 8).join("\n");
+    assert!(!rows.contains("pulling"), "gone when it finished:\n{rows}");
 }
 
 #[test]
@@ -769,10 +806,7 @@ fn a_notification_does_not_reflow_the_content_underneath() {
     let m = main_window_with(vec!["line one", "line two"]);
     let before = rows_of(&m, 40, 6);
     let mut with = main_window_with(vec!["line one", "line two"]);
-    with.apply(UiEvent::Message {
-        level: neosh_proto::MessageLevel::Info,
-        text: "hi".into(),
-    });
+    with.apply(notice("hi", neosh_proto::NoticeKind::Reply));
     let after = rows_of(&with, 40, 6);
     assert_eq!(before[0], after[0], "the first line did not move");
     assert_eq!(before[1], after[1]);

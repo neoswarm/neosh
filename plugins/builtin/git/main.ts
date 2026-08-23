@@ -231,6 +231,7 @@ two-word scratch name it was created with.",
       priority: 20,
     });
   };
+  refreshFooter = () => void footer();
   await footer();
   subscriptions.push(neosh.agent.onTurnEnd(() => void footer()));
   subscriptions.push(neosh.session.onChange(() => void footer()));
@@ -294,7 +295,7 @@ async function switchBranch(neosh: Neosh): Promise<void> {
 
   try {
     await neosh.git.checkout(chosen);
-    neosh.notify(`on ${chosen}`);
+    refreshFooter();
   } catch (e) {
     // Almost always uncommitted changes that would be overwritten. git's own message says which
     // files, and is more useful than anything this plugin could invent.
@@ -302,17 +303,31 @@ async function switchBranch(neosh: Neosh): Promise<void> {
   }
 }
 
+/**
+ * Redraw the branch segment, now.
+ *
+ * Set by `activate`. Anything that moves `HEAD` calls it instead of announcing the move in the
+ * corner: the branch already has a place on screen, and a toast saying what the footer says is the
+ * same fact printed twice. Without this the footer is up to five seconds stale — which is why the
+ * toast was there, and is the thing to fix rather than to caption. See ADR 0057.
+ */
+let refreshFooter: () => void = () => {};
+
 async function newBranch(neosh: Neosh): Promise<void> {
   const description = await prompt(neosh, "What are you about to work on?", { width: 76 });
   if (!description || !description.trim()) return;
 
-  neosh.notify("naming the branch…");
+  // Progress rather than a message: it is a state that stops being true the moment the model
+  // answers, and pushed onto the stack it sat *above* the row that superseded it. See ADR 0057.
+  neosh.progress("git.name", "naming the branch…");
   let unique: string;
   try {
     unique = await nameBranch(neosh, description);
   } catch (e) {
     neosh.notify(`could not name the branch: ${e}`, "error");
     return;
+  } finally {
+    neosh.done("git.name");
   }
 
   const edited = await prompt(neosh, "Branch name", { initial: unique, width: 76 });
@@ -320,7 +335,7 @@ async function newBranch(neosh: Neosh): Promise<void> {
 
   try {
     await neosh.git.createBranch(edited.trim());
-    neosh.notify(`on ${edited.trim()}`);
+    refreshFooter();
   } catch (e) {
     neosh.notify(String(e), "error");
   }
@@ -416,7 +431,7 @@ async function commit(neosh: Neosh): Promise<void> {
     return;
   }
 
-  neosh.notify("writing the commit message…");
+  neosh.progress("git.commit", "writing the commit message…");
   let message: string;
   try {
     const answer = await neosh.gen.json<{ subject?: string; body?: string }>(
@@ -439,6 +454,10 @@ async function commit(neosh: Neosh): Promise<void> {
   } catch (e) {
     neosh.notify(`could not write a commit message: ${e}`, "error");
     return;
+  } finally {
+    // Before the confirmation prompt, not after the commit: what the row claims is that a model is
+    // writing, and it stops being that as soon as one has.
+    neosh.done("git.commit");
   }
 
   if (await neosh.opt.get<boolean>("git.commit.confirm")) {
@@ -955,7 +974,7 @@ function insideDir(configured: string): string {
  * and a command that swallows both teaches you to run it twice to be sure.
  */
 async function pull(neosh: Neosh, cwd?: string): Promise<void> {
-  neosh.notify("pulling…");
+  neosh.progress("git.pull", "pulling…");
   try {
     const summary = await neosh.git.pull(cwd ? { cwd } : undefined);
     neosh.notify(summary);
@@ -963,6 +982,8 @@ async function pull(neosh: Neosh, cwd?: string): Promise<void> {
     // Diverged branches, no remote, auth — git's message names it, and inventing a friendlier one
     // here would mean guessing which of those it was.
     neosh.notify(String(e), "error");
+  } finally {
+    neosh.done("git.pull");
   }
 }
 

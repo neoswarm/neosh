@@ -1117,7 +1117,10 @@ fn the_generated_name_is_editable_before_the_branch_is_created() {
     s.ctrl("u");
     s.type_text("my-own-name");
     s.special("enter");
-    s.wait_for("on my-own-name");
+    // The footer, which is where the branch lives. It used to be a toast saying the same thing,
+    // and a message restating what is already on screen is exactly what ADR 0057 took away — so
+    // the branch segment is now refreshed on the spot instead, and this waits on that.
+    s.wait_for("my-own-name  mock");
 
     let branch = Command::new("git")
         .current_dir(sb.work())
@@ -1731,7 +1734,8 @@ fn a_model_answer_git_would_reject_is_made_into_a_legal_refname() {
     s.special("enter");
     s.wait_for("fix/the-login");
     s.special("enter");
-    s.wait_for("on fix/the-login");
+    // The footer rather than a toast — see ADR 0057.
+    s.wait_for("fix/the-login  mock");
 
     // The real proof: git accepted it.
     let branch = Command::new("git")

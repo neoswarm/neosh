@@ -4,6 +4,7 @@ import type { CursorShape } from "./CursorShape";
 import type { HighlightDef } from "./HighlightDef";
 import type { LineRender } from "./LineRender";
 import type { MessageLevel } from "./MessageLevel";
+import type { NoticeKind } from "./NoticeKind";
 import type { Rect } from "./Rect";
 import type { SurfaceCell } from "./SurfaceCell";
 import type { SurfaceId } from "./SurfaceId";
@@ -43,7 +44,35 @@ export type UiEvent =
   | { "type": "surface_cells"; surface: SurfaceId; cells: Array<SurfaceCell> }
   | { "type": "surface_released"; surface: SurfaceId }
   | { "type": "focus_changed"; win: WindowId | null }
-  | { "type": "message"; level: MessageLevel; text: string }
+  | {
+    "type": "message";
+    level: MessageLevel;
+    text: string;
+    /**
+     * Whether you asked for this, which is what decides how long it lives. See ADR 0057.
+     *
+     * Defaulted rather than required: `Reply` is what every existing sender meant, and a
+     * frontend from before this existed folds the field away and draws what it always drew.
+     */
+    kind: NoticeKind;
+    /**
+     * Which progress row this is, for [`NoticeKind::Progress`].
+     *
+     * Ignored on every other kind. Writing the same key twice replaces the row; see
+     * [`UiEvent::ProgressDone`] for taking it away.
+     */
+    key?: string | null;
+  }
+  | { "type": "progress_done"; key: string }
+  | {
+    "type": "alert";
+    /**
+     * What this is about, in a few words — a conversation's name, usually.
+     */
+    title: string;
+    body: string;
+    level: MessageLevel;
+  }
   | { "type": "clipboard"; text: string }
   | { "type": "flush" }
   | { "type": "shutdown" };

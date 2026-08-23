@@ -49,6 +49,22 @@ const BUILTIN: &str = "neosh";
 /// Broadcast once every plugin has loaded. See [`Host::announce_ready`].
 const READY_EVENT: &str = "neosh.ready";
 
+/// The workspace var naming every conversation blocked on an answer.
+///
+/// Written by whatever serves `ask_user` — the `questions` plugin, normally — and read by whatever
+/// draws conversations. The host reads it too, because "is anybody blocked on me" is exactly the
+/// question a notification exists to answer, and putting it on a var is what stops there being two
+/// answers. See ADR 0043 and ADR 0057.
+const VAR_ASKING: &str = "question.asking";
+
+/// The same, for conversations blocked on an approval rather than on a question.
+///
+/// Written by whatever serves `permission_pre` — the `approvals` plugin — and read here for the
+/// same reason `question.asking` is: being blocked on a person is a fact about the conversation.
+/// Two vars rather than one, because they are two different things to go and do and the panel that
+/// draws them may want to say which. See ADR 0057.
+const VAR_PERMITTING: &str = "permission.asking";
+
 /// What the host is streaming into the chat buffer right now.
 ///
 /// Distinguishing the two matters because switching between them has to break the line; appending
@@ -477,6 +493,20 @@ pub struct Host {
     unasked_tx: tokio::sync::mpsc::UnboundedSender<neosh_proto::SessionId>,
     /// Set by a turn ending, cleared by the poll that follows it. See [`crate::quota::AFTER_TURN`].
     quota_due: bool,
+    /// Conversations that were blocked on an answer as of the last `question.asking`.
+    ///
+    /// Kept so that the *newly* blocked ones can be told apart from the ones that already were:
+    /// the var is rewritten whenever the set changes, so answering one of three questions
+    /// re-announces the other two, and a notification per answer is a notification for something
+    /// you are in the middle of doing. See ADR 0057.
+    asking: Vec<neosh_proto::SessionId>,
+    /// The same, for conversations blocked on an approval. See [`VAR_PERMITTING`].
+    permitting: Vec<neosh_proto::SessionId>,
+    /// What is worth interrupting somebody for, and what has already been said.
+    ///
+    /// Holds the gathered burst; the run loop is what delivers it, because only the run loop can
+    /// ask the frontend whether anybody is looking. See [`crate::notify`] and ADR 0057.
+    notifier: crate::notify::Notifier,
     /// Where a picture that had to be fetched comes back to.
     ///
     /// Same reason as the quota channel above: what is on the clipboard is sometimes only the
@@ -903,6 +933,9 @@ impl Host {
             unasked_rx: Some(unasked_rx),
             unasked_tx,
             quota_due: false,
+            asking: Vec::new(),
+            permitting: Vec::new(),
+            notifier: crate::notify::Notifier::new(Default::default()),
             image_tx,
             image_rx: Some(image_rx),
             repos: Default::default(),
@@ -1242,6 +1275,17 @@ impl Host {
             }
             ApiCall::VarSet { scope, key, value } => {
                 self.vars.set(&scope, key.clone(), value.clone());
+                // Which conversations are blocked on a person already travels this way — ADR 0043
+                // put it on a var precisely because it is a fact about them rather than about
+                // whichever panel happened to learn it — so this is where the host learns it too,
+                // and no second channel has to be invented for the notification. See ADR 0057.
+                match key.as_str() {
+                    VAR_ASKING => self.alert_asking(&value, crate::notify::AlertReason::Question),
+                    VAR_PERMITTING => {
+                        self.alert_asking(&value, crate::notify::AlertReason::Permission)
+                    }
+                    _ => {}
+                }
                 self.bridge.broadcast(PluginEvent::VarChanged {
                     scope,
                     key,
@@ -1251,6 +1295,14 @@ impl Host {
             }
             ApiCall::VarDelete { scope, key } => {
                 self.vars.delete(&scope, &key);
+                // Nobody is asking any more. Cleared rather than left, or the next question in a
+                // conversation that had one would look like a conversation that already did — and
+                // would therefore be the one question that never notified.
+                match key.as_str() {
+                    VAR_ASKING => self.asking.clear(),
+                    VAR_PERMITTING => self.permitting.clear(),
+                    _ => {}
+                }
                 self.bridge.broadcast(PluginEvent::VarChanged { scope, key, value: None });
                 Ok(ApiOk::Unit)
             }
@@ -1615,6 +1667,38 @@ impl Host {
                 self.set_permission_mode(mode);
                 Ok(ApiOk::PermissionMode { mode })
             }
+            // News from a plugin. Declared, because it can interrupt somebody who is not looking
+            // at neosh — see `PluginPermission::Notify` and ADR 0057. Whether it *does* interrupt
+            // them is still the host's decision and not the caller's: a plugin cannot know which
+            // conversation is on screen or whether a terminal has focus.
+            ApiCall::Alert { level, title, message, session } => {
+                if !self
+                    .plugin_permissions
+                    .get(plugin)
+                    .is_some_and(|p| p.contains(&neosh_proto::PluginPermission::Notify))
+                {
+                    return Err(ApiError::NotPermitted {
+                        capability: "notify — add it to plugin.toml. `neosh.notify` draws in the \
+                                     corner and needs nothing."
+                            .into(),
+                    });
+                }
+                // A conversation the user is looking at is one they can see already, whoever
+                // raised it. The plugin does not get to override that, because the whole reason
+                // this goes through the host is that the plugin cannot know.
+                if session.as_ref().is_some_and(|s| self.can_see(s)) {
+                    self.editor_message(level, message);
+                    return Ok(ApiOk::Unit);
+                }
+                self.alert(
+                    crate::notify::AlertReason::Plugin,
+                    session.as_ref(),
+                    level,
+                    title,
+                    message,
+                );
+                Ok(ApiOk::Unit)
+            }
             ApiCall::HintSet { key, hint } => {
                 self.hints.insert(format!("{plugin}:{key}"), hint);
                 self.refresh_composer();
@@ -1792,7 +1876,11 @@ impl Host {
             }
             Ok(crate::images::Clipped::Remote(url)) => {
                 let where_ = short_url(&url);
-                self.editor_message(MessageLevel::Info, format!("fetching {where_}\u{2026}"));
+                // Progress, not a message: it stops being true the moment the picture lands, and
+                // pushing it onto a stack meant the row that superseded it sat *underneath* the
+                // one it superseded. Keyed by conversation, so two fetches at once are two rows
+                // and each is taken away by the one that finishes it. See ADR 0057.
+                self.editor_progress(&format!("image:{session}"), format!("fetching {where_}\u{2026}"));
                 let tx = self.image_tx.clone();
                 tokio::spawn(async move {
                     let result = crate::images::from_url(&store, &url).await;
@@ -1814,6 +1902,8 @@ impl Host {
         result: Result<crate::images::Attachment, String>,
         announce: bool,
     ) {
+        // Whatever this one was, it is no longer being fetched.
+        self.editor_progress_done(&format!("image:{session}"));
         match &result {
             Ok(got) => {
                 let elsewhere = session != self.active_session();
@@ -2040,10 +2130,274 @@ impl Host {
         id
     }
 
+    /// Say something in the corner, as a reply to a key that was just pressed.
+    ///
+    /// The default kind, and what all sixty-odd of the host's own call sites mean: this is
+    /// feedback for a keystroke, it is not news, and it never leaves the terminal. See ADR 0057
+    /// and, for the two things that are not this, [`Host::editor_progress`] and [`Host::alert`].
     fn editor_message(&mut self, level: MessageLevel, text: impl Into<String>) {
+        let _ = self.editor.apply(&PluginId::from(BUILTIN), ApiCall::Notify {
+            level,
+            message: text.into(),
+            kind: neosh_proto::NoticeKind::Reply,
+            key: None,
+        });
+    }
+
+    /// Say what is happening, in a row that will be replaced rather than stacked.
+    ///
+    /// Ends with [`Host::editor_progress_done`] on the same key. A progress row that is never
+    /// finished falls off after a minute rather than staying forever, but relying on that is a
+    /// row that lies for up to sixty seconds.
+    fn editor_progress(&mut self, key: &str, text: impl Into<String>) {
+        let _ = self.editor.apply(&PluginId::from(BUILTIN), ApiCall::Notify {
+            level: MessageLevel::Info,
+            message: text.into(),
+            kind: neosh_proto::NoticeKind::Progress,
+            key: Some(key.to_string()),
+        });
+    }
+
+    fn editor_progress_done(&mut self, key: &str) {
         let _ = self
             .editor
-            .apply(&PluginId::from(BUILTIN), ApiCall::Notify { level, message: text.into() });
+            .apply(&PluginId::from(BUILTIN), ApiCall::NotifyDone { key: key.to_string() });
+    }
+
+    /// News: something happened that the user did not cause.
+    ///
+    /// Drawn in the corner *and*, if they turn out not to be looking, raised outside the terminal.
+    /// Whether they are looking is settled later — in the run loop, which is the only place that
+    /// can ask the frontend — so this is the offer rather than the decision. See ADR 0057.
+    fn alert(
+        &mut self,
+        reason: crate::notify::AlertReason,
+        session: Option<&neosh_proto::SessionId>,
+        level: MessageLevel,
+        title: impl Into<String>,
+        body: impl Into<String>,
+    ) {
+        let title = title.into();
+        let body = body.into();
+        // On screen either way. An alert the user *can* see is still worth a row in the corner —
+        // it is the leaving-the-terminal part that is conditional, not the saying of it.
+        let _ = self.editor.apply(&PluginId::from(BUILTIN), ApiCall::Notify {
+            level,
+            message: body.clone(),
+            kind: neosh_proto::NoticeKind::Alert,
+            key: None,
+        });
+        self.notifier.offer(reason, session, crate::notify::Alert { title, body, level });
+    }
+
+    /// A conversation is blocked on you answering something.
+    ///
+    /// The strongest case there is for a notification: the turn is not merely finished, it is
+    /// *stopped*, and it stays stopped until you go and look. Only for conversations that were not
+    /// already asking — the var is rewritten whenever the set changes, including when one of three
+    /// is answered, and re-announcing the other two then would be a notification per answer.
+    fn alert_asking(&mut self, value: &serde_json::Value, reason: crate::notify::AlertReason) {
+        let Some(ids) = value.as_array() else { return };
+        let now: Vec<neosh_proto::SessionId> = ids
+            .iter()
+            .filter_map(|v| v.as_str())
+            .map(|s| neosh_proto::SessionId(s.to_string()))
+            .collect();
+        let seen = match reason {
+            crate::notify::AlertReason::Permission => &mut self.permitting,
+            _ => &mut self.asking,
+        };
+        let fresh: Vec<neosh_proto::SessionId> =
+            now.iter().filter(|s| !seen.contains(*s)).cloned().collect();
+        *seen = now;
+        for session in fresh {
+            // A question in the conversation you are looking at opens its panel over the composer,
+            // which is louder than any notification and already has your attention.
+            if self.can_see(&session) {
+                continue;
+            }
+            let label = self
+                .agent
+                .sessions()
+                .get(&session)
+                .map(|s| s.label())
+                .unwrap_or_else(|| "a conversation".into());
+            self.alert(reason, Some(&session), MessageLevel::Warn, label, match reason {
+                crate::notify::AlertReason::Permission => "is waiting for permission",
+                _ => "is asking you something",
+            });
+        }
+    }
+
+    /// Read the whole `notify.*` family into the notifier, and tell the terminal how to raise one.
+    ///
+    /// An unparseable enum keeps the default rather than failing: these arrive from a declared
+    /// `OptionType::Enum`, so the set has already been checked at set time, and the only way to be
+    /// here with a word we do not know is a version skew — where a notification nobody expected is
+    /// better than no notifications at all.
+    fn reload_notify(&mut self) {
+        let opts = self.editor.options();
+        let str_of = |name: &str| opts.str(name).unwrap_or_default().to_string();
+        let cfg = crate::notify::NotifyConfig {
+            enabled: opts.bool("notify.enabled").unwrap_or(true),
+            when: opts.list("notify.when").unwrap_or_else(|| {
+                crate::notify::AlertReason::all().iter().map(|r| r.key().to_string()).collect()
+            }),
+            away: crate::notify::AwayPolicy::parse(&str_of("notify.away")).unwrap_or_default(),
+            desktop: crate::notify::DesktopPolicy::parse(&str_of("notify.desktop"))
+                .unwrap_or_default(),
+            idle_after: Duration::from_secs(opts.int("notify.idle_after").unwrap_or(60).max(1) as u64),
+            min_turn: Duration::from_secs(opts.int("notify.min_turn").unwrap_or(10).max(0) as u64),
+            bell: opts.bool("notify.bell").unwrap_or(false),
+        };
+        let osc = neosh_tui::terminal::AlertOsc::parse(&str_of("notify.osc"))
+            .unwrap_or_else(neosh_tui::terminal::AlertOsc::detect);
+        let bell = cfg.bell;
+        self.notifier.configure(cfg);
+        // A no-op unless this process owns its terminal. A client attached over a socket detects
+        // its own and is overridden by `NEOSH_NOTIFY_OSC`, because the terminal may be on another
+        // machine entirely and a workspace's configuration is its own.
+        self.frontend.configure_alerts(osc, bell);
+    }
+
+    /// A turn ended. Decide whether that is news, and say so if it is.
+    ///
+    /// Three tests, and it is not a notification unless it passes all of them: it happened
+    /// somewhere you are not looking, it took long enough that you had time to look away, and the
+    /// kind of ending is one you asked to hear about. See ADR 0057.
+    fn alert_turn_ended(
+        &mut self,
+        session: &neosh_proto::SessionId,
+        stop_reason: &neosh_proto::StopReason,
+        label: &str,
+        took: Option<i64>,
+    ) {
+        use neosh_proto::StopReason;
+
+        // The screen in front of you. ADR 0042's rule, and the only one of the three that is
+        // about where the person is rather than about the turn.
+        if self.can_see(session) {
+            return;
+        }
+        // `<Esc>` is you ending the turn, so a notification saying it ended is a notification about
+        // something you just did. `ToolUse` is not an ending at all — the loop is between rounds.
+        if matches!(stop_reason, StopReason::Cancelled | StopReason::ToolUse) {
+            return;
+        }
+        let (reason, level, what) = match stop_reason {
+            StopReason::Error { message } => (
+                crate::notify::AlertReason::Failure,
+                MessageLevel::Error,
+                format!("failed: {message}"),
+            ),
+            StopReason::Refusal { explanation, .. } => (
+                crate::notify::AlertReason::Failure,
+                MessageLevel::Warn,
+                match explanation {
+                    Some(why) => format!("stopped: {why}"),
+                    None => "stopped without answering".to_string(),
+                },
+            ),
+            // Not an error, and not a clean finish either: the answer is cut off mid-sentence and
+            // saying "finished" about it would be wrong.
+            StopReason::MaxTokens => (
+                crate::notify::AlertReason::TurnDone,
+                MessageLevel::Warn,
+                "ran out of room mid-answer".to_string(),
+            ),
+            _ => (
+                crate::notify::AlertReason::TurnDone,
+                MessageLevel::Info,
+                "finished".to_string(),
+            ),
+        };
+        // A turn that took three seconds ended while you were still looking at the key that
+        // started it. Failures are exempt: a turn that died in two seconds died *because* it went
+        // wrong immediately, which is the one you most need telling about.
+        let min = self.notifier.config().min_turn.as_secs() as i64;
+        if reason == crate::notify::AlertReason::TurnDone
+            && took.is_some_and(|secs| secs < min)
+        {
+            return;
+        }
+        self.alert(reason, Some(session), level, label, what);
+    }
+
+    /// Send the gathered burst, if its window has closed.
+    async fn deliver_alerts(&mut self) -> anyhow::Result<()> {
+        let Some(alert) = self.notifier.take_due() else { return Ok(()) };
+        self.raise(alert).await
+    }
+
+    /// Send whatever is waiting, window or no window. For shutdown.
+    async fn deliver_alerts_now(&mut self) -> anyhow::Result<()> {
+        let Some(alert) = self.notifier.flush() else { return Ok(()) };
+        self.raise(alert).await
+    }
+
+    /// Get one notification in front of a person, by whichever route can reach them.
+    ///
+    /// The only place that asks where they are, because the frontend is the only thing that knows
+    /// and this is the only place with a frontend. Three answers and three channels:
+    ///
+    /// - **Watching** — a terminal is attached and in front of somebody. The corner already said
+    ///   it, and nothing else should: a notification for something on screen is what teaches
+    ///   people to dismiss notifications.
+    /// - **Away** — attached, unfocused. `UiEvent::Alert` goes to the views and each writes the
+    ///   escape its own terminal speaks, which is the only way it comes out where the person is
+    ///   rather than where the process is.
+    /// - **Detached** — nothing attached, so there is no stream and no wrong machine to be on.
+    ///
+    /// See ADR 0057.
+    async fn raise(&mut self, alert: crate::notify::Alert) -> anyhow::Result<()> {
+        use crate::frontend::Presence;
+        use crate::notify::DesktopPolicy;
+
+        let cfg = self.notifier.config().clone();
+        if !cfg.enabled || cfg.away == crate::notify::AwayPolicy::Never {
+            return Ok(());
+        }
+        let presence = self.frontend.presence(cfg.idle_after).await;
+        // `offscreen` is for a tiled layout somebody keeps neosh visible in and does not watch:
+        // by the time an alert exists the host has already established it is about a conversation
+        // they are not in, so being attached is as far as the question goes.
+        let away = match cfg.away {
+            crate::notify::AwayPolicy::Offscreen => presence != Presence::Detached,
+            _ => presence == Presence::Away,
+        };
+
+        if away {
+            self.frontend
+                .send(vec![
+                    UiEvent::Alert {
+                        title: alert.title.clone(),
+                        body: alert.body.clone(),
+                        level: alert.level,
+                    },
+                    UiEvent::Flush,
+                ])
+                .await?;
+        }
+        let desktop = match cfg.desktop {
+            DesktopPolicy::Never => false,
+            DesktopPolicy::Always => away || presence == Presence::Detached,
+            DesktopPolicy::WhenDetached => presence == Presence::Detached,
+        };
+        if desktop {
+            crate::notify::desktop(&alert);
+        }
+        Ok(())
+    }
+
+    /// Whether the user can already see what is happening in this conversation.
+    ///
+    /// The whole test. A turn ending in the conversation on screen is the screen in front of you,
+    /// and ADR 0042's `unread` says the same thing — but it counts *detached* as on screen, on the
+    /// reasoning that reattaching lands you in that conversation with the answer in it. True for
+    /// the mark and false for the notification: with nothing attached, a finished turn is the most
+    /// newsworthy thing a workspace can produce. Attachment is asked separately, in the run loop.
+    fn can_see(&self, session: &neosh_proto::SessionId) -> bool {
+        *session == self.active_session()
     }
 
     fn drain_effects(&mut self) {
@@ -2692,6 +3046,10 @@ impl Host {
                 self.agent.session().system =
                     if text.is_empty() { None } else { Some(text.to_string()) };
             }
+            // Re-read whole rather than patched field by field: they are eight settings describing
+            // one behaviour, they are all cheap to read, and a partial update is how two of them
+            // end up disagreeing about whether notifications are on.
+            n if n.starts_with("notify.") => self.reload_notify(),
             _ => {}
         }
     }
@@ -6563,6 +6921,12 @@ impl Host {
                 let leftover = self.agent.take_steering(&session);
                 self.turns.remove(&session);
                 self.rounds.remove(&session);
+                // Read out before the fields below are cleared, because a notification about a
+                // turn wants to know how long it took and what to call the conversation, and
+                // `running_since` is about to be `None`.
+                let ended = self.agent.sessions().get(&session).map(|s| {
+                    (s.label(), s.running_since.map(|at| now_secs().saturating_sub(at).max(0)))
+                });
                 if let Some(s) = self.agent.sessions().get_mut(&session) {
                     s.updated_at = now_secs();
                     // The turn ended, so there is nothing for a later process to notice. Cleared
@@ -6575,6 +6939,9 @@ impl Host {
                     // already in it. Anywhere else, the row is the only thing that will ever
                     // mention it, so it has to say so until you go there. See ADR 0042.
                     s.unread = !on_screen;
+                }
+                if let Some((label, took)) = ended {
+                    self.alert_turn_ended(&session, &stop_reason, &label, took);
                 }
                 self.persist_sessions();
                 if self.watched(&session) {
@@ -7224,6 +7591,10 @@ impl Host {
             }
             // Answered in the run loop, which is the only place with a frontend to draw to.
             InputEvent::Repaint => {}
+            // Recorded against the view it came from, not folded into one workspace-wide flag: a
+            // workspace is away only when *every* terminal open on it is, and that is a question
+            // about the set of them. Handled in the run loop, which is where views live.
+            InputEvent::Focus { .. } => {}
             InputEvent::Disconnected => return false,
         }
         true
@@ -7314,6 +7685,13 @@ impl Host {
         tokio::pin!(plan);
         // How many times in a row a poll has come back with nothing. Doubles the wait each time.
         let mut quota_backoff: u32 = 0;
+
+        // When the gathered notifications go out. A day away when nothing is waiting, which is
+        // almost always: the same shape as `clock` above, and for the same reason — a timer that
+        // is never ready costs a branch, and one that fires every second costs a wake-up.
+        let burst = tokio::time::sleep(Duration::from_secs(86_400));
+        tokio::pin!(burst);
+        let mut bursting = false;
 
         loop {
             tokio::select! {
@@ -7416,6 +7794,13 @@ impl Host {
                         true,
                     );
                 }
+                // The gathered burst is due. Not a per-alert timer: three conversations finishing
+                // while you are at lunch is one notification that says three, and the only way to
+                // know it was three is to wait a moment before speaking. See ADR 0057.
+                () = &mut burst, if bursting => {
+                    bursting = false;
+                    self.deliver_alerts().await?;
+                }
                 () = &mut plan => {
                     self.refresh_quota(None);
                     // Reset unconditionally, and to the idle interval whichever branch armed it.
@@ -7458,10 +7843,20 @@ impl Host {
                 idle.as_mut().reset(Instant::now() + COALESCE);
                 armed = true;
             }
+            if let Some(wait) = self.notifier.due_in()
+                && !bursting
+            {
+                burst.as_mut().reset(Instant::now() + wait);
+                bursting = true;
+            }
         }
 
         // Last thing before the screen goes: whatever was said this session is on disk.
         self.persist_sessions();
+        // Anything gathered and not yet spoken. Waiting out the burst window here means never —
+        // and a workspace stopping with a question unanswered in it is exactly the case somebody
+        // needs telling about.
+        self.deliver_alerts_now().await?;
         self.flush().await?;
         self.frontend.send(vec![UiEvent::Shutdown]).await?;
         self.frontend.shutdown().await?;
@@ -8555,6 +8950,104 @@ impl Host {
                      default and not detected: a terminal cannot be asked what its font contains, \
                      and guessing wrong draws a row of boxes, which reads as a broken program \
                      rather than as a missing font."
+                        .into(),
+                ),
+            },
+            // Notifications. Declared here rather than by a plugin for the same reason the display
+            // settings above are: everything in the workspace reads them, and a setting that
+            // disappears when `plugins.disabled` names its owner is not a setting. See ADR 0057.
+            OptionSpec {
+                name: "notify.enabled".into(),
+                ty: OptionType::Bool,
+                default: OptionValue::Bool(true),
+                description: Some(
+                    "Tell you about things you did not ask for and cannot see. Off leaves the \
+                     sidebar's own marks, which are what remember it either way."
+                        .into(),
+                ),
+            },
+            OptionSpec {
+                name: "notify.when".into(),
+                ty: OptionType::List,
+                default: OptionValue::List(
+                    crate::notify::AlertReason::all().iter().map(|r| r.key().into()).collect(),
+                ),
+                description: Some(
+                    "What is worth interrupting you for: turn.done, question, permission, \
+                     failure, quota, plugin. A list rather than six switches, because it is one \
+                     decision asked six times."
+                        .into(),
+                ),
+            },
+            OptionSpec {
+                name: "notify.away".into(),
+                ty: OptionType::Enum {
+                    values: vec!["focus".into(), "offscreen".into(), "never".into()],
+                },
+                default: OptionValue::Str("focus".into()),
+                description: Some(
+                    "When you count as not looking. `focus` is when no terminal has it — the \
+                     honest answer; `offscreen` is any conversation that is not the one on screen, \
+                     for a tiled layout you keep neosh visible in and do not watch."
+                        .into(),
+                ),
+            },
+            OptionSpec {
+                name: "notify.desktop".into(),
+                ty: OptionType::Enum {
+                    values: vec!["when-detached".into(), "always".into(), "never".into()],
+                },
+                default: OptionValue::Str("when-detached".into()),
+                description: Some(
+                    "When to use the machine's own notifications rather than the terminal's. \
+                     Detached only, by default: with a terminal attached the escape reaches the \
+                     machine you are sitting at, and this one reaches the machine neosh is on — \
+                     which over SSH is not the same computer."
+                        .into(),
+                ),
+            },
+            OptionSpec {
+                name: "notify.idle_after".into(),
+                ty: OptionType::Int { min: Some(5), max: Some(3600) },
+                default: OptionValue::Int(60),
+                description: Some(
+                    "Seconds without a keystroke that count as away, on a terminal that cannot \
+                     report whether it has focus. Ignored by one that can."
+                        .into(),
+                ),
+            },
+            OptionSpec {
+                name: "notify.min_turn".into(),
+                ty: OptionType::Int { min: Some(0), max: Some(3600) },
+                default: OptionValue::Int(10),
+                description: Some(
+                    "The shortest turn worth telling you finished. A three-second turn ended while \
+                     you were still looking at the key that started it."
+                        .into(),
+                ),
+            },
+            OptionSpec {
+                name: "notify.osc".into(),
+                ty: OptionType::Enum {
+                    values: vec!["auto".into(), "9".into(), "777".into(), "99".into(), "off".into()],
+                },
+                default: OptionValue::Str("auto".into()),
+                description: Some(
+                    "Which escape your terminal raises a notification with. Guessed from the \
+                     environment, which is sometimes wrong because a multiplexer lies about $TERM. \
+                     Only reaches a terminal this process owns — set NEOSH_NOTIFY_OSC where the \
+                     terminal is when you are attached over a socket."
+                        .into(),
+                ),
+            },
+            OptionSpec {
+                name: "notify.bell".into(),
+                ty: OptionType::Bool,
+                default: OptionValue::Bool(false),
+                description: Some(
+                    "Ring the terminal bell as well. Off by default — a bell says something \
+                     happened and never which thing — but many terminals turn one into a mark on \
+                     the tab, which is the whole point."
                         .into(),
                 ),
             },

@@ -134,6 +134,15 @@ impl OptionRegistry {
     pub fn int(&self, name: &str) -> Option<i64> {
         self.get(name).and_then(OptionValue::as_int)
     }
+
+    /// A list option's entries. `None` when it is unset *or* empty, which for a list of things to
+    /// do is the same answer: nothing to do.
+    pub fn list(&self, name: &str) -> Option<Vec<String>> {
+        self.get(name)
+            .and_then(OptionValue::as_list)
+            .filter(|v| !v.is_empty())
+            .map(|v| v.to_vec())
+    }
 }
 
 fn render(name: &str, e: &Entry) -> OptionEntry {

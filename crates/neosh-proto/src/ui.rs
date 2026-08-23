@@ -615,6 +615,35 @@ pub enum MessageLevel {
     Error,
 }
 
+/// What kind of thing a message is, which is a different question from how bad it is.
+///
+/// [`MessageLevel`] says how bad and therefore what colour; this says whether you asked for it,
+/// and therefore where it goes and how long it lives. Every message used to be the same kind of
+/// thing — a row in a six-second stack — so a pull's progress, the echo of a key you just pressed
+/// and a node dropping off the swarm were one channel with one lifetime. See ADR 0057.
+#[derive(TS, Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug, Default)]
+#[serde(rename_all = "snake_case")]
+#[ts(export)]
+pub enum NoticeKind {
+    /// Feedback for a key you just pressed.
+    ///
+    /// The default, so a bare `neosh.notify` keeps meaning what it always meant. It does not stack:
+    /// two keys pressed quickly are two keys, and the reply you want is the one for the second.
+    #[default]
+    Reply,
+    /// A state that will be replaced, not a message that accumulates.
+    ///
+    /// Keyed, so writing it again with the same key replaces the row rather than pushing a second
+    /// one — which is what made a pull draw `pulling…` and then `up to date` as two rows of a
+    /// stack instead of one row that changed.
+    Progress,
+    /// Something happened that you did not cause.
+    ///
+    /// The only kind that is news, and therefore the only one that may leave the terminal — see
+    /// [`UiEvent::Alert`], which is how it does.
+    Alert,
+}
+
 /// A retained-state delta. Frontends fold these into a mirror and draw from it.
 ///
 /// Emitted in coalesced batches — see [`UiEvent::Flush`].
@@ -711,6 +740,43 @@ pub enum UiEvent {
     Message {
         level: MessageLevel,
         text: String,
+        /// Whether you asked for this, which is what decides how long it lives. See ADR 0057.
+        ///
+        /// Defaulted rather than required: `Reply` is what every existing sender meant, and a
+        /// frontend from before this existed folds the field away and draws what it always drew.
+        #[serde(default)]
+        kind: NoticeKind,
+        /// Which progress row this is, for [`NoticeKind::Progress`].
+        ///
+        /// Ignored on every other kind. Writing the same key twice replaces the row; see
+        /// [`UiEvent::ProgressDone`] for taking it away.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        key: Option<String>,
+    },
+
+    /// Take a progress row off, because the thing it was about has finished.
+    ///
+    /// Separate from writing an empty message: a plugin that finishes clears the row, and a row
+    /// cleared by writing `""` is a row of nothing rather than no row.
+    ProgressDone {
+        key: String,
+    },
+
+    /// Raise this outside the terminal, because the person is not looking at it.
+    ///
+    /// The host decides *whether* — it is the only thing that knows which conversation is on
+    /// screen, which views are attached and whether any of them has focus — and the view decides
+    /// *how*, because it is the only thing that knows what terminal this is. That split is the
+    /// same one [`UiEvent::Clipboard`] makes and for the same reason: neosh is used over SSH, and
+    /// anything the workspace raises by itself is raised on the wrong machine.
+    ///
+    /// Never sent for something on screen. By the time one of these exists, the host has already
+    /// established you cannot see the thing it is about. See ADR 0057.
+    Alert {
+        /// What this is about, in a few words — a conversation's name, usually.
+        title: String,
+        body: String,
+        level: MessageLevel,
     },
 
     /// Put text on the system clipboard.
@@ -919,6 +985,17 @@ pub enum InputEvent {
     /// This is the *only* thing that draws a frame nobody asked for, and it exists on the frontend's
     /// terms: there is still no frame loop, and an idle workspace still sends nothing at all.
     Repaint,
+    /// Whether this terminal is the focused window of whatever is running it.
+    ///
+    /// The one thing that decides whether a notification is worth raising outside the terminal, and
+    /// the frontend is the only thing that can answer it. Sent only by a frontend whose terminal
+    /// supports mode 1004; the host treats a view that has never sent one as *unknown* rather than
+    /// as focused, and falls back to how long it has been since a key arrived. Assuming focus would
+    /// mean a terminal that cannot report is a terminal that never notifies, which is the wrong way
+    /// round to be wrong. See ADR 0057.
+    Focus {
+        on: bool,
+    },
     /// The frontend is going away (terminal closed, socket dropped).
     Disconnected,
 }

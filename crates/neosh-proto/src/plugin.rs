@@ -308,6 +308,14 @@ pub enum PluginPermission {
     /// it through a registered tool, which is gated like every other tool. Making a user pressing
     /// Enter in a branch picker ask the agent's policy for permission would be a category error.
     VcsWrite,
+    /// Raise a notification the user sees outside the terminal.
+    ///
+    /// Drawing in the corner is free, like every other kind of drawing — `neosh.notify` needs
+    /// nothing. This is the other thing: a plugin that can put a notification on somebody's
+    /// desktop while they are in another application is a plugin that can interrupt them, and that
+    /// is exactly the kind of capability the manifest exists to make you agree to in advance. See
+    /// ADR 0057.
+    Notify,
 }
 
 /// `plugin.toml`, next to the plugin's entry point.
