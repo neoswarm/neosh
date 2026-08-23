@@ -347,6 +347,19 @@ per decision, and records the *reasoning*, not the choice.
   *path*, not bytes: a transcript that is mostly base64 is one nothing can read back, so the bytes
   live once in the state directory and a driver reads them when it builds its request. The media
   type is read off the bytes, because a `.png` that is really a JPEG fails the turn. See ADR 0041.
+- **An agent that speaks when nobody asked is still speaking to you.** ADR 0054 stopped a turn
+  `claude` starts for itself — a backgrounded command finishing, enqueued as a message to itself and
+  answered — from being read as the answer to your next question, by draining the pipe before the
+  prompt goes in and dropping what it found. This is the half it deferred: the same turn, *heard
+  while it happens*. The reader outlives the turn the way the process does — stdout is read for the
+  life of the child, not the length of an answer — so nothing is lost and a pipe nobody reads cannot
+  fill and stop the CLI mid-sentence. It reports what nothing is reading (`Unasked`), and the host
+  opens a turn to hold it: one that **says nothing** (`listen_only`, no user message pushed, and no
+  drain, because dropping what the turn exists to show is the one mistake it cannot make), because
+  a turn opened to hold an answer has no question above it. **A turn still ends on its own
+  `result`** — `init` opens one and `result` closes one for their turns as much as ours, so a prompt
+  queued behind one has two endings to wait for, and ending on the first is how a message that had
+  not been read yet came back as `{"type":"thinking","text":""}`. See ADR 0056.
 - **A vendor CLI outlives the turn, so an abandoned turn has to be *drained*.** `Live::lines` is
   per conversation. A turn that is walked away from — `<Esc>`, a switch — leaves the CLI mid-answer
   with the rest of it in the pipe, and the next turn reads it as its own: someone else's reply, and

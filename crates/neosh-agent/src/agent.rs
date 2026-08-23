@@ -593,7 +593,16 @@ impl Agent {
         self.emit(AgentEvent::TurnStarted { session: session.clone(), turn: turn.clone() });
         // The hook may have rewritten the words; what was attached is not its business and rides
         // through untouched.
-        self.with(&session, |s| s.push_user(&Prompt { text: text.clone(), images }));
+        //
+        // Nothing to push when there is nothing to say. A turn opened to hold something the agent
+        // has *already* started saying — a backgrounded command finishing, and the agent answering
+        // its own notification about it — is a real turn with a real answer in it and no question
+        // above it. An empty user message there is a blank row in the transcript and, worse, a
+        // question the driver would go and ask.
+        let asking = !text.is_empty() || !images.is_empty();
+        if asking {
+            self.with(&session, |s| s.push_user(&Prompt { text: text.clone(), images }));
+        }
 
         // --- turn.route: a plugin may say who answers ---------------------
         //

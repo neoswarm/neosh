@@ -84,4 +84,33 @@ pub trait AgentDriver: Send + Sync {
     /// Defaulted to doing nothing, for the same reason: a driver with no way to ask has nothing to
     /// put here.
     fn set_question_asker(&self, _asker: std::sync::Arc<dyn crate::ask::QuestionAsker>) {}
+
+    /// Give the driver somewhere to say that its agent has started talking unprompted.
+    ///
+    /// Defaulted to doing nothing, because most agents only ever answer. See [`Unasked`].
+    fn set_unasked(&self, _sink: std::sync::Arc<dyn Unasked>) {}
+
+    /// The next turn in this conversation has nothing to say and is only there to listen.
+    ///
+    /// The other half of [`Unasked`]: the workspace opens a turn so there is somewhere to *put*
+    /// what the agent is already saying, and a turn that spoke would be asking a second question
+    /// on top of the one being answered. Consumed by the turn it describes, so it is set
+    /// immediately before one is started and never sticks to the one after.
+    ///
+    /// Defaulted to doing nothing: a driver that never reports an unasked turn is never sent one.
+    fn listen_only(&self, _conversation: &neosh_proto::SessionId) {}
+}
+
+/// Somewhere to say that an agent has started talking with nobody having asked it to.
+///
+/// `claude` does this and it is not an edge case: a backgrounded command finishing is enqueued as
+/// a message to itself and answered — a whole turn of thinking, tools and text — and the agent
+/// saying it will report back when the build lands is the most ordinary thing in the world.
+///
+/// It belongs to the conversation, so it has to go *in* the conversation, and the only way it can
+/// be shown while it is happening is for the workspace to open a turn to hold it. Read only when
+/// nothing is attached: a turn that is already running is reading that pipe itself.
+pub trait Unasked: Send + Sync + std::fmt::Debug {
+    /// The agent in this conversation has begun saying something nobody asked for.
+    fn began(&self, conversation: &neosh_proto::SessionId);
 }

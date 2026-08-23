@@ -164,7 +164,33 @@ impl Launch {
 struct Live {
     child: tokio::process::Child,
     stdin: tokio::process::ChildStdin,
-    lines: tokio::io::Lines<BufReader<tokio::process::ChildStdout>>,
+    /// Everything the CLI has said that nothing has read yet.
+    ///
+    /// A channel rather than the pipe itself, because the reader has to outlive the turn for the
+    /// same reason the process does. `claude` answers things nobody asked it: a backgrounded
+    /// command finishing is enqueued as a message and replied to on its own, with a whole turn of
+    /// `init`, thinking, text and `result` on stdout. Read only while a turn is in flight, that
+    /// turn is invisible until somebody happens to type — and then it is worse than invisible,
+    /// because its `result` is the first one the next turn sees and the next turn ends on it. See
+    /// [`run_turn`].
+    ///
+    /// Unbounded on purpose: the alternative to holding it is a full pipe, and a full pipe stops
+    /// the CLI mid-sentence with nothing anywhere to say why.
+    lines: mpsc::UnboundedReceiver<String>,
+    /// Whether the CLI is in the middle of a turn — `system`/`init` opens one, `result` closes it.
+    ///
+    /// On the process rather than in the turn, because the turn it describes need not be ours.
+    busy: bool,
+    /// Shared with the reader: whether a turn has begun that nothing has read. Cleared here, by
+    /// whoever reads the `init` that set it. See [`Unread`].
+    unread: Arc<Unread>,
+    /// Lines read after a turn was already over, kept for whoever reads next.
+    ///
+    /// There is exactly one moment a turn reads past its own ending: having seen `result` it asks
+    /// how full the context is and waits for the answer. Whatever else arrives in that window is
+    /// the *next* turn's — the CLI answering something nobody asked, most often — and folding it
+    /// into an answer that has already been given puts half of one turn under another.
+    pushed_back: std::collections::VecDeque<String>,
     /// Kept so a failure can be reported with its actual cause rather than an exit code.
     stderr: Arc<Mutex<String>>,
     /// The stream parser's memory.
@@ -181,6 +207,25 @@ struct Live {
     /// is not sent: `set_model` on every turn would be a control round-trip saying nothing.
     model: String,
     mode: PermissionMode,
+}
+
+/// Whether the CLI has begun a turn that nothing has read — the one piece of state the reader task
+/// and the turn loop both touch.
+///
+/// The reader is the only thing looking at the pipe between turns, so it is the only thing that can
+/// notice a turn nobody asked for. It cannot simply report every `init` it sees: an ordinary turn
+/// opens with one too, and that one is being read. So it reports only what nothing is reading —
+/// and, when something *is*, leaves a note that whoever it was clears by reading the line. A note
+/// still there when the last reader goes is a turn that was begun and never heard, and it is
+/// reported on the way out. Without that, an `init` landing in the moment between a turn's last
+/// read and its bookkeeping was a turn nobody would ever hear about.
+#[derive(Debug, Default)]
+struct Unread {
+    /// How many turns are reading. A count rather than a flag: a turn that starts while the last
+    /// one is still winding down would otherwise be un-marked by the older one's way out.
+    attached: std::sync::atomic::AtomicUsize,
+    /// An `init` seen while somebody was reading, and not yet read by them.
+    pending: std::sync::atomic::AtomicBool,
 }
 
 /// A change asked for while a turn is running.
@@ -205,6 +250,12 @@ struct Conversation {
     /// polling — and so a change made while the model has been thinking silently for half a minute
     /// does not wait for it to say something.
     wake: tokio::sync::Notify,
+    /// Whether the CLI has begun a turn that nothing has read. See [`Unread`].
+    unread: Arc<Unread>,
+    /// Set by the host just before it opens a turn to hold something the agent is already saying.
+    /// Taken by that turn, which then says nothing and only reads. See
+    /// [`super::AgentDriver::listen_only`].
+    listen: Arc<std::sync::atomic::AtomicBool>,
 }
 
 #[derive(Debug)]
@@ -236,6 +287,8 @@ pub struct ClaudeCliProvider {
     /// Where a question goes. Separate from `asker` because a question is not a permission — see
     /// [`crate::ask`].
     questioner: Arc<Mutex<Option<Arc<dyn QuestionAsker>>>>,
+    /// Where to say that the CLI has started a turn nobody asked for. See [`super::Unasked`].
+    unasked: Arc<Mutex<Option<Arc<dyn super::Unasked>>>>,
 }
 
 impl Default for ClaudeCliProvider {
@@ -253,6 +306,7 @@ impl ClaudeCliProvider {
             mode: Arc::new(Mutex::new(PermissionMode::Ask)),
             asker: Arc::default(),
             questioner: Arc::default(),
+            unasked: Arc::default(),
         }
     }
 
@@ -457,12 +511,19 @@ impl Provider for ClaudeCliProvider {
         let mode = *self.mode.lock().expect("mode lock poisoned");
         let asker = self.asker.lock().expect("asker lock poisoned").clone();
         let questioner = self.questioner.lock().expect("questioner lock poisoned").clone();
+        let unasked = self.unasked.lock().expect("unasked lock poisoned").clone();
+        let here = request.conversation.clone();
 
         tokio::spawn(async move {
+            // Before the lock, not after: a turn queued behind another one is still a turn, and
+            // the reader must not report what it is waiting for as something nobody asked for.
+            let watch =
+                Watch { unread: slot.unread.clone(), conversation: here, sink: unasked.clone() };
+            let attached = Attached::of(watch.clone());
             // Held for the whole turn. Two turns in one conversation share one process and one
             // stdin, so running them at once would interleave two answers down one pipe.
             let mut guard = slot.live.lock().await;
-            let mut turn = Turn { request, mode, asker, questioner };
+            let mut turn = Turn { request, mode, asker, questioner, unasked };
             // Retried exactly once, and only for the one failure a retry can fix: the conversation
             // this driver was told to pick up is not there any more — the CLI's own history was
             // cleared, or the project directory moved out from under it. Starting fresh loses what
@@ -482,6 +543,7 @@ impl Provider for ClaudeCliProvider {
                 *guard = None;
                 let _ = tx.send(ProviderEvent::Error { message, retryable: false }).await;
             }
+            drop(attached);
         });
 
         Box::pin(tokio_stream::wrappers::ReceiverStream::new(rx))
@@ -498,6 +560,34 @@ struct Turn {
     mode: PermissionMode,
     asker: Option<Arc<dyn PermissionAsker>>,
     questioner: Option<Arc<dyn QuestionAsker>>,
+    unasked: Option<Arc<dyn super::Unasked>>,
+}
+
+/// Says a turn is reading this conversation's stdout, for exactly as long as one is.
+///
+/// A guard rather than two assignments, because a turn has several ways out — a spawn that failed,
+/// a stale resume that retries, a cancellation — and a count left raised is a conversation whose
+/// agent can never again be heard talking on its own.
+struct Attached(Watch);
+
+impl Attached {
+    fn of(watch: Watch) -> Self {
+        watch.unread.attached.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Self(watch)
+    }
+}
+
+impl Drop for Attached {
+    fn drop(&mut self) {
+        self.0.unread.attached.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        // The last one out takes any note with it. A turn that began while this one was reading
+        // and that this one never got to is a turn nothing has heard, and now nothing else will.
+        if !self.0.reading()
+            && self.0.unread.pending.swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            self.0.report();
+        }
+    }
 }
 
 /// How a turn ended, for the one caller that can do something about it.
@@ -521,7 +611,11 @@ async fn run_turn(
     cancel: CancellationToken,
     tx: &mpsc::Sender<ProviderEvent>,
 ) -> Result<Outcome, String> {
-    let Turn { request, mode, asker, questioner } = turn;
+    let Turn { request, mode, asker, questioner, unasked } = turn;
+    // A turn opened to hold something the agent is already saying. It has nothing of its own to
+    // ask, so it says nothing and reads until whatever is running stops. Taken rather than read:
+    // it describes this turn and must not stick to the next one.
+    let listen_only = conversation.listen.swap(false, std::sync::atomic::Ordering::Relaxed);
     // Only offered when somebody can answer it. Passing the flag with nobody behind it would route
     // every decision to a pipe nothing ever writes to, and the turn would hang instead of being
     // refused — worse than the behaviour it replaces.
@@ -555,7 +649,14 @@ async fn run_turn(
                 request.resume.clone()
             }
         };
-        *slot = Some(Live::spawn(program, &launch, &model, resume.as_deref()).await?);
+        *slot = Some(
+            Live::spawn(program, &launch, &model, resume.as_deref(), Watch {
+                unread: conversation.unread.clone(),
+                conversation: request.conversation.clone(),
+                sink: unasked.clone(),
+            })
+            .await?,
+        );
         fresh = true;
     }
     let live = slot.as_mut().expect("a session was just put there");
@@ -588,7 +689,10 @@ async fn run_turn(
                 activity: Activity::Background { tasks: Vec::new() },
             })
             .await;
-    } else {
+    } else if !listen_only {
+        // Never for a turn opened to *hear* one of these. Dropping the unasked turn's content is
+        // right when it would land under a question it does not answer, and exactly wrong when the
+        // turn was opened to put it somewhere of its own. See [`super::AgentDriver::listen_only`].
         drain_between_turns(live, tx).await;
     }
 
@@ -607,10 +711,24 @@ async fn run_turn(
     }
 
     let prompt = ClaudeCliProvider::prompt_from(&request.messages);
-    live.say(prompt).await?;
 
-    // Nothing after this point returns `Err`: the process is up and talking, so whatever happens
-    // is something it said, and the turn keeps whatever it produced before it.
+    // Whether the prompt has gone out, and how many turn endings stand between here and the end of
+    // this one.
+    //
+    // `drain_between_turns` above took what had already arrived, but a turn nobody asked for that
+    // is *still going* is not over: the CLI queues the prompt behind it, and the first `result`
+    // after that is theirs. Ending on it is how a message that had not been read yet came back as
+    // a turn that said nothing.
+    let mut said = false;
+    let mut owed = 0usize;
+    if !listen_only {
+        live.say(prompt).await?;
+        said = true;
+        owed = if live.busy { 2 } else { 1 };
+    }
+
+    // Nothing after this point returns `Err`: the process is up and talking, so whatever happens is
+    // something it said, and the turn keeps whatever it produced before it.
     let mut refused = 0usize;
     let mut interrupted = false;
     let mut finished = false;
@@ -619,6 +737,10 @@ async fn run_turn(
     let mut abandoned = false;
     // Whether the context question in flight is the one that ends the turn.
     let mut ending = false;
+    // Lines read during that wait, which belong to whatever comes next. Held here rather than put
+    // straight back where the next turn will find them, because this loop reads from there too —
+    // put back, the same line is read, put back and read again, forever.
+    let mut held: Vec<String> = Vec::new();
     // How full the CLI's context is, asked while it works rather than once at the end.
     //
     // This is what the meter is for, and it only means anything if it moves: "should I start a new
@@ -632,6 +754,19 @@ async fn run_turn(
     tokio::pin!(giveup);
 
     loop {
+        // A turn opened to hold what the agent is already saying — see `listen_only`. It has
+        // nothing to ask, so it says nothing and reads until that turn is over. Nothing was drained
+        // on the way in, because dropping the very thing this turn exists to show would be the one
+        // mistake it cannot make; so it reads what has arrived first and then decides. An empty
+        // pipe with nothing running means it has all been read, and there is nothing to wait for.
+        if listen_only && !said && live.pushed_back.is_empty() && live.lines.is_empty() {
+            if !live.busy {
+                finished = true;
+                break;
+            }
+            said = true;
+            owed = 1;
+        }
         tokio::select! {
             biased;
             // Somebody changed the model or the permission mode while this was running. Both are
@@ -678,23 +813,29 @@ async fn run_turn(
                 }
                 break;
             }
-            line = live.lines.next_line() => {
-                let line = match line {
-                    Ok(Some(line)) => line,
-                    // The process is gone. Whatever it managed to say is already in the turn.
-                    Ok(None) => break,
-                    Err(e) => {
-                        let _ = tx.send(ProviderEvent::Error {
-                            message: format!("reading {program} output: {e}"),
-                            retryable: false,
-                        }).await;
-                        *slot = None;
-                        return Ok(Outcome::Done);
-                    }
-                };
+            line = async {
+                // What a previous turn read past its own ending comes first, in the order it was
+                // said. See [`Live::pushed_back`].
+                match live.pushed_back.pop_front() {
+                    Some(line) => Some(line),
+                    None => live.lines.recv().await,
+                }
+            } => {
+                // The process is gone. Whatever it managed to say is already in the turn.
+                let Some(line) = line else { break };
                 let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) else {
                     continue; // non-JSON chatter on stdout is not fatal
                 };
+                // This turn is over and this is the wait for one last number. Anything the CLI
+                // says that is not that number belongs to what comes next.
+                if ending && v.get("type").and_then(Value::as_str) != Some("control_response") {
+                    held.push(line);
+                    continue;
+                }
+                // Whether a turn is running, ours or one of its own. Read for the boundary rather
+                // than for the handshake — what an `init` *carries* is forwarded below with
+                // everything else, and a `result` is acted on where it is read.
+                live.note_boundary(&v);
                 // The CLI declined to pick up where it left off. Nothing has been forwarded and
                 // the turn has not begun, so this is not a failure to report — it is a token to
                 // throw away, said to the caller who is holding it.
@@ -814,10 +955,20 @@ async fn run_turn(
                         break;
                     }
                 }
-                // The turn is over, and the process is not. Before letting it go back to waiting,
-                // ask the one question only it can answer: how full its context is. See
-                // [`context_usage`].
+                // A turn is over, and the process is not.
+                //
+                // Not necessarily *this* turn: a `result` closing something the CLI started for
+                // itself, or closing the turn ours is queued behind, is one more line to forward
+                // and not the end of the answer. Ending here is how a message that had not even
+                // been sent yet came back as a turn that said nothing.
                 if v.get("type").and_then(|t| t.as_str()) == Some("result") {
+                    owed = owed.saturating_sub(1);
+                    // Abandoned is the exception, and the reason is the one draining exists for:
+                    // there is nobody to give the rest to, so the process is left at the first turn
+                    // boundary going rather than the one this turn was promised.
+                    if !abandoned && (!said || owed > 0) {
+                        continue;
+                    }
                     finished = true;
                     // Not when it has been abandoned: there is nobody to tell, and asking would
                     // re-arm the deadline that an interrupt has already pointed at killing the
@@ -838,6 +989,11 @@ async fn run_turn(
                 }
             }
         }
+    }
+
+    // Whatever arrived after the answer was already given, left where the next turn reads first.
+    if let Some(live) = slot.as_mut() {
+        live.pushed_back.extend(held);
     }
 
     // Said once, at the end, rather than per refusal: the transcript already shows each refused
@@ -914,15 +1070,23 @@ async fn drain_between_turns(live: &mut Live, tx: &mpsc::Sender<ProviderEvent>) 
     /// Far more than a turn boundary ever leaves behind, and small enough to be free.
     const CAP: usize = 512;
     for _ in 0..CAP {
-        let line = match tokio::time::timeout(Duration::ZERO, live.lines.next_line()).await {
-            // Nothing more has arrived: the common case, and the only one that costs anything.
-            Err(_) => return,
-            Ok(Ok(Some(line))) => line,
-            // The process is gone, or said something unreadable. Either way the turn below is the
-            // thing that reports it — it has a `tx` nobody has closed and an error path already.
-            Ok(Ok(None)) | Ok(Err(_)) => return,
+        // What a previous turn read past its own ending first, then whatever the reader has
+        // collected since. Nothing is *waited* for: both are what has already arrived.
+        let line = match live.pushed_back.pop_front() {
+            Some(line) => line,
+            None => match live.lines.try_recv() {
+                Ok(line) => line,
+                // Nothing more has arrived, or the process is gone. Either way the turn below is
+                // the thing that reports it — it has a `tx` nobody has closed and an error path
+                // already.
+                Err(_) => return,
+            },
         };
         let Ok(v) = serde_json::from_str::<Value>(&line) else { continue };
+        // Counted even though most of it is dropped. A turn nobody asked for that has *ended* is
+        // one the prompt below is not queued behind; one still running is, and the turn loop has to
+        // wait for its ending as well as its own. See `owed`.
+        live.note_boundary(&v);
         // Only what the CLI says about the *conversation*. `type: "system"` is the family that
         // carries it — the live set of background tasks, a task's status, the report a finished one
         // files — and `sse::claude_cli_line` already knows which of those are worth an event and
@@ -997,6 +1161,60 @@ fn control_failure(v: &serde_json::Value) -> Option<ProviderEvent> {
     })
 }
 
+/// What the reader task needs in order to notice a turn nobody asked for.
+///
+/// It reads the pipe for the life of the process, which means it is the only thing looking at it
+/// between turns — and between turns is exactly when the CLI answers its own backgrounded work.
+/// See [`super::Unasked`].
+#[derive(Clone)]
+struct Watch {
+    unread: Arc<Unread>,
+    conversation: SessionId,
+    sink: Option<Arc<dyn super::Unasked>>,
+}
+
+impl Watch {
+    /// One line off the pipe, looked at only when nobody else is looking.
+    ///
+    /// `system`/`init` is what the CLI says at the top of every turn it starts. Parsed rather than
+    /// matched as a substring, and only in the detached case, so an attached turn pays nothing.
+    fn opens_a_turn(&self, line: &str) -> bool {
+        if self.sink.is_none() {
+            return false;
+        }
+        let Ok(v) = serde_json::from_str::<Value>(line) else { return false };
+        v.get("type").and_then(Value::as_str) == Some("system")
+            && v.get("subtype").and_then(Value::as_str) == Some("init")
+    }
+
+    fn reading(&self) -> bool {
+        self.unread.attached.load(std::sync::atomic::Ordering::SeqCst) > 0
+    }
+
+    /// A turn has begun. Report it if nothing is reading, and otherwise leave the note that
+    /// whoever is reading clears by getting to it. See [`Unread`].
+    fn began(&self) {
+        if self.reading() {
+            self.unread.pending.store(true, std::sync::atomic::Ordering::SeqCst);
+            // Checked again, because the last reader may have gone between the two — and it takes
+            // what is pending with it on the way out, so a note left after that lands nowhere.
+            if self.reading() {
+                return;
+            }
+            if !self.unread.pending.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                return;
+            }
+        }
+        self.report();
+    }
+
+    fn report(&self) {
+        if let Some(sink) = &self.sink {
+            sink.began(&self.conversation);
+        }
+    }
+}
+
 impl Live {
     /// Start one, resuming a conversation a previous process was holding.
     async fn spawn(
@@ -1004,6 +1222,7 @@ impl Live {
         launch: &Launch,
         model: &str,
         resume: Option<&str>,
+        watch: Watch,
     ) -> Result<Self, String> {
         let mut cmd = Command::new(program);
         if !launch.cwd.as_os_str().is_empty() {
@@ -1058,10 +1277,35 @@ impl Live {
             });
         }
 
+        // Stdout is read for the life of the *process*, not the length of a turn. See
+        // [`Live::lines`] for what is on the other end of that distinction. A read error is left
+        // to the `None` it is immediately followed by: the interesting half of a broken pipe is
+        // the exit status and the stderr, and both are collected where the turn ends.
+        let (line_tx, lines) = mpsc::unbounded_channel();
+        let unread = watch.unread.clone();
+        tokio::spawn(async move {
+            let mut l = BufReader::new(stdout).lines();
+            while let Ok(Some(line)) = l.next_line().await {
+                let opens = watch.opens_a_turn(&line);
+                if line_tx.send(line).is_err() {
+                    break;
+                }
+                // After the send, never before: the workspace answers this by opening a turn to
+                // read, and a turn that arrives before the line it was opened for finds an empty
+                // pipe and closes again.
+                if opens {
+                    watch.began();
+                }
+            }
+        });
+
         Ok(Self {
             child,
             stdin,
-            lines: BufReader::new(stdout).lines(),
+            lines,
+            busy: false,
+            unread,
+            pushed_back: std::collections::VecDeque::new(),
             stderr: buf,
             state: sse::ClaudeState::default(),
             session: resume.map(str::to_string),
@@ -1072,6 +1316,25 @@ impl Live {
             // skip the control request that gets it there.
             mode: if launch.dangerous { PermissionMode::Allow } else { PermissionMode::Ask },
         })
+    }
+
+    /// Note what one line says about whether a turn is running.
+    ///
+    /// `system`/`init` opens a turn and `result` closes one, for turns the CLI starts of its own
+    /// accord as much as for ours. A flag rather than a count on purpose: a count that drifts
+    /// upward is a turn waiting for an ending that never comes, where a flag is wrong by at most
+    /// one ending and an install that stopped emitting `init` would simply put this back where it
+    /// was.
+    fn note_boundary(&mut self, v: &Value) {
+        match v.get("type").and_then(Value::as_str) {
+            Some("system") if v.get("subtype").and_then(Value::as_str) == Some("init") => {
+                self.busy = true;
+                // Somebody is reading it, so it is not news. See [`Unread::pending`].
+                self.unread.pending.store(false, std::sync::atomic::Ordering::SeqCst);
+            }
+            Some("result") => self.busy = false,
+            _ => {}
+        }
     }
 
     /// Ask the running session to change something about itself, or to say something about itself.
@@ -1136,6 +1399,14 @@ impl super::AgentDriver for ClaudeCliProvider {
 
     fn set_permission_asker(&self, asker: Arc<dyn PermissionAsker>) {
         *self.asker.lock().expect("asker lock poisoned") = Some(asker);
+    }
+
+    fn set_unasked(&self, sink: Arc<dyn super::Unasked>) {
+        *self.unasked.lock().expect("unasked lock poisoned") = Some(sink);
+    }
+
+    fn listen_only(&self, conversation: &SessionId) {
+        self.slot(conversation).listen.store(true, std::sync::atomic::Ordering::Relaxed);
     }
 }
 
@@ -1370,6 +1641,196 @@ mod tests {
             "spawned in {saw:?}, wanted {}",
             work.display()
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A turn the CLI started for itself must not end the turn neosh asked for.
+    ///
+    /// The failure, from a real transcript: the agent backgrounds a command and says it will
+    /// report back. The command finishes, `claude` enqueues a notification to itself and answers
+    /// it — a whole turn of `init`, text and `result` on a stdout nothing was reading. Type
+    /// anything and two things went wrong at once: that turn appeared all at once as though it
+    /// were the reply, and its `result` ended the turn before the CLI had even taken the message
+    /// off its own queue. What you typed was never answered and nothing said so.
+    ///
+    /// A real child rather than a mock, for the same reason the directory test uses one: the whole
+    /// bug lives in what is on the pipe and when, and nothing short of a process writing to one
+    /// would have caught it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_turn_the_cli_started_for_itself_does_not_end_the_one_we_asked_for() {
+        use futures::StreamExt;
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join(format!("neosh-unasked-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("dirs");
+        let script = dir.join("fake-claude");
+        // Turn one is answered, and then — with nobody having asked — a turn of its own *begins*
+        // and does not finish: `init`, and the rest of it only once the next prompt has been read.
+        // That is the case the drain cannot cover, because the turn is still going when the prompt
+        // goes in and the CLI queues it behind them.
+        std::fs::write(
+            &script,
+            r#"#!/bin/sh
+n=0
+spoke=
+pending=
+while IFS= read -r line; do
+  case "$line" in
+    *control_request*)
+      id=`printf '%s' "$line" | sed 's/.*"request_id":"\([^"]*\)".*/\1/'`
+      printf '{"type":"control_response","response":{"subtype":"success","request_id":"%s","response":{"totalTokens":10,"maxTokens":100}}}\n' "$id"
+      if [ "$n" = 1 ] && [ -z "$spoke" ]; then
+        spoke=1
+        pending=1
+        printf '{"type":"system","subtype":"init","session_id":"s","slash_commands":[]}\n'
+      fi
+      continue
+      ;;
+  esac
+  if [ -n "$pending" ]; then
+    pending=
+    printf '{"type":"result","subtype":"success","is_error":false,"session_id":"s","result":"the background command finished"}\n'
+  fi
+  n=`expr $n + 1`
+  printf '{"type":"system","subtype":"init","session_id":"s","slash_commands":[]}\n'
+  printf '{"type":"result","subtype":"success","is_error":false,"session_id":"s","result":"answer %s"}\n' "$n"
+done
+"#,
+        )
+        .expect("script");
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+
+        let p = ClaudeCliProvider::new(script.display().to_string());
+        let said = |evs: Vec<ProviderEvent>| {
+            evs.into_iter()
+                .filter_map(|e| match e {
+                    ProviderEvent::TextDelta { text, .. } => Some(text),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join(" / ")
+        };
+
+        let first: Vec<_> =
+            p.stream(&inst(), req("claude-opus-5"), CancellationToken::new()).collect().await;
+        assert_eq!(said(first), "answer 1");
+
+        // The same conversation, so the same process — and a turn of the CLI's own still running on
+        // it when the prompt goes in.
+        let second: Vec<_> =
+            p.stream(&inst(), req("claude-opus-5"), CancellationToken::new()).collect().await;
+        assert_eq!(
+            said(second),
+            "the background command finished / answer 2",
+            "the ending that arrives first belongs to the turn this one was queued behind, and the \
+             message that was actually sent is still answered after it"
+        );
+
+        p.shutdown(&neosh_proto::SessionId::from("test"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Nobody asked, so the workspace is told — and the turn it opens listens without speaking.
+    ///
+    /// The other half of the failure above. Reading the unasked-for turn at the top of the *next*
+    /// message stops it being lost and stops it eating that message's answer, but it is still
+    /// invisible until somebody types: the agent says it will report back when the build lands,
+    /// the build lands, and the screen never changes. So the driver says so the moment it happens,
+    /// and the turn opened for it says nothing of its own — one that spoke would be asking a
+    /// second question on top of the one being answered.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_agent_that_speaks_unprompted_is_reported_and_then_listened_to() {
+        use futures::StreamExt;
+        use std::os::unix::fs::PermissionsExt;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        #[derive(Debug, Default)]
+        struct Heard(AtomicUsize);
+        impl super::super::Unasked for Heard {
+            fn began(&self, _conversation: &SessionId) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        let dir = std::env::temp_dir().join(format!("neosh-unprompted-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("dirs");
+        let script = dir.join("fake-claude");
+        // Turn one is answered and the context question that closes it is answered too — and only
+        // then, with the turn over and nothing reading, does a turn nobody asked for begin. The
+        // second half of it arrives a moment later, so the listening turn has something to wait
+        // for rather than a pipe that is already empty.
+        std::fs::write(
+            &script,
+            r#"#!/bin/sh
+n=0
+spoke=
+while IFS= read -r line; do
+  case "$line" in
+    *control_request*)
+      id=`printf '%s' "$line" | sed 's/.*"request_id":"\([^"]*\)".*/\1/'`
+      printf '{"type":"control_response","response":{"subtype":"success","request_id":"%s","response":{"totalTokens":10,"maxTokens":100}}}\n' "$id"
+      if [ "$n" = 1 ] && [ -z "$spoke" ]; then
+        spoke=1
+        printf '{"type":"system","subtype":"init","session_id":"s","slash_commands":[]}\n'
+        sleep 1
+        printf '{"type":"result","subtype":"success","is_error":false,"session_id":"s","result":"the background command finished"}\n'
+      fi
+      continue
+      ;;
+  esac
+  n=`expr $n + 1`
+  printf '{"type":"system","subtype":"init","session_id":"s","slash_commands":[]}\n'
+  printf '{"type":"result","subtype":"success","is_error":false,"session_id":"s","result":"answer %s"}\n' "$n"
+done
+"#,
+        )
+        .expect("script");
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+
+        let p = ClaudeCliProvider::new(script.display().to_string());
+        let heard = Arc::new(Heard::default());
+        crate::drivers::AgentDriver::set_unasked(&p, heard.clone());
+        let conversation = SessionId::from("test");
+        let said = |evs: Vec<ProviderEvent>| {
+            evs.into_iter()
+                .filter_map(|e| match e {
+                    ProviderEvent::TextDelta { text, .. } => Some(text),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join(" / ")
+        };
+
+        let first: Vec<_> =
+            p.stream(&inst(), req("claude-opus-5"), CancellationToken::new()).collect().await;
+        assert_eq!(said(first), "answer 1");
+
+        // Nothing is attached now, so the next thing the CLI says on its own is news.
+        for _ in 0..200 {
+            if heard.0.load(Ordering::SeqCst) > 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert_eq!(heard.0.load(Ordering::SeqCst), 1, "the workspace was never told");
+
+        // What the host does with that: mark the next turn as one that only listens, and open it.
+        crate::drivers::AgentDriver::listen_only(&p, &conversation);
+        let mut listening = req("claude-opus-5");
+        listening.messages.clear();
+        let heard_out: Vec<_> =
+            p.stream(&inst(), listening, CancellationToken::new()).collect().await;
+        assert_eq!(
+            said(heard_out),
+            "the background command finished",
+            "a turn opened to listen hears the rest of what was already being said"
+        );
+        // And says nothing while doing it: a prompt down that pipe would have come back "answer 2".
+        assert_eq!(heard.0.load(Ordering::SeqCst), 1, "and started nothing of its own");
+
+        p.shutdown(&conversation);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
