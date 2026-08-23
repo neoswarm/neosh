@@ -230,7 +230,7 @@ impl Session {
         let virt = self.sidebar_virt_now();
         text.iter()
             .zip(virt.iter())
-            .filter(|(l, v)| l.starts_with("    ") && !v.trim().is_empty())
+            .filter(|(l, v)| l.starts_with(CONVERSATION_INDENT) && !v.trim().is_empty())
             .count()
     }
 
@@ -2073,6 +2073,12 @@ fn a_running_turn_says_how_long_it_has_been_running() {
 /// an emoji, so a terminal with a colour-emoji font draws it from there and hands back an outline.
 const STAR: char = '\u{2605}';
 
+/// What a conversation's row is indented by, and therefore what tells one from a project's.
+///
+/// A project sits one column in and a conversation three, which is the same two-column step a
+/// worktree takes from the repository it is a tree of.
+const CONVERSATION_INDENT: &str = "   ";
+
 /// Project rows carrying the favourite mark.
 ///
 /// Scoped to rows naming a project, because the hint strip also prints a star — that is the point
@@ -2424,7 +2430,11 @@ fn a_worktree_nests_under_the_repository_it_belongs_to() {
             match (repo, tree) {
                 // Below its repository, indented past the repository's own arrow, and the branch
                 // alone — `work · sideline` is the flat list this replaced.
-                (Some(r), Some(t)) => t > r && rows[t].starts_with("    ") && !rows[t].contains('\u{b7}'),
+                (Some(r), Some(t)) => {
+                    t > r
+                        && rows[t].starts_with(CONVERSATION_INDENT)
+                        && !rows[t].contains('\u{b7}')
+                }
                 _ => false,
             }
         }),
@@ -2474,7 +2484,7 @@ fn an_emptied_worktree_is_still_inside_its_repository() {
             let repo = rows.iter().position(|l| l.contains("work") && !l.contains("sideline"));
             let tree = rows.iter().position(|l| l.contains("sideline"));
             match (repo, tree) {
-                (Some(r), Some(t)) => t > r && rows[t].starts_with("    "),
+                (Some(r), Some(t)) => t > r && rows[t].starts_with(CONVERSATION_INDENT),
                 _ => false,
             }
         }),
