@@ -484,6 +484,8 @@ fn item_started(item: &Value, state: &mut CodexState) -> Vec<ProviderEvent> {
             role: str_at(item, "tool").map(str::to_string),
             parent_call: None,
             model: str_at(item, "model").map(str::to_string),
+            // codex blocks the turn on both of its sub-agent shapes; nothing here is let go of.
+            backgrounded: false,
         })],
         "subAgentActivity" => vec![activity(Activity::TaskStarted {
             task: TaskId::from(str_at(item, "agentThreadId").unwrap_or(id)),
@@ -491,6 +493,7 @@ fn item_started(item: &Value, state: &mut CodexState) -> Vec<ProviderEvent> {
             role: None,
             parent_call: None,
             model: None,
+            backgrounded: false,
         })],
         "contextCompaction" => vec![activity(Activity::Compacted { before: None, after: None })],
         _ => Vec::new(),

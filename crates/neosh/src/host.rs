@@ -528,6 +528,14 @@ struct Round {
     started: std::time::Instant,
     /// What it is waiting on, when that is something other than the model.
     note: Option<String>,
+    /// Whether [`Self::note`] is a *wait* rather than a running tool.
+    ///
+    /// They end differently and only one of them ends by itself. A tool's note is cleared by the
+    /// tool coming back; a wait has no matching event and is cleared by being overtaken — the next
+    /// token is the usual way. Without telling them apart, an agent driver that says something
+    /// while a command is still running wipes `Running cargo test` off the line and puts the
+    /// generic verb back, which is the label flicker ADR 0033 chose a fixed verb to avoid.
+    note_is_wait: bool,
     /// Everything this turn has produced that the conversation does not hold yet.
     ///
     /// Cleared the moment the turn's messages land in the conversation, because from then on the
@@ -1888,6 +1896,7 @@ impl Host {
             verb,
             started: std::time::Instant::now(),
             note: None,
+            note_is_wait: false,
             said: Vec::new(),
             changes: Vec::new(),
             plan: Vec::new(),
@@ -6063,7 +6072,7 @@ impl Host {
         } else {
             Vec::new()
         };
-        let out: Vec<cards::TaskRow> = r
+        let mut out: Vec<cards::TaskRow> = r
             .tasks
             .iter()
             .filter(|t| t.listed())
@@ -6074,6 +6083,47 @@ impl Host {
                 live: t.status == neosh_proto::TaskStatus::Running,
             })
             .collect();
+        // And whatever else is running that this turn never started — a shell backgrounded two
+        // turns ago is not in any round, and the footer is the one surface that is on screen while
+        // you wait. Keyed by task id against what the round already has, since the level and the
+        // edges describe the same things and a task in both would otherwise be two rows.
+        //
+        // No clock on these: the level says what is running, never since when, and a duration
+        // counted from the moment this process first heard of it would be a number about neosh
+        // rather than about the work. `live: false` for the same reason it is on the block a
+        // finished turn leaves behind — nothing is waiting on them.
+        //
+        // The id is read *first* and on its own line. `active_session` locks the session store, and
+        // the store's mutex is not reentrant — written as `sessions().get(&self.active_session())`
+        // the receiver takes the lock and then the argument asks for it again, and the host loop
+        // stops dead with the panel frozen on whatever it last drew.
+        let seen: Vec<&neosh_proto::TaskId> = r.tasks.iter().map(|t| &t.id).collect();
+        let here = self.active_session();
+        let extra: Vec<(String, Option<String>)> = self
+            .agent
+            .sessions()
+            .get(&here)
+            .map(|s| {
+                s.background
+                    .iter()
+                    .filter(|t| !seen.contains(&&t.id))
+                    .map(|t| {
+                        let title = if t.title.is_empty() {
+                            "background task".to_string()
+                        } else {
+                            t.title.clone()
+                        };
+                        (title, t.kind.clone())
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        out.extend(extra.iter().map(|(title, kind)| cards::TaskRow {
+            title,
+            role: kind.as_deref(),
+            since: None,
+            live: false,
+        }));
         if !out.is_empty() {
             rows.extend(cards::tasks(&g, &out, width));
         }
@@ -6082,24 +6132,66 @@ impl Host {
 
     /// What is still out when the turn stops waiting for it, as rows to leave behind.
     fn tasks_left_running(&self, session: &neosh_proto::SessionId) -> Vec<cards::Row> {
-        let Some(r) = self.rounds.get(session) else { return Vec::new() };
-        let left: Vec<cards::TaskRow> = r
-            .tasks
+        // The level first, and the turn's own bookends only when there is no level to be had.
+        //
+        // A driver that reports the whole live set is telling us the answer; the turn's list is a
+        // reconstruction of it from edges, and the two disagree exactly where reconstructions do —
+        // a shell backgrounded three turns ago is in the level and in no round at all. Codex has no
+        // level signal, so the edges are all there is there, and dropping them would trade one
+        // driver's accuracy for another's silence.
+        //
+        // Copied out rather than borrowed: `sessions()` is a lock guard, and a `TaskRow` borrows
+        // the strings it names.
+        let level: Vec<(String, Option<String>)> = self
+            .agent
+            .sessions()
+            .get(session)
+            .map(|s| {
+                s.background
+                    .iter()
+                    .map(|t| {
+                        let title = if t.title.is_empty() {
+                            "background task".to_string()
+                        } else {
+                            t.title.clone()
+                        };
+                        (title, t.kind.clone())
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let level: Vec<cards::TaskRow> = level
             .iter()
-            .filter(|t| t.listed())
-            .map(|t| cards::TaskRow {
-                title: &t.title,
-                role: t.role.as_deref(),
+            .map(|(title, kind)| cards::TaskRow {
+                title,
+                role: kind.as_deref(),
                 // No clock. It is still running and this row is not: a frozen number beside
                 // something that is still going is worse than no number.
                 since: None,
                 live: false,
             })
             .collect();
+        let left = if level.is_empty() {
+            let Some(r) = self.rounds.get(session) else { return Vec::new() };
+            r.tasks
+                .iter()
+                .filter(|t| t.listed())
+                .map(|t| cards::TaskRow {
+                    title: &t.title,
+                    role: t.role.as_deref(),
+                    since: None,
+                    live: false,
+                })
+                .collect()
+        } else {
+            level
+        };
         if left.is_empty() {
             return Vec::new();
         }
-        cards::tasks(&self.glyphs(), &left, self.chat_width())
+        let mut rows = cards::still_running(&self.glyphs(), left.len());
+        rows.extend(cards::tasks(&self.glyphs(), &left, self.chat_width()));
+        rows
     }
 
     /// Move the clock on anything in the footer that has one.
@@ -6307,6 +6399,15 @@ impl Host {
             }
             AgentEvent::Token { session, turn, text } => {
                 if let Some(r) = self.rounds.get_mut(&session) {
+                    // Whatever it was waiting for, it is not waiting any more — the model is
+                    // talking. There is no event for a wait *ending*: a driver that has stopped
+                    // waiting simply gets on with the thing it was waiting to do, and this is it.
+                    // Cheap to leave in the hot path because it only writes when there is something
+                    // to clear, which is almost never.
+                    if r.note_is_wait {
+                        r.note = None;
+                        r.note_is_wait = false;
+                    }
                     match r.said.last_mut() {
                         Some(Said::Text(t)) => t.push_str(&text),
                         _ => r.said.push(Said::Text(text.clone())),
@@ -6341,6 +6442,7 @@ impl Host {
             AgentEvent::ToolStarted { session, turn, call } => {
                 if let Some(r) = self.rounds.get_mut(&session) {
                     r.note = Some(format!("Running {}", call.name));
+                    r.note_is_wait = false;
                     r.said.push(Said::Tool { call: call.clone(), result: None });
                 }
                 if on_screen {
@@ -6354,6 +6456,7 @@ impl Host {
             AgentEvent::ToolFinished { session, turn, call, result } => {
                 if let Some(r) = self.rounds.get_mut(&session) {
                     r.note = None;
+                    r.note_is_wait = false;
                     // The call this answers, so a replay of the round draws the pair rather than a
                     // dot that is still pulsing over a tool that came back minutes ago.
                     for said in r.said.iter_mut().rev() {
@@ -6553,13 +6656,21 @@ impl Host {
             // once when this turn's own call starts one — so this is written to be idempotent.
             // The second telling knows more (which call it belongs to, which kind of agent it is)
             // and is allowed to fill in what the first could not.
-            Activity::TaskStarted { task, title, role, .. } => {
+            Activity::TaskStarted { task, title, role, backgrounded, .. } => {
                 let Some(r) = self.rounds.get_mut(&session) else { return };
+                // Let go of at the moment it started — a detached shell, a sub-agent spawned into
+                // the background — is not something this turn is waiting on, and the footer draws
+                // it still rather than live from the first frame it appears in.
+                let status =
+                    if backgrounded { TaskStatus::Backgrounded } else { TaskStatus::Running };
                 match r.tasks.iter_mut().find(|t| t.id == task) {
                     Some(t) => {
                         t.title = title;
                         if role.is_some() {
                             t.role = role;
+                        }
+                        if backgrounded {
+                            t.status = status;
                         }
                     }
                     None => r.tasks.push(Task {
@@ -6567,7 +6678,7 @@ impl Host {
                         title,
                         role,
                         since: std::time::Instant::now(),
-                        status: TaskStatus::Running,
+                        status,
                     }),
                 }
                 if on_screen {
@@ -6587,6 +6698,37 @@ impl Host {
                     self.redraw_footer();
                 }
             }
+            // The whole set, whole, and therefore *replacing* the whole set. Not merged into the
+            // turn's own list of sub-agents: that one is edges — what this turn started and is
+            // waiting on — and this is a level, said by the driver precisely so that a receiver
+            // which only wants "is anything still running" cannot wedge on a bookend it never got.
+            // See `Activity::Background`.
+            //
+            // On the conversation and not the round, which is the entire point: the round is thrown
+            // away when the turn ends, and a shell that was put in the background is still running
+            // after that.
+            Activity::Background { tasks } => {
+                // `if let` and not `let ... else`: the temporary `sessions()` hands back does not
+                // outlive a `let`-else, and the borrow it yields is what is being written through.
+                let changed = if let Some(s) = self.agent.sessions().get_mut(&session) {
+                    let changed = s.background != tasks;
+                    s.background = tasks;
+                    changed
+                } else {
+                    return;
+                };
+                if !changed {
+                    return;
+                }
+                // Nothing else is broadcast here: the activity itself already went out to every
+                // plugin above, and that is the signal that means what it means. `SessionChanged`
+                // means the conversation you are *in* changed, and borrowing it to say "a row's
+                // state moved" would have every listener refreshing a footer about a conversation
+                // nobody switched to.
+                if on_screen {
+                    self.redraw_footer();
+                }
+            }
             Activity::TaskEnded { task, status, .. } => {
                 let Some(r) = self.rounds.get_mut(&session) else { return };
                 let Some(t) = r.tasks.iter_mut().find(|t| t.id == task) else { return };
@@ -6598,11 +6740,31 @@ impl Host {
                     self.redraw_footer();
                 }
             }
+            // Not answering, and now the line says why.
+            //
+            // Straight onto the working line rather than into the transcript: it is a state and not
+            // an event, it is over in seconds or minutes, and a row about it would still be sitting
+            // in the conversation a week later saying nothing anybody wants. The clock beside it is
+            // the turn's own and keeps running, which is the half that makes a wait bearable.
+            Activity::Waiting { what, retry_in_ms } => {
+                let Some(r) = self.rounds.get_mut(&session) else { return };
+                r.note_is_wait = true;
+                r.note = Some(match retry_in_ms {
+                    // Rounded up, because a wait reported as `0s` is a wait that reads as a lie.
+                    Some(ms) => format!("{what} \u{b7} in {}s", ms.div_ceil(1000).max(1)),
+                    None => what,
+                });
+                if on_screen {
+                    self.draw_working();
+                }
+            }
             // The several seconds where the driver answers nothing at all. Without this it is
             // indistinguishable from a hang, which is exactly what `/compact` looked like.
             Activity::Compacting => {
                 if let Some(r) = self.rounds.get_mut(&session) {
                     r.note = Some("Compacting the conversation".into());
+                    // Ended by `Compacted`, which is a real event, so it is not a self-ending wait.
+                    r.note_is_wait = false;
                 }
                 if on_screen {
                     self.draw_working();
@@ -6611,6 +6773,7 @@ impl Host {
             Activity::Compacted { before, after } => {
                 if let Some(r) = self.rounds.get_mut(&session) {
                     r.note = None;
+                    r.note_is_wait = false;
                     // The plan was built from calls the driver can no longer see. Keeping it would
                     // be a checklist for work nothing is going to pick up.
                     r.plan.clear();

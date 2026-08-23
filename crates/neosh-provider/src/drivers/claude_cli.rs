@@ -537,6 +537,10 @@ async fn run_turn(
     // only kind that can be stale: one taken from a process this one is replacing was valid a
     // moment ago.
     let mut borrowed = false;
+    // Whether the process below was started by *this* call. A fresh one has nothing left over from
+    // a previous turn by definition, and everything it has said so far belongs to the turn about to
+    // run — including the `result` that says it would not resume. See [`drain_between_turns`].
+    let mut fresh = false;
     if slot.as_ref().is_none_or(|live| live.launched != launch) {
         let resume = match slot.take() {
             Some(live) => {
@@ -552,8 +556,41 @@ async fn run_turn(
             }
         };
         *slot = Some(Live::spawn(program, &launch, &model, resume.as_deref()).await?);
+        fresh = true;
     }
     let live = slot.as_mut().expect("a session was just put there");
+
+    // Whatever the CLI said while nobody was reading.
+    //
+    // A turn stops being read at its `result`, and the process does not stop talking there. A
+    // shell the agent put in the background finishes minutes later, and the CLI says so —
+    // `background_tasks_changed`, `task_updated`, `task_notification` — and then *starts a turn of
+    // its own* to react to it: a fresh `init`, an assistant message, and a `result`, with nobody
+    // having asked it anything. All of it is still sitting in the pipe when the next question is
+    // asked, and the loop below reads it as the answer to that question. The stray `result` ends
+    // the turn before the CLI has even seen the prompt, so the reply drawn under what you typed is
+    // the model's reaction to a shell exiting, and your actual answer arrives one turn late.
+    //
+    // So it is read *here*, before the prompt goes in, and split: what the CLI said about the
+    // conversation is forwarded — those are level and edge facts, idempotent and keyed by task, and
+    // the whole reason the indicator can be put right at all — and the unasked turn's own content
+    // is dropped. Dropped rather than drawn: it is an answer to a question that was never put, and
+    // showing it under the one that was is the mis-attribution this exists to stop. The CLI keeps
+    // it in its own history either way, so the model has not forgotten it; only the transcript has.
+    if fresh {
+        // A process that has just started is running nothing, and it will not say so: the live set
+        // is only ever reported when it *changes*, so a receiver that was told about two background
+        // shells by the process this one replaced would go on drawing them until something else
+        // happened to change the set — which, for shells that died with the old process, is never.
+        // The vendor's own rule for this signal, said on our wire: reset to empty on (re)start.
+        let _ = tx
+            .send(ProviderEvent::Activity {
+                activity: Activity::Background { tasks: Vec::new() },
+            })
+            .await;
+    } else {
+        drain_between_turns(live, tx).await;
+    }
 
     // Fired rather than awaited. Ordering on one pipe is enough: the CLI reads these before it
     // reads the message below, so the turn runs with the new setting. An answer that says the
@@ -855,6 +892,66 @@ fn stale_resume(v: &Value) -> bool {
         .and_then(Value::as_array)
         .is_some_and(|e| e.iter().filter_map(Value::as_str).any(gone))
         || v.get("result").and_then(Value::as_str).is_some_and(gone)
+}
+
+/// Read everything the CLI already said while no turn was listening, and keep only the part that is
+/// about the conversation rather than about a turn nobody asked for.
+///
+/// Bounded twice, because this runs on the path that sends every message. Nothing is *waited* for —
+/// a zero timeout takes what has already arrived and stops the moment the pipe would block, so a
+/// quiet process costs one poll — and a process that has been talking to itself for an hour cannot
+/// hold a keystroke open: past the cap the rest is left where it is and read as part of this turn,
+/// which is the behaviour this replaces and no worse than it.
+///
+/// A partly-arrived line is not lost by stopping: `Lines` keeps what it has buffered and the turn
+/// loop picks the rest up.
+///
+/// Never called on a process this turn started. A fresh one has no previous turn to have leftovers
+/// from, and it has one thing to say that only the turn loop can act on: a `result` refusing to
+/// `--resume`, which is read there as a token to throw away rather than as an answer. Draining that
+/// would drop it, and the turn would then wait on a process that had already given up.
+async fn drain_between_turns(live: &mut Live, tx: &mpsc::Sender<ProviderEvent>) {
+    /// Far more than a turn boundary ever leaves behind, and small enough to be free.
+    const CAP: usize = 512;
+    for _ in 0..CAP {
+        let line = match tokio::time::timeout(Duration::ZERO, live.lines.next_line()).await {
+            // Nothing more has arrived: the common case, and the only one that costs anything.
+            Err(_) => return,
+            Ok(Ok(Some(line))) => line,
+            // The process is gone, or said something unreadable. Either way the turn below is the
+            // thing that reports it — it has a `tx` nobody has closed and an error path already.
+            Ok(Ok(None)) | Ok(Err(_)) => return,
+        };
+        let Ok(v) = serde_json::from_str::<Value>(&line) else { continue };
+        // Only what the CLI says about the *conversation*. `type: "system"` is the family that
+        // carries it — the live set of background tasks, a task's status, the report a finished one
+        // files — and `sse::claude_cli_line` already knows which of those are worth an event and
+        // which are noise. Everything else here belongs to the unasked turn: its `init`, its
+        // assistant blocks, the tool round it ran, and the `result` that would otherwise end this
+        // one before it started.
+        if v.get("type").and_then(Value::as_str) != Some("system") {
+            continue;
+        }
+        // Kept for the same reason the turn loop keeps it, and it is why this cannot simply skip
+        // what it does not forward: an unasked turn opens with an `init`, and `init` is where a new
+        // id for this conversation is announced. Missed here, the next process `--resume`s into a
+        // history that stops at the last turn somebody asked for.
+        if let Some(id) = v.get("session_id").and_then(Value::as_str).filter(|s| !s.is_empty())
+            && live.session.as_deref() != Some(id)
+        {
+            live.session = Some(id.to_string());
+            let _ = tx
+                .send(ProviderEvent::Activity {
+                    activity: Activity::Resume { token: id.to_string() },
+                })
+                .await;
+        }
+        for ev in sse::claude_cli_line(&v, &mut live.state) {
+            if tx.send(ev).await.is_err() {
+                return;
+            }
+        }
+    }
 }
 
 /// How full the CLI says its context is.
