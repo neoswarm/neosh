@@ -74,6 +74,15 @@ places that already apply a pending model and run a queued reload. A plugin whos
 returns still wedges those — it always has — and that is the argument for a load timeout, not
 against holding.
 
+One test in that suite was red for a different reason and is worth writing down beside these,
+because it is the same shape: the last-30-days block is read from `~/.claude/projects` and
+`~/.codex/sessions` — files another program wrote, which is the whole point of ADR 0044 — and the
+test asserted on whatever was in them. On a laptop that is a real month of work and the assertion
+passes; on a fresh runner it is `nothing in this span`. The sandbox now sets `CLAUDE_CONFIG_DIR`
+and `CODEX_HOME` the way it already set `NEOSH_STATE_DIR`, and the test writes the one transcript
+line it wants to count. Which also stops a hundred and forty-seven neoshes scanning somebody's real
+`~/.claude` on every run.
+
 Not fixed here: a *key* pressed before anything has bound it still does nothing. There is no name to
 hold — an unbound key produces no command — and holding raw keys would mean deciding what `^Q`
 means during startup, which is a different question with a worse failure mode.

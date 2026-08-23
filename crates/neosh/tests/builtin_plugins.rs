@@ -38,7 +38,9 @@ impl Sandbox {
     fn new(name: &str) -> Self {
         let root = std::env::temp_dir().join(format!("neosh-builtin-{}-{name}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
-        for d in ["config", "state", "work"] {
+        // `claude` and `codex` are the vendors' own homes, empty unless a test fills one. See
+        // `Sandbox::write_usage_history`.
+        for d in ["config", "state", "work", "claude/projects", "codex/sessions"] {
             std::fs::create_dir_all(root.join(d)).expect("sandbox dirs");
         }
         Self { root }
@@ -71,6 +73,34 @@ impl Sandbox {
         run(&["commit", "-m", "initial"]);
     }
 
+    /// One answer in a `claude` transcript, `hours_ago` old.
+    ///
+    /// The last-30-days block is read from `~/.claude/projects` and `~/.codex/sessions`, which are
+    /// files another program wrote — so a test that asserts on it has to bring its own. Without
+    /// this the assertion is about whatever the developer happened to have spent that month, which
+    /// is a test that passes on a laptop and says "nothing in this span" on a fresh runner.
+    fn write_usage_history(&self, model: &str, hours_ago: i64) {
+        let at = now_secs() - hours_ago * 3_600;
+        let dir = self.root.join("claude/projects/-tmp-neosh");
+        std::fs::create_dir_all(&dir).expect("transcript dir");
+        let line = serde_json::json!({
+            "type": "assistant",
+            "timestamp": iso_utc(at),
+            "requestId": "req-1",
+            "message": {
+                "id": "msg-1",
+                "model": model,
+                "usage": {
+                    "input_tokens": 12_000,
+                    "output_tokens": 3_000,
+                    "cache_read_input_tokens": 40_000,
+                    "cache_creation_input_tokens": 1_000,
+                },
+            },
+        });
+        std::fs::write(dir.join("session.jsonl"), format!("{line}\n")).expect("transcript");
+    }
+
     fn start(&self) -> Session {
         let child = Command::new(env!("CARGO_BIN_EXE_neosh"))
             .args(["--ui-protocol", "stdio"])
@@ -81,6 +111,11 @@ impl Sandbox {
             .args(["--mock-script", &fixture().display().to_string()])
             .args(["--model", "mock/mock"])
             .env("NEOSH_STATE_DIR", self.root.join("state"))
+            // The history block reads the *vendors'* transcripts rather than ours — see
+            // `crate::usage`. Pointed at this sandbox, because the alternative is a hundred and
+            // forty-seven neoshes scanning a real month of somebody's work and asserting on it.
+            .env("CLAUDE_CONFIG_DIR", self.root.join("claude"))
+            .env("CODEX_HOME", self.root.join("codex"))
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
@@ -88,6 +123,33 @@ impl Sandbox {
             .expect("neosh should start");
         Session::wrap(child)
     }
+}
+
+fn now_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or_default()
+}
+
+/// A unix second as `YYYY-MM-DDTHH:MM:SSZ`, which is what a transcript timestamp looks like.
+///
+/// Hinnant's `civil_from_days`, the companion to the `days_from_civil` in `crate::usage` that
+/// reads it back. Written out rather than pulled in: one date format in one direction is not worth
+/// a dependency, and the two halves failing together is easier to see when they are both here.
+fn iso_utc(secs: i64) -> String {
+    let (days, rest) = (secs.div_euclid(86_400), secs.rem_euclid(86_400));
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = yoe + era * 400 + i64::from(m <= 2);
+    let (h, mi, sec) = (rest / 3_600, (rest % 3_600) / 60, rest % 60);
+    format!("{y:04}-{m:02}-{d:02}T{h:02}:{mi:02}:{sec:02}Z")
 }
 
 fn fixture() -> PathBuf {
@@ -833,6 +895,11 @@ impl Sandbox {
             .arg(self.work())
             .args(["--mock-script", &script.display().to_string()])
             .env("NEOSH_STATE_DIR", self.root.join("state"))
+            // The history block reads the *vendors'* transcripts rather than ours — see
+            // `crate::usage`. Pointed at this sandbox, because the alternative is a hundred and
+            // forty-seven neoshes scanning a real month of somebody's work and asserting on it.
+            .env("CLAUDE_CONFIG_DIR", self.root.join("claude"))
+            .env("CODEX_HOME", self.root.join("codex"))
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null());
@@ -6117,6 +6184,9 @@ fn the_usage_panel_opens_with_the_plan_above_the_history() {
 fn the_usage_panel_swaps_metric_on_its_own_key() {
     let sb = Sandbox::new("planmetric");
     install_planner(&sb);
+    // A month with exactly one answer in it, so the breakdown below has a row to draw. Read off a
+    // transcript this test wrote, never off the developer's own.
+    sb.write_usage_history("claude-opus-4-8", 2);
     sb.write_config("[options]\n\"agent.model\" = \"planner/planner-1\"\n");
     let mut s = sb.start_letting_config_choose();
     s.wait_for("planner ready");
