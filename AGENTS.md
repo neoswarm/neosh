@@ -331,6 +331,19 @@ per decision, and records the *reasoning*, not the choice.
   one nothing can read back, so the bytes live once in the state directory and a driver reads them
   when it builds its request. The media type is read off the bytes, because a `.png` that is really
   a JPEG fails the turn. See ADR 0041.
+- **An agent that speaks when nobody asked is still speaking to you.** `claude` runs turns neosh
+  never sent: a backgrounded command finishing is enqueued as a message to itself and answered,
+  whole turn and all. So the reader outlives the turn the way the process does — stdout is read for
+  the life of the child, not the length of an answer — because a pipe nobody is reading loses that
+  turn, then fills, and then stops the CLI mid-sentence. **A turn ends on its own `result`**:
+  `system`/`init` opens one and `result` closes one for *their* turns as much as ours, the prompt
+  goes out only once what is already in the pipe has been read, and the first `result` after it is
+  somebody else's when the CLI queued you behind them. Ending on it is how three messages in a row
+  were drawn as sent, never asked, and each came back as `{"type":"thinking","text":""}`. And it is
+  said when it happens: the reader is the only thing watching between turns, so it reports
+  (`Unasked`) and the host opens a turn to hold it — one that **says nothing** (`listen_only`, and
+  no user message pushed), because a turn opened to hold an answer has no question above it. See
+  ADR 0054.
 - **A vendor CLI outlives the turn, so an abandoned turn has to be *drained*.** `Live::lines` is
   per conversation. A turn that is walked away from — `<Esc>`, a switch — leaves the CLI mid-answer
   with the rest of it in the pipe, and the next turn reads it as its own: someone else's reply, and

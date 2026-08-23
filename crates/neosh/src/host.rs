@@ -457,6 +457,13 @@ pub struct Host {
     /// awaited by whoever asked, because nobody asked: the interval did.
     quota_tx: tokio::sync::mpsc::UnboundedSender<crate::quota::Polled>,
     quota_rx: Option<tokio::sync::mpsc::UnboundedReceiver<crate::quota::Polled>>,
+    /// Conversations whose agent has started saying something nobody asked for.
+    ///
+    /// Out of band, like the quota poll and for the same reason: it is news from a driver that
+    /// arrives when no turn is running, so there is no stream for it to come back on. See
+    /// [`neosh_provider::drivers::Unasked`] and ADR 0054.
+    unasked_rx: Option<tokio::sync::mpsc::UnboundedReceiver<neosh_proto::SessionId>>,
+    unasked_tx: tokio::sync::mpsc::UnboundedSender<neosh_proto::SessionId>,
     /// Set by a turn ending, cleared by the poll that follows it. See [`crate::quota::AFTER_TURN`].
     quota_due: bool,
     /// Repositories by directory, discovered on demand.
@@ -736,6 +743,7 @@ impl Host {
     ) -> Self {
         let mut editor = Editor::new();
         let (quota_tx, quota_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (unasked_tx, unasked_rx) = tokio::sync::mpsc::unbounded_channel();
 
         let chat = editor.create_buffer("[chat]");
         let chat_win =
@@ -846,6 +854,8 @@ impl Host {
             quota: crate::quota::QuotaStore::new(None),
             quota_tx,
             quota_rx: Some(quota_rx),
+            unasked_rx: Some(unasked_rx),
+            unasked_tx,
             quota_due: false,
             repos: Default::default(),
             cwd: std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
@@ -1773,7 +1783,12 @@ impl Host {
             // Asking a question means you want to see the answer: scrolled-back state does not
             // survive sending, or the reply arrives somewhere off screen.
             self.scroll_chat(0);
-            self.chat_question(&prompt);
+            // Unless nothing was asked. A turn opened to hold something the agent had already
+            // started saying has an answer and no question, and a blank question row above it is
+            // a message the transcript claims you sent. See [`Self::hear_out`].
+            if !prompt.text.is_empty() || !prompt.images.is_empty() {
+                self.chat_question(&prompt);
+            }
             self.begin_working();
             // `\u{23ce}` steers from here until the turn is over, and the empty field is where that
             // has to be said — it is the one thing on screen you are looking at when you press it.
@@ -3283,9 +3298,15 @@ impl Host {
         // goes somewhere else entirely — see [`neosh_agent::DriverQuestioner`].
         let questioner: Arc<dyn neosh_provider::ask::QuestionAsker> =
             Arc::new(neosh_agent::DriverQuestioner::new(&self.agent, self.bridge.clone()));
+        // Where an agent that speaks unprompted is heard. One per workspace rather than one per
+        // driver: what comes back is the conversation it happened in, which is all the host needs
+        // to know where to put it.
+        let unasked: Arc<dyn neosh_provider::drivers::Unasked> =
+            Arc::new(UnaskedSink(self.unasked_tx.clone()));
         for d in &drivers {
             d.set_permission_asker(asker.clone());
             d.set_question_asker(questioner.clone());
+            d.set_unasked(unasked.clone());
         }
         self.agent_drivers = drivers;
         self.sync_agent_drivers();
@@ -6868,6 +6889,32 @@ impl Host {
         true
     }
 
+    /// Open a turn to hold something the agent has already started saying.
+    ///
+    /// A backgrounded command finishing is a message `claude` enqueues to itself and answers, and
+    /// the answer is this conversation's. With nothing reading it, the whole turn was invisible
+    /// until you next typed — and then it arrived all at once as though it were the reply to what
+    /// you had just sent, whose own answer never came. See ADR 0054.
+    ///
+    /// The turn says nothing: [`AgentDriver::listen_only`] is what tells the driver that, and it is
+    /// set here rather than carried on the wire because it is true of exactly the turn about to
+    /// start and of nothing else.
+    fn hear_out(&mut self, session: neosh_proto::SessionId) {
+        // A turn is already reading that pipe. Nothing to open, and opening one would put an empty
+        // message into a conversation that is mid-answer.
+        if self.turns.contains_key(&session) {
+            return;
+        }
+        // Gone since the driver said so — closed, or a workspace shutting down.
+        if !self.agent.sessions().list().iter().any(|s| s.id == session) {
+            return;
+        }
+        for d in &self.agent_drivers {
+            d.listen_only(&session);
+        }
+        self.start_turn_in(session, neosh_agent::Prompt::default());
+    }
+
     /// Emit one coalesced frame.
     async fn flush(&mut self) -> anyhow::Result<()> {
         // Anything worth drawing is something that might have changed what this workspace is
@@ -6920,6 +6967,7 @@ impl Host {
         // first screen has real numbers on it — a gauge that only appears after five minutes of
         // sitting there is one nobody knows exists.
         let mut quota_rx = self.quota_rx.take();
+        let mut unasked_rx = self.unasked_rx.take();
         let plan = tokio::time::sleep(crate::quota::AFTER_TURN);
         tokio::pin!(plan);
         // How many times in a row a poll has come back with nothing. Doubles the wait each time.
@@ -6972,6 +7020,13 @@ impl Host {
                         self.drain_effects();
                     }
                 }
+                Some(session) = async {
+                    match unasked_rx.as_mut() {
+                        Some(rx) => rx.recv().await,
+                        // Never ready, rather than ready-with-nothing: the latter would spin.
+                        None => std::future::pending().await,
+                    }
+                } => self.hear_out(session),
                 Some(polled) = async {
                     match quota_rx.as_mut() {
                         Some(rx) => rx.recv().await,
@@ -8517,6 +8572,21 @@ pub fn install_builtin_providers(
         }
     }
     out
+}
+
+/// The workspace, as somewhere a driver can say its agent started talking on its own.
+///
+/// A channel rather than a call into the host: this arrives from a reader task on a driver's own
+/// thread, and the host is a single writer that owns everything it would have to touch.
+#[derive(Debug)]
+struct UnaskedSink(tokio::sync::mpsc::UnboundedSender<neosh_proto::SessionId>);
+
+impl neosh_provider::drivers::Unasked for UnaskedSink {
+    fn began(&self, conversation: &neosh_proto::SessionId) {
+        // A closed channel is a workspace that has stopped. Nothing to report it to, and nothing
+        // to be done about it.
+        let _ = self.0.send(conversation.clone());
+    }
 }
 
 /// Route one slow call to its service.
