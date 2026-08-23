@@ -325,12 +325,19 @@ per decision, and records the *reasoning*, not the choice.
 - **A terminal cannot paste a picture, so pasting one is a key.** Bracketed paste is a text
   protocol: a screenshot arrives as nothing, and a dragged file arrives as its path. `^V` asks the
   system clipboard through whichever of `wl-paste`/`xclip`/`pngpaste`/`osascript`/`powershell` is
-  there; a pasted line that is unambiguously a path to an image becomes that image. An attachment
-  is a **chip above the field**, never a token in it — the message you send is the message you
-  typed. `ContentBlock::Image` carries a *path*, not bytes: a transcript that is mostly base64 is
-  one nothing can read back, so the bytes live once in the state directory and a driver reads them
-  when it builds its request. The media type is read off the bytes, because a `.png` that is really
-  a JPEG fails the turn. See ADR 0041.
+  there; a pasted line that is unambiguously a path to an image becomes that image. A clipboard is
+  **asked what it holds, not told**: the best picture type *on offer* is the one requested, because
+  asking for `image/png` and nothing else reads a JPEG, a WebP and a BMP as an empty clipboard. And
+  a picture copied off a page is often not on the clipboard at all — what a browser leaves is an
+  address (`text/uri-list`, an `<img src>` in `text/html`, a `data:` URI, a plain URL), so
+  `from_clipboard` answers with bytes *or* a `Remote` to go and get. That fetch is spawned rather
+  than awaited on the loop, carries the conversation it was asked in, and is the one attachment
+  that says something on the way. A photograph too busy to fit as a PNG is sent as a JPEG rather
+  than refused over an encoding. See ADR 0051. An attachment is a **chip above the field**, never a
+  token in it — the message you send is the message you typed. `ContentBlock::Image` carries a
+  *path*, not bytes: a transcript that is mostly base64 is one nothing can read back, so the bytes
+  live once in the state directory and a driver reads them when it builds its request. The media
+  type is read off the bytes, because a `.png` that is really a JPEG fails the turn. See ADR 0041.
 - **A vendor CLI outlives the turn, so an abandoned turn has to be *drained*.** `Live::lines` is
   per conversation. A turn that is walked away from — `<Esc>`, a switch — leaves the CLI mid-answer
   with the rest of it in the pipe, and the next turn reads it as its own: someone else's reply, and
@@ -471,7 +478,7 @@ only way to do anything. See ADR 0048.
 | `⏎` | Send. While a turn is running, **steer** it: the message is held and taken in at the next gap. |
 | `⇧⏎` | Newline, so a pasted snippet stays one message |
 | `^Y` | Take the last thing you queued back into the composer, to change it or drop it. Readline's yank: `^U`/`^W` kill, `^Y` brings it back |
-| `^V` | Attach the image on the clipboard. A key rather than a paste, because a terminal's paste can only ever hand over text |
+| `^V` | Attach the image on the clipboard — the picture itself, or the one it only names: a page's `<img>`, a URL, a file. A key rather than a paste, because a terminal's paste can only ever hand over text |
 | `⌫` | On an empty composer, take the last attached image back off |
 | `^P` | Pick a model. Mid-turn too — the running agent is told, and thinks the rest with it |
 | `^E` | Everything this model can be told, on one panel: effort, thinking, fast mode, context, and whatever a driver invented. `h`/`l` along a row, `j`/`k` between them, arrows too, and it applies as you move. Nothing else reaches the keyboard while it is open; `^E` again closes it |
