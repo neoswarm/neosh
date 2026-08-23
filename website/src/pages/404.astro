@@ -1,0 +1,62 @@
+---
+import Base from "../layouts/Base.astro";
+import Nav from "../components/Nav.astro";
+import Footer from "../components/Footer.astro";
+---
+
+<Base title="Page Not Found" description="This page doesn't exist.">
+  <Nav />
+  <main>
+    <section class="nf">
+      <div class="wrap">
+        <p class="code">404</p>
+        <h1>This page doesn't exist.</h1>
+        <p class="lede">The address may have changed, or it never was.</p>
+        <a class="home" href="/">Back to the start</a>
+      </div>
+    </section>
+  </main>
+  <Footer />
+</Base>
+
+<style>
+  .nf {
+    padding: 220px 0 140px;
+    text-align: center;
+  }
+
+  .code {
+    font-family: var(--mono);
+    font-size: 13px;
+    letter-spacing: 0.14em;
+    color: var(--dim);
+    margin: 0 0 18px;
+  }
+
+  h1 {
+    font-size: clamp(32px, 4vw, 48px);
+    font-weight: 600;
+    letter-spacing: -0.02em;
+    margin: 0 0 12px;
+  }
+
+  .lede {
+    color: var(--muted);
+    margin: 0 auto;
+  }
+
+  .home {
+    display: inline-block;
+    margin-top: 36px;
+    padding: 12px 24px;
+    border: 1px solid var(--line-strong);
+    border-radius: 8px;
+    font-weight: 500;
+    transition: border-color 0.2s ease, background 0.2s ease;
+  }
+
+  .home:hover {
+    border-color: var(--accent);
+    background: rgba(165, 180, 252, 0.06);
+  }
+</style>
