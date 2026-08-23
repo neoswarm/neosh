@@ -507,7 +507,16 @@ impl Provider for ClaudeCliProvider {
     ) -> ProviderStream {
         let (tx, rx) = mpsc::channel::<ProviderEvent>(256);
         let program = self.program.clone();
-        let slot = self.slot(&request.conversation);
+        // A one-shot belongs to nobody, so it gets a slot nobody else can find and the process is
+        // let go of at the end of it. Keyed into the map instead — which is what an empty id does
+        // if you do not ask — every branch name and thread title in the workspace shared one CLI,
+        // and that CLI was never closed: a second `claude` running beside the conversation you
+        // were in, holding a full-access session open for as long as the workspace lived.
+        let one_shot = request.is_one_shot();
+        let slot = match one_shot {
+            true => Arc::new(Conversation::default()),
+            false => self.slot(&request.conversation),
+        };
         let mode = *self.mode.lock().expect("mode lock poisoned");
         let asker = self.asker.lock().expect("asker lock poisoned").clone();
         let questioner = self.questioner.lock().expect("questioner lock poisoned").clone();
@@ -542,6 +551,11 @@ impl Provider for ClaudeCliProvider {
                 // whose other end has gone.
                 *guard = None;
                 let _ = tx.send(ProviderEvent::Error { message, retryable: false }).await;
+            }
+            // Nothing is coming back to this one, so it is asked to stop rather than left holding
+            // a login and a JS heap until the workspace ends.
+            if one_shot && let Some(live) = guard.take() {
+                live.close().await;
             }
             drop(attached);
         });
@@ -806,12 +820,15 @@ async fn run_turn(
             // the context question: nothing at all went wrong — the turn is already finished and
             // that was an extra — so it is simply given up on.
             () = &mut giveup, if interrupted || ending => {
-                if interrupted {
-                    let _ = live.child.start_kill();
-                    *slot = None;
-                    return Ok(Outcome::Done);
+                // `ending` is asked first, because it is armed *last* and only by a turn that has
+                // already finished. Reading `interrupted` first meant the two-second wait for one
+                // number was answered by killing a process that had done everything asked of it.
+                if ending {
+                    break;
                 }
-                break;
+                let _ = live.child.start_kill();
+                *slot = None;
+                return Ok(Outcome::Done);
             }
             line = async {
                 // What a previous turn read past its own ending comes first, in the order it was
@@ -973,7 +990,15 @@ async fn run_turn(
                     // Not when it has been abandoned: there is nobody to tell, and asking would
                     // re-arm the deadline that an interrupt has already pointed at killing the
                     // process — which is the one thing draining exists to avoid.
+                    //
+                    // And not when it has been interrupted, which is the same sentence about the
+                    // same deadline and was the half that was missing. `<Esc>` on a turn the CLI
+                    // then stopped politely still left `interrupted` set; this asked one last
+                    // question, re-armed the deadline at two seconds, and the branch below read
+                    // that expiry as "asked to stop and did not" — so every interrupt ended with
+                    // the conversation's CLI killed and the next turn resuming into a fresh one.
                     if !abandoned
+                        && !interrupted
                         && !ending
                         && live.control(&json!({"subtype": "get_context_usage"})).await.is_ok()
                     {
@@ -1910,4 +1935,270 @@ done
             "`--effort` and nothing else"
         );
     }
+
+    /// The user's sequence: a turn is interrupted mid-answer, and the next question is asked on
+    /// the same conversation.
+    ///
+    /// Two things have to hold, and only one of them used to. Whatever the CLI was still writing
+    /// must not arrive under the new question — that is the drain, and it worked. And the
+    /// conversation must still be *the same CLI*: an interrupt asks the process to stop, it stops,
+    /// and a turn that stopped politely is not a turn to kill. It was killed, every time, because
+    /// the last thing an ending turn does is ask for one more number and the deadline that arms is
+    /// the same one the interrupt armed.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_interrupted_answer_does_not_arrive_under_the_next_question() {
+        use futures::StreamExt;
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join(format!("neosh-cut-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("dirs");
+        let script = dir.join("fake-claude");
+        // A CLI that answers slowly, in a writer of its own, so a control request can arrive in
+        // the middle of an answer the way it does against the real one. `interrupt` stops the
+        // writer, and the turn is closed with a `result` — which is what `claude` does.
+        std::fs::write(
+            &script,
+            r#"#!/bin/sh
+d=`dirname "$0"`
+echo "$$" >> "$d/spawns"
+n=0
+while IFS= read -r line; do
+  case "$line" in
+    *'"subtype":"interrupt"'*)
+      : > "$d/stop"
+      id=`printf '%s' "$line" | sed 's/.*"request_id":"\([^"]*\)".*/\1/'`
+      printf '{"type":"control_response","response":{"subtype":"success","request_id":"%s","response":{}}}\n' "$id"
+      continue
+      ;;
+    *control_request*)
+      id=`printf '%s' "$line" | sed 's/.*"request_id":"\([^"]*\)".*/\1/'`
+      printf '{"type":"control_response","response":{"subtype":"success","request_id":"%s","response":{"totalTokens":10,"maxTokens":100}}}\n' "$id"
+      continue
+      ;;
+  esac
+  n=`expr $n + 1`
+  rm -f "$d/stop"
+  printf '{"type":"system","subtype":"init","session_id":"s","slash_commands":[]}\n'
+  m=$n
+  (
+    i=1
+    while [ $i -le 6 ]; do
+      if [ -f "$d/stop" ]; then break; fi
+      printf '{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"T%s-%s "}}}\n' "$m" "$i"
+      sleep 1
+      i=`expr $i + 1`
+    done
+    printf '{"type":"result","subtype":"success","is_error":false,"session_id":"s","result":""}\n'
+  ) &
+done
+"#,
+        )
+        .expect("script");
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+
+        let p = ClaudeCliProvider::new(script.display().to_string());
+        let said = |evs: &[ProviderEvent]| {
+            evs.iter()
+                .filter_map(|e| match e {
+                    ProviderEvent::TextDelta { text, .. } => Some(text.clone()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join("")
+        };
+
+        // Turn one, cut off the way `<Esc>` cuts one off: the token is cancelled and the consumer
+        // lets go of the stream at once.
+        let cancel = CancellationToken::new();
+        let mut first = p.stream(&inst(), req("claude-opus-5"), cancel.clone());
+        let mut got = Vec::new();
+        while let Some(ev) = first.next().await {
+            let stop = matches!(&ev, ProviderEvent::TextDelta { text, .. } if text.starts_with("T1-2"));
+            got.push(ev);
+            if stop {
+                break;
+            }
+        }
+        assert!(said(&got).contains("T1-1"), "the first turn said something: {:?}", said(&got));
+        cancel.cancel();
+        drop(first);
+
+        // Long enough for the interrupted turn to have been drained, and for anything it was
+        // still writing to have been written.
+        tokio::time::sleep(Duration::from_secs(3)).await;
+
+        // Turn two, on the same conversation and therefore the same process.
+        let second: Vec<_> =
+            p.stream(&inst(), req("claude-opus-5"), CancellationToken::new()).collect().await;
+        let text = said(&second);
+        assert!(
+            !text.contains("T1-"),
+            "the interrupted answer arrived under the next question: {text:?}"
+        );
+        assert!(text.contains("T2-"), "and the next question was answered: {text:?}");
+        let spawned = std::fs::read_to_string(dir.join("spawns")).unwrap_or_default();
+        assert_eq!(
+            spawned.lines().count(),
+            1,
+            "the conversation kept the CLI it started with: {spawned:?}"
+        );
+
+        p.shutdown(&neosh_proto::SessionId::from("test"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Interrupting a turn does not cost the conversation its agent.
+    ///
+    /// The last thing an ending turn does is ask the CLI how full its context is, on a two-second
+    /// deadline — an extra, and one an install is perfectly entitled to answer with nothing useful
+    /// or not at all. On an *interrupted* turn that deadline was the same timer the interrupt had
+    /// armed, and its expiry was read as "asked to stop and did not": the process was killed, and
+    /// the next question in that conversation started a second `claude` and resumed into it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_interrupt_does_not_kill_a_cli_that_stopped_when_it_was_asked() {
+        use futures::StreamExt;
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join(format!("neosh-keepcli-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("dirs");
+        let script = dir.join("fake-claude");
+        // It stops the moment it is asked to and says so — and it answers control requests without
+        // token counts, which is all an install that does not report context usage can do. That is
+        // what leaves the closing question unanswered and the deadline to expire.
+        std::fs::write(
+            &script,
+            r#"#!/bin/sh
+d=`dirname "$0"`
+echo "$$" >> "$d/spawns"
+n=0
+while IFS= read -r line; do
+  case "$line" in
+    *'"subtype":"interrupt"'*)
+      : > "$d/stop"
+      id=`printf '%s' "$line" | sed 's/.*"request_id":"\([^"]*\)".*/\1/'`
+      printf '{"type":"control_response","response":{"subtype":"success","request_id":"%s","response":{}}}\n' "$id"
+      continue
+      ;;
+    *control_request*)
+      id=`printf '%s' "$line" | sed 's/.*"request_id":"\([^"]*\)".*/\1/'`
+      printf '{"type":"control_response","response":{"subtype":"success","request_id":"%s","response":{}}}\n' "$id"
+      continue
+      ;;
+  esac
+  n=`expr $n + 1`
+  rm -f "$d/stop"
+  printf '{"type":"system","subtype":"init","session_id":"s","slash_commands":[]}\n'
+  m=$n
+  (
+    i=1
+    while [ $i -le 40 ]; do
+      if [ -f "$d/stop" ]; then break; fi
+      printf '{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"T%s-%s "}}}\n' "$m" "$i"
+      sleep 0.2
+      i=`expr $i + 1`
+    done
+    printf '{"type":"result","subtype":"success","is_error":false,"session_id":"s","result":""}\n'
+  ) &
+done
+"#,
+        )
+        .expect("script");
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+
+        let p = ClaudeCliProvider::new(script.display().to_string());
+        let cancel = CancellationToken::new();
+        let mut first = p.stream(&inst(), req("claude-opus-5"), cancel.clone());
+        while let Some(ev) = first.next().await {
+            if matches!(&ev, ProviderEvent::TextDelta { text, .. } if text.starts_with("T1-1")) {
+                break;
+            }
+        }
+        // `<Esc>`: the token is cancelled and the consumer lets go, exactly as the turn loop does.
+        cancel.cancel();
+        drop(first);
+
+        // Longer than either deadline the turn can arm, so a process that was going to be killed
+        // has been.
+        tokio::time::sleep(Duration::from_secs(6)).await;
+
+        let second: Vec<_> =
+            p.stream(&inst(), req("claude-opus-5"), CancellationToken::new()).collect().await;
+        assert!(
+            second.iter().any(|e| matches!(e, ProviderEvent::TextDelta { text, .. } if text.starts_with("T2-"))),
+            "the next question is answered by the CLI that already knows this conversation"
+        );
+        let spawned = std::fs::read_to_string(dir.join("spawns")).unwrap_or_default();
+        assert_eq!(
+            spawned.lines().count(),
+            1,
+            "and it is the same one: {spawned:?}"
+        );
+
+        p.shutdown(&neosh_proto::SessionId::from("test"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A one-shot generation borrows the model and gives it back.
+    ///
+    /// A branch name or a thread title is nobody's conversation — [`TurnRequest::conversation`] is
+    /// empty and says so. Keyed into the live map by that empty id, every one of them shared a
+    /// process that nothing ever closed: a second `claude`, with the same flags as the one
+    /// answering you, running for as long as the workspace did.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_one_shot_generation_does_not_leave_a_cli_behind() {
+        use futures::StreamExt;
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join(format!("neosh-oneshot-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("dirs");
+        let script = dir.join("fake-claude");
+        // It answers, and then reports when its stdin is closed — which is how a `--print` session
+        // is told there are no more messages coming, and the only way to see that it was told.
+        std::fs::write(
+            &script,
+            r#"#!/bin/sh
+d=`dirname "$0"`
+while IFS= read -r line; do
+  case "$line" in
+    *control_request*)
+      id=`printf '%s' "$line" | sed 's/.*"request_id":"\([^"]*\)".*/\1/'`
+      printf '{"type":"control_response","response":{"subtype":"success","request_id":"%s","response":{"totalTokens":10,"maxTokens":100}}}\n' "$id"
+      continue
+      ;;
+  esac
+  printf '{"type":"system","subtype":"init","session_id":"s","slash_commands":[]}\n'
+  printf '{"type":"result","subtype":"success","is_error":false,"session_id":"s","result":"a-name"}\n'
+done
+echo done > "$d/closed"
+"#,
+        )
+        .expect("script");
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+
+        let p = ClaudeCliProvider::new(script.display().to_string());
+        let mut one_shot = req("claude-opus-5");
+        one_shot.conversation = neosh_proto::SessionId::from("");
+        assert!(one_shot.is_one_shot(), "that is what an empty conversation means");
+        let evs: Vec<_> = p.stream(&inst(), one_shot, CancellationToken::new()).collect().await;
+        assert!(
+            evs.iter().any(|e| matches!(e, ProviderEvent::TextDelta { text, .. } if text == "a-name")),
+            "it still answers"
+        );
+
+        for _ in 0..200 {
+            if dir.join("closed").exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert!(dir.join("closed").exists(), "and the process it borrowed was given back");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
 }

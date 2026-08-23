@@ -807,7 +807,14 @@ impl Provider for CodexCliProvider {
     ) -> ProviderStream {
         let (tx, rx) = mpsc::channel::<ProviderEvent>(256);
         let program = self.program.clone();
-        let slot = self.slot(&request.conversation);
+        // A one-shot — a branch name, a thread title — belongs to no conversation, so it gets a
+        // slot nobody else can find and the app-server is let go of at the end of it. Keyed into
+        // the map instead, every one of them shared a process that nothing ever closed.
+        let one_shot = request.is_one_shot();
+        let slot = match one_shot {
+            true => Arc::new(Conversation::default()),
+            false => self.slot(&request.conversation),
+        };
         let mode = *self.mode.lock().expect("mode lock poisoned");
         let asker = self.asker.lock().expect("asker lock poisoned").clone();
 
@@ -821,6 +828,10 @@ impl Provider for CodexCliProvider {
                 // has gone.
                 *guard = None;
                 let _ = tx.send(ProviderEvent::Error { message, retryable: false }).await;
+            }
+            // Nothing is coming back to this one.
+            if one_shot && let Some(live) = guard.take() {
+                live.close().await;
             }
         });
 

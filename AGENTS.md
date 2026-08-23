@@ -147,7 +147,16 @@ per decision, and records the *reasoning*, not the choice.
 - **An agent driver keeps one process per conversation, keyed by `TurnRequest::conversation`.** Not
   per turn, and never one per driver — several conversations run at once, and a driver holding a
   single session id resumes the second into the first one's history. (ACP is the exception and says
-  why: its session lives on the agent's side.)
+  why: its session lives on the agent's side.) **And exactly one process, which means a turn that
+  belongs to no conversation has to be *asked about* rather than keyed on.** A branch name, a
+  thread title, a commit message — `Agent::complete` — sends an empty `conversation`, and empty is
+  an ordinary map key: every one of them shared a slot that nothing ever emptied, so a workspace
+  ran a second `claude` beside the one you were talking to, with the same flags and the same
+  access, answering nobody, for as long as it lived. `TurnRequest::is_one_shot` is the question,
+  and the answer is a slot nobody else can find and a process closed when the turn is. The other
+  half is that an *interrupt* must not cost a conversation its process either: `<Esc>` asks the CLI
+  to stop, and a CLI that stops is one to keep — the deadline the closing context question arms is
+  not the deadline the interrupt armed, however much they share a timer.
 - **What a driver calls a conversation is the conversation's, not the process's.** A vendor CLI
   keeps the history and hands back a handle; a driver that only remembers it in memory remembers it
   until the workspace stops, and then reopening a conversation starts an agent that has never heard
