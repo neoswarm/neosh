@@ -1319,6 +1319,20 @@ impl Host {
             ApiCall::ProviderSetCredential { .. } => Err(ApiError::Internal {
                 message: "credential prompts are answered by the host loop".into(),
             }),
+            // On the host loop rather than through `spawn_slow`, and it is the *only* git write
+            // that is. `git branch -m` is one ref write — the same order of cost as the
+            // `rev-parse` `remember_repo` already awaits here — and what follows it cannot be done
+            // from a spawned task: the branch is half of what [`ProjectFacts`] cached the first
+            // time this directory was seen, so a rename that did not reach the host would leave
+            // every project list drawing the old name until the workspace restarted. ADR 0036's
+            // rule, from the other end: a value the host *kept* has to be put right by whatever
+            // changed it.
+            ApiCall::GitRenameBranch { old, new, cwd } => {
+                let svc = self.services(plugin);
+                svc.git_rename_branch(old.clone(), new, cwd.clone()).await?;
+                self.rebranded(&old, cwd.as_deref()).await;
+                Ok(ApiOk::Unit)
+            }
             ApiCall::SessionRename { session, title } => {
                 self.agent
                     .sessions()
@@ -6359,6 +6373,57 @@ impl Host {
             }
         }
         self.repos.insert(dir, found);
+    }
+
+    /// A branch was renamed: put right everything the host had written down about it.
+    ///
+    /// [`ProjectFacts`] is asked once, when a directory is first seen, and then read on every
+    /// redraw of every panel — which is right, because a label is not worth a subprocess per
+    /// frame, and wrong for exactly one moment: the one where somebody moves the branch. The
+    /// worktree row in the sidebar *is* `SessionInfo::branch`, so without this the panel says
+    /// `spry-reef` under a conversation working on `feature/proxy-rate-limiter` until the
+    /// workspace is restarted.
+    ///
+    /// Matched on the cached branch rather than on `cwd`, because one rename can move several
+    /// rows: `cwd` names the checkout the git call ran in, and the branch may be checked out in a
+    /// worktree that is a different directory from it. Every directory the host knows that was on
+    /// `old` is on `new` now.
+    ///
+    /// The name is rebuilt through [`project_name`] rather than patched, so `neosh · spry-reef`
+    /// becomes `neosh · feature/proxy-rate-limiter` by the one function that decides what a
+    /// checkout is called — a second place that formats it is a second place to get it wrong.
+    async fn rebranded(&mut self, old: &str, cwd: Option<&str>) {
+        let touched: Vec<std::path::PathBuf> = self
+            .projects
+            .iter()
+            .filter(|(dir, facts)| {
+                facts.branch.as_deref() == Some(old)
+                    // The checkout the call named counts even on a detached head or a stale
+                    // cache: it is the one directory we know for certain was involved.
+                    || cwd.is_some_and(|c| std::path::Path::new(c) == dir.as_path())
+            })
+            .map(|(dir, _)| dir.clone())
+            .collect();
+        for dir in touched {
+            // Re-asked rather than patched: `identity()` is the same call the facts were built
+            // from, and a rename that failed halfway is then simply not reflected.
+            // Cloned rather than borrowed: `Git` is a path and a fact, cheap to copy, and this
+            // holds it across an await while the map it came from is written to below.
+            let Some(g) = self.repos.get(&dir).and_then(Option::as_ref).cloned() else { continue };
+            let (branch, main) = g.identity().await;
+            let name = project_name(&dir, branch.clone(), main.clone());
+            self.projects.insert(
+                dir,
+                ProjectFacts { name, repo_root: main.map(|p| p.display().to_string()), branch },
+            );
+        }
+        // Every list that draws a conversation is drawing a name that just changed, and the panel
+        // redraws on this. Not the same event as switching — nothing moved — but it is the one
+        // signal a thread list already listens to for "the conversations are not what you drew".
+        self.bridge.broadcast(PluginEvent::SessionChanged {
+            session: self.agent.sessions().active_id().clone(),
+        });
+        self.refresh_status();
     }
 
     /// Stamp the display name onto a conversation's info.

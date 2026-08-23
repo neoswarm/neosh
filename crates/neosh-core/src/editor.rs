@@ -177,6 +177,7 @@ impl Editor {
                 | ApiCall::GitDefaultBranch
                 | ApiCall::GitCreateBranch { .. }
                 | ApiCall::GitCheckout { .. }
+                | ApiCall::GitRenameBranch { .. }
                 | ApiCall::GitStage { .. }
                 | ApiCall::GitUnstage { .. }
                 | ApiCall::GitCommit { .. }
@@ -1336,6 +1337,7 @@ fn call_name(call: &ApiCall) -> &'static str {
         ApiCall::GitDiff { .. } => "git.diff",
         ApiCall::GitDefaultBranch => "git.defaultBranch",
         ApiCall::GitCreateBranch { .. } => "git.createBranch",
+        ApiCall::GitRenameBranch { .. } => "git.renameBranch",
         ApiCall::GitCheckout { .. } => "git.checkout",
         ApiCall::GitStage { .. } => "git.stage",
         ApiCall::GitUnstage { .. } => "git.unstage",

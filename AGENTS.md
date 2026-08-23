@@ -216,6 +216,23 @@ per decision, and records the *reasoning*, not the choice.
   no `<repo>` level, nothing else's trees can land there — and `add_worktree` writes the directory
   into the repository's `.gitignore` (tracked, so every clone gets it; skipped when already
   ignored), or every `git status` reads as one giant untracked directory. See ADR 0046.
+- **A branch is named by what you asked for, once you have asked.** A worktree you did not name
+  starts on `wily-nimbus`, because naming a branch before the work is a decision made at the worst
+  possible moment — and the first message sent in it *is* that decision, arriving on its own, so
+  the branch is renamed from it and never touched again. Only a name nobody chose: the mark is a
+  session var written by whoever generated it (`git.branch.scratch`), never a pattern match on the
+  shape of the name, which cannot tell `brisk-otter` we picked from `brisk-otter` you typed. At
+  turn *start*, because the panel is drawn all through a turn — `git branch -m` is one ref write,
+  so it is safe under a running agent and safe on uncommitted work. **One attempt, ever**: the mark
+  is spent before the model is asked, or a cheap model's hiccup becomes a request per message. The
+  *type* is the model's — `feature/`, `fix/`, `chore/` — so `git.branch.prefix` applies only to a
+  name that arrived without one, or you get `feature/fix/the-login` under a type that is now wrong.
+  `git.branch.model` is unset by default and the plugin sends **no selection at all** rather than a
+  guess, so the fallback stays the host's: `gen.model`, then the model you are already talking to.
+  And the host has to put *its own* label right — `ProjectFacts` is asked once per directory and
+  read on every redraw, so `GitRenameBranch` is the one git write handled on the host loop, which
+  is what makes the sidebar row follow instead of saying `wily-nimbus` until restart. The directory
+  keeps the old name on purpose: moving it would invalidate the conversation's `cwd`. See ADR 0051.
 - **A project outlives the conversations in it.** The panel's list is written down (`sidebar.projects`,
   a workspace var) rather than worked out from where the conversations happen to be — derived, it
   deleted the directory you had worked in all month the moment you cleared out the last thread in
@@ -407,7 +424,7 @@ only way to do anything. See ADR 0048.
 | `^T` | Projects and conversations. Switching is never refused — turns keep running where they are |
 | `^J` | The computers in this workspace. Add one by its address, allow one that is asking, or open what it is running |
 | `^F` | What you have archived. Filter it, put one back, or finally throw it away |
-| `^N` | New conversation. In a repository it asks where: here, a worktree you need not name, one kept inside the project, one you do name, an existing one, another machine, elsewhere |
+| `^N` | New conversation. In a repository it asks where: here, a worktree you need not name, one kept inside the project, one you do name, an existing one, another machine, elsewhere. A worktree you did not name is named by your first message — `fix/composer-paste-truncation`, not `wily-nimbus` |
 | `^O` | Add a project |
 | `^B` | Toggle the sidebar |
 | `^K` | Command palette |

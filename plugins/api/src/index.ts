@@ -862,6 +862,20 @@ export interface GitApi {
   /** What this branch would merge into: `origin/HEAD`, else `main`/`master`. */
   defaultBranch(): Promise<string | null>;
   createBranch(name: string, opts?: { from?: string }): Promise<void>;
+  /**
+   * Move a branch to another name — `git branch -m`.
+   *
+   * One ref write. The working tree is untouched, so this is safe on a branch that is checked out
+   * and safe while an agent is editing files against it — which is the case it exists for: naming
+   * a worktree's branch from the first message, once there is a message to name it from.
+   *
+   * `cwd` is the checkout the branch belongs to, and you almost always want it: the worktree being
+   * renamed is very often not the one the active conversation is standing in.
+   *
+   * Fails if `next` is taken — a generated name does not get to overwrite somebody's branch. Ask
+   * `branches()` and pick a free one.
+   */
+  renameBranch(name: string, next: string, opts?: { cwd?: string }): Promise<void>;
   checkout(rev: string): Promise<void>;
   /** Empty `paths` stages everything, like `git add .` from the repository root. */
   stage(paths?: string[]): Promise<void>;
@@ -2107,6 +2121,9 @@ export function __createContext(plugin: string, config: unknown, version: number
       },
       async createBranch(name, opts) {
         await c({ call: "git_create_branch", name, from: opts?.from ?? null });
+      },
+      async renameBranch(name, next, opts) {
+        await c({ call: "git_rename_branch", old: name, new: next, cwd: opts?.cwd ?? null });
       },
       async checkout(rev) {
         await c({ call: "git_checkout", rev });
