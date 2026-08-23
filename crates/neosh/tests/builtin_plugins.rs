@@ -2222,6 +2222,63 @@ fn a_new_conversation_in_a_repository_offers_a_worktree() {
     );
 }
 
+/// The trees it offers under "an existing one" are the ones on the panel's list, not every
+/// checkout `git worktree list` can see.
+///
+/// A scratch branch you finished with in March is still a worktree on disk long after `X` took it
+/// off the panel, so this picker was handing back every project you had ever removed — twenty rows
+/// of finished work above the three you are in — and choosing one put it straight into the sidebar
+/// again. The list is the workspace's answer to *which places do I work in* (ADR 0039), and this
+/// question asks exactly that.
+///
+/// Two worktrees, alike in every way git can see and differing only in whether anything was ever
+/// started in one of them, which is what makes this a statement about the list rather than about
+/// worktrees.
+#[test]
+fn a_worktree_that_is_not_on_the_list_is_not_offered() {
+    if !have_git() {
+        return;
+    }
+    let sb = Sandbox::new("newwherelist");
+    sb.git_init();
+    let add = |branch: &str| {
+        let at = sb.root.join(branch);
+        let out = Command::new("git")
+            .current_dir(sb.work())
+            .args(["worktree", "add", "-b", branch, &at.display().to_string()])
+            .output()
+            .expect("git runs");
+        assert!(out.status.success(), "worktree add: {}", String::from_utf8_lossy(&out.stderr));
+        at
+    };
+    let onlist = add("onlist");
+    add("offlist");
+
+    let mut s = sb.start();
+    s.wait_for("PROJECTS");
+    // A conversation started in a directory is how it joins the list. The other tree gets nothing,
+    // which is the state `X` leaves behind: on the disk, in git, on nobody's list.
+    s.send(&command_with("project.open", &onlist.display().to_string()));
+    assert!(s.pump(|s| s.sidebar_rows() >= 2), "it is a project now\n{:?}", s.sidebar_now());
+    // Asked from the checkout rather than from inside the new tree — the tree you are standing in
+    // is never one of the answers, so asking there could not tell the two rules apart.
+    s.send(&command_with("project.open", &sb.work().display().to_string()));
+    assert!(s.pump(|s| s.sidebar_rows() >= 3), "and we are back\n{:?}", s.sidebar_now());
+
+    s.ctrl("n");
+    assert!(
+        s.pump(|s| s.picker_named("[New conversation]").iter().any(|l| l.contains("onlist"))),
+        "the tree on the list is a row\n{:?}",
+        s.picker_named("[New conversation]")
+    );
+    let rows = s.picker_named("[New conversation]");
+    assert!(rows.iter().any(|l| l.contains("Here")), "the question is still asked\n{rows:?}");
+    assert!(
+        !rows.iter().any(|l| l.contains("offlist")),
+        "and the one nobody kept is not\n{rows:?}"
+    );
+}
+
 /// The picker's in-project row works with nothing configured: the tree lands in `.worktrees/`
 /// and `.gitignore` keeps it out of `git status` — no `worktree.root` edit required.
 ///

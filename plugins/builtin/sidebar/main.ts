@@ -1135,7 +1135,7 @@ async function registerCommands(w: Wiring): Promise<void> {
     // row, so `n ⏎` is what `n` always did.
     const cwd = owningProject(target) ?? undefined;
     await p.leave();
-    await newConversation(neosh, cwd);
+    await newConversation(neosh, arrangement, cwd);
   }, { redraw: false });
 
   // ---- doors out of the panel ----
@@ -1187,9 +1187,11 @@ async function registerCommands(w: Wiring): Promise<void> {
     }, { desc: "Redraw the sidebar now" }),
   );
   w.subscriptions.push(
-    await neosh.cmd.register("session.new", (args) => newConversation(neosh, args[0]), {
-      desc: "Start a new conversation — here, or in a worktree of its own",
-    }),
+    await neosh.cmd.register(
+      "session.new",
+      (args) => newConversation(neosh, arrangement, args[0]),
+      { desc: "Start a new conversation — here, or in a worktree of its own" },
+    ),
   );
   w.subscriptions.push(
     await neosh.cmd.register("session.new.here", async (p) => {
@@ -1440,8 +1442,22 @@ function argsFor(target: Target | undefined): string[] {
  * Outside a repository the question has one answer, so it is not asked: `^N` stays a single key
  * everywhere the choice would be theatre. Inside one, `Here` is selected, so `^N ⏎` is what `^N`
  * always did.
+ *
+ * **The worktrees it offers are the ones on the panel's list**, which is what `arrangement` is for
+ * here. Every tree `git worktree list` knows is not the same set: a scratch branch you finished
+ * with in March is still a checkout on disk long after `X` took it off the list, so this picker
+ * was offering back, under "an existing one", every project you had ever removed — twenty rows of
+ * finished work above the three you are actually in, and choosing one put it straight back in the
+ * sidebar. The list is the workspace's answer to *which places do I work in* (see ADR 0039), and
+ * this question is asking exactly that. A worktree neosh has never heard of is not on it either,
+ * which is correct rather than a casualty: `Another directory…` lists every tree git knows and is
+ * how a directory joins the list in the first place.
  */
-async function newConversation(neosh: Neosh, base?: string): Promise<void> {
+async function newConversation(
+  neosh: Neosh,
+  arrangement: Arrangement,
+  base?: string,
+): Promise<void> {
   const current = await neosh.session.current().catch(() => null);
   const here = base ?? current?.cwd;
   // Empty outside a repository, which is also how this knows there is nothing to ask about: a
@@ -1455,7 +1471,9 @@ async function newConversation(neosh: Neosh, base?: string): Promise<void> {
   const canBranch = trees.length > 0 && commands.has("git.worktree.new.auto");
   const canInside = trees.length > 0 && commands.has("git.worktree.new.inside");
   const canName = trees.length > 0 && commands.has("git.worktree.new");
-  const others = trees.filter((t) => t.path !== here);
+  // On the list, and not merely on disk. `here` is dropped because you are already in it.
+  const known = new Set(arrangement.all());
+  const others = trees.filter((t) => t.path !== here && known.has(t.path));
 
   if (!canBranch && !canInside && !canName && others.length === 0) {
     await neosh.session.create(here ? { cwd: here } : undefined);
