@@ -521,6 +521,48 @@ records why that trade was made.
 
 ---
 
+## Terminals
+
+A workspace can have several terminals attached and they are not copies of each other. Each is
+somewhere: its own conversation on screen, its own scroll position, its own composer, its own
+panels. What they share is the work — the conversations, the turns running in them, and everything
+your plugin registered.
+
+**Most plugins need to know none of this.** A window you open is routed for you: a float anchored
+to a window goes where that window is, a buffer only one terminal is showing names it, and
+otherwise it is the terminal whose key press is running. So a picker, a preview or a status panel
+opened in answer to a key lands where the person who pressed it is looking, without a line about
+views.
+
+The one thing that does have to say is a **dock**, because one that exists once exists in one
+terminal. Open one per view:
+
+```ts
+const panels = new Map<ViewId, Panel>();
+
+neosh.view.onOpen(async (view) => {          // and for the terminals already here
+  panels.set(view, await makePanel(neosh.view.at(view)));
+});
+neosh.view.onClose((view) => {               // its windows are already gone
+  panels.delete(view);
+});
+```
+
+`neosh.view.at(id)` is the whole `neosh` namespace bound to one terminal — every call on it is the
+call it always was, except that a window opened through it lands there. Inside a command handler
+you are handed one already, as the third argument:
+
+```ts
+await neosh.cmd.register("mine.panel", async (args, key, here) => {
+  const buf = await neosh.buf.create({ name: "[mine]", scratch: true });
+  await here.win.open(buf, "right", { size: 40 });   // this terminal
+});
+```
+
+`key.view` is the terminal the key was pressed in, `neosh.view.list()` is every terminal and what
+each is looking at, and `session.onChange` says which one moved. If you are drawing something a
+person has to answer, that last one is what tells you which screen to put it on.
+
 ## Conversations
 
 ```ts

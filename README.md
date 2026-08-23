@@ -34,8 +34,9 @@ configure anything. `cargo run -- init` writes a starter config you can edit.
 
 ## How it works
 
-The workspace is a process. Terminals attach to it and mirror it, live. Close one, the turns keep
-running, and `neosh` puts you back.
+The workspace is a process. Terminals attach to it, and each one is somewhere in it: its own
+conversation, its own scroll, its own panels — while the work is shared, so every window shows
+every turn that is running and where. Close one, the turns keep running, and `neosh` puts you back.
 
 ```
  plugins (TypeScript)          your init.ts is one too
@@ -44,7 +45,7 @@ running, and `neosh` puts you back.
  one core (Rust)               buffers, windows, agents, keys
         │
         ▼
- every terminal                attached, mirrored, detachable
+ every terminal                attached, somewhere of its own, detachable
 ```
 
 Everything on screen came through the same API a third party plugin uses. The chat, the sidebar,

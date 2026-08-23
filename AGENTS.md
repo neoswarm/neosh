@@ -169,20 +169,40 @@ per decision, and records the *reasoning*, not the choice.
   delta stream, so anything a client needs on reattach has to be *kept* by the editor and said again
   by `Editor::republish`; a value that is only forwarded is a value that comes back wrong. See ADR
   0036.
-- **However many terminals you open, you see everything.** Attaching joins; it does not take over.
-  Every attached terminal is a mirror of one `Editor` — same transcript, same composer, live — and
-  `^Q` closes the one it was pressed in. Which one is read off the tag input arrives with, never
-  from whoever spoke most recently: the host can be behind the channel, and "the last event sent"
-  is not "the event being handled". Three things follow and each was a bug. **`republish` goes to
-  every view, so it has to be idempotent** — it spliced at `old_end: 0`, an insertion, which is
-  right only against a mirror that has nothing and doubled every buffer in one that had the state.
-  **The workspace is the size of the smallest attached terminal**, because a card is one row of
-  buffer *content* shared by all of them, and a card measured for the wide window wraps in the
-  narrow one; sizes are re-merged when a view *leaves* too, since nobody reports a size when
-  somebody else closes a window. **`ViewportChanged` is where the host learns a width**, so
-  anything drawn to one is redrawn there. Independent views — a transcript here, a diff there —
-  are not this: they need `Host` split into a `Workspace` and a `View`, and an `ApiCall` that names
-  the view it draws into. See ADR 0042.
+- **What the agent produced is the workspace's; where you are looking is yours.** Attaching joins,
+  it does not take over, and it does not make a copy: every terminal has a **view** of its own —
+  its own conversation on screen, transcript, scroll, cursor, folded cards, composer and panels —
+  while the conversations, the turns running in them and everything a plugin registered are shared.
+  A window belongs to exactly one view and a buffer does not, which is the whole mechanism;
+  `neosh_core::Window` has always held the cursor, the anchor and the scroll, so the window map
+  only had to gain an owner. A **client** is a socket and a **view** is a set of windows: `^Q`
+  closes the client it was pressed in, read off the tag input arrives with and never from whoever
+  spoke most recently, because the host can be behind the channel. A frame is therefore *routed* —
+  `push_ui` reads the tag off the window an event names, and a terminal whose share is only the
+  trailing flush is not woken up at all. A transcript is per view rather than per conversation
+  because folding a card open is navigation: `⇥` on a diff must not move the rows under somebody
+  else in the same conversation. `on_screen` is gone and `views_showing` replaced it — a turn draws
+  once in each terminal showing its conversation, which may be none, and that is when the unread
+  mark is set. A terminal attaching lands in the most recent conversation nobody else is reading;
+  the last screen of all is kept for whoever comes back, which is what makes leaving mid-answer and
+  returning find the answer still arriving. **The smallest-terminal rule is gone** — it existed
+  because a card was shared content — and what is still merged is one window two terminals share.
+  `republish` says only what the arriving view can see and has to stay idempotent, and
+  `ViewportChanged` is still where the host learns a width. See ADR 0057, and ADR 0042 for the
+  connection half.
+- **A plugin says which terminal it is drawing into, and almost never has to.** Three rules in
+  order: a float anchored to a window goes where that window is; a buffer only one terminal shows
+  names it; otherwise it is the terminal being served, which for anything done in answer to a key
+  is exact. So every float that builds its window per invocation — the palette, the model sheet,
+  git — needed no change. A **dock** is the exception, because one that exists once exists in one
+  place: `view.onOpen` is when to make it (fired for the terminals already here as well as the ones
+  still to come) and `view.onClose` is when to let go. When it does have to be said, `KeyContext`
+  carries the view, `win.open`/`float.open`/`session.switch` take one, and a command handler's
+  third argument is the whole `neosh` namespace bound to the terminal the key was pressed in — so
+  `here.win.open(...)` lands where the person pressing the key is looking. `SessionChanged` names
+  the terminal that moved, because "the active conversation" has as many answers as there are
+  screens; a question waits until some terminal is reading its conversation and opens there.
+  See ADR 0057.
 - **Every view gets every event.** `Agent` fans its stream out to one queue per view. Never a
   `broadcast` channel: lagging consumers drop the oldest, silently, under load — and a view that
   missed one `ToolFinished` has a card that spins forever with nothing to put it right.

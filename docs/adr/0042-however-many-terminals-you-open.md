@@ -93,16 +93,18 @@ grows instead, which is a failure you can see.
 
 ## What this still does not do
 
-Independent views — a transcript here, a diff there, two people in one workspace — need what ADR
-0036 already costed out, and the estimate stands:
+Superseded by [0057](0057-a-terminal-is-a-place-you-are.md), which is the rest of it: a view per
+terminal, so a second window is somewhere else rather than a copy. Three things were named here as
+what it would take, and all three are what that ADR did — `Host` split into what the workspace owns
+and what a terminal owns, "the conversation on screen" moved out of the session store, and an
+`ApiCall` that names the view it draws into.
 
-1. `Host` split into a shared `Workspace` (sessions, turns, providers, plugins) and a per-view
-   `View` (editor, buffers, cursor, composer, cards). The fan-out router this ADR adds is the first
-   of the three obstacles named there, and it is now done.
-2. `Agent`'s notion of "the conversation on screen" is per-view state living in shared state.
-3. Plugins draw, and would have to say where: `ui.float.open()` lands in *the* editor, and with
-   several an `ApiCall` has to name the view — defaulting to the one whose input triggered the
-   plugin, which means threading a view through the plugin RPC and through `@neosh/api`.
+Two claims of this ADR did not survive it, and 0057 says why: **the views share a cursor** (they do
+not; a window has always been where a cursor lives, and a window belongs to a view), and **the
+workspace is the size of the smallest attached terminal** (it is not; that existed because a tool
+card was one row of content every view shared, and a transcript belongs to a view now).
 
-Only (3) is a public API change, which is why it is last: everything before it can land without
-anybody's `init.ts` noticing.
+What does survive is everything about *connections*: attaching joins rather than taking over, `^Q`
+is answered from the tag the input arrived with, `republish` is idempotent because it goes to a
+mirror that may already have the state, and the event stream fans out to a queue per view rather
+than through a `broadcast` channel that drops the oldest under load.

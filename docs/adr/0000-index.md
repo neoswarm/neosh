@@ -60,3 +60,4 @@ implementation — and in two cases (0005, 0008) it did not, which is itself rec
 | [0054](0054-a-turn-can-end-while-its-work-does-not.md) | A turn can end while its work does not, and a turn that is waiting should say so | Accepted |
 | [0055](0055-a-plugin-being-ready-is-not-the-workspace-being-ready.md) | A plugin being ready is not the workspace being ready | Accepted |
 | [0056](0056-an-agent-that-speaks-when-nobody-asked.md) | An agent that speaks when nobody asked | Accepted |
+| [0057](0057-a-terminal-is-a-place-you-are.md) | A terminal is a place you are, not a copy of somebody else's screen | Accepted |
