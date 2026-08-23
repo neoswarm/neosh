@@ -4357,7 +4357,10 @@ impl Host {
             shape: neosh_proto::CursorShape::Bar,
         });
         let _ = self.editor.apply(&plugin, ApiCall::WinSelect { win: self.v().chat_win, on: false });
-        let _ = self.editor.apply(&plugin, ApiCall::FocusPop);
+        // Named, because giving focus back is about a keyboard: a window names its own view, but
+        // *popping* names none, and the local view is not this terminal in a served workspace.
+        let here = self.serving();
+        let _ = self.editor.apply_in(here, &plugin, ApiCall::FocusPop);
         // Back to following the newest, because that is what the composer is the bottom of.
         //
         // Reading is a place *in* the transcript and the scroll offset is how it gets there —
