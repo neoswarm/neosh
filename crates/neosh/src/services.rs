@@ -203,6 +203,24 @@ impl Services {
         Ok(ApiOk::Unit)
     }
 
+    /// `git branch -m`, in whichever checkout the branch belongs to.
+    ///
+    /// Takes a `cwd` where [`Self::git_checkout`] does not, because the caller this exists for is
+    /// renaming the branch of a *worktree* — very often not the one the active conversation is
+    /// standing in. Nothing about the working tree changes, so it is safe on a branch that is
+    /// checked out and safe while an agent is mid-turn against it.
+    pub async fn git_rename_branch(
+        &self,
+        old: String,
+        new: String,
+        cwd: Option<String>,
+    ) -> ApiResult {
+        self.permit_write("branch -m")?;
+        let repo = self.repo_at(cwd).await?;
+        repo.rename_branch(&old, &new).await.map_err(vcs_err)?;
+        Ok(ApiOk::Unit)
+    }
+
     pub async fn git_stage(&self, paths: Vec<String>) -> ApiResult {
         self.permit_write("add")?;
         self.repo()?.stage(&paths).await.map_err(vcs_err)?;

@@ -661,6 +661,25 @@ pub enum TaskStatus {
     Cancelled,
 }
 
+/// One thing still running that no turn is waiting for.
+///
+/// A *shell that was backgrounded*, a sub-agent that was let go of, a monitor left watching
+/// something — whatever the driver started and no longer holds the turn open for. What it is
+/// doing is the driver's business; that it is still doing it is the reader's.
+#[derive(TS, Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
+#[ts(export)]
+pub struct BackgroundTask {
+    pub id: TaskId,
+    /// One line, in the driver's own words. Empty when it would not say.
+    #[serde(default)]
+    pub title: String,
+    /// Which sort of thing it is, verbatim from the driver — `claude` says `local_bash`,
+    /// `local_agent`, `local_workflow`, `monitor_ws`. Not translated: a name we invented for a
+    /// kind we have never seen is a name that is wrong on the install that has one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
+}
+
 /// A command the driver itself accepts, as opposed to one neosh implements.
 ///
 /// Reported rather than configured. Which commands exist depends on the install — `claude` counts
@@ -710,6 +729,14 @@ pub enum Activity {
         parent_call: Option<ToolCallId>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         model: Option<String>,
+        /// Whether it was let go of at the moment it started, rather than the turn blocking on it.
+        ///
+        /// A shell launched detached and a sub-agent spawned into the background both arrive this
+        /// way. The *later* move to the background arrives as a status change instead, which is
+        /// the case that was already handled — so without this the two halves of one idea were
+        /// read in two different places and the commoner half was the one that was missed.
+        #[serde(default)]
+        backgrounded: bool,
     },
     /// It is still going, and here is what it is up to.
     TaskProgress {
@@ -732,12 +759,53 @@ pub enum Activity {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         summary: Option<String>,
     },
+    /// Everything running in the background *now*, whole.
+    ///
+    /// A **level**, not a pair of edges, and the difference is the whole point. `TaskStarted` and
+    /// `TaskEnded` are bookends, and a receiver that pairs them wedges a spinner forever the first
+    /// time it misses one — which it will, because a turn stops being read the moment its `result`
+    /// arrives and a background task does not stop when the turn does. This says what the set *is*,
+    /// so a receiver **replaces** its own with this and cannot be wrong for longer than one
+    /// message. `claude` documents its own `background_tasks_changed` in exactly these terms.
+    ///
+    /// Empty is a value and means nothing is running — never "no news". It is what clears the mark.
+    ///
+    /// Per *process*: nothing is said at startup, so a receiver resets to empty whenever the
+    /// driver's process (re)starts and waits for the next change to repopulate it. Which is also
+    /// why this is never written to disk — a workspace that stopped while a shell was running
+    /// would otherwise come back reporting it forever.
+    Background { tasks: Vec<BackgroundTask> },
     /// The plan, whole.
     ///
     /// Whole rather than patched because a patch is only correct if the previous state was, and a
     /// checklist that drifts is worse than no checklist. Every driver that has one reports it this
     /// way anyway.
     Plan { steps: Vec<PlanStep> },
+    /// The turn is not answering, and this is what it is waiting for.
+    ///
+    /// The other half of [`Self::Background`]. That one is work that outlived the turn; this is a
+    /// turn that has not finished and is not doing anything a reader can see — which on screen is
+    /// indistinguishable from a hang, and is what sends people to `^C` on a turn that was about to
+    /// come back. `claude` sitting in retry backoff after a 529 is the case that matters: several
+    /// silent minutes, no tokens, no card, nothing.
+    ///
+    /// `what` is already a sentence, because only the driver knows what it is waiting on and a
+    /// vocabulary of reasons invented here would be wrong for the first driver that waits on
+    /// something new. `retry_in_ms` is said when the driver knows — waiting with a number on it is
+    /// a different experience from waiting without one.
+    ///
+    /// It ends by being overtaken: the next message, the next tool, or the turn finishing. There is
+    /// no `Waited` to match it, because no driver says so — what a driver does when the wait is
+    /// over is get on with the thing it was waiting to do, and that is already an event.
+    ///
+    /// [`Self::Compacting`] is deliberately *not* this. Compaction is a wait with consequences —
+    /// the plan is dropped and the meter moves — and folding it into a note would lose them.
+    Waiting {
+        what: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(type = "number | null")]
+        retry_in_ms: Option<u64>,
+    },
     /// The driver started compacting its own context, and is not answering until it is done.
     Compacting,
     /// It finished. Token counts either side when the driver says.

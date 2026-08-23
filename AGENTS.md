@@ -232,6 +232,23 @@ per decision, and records the *reasoning*, not the choice.
   no `<repo>` level, nothing else's trees can land there — and `add_worktree` writes the directory
   into the repository's `.gitignore` (tracked, so every clone gets it; skipped when already
   ignored), or every `git status` reads as one giant untracked directory. See ADR 0046.
+- **A branch is named by what you asked for, once you have asked.** A worktree you did not name
+  starts on `wily-nimbus`, because naming a branch before the work is a decision made at the worst
+  possible moment — and the first message sent in it *is* that decision, arriving on its own, so
+  the branch is renamed from it and never touched again. Only a name nobody chose: the mark is a
+  session var written by whoever generated it (`git.branch.scratch`), never a pattern match on the
+  shape of the name, which cannot tell `brisk-otter` we picked from `brisk-otter` you typed. At
+  turn *start*, because the panel is drawn all through a turn — `git branch -m` is one ref write,
+  so it is safe under a running agent and safe on uncommitted work. **One attempt, ever**: the mark
+  is spent before the model is asked, or a cheap model's hiccup becomes a request per message. The
+  *type* is the model's — `feature/`, `fix/`, `chore/` — so `git.branch.prefix` applies only to a
+  name that arrived without one, or you get `feature/fix/the-login` under a type that is now wrong.
+  `git.branch.model` is unset by default and the plugin sends **no selection at all** rather than a
+  guess, so the fallback stays the host's: `gen.model`, then the model you are already talking to.
+  And the host has to put *its own* label right — `ProjectFacts` is asked once per directory and
+  read on every redraw, so `GitRenameBranch` is the one git write handled on the host loop, which
+  is what makes the sidebar row follow instead of saying `wily-nimbus` until restart. The directory
+  keeps the old name on purpose: moving it would invalidate the conversation's `cwd`. See ADR 0051.
 - **A project outlives the conversations in it.** The panel's list is written down (`sidebar.projects`,
   a workspace var) rather than worked out from where the conversations happen to be — derived, it
   deleted the directory you had worked in all month the moment you cleared out the last thread in
@@ -290,13 +307,22 @@ per decision, and records the *reasoning*, not the choice.
   before it is moved into place, named by its manifest, and never able to delete what you put in
   your own config directory by hand. See ADR 0053.
 - **A card is a row until you ask for more.** A call that only *looked* at something folds to its
-  header with the size of what came back on the end of it; a command keeps its output, an edit keeps
-  its diff, and a failure always shows. See ADR 0033.
-- **A run of calls that only looked at things is one row**, naming as many of them as fit and
-  counting the rest — a turn that read six files reads as one. A run is calls with *nothing drawn
-  between them*, asked the same way by the live path and the replay, or switching away and back
-  re-folds the conversation. Only a mark that is news gets drawn: `▸` while a call is out, `✗` if it
-  failed, and nothing at all when it worked. See ADR 0040.
+  header with the size of what came back on the end of it; a command keeps its output — a stack of
+  them keeps the last one's — an edit keeps its diff, and a failure always shows. See ADR 0033.
+- **A run of calls of one kind is one row**, naming as many of them as fit and counting the rest —
+  a turn that read six files reads as one, and so does a stretch of it spent on `git add`, `git
+  commit`, `git push`. Reads with reads and commands with commands, never one of each, and never an
+  edit. A run is calls with *nothing drawn between them*, asked the same way by the live path and
+  the replay, or switching away and back re-folds the conversation. A stack of commands keeps the
+  **last one's output** — what a command printed is the answer, and the ones before it are how you
+  got there — names each command by what it *is* rather than how it was spelled (`cargo test`, not
+  `cargo test -p neosh-core -- --test-threads 2`), and gives every command back in full, with what
+  it said, on `⇥`. A run **never continues past a failure**, so a failed command is the last call
+  on its card and its output is the one showing. While a run is still going the row is fitted from
+  the *end*: then it is a report of what is happening rather than an account of what happened, and
+  the call being waited on is the one name that must never be the name that did not fit. Only a
+  mark that is news gets drawn: `▸` while a call is out, `✗` if it failed, and nothing at all when
+  it worked. See ADR 0040 and ADR 0051.
 - **A card says what happened, not which tool did it.** `Ran cargo test`, not `Bash cargo test` —
   read off the arguments, like the colour. A call nothing here classifies keeps the name its author
   gave it, so a plugin's tool is never renamed. **A command's output folds from the middle**: the
@@ -308,12 +334,19 @@ per decision, and records the *reasoning*, not the choice.
 - **A terminal cannot paste a picture, so pasting one is a key.** Bracketed paste is a text
   protocol: a screenshot arrives as nothing, and a dragged file arrives as its path. `^V` asks the
   system clipboard through whichever of `wl-paste`/`xclip`/`pngpaste`/`osascript`/`powershell` is
-  there; a pasted line that is unambiguously a path to an image becomes that image. An attachment
-  is a **chip above the field**, never a token in it — the message you send is the message you
-  typed. `ContentBlock::Image` carries a *path*, not bytes: a transcript that is mostly base64 is
-  one nothing can read back, so the bytes live once in the state directory and a driver reads them
-  when it builds its request. The media type is read off the bytes, because a `.png` that is really
-  a JPEG fails the turn. See ADR 0041.
+  there; a pasted line that is unambiguously a path to an image becomes that image. A clipboard is
+  **asked what it holds, not told**: the best picture type *on offer* is the one requested, because
+  asking for `image/png` and nothing else reads a JPEG, a WebP and a BMP as an empty clipboard. And
+  a picture copied off a page is often not on the clipboard at all — what a browser leaves is an
+  address (`text/uri-list`, an `<img src>` in `text/html`, a `data:` URI, a plain URL), so
+  `from_clipboard` answers with bytes *or* a `Remote` to go and get. That fetch is spawned rather
+  than awaited on the loop, carries the conversation it was asked in, and is the one attachment
+  that says something on the way. A photograph too busy to fit as a PNG is sent as a JPEG rather
+  than refused over an encoding. See ADR 0051. An attachment is a **chip above the field**, never a
+  token in it — the message you send is the message you typed. `ContentBlock::Image` carries a
+  *path*, not bytes: a transcript that is mostly base64 is one nothing can read back, so the bytes
+  live once in the state directory and a driver reads them when it builds its request. The media
+  type is read off the bytes, because a `.png` that is really a JPEG fails the turn. See ADR 0041.
 - **A vendor CLI outlives the turn, so an abandoned turn has to be *drained*.** `Live::lines` is
   per conversation. A turn that is walked away from — `<Esc>`, a switch — leaves the CLI mid-answer
   with the rest of it in the pipe, and the next turn reads it as its own: someone else's reply, and
@@ -454,7 +487,7 @@ only way to do anything. See ADR 0048.
 | `⏎` | Send. While a turn is running, **steer** it: the message is held and taken in at the next gap. |
 | `⇧⏎` | Newline, so a pasted snippet stays one message |
 | `^Y` | Take the last thing you queued back into the composer, to change it or drop it. Readline's yank: `^U`/`^W` kill, `^Y` brings it back |
-| `^V` | Attach the image on the clipboard. A key rather than a paste, because a terminal's paste can only ever hand over text |
+| `^V` | Attach the image on the clipboard — the picture itself, or the one it only names: a page's `<img>`, a URL, a file. A key rather than a paste, because a terminal's paste can only ever hand over text |
 | `⌫` | On an empty composer, take the last attached image back off |
 | `^P` | Pick a model. Mid-turn too — the running agent is told, and thinks the rest with it |
 | `^E` | Everything this model can be told, on one panel: effort, thinking, fast mode, context, and whatever a driver invented. `h`/`l` along a row, `j`/`k` between them, arrows too, and it applies as you move. Nothing else reaches the keyboard while it is open; `^E` again closes it |
@@ -462,7 +495,7 @@ only way to do anything. See ADR 0048.
 | `^T` | Projects and conversations. Switching is never refused — turns keep running where they are |
 | `^J` | The computers in this workspace. Add one by its address, allow one that is asking, or open what it is running |
 | `^F` | What you have archived. Filter it, put one back, or finally throw it away |
-| `^N` | New conversation. In a repository it asks where: here, a worktree you need not name, one kept inside the project, one you do name, an existing one, another machine, elsewhere |
+| `^N` | New conversation. In a repository it asks where: here, a worktree you need not name, one kept inside the project, one you do name, an existing one, another machine, elsewhere. A worktree you did not name is named by your first message — `fix/composer-paste-truncation`, not `wily-nimbus` |
 | `^O` | Add a project |
 | `^B` | Toggle the sidebar |
 | `^K` | Command palette |

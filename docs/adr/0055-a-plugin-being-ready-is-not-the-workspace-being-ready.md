@@ -1,4 +1,4 @@
-# 0054 — A plugin being ready is not the workspace being ready
+# 0055 — A plugin being ready is not the workspace being ready
 
 ## What happened
 

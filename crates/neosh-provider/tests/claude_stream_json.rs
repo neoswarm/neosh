@@ -77,10 +77,14 @@ impl Drop for Fake {
 
 impl Fake {
     fn new(name: &str) -> Self {
+        Self::running(name, FAKE)
+    }
+
+    fn running(name: &str, script: &str) -> Self {
         let dir = std::env::temp_dir().join(format!("neosh-claude-{}-{name}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("sandbox");
-        support::write_executable(&dir.join("claude"), FAKE);
+        support::write_executable(&dir.join("claude"), script);
         Self { dir }
     }
 
@@ -160,6 +164,119 @@ async fn what_an_abandoned_turn_was_still_saying_is_not_the_next_turn_s_answer()
     assert!(
         !said.contains("FIRST-TAIL"),
         "the rest of the abandoned turn was read as this one's reply\n{said:?}"
+    );
+    assert!(said.contains("SECOND"), "and this turn's own answer never arrived\n{said:?}");
+}
+
+/// A `claude` that keeps talking after the turn is over, which is what one holding a backgrounded
+/// shell does.
+///
+/// Every line here was captured off `claude 2.1.240`, in this order. The first turn starts a
+/// detached `sleep`, answers, and closes with its `result`. Some time later the shell exits — and
+/// the CLI does two things nothing was waiting for: it reports the task, and then it *runs a turn
+/// of its own* about it, with a fresh `init`, an assistant message and a second `result`. All of it
+/// lands in a pipe nobody is reading, and sits there until the next question is asked.
+const CHATTY: &str = r#"#!/bin/sh
+n=0
+say() { printf '%s\n' "$1"; }
+while IFS= read -r line; do
+  case "$line" in
+    *'"subtype":"get_context_usage"'*)
+      say '{"type":"control_response","response":{"subtype":"success","request_id":"x","response":{"totalTokens":10,"maxTokens":100}}}' ;;
+    *'"type":"user"'*)
+      n=$((n+1))
+      if [ "$n" = 1 ]; then
+        say '{"type":"system","subtype":"background_tasks_changed","tasks":[{"task_id":"bcuwuj1ft","task_type":"local_bash","description":"npm run build"}]}'
+        say '{"type":"system","subtype":"task_started","task_id":"bcuwuj1ft","tool_use_id":"t1","description":"npm run build","is_backgrounded":true,"task_type":"local_bash"}'
+        say '{"type":"stream_event","session_id":"s","event":{"type":"message_start","message":{"model":"m","usage":{}}}}'
+        say '{"type":"stream_event","session_id":"s","event":{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}}'
+        say '{"type":"stream_event","session_id":"s","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"STARTED"}}}'
+        say '{"type":"stream_event","session_id":"s","event":{"type":"content_block_stop","index":0}}'
+        say '{"type":"stream_event","session_id":"s","event":{"type":"message_stop"}}'
+        say '{"type":"result","subtype":"success","is_error":false,"result":"STARTED","session_id":"s"}'
+        # Detached, and that is the whole point: the shell exits well after the turn it was started
+        # in has been read to its end and let go of. Everything below lands in a pipe nobody holds.
+        (
+          sleep 2
+          say '{"type":"system","subtype":"background_tasks_changed","tasks":[]}'
+          say '{"type":"system","subtype":"task_updated","task_id":"bcuwuj1ft","patch":{"status":"completed","end_time":1787457600637}}'
+          say '{"type":"system","subtype":"task_notification","task_id":"bcuwuj1ft","status":"completed","summary":"npm run build"}'
+          # The turn the CLI then runs at itself about the shell exiting.
+          say '{"type":"system","subtype":"init","session_id":"s","slash_commands":[]}'
+          say '{"type":"stream_event","session_id":"s","event":{"type":"message_start","message":{"model":"m","usage":{}}}}'
+          say '{"type":"stream_event","session_id":"s","event":{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}}'
+          say '{"type":"stream_event","session_id":"s","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"UNASKED"}}}'
+          say '{"type":"stream_event","session_id":"s","event":{"type":"content_block_stop","index":0}}'
+          say '{"type":"stream_event","session_id":"s","event":{"type":"message_stop"}}'
+          say '{"type":"result","subtype":"success","is_error":false,"result":"UNASKED","session_id":"s"}'
+        ) &
+      else
+        say '{"type":"stream_event","session_id":"s","event":{"type":"message_start","message":{"model":"m","usage":{}}}}'
+        say '{"type":"stream_event","session_id":"s","event":{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}}'
+        say '{"type":"stream_event","session_id":"s","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"SECOND"}}}'
+        say '{"type":"stream_event","session_id":"s","event":{"type":"content_block_stop","index":0}}'
+        say '{"type":"stream_event","session_id":"s","event":{"type":"message_stop"}}'
+        say '{"type":"result","subtype":"success","is_error":false,"result":"SECOND","session_id":"s"}'
+      fi ;;
+  esac
+done
+"#;
+
+fn sets_of(events: &[ProviderEvent]) -> Vec<Vec<neosh_proto::BackgroundTask>> {
+    events
+        .iter()
+        .filter_map(|e| match e {
+            ProviderEvent::Activity { activity: neosh_proto::Activity::Background { tasks }, .. } => {
+                Some(tasks.clone())
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn a_turn_that_walked_away_from_a_shell_is_told_when_the_shell_finishes() {
+    let fake = Fake::running("background", CHATTY);
+    let p = ClaudeCliProvider::new(fake.program());
+
+    let first: Vec<ProviderEvent> =
+        p.stream(&inst(), req(&fake.dir, "one"), CancellationToken::new()).collect().await;
+    assert_eq!(
+        sets_of(&first),
+        vec![
+            // The reset a freshly started process owes its receiver. Nothing is running yet, and
+            // nothing will say so — the set is only reported when it changes.
+            vec![],
+            vec![neosh_proto::BackgroundTask {
+                id: neosh_proto::TaskId("bcuwuj1ft".into()),
+                title: "npm run build".into(),
+                kind: Some("local_bash".into()),
+            }],
+        ],
+        "the turn ends knowing one thing is still going"
+    );
+    assert!(text_of(&first).contains("STARTED"));
+
+    // Long enough for the shell to have exited and the CLI to have said so — and to have talked to
+    // itself about it. All of that is now in the pipe, ahead of the prompt this turn is about to
+    // send.
+    tokio::time::sleep(std::time::Duration::from_millis(2500)).await;
+    let second: Vec<ProviderEvent> =
+        p.stream(&inst(), req(&fake.dir, "two"), CancellationToken::new()).collect().await;
+    let said = text_of(&second);
+
+    assert_eq!(
+        sets_of(&second).last().map(Vec::len),
+        Some(0),
+        "the empty set is what puts the indicator out, and it is on the far side of a `result`"
+    );
+    // Both halves of the mis-attribution the drain exists to stop. The stray `result` ended the
+    // turn before the CLI had read the prompt, so this one used to be `UNASKED` and nothing else —
+    // the model's reaction to a shell exiting, drawn as the answer to a question about something
+    // else — with the real reply arriving one turn late.
+    assert!(
+        !said.contains("UNASKED"),
+        "a turn nobody asked for was read as this one's answer\n{said:?}"
     );
     assert!(said.contains("SECOND"), "and this turn's own answer never arrived\n{said:?}");
 }

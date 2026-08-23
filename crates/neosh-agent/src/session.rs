@@ -108,6 +108,16 @@ pub struct Session {
     /// See [`neosh_proto::SessionInfo::interrupted`]. Derived once, where it can be: at load, from
     /// a `running_since` that outlived the process that set it.
     pub interrupted: bool,
+    /// What is still running here that no turn is waiting for.
+    ///
+    /// See [`neosh_proto::SessionInfo::background`]. Held on the conversation for the same reason
+    /// `unread` is — several lists have to agree about it — and, unlike `unread` and unlike
+    /// `interrupted` above, deliberately *not* written down. The two are opposite halves of one
+    /// question and want opposite treatment: a turn cut off by a dead process can only be known
+    /// from a note that outlived it, and a background shell can only be known from a driver that is
+    /// still up to report it. Persisting this would mean a workspace coming back reporting a shell
+    /// that died with it, forever.
+    pub background: Vec<neosh_proto::BackgroundTask>,
     /// Put away, not thrown away: still on disk, still openable, just not in the everyday list.
     pub archived: bool,
     /// When it was put away, in seconds since the epoch. Set by whoever archives it, for the same
@@ -160,6 +170,7 @@ impl Session {
             unread: false,
             running_since: None,
             interrupted: false,
+            background: Vec::new(),
             archived: false,
             archived_at: None,
             permission_mode: None,
@@ -307,6 +318,7 @@ impl Session {
             is_active: false,
             unread: self.unread,
             interrupted: self.interrupted,
+            background: self.background.clone(),
             archived: self.archived,
             archived_at: self.archived_at,
             permission_mode: self.permission_mode,

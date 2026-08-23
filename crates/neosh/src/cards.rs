@@ -395,6 +395,10 @@ pub struct Head<'a> {
     /// was read without saying how much of it there was is a card you have to open to learn the one
     /// thing you would have guessed from the body's height.
     pub output: Option<usize>,
+    /// What came back, for the one card that draws a body per call: a [run of
+    /// commands](run_body). `None` until it has, and `None` for every other purpose here — a
+    /// header is a sentence about a call and never about its output.
+    pub result: Option<&'a neosh_proto::ToolResult>,
 }
 
 /// What the call *did*, in a word, when its arguments say plainly enough.
@@ -460,6 +464,16 @@ pub fn did(input: &serde_json::Value) -> Option<&'static str> {
 /// failures.
 pub fn looks_at_something(input: &serde_json::Value) -> bool {
     Kind::of(input) == Kind::Read
+}
+
+/// Whether a call is one that *ran* something: it was handed a command.
+///
+/// The other half of [`looks_at_something`], and by the same rule — read off the arguments, so a
+/// shell a plugin registers tomorrow is a command because it was given one. A run of these shares
+/// a card the way a run of reads does, with the one difference that follows from what a command
+/// is: what it printed is the answer, so the run keeps the last one's output. See ADR 0051.
+pub fn runs_a_command(input: &serde_json::Value) -> bool {
+    Kind::of(input) == Kind::Run
 }
 
 /// Below this, a call did not take any time worth reporting.
@@ -648,8 +662,10 @@ fn verb<'a>(heads: &'a [Head<'a>], live: bool) -> &'a str {
 /// card: the names, comma-separated, as many as fit, and `+N more` for the rest. `⇥` while reading
 /// opens it back into a row per call.
 ///
-/// Only calls that *looked* at something ever join a run. A command keeps its output and an edit
-/// keeps its diff, and neither has anything to gain from being summarised into a list of names.
+/// Calls of one kind only, and never an edit: a diff is the answer and there is no summarising it
+/// into a list of names. A run of *commands* gets the same row, named by what each command is
+/// rather than how it was spelled, and keeps the last one's output under it — see [`run_body`] and
+/// ADR 0051.
 pub fn group_header(g: &Glyphs, heads: &[Head], root: &std::path::Path, width: usize) -> Row {
     let live = heads.iter().any(|h| h.state == ToolState::Running);
     let failed = heads.iter().any(|h| h.state == ToolState::Failed);
@@ -663,8 +679,12 @@ pub fn group_header(g: &Glyphs, heads: &[Head], root: &std::path::Path, width: u
     let (mark, mark_hl) = g.mark(state);
     let name = verb(heads, live);
 
+    // Coloured by what the run *is*, the same way a card of one call is: a stack of commands is
+    // `Agent.ToolRun`, and reading the kind off the first call is safe because nothing but calls
+    // of one kind ever shares a card. See [`groups_with`].
+    let kind = heads.first().map_or(Kind::Read, |h| Kind::of(h.input));
     let mut text = format!("{mark} {name}");
-    let mut spans = vec![(0, mark.len(), mark_hl), (mark.len() + 1, text.len(), Kind::Read.hl())];
+    let mut spans = vec![(0, mark.len(), mark_hl), (mark.len() + 1, text.len(), kind.hl())];
 
     // The names, then as much of the list as fits. Counting what was dropped rather than clipping
     // the last one mid-word: `+2 more` is a fact, and `cards.r…` is a name that does not exist.
@@ -675,36 +695,31 @@ pub fn group_header(g: &Glyphs, heads: &[Head], root: &std::path::Path, width: u
     let names: Vec<String> = heads.iter().map(|h| short_subject_of(h.input, root)).collect();
     let room = width.saturating_sub(text.chars().count() + 2).max(8);
     let at = text.len() + 2;
-    let mut shown = 0usize;
-    let mut so_far = 0usize;
+    let shown = fits(&names, room, live);
+
     let mut list: Vec<Span> = Vec::new();
     let mut listed = String::new();
-    for (i, n) in names.iter().enumerate() {
-        let rest = names.len() - i - 1;
-        // Room for this name, its separator, and the `+N more` that would follow if any are left.
-        let more = if rest > 0 { format!(", +{rest} more").chars().count() } else { 0 };
-        let sep = if i == 0 { 0 } else { 2 };
-        if so_far + sep + n.chars().count() + more > room && i > 0 {
-            break;
-        }
-        if i > 0 {
+    let add = |listed: &mut String, list: &mut Vec<Span>, piece: &str, hl: &'static str| {
+        if !listed.is_empty() {
             listed.push_str(", ");
         }
         let from = listed.len();
-        listed.push_str(n);
-        list.push((at + from, at + listed.len(), match heads[i].state {
+        listed.push_str(piece);
+        list.push((at + from, at + listed.len(), hl));
+    };
+    if shown.start > 0 {
+        add(&mut listed, &mut list, &format!("+{} earlier", shown.start), "Agent.Usage");
+    }
+    for i in shown.clone() {
+        add(&mut listed, &mut list, &names[i], match heads[i].state {
             ToolState::Running => "Agent.ToolLive",
             ToolState::Failed => "Agent.ToolFailed",
             ToolState::Done => "Agent.Usage",
-        }));
-        so_far += sep + n.chars().count();
-        shown += 1;
+        });
     }
-    let rest = names.len() - shown;
+    let rest = names.len() - shown.end;
     if rest > 0 {
-        let from = listed.len();
-        listed.push_str(&format!(", +{rest} more"));
-        list.push((at + from, at + listed.len(), "Agent.Usage"));
+        add(&mut listed, &mut list, &format!("+{rest} more"), "Agent.Usage");
     }
     if !listed.is_empty() {
         text.push_str("  ");
@@ -712,6 +727,35 @@ pub fn group_header(g: &Glyphs, heads: &[Head], root: &std::path::Path, width: u
         spans.extend(list);
     }
     Row::new(text, spans)
+}
+
+/// Which of `names` fit in `room`, and from which end.
+///
+/// From the front for a run that is over: it is an account of what a stretch of the turn did, and
+/// an account starts at the beginning. From the *back* while one of them is still out, because
+/// then the row is not an account, it is a report of what is happening — the call being waited on
+/// is the last one, and it is the one name that must never be the name that did not fit. A run of
+/// nine commands would otherwise say what it was doing forty seconds ago and `+4 more`.
+///
+/// Always at least one, however long it is: a row of `+9 more` and nothing else answers nothing.
+fn fits(names: &[String], room: usize, from_back: bool) -> std::ops::Range<usize> {
+    let n = names.len();
+    let (mut used, mut kept) = (0usize, 0usize);
+    for step in 0..n {
+        let i = if from_back { n - 1 - step } else { step };
+        // Room for this name, its separator, and the count that stands for whatever is left —
+        // which is a longer word at the front of the row than at the end of it.
+        let dropped = n - kept - 1;
+        let word = if from_back { "earlier" } else { "more" };
+        let more = if dropped > 0 { format!(", +{dropped} {word}").chars().count() } else { 0 };
+        let sep = usize::from(kept > 0) * 2;
+        if used + sep + names[i].chars().count() + more > room && kept > 0 {
+            break;
+        }
+        used += sep + names[i].chars().count();
+        kept += 1;
+    }
+    if from_back { n - kept..n } else { 0..kept }
 }
 
 /// What an opened run shows: one row per call, under the header.
@@ -729,9 +773,14 @@ pub fn group_body(
     g: &Glyphs,
     heads: &[Head],
     root: &std::path::Path,
+    limits: Limits,
     expanded: bool,
     width: usize,
 ) -> Vec<Row> {
+    // A stack of commands is the other kind of run, and it keeps an output. See [`run_body`].
+    if heads.first().is_some_and(|h| runs_a_command(h.input)) {
+        return run_body(g, heads, root, limits, expanded, width);
+    }
     if !expanded {
         return Vec::new();
     }
@@ -751,9 +800,91 @@ pub fn group_body(
     rows
 }
 
-/// Whether two calls may share one card: both only looked at something.
+/// What a stack of commands shows: the last one's output, and every one of them when it is opened.
+///
+/// A run of reads folds to nothing, because the answer to a read is "yes, and it was what you
+/// would expect". A command is the opposite — what it printed *is* the answer — so a stack of them
+/// keeps one output, and it is the last one's:
+///
+/// ```text
+///   Ran  cargo fmt, cargo build, cargo test
+///   └    Compiling neosh v0.1.0
+///     … +18 lines (^S ⇥ to expand)
+///     test result: ok. 142 passed
+/// ```
+///
+/// The last one, because in a stretch of commands the ones before it are how you get there and the
+/// last one is what you were waiting for: `git add` and `git commit` and then `git push`. It is
+/// also the only one that can be the answer while the run is still growing — the moment another
+/// command starts, the one above it has been superseded by the thing the model decided to do next.
+///
+/// Nothing is lost that a key does not give back. `⇥` opens the stack into a row per command with
+/// the whole of its output under it, which is exactly what each of them would have had as a card
+/// of its own:
+///
+/// ```text
+///   └ Ran  cargo fmt --check
+///         all good
+///     Ran  cargo test -p neosh-core -- --test-threads 2
+///         running 142 tests
+///         test result: ok. 142 passed
+/// ```
+///
+/// And a failure is never the output that folded away: a run does not continue past one, so a
+/// command that failed is the last call on its card and its output is the one showing. See ADR
+/// 0051.
+fn run_body(
+    g: &Glyphs,
+    heads: &[Head],
+    root: &std::path::Path,
+    limits: Limits,
+    expanded: bool,
+    width: usize,
+) -> Vec<Row> {
+    let margin = g.margin();
+    let deeper = format!("{margin}    ");
+    let mut rows: Vec<Row> = Vec::new();
+
+    // Which of them get an output. Opened, all of them. Folded, the last one — and anything that
+    // failed, wherever it is in the stack: a run does not usually continue past a failure, but
+    // calls made in parallel land in whatever order they land in, and a fold is about noise.
+    let shown: Vec<usize> = (0..heads.len())
+        .filter(|&i| expanded || i + 1 == heads.len() || heads[i].state == ToolState::Failed)
+        .collect();
+    // Whose output this is only has to be said when more than one of them is saying anything.
+    // Folded to the last command alone, the stack above it is the header's list and a row naming
+    // it again is a row spent repeating the line above.
+    let named = expanded || shown.len() > 1;
+    let room = width.saturating_sub(margin.chars().count()).max(8);
+
+    for i in shown {
+        let h = &heads[i];
+        if named {
+            // The command in full on its own row, and what it printed under it — one indent
+            // deeper, because those rows belong to *that* command and not to the stack. At the
+            // same indent the next command's name reads as another line of the output above it.
+            let (text, spans) = label(h, root, room);
+            let at = margin.len();
+            let mut all = vec![(0, at, "Agent.Usage")];
+            all.extend(spans.into_iter().map(|(a, b, hl)| (at + a, at + b, hl)));
+            rows.push(Row::new(format!("{margin}{text}"), all));
+        }
+        if let Some(result) = h.result {
+            let under = if named { &deeper } else { &margin };
+            rows.extend(result_rows(g, result, limits.output_lines, expanded, width, under));
+        }
+    }
+    attach(g, &mut rows);
+    rows
+}
+
+/// Whether two calls may share one card: both only looked at something, or both ran something.
+///
+/// Never one of each. A run is a row that says *what a stretch of the turn was doing*, and
+/// `Explored  a.rs, cargo test` is two different activities wearing one verb — the mixture that
+/// [`verb`] has no true name for is a mixture of reads, not a mixture of kinds.
 pub fn groups_with(a: &serde_json::Value, b: &serde_json::Value) -> bool {
-    looks_at_something(a) && looks_at_something(b)
+    (looks_at_something(a) && looks_at_something(b)) || (runs_a_command(a) && runs_a_command(b))
 }
 
 /// The agent's own checklist, drawn.
@@ -852,6 +983,28 @@ pub fn tasks(g: &Glyphs, rows: &[TaskRow], width: usize) -> Vec<Row> {
         .collect()
 }
 
+/// The header over what a finished turn walked away from.
+///
+/// The one line the user asked for and the transcript could not say. A turn ends, the working line
+/// goes away with the footer that was listing what was out, and the answer sitting there reads as
+/// *done* — while the shell the agent detached two minutes ago is still building. The rows under
+/// this say what those things are; this says that they are, and that the turn ending was not them
+/// finishing.
+///
+/// It wears `Status.Unread` rather than anything that moves. `Status.Pending` pulses because a
+/// question ends the moment you answer it and the motion is asking you to; this ends when it ends,
+/// and a transcript that throbs at you over work you were told to ignore is the version of this
+/// nobody wants. See ADR 0045 on why motion means "act now".
+pub fn still_running(g: &Glyphs, n: usize) -> Vec<Row> {
+    let what = if n == 1 { "1 thing".to_string() } else { format!("{n} things") };
+    let text = format!("{} Still running in the background \u{b7} {what}", g.elbow);
+    let mark = g.elbow.len();
+    vec![Row::new(text.clone(), vec![
+        (0, mark, "Agent.Usage"),
+        (mark, text.len(), "Status.Unread"),
+    ])]
+}
+
 /// A compaction, once it has landed, as the one row it leaves behind.
 ///
 /// Worth a row of its own rather than a note that disappears: the conversation the agent is holding
@@ -946,6 +1099,10 @@ fn subject(input: &serde_json::Value) -> Option<(&'static str, String)> {
 pub fn short_subject_of(input: &serde_json::Value, root: &std::path::Path) -> String {
     let Some((key, value)) = subject(input) else { return String::new() };
     let full = relative_to(&value, root);
+    // A command says what it is in its first two or three words and spends the rest on flags.
+    if key == "command" {
+        return short_command(&full);
+    }
     // Only where it is a path. A pattern's last component is not a shorter pattern — `**/*.rs`
     // would come out as `*.rs`, which is a different glob.
     if !PATH_KEYS.contains(&key) {
@@ -955,6 +1112,52 @@ pub fn short_subject_of(input: &serde_json::Value, root: &std::path::Path) -> St
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or(full)
+}
+
+/// A command, as short as a list of them can say it: what it *is*, without its flags.
+///
+/// `cargo test -p neosh-core -- --test-threads 2` is forty-two columns of one card, on a row that
+/// has to hold four of them, and thirty of those columns are how the run was tuned rather than
+/// what was run. The first words are the answer — `cargo test`, `git status`, `npm run build` — so
+/// the short form is the leading run of plain words and nothing else.
+///
+/// No ellipsis, for the same reason a path's last component does not wear one: the row it goes on
+/// is a summary of a stretch of the turn, everything on it is short for something, and three
+/// `git add…, git commit…, git push` is punctuation saying what the row already says. The whole
+/// command line is one `⇥` away, on the row this call gets when the stack is opened, and it is
+/// what the card says when the call is alone.
+///
+/// A leading `VAR=value` is not one of those words: it is how the command was set up, and a column
+/// of `NEOSH_STATE_DIR=…` says nothing about four different commands. Three words is the cap,
+/// because a fourth is already an argument in every shape this is trying to catch.
+fn short_command(command: &str) -> String {
+    let mut words: Vec<&str> = Vec::new();
+    for word in command.split_whitespace() {
+        // The environment a command was given is not the command.
+        if words.is_empty()
+            && word.split_once('=').is_some_and(|(k, _)| {
+                !k.is_empty() && k.chars().all(|c| c.is_ascii_uppercase() || c == '_')
+            })
+        {
+            continue;
+        }
+        if words.len() == 3 || word.starts_with('-') || !word.chars().all(is_word) {
+            break;
+        }
+        words.push(word);
+    }
+    // Nothing that reads as a name — a subshell, a pipeline, a `for` loop written out. Then the
+    // command is whatever it is, clipped, because guessing a name for it would be worse.
+    if words.is_empty() {
+        return clip(command.trim(), 24);
+    }
+    words.join(" ")
+}
+
+/// What may appear in the *name* of a command: a word, a path, a version. Anything else — a pipe,
+/// a redirect, a quote, an `&&` — is where the command stops being one thing.
+fn is_word(c: char) -> bool {
+    c.is_alphanumeric() || "._-/+@:".contains(c)
 }
 
 /// A path inside the conversation's directory, said the short way.
@@ -1026,7 +1229,7 @@ pub fn body(
         // Folded to the header alone. The count is already on it, and `⇥` opens this.
         Vec::new()
     } else {
-        result_rows(g, result, limits.output_lines, expanded, width)
+        result_rows(g, result, limits.output_lines, expanded, width, &g.margin())
     };
     attach(g, &mut rows);
     rows
@@ -1088,15 +1291,18 @@ fn trailer(g: &Glyphs, margin: &str, rest: usize, what: &str) -> Row {
 /// Tabs become spaces on the way in. A terminal advances to the next tab stop and a buffer line
 /// does not, so a `Read` whose output is `     1\thello` arrives on screen as `1hello` — the one
 /// place a tool's output is *deliberately* aligned is the one place it collapses.
+///
+/// `margin` is what every row of it starts with: a body's four columns, or eight for an output
+/// inside an [opened stack of commands](run_body), where four is the row the command itself is on.
 fn result_rows(
     g: &Glyphs,
     result: &neosh_proto::ToolResult,
     limit: usize,
     expanded: bool,
     width: usize,
+    margin: &str,
 ) -> Vec<Row> {
     let hl = if result.is_error { "Agent.ToolError" } else { "Agent.Usage" };
-    let margin = g.margin();
 
     let body = result.content.trim_end();
     if body.trim().is_empty() {
@@ -1149,7 +1355,7 @@ fn result_rows(
     }
     let kept: Vec<&str> =
         all[from..].iter().copied().filter(|l| says_something(l)).collect();
-    out.push(trailer(g, &margin, total - out.len() - kept.len(), "lines"));
+    out.push(trailer(g, margin, total - out.len() - kept.len(), "lines"));
     out.extend(kept.into_iter().map(|l| row(l)));
     out
 }
@@ -1514,6 +1720,7 @@ mod tests {
             took: Some(Duration::from_millis(4)),
             exit: None,
             output: None,
+            result: None,
         };
         let text = header_text(&g(), &quick, &root(), 80);
         assert_eq!(text, "  Read  a.rs", "{text:?}");
@@ -1552,6 +1759,7 @@ mod tests {
             took: Some(std::time::Duration::from_millis(120)),
             exit: Some(1),
             output: None,
+            result: None,
         };
         let text = header_text(&g(), &full, &root(), 90);
         assert!(text.ends_with("+1 -1  exit 1  120ms"), "{text:?}");
@@ -1567,7 +1775,7 @@ mod tests {
         input: &'a serde_json::Value,
         state: ToolState,
     ) -> Head<'a> {
-        Head { name, input, state, took: None, exit: None, output: None }
+        Head { name, input, state, took: None, exit: None, output: None, result: None }
     }
 
     fn header_text(g: &Glyphs, head: &Head, root: &std::path::Path, width: usize) -> String {
@@ -1709,14 +1917,155 @@ mod tests {
             Head { output: Some(120), ..head("Read", &a, ToolState::Done) },
             Head { output: Some(3), ..head("Grep", &b, ToolState::Done) },
         ];
-        assert!(group_body(&g(), &heads, &root(), false, 80).is_empty(), "folded, it is one row");
-        let rows = group_body(&g(), &heads, &root(), true, 80);
+        let limits = Limits { diff_lines: 12, output_lines: 3 };
+        assert!(
+            group_body(&g(), &heads, &root(), limits, false, 80).is_empty(),
+            "folded, it is one row"
+        );
+        let rows = group_body(&g(), &heads, &root(), limits, true, 80);
         // Opened, every call gets its own row with the *whole* subject: the short names on the
         // folded row are the loose answer, and this is where it is exact.
         assert_eq!(texts(&rows), vec![
             "  \u{2514} Read  deep/down/a.rs  120 lines",
             "    Searched  fn main  3 lines",
         ]);
+    }
+
+    /// A stretch of a turn spent running things is one row, and the answer is the last one's.
+    #[test]
+    fn a_stack_of_commands_keeps_the_last_answer() {
+        let limits = Limits { diff_lines: 12, output_lines: 3 };
+        let add = json!({ "command": "git add -A" });
+        let commit = json!({ "command": "git commit -m 'fix the thing'" });
+        let push = json!({ "command": "git push" });
+        let quiet = neosh_proto::ToolResult::ok("");
+        let said = neosh_proto::ToolResult::ok("[main 6759f10] fix the thing\n 1 file changed");
+        let sent = neosh_proto::ToolResult::ok("To github.com:neoswarm/neosh\n   6759f10..c280938");
+        let heads = [
+            Head { result: Some(&quiet), ..head("Bash", &add, ToolState::Done) },
+            Head { result: Some(&said), ..head("Bash", &commit, ToolState::Done) },
+            Head { result: Some(&sent), ..head("Bash", &push, ToolState::Done) },
+        ];
+        // The commands, named by what they are rather than by how they were spelled.
+        assert_eq!(
+            group_header(&g(), &heads, &root(), 80).text,
+            "  Ran  git add, git commit, git push"
+        );
+        // And under it the last one's output, and nothing from the two that got there.
+        assert_eq!(texts(&group_body(&g(), &heads, &root(), limits, false, 80)), vec![
+            "  \u{2514} To github.com:neoswarm/neosh",
+            "       6759f10..c280938",
+        ]);
+    }
+
+    /// The fold is a summary and the key is the detail — for a command that means its output.
+    #[test]
+    fn an_opened_stack_is_every_command_in_full_with_what_it_printed() {
+        let limits = Limits { diff_lines: 12, output_lines: 1 };
+        let fmt = json!({ "command": "cargo fmt --check" });
+        let test = json!({ "command": "cargo test -p neosh-core -- --test-threads 2" });
+        let ok = neosh_proto::ToolResult::ok("all good");
+        let ran = neosh_proto::ToolResult::ok("running 142 tests\ntest result: ok");
+        let heads = [
+            Head { result: Some(&ok), ..head("Bash", &fmt, ToolState::Done) },
+            Head { result: Some(&ran), ..head("Bash", &test, ToolState::Done) },
+        ];
+        // Every one of them, the whole command line, and the whole of what it said — one indent
+        // deeper, or the next command's name reads as another line of the output above it.
+        assert_eq!(texts(&group_body(&g(), &heads, &root(), limits, true, 80)), vec![
+            "  \u{2514} Ran  cargo fmt --check",
+            "        all good",
+            "    Ran  cargo test -p neosh-core -- --test-threads 2",
+            "        running 142 tests",
+            "        test result: ok",
+        ]);
+    }
+
+    /// A fold is about noise, and a failure is not noise — wherever in the stack it landed.
+    #[test]
+    fn a_stack_never_folds_a_failure_away() {
+        let limits = Limits { diff_lines: 12, output_lines: 3 };
+        let build = json!({ "command": "cargo build" });
+        let test = json!({ "command": "cargo test" });
+        let broke = neosh_proto::ToolResult::error("error[E0308]: mismatched types");
+        let ok = neosh_proto::ToolResult::ok("test result: ok");
+        let heads = [
+            Head { result: Some(&broke), ..head("Bash", &build, ToolState::Failed) },
+            Head { result: Some(&ok), ..head("Bash", &test, ToolState::Done) },
+        ];
+        // Two outputs, so each says whose it is. `Card::takes` is what makes this rare — a run
+        // does not continue past a failure — but calls made in parallel land in any order.
+        assert_eq!(texts(&group_body(&g(), &heads, &root(), limits, false, 80)), vec![
+            "  \u{2514} Ran  cargo build",
+            "        error[E0308]: mismatched types",
+            "    Ran  cargo test",
+            "        test result: ok",
+        ]);
+    }
+
+    /// While it is going, the row is a report of what is happening rather than an account of what
+    /// happened — so the name that must never be dropped is the one still out.
+    #[test]
+    fn a_live_stack_is_fitted_from_the_end() {
+        let inputs: Vec<serde_json::Value> = ["cargo fmt", "cargo build", "cargo clippy",
+            "cargo test", "cargo doc"]
+            .iter()
+            .map(|c| json!({ "command": c }))
+            .collect();
+        let mut heads: Vec<Head> =
+            inputs.iter().map(|i| head("Bash", i, ToolState::Done)).collect();
+        let last = heads.len() - 1;
+        heads[last].state = ToolState::Running;
+        let row = group_header(&g(), &heads, &root(), 44);
+        assert!(row.text.chars().count() <= 44, "{row:?}");
+        assert!(row.text.ends_with("cargo doc"), "the one being waited on: {row:?}");
+        assert!(row.text.contains("earlier"), "and a count of what it got there through: {row:?}");
+        // Finished, it reads from the beginning again: an account starts where the work did.
+        heads[last].state = ToolState::Done;
+        let row = group_header(&g(), &heads, &root(), 44);
+        assert!(row.text.starts_with("  Ran  cargo fmt"), "{row:?}");
+        assert!(row.text.ends_with("more"), "{row:?}");
+    }
+
+    #[test]
+    fn a_command_in_a_list_is_what_it_is_and_not_how_it_was_spelled() {
+        for (command, want) in [
+            ("cargo test -p neosh-core -- --test-threads 2", "cargo test"),
+            ("git status", "git status"),
+            ("npm run build", "npm run build"),
+            ("npm run build --silent", "npm run build"),
+            ("NEOSH_STATE_DIR=/tmp/x cargo run", "cargo run"),
+            ("ls -la /tmp", "ls"),
+            ("./scripts/shot.py --cols 110", "./scripts/shot.py"),
+            // Where it stops being one command, the name stops with it.
+            ("cd crates && cargo test", "cd crates"),
+            ("grep -rn foo | wc -l", "grep"),
+            ("for f in *.rs; do echo $f; done", "for f in"),
+            // And something with no name in it at all is itself, as much as fits.
+            ("(cd crates && ls)", "(cd crates && ls)"),
+            ("(cd crates && ls) | sort -u", "(cd crates && ls) | sor\u{2026}"),
+        ] {
+            let input = json!({ "command": command });
+            assert_eq!(short_subject_of(&input, &root()), want, "{command}");
+        }
+    }
+
+    /// Reads with reads and commands with commands. A run is a row saying what a stretch of the
+    /// turn was doing, and one verb over two kinds of activity is a verb that is not true.
+    #[test]
+    fn only_calls_of_one_kind_share_a_card() {
+        let read = json!({ "file_path": "/work/a.rs" });
+        let grep = json!({ "pattern": "fn main" });
+        let ran = json!({ "command": "cargo test" });
+        let edit = json!({ "file_path": "/work/a.rs", "old_string": "a", "new_string": "b" });
+        assert!(groups_with(&read, &grep));
+        assert!(
+            groups_with(&ran, &json!({ "command": "git status" })),
+            "ADR 0051: what a command printed is the answer, and the stack keeps the last one's"
+        );
+        assert!(!groups_with(&read, &ran), "one verb over two activities is a verb that is not true");
+        assert!(!groups_with(&read, &edit), "an edit's diff is the answer");
+        assert!(!groups_with(&edit, &edit), "a diff is the answer and does not summarise");
     }
 
     #[test]
@@ -1813,18 +2162,6 @@ mod tests {
         let glob = json!({ "pattern": "**/*.rs" });
         assert_eq!(short_subject_of(&glob, &root()), "**/*.rs");
         assert_eq!(short_subject_of(&json!({ "path": "/work/a/b/c.rs" }), &root()), "c.rs");
-    }
-
-    #[test]
-    fn only_calls_that_looked_at_something_share_a_card() {
-        let read = json!({ "file_path": "/work/a.rs" });
-        let grep = json!({ "pattern": "x" });
-        let run = json!({ "command": "ls" });
-        let edit = json!({ "file_path": "/work/a.rs", "old_string": "a", "new_string": "b" });
-        assert!(groups_with(&read, &grep));
-        assert!(!groups_with(&read, &run), "a command's output is the answer, not a name");
-        assert!(!groups_with(&read, &edit), "an edit's diff is the answer");
-        assert!(!groups_with(&run, &run));
     }
 
     #[test]
