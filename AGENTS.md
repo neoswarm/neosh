@@ -247,13 +247,22 @@ per decision, and records the *reasoning*, not the choice.
   is announced once at startup, empty, and that is what clears the one left behind by a workspace
   that stopped mid-question. See ADR 0043.
 - **A card is a row until you ask for more.** A call that only *looked* at something folds to its
-  header with the size of what came back on the end of it; a command keeps its output, an edit keeps
-  its diff, and a failure always shows. See ADR 0033.
-- **A run of calls that only looked at things is one row**, naming as many of them as fit and
-  counting the rest — a turn that read six files reads as one. A run is calls with *nothing drawn
-  between them*, asked the same way by the live path and the replay, or switching away and back
-  re-folds the conversation. Only a mark that is news gets drawn: `▸` while a call is out, `✗` if it
-  failed, and nothing at all when it worked. See ADR 0040.
+  header with the size of what came back on the end of it; a command keeps its output — a stack of
+  them keeps the last one's — an edit keeps its diff, and a failure always shows. See ADR 0033.
+- **A run of calls of one kind is one row**, naming as many of them as fit and counting the rest —
+  a turn that read six files reads as one, and so does a stretch of it spent on `git add`, `git
+  commit`, `git push`. Reads with reads and commands with commands, never one of each, and never an
+  edit. A run is calls with *nothing drawn between them*, asked the same way by the live path and
+  the replay, or switching away and back re-folds the conversation. A stack of commands keeps the
+  **last one's output** — what a command printed is the answer, and the ones before it are how you
+  got there — names each command by what it *is* rather than how it was spelled (`cargo test`, not
+  `cargo test -p neosh-core -- --test-threads 2`), and gives every command back in full, with what
+  it said, on `⇥`. A run **never continues past a failure**, so a failed command is the last call
+  on its card and its output is the one showing. While a run is still going the row is fitted from
+  the *end*: then it is a report of what is happening rather than an account of what happened, and
+  the call being waited on is the one name that must never be the name that did not fit. Only a
+  mark that is news gets drawn: `▸` while a call is out, `✗` if it failed, and nothing at all when
+  it worked. See ADR 0040 and ADR 0051.
 - **A card says what happened, not which tool did it.** `Ran cargo test`, not `Bash cargo test` —
   read off the arguments, like the colour. A call nothing here classifies keeps the name its author
   gave it, so a plugin's tool is never renamed. **A command's output folds from the middle**: the

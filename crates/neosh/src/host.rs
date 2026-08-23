@@ -527,11 +527,11 @@ struct Leg {
 /// finished when the call comes back — without going looking for the call in the conversation,
 /// which for a running agent turn does not hold it yet.
 ///
-/// Usually one call. A *run* of calls that only looked at things — reads, greps, listings, one
-/// after another with nothing drawn between them — shares a card, and the card is one row saying
-/// what they all looked at. See [`cards::group_header`]. Nothing else ever shares: a command's
-/// output and an edit's diff are the answer, and there is no summarising them into a list of
-/// names.
+/// Usually one call. A *run* of calls of one kind, one after another with nothing drawn between
+/// them, shares a card: reads, greps and listings fold to one row saying what they all looked at,
+/// and commands fold to one row naming them with the last one's output under it. See
+/// [`cards::group_header`] and [`cards::groups_with`]. An edit never shares — its diff is the
+/// answer, and there is no summarising a diff into a list of names.
 struct Card {
     /// One, or a run of read-only calls, in the order they were made.
     legs: Vec<Leg>,
@@ -567,11 +567,17 @@ impl Card {
 
     /// Whether a call `input` could join this card.
     ///
-    /// Both sides have to be calls that only looked at something, and the card has to have room
-    /// for the idea — a card whose body is already on screen is a card the reader has opened, and
-    /// growing it under them would move what they were reading.
+    /// Both sides have to be the same kind of call — reads with reads, commands with commands —
+    /// and the card has to have room for the idea: a card whose body is already on screen is a
+    /// card the reader has opened, and growing it under them would move what they were reading.
+    ///
+    /// **A run does not continue past a failure.** A stack of commands shows the last one's
+    /// output, so a failed call that is not the last one is a failure whose output folded away —
+    /// and the fold is about noise. Ending the run there gives the failure its own card with its
+    /// own body, which is what it would have had alone.
     fn takes(&self, input: &serde_json::Value) -> bool {
         !self.expanded
+            && !self.legs.iter().any(|l| l.result.as_ref().is_some_and(|r| r.is_error))
             && self.legs.last().is_some_and(|l| cards::groups_with(&l.input, input))
     }
 }
@@ -4404,8 +4410,16 @@ impl Host {
         {
             self.cards[i].legs.push(leg);
             let row = self.cards[i].row;
-            let header = self.card_header(i);
-            self.replace_row(row, &header);
+            if self.cards[i].body > 0 {
+                // A stack of commands shows the *last* one's output, and the call that just
+                // started has not printed one yet — so its predecessor's rows come off here.
+                self.redraw_card(i);
+            } else {
+                // A run of reads has no body at all, and rewriting the header in place is what
+                // keeps a run from costing rows while it happens.
+                let header = self.card_header(i);
+                self.replace_row(row, &header);
+            }
             return Some(row);
         }
         let g = self.glyphs();
@@ -4418,6 +4432,7 @@ impl Host {
             took: None,
             exit: None,
             output: None,
+            result: None,
         };
         let card = cards::header(&g, &head, &root, width);
         // No blank row above it. Air used to go between one action and the next on the argument
@@ -4525,6 +4540,8 @@ impl Host {
                 took: leg.took.or_else(|| leg.started.map(|s| s.elapsed())),
                 exit: leg.exit,
                 output: leg.result.as_ref().map(|r| lines_in(&r.content)),
+                // Only a stack of commands draws one, and only that reads it back.
+                result: leg.result.as_ref(),
             })
             .collect()
     }
@@ -4580,10 +4597,11 @@ impl Host {
                 Some(r) => cards::body(&g, &leg.input, r, limits, card.expanded, width),
                 None => Vec::new(),
             },
-            // A run: nothing until it is opened, and then a row per call. What the fold exists to
-            // keep out of the transcript is the *contents* of the six files, so opening a run
-            // gives back the six names in full and stops there.
-            _ => cards::group_body(&g, &Self::card_heads(card), &root, card.expanded, width),
+            // A run of reads: nothing until it is opened, and then a row per call. What the fold
+            // exists to keep out of the transcript is the *contents* of the six files, so opening
+            // a run gives back the six names in full and stops there. A run of *commands* keeps
+            // the last one's output, because what a command printed is the answer — see ADR 0051.
+            _ => cards::group_body(&g, &Self::card_heads(card), &root, limits, card.expanded, width),
         };
         // Anything else writing into the transcript ends the answer: its rows are addressed by
         // range, and rows moving underneath it would make "the end of the answer" ambiguous. An
@@ -7708,6 +7726,35 @@ fn transcript(
             lines.insert(row as usize, r.text);
         }
     }
+    // What is under card `i`, replaced. A card acquires and loses a body while the conversation is
+    // being read — a stack of commands shows the last one's output, so every command that joins it
+    // takes the previous one's rows back off the screen — and the rows below it, the marks and the
+    // other cards all move with it.
+    #[allow(clippy::items_after_statements)]
+    fn set_body(
+        lines: &mut Vec<String>,
+        marks: &mut Vec<Mark>,
+        cards: &mut Vec<Card>,
+        i: usize,
+        rows: Vec<cards::Row>,
+    ) {
+        let at = cards[i].row + 1;
+        let old = cards[i].body;
+        if old > 0 {
+            lines.drain(at as usize..(at + old) as usize);
+            marks.retain(|m| m.row < at || m.row >= at + old);
+            for m in marks.iter_mut().filter(|m| m.row >= at + old) {
+                m.row -= old;
+            }
+            for c in cards.iter_mut().filter(|c| c.row >= at + old) {
+                c.row -= old;
+            }
+            cards[i].body = 0;
+        }
+        let n = rows.len() as u32;
+        insert(lines, marks, cards, at, rows);
+        cards[i].body = n;
+    }
     // A card's header, from what the conversation says about every call on it.
     //
     // The results are read out of `answered` rather than off the legs: a result block always comes
@@ -7720,7 +7767,20 @@ fn transcript(
         root: &std::path::Path,
         width: usize,
     ) -> cards::Row {
-        let heads: Vec<cards::Head> = card
+        let heads = heads_of(card, answered);
+        match heads.as_slice() {
+            [one] => cards::header(g, one, root, width),
+            many => cards::group_header(g, many, root, width),
+        }
+    }
+    // Every call on a card, as the renderer wants them. The live path's `card_heads`, for a card
+    // built out of the conversation rather than watched happening.
+    #[allow(clippy::items_after_statements)]
+    fn heads_of<'a>(
+        card: &'a Card,
+        answered: &std::collections::HashMap<&neosh_proto::ToolCallId, (bool, Option<i64>, usize)>,
+    ) -> Vec<cards::Head<'a>> {
+        card
             .legs
             .iter()
             .map(|leg| {
@@ -7736,12 +7796,29 @@ fn transcript(
                     took: None,
                     exit,
                     output,
+                    result: leg.result.as_ref(),
                 }
             })
-            .collect();
-        match heads.as_slice() {
-            [one] => cards::header(g, one, root, width),
-            many => cards::group_header(g, many, root, width),
+            .collect()
+    }
+    // What goes under a card, folded, from what the conversation says: one call's answer, or a
+    // stack's. The live path's [`Host::redraw_card`] arm, asked the same way — the two have to
+    // produce the same rows, or switching away and back re-draws the conversation.
+    #[allow(clippy::items_after_statements)]
+    fn body_of(
+        g: &Glyphs,
+        card: &Card,
+        answered: &std::collections::HashMap<&neosh_proto::ToolCallId, (bool, Option<i64>, usize)>,
+        root: &std::path::Path,
+        limits: cards::Limits,
+        width: usize,
+    ) -> Vec<cards::Row> {
+        match card.legs.as_slice() {
+            [leg] => match &leg.result {
+                Some(r) => cards::body(g, &leg.input, r, limits, false, width),
+                None => Vec::new(),
+            },
+            _ => cards::group_body(g, &heads_of(card, answered), root, limits, false, width),
         }
     }
     // A gap, unless there already is one: what came before was often a tool card, which has no
@@ -7845,6 +7922,12 @@ fn transcript(
                     let at = if open {
                         let i = cards.len() - 1;
                         cards[i].legs.push(leg);
+                        // A card that was one command with its output under it is now a stack of
+                        // them, and a stack shows the *last* one's output — which this call has
+                        // not produced yet. So its predecessor's rows come off the screen here,
+                        // exactly as the live path takes them off when it redraws the card.
+                        let rows = body_of(&g, &cards[i], &answered, root, limits, width);
+                        set_body(&mut lines, &mut marks, &mut cards, i, rows);
                         cards[i].row
                     } else {
                         // No gap, exactly as the live path draws it: the two have to produce the
@@ -7881,18 +7964,12 @@ fn transcript(
                             if !*is_error {
                                 cards::tally(&mut changes, &cards::edits_of(&cards[i].legs[k].input));
                             }
-                            // A run holds its calls' answers and shows none of them: it is one row
-                            // until somebody opens it, exactly as it is live.
-                            let rows = if cards[i].legs.len() > 1 {
-                                Vec::new()
-                            } else {
-                                cards::body(&g, &cards[i].legs[k].input, &result, limits, false, width)
-                            };
-                            let n = rows.len() as u32;
-                            let at = cards[i].row + 1;
-                            insert(&mut lines, &mut marks, &mut cards, at, rows);
+                            // The answer goes on the leg first, because what a card shows is a
+                            // question about the whole card: a run of reads shows none of them, a
+                            // stack of commands shows the last one's, and one call shows its own.
                             cards[i].legs[k].result = Some(result);
-                            cards[i].body = n;
+                            let rows = body_of(&g, &cards[i], &answered, root, limits, width);
+                            set_body(&mut lines, &mut marks, &mut cards, i, rows);
                         }
                         // No card to go under — cards are off and this is an error — so at the
                         // end, which is where the live path puts it too.
