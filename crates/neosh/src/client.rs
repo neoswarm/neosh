@@ -192,7 +192,7 @@ async fn run(
                 // workspace owns, and a round trip per animation frame would put the socket in the
                 // path of a twenty-hertz shimmer.
                 if matches!(ev, InputEvent::Repaint) {
-                    ui.send(vec![UiEvent::Flush]).await?;
+                    ui.send(vec![(None, UiEvent::Flush)]).await?;
                     continue;
                 }
                 if matches!(ev, InputEvent::Disconnected) {
@@ -217,7 +217,9 @@ async fn run(
                 match serde_json::from_str::<ServerMessage>(&l) {
                     Ok(ServerMessage::Events { batch }) => {
                         let leaving = batch.iter().any(|e| matches!(e, UiEvent::Shutdown));
-                        ui.send(batch).await?;
+                        // Untagged on the way in: the workspace already decided this batch was
+                        // for us, and what arrives here is one terminal's share of a frame.
+                        ui.send(batch.into_iter().map(|e| (None, e)).collect()).await?;
                         if leaving {
                             return Ok(Ended::Stopped);
                         }
@@ -229,8 +231,10 @@ async fn run(
                         // workspace because the workspace cannot know it is the stale one — it is
                         // running the only code it has ever had.
                         if let Some(text) = stale(&build, crate::build::capture()) {
+                            // Untagged, like everything else arriving here: this process is one
+                            // terminal, so its share of a frame is the whole of it.
                             ui.send(vec![
-                                UiEvent::Message {
+                                (None, UiEvent::Message {
                                     level: MessageLevel::Warn,
                                     text,
                                     // News rather than a reply, for the reason `ALERT_TTL` gives:
@@ -240,8 +244,8 @@ async fn run(
                                     // `UiEvent::Alert`, which is the host's to send, not this.
                                     kind: NoticeKind::Alert,
                                     key: None,
-                                },
-                                UiEvent::Flush,
+                                }),
+                                (None, UiEvent::Flush),
                             ])
                             .await?;
                         }

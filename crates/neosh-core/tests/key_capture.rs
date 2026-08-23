@@ -5,8 +5,9 @@
 //! picker and lose the key that quits.
 
 use neosh_core::{CoreEffect, Editor};
-use neosh_proto::{Gravity, 
-    ApiCall, Dock, KeyCode, KeyMods, KeyPress, Mode, PluginId, WindowId, WindowLayout,
+use neosh_proto::{
+    ApiCall, Dock, Gravity, KeyCode, KeyMods, KeyPress, Mode, PluginId, ViewId, WindowId,
+    WindowLayout,
 };
 
 fn key(c: &str) -> KeyPress {
@@ -53,7 +54,7 @@ fn a_capture_receives_keys_no_binding_wanted() {
     e.apply(&plugin, ApiCall::KeymapCapture { win, command: "picker.key".into() })
         .expect("captures");
 
-    e.feed_key(key("a"));
+    e.feed_key(ViewId::LOCAL, key("a"));
     let effects = e.drain_effects();
     assert_eq!(invoked(&effects), vec!["picker.key"]);
     assert_eq!(unhandled(&effects), 0, "a captured key must not also be reported as unhandled");
@@ -64,7 +65,7 @@ fn the_captured_key_is_passed_through_so_one_handler_can_switch_on_it() {
     let (mut e, plugin, win) = setup();
     e.apply(&plugin, ApiCall::KeymapCapture { win, command: "picker.key".into() }).unwrap();
 
-    e.feed_key(key("z"));
+    e.feed_key(ViewId::LOCAL, key("z"));
     let effects = e.drain_effects();
     let CoreEffect::InvokeCommand { key: Some(ctx), .. } = &effects[0] else {
         panic!("expected a key context, got {effects:?}");
@@ -89,14 +90,14 @@ fn bindings_still_win_while_a_capture_is_active() {
     e.apply(&plugin, ApiCall::KeymapCapture { win, command: "picker.key".into() }).unwrap();
     e.drain_effects();
 
-    e.feed_key(ctrl("q"));
+    e.feed_key(ViewId::LOCAL, ctrl("q"));
     assert_eq!(invoked(&e.drain_effects()), vec!["quit"], "the binding, not the capture");
 }
 
 #[test]
 fn without_a_capture_the_key_is_reported_unhandled_as_before() {
     let (mut e, _plugin, _win) = setup();
-    e.feed_key(key("a"));
+    e.feed_key(ViewId::LOCAL, key("a"));
     let effects = e.drain_effects();
     assert_eq!(unhandled(&effects), 1);
     assert!(invoked(&effects).is_empty());
@@ -111,7 +112,7 @@ fn a_capture_only_applies_to_the_focused_window() {
     e.apply(&plugin, ApiCall::FocusPush { win: other_win }).unwrap();
     e.drain_effects();
 
-    e.feed_key(key("a"));
+    e.feed_key(ViewId::LOCAL, key("a"));
     let effects = e.drain_effects();
     assert!(invoked(&effects).is_empty(), "another window's capture must not fire");
     assert_eq!(unhandled(&effects), 1);
@@ -126,7 +127,7 @@ fn closing_the_window_releases_the_capture() {
     e.apply(&plugin, ApiCall::WinClose { win }).unwrap();
     e.drain_effects();
 
-    e.feed_key(key("a"));
+    e.feed_key(ViewId::LOCAL, key("a"));
     let effects = e.drain_effects();
     assert!(invoked(&effects).is_empty());
 }
@@ -149,7 +150,7 @@ fn a_float_that_closes_on_blur_releases_its_capture_too() {
     e.drain_effects();
 
     // The window is gone; re-focusing its id must not resurrect the capture.
-    e.feed_key(key("a"));
+    e.feed_key(ViewId::LOCAL, key("a"));
     assert!(invoked(&e.drain_effects()).is_empty());
 }
 
@@ -160,7 +161,7 @@ fn unloading_the_plugin_releases_its_captures() {
     e.remove_plugin(&plugin);
     e.drain_effects();
 
-    e.feed_key(key("a"));
+    e.feed_key(ViewId::LOCAL, key("a"));
     let effects = e.drain_effects();
     assert!(
         invoked(&effects).is_empty(),
@@ -177,7 +178,7 @@ fn releasing_restores_ordinary_routing() {
     e.apply(&plugin, ApiCall::KeymapRelease { win }).unwrap();
     e.drain_effects();
 
-    e.feed_key(key("a"));
+    e.feed_key(ViewId::LOCAL, key("a"));
     assert_eq!(unhandled(&e.drain_effects()), 1);
 }
 
@@ -201,7 +202,7 @@ fn a_second_capture_on_the_same_window_replaces_the_first() {
     e.apply(&plugin, ApiCall::KeymapCapture { win, command: "second.key".into() }).unwrap();
     e.drain_effects();
 
-    e.feed_key(key("a"));
+    e.feed_key(ViewId::LOCAL, key("a"));
     assert_eq!(invoked(&e.drain_effects()), vec!["second.key"]);
 }
 
@@ -280,7 +281,7 @@ fn modal_setup() -> (Editor, PluginId, WindowId) {
 #[test]
 fn a_modal_takes_the_global_bindings_out_of_reach() {
     let (mut e, _plugin, _win) = modal_setup();
-    e.feed_key(ctrl("n"));
+    e.feed_key(ViewId::LOCAL, ctrl("n"));
     let effects = e.drain_effects();
     assert!(invoked(&effects).is_empty(), "`^N` must not start a conversation behind the panel");
 }
@@ -300,7 +301,7 @@ fn a_modal_keeps_its_own_bindings() {
     .expect("binds");
     e.drain_effects();
 
-    e.feed_key(ctrl("n"));
+    e.feed_key(ViewId::LOCAL, ctrl("n"));
     assert_eq!(invoked(&e.drain_effects()), vec!["panel.key"]);
 }
 
@@ -310,7 +311,7 @@ fn the_escape_hatches_survive_a_modal() {
     // terminal somebody has to kill, and "the panel is buggy" must never be the same event as
     // "the program is gone".
     let (mut e, _plugin, _win) = modal_setup();
-    e.feed_key(ctrl("q"));
+    e.feed_key(ViewId::LOCAL, ctrl("q"));
     assert_eq!(invoked(&e.drain_effects()), vec!["quit"]);
 }
 
@@ -329,7 +330,7 @@ fn a_modal_that_binds_an_escape_key_itself_keeps_it() {
     .expect("binds");
     e.drain_effects();
 
-    e.feed_key(ctrl("q"));
+    e.feed_key(ViewId::LOCAL, ctrl("q"));
     assert_eq!(invoked(&e.drain_effects()), vec!["panel.key"]);
 }
 
@@ -349,7 +350,7 @@ fn an_emptied_escape_list_is_honoured_and_an_undeclared_one_is_not() {
     .expect("declares");
     e.drain_effects();
 
-    e.feed_key(ctrl("q"));
+    e.feed_key(ViewId::LOCAL, ctrl("q"));
     assert!(invoked(&e.drain_effects()).is_empty(), "an empty list means no way past the panel");
 }
 
@@ -359,7 +360,7 @@ fn a_modal_swallows_what_nothing_claimed() {
     // and reads `<Esc>` as "interrupt the turn". Typing into a field you cannot see is worse than
     // a key that does nothing.
     let (mut e, _plugin, _win) = modal_setup();
-    e.feed_key(key("x"));
+    e.feed_key(ViewId::LOCAL, key("x"));
     let effects = e.drain_effects();
     assert_eq!(unhandled(&effects), 0);
     assert!(invoked(&effects).is_empty());
@@ -373,7 +374,7 @@ fn a_modal_with_a_capture_still_gets_its_raw_keys() {
     e.apply(&plugin, ApiCall::KeymapCapture { win, command: "panel.key".into() }).expect("captures");
     e.drain_effects();
 
-    e.feed_key(key("x"));
+    e.feed_key(ViewId::LOCAL, key("x"));
     assert_eq!(invoked(&e.drain_effects()), vec!["panel.key"]);
 }
 
@@ -396,8 +397,8 @@ fn an_ordinary_float_is_unaffected() {
     e.apply(&plugin, ApiCall::FocusPush { win }).expect("focuses");
     e.drain_effects();
 
-    e.feed_key(ctrl("q"));
+    e.feed_key(ViewId::LOCAL, ctrl("q"));
     assert_eq!(invoked(&e.drain_effects()), vec!["quit"]);
-    e.feed_key(key("x"));
+    e.feed_key(ViewId::LOCAL, key("x"));
     assert_eq!(unhandled(&e.drain_effects()), 1, "still reaches the composer");
 }

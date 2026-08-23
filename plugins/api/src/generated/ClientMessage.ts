@@ -37,6 +37,7 @@ export type ClientMessage =
     & (
       | { "type": "ready"; width: number; height: number }
       | { "type": "attached"; width: number; height: number }
+      | { "type": "detached" }
       | { "type": "key"; key: KeyPress }
       | { "type": "paste"; text: string }
       | { "type": "resize"; width: number; height: number }

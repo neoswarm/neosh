@@ -214,7 +214,10 @@ pub fn save_all(state: &Path, store: &SessionStore) -> std::io::Result<()> {
         .collect();
     let order = Order {
         order,
-        active: Some(store.active_id().clone())
+        // The most recently arrived in anywhere, which is where a restart puts you. With several
+        // terminals there is no single conversation to save, and saving one per view would mean a
+        // workspace reopened with one terminal had to pick anyway.
+        active: Some(store.current_id().clone())
             .filter(|id| store.get(id).is_some_and(|s| !s.ephemeral)),
     };
     let path = order_path(state);
@@ -425,7 +428,7 @@ mod tests {
         let (ia, ib) = (a.id.clone(), b.id.clone());
         let mut store = SessionStore::new(a);
         store.insert(b);
-        store.switch(&ib).expect("switch");
+        store.enter(&ib, Some(&ia)).expect("enter");
         save_all(&t.0, &store).expect("save");
 
         let (loaded, active) = load(&t.0);

@@ -24,13 +24,13 @@ fn a_burst_of_token_appends_becomes_one_frame() {
     let mut e = Editor::new();
     let plugin = PluginId::from("test");
     let buf = e.create_buffer("[chat]");
-    e.drain_ui();
+    e.drain_events();
 
     for token in ["All ", "done", "."] {
         e.apply(&plugin, ApiCall::BufAppendText { buf, text: token.into() }).expect("append");
     }
 
-    let frames = appends(&e.drain_ui(), buf);
+    let frames = appends(&e.drain_events(), buf);
     assert_eq!(frames.len(), 1, "three appends, one frame: {frames:?}");
     assert_eq!(frames[0], vec!["All done."], "carrying the final text");
 }
@@ -49,14 +49,14 @@ fn an_edit_outside_the_pending_region_starts_a_new_frame() {
         lines: vec!["one".into(), "two".into(), "three".into()],
     })
     .expect("seed");
-    e.drain_ui();
+    e.drain_events();
 
     e.apply(&plugin, ApiCall::BufSetLines { buf, start: 0, end: 1, lines: vec!["ONE".into()] })
         .expect("edit");
     e.apply(&plugin, ApiCall::BufSetLines { buf, start: 2, end: 3, lines: vec!["THREE".into()] })
         .expect("edit");
 
-    let frames = appends(&e.drain_ui(), buf);
+    let frames = appends(&e.drain_events(), buf);
     assert_eq!(frames.len(), 2, "two disjoint edits stay two frames: {frames:?}");
 }
 
@@ -66,12 +66,12 @@ fn edits_to_two_buffers_never_merge_into_each_other() {
     let plugin = PluginId::from("test");
     let chat = e.create_buffer("[chat]");
     let composer = e.create_buffer("[composer]");
-    e.drain_ui();
+    e.drain_events();
 
     e.apply(&plugin, ApiCall::BufAppendText { buf: chat, text: "a".into() }).expect("append");
     e.apply(&plugin, ApiCall::BufAppendText { buf: composer, text: "b".into() }).expect("append");
 
-    let ui = e.drain_ui();
+    let ui = e.drain_events();
     assert_eq!(appends(&ui, chat).len(), 1);
     assert_eq!(appends(&ui, composer).len(), 1);
 }
@@ -89,7 +89,7 @@ fn motion_can_be_switched_off_without_the_text_going_with_it() {
     let animated = |editor: &mut Editor| -> (bool, bool) {
         let mut moves = false;
         let mut coloured = false;
-        for ev in editor.drain_ui() {
+        for ev in editor.drain_events() {
             if let UiEvent::HighlightDefined { name, def } = ev
                 && name == "Status.Streaming"
                 && let HighlightDef::Spec { spec } = def

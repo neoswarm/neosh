@@ -17,6 +17,7 @@ pub use agent::{Agent, AgentEvent, DriverAsker, DriverQuestioner, Fanout, TurnOu
 pub use hooks::HookRegistry;
 pub use permission::PermissionLayer;
 pub use session::{Prompt, Session};
+pub use store::{SessionStore, StoreError};
 pub use tools::{BuiltinTool, ToolCtx, ToolRegistry};
 pub use turn::{TurnAssembler, TurnUpdate};
 

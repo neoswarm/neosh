@@ -118,6 +118,8 @@ import type { SwarmAgent } from "./generated/SwarmAgent";
 import type { SwarmNode } from "./generated/SwarmNode";
 import type { SwarmStranger } from "./generated/SwarmStranger";
 import type { VarScope } from "./generated/VarScope";
+import type { ViewId } from "./generated/ViewId";
+import type { ViewInfo } from "./generated/ViewInfo";
 import type { Viewport } from "./generated/Viewport";
 import type { WindowId } from "./generated/WindowId";
 import type { WindowInfo } from "./generated/WindowInfo";
@@ -141,7 +143,7 @@ export type {
   SurfaceCell, SurfaceId, TextEdit, ToolCall, ToolDef, ToolResult, TurnRequest, Usage,
   NodeCapabilities, NodeId, NodeInfo, ProjectKey, RemoteProject, StreamEvent,
   SwarmAgent, SwarmNode, SwarmStranger,
-  VarScope, Viewport,
+  VarScope, ViewId, ViewInfo, Viewport,
   WindowId, WindowInfo, WindowLayout,
   WorktreeInfo,
 };
@@ -256,17 +258,17 @@ function send(msg: unknown): void {
  * Calls from one plugin are applied by the host in the order they were issued, so a caller that
  * fires several mutations without awaiting cannot race itself.
  */
-function call(plugin: string, c: ApiCall): Promise<ApiOk> {
+function call(plugin: string, c: ApiCall, view?: ViewId): Promise<ApiOk> {
   const id = `${plugin}#${++seq}`;
   return new Promise<ApiOk>((resolve, reject) => {
     pending.set(id, { resolve, reject });
-    send({ type: "plugin", plugin, msg: { type: "call", id, call: c } });
+    send({ type: "plugin", plugin, msg: { type: "call", id, call: c, view } });
   });
 }
 
 /** Fire-and-forget. Used on the streaming path so appending a token is not round-trip bound. */
-function notify(plugin: string, c: ApiCall): void {
-  send({ type: "plugin", plugin, msg: { type: "notify", call: c } });
+function notify(plugin: string, c: ApiCall, view?: ViewId): void {
+  send({ type: "plugin", plugin, msg: { type: "notify", call: c, view } });
 }
 
 function settle(id: string, response: ApiResponse): void {
@@ -389,6 +391,7 @@ export interface Neosh {
   readonly git: GitApi;
   readonly gen: GenApi;
   readonly session: SessionApi;
+  readonly view: ViewApi;
   readonly status: StatusApi;
   readonly hint: HintApi;
   readonly opt: OptionApi;
@@ -1018,6 +1021,41 @@ export interface GenApi {
  * Conversations are saved to the state directory as you go and restored at startup, so switching
  * away from one is not a way to lose it.
  */
+/**
+ * The terminals looking at this workspace.
+ *
+ * A workspace can have several and they are not copies of each other: each has its own
+ * conversation on screen, its own scroll position, its own composer and its own panels. What they
+ * share is the work — the conversations themselves, the turns running in them, everything a plugin
+ * registered.
+ *
+ * A plugin that owns a **dock** has to open one panel per view, and `onOpen` is when. A plugin that
+ * only opens floats in answer to a key needs none of this: the host puts a float in the terminal
+ * whose key press opened it.
+ */
+export interface ViewApi {
+  /** Every terminal, and what each is looking at. */
+  list(): Promise<ViewInfo[]>;
+  /** The one being served — the terminal whose key press is running. */
+  current(): Promise<ViewInfo | null>;
+  /**
+   * The whole `neosh` namespace, bound to one terminal.
+   *
+   * Every call on it is the call it always was, except that a window opened through it lands
+   * there. The same object a command handler is given as its third argument.
+   */
+  at(view: ViewId): Neosh;
+  /**
+   * A terminal arrived. Open your panel in it.
+   *
+   * Fired for every view that already exists when the plugin loads, too, so a plugin does not have
+   * to decide whether it was here first.
+   */
+  onOpen(cb: (view: ViewId) => void): Disposable;
+  /** A terminal went away. Its windows are already closed; let go of what you were keeping. */
+  onClose(cb: (view: ViewId) => void): Disposable;
+}
+
 export interface SessionApi {
   /**
    * Most recently active first, with exactly one flagged `is_active`.
@@ -1061,8 +1099,13 @@ export interface SessionApi {
   archive(session: SessionId, archived?: boolean): Promise<void>;
   /** The conversation itself, for a transcript view that renders rather than replays. */
   messages(session?: SessionId): Promise<Message[]>;
-  /** Fires whenever the active conversation changes — switched, created, or closed. */
-  onChange(cb: (e: { session: SessionId }) => void): Disposable;
+  /**
+   * Fires whenever a terminal is looking at a different conversation — switched, created, closed.
+   *
+   * `view` is which terminal moved. A workspace can have several and each is somewhere, so
+   * "the active conversation" is a question with as many answers as there are screens.
+   */
+  onChange(cb: (e: { session: SessionId; view: ViewId }) => void): Disposable;
 }
 
 /**
@@ -1484,13 +1527,18 @@ export interface Logger {
 // ---------------------------------------------------------------------------
 
 interface Registered {
-  commands: Map<string, (args: string[], key?: KeyContext) => unknown>;
+  commands: Map<string, (args: string[], key?: KeyContext, here?: Neosh) => unknown>;
   tools: Map<string, (input: unknown) => ToolResult | Promise<ToolResult>>;
   hooks: Map<HookName, (p: HookPayload) => HookOutcome | Promise<HookOutcome>>;
   providers: Map<string, (req: TurnRequest, emit: (e: ProviderEvent) => void, signal: { cancelled: boolean }) => unknown>;
   bufferListeners: Map<number, Array<(e: { buf: BufferId; start: number; oldEnd: number; newEnd: number }) => void>>;
   optionListeners: Array<(e: { name: string; value: OptionValue }) => void>;
-  sessionListeners: Array<(e: { session: SessionId }) => void>;
+  /// The protocol version this plugin was handed, kept so a namespace can be rebuilt for a
+  /// view long after `__createContext` returned.
+  version: number;
+  sessionListeners: Array<(e: { session: SessionId; view: ViewId }) => void>;
+  viewOpenListeners: Array<(view: ViewId) => void>;
+  viewCloseListeners: Array<(view: ViewId) => void>;
   selectionListeners: Array<(e: { selection: ModelSelection }) => void>;
   composerListeners: Array<(e: { text: string }) => void>;
   activityListeners: Array<(e: { session: SessionId; turn: string; activity: Activity }) => void>;
@@ -1529,7 +1577,10 @@ function reg(plugin: string): Registered {
       providers: new Map(),
       bufferListeners: new Map(),
       optionListeners: [],
+      version: 0,
       sessionListeners: [],
+      viewOpenListeners: [],
+      viewCloseListeners: [],
       selectionListeners: [],
       composerListeners: [],
       activityListeners: [],
@@ -1599,11 +1650,27 @@ function markOpts(o: MarkOptions = {}): ExtmarkOpts {
   };
 }
 
-/** Build the API object handed to one plugin. Internal; the host calls this. */
-export function __createContext(plugin: string, config: unknown, version: number): PluginContext {
-  const r = reg(plugin);
-  const c = (x: ApiCall) => call(plugin, x);
-  const n = (x: ApiCall) => notify(plugin, x);
+/**
+ * Build the whole `neosh` namespace over one pair of call functions.
+ *
+ * Called once per plugin with calls that say nothing about where they land, which is the ordinary
+ * `neosh`: the host works out which terminal a window belongs in, and for anything done in answer
+ * to a key that is exact. And again, per view, with calls that name it — which is what a command
+ * handler is handed as its third argument. Inside a handler, `here.win.open(...)` is a panel in
+ * the terminal the key was pressed in, and every other call on `here` is the call it always was.
+ */
+function build(
+  plugin: string,
+  version: number,
+  r: ReturnType<typeof reg>,
+  view: ViewId | null,
+): Neosh {
+  // On the envelope rather than in each call: a call comes *from* a terminal, exactly as a key
+  // press does, and it is the same fact for all of them. It matters for far more than opening a
+  // window — which conversation is on screen, what is in the composer, what `session.list` marks
+  // as the one you are in are all questions with an answer per terminal.
+  const c = (x: ApiCall) => call(plugin, x, view ?? undefined);
+  const n = (x: ApiCall) => notify(plugin, x, view ?? undefined);
 
   const api: Neosh = {
     version,
@@ -2304,6 +2371,38 @@ export function __createContext(plugin: string, config: unknown, version: number
         return expect(v, "json").value as never;
       },
     },
+    view: {
+      async list() {
+        return expect(await c({ call: "view_list" }), "views").views;
+      },
+      async current() {
+        const views = expect(await c({ call: "view_list" }), "views").views;
+        return views.find((v) => v.current) ?? null;
+      },
+      at: (id) => build(plugin, version, r, id),
+      onOpen(cb) {
+        // The terminals that were already here, as well as the ones still to come. A plugin loaded
+        // after them missed their arrival, and "open a panel in every view" would otherwise mean
+        // every view *from now on* — which is every view except the one you are sitting in.
+        //
+        // Announced once each: a view that arrives while the list is in flight arrives by the
+        // event too, and `seen` is what stops it being announced twice.
+        const seen = new Set<ViewId>();
+        const announce = (id: ViewId) => {
+          if (seen.has(id)) return;
+          seen.add(id);
+          cb(id);
+        };
+        const d = listener(r.viewOpenListeners, announce);
+        void c({ call: "view_list" })
+          .then((v) => {
+            for (const info of expect(v, "views").views) announce(info.view);
+          })
+          .catch(() => {});
+        return d;
+      },
+      onClose: (cb) => listener(r.viewCloseListeners, cb),
+    },
     session: {
       async list(opts) {
         const v = await c({
@@ -2393,8 +2492,19 @@ export function __createContext(plugin: string, config: unknown, version: number
       },
     },
   };
+  return api;
+}
 
-  return { neosh: api, pluginId: plugin, config, subscriptions: r.subscriptions };
+/** Build the API object handed to one plugin. Internal; the host calls this. */
+export function __createContext(plugin: string, config: unknown, version: number): PluginContext {
+  const r = reg(plugin);
+  r.version = version;
+  return {
+    neosh: build(plugin, version, r, null),
+    pluginId: plugin,
+    config,
+    subscriptions: r.subscriptions,
+  };
 }
 
 /** Route one host message. Internal; the host's bootstrap calls this. */
@@ -2456,10 +2566,33 @@ export async function __dispatch(plugin: string, msg: Record<string, unknown>): 
 
   if (msg.type === "event") {
     const ev = msg.event as PluginEvent;
+    try {
+      await dispatchEvent(plugin, r, ev);
+    } catch (e) {
+      // A listener that throws is one plugin's bug, and it used to be every plugin's: an
+      // unhandled rejection stops the runtime, and the runtime is shared. Reported and survived.
+      const what = e instanceof Error ? (e.stack ?? e.message) : String(e);
+      notify(plugin, { call: "log", level: "error", message: `handling ${ev.type}: ${what}` });
+    }
+    return;
+  }
+}
+
+async function dispatchEvent(
+  plugin: string,
+  r: ReturnType<typeof reg>,
+  ev: PluginEvent,
+): Promise<void> {
+  {
     switch (ev.type) {
       case "command_invoked": {
         const h = r.commands.get(ev.name);
-        if (h) await h(ev.args ?? [], ev.key ?? undefined);
+        if (!h) break;
+        // The third argument is the whole namespace bound to the terminal the key was pressed in.
+        // A handler that opens a panel writes `here.win.open(...)` and it lands where the person
+        // pressing the key is looking, without having to say so or to know that views exist.
+        const here = ev.key ? build(plugin, r.version, r, ev.key.view) : undefined;
+        await h(ev.args ?? [], ev.key ?? undefined, here);
         break;
       }
       case "buffer_changed": {
@@ -2516,7 +2649,13 @@ export async function __dispatch(plugin: string, msg: Record<string, unknown>): 
         for (const cb of r.optionListeners) cb({ name: ev.name, value: ev.value });
         break;
       case "session_changed":
-        for (const cb of r.sessionListeners) cb({ session: ev.session });
+        for (const cb of r.sessionListeners) cb({ session: ev.session, view: ev.view });
+        break;
+      case "view_attached":
+        for (const cb of r.viewOpenListeners) cb(ev.view);
+        break;
+      case "view_closed":
+        for (const cb of r.viewCloseListeners) cb(ev.view);
         break;
       case "selection_changed":
         for (const cb of r.selectionListeners) cb({ selection: ev.selection });
