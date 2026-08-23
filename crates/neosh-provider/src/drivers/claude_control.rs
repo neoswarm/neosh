@@ -71,8 +71,15 @@ pub fn can_use_tool(v: &Value, cwd: &Path) -> Option<CanUseTool> {
     // A question is not a permission, and reading one as a permission is how it stops working:
     // policy answers it — `full access` says yes before anyone is asked — and the bare yes that
     // comes back carries no answers, so the CLI tells its own model "The user did not answer the
-    // questions". [`ask_user_question`] claims these; this refuses them.
-    if is_question(req) {
+    // questions".
+    //
+    // Asked as *"would [`ask_user_question`] claim this?"* rather than decided over again here.
+    // The two used to test different things — this one a flag, that one a shape — so a request
+    // that set the flag without carrying the shape was refused by both and answered by neither.
+    // The CLI blocks until something replies, which makes that a turn with no end: `ExitPlanMode`
+    // sets `requires_user_interaction` and carries a `plan` rather than `questions`, and hung for
+    // as long as the workspace stayed up. One parse, one owner, and the two cannot drift apart.
+    if ask_user_question(v).is_some() {
         return None;
     }
     let request_id = v.get("request_id").and_then(Value::as_str)?.to_string();
@@ -172,6 +179,33 @@ pub fn response(ask: &CanUseTool, answer: &PermissionAnswer) -> Value {
     })
 }
 
+/// The reply to a `control_request` nothing above understood.
+///
+/// The CLI blocks on every request it sends until a response carrying that id comes back, so a
+/// line no handler claimed is not an event that was ignored — it is a turn that stops, with a
+/// spinner over it, until the workspace is restarted. Silence is the one answer there is no
+/// recovering from, so whatever is left over is refused out loud: the CLI unblocks, its model is
+/// told the call failed, and the turn goes on to say so.
+///
+/// Deliberately last and deliberately dumb. It exists for the subtype this was not written
+/// against — the one the next release of the CLI invents — and the fix for any particular one of
+/// them is a handler above, not a better sentence here.
+pub fn unhandled(v: &Value) -> Option<Value> {
+    if v.get("type").and_then(Value::as_str) != Some("control_request") {
+        return None;
+    }
+    let request_id = v.get("request_id").and_then(Value::as_str)?;
+    let subtype = v.pointer("/request/subtype").and_then(Value::as_str).unwrap_or("unknown");
+    Some(json!({
+        "type": "control_response",
+        "response": {
+            "subtype": "error",
+            "request_id": request_id,
+            "error": format!("neosh does not handle {subtype}"),
+        },
+    }))
+}
+
 /// One `can_use_tool` that is really a question, read into something a person can be asked.
 ///
 /// The CLI's `AskUserQuestion` arrives down the same pipe as a permission request and is not one.
@@ -192,12 +226,19 @@ pub struct AskUser {
     pub raw: Value,
 }
 
-/// Whether a `can_use_tool` request is a question rather than a permission.
+/// Whether a `can_use_tool` request *claims* to be a question.
 ///
-/// Both tests, because they fail differently. `requires_user_interaction` is the CLI *saying so*
-/// and is the honest signal — it is set for anything that must reach a person, whatever it ends up
-/// being called. The name is the fallback for an install too old to send the flag, and it is the
-/// one every version has.
+/// Both tests, because they fail differently. `requires_user_interaction` is the CLI saying
+/// something has to reach a person, and it is the signal for a tool this was never written
+/// against. The name is the fallback for an install too old to send the flag, and it is the one
+/// every version has.
+///
+/// Neither is sufficient, which is why this is private and a precondition rather than a decision.
+/// The flag is set for *anything* that must reach a person — `ExitPlanMode` sets it, and what it
+/// carries is a plan — while only a request with `questions` in it can be *answered* as a
+/// question. What makes something a question here is that there is a question in it, so
+/// [`ask_user_question`] is the one that decides, and [`can_use_tool`] asks it rather than
+/// repeating it.
 fn is_question(req: &Value) -> bool {
     req.get("requires_user_interaction").and_then(Value::as_bool).unwrap_or(false)
         || req.get("tool_name").and_then(Value::as_str) == Some("AskUserQuestion")
@@ -469,7 +510,9 @@ fn host_of(url: &str) -> Option<String> {
 
 #[cfg(test)]
 mod questions {
-    //! The `AskUserQuestion` half, captured from a real `claude 2.1.237`.
+    //! The `AskUserQuestion` half, captured from a real `claude 2.1.237` — and the line
+    //! between it and the permission half, which is where a request that is neither went
+    //! missing.
 
     use super::*;
     use neosh_proto::QuestionAnswer;
@@ -567,6 +610,9 @@ mod questions {
             let mut v = asked();
             v["request"]["input"] = input.clone();
             assert_eq!(ask_user_question(&v), None, "{input}");
+            // And the ordinary path really does have it. Asserted rather than assumed: the two
+            // used to read the same flag and both step aside, which left nothing to refuse it.
+            assert!(can_use_tool(&v, Path::new("/w")).is_some(), "{input}");
         }
     }
 
@@ -672,6 +718,87 @@ mod questions {
         let answers = &r["response"]["response"]["updatedInput"]["answers"];
         assert_eq!(answers["Do you prefer tabs or spaces?"], "Tabs");
         assert!(answers.get("Which of these should be enabled?").is_none());
+    }
+
+    /// A real `ExitPlanMode` request, exactly as `claude 2.1.237` sends it. Note what it has and
+    /// what it has not: the flag that says a person must see this, and an input that is a plan.
+    fn exiting_plan_mode() -> Value {
+        json!({
+            "type": "control_request",
+            "request_id": "48d09a8a-1bd5-45af-9f7e-9d5f55a5bf36",
+            "request": {
+                "subtype": "can_use_tool",
+                "tool_name": "ExitPlanMode",
+                "display_name": "ExitPlanMode",
+                "input": {
+                    "plan": "# Independent views\n\n## Context\n",
+                    "planFilePath": "/home/x/.claude/plans/quizzical-fluttering-thunder.md",
+                },
+                "tool_use_id": "toolu_01VbsogyQFdV9mqxi4Qc7JMd",
+                "requires_user_interaction": true,
+            },
+        })
+    }
+
+    #[test]
+    fn asking_to_leave_plan_mode_is_a_permission_and_is_answered() {
+        // The hang. `requires_user_interaction` was read as "this is a question", so the
+        // permission path refused it; the question path wanted a `questions` array it does not
+        // have and refused it too. Nothing replied, and the CLI blocks until something does — a
+        // turn with a spinner on it for as long as the workspace was up.
+        let v = exiting_plan_mode();
+        assert_eq!(ask_user_question(&v), None, "there is no question in it");
+        let ask = can_use_tool(&v, Path::new("/w")).expect("a permission request");
+        assert_eq!(ask.request_id, "48d09a8a-1bd5-45af-9f7e-9d5f55a5bf36");
+        assert_eq!(ask.tool_use_id.as_deref(), Some("toolu_01VbsogyQFdV9mqxi4Qc7JMd"));
+
+        // And the yes the CLI accepts for it. Verified against the real thing, which answers
+        // "User has approved exiting plan mode."
+        let r = response(&ask, &PermissionAnswer::Allow);
+        assert_eq!(r["response"]["request_id"], ask.request_id);
+        assert_eq!(r["response"]["response"]["behavior"], "allow");
+        assert_eq!(r["response"]["response"]["toolUseID"], "toolu_01VbsogyQFdV9mqxi4Qc7JMd");
+    }
+
+    #[test]
+    fn every_request_that_must_reach_a_person_is_claimed_by_exactly_one_of_the_two() {
+        // The invariant the two used to break between them, over the flag they both read.
+        for v in [exiting_plan_mode(), asked()] {
+            let question = ask_user_question(&v).is_some();
+            let permission = can_use_tool(&v, Path::new("/w")).is_some();
+            assert!(question ^ permission, "{v}");
+        }
+    }
+
+    #[test]
+    fn a_control_request_nothing_claimed_is_refused_rather_than_dropped() {
+        // The backstop, for the subtype that does not exist yet. A refusal ends the turn badly;
+        // silence does not end it at all.
+        let v = json!({
+            "type": "control_request",
+            "request_id": "r-9",
+            "request": { "subtype": "something_invented_later" },
+        });
+        assert_eq!(ask_user_question(&v), None);
+        assert_eq!(can_use_tool(&v, Path::new("/w")), None);
+        let reply = unhandled(&v).expect("a refusal");
+        assert_eq!(reply["type"], "control_response");
+        assert_eq!(reply["response"]["subtype"], "error");
+        assert_eq!(reply["response"]["request_id"], "r-9");
+        let why = reply["response"]["error"].as_str().unwrap_or_default();
+        assert!(why.contains("something_invented_later"), "{reply}");
+    }
+
+    #[test]
+    fn what_the_cli_says_back_is_never_answered_as_a_request() {
+        // `unhandled` is reached by every line, so it has to be able to tell the two apart.
+        for v in [
+            json!({ "type": "control_response", "response": { "subtype": "success" } }),
+            json!({ "type": "assistant", "message": { "content": [] } }),
+            json!({ "type": "control_request" }),
+        ] {
+            assert_eq!(unhandled(&v), None, "{v}");
+        }
     }
 }
 
