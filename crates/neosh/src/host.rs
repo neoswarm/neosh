@@ -4631,6 +4631,7 @@ impl Host {
             (Pending::Yank, "y") => self.yank_line(),
             (Pending::Yank, "c") => self.yank_code(),
             (Pending::Yank, "m" | "t") => self.yank_turn(),
+            (Pending::Yank, "p") => self.yank_path(),
             (Pending::Yank, "a") => {
                 self.select_all(self.chat_win);
                 if self.copy_selection(false) {
@@ -4650,7 +4651,7 @@ impl Host {
                 Some(m) => self.yank_over(m, count),
                 None => self.editor_message(
                     MessageLevel::Info,
-                    "y then a motion, or one of y c m a — `?` lists them",
+                    "y then a motion, or one of y c m p a — `?` lists them",
                 ),
             },
 
@@ -4668,9 +4669,9 @@ impl Host {
 
     /// The motions `y` will take as its second key.
     ///
-    /// Not every motion in the table: `yy` is the line and `yc`, `ym` and `ya` are the transcript's
-    /// own three, so the letters they use are theirs. Everything here is a key that means the same
-    /// after `y` as it does on its own.
+    /// Not every motion in the table: `yy` is the line and `yc`, `ym`, `yp` and `ya` are the
+    /// transcript's own four, so the letters they use are theirs. Everything here is a key that
+    /// means the same after `y` as it does on its own.
     fn yank_motion_for(&self, ch: &str) -> Option<vim::Motion> {
         use vim::Motion as M;
         Some(match ch {
@@ -5197,8 +5198,23 @@ impl Host {
         Some(from..to)
     }
 
-    /// Copy the whole exchange the cursor is in — the question and everything it produced.
+    /// Copy the conversation's directory — in a worktree, the worktree's.
+    ///
+    /// The one `y` target that is not a piece of the transcript, here because it is the other thing
+    /// you take out of a conversation: the path its shell, its editor and its next message want.
+    /// Three keys every terminal sends, which is what lets the chat key be `⌥Y` — an Alt chord,
+    /// `¥` on a Mac out of the box, and allowed as a default only because this route exists
+    /// beside it (ADR 0048). `session.copy.path` is the same verb by name, and the panel's `y`
+    /// does it for any row.
+    fn yank_path(&mut self) {
+        let path = self.root().display().to_string();
+        let _ = self
+            .editor
+            .apply(&PluginId::from(BUILTIN), ApiCall::ClipboardWrite { text: path.clone() });
+        self.editor_message(MessageLevel::Info, format!("copied {path}"));
+    }
 
+    /// Copy the whole exchange the cursor is in — the question and everything it produced.
     fn yank_turn(&mut self) {
         let here = self.chat_cursor().0;
         let rows = self.turn_rows();
@@ -8396,7 +8412,7 @@ impl Host {
             ("chat.scroll_end", "Jump to the end of the transcript"),
             (
                 "chat.read",
-                "Read the transcript: hjkl move, [ ] turns, { } blocks, / finds, yc takes the code",
+                "Read the transcript: hjkl move, [ ] turns, { } blocks, / finds, yc takes the code, yp the path",
             ),
             ("chat.toggle_card", "Open or fold the tool card under the cursor, while reading"),
             (

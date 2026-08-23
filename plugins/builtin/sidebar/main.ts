@@ -1091,6 +1091,12 @@ async function registerCommands(w: Wiring): Promise<void> {
       neosh.notify(`copied ${current.cwd}`);
     }, { desc: "Copy this conversation's directory to the clipboard" }),
   );
+  // An Alt chord, which ADR 0048 keeps out of the defaults — on a Mac out of the box `⌥Y` is `¥`,
+  // a key neosh never receives — with the one exception the same ADR makes for arrows: bound where
+  // it means something, and never the only way. Chat mode has no Ctrl chord left to give this, and
+  // every terminal-sendable route exists beside it — `yp` in the reader, `y` on any row of this
+  // panel, `^K` and `/copy` by name — so a terminal that sends Alt gets a key in the composer and
+  // one that does not has lost nothing.
   await neosh.keymap.set("chat", "<A-y>", "session.copy.path", {
     desc: "Copy this conversation's directory",
   });
