@@ -200,6 +200,12 @@ fn object_for(ch: &str) -> Option<vim::Object> {
 /// under somebody else who happens to be in the same conversation. The rows are the same; where
 /// you are in them is yours.
 struct ViewState {
+    /// The conversation on screen here.
+    ///
+    /// On the view rather than in the store, which is the whole of what "two terminals in two
+    /// conversations" means. The store holds every conversation and the order they were last
+    /// arrived in; who is looking at which one is this.
+    session: neosh_proto::SessionId,
     chat: BufferId,
     chat_win: WindowId,
     /// Where the transcript is scrolled to, as the host intends it. `None` follows the newest.
@@ -812,6 +818,9 @@ impl Host {
         frontend: Box<dyn Frontend>,
     ) -> Self {
         let mut editor = Editor::new();
+        // Whichever conversation the store was built with. There is exactly one terminal at this
+        // point and it has to be somewhere; every other view is put somewhere as it attaches.
+        let here = agent.sessions().current_id().clone();
         let (quota_tx, quota_rx) = tokio::sync::mpsc::unbounded_channel();
         let (unasked_tx, unasked_rx) = tokio::sync::mpsc::unbounded_channel();
         let (image_tx, image_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -861,6 +870,7 @@ impl Host {
             bridge,
             frontend,
             view: ViewState {
+                session: here,
                 chat,
                 chat_win,
                 chat_top: None,
@@ -955,11 +965,9 @@ impl Host {
     /// `gen.model` is read here rather than stored, so changing it in `config.toml` and reloading
     /// takes effect on the next generation without the host caching a stale copy.
     fn services(&self, plugin: &PluginId) -> Services {
-        // The active conversation's directory, so git answers about the tree you are working in.
-        let cwd = {
-            let store = self.agent.sessions();
-            store.active().cwd.clone()
-        };
+        // The directory of the conversation on screen here, so git answers about the tree you are
+        // working in.
+        let cwd = self.session_cwd(&self.active_session());
         let git = self.repos.get(&cwd).cloned().flatten();
         Services {
             agent: self.agent.clone(),
@@ -1440,9 +1448,13 @@ impl Host {
                 })
             }
             ApiCall::SessionCurrent => {
+                let here = self.active_session();
                 let info = {
                     let store = self.agent.sessions();
-                    let mut i = store.active().info();
+                    let mut i = store
+                        .get(&here)
+                        .map(|s| s.info())
+                        .ok_or_else(|| ApiError::NotFound { what: format!("session {here}") })?;
                     i.is_active = true;
                     i
                 };
@@ -1466,26 +1478,26 @@ impl Host {
                 session.system = self.agent.session().system.clone();
                 let id = session.id.clone();
 
+                self.agent.sessions().insert(session);
+                if activate {
+                    self.arrive_in(&id).map_err(|e| ApiError::NotFound { what: e.to_string() })?;
+                }
                 let info = {
-                    let mut store = self.agent.sessions();
-                    store.insert(session);
-                    if activate {
-                        store.switch(&id).map_err(|e| ApiError::NotFound { what: e.to_string() })?;
-                    }
+                    let store = self.agent.sessions();
                     // The session was just inserted, so this cannot miss; the `?` is here rather
                     // than an unwrap because a future refactor could make it miss.
                     let mut i = store
                         .get(&id)
                         .map(|s| s.info())
                         .ok_or_else(|| ApiError::Internal { message: "session vanished".into() })?;
-                    i.is_active = store.active_id() == &id;
+                    i.is_active = self.view.session == id;
                     i
                 };
                 let info = self.named(info);
                 if activate {
                     // Before the redraw: the banner names the directory, and the file tools have
                     // to be pointed at it before the first turn rather than after it.
-                    let here = { self.agent.sessions().active().cwd.clone() };
+                    let here = self.session_cwd(&id);
                     self.work_in(here).await;
                     self.enter_session();
                 }
@@ -1497,24 +1509,20 @@ impl Host {
             // rebuilt from the conversation you switched to. Waiting for a model to finish before
             // you may look at something else is the workspace refusing to be a workspace.
             ApiCall::SessionSwitch { session } => {
-                self.agent
-                    .sessions()
-                    .switch(&session)
+                self.arrive_in(&session)
                     .map_err(|e| ApiError::NotFound { what: e.to_string() })?;
-                let cwd = { self.agent.sessions().active().cwd.clone() };
+                let cwd = self.session_cwd(&session);
                 self.work_in(cwd).await;
                 self.enter_session();
                 Ok(ApiOk::Unit)
             }
             ApiCall::SessionClose { session } => {
-                let closing_active = self.agent.sessions().active_id() == &session;
-                // Closing the conversation you are in has to land you somewhere, and the store
-                // will not step out of the last one on its own. Same line as the archive path
-                // below and for the same reason: being unable to delete the conversation you have
-                // finished with, because it is the only one, is not a rule anybody wanted.
-                if closing_active {
-                    self.ensure_somewhere_to_go(&session);
-                }
+                // Closing the conversation you are in has to land you somewhere first, because
+                // afterwards this terminal would name something that is not in the store. Same
+                // line as the archive path below and for the same reason: being unable to delete
+                // the conversation you have finished with, because it is the only one, is not a
+                // rule anybody wanted.
+                let closing_active = self.step_out_of(&session);
                 // Closing is the one case that does stop a turn: there is about to be nowhere to
                 // put its answer, and a stream writing into a conversation that no longer exists is
                 // a subprocess nobody can reach.
@@ -1549,7 +1557,7 @@ impl Host {
                     // Where you landed is a conversation of its own, and it may be in another
                     // directory: the banner names one, the file tools are pointed at one, and
                     // both were still the deleted conversation's until this said otherwise.
-                    let here = { self.agent.sessions().active().cwd.clone() };
+                    let here = self.session_cwd(&self.active_session());
                     self.work_in(here).await;
                     self.enter_session();
                 }
@@ -1560,12 +1568,9 @@ impl Host {
             // read, not about the work: it keeps its messages, and it keeps whatever it was in the
             // middle of saying.
             ApiCall::SessionArchive { session, archived } => {
-                let leaving = archived && self.agent.sessions().active_id() == &session;
                 // Archiving the only conversation you have is a reasonable thing to want, and
                 // "there is nowhere to go" is a bad answer to it. Somewhere to go is one line.
-                if leaving {
-                    self.ensure_somewhere_to_go(&session);
-                }
+                let leaving = archived && self.step_out_of(&session);
                 let at = now_secs();
                 self.agent.sessions().archive(&session, archived, at).map_err(|e| match e {
                     neosh_agent::store::StoreError::LastSession => {
@@ -1574,7 +1579,7 @@ impl Host {
                     other => ApiError::NotFound { what: other.to_string() },
                 })?;
                 if leaving {
-                    let here = { self.agent.sessions().active().cwd.clone() };
+                    let here = self.session_cwd(&self.active_session());
                     self.work_in(here).await;
                     self.enter_session();
                 }
@@ -1619,11 +1624,9 @@ impl Host {
                 Ok(ApiOk::Unit)
             }
             ApiCall::SessionMessages { session } => {
+                let here = self.active_session();
                 let store = self.agent.sessions();
-                let target = match &session {
-                    Some(id) => store.get(id),
-                    None => Some(store.active()),
-                };
+                let target = store.get(session.as_ref().unwrap_or(&here));
                 match target {
                     Some(s) => Ok(ApiOk::Messages { messages: s.messages.clone() }),
                     None => Err(ApiError::NotFound {
@@ -1747,10 +1750,58 @@ impl Host {
         }
     }
 
-    /// The conversation on screen. Cloned rather than borrowed: everything that asks this goes on
-    /// to touch the store again, and holding the lock across that is how a deadlock is written.
+    /// The conversation on screen *in the terminal being served right now*.
+    ///
+    /// Cloned rather than borrowed: everything that asks this goes on to touch the store again,
+    /// and holding the lock across that is how a deadlock is written — which is also why this no
+    /// longer reads the store at all. It is a fact about a view.
     fn active_session(&self) -> neosh_proto::SessionId {
-        self.agent.sessions().active_id().clone()
+        self.view.session.clone()
+    }
+
+    /// Put this terminal in a conversation. What *moves*; [`Self::enter_session`] is what draws.
+    ///
+    /// The conversation being left is named rather than worked out by the store, because the store
+    /// has no idea how many terminals there are: leaving a placeholder is what drops it, and a
+    /// placeholder somebody else is still sitting in is not one anybody left.
+    fn arrive_in(
+        &mut self,
+        session: &neosh_proto::SessionId,
+    ) -> Result<(), neosh_agent::StoreError> {
+        let leaving = self.abandoning(session);
+        self.agent.sessions().enter(session, leaving.as_ref())?;
+        self.view.session = session.clone();
+        Ok(())
+    }
+
+    /// The conversation this terminal is leaving, if no other terminal is in it.
+    fn abandoning(
+        &self,
+        going_to: &neosh_proto::SessionId,
+    ) -> Option<neosh_proto::SessionId> {
+        let leaving = self.view.session.clone();
+        if leaving == *going_to {
+            return None;
+        }
+        let elsewhere = self
+            .views_showing(&leaving)
+            .into_iter()
+            .any(|v| v != self.from.view);
+        (!elsewhere).then_some(leaving)
+    }
+
+    /// Where a conversation is, without holding the store's lock across anything else.
+    fn session_cwd(&self, session: &neosh_proto::SessionId) -> std::path::PathBuf {
+        let store = self.agent.sessions();
+        store.get(session).map(|s| s.cwd.clone()).unwrap_or_else(|| self.cwd.clone())
+    }
+
+    /// Every terminal showing this conversation.
+    ///
+    /// The question that replaced "is this the one on screen". A turn's output goes to whoever is
+    /// looking at it, which may be nobody and may be two people.
+    fn views_showing(&self, session: &neosh_proto::SessionId) -> Vec<neosh_proto::ViewId> {
+        (self.view.session == *session).then_some(neosh_proto::ViewId::LOCAL).into_iter().collect()
     }
 
     /// Send what is in the composer: the words, and whatever is on the attachment row.
@@ -2031,6 +2082,25 @@ impl Host {
                 s.ephemeral = true;
             }
         }
+    }
+
+    /// Take this terminal out of a conversation that is about to go away, and say whether it moved.
+    ///
+    /// The store used to do this itself, as part of closing or archiving: it held one session out
+    /// of the map and called it active, so "step away" had exactly one thing to move. With a view
+    /// per terminal there is no single "you" — two of them may be in the conversation being
+    /// deleted, and each has to be told separately — so the move is the host's and the store only
+    /// answers where to go.
+    ///
+    /// Call it *before* the conversation leaves the store: afterwards this view names something
+    /// that is not there.
+    fn step_out_of(&mut self, going: &neosh_proto::SessionId) -> bool {
+        if self.view.session != *going {
+            return false;
+        }
+        self.ensure_somewhere_to_go(going);
+        let Some(next) = self.agent.sessions().next_after(going) else { return false };
+        self.arrive_in(&next).is_ok()
     }
 
     /// Start an empty conversation without switching to it, and say which one it is.
@@ -5147,7 +5217,7 @@ impl Host {
         let running = self.turns.contains_key(&here);
         let (lines, marks) = {
             let store = self.agent.sessions();
-            let s = store.active();
+            let Some(s) = store.get(&here) else { return };
             let (lines, marks, _) = transcript(s, ascii, limits, width, show_tools, running);
             (lines, marks)
         };
@@ -5182,9 +5252,8 @@ impl Host {
         // opens on — so this is the one place that has to clear the mark, and a flag left set on
         // the conversation you are sitting in would say "new" about the answer on screen.
         let arrived = {
-            let mut store = self.agent.sessions();
-            let here = store.active_id().clone();
-            store.mark_read(&here)
+            let here = self.active_session();
+            self.agent.sessions().mark_read(&here)
         };
         if arrived {
             self.persist_sessions();
@@ -5209,11 +5278,15 @@ impl Host {
         let show_tools = self.option_bool("chat.show_tools");
         let here = self.active_session();
         let running = self.turns.contains_key(&here);
-        let (lines, marks, cards, label) = {
+        let Some((lines, marks, cards, label)) = ({
             let store = self.agent.sessions();
-            let s = store.active();
-            let (lines, marks, cards) = transcript(s, ascii, limits, width, show_tools, running);
-            (lines, marks, cards, s.label())
+            store.get(&here).map(|s| {
+                let (lines, marks, cards) =
+                    transcript(s, ascii, limits, width, show_tools, running);
+                (lines, marks, cards, s.label())
+            })
+        }) else {
+            return;
         };
         let plugin = PluginId::from(BUILTIN);
         let _ = self.editor.apply(&plugin, ApiCall::MarkClear {
@@ -5268,7 +5341,7 @@ impl Host {
         self.set_composer("");
         self.refresh_status();
         self.bridge.broadcast(PluginEvent::SessionChanged {
-            session: self.agent.sessions().active_id().clone(),
+            session: self.active_session(),
         });
     }
 
@@ -5282,8 +5355,7 @@ impl Host {
 
     /// The directory paths in the transcript are shown relative to: the conversation's.
     fn root(&self) -> std::path::PathBuf {
-        let store = self.agent.sessions();
-        store.active().cwd.clone()
+        self.session_cwd(&self.active_session())
     }
 
     /// Draw one tool call's card — the header, with nothing under it yet — and remember where it
@@ -7549,12 +7621,12 @@ impl Host {
             return;
         }
         let restored = saved.len();
-        {
+        // The session the store was constructed with is empty and unsaved; replacing the ordering
+        // below drops it from the list, but it must not linger as a phantom "New conversation"
+        // beside the ones the user actually had.
+        let placeholder = self.active_session();
+        let landed = {
             let mut store = self.agent.sessions();
-            // The session the store was constructed with is empty and unsaved; replacing the
-            // ordering below drops it from the list, but it must not linger as a phantom "New
-            // conversation" beside the ones the user actually had.
-            let placeholder = store.active_id().clone();
             let order: Vec<_> = saved.iter().map(|s| s.id.clone()).collect();
             for s in saved {
                 store.insert(s);
@@ -7564,10 +7636,8 @@ impl Host {
             let target = active.or_else(|| {
                 order.iter().find(|id| store.get(id).is_some_and(|s| !s.archived)).cloned()
             });
-            match target.filter(|id| store.switch(id).is_ok()) {
-                Some(_) => {
-                    let _ = store.remove(&placeholder);
-                }
+            let landed = target.filter(|id| store.enter(id, None).is_ok());
+            match &landed {
                 // Nothing to land in, so what you land in is not a conversation either: the
                 // session the store was constructed with becomes the placeholder, which is what
                 // makes "everything is archived" look like an empty workspace rather than like a
@@ -7577,8 +7647,14 @@ impl Host {
                         s.ephemeral = true;
                     }
                 }
+                Some(_) => {}
             }
             store.set_order(order);
+            landed
+        };
+        if let Some(id) = landed {
+            self.view.session = id;
+            let _ = self.agent.sessions().remove(&placeholder);
         }
         // Every restored conversation may live in a different checkout — that is what makes a
         // second project, or a worktree, appear in the sidebar.
@@ -7592,7 +7668,7 @@ impl Host {
         // And the one that is active decides where "here" is, which is not necessarily where neosh
         // was started: reopening the last conversation you were in should put you back in *its*
         // project, not in whichever directory the shell happened to be sitting in.
-        let here = { self.agent.sessions().active().cwd.clone() };
+        let here = self.session_cwd(&self.active_session());
         if here.is_dir() {
             self.work_in(here).await;
         }
@@ -7771,7 +7847,7 @@ impl Host {
         // redraws on this. Not the same event as switching — nothing moved — but it is the one
         // signal a thread list already listens to for "the conversations are not what you drew".
         self.bridge.broadcast(PluginEvent::SessionChanged {
-            session: self.agent.sessions().active_id().clone(),
+            session: self.active_session(),
         });
         self.refresh_status();
     }

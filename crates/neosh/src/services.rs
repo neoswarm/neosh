@@ -414,7 +414,7 @@ impl Services {
         // Read and dropped before the await. The store's guard is not `Send`, and holding one
         // across a question that may sit unanswered for half an hour would lock the conversation
         // list for exactly that long.
-        let conversation = self.agent.sessions().active_id().clone();
+        let conversation = self.agent.sessions().current_id().clone();
         let answers = asker
             .ask(neosh_provider::ask::QuestionRequest { questions, conversation, cwd: self.cwd.clone() })
             .await;
