@@ -1562,13 +1562,38 @@ impl Host {
             // conversation: it keeps streaming into that one's transcript, and what you see is
             // rebuilt from the conversation you switched to. Waiting for a model to finish before
             // you may look at something else is the workspace refusing to be a workspace.
-            ApiCall::SessionSwitch { session } => {
-                self.arrive_in(&session)
-                    .map_err(|e| ApiError::NotFound { what: e.to_string() })?;
+            ApiCall::SessionSwitch { session, view } => {
+                // In the terminal that asked, unless the caller named another. `^T` in one window
+                // must not move the window next door — which is the whole of what independent
+                // views are — and an orchestrator steering somebody else's screen says so.
+                let view = view.unwrap_or_else(|| self.serving());
+                let moved = self.in_view(view, |me| {
+                    me.arrive_in(&session)
+                        .map_err(|e| ApiError::NotFound { what: e.to_string() })
+                });
+                moved?;
                 let cwd = self.session_cwd(&session);
                 self.work_in(cwd).await;
-                self.enter_session();
+                self.in_view(view, |me| me.enter_session());
                 Ok(ApiOk::Unit)
+            }
+            ApiCall::ViewList => {
+                let here = self.serving();
+                Ok(ApiOk::Views {
+                    views: self
+                        .views
+                        .iter()
+                        // Not the one being kept for whoever attaches next. Nobody is at it, and a
+                        // plugin that furnished a panel into it would have that panel rehomed on
+                        // top of the one it opens when a terminal really does arrive.
+                        .filter(|(id, _)| Some(**id) != self.orphan)
+                        .map(|(id, v)| neosh_proto::ViewInfo {
+                            view: *id,
+                            session: v.session.clone(),
+                            current: *id == here,
+                        })
+                        .collect(),
+                })
             }
             ApiCall::SessionClose { session } => {
                 // Closing the conversation you are in has to land you somewhere first, because
@@ -1854,6 +1879,13 @@ impl Host {
     ///    — it is the last terminal to have pressed anything, which is a guess, and the reason
     ///    [`neosh_proto::KeyContext::view`] exists is so a plugin never has to rely on it.
     fn view_for(&self, call: &ApiCall) -> neosh_proto::ViewId {
+        // Said outright beats every rule below it. This is the escape hatch a plugin reaches for
+        // when it means a terminal other than the one it is being run from.
+        if let ApiCall::WinOpen { view: Some(view), .. }
+        | ApiCall::FloatOpen { view: Some(view), .. } = call
+        {
+            return *view;
+        }
         let anchored = match call {
             ApiCall::FloatOpen { config: neosh_proto::FloatConfig { anchor, .. }, .. } => {
                 match anchor {
@@ -1952,12 +1984,24 @@ impl Host {
             return;
         }
         if self.views.len() <= 1 {
+            // Kept for whoever attaches next, but no longer a screen anybody is at: it is out of
+            // `view.list` from here, so a plugin loading meanwhile does not furnish a panel into a
+            // terminal that does not exist.
+            //
+            // The host's own chrome stays — that is what coming back to where you were means — and
+            // everything a plugin put there is closed now rather than left for the plugin to close
+            // when it hears about this. A panel closed asynchronously is a panel still on screen
+            // when the next terminal arrives and its replacement opens beside it.
+            let chrome = [self.v().chat, self.v().composer, self.v().status];
+            self.editor.close_others_in(view, &chrome);
             self.orphan = Some(view);
-            return;
+        } else {
+            self.editor.close_view(view);
+            self.views.remove(&view);
+            self.orphan = self.orphan.filter(|o| *o != view);
         }
-        self.editor.close_view(view);
-        self.views.remove(&view);
-        self.orphan = self.orphan.filter(|o| *o != view);
+        // So a plugin can let go of whatever it was keeping about that panel.
+        self.bridge.broadcast(neosh_proto::PluginEvent::ViewClosed { view });
     }
 
     /// Do something as though the key had been pressed in `view`.
@@ -7553,10 +7597,20 @@ impl Host {
                 self.draw_welcome();
                 // Every plugin holding a surface has to paint it again: the editor forwards cells
                 // and does not keep them, so a claim is all that could be republished.
-                self.bridge.broadcast(neosh_proto::PluginEvent::ViewAttached);
+                self.bridge.broadcast(neosh_proto::PluginEvent::ViewAttached { view: arriving });
                 // Certainly changed, and not subject to the once-a-second rule: "is anyone
                 // watching" is the one field of the report a viewer arriving is entirely about.
                 self.report_live_now();
+            }
+            // A frontend that *is* this process. There is one view, it is this one, and it has
+            // been watched since the workspace started — which has to be said, because a view
+            // nobody is attached to is deliberately invisible to `view.list` and a plugin would
+            // furnish no panel into it.
+            InputEvent::Ready { .. } if self.orphan == Some(self.from.view) => {
+                self.orphan = None;
+                self.bridge
+                    .broadcast(neosh_proto::PluginEvent::ViewAttached { view: self.from.view });
+                self.draw_welcome();
             }
             InputEvent::Ready { .. } | InputEvent::Resize { .. } => {
                 // A resize changes nothing the core owns; the frontend re-lays-out from the

@@ -16,7 +16,7 @@ use ts_rs::TS;
 use crate::agent::{HookName, HookOutcome, HookPayload, StopReason, ToolCall, ToolResult, Usage};
 use crate::api::{ApiCall, ApiResponse, KeyContext, VarScope};
 use crate::ascp::{NodeId, StreamEvent};
-use crate::ids::{BufferId, RequestId, SessionId, StreamId, TurnId, WindowId};
+use crate::ids::{BufferId, RequestId, SessionId, StreamId, TurnId, ViewId, WindowId};
 use crate::options::OptionValue;
 use crate::provider::{Activity, ModelSelection, TurnRequest};
 
@@ -98,12 +98,23 @@ pub enum PluginEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         key: Option<KeyContext>,
     },
-    /// A viewer connected to a workspace that was already running.
+    /// A terminal arrived, with a screen of its own.
     ///
-    /// Only matters to a plugin that draws a [`crate::SurfaceId`]: the core forwards a surface's
-    /// cells and does not keep a copy, so the claim can be re-announced to a new client and the
-    /// contents cannot. Anything drawn into a buffer is republished without the plugin's help.
-    ViewAttached,
+    /// Two things need it. A plugin that owns a **dock** has to open one panel per view — a
+    /// sidebar that exists once exists in one terminal — and this is when. And a plugin that draws
+    /// a [`crate::SurfaceId`] has to paint it again: the core forwards a surface's cells and does
+    /// not keep a copy, so the claim can be re-announced to a new client and the contents cannot.
+    /// Anything drawn into a buffer is republished without the plugin's help.
+    ///
+    /// Sent for a terminal reattaching to a workspace that was already running, too — it is given
+    /// the screen the last one left, and the id it is given is new.
+    ViewAttached { view: ViewId },
+    /// A terminal went away and its screen with it.
+    ///
+    /// Its windows are already closed; what a plugin has to do is let go of whatever it was
+    /// keeping about that panel, or it holds a window id that names nothing for as long as the
+    /// workspace runs.
+    ViewClosed { view: ViewId },
     /// A buffer the plugin attached to changed. Mirrors the splice the core performed.
     BufferChanged {
         buf: BufferId,

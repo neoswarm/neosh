@@ -195,6 +195,31 @@ impl Editor {
         }
     }
 
+    /// Close every window in a view except the ones showing `keep`.
+    ///
+    /// For a screen nobody is attached to any more that is being kept for whoever comes back: the
+    /// host's own chrome stays, because that is what "come back to where you were" means, and
+    /// everything a plugin put there goes — it is about to be told the view closed, and a panel
+    /// left behind would still be on screen when the plugin opens its replacement.
+    pub fn close_others_in(&mut self, view: ViewId, keep: &[BufferId]) {
+        let doomed: Vec<WindowId> = self
+            .windows
+            .values()
+            .filter(|w| w.view == view && !keep.contains(&w.buf))
+            .map(|w| w.id)
+            .collect();
+        for win in doomed {
+            self.windows.remove(&win);
+            self.captures.remove(&win);
+            self.keymaps.remove_window(win);
+            self.surfaces.retain(|_, (w, _)| *w != win);
+            if let Some(v) = self.views.get_mut(&view) {
+                v.focus.remove(win);
+            }
+            self.push_ui_in(view, UiEvent::WindowClosed { win });
+        }
+    }
+
     /// Forget a view and everything it had open.
     ///
     /// Its windows close — a window belongs to exactly one view, so nothing else is looking at
@@ -272,6 +297,7 @@ impl Editor {
                 | ApiCall::GitRemoveWorktree { .. }
                 | ApiCall::GenComplete { .. }
                 | ApiCall::SessionList { .. }
+                | ApiCall::ViewList
                 | ApiCall::SessionCurrent
                 | ApiCall::SessionNew { .. }
                 | ApiCall::SessionSwitch { .. }
@@ -1029,12 +1055,14 @@ impl Editor {
             }
 
             // ---- windows & floats ------------------------------------
-            ApiCall::WinOpen { buf, layout } => {
+            ApiCall::WinOpen { buf, layout, view: named } => {
                 self.buf(buf)?;
+                let view = named.unwrap_or(view);
                 Ok(ApiOk::Win { win: self.open_window_in(view, buf, layout) })
             }
-            ApiCall::FloatOpen { buf, config } => {
+            ApiCall::FloatOpen { buf, config, view: named } => {
                 self.buf(buf)?;
+                let view = named.unwrap_or(view);
                 let focusable = config.focusable;
                 let win = self.open_window_in(view, buf, WindowLayout::Float { config });
                 if focusable {
@@ -1672,6 +1700,7 @@ fn call_name(call: &ApiCall) -> &'static str {
         ApiCall::HintClear { .. } => "hint.clear",
         ApiCall::StatusClear { .. } => "status.clear",
         ApiCall::SessionList { .. } => "session.list",
+        ApiCall::ViewList => "view.list",
         ApiCall::SessionCurrent => "session.current",
         ApiCall::SessionNew { .. } => "session.new",
         ApiCall::SessionSwitch { .. } => "session.switch",

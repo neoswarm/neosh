@@ -171,6 +171,23 @@ pub struct WindowInfo {
     pub focused: bool,
 }
 
+/// One terminal looking at this workspace.
+///
+/// A view is a set of windows: the conversation on screen, how far up it you have read, the
+/// composer, the panels open over it. Buffers are not — what the agent produced is the workspace's
+/// — so a conversation open in two terminals is one conversation with two places to be in it.
+#[derive(TS, Serialize, Deserialize, Clone, PartialEq, Debug)]
+#[ts(export)]
+pub struct ViewInfo {
+    pub view: ViewId,
+    /// The conversation on screen here.
+    pub session: SessionId,
+    /// Whether this is the terminal being served — the one whose key press is running, or whose
+    /// turn it is to be drawn into.
+    #[serde(default)]
+    pub current: bool,
+}
+
 #[derive(TS, Serialize, Deserialize, Clone, PartialEq, Debug)]
 #[serde(tag = "call", rename_all = "snake_case")]
 #[ts(export)]
@@ -270,6 +287,15 @@ pub enum ApiCall {
     WinOpen {
         buf: BufferId,
         layout: WindowLayout,
+        /// Which terminal to open it in.
+        ///
+        /// Almost never worth saying. The host works it out from the call — a float anchored to a
+        /// window goes where that window is, and a buffer only one terminal is showing names it —
+        /// and otherwise from the terminal whose key press is being served, which for anything a
+        /// plugin does in answer to a key is exact. What this is for is the case none of that
+        /// covers: an orchestrator putting something on a screen other than the one you are at.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        view: Option<ViewId>,
     },
     WinClose {
         win: WindowId,
@@ -391,6 +417,15 @@ pub enum ApiCall {
     FloatOpen {
         buf: BufferId,
         config: FloatConfig,
+        /// Which terminal to open it in.
+        ///
+        /// Almost never worth saying. The host works it out from the call — a float anchored to a
+        /// window goes where that window is, and a buffer only one terminal is showing names it —
+        /// and otherwise from the terminal whose key press is being served, which for anything a
+        /// plugin does in answer to a key is exact. What this is for is the case none of that
+        /// covers: an orchestrator putting something on a screen other than the one you are at.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        view: Option<ViewId>,
     },
     FloatConfigure {
         win: WindowId,
@@ -652,7 +687,16 @@ pub enum ApiCall {
     },
     SessionSwitch {
         session: SessionId,
+        /// Which terminal moves. Defaults to the one being served, which is what a key press in a
+        /// panel means; an orchestrator sending somebody else's screen somewhere says so.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        view: Option<ViewId>,
     },
+    /// Every terminal attached to this workspace, and what each is looking at.
+    ///
+    /// A plugin that owns a dock needs this: it opens one panel per view, and a plugin loaded
+    /// after the terminals were is a plugin that missed their arrival.
+    ViewList,
     /// Close a conversation. Closing the active one moves to the most recently used other; closing
     /// the last one is an error, because there is always somewhere for the next thing you type.
     SessionClose {
@@ -1196,6 +1240,7 @@ pub enum ApiOk {
     Bool { value: bool },
     Buf { buf: BufferId },
     Win { win: WindowId },
+    Views { views: Vec<ViewInfo> },
     Ns { ns: NamespaceId },
     Mark { id: ExtmarkId },
     Surface { surface: SurfaceId },

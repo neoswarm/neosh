@@ -50,7 +50,9 @@ import type {
   SwarmAgent,
   SwarmNode,
   SwarmStranger,
+  BufferId,
   VarScope,
+  ViewId,
   WindowId,
   WorktreeInfo,
 } from "@neosh/api";
@@ -271,154 +273,199 @@ export async function activate({ neosh, subscriptions }: PluginContext) {
     await neosh.vars.get<string[]>({ scope: "global" }, VAR_ASKING).catch(() => null),
   );
 
-  // The kind is what makes this panel something other plugins can act on: it is the scope their
-  // keymaps bind at and the handle `win.ofKind` finds it by. One argument, and the difference
-  // between a panel you can extend and one you can only replace.
-  const buf = await neosh.buf.create({ name: "[sidebar]", scratch: true, kind: KIND });
-  const ns = await neosh.ns.create(NS);
-  // The panel's own width, as of the last frame. The list needs it to unfold the row under the
-  // cursor, and reading the option again per render would be a round trip inside a redraw.
-  let panelWidth = 34;
-  const list = new CursoredList<Target>(neosh, buf, ns, { width: () => panelWidth });
-  let win: WindowId | null = null;
-  let focused = false;
-  // Typed before a motion and consumed by it. Shared with the key table and with the draw, which
-  // is what puts it on screen while it is half typed.
-  const count = { pending: "" };
-  let capture: Disposable | null = null;
-  let running = false;
+  // One panel per terminal.
+  //
+  // A workspace can have several and they are not copies of each other: which conversation is
+  // open, which row the cursor is on, whether the column is showing at all. All of that is
+  // navigation, and navigation is what a view *is* — so the buffer is per view too, since the
+  // cursor and the unfolded row are drawn into its text. See ADR 0057.
+  const panels = new Map<ViewId, Panel>();
 
-  // Serialises redraws. Two overlapping refreshes interleave their `setLines` and `mark` calls and
-  // leave highlights pointing at rows that have already been replaced.
-  let drawing = false;
-  let again = false;
+  const makePanel = async (view: ViewId): Promise<Panel> => {
+    // The kind is what makes this panel something other plugins can act on: it is the scope their
+    // keymaps bind at and the handle `win.ofKind` finds it by. One argument, and the difference
+    // between a panel you can extend and one you can only replace.
+    const buf = await neosh.buf.create({ name: "[sidebar]", scratch: true, kind: KIND });
+    const ns = await neosh.ns.create(NS);
+    // In this terminal, and only this one. Everything else on `here` is the call it always was.
+    const here = neosh.view.at(view);
+    // The panel's own width, as of the last frame. The list needs it to unfold the row under the
+    // cursor, and reading the option again per render would be a round trip inside a redraw.
+    let panelWidth = 34;
+    const list = new CursoredList<Target>(here, buf, ns, { width: () => panelWidth });
+    let win: WindowId | null = null;
+    let focused = false;
+    // Typed before a motion and consumed by it. Shared with the key table and with the draw, which
+    // is what puts it on screen while it is half typed.
+    const count = { pending: "" };
+    let capture: Disposable | null = null;
+    let running = false;
 
-  const draw = async () => {
-    if (win === null) return;
-    if (drawing) {
-      again = true;
-      return;
-    }
-    drawing = true;
-    try {
-      do {
-        again = false;
-        // Read per frame rather than cached at load: a setting arrives from `config.toml` after
-        // this plugin has declared it, and a value captured at activation would be the default
-        // forever.
-        const [width, ascii, hints] = await Promise.all([
-          neosh.opt.get<number>("sidebar.width"),
-          neosh.opt.get<boolean>("ui.ascii_only"),
-          neosh.opt.get<boolean>("sidebar.hints"),
-        ]);
-        panelWidth = width ?? 34;
-        const built = await collect(neosh, arrangement, {
-          width: panelWidth,
-          ascii: ascii ?? false,
-          hints: hints ?? true,
-          focused,
-          selected: list.value,
-          actions: actions(),
-          asking,
-          count: count.pending,
-          // Filled in by `collect`, which is what reads the swarm.
-          remote: new Map(),
-          hosts: new Map(),
-        });
-        running = built.running;
-        list.setRows(built.rows, same);
-        await list.render({
-          showCursor: focused,
-          win: win ?? undefined,
-          pinned: built.pinned,
-        });
-      } while (again);
-    } finally {
-      drawing = false;
-    }
+    // Serialises redraws. Two overlapping refreshes interleave their `setLines` and `mark` calls
+    // and leave highlights pointing at rows that have already been replaced.
+    let drawing = false;
+    let again = false;
+
+    const draw = async () => {
+      if (win === null) return;
+      if (drawing) {
+        again = true;
+        return;
+      }
+      drawing = true;
+      try {
+        do {
+          again = false;
+          // Read per frame rather than cached at load: a setting arrives from `config.toml` after
+          // this plugin has declared it, and a value captured at activation would be the default
+          // forever.
+          const [width, ascii, hints] = await Promise.all([
+            neosh.opt.get<number>("sidebar.width"),
+            neosh.opt.get<boolean>("ui.ascii_only"),
+            neosh.opt.get<boolean>("sidebar.hints"),
+          ]);
+          panelWidth = width ?? 34;
+          const built = await collect(here, arrangement, {
+            width: panelWidth,
+            ascii: ascii ?? false,
+            hints: hints ?? true,
+            focused,
+            selected: list.value,
+            actions: actions(),
+            asking,
+            count: count.pending,
+            // Filled in by `collect`, which is what reads the swarm.
+            remote: new Map(),
+            hosts: new Map(),
+          });
+          running = built.running;
+          list.setRows(built.rows, same);
+          await list.render({
+            showCursor: focused,
+            win: win ?? undefined,
+            pinned: built.pinned,
+          });
+        } while (again);
+      } finally {
+        drawing = false;
+      }
+    };
+
+    const open = async () => {
+      if (win === null) {
+        const width = (await neosh.opt.get<number>("sidebar.width")) ?? 34;
+        win = await here.win.open(buf, "left", { size: width });
+      }
+      await draw();
+      // And again once the frontend has said how tall the panel turned out to be. The foot is held
+      // against the bottom edge, which is a measurement — and on the first frame there is nothing
+      // to measure yet, so without this the strip sits under the last project until something else
+      // happens to redraw.
+      // Not held in `subscriptions`: the panel is opened and closed as often as `^B` is pressed,
+      // and the runtime cancels a plugin's timers when it unloads anyway.
+      neosh.timer.after(120, () => void draw());
+    };
+
+    const leave = async () => {
+      if (!focused) return;
+      focused = false;
+      capture?.dispose();
+      capture = null;
+      await here.focus.pop().catch(() => {});
+      await draw();
+    };
+
+    const close = async () => {
+      if (win === null) return;
+      const w = win;
+      win = null;
+      await leave();
+      await neosh.win.close(w).catch(() => {});
+    };
+
+    const enter = async () => {
+      await open();
+      if (win === null || focused) return;
+      focused = true;
+      await neosh.focus.push(win);
+      // Every key the bindings did not claim comes here, which is what makes `j`, `f` and `?` mean
+      // something in the panel while `^Q` still quits.
+      capture = await neosh.keymap.capture(win, `${NS}.key`).catch(() => null);
+      // Land on the conversation you are in, not wherever the cursor happened to be — and *this*
+      // terminal's, which is the whole reason the panel is per view.
+      const current = await here.session.current().catch(() => null);
+      if (current) {
+        // Unfold the project it lives in, or "go to where I am" lands on a collapsed heading. For
+        // a conversation in a worktree that is two folds: the repository's, then the worktree's.
+        if (current.repo_root) arrangement.unfold(current.repo_root);
+        arrangement.unfold(current.cwd);
+        list.select((t) => t.kind === "session" && t.id === current.id);
+      }
+      await draw();
+    };
+
+    return {
+      view,
+      here,
+      buf,
+      list,
+      count,
+      draw,
+      open,
+      close,
+      enter,
+      leave,
+      isOpen: () => win !== null,
+      isRunning: () => running,
+      width: () => panelWidth,
+      setWidth: (n: number) => {
+        panelWidth = n;
+        if (win !== null) void neosh.win.resize(win, n).then(draw).catch(() => {});
+      },
+      height: async () => {
+        if (win === null) return 20;
+        const v = await neosh.win.viewport(win).catch(() => null);
+        return v?.height ?? 20;
+      },
+      dispose: () => {
+        capture?.dispose();
+        capture = null;
+        // Not closed here: the terminal has gone and the host took its windows with it. Closing a
+        // window that is already gone is an error message about nothing.
+        win = null;
+      },
+    };
   };
 
-  const open = async () => {
-    if (win !== null) return;
-    const width = (await neosh.opt.get<number>("sidebar.width")) ?? 34;
-    win = await neosh.win.open(buf, "left", { size: width });
-    await draw();
-    // And again once the frontend has said how tall the panel turned out to be. The foot is held
-    // against the bottom edge, which is a measurement — and on the first frame there is nothing to
-    // measure yet, so without this the strip sits under the last project until something else
-    // happens to redraw.
-    // Not held in `subscriptions`: the panel is opened and closed as often as `^B` is pressed, and
-    // the runtime cancels a plugin's timers when it unloads anyway.
-    neosh.timer.after(120, () => void draw());
+  /** The panel in a named terminal, or the one being served when nothing is named. */
+  const panel = (view?: ViewId): Panel | null => {
+    if (view !== undefined) return panels.get(view) ?? null;
+    // A command run by name rather than by key — `^K`, a plugin — names no terminal. There is
+    // usually one, and when there is not, the one that has a window open is the one somebody is
+    // looking at.
+    const all = [...panels.values()];
+    return all.find((p) => p.isOpen()) ?? all[0] ?? null;
   };
 
-  const close = async () => {
-    if (win === null) return;
-    const w = win;
-    win = null;
-    await leave();
-    await neosh.win.close(w).catch(() => {});
+  const each = (fn: (p: Panel) => unknown) => {
+    for (const p of panels.values()) void fn(p);
   };
 
-  const leave = async () => {
-    if (!focused) return;
-    focused = false;
-    capture?.dispose();
-    capture = null;
-    await neosh.focus.pop().catch(() => {});
-    await draw();
-  };
-
-  const enter = async () => {
-    await open();
-    if (win === null || focused) return;
-    focused = true;
-    await neosh.focus.push(win);
-    // Every key the bindings did not claim comes here, which is what makes `j`, `f` and `?` mean
-    // something in the panel while `^Q` still quits.
-    capture = await neosh.keymap.capture(win, `${NS}.key`).catch(() => null);
-    // Land on the conversation you are in, not wherever the cursor happened to be.
-    const current = await neosh.session.current().catch(() => null);
-    if (current) {
-      // Unfold the project it lives in, or "go to where I am" lands on a collapsed heading. For a
-      // conversation in a worktree that is two folds: the repository's, then the worktree's own.
-      if (current.repo_root) arrangement.unfold(current.repo_root);
-      arrangement.unfold(current.cwd);
-      list.select((t) => t.kind === "session" && t.id === current.id);
-    }
-    await draw();
-  };
+  const drawAll = () => each((p) => p.draw());
 
   // The verbs other plugins put on our rows. Bound here rather than by them so the row under the
   // cursor can be handed along; see `installActions`.
-  const installed = installActions(neosh, list, () => void draw());
+  const installed = installActions(neosh, panel, drawAll);
   const actions = installed.actions;
   subscriptions.push(installed.dispose);
 
-  await registerCommands({
-    neosh,
-    subscriptions,
-    list,
-    arrangement,
-    count,
-    height: async () => {
-      if (win === null) return 20;
-      const v = await neosh.win.viewport(win).catch(() => null);
-      return v?.height ?? 20;
-    },
-    draw,
-    open,
-    close,
-    enter,
-    leave,
-    isOpen: () => win !== null,
-  });
+  await registerCommands({ neosh, subscriptions, arrangement, panel, each });
 
   // Text changes: a turn started or ended, the conversation changed, a setting moved.
-  subscriptions.push(neosh.agent.onTurnStart(() => void draw()));
-  subscriptions.push(neosh.agent.onTurnEnd(() => void draw()));
-  subscriptions.push(neosh.agent.onToolStart(() => void draw()));
-  subscriptions.push(neosh.session.onChange(() => void draw()));
+  subscriptions.push(neosh.agent.onTurnStart(drawAll));
+  subscriptions.push(neosh.agent.onTurnEnd(drawAll));
+  subscriptions.push(neosh.agent.onToolStart(drawAll));
+  subscriptions.push(neosh.session.onChange(drawAll));
   // What a conversation is still running after its turn ended. The only state on these rows that
   // moves without a turn starting or ending — that is the whole point of it — so nothing else this
   // panel already listens to would ever bring it. Filtered to the one kind, because a driver
@@ -426,19 +473,19 @@ export async function activate({ neosh, subscriptions }: PluginContext) {
   // redraws for nothing.
   subscriptions.push(
     neosh.agent.onActivity((e) => {
-      if (e.activity.kind === "background") void draw();
+      if (e.activity.kind === "background") drawAll();
     }),
   );
   // Somebody pinned, folded or tagged a project — possibly us, possibly a plugin that has never
   // heard of this one. Both arrive here, and the arrangement takes them in the same way.
   subscriptions.push(
     neosh.vars.onChange((e) => {
-      if (arrangement.observe(e.scope, e.key, e.value)) void draw();
+      if (arrangement.observe(e.scope, e.key, e.value)) drawAll();
       // Somebody started waiting on an answer, or stopped. Deleting the var is how "nobody is
       // asking" arrives, and it comes through here with `value` unset rather than as an empty list.
       if (e.scope.scope === "global" && e.key === VAR_ASKING) {
         asking = asked(e.value);
-        void draw();
+        drawAll();
       }
     }),
   );
@@ -446,21 +493,21 @@ export async function activate({ neosh, subscriptions }: PluginContext) {
   // after us contributing rows nobody sees until the next unrelated refresh.
   subscriptions.push(
     neosh.ext.onChange((e) => {
-      if (e.point === POINT_SECTION) void draw();
+      if (e.point === POINT_SECTION) drawAll();
     }),
   );
   subscriptions.push(
     neosh.opt.onChange((e) => {
       if (e.name === "ui.motion" || e.name === "ui.ascii_only") {
-        void applyMotion().then(draw);
-      } else if (e.name === "sidebar.width" && win !== null) {
+        void applyMotion().then(drawAll);
+      } else if (e.name === "sidebar.width") {
         // In place. Reopening was how this used to work, and it gave the panel a new window id and
         // dropped whatever had the keyboard — so resizing from inside the panel threw the cursor
         // back to the composer on every press.
-        panelWidth = (typeof e.value === "number" ? e.value : null) ?? panelWidth;
-        void neosh.win.resize(win, panelWidth).then(draw).catch(() => {});
+        const n = typeof e.value === "number" ? e.value : null;
+        if (n !== null) each((p) => p.setWidth(n));
       } else if (e.name.startsWith("sidebar.") || e.name === "ui.theme") {
-        void draw();
+        drawAll();
       }
     }),
   );
@@ -469,16 +516,39 @@ export async function activate({ neosh, subscriptions }: PluginContext) {
   // workspace has no timer at all.
   subscriptions.push(
     onTick(() => {
-      if (win !== null && running) void draw();
+      each((p) => {
+        if (p.isOpen() && p.isRunning()) void p.draw();
+      });
     }),
   );
 
   await installFooter(neosh, subscriptions);
 
   const period = (await neosh.opt.get<number>("sidebar.refresh_ms")) ?? 4000;
-  subscriptions.push(neosh.timer.every(period, () => void draw()));
+  subscriptions.push(neosh.timer.every(period, drawAll));
 
-  if (await neosh.opt.get<boolean>("sidebar.open")) await open();
+  // One panel per terminal, and one for every terminal that was already here when this plugin
+  // loaded. `sidebar.open` decides whether it starts showing, per view rather than once for the
+  // workspace: `^B` in one window is `^B` in that window.
+  const startOpen = (await neosh.opt.get<boolean>("sidebar.open")) ?? true;
+  subscriptions.push(
+    neosh.view.onOpen((view) => {
+      void (async () => {
+        if (panels.has(view)) return;
+        const made = await makePanel(view);
+        panels.set(view, made);
+        if (startOpen) await made.open();
+      })();
+    }),
+  );
+  subscriptions.push(
+    neosh.view.onClose((view) => {
+      // The windows went with the terminal; what is left is what we were keeping about them, which
+      // would otherwise be a capture pointed at a window that no longer exists.
+      panels.get(view)?.dispose();
+      panels.delete(view);
+    }),
+  );
 }
 
 function same(a: Target, b: Target): boolean {
@@ -765,11 +835,20 @@ function unique(v: string[]): string[] {
 // Keys
 // ---------------------------------------------------------------------------
 
-interface Wiring {
-  neosh: Neosh;
-  subscriptions: PluginContext["subscriptions"];
-  list: CursoredList<Target>;
-  arrangement: Arrangement;
+/**
+ * One terminal's panel.
+ *
+ * Everything here is per view because all of it is navigation: which row the cursor is on, whether
+ * the column is showing, how wide it is, a count half typed. The buffer is per view too, since the
+ * cursor and the unfolded row are drawn into its text — two terminals reading one project list is
+ * the same list rendered twice, and `j` in one must not move the other.
+ */
+interface Panel {
+  readonly view: ViewId;
+  /** The whole API, bound to this terminal. A window opened through it lands here. */
+  readonly here: Neosh;
+  readonly buf: BufferId;
+  readonly list: CursoredList<Target>;
   /**
    * A count typed before a motion — `5j`, `12G`.
    *
@@ -777,19 +856,40 @@ interface Wiring {
    * it is drawn in the hint strip: a count you cannot see is a keypress that appears to have done
    * nothing at all.
    */
-  count: { pending: string };
-  /** How many rows of panel there are, for the two keys that mean "a screen". */
-  height(): Promise<number>;
+  readonly count: { pending: string };
   draw(): Promise<void>;
   open(): Promise<void>;
   close(): Promise<void>;
   enter(): Promise<void>;
   leave(): Promise<void>;
   isOpen(): boolean;
+  /** Whether anything in this panel's list has a turn in flight, for the animation tick. */
+  isRunning(): boolean;
+  width(): number;
+  setWidth(n: number): void;
+  /** How many rows of panel there are, for the two keys that mean "a screen". */
+  height(): Promise<number>;
+  dispose(): void;
+}
+
+interface Wiring {
+  neosh: Neosh;
+  subscriptions: PluginContext["subscriptions"];
+  arrangement: Arrangement;
+  /**
+   * The panel a key was pressed in.
+   *
+   * Every verb in this file starts here. A command run by name rather than by key names no
+   * terminal, and then it is whichever one has the panel open — there is usually exactly one, and
+   * "the one somebody is looking at" is the only answer that is ever right.
+   */
+  panel(view?: ViewId): Panel | null;
+  /** Do something in every terminal's panel. */
+  each(fn: (p: Panel) => unknown): void;
 }
 
 async function registerCommands(w: Wiring): Promise<void> {
-  const { neosh, list, arrangement } = w;
+  const { neosh, arrangement } = w;
 
   /** Rebuild the grouping the arrangement reorders against, without redrawing. */
   const groups = async (): Promise<Project[][]> => {
@@ -814,16 +914,22 @@ async function registerCommands(w: Wiring): Promise<void> {
     name: string,
     key: string | null,
     desc: string,
-    fn: (target: Target | undefined, args: string[]) => Promise<void> | void,
+    fn: (p: Panel, target: Target | undefined, args: string[]) => Promise<void> | void,
     opts: { redraw?: boolean } = {},
   ): Promise<void> => {
     w.subscriptions.push(
-      await neosh.cmd.register(name, async (args) => {
-        await fn(list.value, args);
+      // The panel the key was pressed in. Every verb below acts on one terminal's column — its
+      // cursor, its fold state, its half-typed count — and with several open, "the panel" is not
+      // an answer. A command run by name rather than by key names no terminal and gets whichever
+      // one is showing.
+      await neosh.cmd.register(name, async (args, key) => {
+        const p = w.panel(key?.view);
+        if (p === null) return;
+        await fn(p, p.list.value, args);
         // A count belongs to the motion typed straight after it. Anything else ends it — otherwise
         // a `5` you thought better of sits there and turns the next `j` into five.
-        w.count.pending = "";
-        if (opts.redraw !== false) await w.draw();
+        p.count.pending = "";
+        if (opts.redraw !== false) await p.draw();
       }, { desc }),
     );
     if (key !== null) {
@@ -845,17 +951,17 @@ async function registerCommands(w: Wiring): Promise<void> {
     await neosh.keymap.set("chat", key, command, { scope, desc });
   };
 
-  /** Take the count that was typed, if one was, and forget it. */
-  const take = (fallback = 1): number => {
-    const n = Number.parseInt(w.count.pending, 10);
-    w.count.pending = "";
+  /** Take the count that was typed in one panel, if one was, and forget it. */
+  const take = (p: Panel, fallback = 1): number => {
+    const n = Number.parseInt(p.count.pending, 10);
+    p.count.pending = "";
     // Bounded, because the count is typed and `999999j` is a keystroke that would walk the list a
     // million times before drawing anything.
     return Number.isFinite(n) && n > 0 ? Math.min(n, 999) : fallback;
   };
 
-  await verb(`${NS}.down`, "j", "Next row", () => void list.move(take()));
-  await verb(`${NS}.up`, "k", "Previous row", () => void list.move(-take()));
+  await verb(`${NS}.down`, "j", "Next row", (p) => void p.list.move(take(p)));
+  await verb(`${NS}.up`, "k", "Previous row", (p) => void p.list.move(-take(p)));
   await also("<Down>", `${NS}.down`, "Next row");
   await also("<Up>", `${NS}.up`, "Previous row");
   await also("<C-n>", `${NS}.down`, "Next row");
@@ -864,12 +970,12 @@ async function registerCommands(w: Wiring): Promise<void> {
   // A screen is however tall the panel turned out to be, which only the frontend knows — asked for
   // rather than assumed, the same way every other display measurement here is. Half a screen for
   // `^D`/`^U` because that is what it is everywhere, and a whole one loses the row you were on.
-  const by = (fraction: number, sign: 1 | -1) => async (): Promise<void> => {
-    const rows = Math.max(2, await w.height());
-    const step = Math.max(1, Math.floor(rows * fraction)) * take();
+  const by = (fraction: number, sign: 1 | -1) => async (p: Panel): Promise<void> => {
+    const rows = Math.max(2, await p.height());
+    const step = Math.max(1, Math.floor(rows * fraction)) * take(p);
     // No wrapping on a page step: `^D` at the foot of the list means there is no more of it, and a
     // cursor that reappears at the top has thrown away the place you were reading from.
-    list.move(sign * step, { wrap: false });
+    p.list.move(sign * step, { wrap: false });
   };
   await verb(`${NS}.half.down`, "<C-d>", "Half a screen down", by(0.5, 1));
   await verb(`${NS}.half.up`, "<C-u>", "Half a screen up", by(0.5, -1));
@@ -881,22 +987,22 @@ async function registerCommands(w: Wiring): Promise<void> {
   await verb(`${NS}.page.up`, "<PageUp>", "A screen up", by(1, -1));
 
   /** The count, when a verb wants the number itself rather than a repetition. */
-  const typed = (): number | null => {
-    const n = Number.parseInt(w.count.pending, 10);
-    w.count.pending = "";
+  const typed = (p: Panel): number | null => {
+    const n = Number.parseInt(p.count.pending, 10);
+    p.count.pending = "";
     return Number.isFinite(n) && n > 0 ? n : null;
   };
   // With a count these are a *row* — `5gg` and `5G` are both the fifth — and without one they are
   // the two ends, exactly as in Vim.
-  await verb(`${NS}.top`, "gg", "The first row, or the n-th with a count", () => {
-    const n = typed();
-    if (n === null) list.toEnd("first");
-    else list.nth(n);
+  await verb(`${NS}.top`, "gg", "The first row, or the n-th with a count", (p) => {
+    const n = typed(p);
+    if (n === null) p.list.toEnd("first");
+    else p.list.nth(n);
   });
-  await verb(`${NS}.bottom`, "G", "The last row, or the n-th with a count", () => {
-    const n = typed();
-    if (n === null) list.toEnd("last");
-    else list.nth(n);
+  await verb(`${NS}.bottom`, "G", "The last row, or the n-th with a count", (p) => {
+    const n = typed(p);
+    if (n === null) p.list.toEnd("last");
+    else p.list.nth(n);
   });
 
   /**
@@ -908,14 +1014,15 @@ async function registerCommands(w: Wiring): Promise<void> {
    */
   w.subscriptions.push(
     await neosh.cmd.register(`${NS}.count`, async (_args, key) => {
+      const p = w.panel(key?.view);
       const code = key?.key.code;
-      if (code?.kind !== "char") return;
-      if (w.count.pending === "" && code.c === "0") return;
+      if (p === null || code?.kind !== "char") return;
+      if (p.count.pending === "" && code.c === "0") return;
       // Bounded while it is being typed, not only when it is read: three digits is more rows than
       // this panel will ever have, and it stops a leant-on key growing a string forever.
-      if (w.count.pending.length < 3) w.count.pending += code.c;
+      if (p.count.pending.length < 3) p.count.pending += code.c;
       // Drawn straight away — the strip is the only thing saying the digit landed anywhere.
-      await w.draw();
+      await p.draw();
     }, { desc: "Begin a count for the next motion" }),
   );
   for (const digit of "0123456789") {
@@ -927,9 +1034,9 @@ async function registerCommands(w: Wiring): Promise<void> {
   // A resize rather than a reopen: reopening gives the window a new id and drops whatever had the
   // keyboard, so the panel would throw you back to the composer on every press. The width is the
   // *setting*, so it is the same number `config.toml` sets and one place decides it.
-  const resize = (delta: number) => async (): Promise<void> => {
+  const resize = (delta: number) => async (p: Panel): Promise<void> => {
     const now = (await neosh.opt.get<number>("sidebar.width")) ?? 34;
-    const want = Math.max(16, Math.min(120, now + delta * take()));
+    const want = Math.max(16, Math.min(120, now + delta * take(p)));
     if (want !== now) await neosh.opt.set("sidebar.width", want);
   };
   await verb(`${NS}.wider`, ">", "Widen the panel", resize(2), { redraw: false });
@@ -939,7 +1046,7 @@ async function registerCommands(w: Wiring): Promise<void> {
   }, { redraw: false });
 
   // ---- leaving ----
-  await verb(`${NS}.leave`, "<Esc>", "Back to the composer", () => w.leave(), { redraw: false });
+  await verb(`${NS}.leave`, "<Esc>", "Back to the composer", (p) => p.leave(), { redraw: false });
   await neosh.keymap.set("chat", "q", `${NS}.leave`, { scope: { kind: "buf_kind", name: KIND } });
   await neosh.keymap.set("chat", "<C-c>", `${NS}.leave`, { scope: { kind: "buf_kind", name: KIND } });
 
@@ -948,14 +1055,14 @@ async function registerCommands(w: Wiring): Promise<void> {
     `${NS}.select`,
     "<CR>",
     "Open a conversation, fold a project, or run the row",
-    (target) => activateTarget(neosh, arrangement, target, w),
+    (p, target) => activateTarget(neosh, arrangement, target, p),
     { redraw: false },
   );
-  await verb(`${NS}.fold`, "<Space>", "Fold or unfold this project", async (target) => {
+  await verb(`${NS}.fold`, "<Space>", "Fold or unfold this project", async (p, target) => {
     if (target?.kind !== "project") return;
     await arrangement.toggleFold(target.cwd);
   });
-  await verb(`${NS}.favorite`, "f", "Pin this project to the top", async (target) => {
+  await verb(`${NS}.favorite`, "f", "Pin this project to the top", async (p, target) => {
     let cwd = owningProject(target);
     if (cwd === null) return;
     // Pinning is about the top of the column, and a worktree is never at the top of the column —
@@ -974,7 +1081,7 @@ async function registerCommands(w: Wiring): Promise<void> {
   // From a conversation row it moves the project that conversation is in. Requiring the cursor to
   // be on the heading first made the feature invisible: you are looking at the project when you are
   // looking at what is inside it.
-  const reorder = (delta: number) => async (target: Target | undefined) => {
+  const reorder = (delta: number) => async (_p: Panel, target: Target | undefined) => {
     const cwd = owningProject(target);
     if (cwd === null) return;
     await arrangement.move(await groups(), cwd, delta);
@@ -982,14 +1089,14 @@ async function registerCommands(w: Wiring): Promise<void> {
   await verb(`${NS}.move.down`, "J", "Move this project down", reorder(1));
   await verb(`${NS}.move.up`, "K", "Move this project up", reorder(-1));
 
-  await verb(`${NS}.rename`, "r", "Rename this conversation", async (target) => {
+  await verb(`${NS}.rename`, "r", "Rename this conversation", async (p, target) => {
     if (target?.kind !== "session") return;
     await renameSession(neosh, target.id);
   });
   // The panel's own copy verb, same letter the transcript uses. What a row is *at* is the thing
   // you paste into a terminal, an editor or a message, and retyping a generated worktree path is
   // the kind of chore this panel exists to remove.
-  await verb(`${NS}.copy.path`, "y", "Copy this row's directory", async (target) => {
+  await verb(`${NS}.copy.path`, "y", "Copy this row's directory", async (p, target) => {
     const cwd = owningProject(target);
     if (cwd === null) return;
     await neosh.edit.copy(cwd);
@@ -998,7 +1105,7 @@ async function registerCommands(w: Wiring): Promise<void> {
   // The everyday verb, and it is reversible. Archiving takes a conversation out of the list without
   // taking anything away, which is what people were reaching for `x` to do before `x` deleted
   // things. Where it goes is `a`, not four dim rows at the foot of this panel.
-  await verb(`${NS}.archive`, "x", "Archive this conversation", async (target) => {
+  await verb(`${NS}.archive`, "x", "Archive this conversation", async (p, target) => {
     if (target?.kind !== "session") return;
     await setArchived(neosh, target.id, true);
   });
@@ -1011,7 +1118,7 @@ async function registerCommands(w: Wiring): Promise<void> {
     `${NS}.delete`,
     "X",
     "Delete this conversation, or remove this project",
-    async (target) => {
+    async (p, target) => {
       if (target?.kind === "project") {
         await removeProject(neosh, arrangement, target.cwd);
         return;
@@ -1020,27 +1127,27 @@ async function registerCommands(w: Wiring): Promise<void> {
       await deleteSession(neosh, target.id);
     },
   );
-  await verb(`${NS}.new`, "n", "New conversation in this project", async (target) => {
+  await verb(`${NS}.new`, "n", "New conversation in this project", async (p, target) => {
     // The same question `^N` asks, about the project you are looking at — which is the whole reason
     // the cursor is there. It used to create one outright, and that was the bug: `n` and `^N` were
     // one letter and a modifier apart and did visibly different things, so the only way to know
     // which one you wanted was to have already learned that they differ. Here is still the first
     // row, so `n ⏎` is what `n` always did.
     const cwd = owningProject(target) ?? undefined;
-    await w.leave();
+    await p.leave();
     await newConversation(neosh, cwd);
   }, { redraw: false });
 
   // ---- doors out of the panel ----
-  await verb(`${NS}.browse`, "a", "What you have archived", async () => {
+  await verb(`${NS}.browse`, "a", "What you have archived", async (p) => {
     await browseArchive(neosh);
-    await w.draw();
+    await p.draw();
   }, { redraw: false });
-  await verb(`${NS}.add`, "o", "Add a project", async () => {
-    await w.leave();
+  await verb(`${NS}.add`, "o", "Add a project", async (p) => {
+    await p.leave();
     await neosh.cmd.exec("project.open").catch(() => {});
   }, { redraw: false });
-  await verb(`${NS}.help`, "?", "The keys for this row", async () => {
+  await verb(`${NS}.help`, "?", "The keys for this row", async (p) => {
     await neosh.cmd.exec("help.keys").catch(() => {});
   }, { redraw: false });
 
@@ -1057,17 +1164,27 @@ async function registerCommands(w: Wiring): Promise<void> {
   );
 
   w.subscriptions.push(
-    await neosh.cmd.register("sidebar.toggle", async () => {
-      // Toggling visibility, not focus: `^T` is how you get in.
-      if (w.isOpen()) await w.close();
-      else await w.open();
+    await neosh.cmd.register("sidebar.toggle", async (_args, key) => {
+      // Toggling visibility, not focus: `^T` is how you get in. In *this* terminal: `^B` is about
+      // the column in front of you and says nothing about anybody else's.
+      const p = w.panel(key?.view);
+      if (p === null) return;
+      if (p.isOpen()) await p.close();
+      else await p.open();
     }, { desc: "Show or hide the sidebar" }),
   );
   w.subscriptions.push(
-    await neosh.cmd.register("sidebar.focus", w.enter, { desc: "Move into the project list" }),
+    await neosh.cmd.register("sidebar.focus", async (_args, key) => {
+      await w.panel(key?.view)?.enter();
+    }, { desc: "Move into the project list" }),
   );
   w.subscriptions.push(
-    await neosh.cmd.register("sidebar.refresh", w.draw, { desc: "Redraw the sidebar now" }),
+    await neosh.cmd.register("sidebar.refresh", async (_args, key) => {
+      // By name and from no key, this means "the panel is stale" rather than "this one is", so it
+      // redraws every terminal's.
+      if (key) await w.panel(key.view)?.draw();
+      else w.each((p) => p.draw());
+    }, { desc: "Redraw the sidebar now" }),
   );
   w.subscriptions.push(
     await neosh.cmd.register("session.new", (args) => newConversation(neosh, args[0]), {
@@ -1075,12 +1192,12 @@ async function registerCommands(w: Wiring): Promise<void> {
     }),
   );
   w.subscriptions.push(
-    await neosh.cmd.register("session.new.here", async () => {
+    await neosh.cmd.register("session.new.here", async (p) => {
       await neosh.session.create();
     }, { desc: "Start a new conversation in this project, without asking where" }),
   );
   w.subscriptions.push(
-    await neosh.cmd.register("session.copy.path", async () => {
+    await neosh.cmd.register("session.copy.path", async (p) => {
       // The conversation's directory — which in a worktree is the worktree, and that is the point:
       // the path you want on the clipboard is the one your shell should cd to.
       const current = await neosh.session.current().catch(() => null);
@@ -1116,9 +1233,9 @@ async function registerCommands(w: Wiring): Promise<void> {
     }, { desc: "Bring an archived conversation back" }),
   );
   w.subscriptions.push(
-    await neosh.cmd.register("session.archived", async () => {
+    await neosh.cmd.register("session.archived", async (_args, key) => {
       await browseArchive(neosh);
-      await w.draw();
+      await w.panel(key?.view)?.draw();
     }, { desc: "Browse what you have archived" }),
   );
   w.subscriptions.push(
@@ -1137,16 +1254,18 @@ async function registerCommands(w: Wiring): Promise<void> {
     }, { desc: "Add a project — start a conversation in another directory" }),
   );
   w.subscriptions.push(
-    await neosh.cmd.register("project.remove", async (args) => {
+    await neosh.cmd.register("project.remove", async (args, key) => {
       // The row under the cursor when there is one, so the palette entry does something useful from
       // inside the panel and a plugin can still name a directory outright.
-      const cwd = args[0]?.trim() || owningProject(list.value);
+      const here = w.panel(key?.view);
+      const cwd = args[0]?.trim() || owningProject(here?.list.value);
       if (!cwd) {
         neosh.notify("project.remove needs a directory", "warn");
         return;
       }
       await removeProject(neosh, arrangement, cwd);
-      await w.draw();
+      // Every terminal's, because a project going away is a row missing from all of them.
+      w.each((p) => p.draw());
     }, { desc: "Take a project off the list" }),
   );
 
@@ -1190,7 +1309,7 @@ async function registerCommands(w: Wiring): Promise<void> {
   await neosh.keymap.set("chat", "<C-j>", "swarm.nodes", { desc: "Computers" });
   // Any change over there is a redraw here. Without it the panel is right only as often as its
   // four-second refresh, which is a long time to watch a spinner that has already stopped.
-  w.subscriptions.push(neosh.swarm.onChange(() => void w.draw()));
+  w.subscriptions.push(neosh.swarm.onChange(() => w.each((p) => p.draw())));
 
   await neosh.hint.set("sessions", { keys: "^T", label: "conversations", priority: 20 });
   await neosh.hint.set("new", { keys: "^N", label: "new", priority: 21 });
@@ -1210,7 +1329,7 @@ async function registerCommands(w: Wiring): Promise<void> {
  */
 function installActions(
   neosh: Neosh,
-  list: CursoredList<Target>,
+  panel: (view?: ViewId) => Panel | null,
   onChange: () => void,
 ): { actions: () => ActionItem[]; dispose: Disposable } {
   const scope = { kind: "buf_kind", name: KIND } as const;
@@ -1234,8 +1353,10 @@ function installActions(
 
     for (const c of valid) {
       const name = `${NS}.action.${c.plugin}.${c.id}`;
-      const command = await neosh.cmd.register(name, async () => {
-        const target = list.value;
+      const command = await neosh.cmd.register(name, async (_args, key) => {
+        // The row under *this* terminal's cursor. A contributed verb is pressed in one panel, and
+        // there may be three of them open on three different rows.
+        const target = panel(key?.view)?.list.value;
         if (!applies(c.item.on ?? "any", target)) return;
         await neosh.cmd.exec(c.item.command, argsFor(target)).catch((e: unknown) => {
           neosh.notify(String(e), "warn");
@@ -1493,7 +1614,7 @@ async function activateTarget(
   neosh: Neosh,
   arrangement: Arrangement,
   target: Target | undefined,
-  w: Wiring,
+  p: Panel,
 ): Promise<void> {
   if (!target) return;
   // Somebody else's row. Nothing here knows what it does, which is the point — the contribution
@@ -1503,7 +1624,7 @@ async function activateTarget(
     await neosh.cmd.exec(target.command, target.args).catch((e: unknown) => {
       neosh.notify(String(e), "warn");
     });
-    await w.draw();
+    await p.draw();
     return;
   }
   // A conversation on another computer. There is nothing to switch to here — it belongs to that
@@ -1515,13 +1636,13 @@ async function activateTarget(
     return;
   }
   if (target.kind === "add") {
-    await w.leave();
+    await p.leave();
     await neosh.cmd.exec("project.open").catch(() => {});
     return;
   }
   if (target.kind === "browse") {
     await browseArchive(neosh);
-    await w.draw();
+    await p.draw();
     return;
   }
   if (target.kind === "project") {
@@ -1530,21 +1651,21 @@ async function activateTarget(
     // to fold, which is what `s.repo_root === target.cwd` finds.
     const sessions = await neosh.session.list().catch(() => [] as SessionInfo[]);
     if (!sessions.some((s) => s.cwd === target.cwd || s.repo_root === target.cwd)) {
-      await neosh.session.create({ cwd: target.cwd });
-      await w.leave();
+      await p.here.session.create({ cwd: target.cwd });
+      await p.leave();
       return;
     }
     await arrangement.toggleFold(target.cwd);
-    await w.draw();
+    await p.draw();
     return;
   }
   try {
-    await neosh.session.switch(target.id);
+    await p.here.session.switch(target.id);
   } catch (e) {
     neosh.notify(String(e), "warn");
     return;
   }
-  await w.leave();
+  await p.leave();
 }
 
 /** The project a row belongs to — its own, or the one its conversation is in. */
