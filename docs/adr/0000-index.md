@@ -58,3 +58,4 @@ implementation — and in two cases (0005, 0008) it did not, which is itself rec
 | [0050](0050-a-card-is-attached-to-what-it-did.md) | A card is attached to what it did | Accepted |
 | [0051](0051-a-stack-of-commands.md) | A stack of commands, and the answer is the last one's | Accepted |
 | [0054](0054-a-turn-can-end-while-its-work-does-not.md) | A turn can end while its work does not, and a turn that is waiting should say so | Accepted |
+| [0055](0055-a-plugin-being-ready-is-not-the-workspace-being-ready.md) | A plugin being ready is not the workspace being ready | Accepted |

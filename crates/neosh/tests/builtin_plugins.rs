@@ -5,6 +5,14 @@
 //! it would show up here as a call these tests cannot make.
 //!
 //! Everything is asserted on rendered text and emitted UI events — what a user would actually see.
+//!
+//! **The mock plugins here announce themselves from `neosh.ready`, never from the end of their own
+//! `activate`**, and every `wait_for("… ready")` below is relying on that. A plugin's own
+//! activation is the wrong moment to type at: the ten bundled plugins are still loading alongside
+//! it, so `^E`, `^L` and `^T` are keys nothing has bound yet, `session.new` is a name nothing
+//! answers to, and a configured `agent.model` naming this very plugin may still be held. A test
+//! that pressed a key there was racing ten module loads — which is a race an idle laptop wins and
+//! a busy CI runner loses, and losing it is what turned twenty of these red at once.
 
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
@@ -30,7 +38,9 @@ impl Sandbox {
     fn new(name: &str) -> Self {
         let root = std::env::temp_dir().join(format!("neosh-builtin-{}-{name}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
-        for d in ["config", "state", "work"] {
+        // `claude` and `codex` are the vendors' own homes, empty unless a test fills one. See
+        // `Sandbox::write_usage_history`.
+        for d in ["config", "state", "work", "claude/projects", "codex/sessions"] {
             std::fs::create_dir_all(root.join(d)).expect("sandbox dirs");
         }
         Self { root }
@@ -63,6 +73,34 @@ impl Sandbox {
         run(&["commit", "-m", "initial"]);
     }
 
+    /// One answer in a `claude` transcript, `hours_ago` old.
+    ///
+    /// The last-30-days block is read from `~/.claude/projects` and `~/.codex/sessions`, which are
+    /// files another program wrote — so a test that asserts on it has to bring its own. Without
+    /// this the assertion is about whatever the developer happened to have spent that month, which
+    /// is a test that passes on a laptop and says "nothing in this span" on a fresh runner.
+    fn write_usage_history(&self, model: &str, hours_ago: i64) {
+        let at = now_secs() - hours_ago * 3_600;
+        let dir = self.root.join("claude/projects/-tmp-neosh");
+        std::fs::create_dir_all(&dir).expect("transcript dir");
+        let line = serde_json::json!({
+            "type": "assistant",
+            "timestamp": iso_utc(at),
+            "requestId": "req-1",
+            "message": {
+                "id": "msg-1",
+                "model": model,
+                "usage": {
+                    "input_tokens": 12_000,
+                    "output_tokens": 3_000,
+                    "cache_read_input_tokens": 40_000,
+                    "cache_creation_input_tokens": 1_000,
+                },
+            },
+        });
+        std::fs::write(dir.join("session.jsonl"), format!("{line}\n")).expect("transcript");
+    }
+
     fn start(&self) -> Session {
         let child = Command::new(env!("CARGO_BIN_EXE_neosh"))
             .args(["--ui-protocol", "stdio"])
@@ -73,6 +111,11 @@ impl Sandbox {
             .args(["--mock-script", &fixture().display().to_string()])
             .args(["--model", "mock/mock"])
             .env("NEOSH_STATE_DIR", self.root.join("state"))
+            // The history block reads the *vendors'* transcripts rather than ours — see
+            // `crate::usage`. Pointed at this sandbox, because the alternative is a hundred and
+            // forty-seven neoshes scanning a real month of somebody's work and asserting on it.
+            .env("CLAUDE_CONFIG_DIR", self.root.join("claude"))
+            .env("CODEX_HOME", self.root.join("codex"))
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
@@ -80,6 +123,33 @@ impl Sandbox {
             .expect("neosh should start");
         Session::wrap(child)
     }
+}
+
+fn now_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or_default()
+}
+
+/// A unix second as `YYYY-MM-DDTHH:MM:SSZ`, which is what a transcript timestamp looks like.
+///
+/// Hinnant's `civil_from_days`, the companion to the `days_from_civil` in `crate::usage` that
+/// reads it back. Written out rather than pulled in: one date format in one direction is not worth
+/// a dependency, and the two halves failing together is easier to see when they are both here.
+fn iso_utc(secs: i64) -> String {
+    let (days, rest) = (secs.div_euclid(86_400), secs.rem_euclid(86_400));
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = yoe + era * 400 + i64::from(m <= 2);
+    let (h, mi, sec) = (rest / 3_600, (rest % 3_600) / 60, rest % 60);
+    format!("{y:04}-{m:02}-{d:02}T{h:02}:{mi:02}:{sec:02}Z")
 }
 
 fn fixture() -> PathBuf {
@@ -457,7 +527,7 @@ export async function activate({ neosh }: PluginContext) {
       { id: "other-2", display_name: "Other Two" },
     ],
   }], async (_req, emit) => { emit({ type: "message_stop" }); });
-  neosh.notify("other ready");
+  neosh.event.on("neosh.ready", () => neosh.notify("other ready"));
 }
 "#;
 
@@ -825,6 +895,11 @@ impl Sandbox {
             .arg(self.work())
             .args(["--mock-script", &script.display().to_string()])
             .env("NEOSH_STATE_DIR", self.root.join("state"))
+            // The history block reads the *vendors'* transcripts rather than ours — see
+            // `crate::usage`. Pointed at this sandbox, because the alternative is a hundred and
+            // forty-seven neoshes scanning a real month of somebody's work and asserting on it.
+            .env("CLAUDE_CONFIG_DIR", self.root.join("claude"))
+            .env("CODEX_HOME", self.root.join("codex"))
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null());
@@ -1203,7 +1278,7 @@ export async function activate({ neosh }: PluginContext) {
     const sel = await neosh.agent.selection();
     neosh.notify(`selection: ${sel?.instance}/${sel?.model} ${JSON.stringify(sel?.options ?? [])}`);
   });
-  neosh.notify("lab ready");
+  neosh.event.on("neosh.ready", () => neosh.notify("lab ready"));
 }
 "#;
 
@@ -1250,7 +1325,7 @@ export async function activate({ neosh }: PluginContext) {
     emit({ type: "message_delta", stop_reason: { kind: "end_turn" }, usage: {} });
     emit({ type: "message_stop" });
   });
-  neosh.notify("spoken ready");
+  neosh.event.on("neosh.ready", () => neosh.notify("spoken ready"));
 }
 "#;
 
@@ -1291,7 +1366,7 @@ export async function activate({ neosh }: PluginContext) {
     const sel = await neosh.agent.selection();
     neosh.notify(`selection: ${sel?.instance}/${sel?.model}`);
   });
-  neosh.notify("ladder ready");
+  neosh.event.on("neosh.ready", () => neosh.notify("ladder ready"));
 }
 "#;
 
@@ -1959,7 +2034,7 @@ export async function activate({ neosh }: PluginContext) {
     blocking: true,
     timeoutMs: 25000,
   });
-  neosh.notify("staller ready");
+  neosh.event.on("neosh.ready", () => neosh.notify("staller ready"));
 }
 "#,
     )
@@ -2192,6 +2267,12 @@ fn a_worktree_is_removed_by_its_path_without_a_picker() {
     s.wait_for("PROJECTS");
 
     s.send(&command("git.worktree.new.inside"));
+    // Waited for by the notification the verb ends with, not by the directory appearing. Those are
+    // the two halves of it: `git worktree add` puts the checkout on disk, and the conversation is
+    // created in it afterwards. The refusal asserted below is about the second half — so a test
+    // that moved as soon as the directory existed was asking to remove a tree nothing was standing
+    // in yet, which is a removal that succeeds.
+    assert!(s.pump(|s| s.saw("branched ")), "the tree was made and entered\n{}", s.transcript());
     let under = sb.work().join(".worktrees");
     assert!(
         s.pump(|_| std::fs::read_dir(&under).is_ok_and(|d| d.count() > 0)),
@@ -3562,7 +3643,7 @@ export async function activate({ neosh }: PluginContext) {
     emit({ type: "message_start", model: "stall", usage: {} });
     // Nothing else, ever. The turn stays in flight.
   });
-  neosh.notify("stall ready");
+  neosh.event.on("neosh.ready", () => neosh.notify("stall ready"));
 }
 "#;
 
@@ -3588,7 +3669,7 @@ export async function activate({ neosh }: PluginContext) {
     } });
     // And then nothing. The wait is the whole turn.
   });
-  neosh.notify("waiter ready");
+  neosh.event.on("neosh.ready", () => neosh.notify("waiter ready"));
 }
 "#;
 
@@ -3649,7 +3730,7 @@ export async function activate({ neosh }: PluginContext) {
     emit({ type: "message_delta", stop_reason: { kind: "end_turn" }, usage: {} });
     emit({ type: "message_stop" });
   });
-  neosh.notify("leaver ready");
+  neosh.event.on("neosh.ready", () => neosh.notify("leaver ready"));
 }
 "#;
 
@@ -3712,7 +3793,7 @@ export async function activate({ neosh }: PluginContext) {
     emit({ type: "text_delta", index: 0, text: "Here is what I found so far." });
     // And then nothing, ever. The turn stays in flight with an answer already on screen.
   });
-  neosh.notify("half ready");
+  neosh.event.on("neosh.ready", () => neosh.notify("half ready"));
 }
 "#;
 
@@ -3749,7 +3830,7 @@ export async function activate({ neosh }: PluginContext) {
     emit({ type: "message_delta", stop_reason: { kind: "end_turn" }, usage: {} });
     emit({ type: "message_stop" });
   });
-  neosh.notify("chatty ready");
+  neosh.event.on("neosh.ready", () => neosh.notify("chatty ready"));
 }
 "#;
 
@@ -3791,7 +3872,7 @@ export async function activate({ neosh }: PluginContext) {
     emit({ type: "message_delta", stop_reason: { kind: "end_turn" }, usage: {} });
     emit({ type: "message_stop" });
   });
-  neosh.notify("editor ready");
+  neosh.event.on("neosh.ready", () => neosh.notify("editor ready"));
 }
 "#;
 
@@ -3839,7 +3920,7 @@ export async function activate({ neosh }: PluginContext) {
     emit({ type: "message_delta", stop_reason: { kind: "end_turn" }, usage: {} });
     emit({ type: "message_stop" });
   });
-  neosh.notify("looker ready");
+  neosh.event.on("neosh.ready", () => neosh.notify("looker ready"));
 }
 "#;
 
@@ -4076,7 +4157,7 @@ export async function activate({ neosh }: PluginContext) {
     });
     emit({ type: "message_stop" });
   });
-  neosh.notify("wide ready");
+  neosh.event.on("neosh.ready", () => neosh.notify("wide ready"));
 }
 "#;
 
@@ -4104,7 +4185,7 @@ export async function activate({ neosh }: PluginContext) {
     emit({ type: "message_delta", stop_reason: { kind: "end_turn" }, usage: {} });
     emit({ type: "message_stop" });
   }, { agentLoop: true });
-  neosh.notify("compactor ready");
+  neosh.event.on("neosh.ready", () => neosh.notify("compactor ready"));
 }
 "#;
 
@@ -4188,7 +4269,7 @@ export async function activate({ neosh }: PluginContext) {
     seen.push(`draft<${text}>`);
     void neosh.buf.setLines(buf, 0, -1, seen);
   });
-  neosh.notify("watcher ready");
+  neosh.event.on("neosh.ready", () => neosh.notify("watcher ready"));
 }
 "#;
 
@@ -4392,7 +4473,7 @@ export async function activate({ neosh }: PluginContext) {
     emit({ type: "message_delta", stop_reason: { kind: "end_turn" }, usage: {} });
     emit({ type: "message_stop" });
   }, { agentLoop: true });
-  neosh.notify("reporter ready");
+  neosh.event.on("neosh.ready", () => neosh.notify("reporter ready"));
 }
 "#;
 
@@ -4714,7 +4795,7 @@ export async function activate({ neosh }: PluginContext) {
     emit({ type: "message_start", model: "sealed", usage: {} });
     emit({ type: "message_stop" });
   });
-  neosh.notify("vault ready");
+  neosh.event.on("neosh.ready", () => neosh.notify("vault ready"));
 }
 "#;
 
@@ -4748,7 +4829,7 @@ export async function activate({ neosh }: PluginContext) {
       },
     });
   });
-  neosh.notify("slow ready");
+  neosh.event.on("neosh.ready", () => neosh.notify("slow ready"));
 }
 "#;
 
@@ -5015,7 +5096,7 @@ export async function activate({ neosh }: PluginContext) {
     emit({ type: "message_delta", stop_reason: { kind: "end_turn" }, usage: {} });
     emit({ type: "message_stop" });
   });
-  neosh.notify("parrot ready");
+  neosh.event.on("neosh.ready", () => neosh.notify("parrot ready"));
 }
 "#;
 
@@ -5159,7 +5240,7 @@ export async function activate({ neosh }: PluginContext) {
     if (found) await neosh.session.switch(found.id);
     else neosh.notify(`no conversation in ${args[0]}`, "warn");
   }, { desc: "switch to the conversation in a directory" });
-  neosh.notify("where ready");
+  neosh.event.on("neosh.ready", () => neosh.notify("where ready"));
 }
 "#;
 
@@ -5573,7 +5654,7 @@ export async function activate({ neosh }: PluginContext) {
     emit({ type: "message_delta", stop_reason: { kind: "end_turn" }, usage: {} });
     emit({ type: "message_stop" });
   });
-  neosh.notify("runner ready");
+  neosh.event.on("neosh.ready", () => neosh.notify("runner ready"));
 }
 "#;
 
@@ -5869,7 +5950,7 @@ export async function activate({ neosh, subscriptions }: PluginContext) {
     on: "any",
   }));
 
-  neosh.notify("acme ready");
+  neosh.event.on("neosh.ready", () => neosh.notify("acme ready"));
 }
 "#;
 
@@ -6240,7 +6321,7 @@ export async function activate({ neosh }: PluginContext) {
     neosh.notify("published");
   });
 
-  neosh.notify("planner ready");
+  neosh.event.on("neosh.ready", () => neosh.notify("planner ready"));
 }
 "#;
 
@@ -6527,6 +6608,9 @@ fn the_usage_panel_opens_with_the_plan_above_the_history() {
 fn the_usage_panel_swaps_metric_on_its_own_key() {
     let sb = Sandbox::new("planmetric");
     install_planner(&sb);
+    // A month with exactly one answer in it, so the breakdown below has a row to draw. Read off a
+    // transcript this test wrote, never off the developer's own.
+    sb.write_usage_history("claude-opus-4-8", 2);
     sb.write_config("[options]\n\"agent.model\" = \"planner/planner-1\"\n");
     let mut s = sb.start_letting_config_choose();
     s.wait_for("planner ready");
@@ -6577,7 +6661,7 @@ export async function activate({ neosh }: PluginContext) {
       neosh.notify(`liar refused: ${e}`);
     }
   });
-  neosh.notify("liar ready");
+  neosh.event.on("neosh.ready", () => neosh.notify("liar ready"));
 }
 "#;
     let sb = Sandbox::new("planliar");
@@ -6630,7 +6714,7 @@ export async function activate({ neosh }: PluginContext) {
     if (other) await neosh.session.switch(other.id);
     else await neosh.session.create({ activate: true });
   });
-  neosh.notify("asker ready");
+  neosh.event.on("neosh.ready", () => neosh.notify("asker ready"));
 }
 "#;
     let sb = Sandbox::new("asking-row");
@@ -6788,7 +6872,7 @@ export async function activate({ neosh }: PluginContext) {
     neosh.notify("fanned out");
     } catch (e) { neosh.notify("fanout failed: " + e); }
   });
-  neosh.notify("lab ready");
+  neosh.event.on("neosh.ready", () => neosh.notify("lab ready"));
 }
 "#;
     let sb = Sandbox::new("fanout");
@@ -6886,7 +6970,7 @@ export async function activate({ neosh }: PluginContext) {
     };
   }, { blocking: true });
 
-  neosh.notify("router ready");
+  neosh.event.on("neosh.ready", () => neosh.notify("router ready"));
 }
 "#;
     let sb = Sandbox::new("router");
