@@ -56,3 +56,4 @@ implementation — and in two cases (0005, 0008) it did not, which is itself rec
 | [0048](0048-a-key-every-terminal-sends.md) | A default binding is a key every terminal sends | Accepted |
 | [0049](0049-a-list-is-a-place-you-move-in.md) | A list is a place you move in | Accepted |
 | [0050](0050-a-card-is-attached-to-what-it-did.md) | A card is attached to what it did | Accepted |
+| [0051](0051-a-stack-of-commands.md) | A stack of commands, and the answer is the last one's | Accepted |

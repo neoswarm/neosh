@@ -5400,6 +5400,150 @@ fn calls_that_only_looked_at_things_share_one_row_and_open_into_several() {
     );
 }
 
+/// A provider that runs three commands in one turn, and a `run` tool with canned output for each.
+///
+/// The shell neosh does not have: what matters to a card is that the call was handed a `command`,
+/// which is how a card decides what a call is in the first place — off the arguments, never off a
+/// list of tool names.
+const RUNNER: &str = r#"
+import type { PluginContext } from "@neosh/api";
+
+const SAID: Record<string, string> = {
+  "git add -A": "",
+  "git commit -m 'stack the cards'": "[main 6759f10] stack the cards\n 3 files changed",
+  "git push origin main": "To github.com:neoswarm/neosh\n   6759f10..c280938  main -> main",
+};
+
+export async function activate({ neosh }: PluginContext) {
+  await neosh.tool.register(
+    { name: "run", description: "Run", inputSchema: { type: "object" } },
+    async (input) => ({ content: SAID[(input as { command: string }).command] ?? "ran" }),
+  );
+  let turn = 0;
+  await neosh.provider.register("runner", [{
+    id: "runner", driver: "runner", display_name: "Runner",
+    models: [{ id: "runner", display_name: "Runner" }],
+  }], async (_req, emit) => {
+    emit({ type: "message_start", model: "runner", usage: {} });
+    turn += 1;
+    if (turn === 1) {
+      Object.keys(SAID).forEach((command, i) => {
+        emit({ type: "block_start", index: i, block: { kind: "tool_use", id: `r${i}`, name: "run" } });
+        emit({ type: "tool_input_delta", index: i, partial_json: JSON.stringify({ command }) });
+        emit({ type: "block_stop", index: i });
+      });
+      emit({ type: "message_delta", stop_reason: { kind: "tool_use" }, usage: {} });
+      emit({ type: "message_stop" });
+      return;
+    }
+    emit({ type: "block_start", index: 0, block: { kind: "text" } });
+    emit({ type: "text_delta", index: 0, text: "Pushed." });
+    emit({ type: "block_stop", index: 0 });
+    emit({ type: "message_delta", stop_reason: { kind: "end_turn" }, usage: {} });
+    emit({ type: "message_stop" });
+  });
+  neosh.notify("runner ready");
+}
+"#;
+
+fn install_runner(sb: &Sandbox) {
+    let dir = sb.root.join("config/plugins/runner");
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    std::fs::write(
+        dir.join("plugin.toml"),
+        "name = \"runner\"\nversion = \"0.1.0\"\nentry = \"main.ts\"\npermissions = [\"providers\", \"tools\"]\n",
+    )
+    .expect("manifest");
+    std::fs::write(dir.join("main.ts"), RUNNER).expect("plugin");
+}
+
+/// ADR 0051. A stretch of a turn spent running things is one row, and the answer is the last one's.
+#[test]
+fn a_run_of_commands_is_one_row_that_keeps_the_last_answer() {
+    let sb = Sandbox::new("stack");
+    install_runner(&sb);
+    sb.write_config(
+        "[options]\n\"agent.model\" = \"runner/runner\"\n\"ui.confirm_destructive\" = false\n",
+    );
+    let mut s = sb.start_letting_config_choose();
+    // The splash names the active model, and the model the config asked for only becomes active
+    // once the plugin that provides it has finished loading. "runner ready" is the plugin saying
+    // it registered; this is the host saying it took.
+    s.wait_for("runner/runner");
+    s.type_text("go");
+    s.enter();
+    assert!(
+        s.pump(|s| {
+            let rows = s.chat_now();
+            rows.iter().any(|l| l.contains("Pushed."))
+                && !rows.iter().any(|l| l.contains("esc to interrupt"))
+        }),
+        "the turn finished\n{:?}",
+        s.chat_now()
+    );
+    let rows = s.chat_now();
+    let run = rows
+        .iter()
+        .position(|l| l.starts_with("  Ran  "))
+        .unwrap_or_else(|| panic!("the stack is one row\n{rows:?}"));
+    assert_eq!(
+        rows[run], "  Ran  git add, git commit, git push origin",
+        "each command named by what it is rather than how it was spelled\n{rows:?}"
+    );
+    // The last one's output, because that is the one the other two were getting to.
+    assert!(
+        rows.iter().any(|l| l.contains("6759f10..c280938")),
+        "the answer is under it\n{rows:?}"
+    );
+    assert!(
+        !rows.iter().any(|l| l.contains("3 files changed")),
+        "and the ones before it folded into their names\n{rows:?}"
+    );
+
+    // Opened, every command in full with the whole of what it printed.
+    s.ctrl("s");
+    s.key("g");
+    s.key("g");
+    for _ in 0..run {
+        s.key("j");
+    }
+    s.special("tab");
+    assert!(
+        s.pump(|s| s.chat_now().iter().any(|l| l.contains("3 files changed"))),
+        "open, nothing the fold hid is out of reach\n{:?}",
+        s.chat_now()
+    );
+    let open = s.chat_now();
+    assert!(
+        open.iter().any(|l| l.contains("Ran  git commit -m 'stack the cards'")),
+        "and every command is there in full\n{open:?}"
+    );
+    assert_eq!(open[run], rows[run], "the header did not move or change\n{open:?}");
+
+    // And the replay folds it exactly as the live stream did, which is the whole reason the two
+    // go through one renderer.
+    s.special("tab");
+    s.special("esc");
+    s.send(&command("session.new"));
+    assert!(s.pump(|s| !s.chat_now().iter().any(|l| l.contains("Pushed."))), "somewhere else");
+    s.send(&command("session.close"));
+    assert!(
+        s.pump(|s| s.chat_now().iter().any(|l| l.contains("Pushed."))),
+        "and back\n{:?}",
+        s.chat_now()
+    );
+    let back = s.chat_now();
+    assert!(
+        back.iter().any(|l| l == "  Ran  git add, git commit, git push origin"),
+        "one row again\n{back:?}"
+    );
+    assert!(
+        back.iter().any(|l| l.contains("6759f10..c280938"))
+            && !back.iter().any(|l| l.contains("3 files changed")),
+        "with the last answer and no other\n{back:?}"
+    );
+}
+
 #[test]
 fn a_folded_card_opens_with_tab_while_reading_and_folds_again() {
     // A card shows enough to know what happened. The whole of it is one key away, in the place
