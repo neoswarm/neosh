@@ -4,7 +4,7 @@
 //! frontend resolves that and reports back via [`Window::viewport`], which the core needs solely to
 //! place cursor-anchored floats and to size a page scroll.
 
-use neosh_proto::{BufferId, CursorShape, SelectShape, WindowId, WindowLayout};
+use neosh_proto::{BufferId, CursorShape, SelectShape, ViewId, WindowId, WindowLayout};
 
 /// What the frontend told us about a window's realized geometry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -19,6 +19,14 @@ pub struct Viewport {
 #[derive(Debug, Clone)]
 pub struct Window {
     pub id: WindowId,
+    /// Which terminal this window is on.
+    ///
+    /// A window belongs to exactly one, and that is the whole of what makes two terminals
+    /// different places rather than two copies of one. The buffer under it does not: what the
+    /// agent produced is the workspace's, so a conversation open in two terminals is one
+    /// transcript with two windows over it — and this type already holds everything that differs
+    /// between them.
+    pub view: ViewId,
     pub buf: BufferId,
     pub layout: WindowLayout,
     /// `(row, byte_col)` in the buffer.
@@ -61,9 +69,10 @@ pub struct Window {
 }
 
 impl Window {
-    pub fn new(id: WindowId, buf: BufferId, layout: WindowLayout) -> Self {
+    pub fn new(id: WindowId, view: ViewId, buf: BufferId, layout: WindowLayout) -> Self {
         Self {
             id,
+            view,
             buf,
             layout,
             cursor: (0, 0),

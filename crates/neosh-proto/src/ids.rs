@@ -51,6 +51,30 @@ numeric_id!(
     /// A claimed raw-cell surface.
     SurfaceId
 );
+numeric_id!(
+    /// One attached terminal.
+    ///
+    /// A workspace can have several, and they are not copies of each other: a window belongs to
+    /// exactly one, so the conversation on screen, the scroll position, the composer and the
+    /// panels open over it are all facts about a view rather than about the workspace. Buffers are
+    /// not — what the agent produced is the workspace's, and a conversation shown in two terminals
+    /// is one transcript with two cursors on it.
+    ///
+    /// On the wire because a plugin has to be able to say which terminal it is drawing into. ADR
+    /// 0042 kept it out of the protocol deliberately, when every view saw the same frame and the
+    /// number bought nothing; a float that must land in *this* terminal is what changed.
+    ViewId
+);
+
+impl ViewId {
+    /// The frontend of a process that is its own terminal — `--no-daemon`, `--ui-protocol=stdio`,
+    /// every integration test that drives the host directly.
+    ///
+    /// There is exactly one and it never goes away, so nothing has to represent it. It exists so
+    /// that "which view was that from" has an answer in the one-process case too, rather than
+    /// every caller carrying an `Option` that is only ever `None` in half the builds.
+    pub const LOCAL: ViewId = ViewId(0);
+}
 
 /// Identifies a loaded plugin. Stable across reloads; derived from the manifest `name`.
 #[derive(TS, Serialize, Deserialize, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Debug)]

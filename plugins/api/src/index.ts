@@ -118,6 +118,7 @@ import type { SwarmAgent } from "./generated/SwarmAgent";
 import type { SwarmNode } from "./generated/SwarmNode";
 import type { SwarmStranger } from "./generated/SwarmStranger";
 import type { VarScope } from "./generated/VarScope";
+import type { ViewId } from "./generated/ViewId";
 import type { Viewport } from "./generated/Viewport";
 import type { WindowId } from "./generated/WindowId";
 import type { WindowInfo } from "./generated/WindowInfo";
@@ -141,7 +142,7 @@ export type {
   SurfaceCell, SurfaceId, TextEdit, ToolCall, ToolDef, ToolResult, TurnRequest, Usage,
   NodeCapabilities, NodeId, NodeInfo, ProjectKey, RemoteProject, StreamEvent,
   SwarmAgent, SwarmNode, SwarmStranger,
-  VarScope, Viewport,
+  VarScope, ViewId, Viewport,
   WindowId, WindowInfo, WindowLayout,
   WorktreeInfo,
 };

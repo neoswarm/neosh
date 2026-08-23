@@ -8,7 +8,7 @@
 //! These pin the calls where getting it wrong is least obvious, because they look like ordinary
 //! key/value work and are in fact backed by the filesystem, which the core has no access to.
 
-use neosh_proto::ApiCall;
+use neosh_proto::{ApiCall, ViewId};
 use neosh_core::Editor;
 
 #[test]
@@ -204,10 +204,10 @@ fn a_kind_scoped_binding_reaches_a_panel_it_does_not_own() {
         .expect("binds");
     }
 
-    e.set_mode(neosh_proto::Mode::Chat);
+    e.set_mode(ViewId::LOCAL, neosh_proto::Mode::Chat);
     e.apply(&panel, ApiCall::FocusPush { win }).expect("focuses");
     let _ = e.drain_effects();
-    e.feed_key(neosh_proto::KeyPress {
+    e.feed_key(ViewId::LOCAL, neosh_proto::KeyPress {
         code: neosh_proto::KeyCode::Char { c: "d".into() },
         mods: neosh_proto::KeyMods::default(),
     });

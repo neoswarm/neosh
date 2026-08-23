@@ -16,7 +16,7 @@ use crate::agent::{
 };
 use crate::ascp::{AgentCommand, AgentSummary, NodeCapabilities, NodeId, NodeInfo, ProjectKey};
 use crate::ids::{
-    BufferId, ExtmarkId, NamespaceId, RequestId, SessionId, StreamId, SurfaceId, WindowId,
+    BufferId, ExtmarkId, NamespaceId, RequestId, SessionId, StreamId, SurfaceId, ViewId, WindowId,
 };
 use crate::options::{OptionEntry, OptionSpec, OptionValue};
 use crate::provider::{
@@ -1456,6 +1456,14 @@ pub type ToolInvocationResult = ToolResult;
 pub struct KeyContext {
     pub key: KeyPress,
     pub mode: Mode,
+    /// Which terminal it was pressed in.
+    ///
+    /// A workspace can have several and they are not copies of each other, so a plugin that puts
+    /// something on screen in answer to a key has to be able to put it on *that* screen. This is
+    /// where the answer comes from, and the ergonomic layer hands it back as a namespace already
+    /// bound to it, so the ordinary plugin never has to name a view at all.
+    #[serde(default)]
+    pub view: ViewId,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub win: Option<WindowId>,
 }

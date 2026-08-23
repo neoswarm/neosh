@@ -29,21 +29,21 @@
 //! exactly the moment you lose sight of that turn.
 //!
 //! What a connection has to reconcile is size, because several terminals report several of them.
-//! See [`crate::views`], which owns that and says why it is the smallest one.
+//! See [`crate::clients`], which owns that and says why it is the smallest one.
 
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use neosh_proto::{
-    ClientMessage, DetachReason, InputEvent, RunningTurn, ServerMessage, UiEvent, WorkspaceStatus,
+    ClientMessage, DetachReason, InputEvent, RunningTurn, ServerMessage, ViewId, WorkspaceStatus,
 };
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{Mutex, mpsc};
 
+use crate::clients::{ClientId, Clients, Frame, Source};
 use crate::frontend::Frontend;
-use crate::views::{ViewId, Views};
 
 /// What the workspace is doing, for anyone who asks without attaching.
 ///
@@ -101,17 +101,17 @@ impl Live {
 
 /// The frontend of a workspace that may have several terminals looking at it, or none.
 ///
-/// A batch with no views goes nowhere, and that is correct rather than lossy: the events are
-/// deltas against a mirror, every one of them is already reflected in the editor's own state, and
-/// the next client to attach is told the state rather than the history. Dropping them is also what
-/// keeps a headless workspace from growing a queue for the rest of its life.
+/// A frame with nobody to draw it goes nowhere, and that is correct rather than lossy: the events
+/// are deltas against a mirror, every one of them is already reflected in the editor's own state,
+/// and the next client to attach is told the state rather than the history. Dropping them is also
+/// what keeps a headless workspace from growing a queue for the rest of its life.
 pub struct Viewer {
-    views: Arc<Mutex<Views>>,
+    clients: Arc<Mutex<Clients>>,
 }
 
 impl Viewer {
-    fn new(views: Arc<Mutex<Views>>) -> Self {
-        Self { views }
+    fn new(clients: Arc<Mutex<Clients>>) -> Self {
+        Self { clients }
     }
 }
 
@@ -123,18 +123,18 @@ impl Frontend for Viewer {
     /// Dropped here rather than left for the reader task to notice, so the very next frame the
     /// host draws goes to the terminals that are still there instead of racing a socket that is
     /// closing.
-    async fn detach(&mut self, view: ViewId) -> anyhow::Result<()> {
-        let mut views = self.views.lock().await;
-        views.tell(view, ServerMessage::Detached { reason: DetachReason::Asked });
-        views.detach(view);
+    async fn detach(&mut self, client: ClientId) -> anyhow::Result<()> {
+        let mut clients = self.clients.lock().await;
+        clients.tell(client, ServerMessage::Detached { reason: DetachReason::Asked });
+        clients.detach(client);
         Ok(())
     }
 
-    async fn send(&mut self, batch: Vec<UiEvent>) -> anyhow::Result<()> {
+    async fn send(&mut self, frame: Frame) -> anyhow::Result<()> {
         // A send failure is a client that went away between the lock and the write, which the
         // reader task notices and cleans up. Not the host's problem, and certainly not a reason to
         // end a turn.
-        self.views.lock().await.send(batch);
+        self.clients.lock().await.send(&frame);
         Ok(())
     }
 }
@@ -142,8 +142,8 @@ impl Frontend for Viewer {
 /// A workspace listening for viewers.
 pub struct Daemon {
     listener: UnixListener,
-    views: Arc<Mutex<Views>>,
-    to_host: mpsc::UnboundedSender<(ViewId, InputEvent)>,
+    clients: Arc<Mutex<Clients>>,
+    to_host: mpsc::UnboundedSender<(Source, InputEvent)>,
     live: Arc<Live>,
 }
 
@@ -184,7 +184,7 @@ impl Daemon {
         let (to_host, _) = mpsc::unbounded_channel();
         Ok(Self {
             listener,
-            views: Arc::new(Mutex::new(Views::default())),
+            clients: Arc::new(Mutex::new(Clients::default())),
             to_host,
             live: Live::new(),
         })
@@ -199,10 +199,10 @@ impl Daemon {
     /// Called once, before [`Self::serve`]. The host then runs forever, with clients coming and
     /// going underneath it — which is the whole point: the run loop never learns that anybody
     /// attached, beyond one [`InputEvent::Attached`] telling it to say everything again.
-    pub fn wire(&mut self) -> (Box<dyn Frontend>, mpsc::UnboundedReceiver<(ViewId, InputEvent)>) {
+    pub fn wire(&mut self) -> (Box<dyn Frontend>, mpsc::UnboundedReceiver<(Source, InputEvent)>) {
         let (tx, rx) = mpsc::unbounded_channel();
         self.to_host = tx;
-        (Box::new(Viewer::new(self.views.clone())), rx)
+        (Box::new(Viewer::new(self.clients.clone())), rx)
     }
 
     /// Accept clients until the process ends. Runs alongside the host, not instead of it.
@@ -210,7 +210,7 @@ impl Daemon {
         loop {
             let Ok((stream, _)) = self.listener.accept().await else { continue };
             let this = Handle {
-                views: self.views.clone(),
+                clients: self.clients.clone(),
                 to_host: self.to_host.clone(),
                 live: self.live.clone(),
             };
@@ -227,8 +227,8 @@ impl Daemon {
 
 #[derive(Clone)]
 struct Handle {
-    views: Arc<Mutex<Views>>,
-    to_host: mpsc::UnboundedSender<(ViewId, InputEvent)>,
+    clients: Arc<Mutex<Clients>>,
+    to_host: mpsc::UnboundedSender<(Source, InputEvent)>,
     live: Arc<Live>,
 }
 
@@ -252,8 +252,7 @@ impl Handle {
             }
         });
 
-        let mut attached = false;
-        let mut view: Option<ViewId> = None;
+        let mut source: Option<Source> = None;
         while let Ok(Some(line)) = lines.next_line().await {
             if line.trim().is_empty() {
                 continue;
@@ -269,7 +268,7 @@ impl Handle {
             };
             match msg {
                 ClientMessage::Status => {
-                    let attached_now = !self.views.lock().await.is_empty();
+                    let attached_now = !self.clients.lock().await.is_empty();
                     let _ = out.send(ServerMessage::Status {
                         status: self.live.snapshot(attached_now),
                     });
@@ -281,7 +280,7 @@ impl Handle {
                     // other, so the workspace leaves the way it always has — conversations
                     // flushed to disk, plugins torn down.
                     let _ = self.to_host.send((
-                        ViewId::LOCAL,
+                        Source::LOCAL,
                         InputEvent::Command { name: "stop".into(), args: Vec::new() },
                     ));
                     break;
@@ -300,13 +299,18 @@ impl Handle {
                         break;
                     }
                     // Alongside whoever is already here, rather than instead of them.
-                    let (id, size) = {
-                        let mut views = self.views.lock().await;
-                        let id = views.attach(out.clone(), (width, height));
-                        (id, views.size().unwrap_or((width, height)))
+                    //
+                    // Every terminal is put on the same view for now, which is a mirror and is
+                    // what ADR 0042 shipped. A view of its own is what the rest of this is for;
+                    // the id is separate from the client's already so that the change is one
+                    // line here rather than a shape nothing else in the workspace has.
+                    let (from, size) = {
+                        let mut clients = self.clients.lock().await;
+                        let id = clients.attach(out.clone(), (width, height), ViewId::LOCAL);
+                        let view = clients.view_of(id).unwrap_or(ViewId::LOCAL);
+                        (Source { client: id, view }, clients.size().unwrap_or((width, height)))
                     };
-                    view = Some(id);
-                    attached = true;
+                    source = Some(from);
                     let _ = out.send(ServerMessage::Attached {
                         protocol_version: neosh_proto::PROTOCOL_VERSION,
                     });
@@ -315,13 +319,14 @@ impl Handle {
                     // every view — which is what makes a terminal joining a workspace also the
                     // moment every other terminal is brought back into step with it.
                     let (width, height) = size;
-                    let _ = self.to_host.send((id, InputEvent::Attached { width, height }));
+                    let _ = self.to_host.send((from, InputEvent::Attached { width, height }));
                 }
                 ClientMessage::Input { event } => {
-                    let Some(id) = view else {
+                    let Some(from) = source else {
                         tracing::warn!("input before attach, ignored");
                         continue;
                     };
+                    let id = from.client;
                     // Two events are about *this terminal's* shape rather than about the
                     // workspace, and several terminals have several answers. They are reconciled
                     // here and forwarded as one, so the host goes on believing there is one screen
@@ -329,7 +334,7 @@ impl Handle {
                     // of the same one.
                     let forward = match event {
                         InputEvent::Resize { width, height } => {
-                            match self.views.lock().await.resized(id, (width, height)) {
+                            match self.clients.lock().await.resized(id, (width, height)) {
                                 Some((width, height)) => Some(InputEvent::Resize { width, height }),
                                 // Somebody smaller is still attached, so nothing the host draws
                                 // changes. The view re-lays-out its own geometry regardless.
@@ -337,12 +342,12 @@ impl Handle {
                             }
                         }
                         InputEvent::ViewportChanged { win, width, height, top_line, rows } => {
-                            self.views.lock().await.viewport(id, win, (width, height, top_line, rows))
+                            self.clients.lock().await.viewport(id, win, (width, height, top_line, rows))
                         }
                         other => Some(other),
                     };
                     let Some(event) = forward else { continue };
-                    if self.to_host.send((id, event)).is_err() {
+                    if self.to_host.send((from, event)).is_err() {
                         break;
                     }
                 }
@@ -356,22 +361,22 @@ impl Handle {
         // However this connection ended — asked to leave, took a signal, or the terminal it was in
         // was closed — the workspace keeps going, and so does every other terminal looking at it.
         // That is the entire point of it being here.
-        if let Some(id) = view {
+        if let Some(from) = source {
             let (size, remerged, empty) = {
-                let mut views = self.views.lock().await;
+                let mut clients = self.clients.lock().await;
                 // `detach` may already have happened: `^Q` is answered by the host, which lets go
                 // of the view before this connection has finished winding down.
-                views.detach(id);
+                clients.detach(from.client);
                 // Nobody reports a size when somebody *else* closes a window, so a workspace that
                 // was pinned narrow by this terminal has to be given its width back from here or
                 // it stays narrow for as long as it runs.
-                (views.size(), views.remerge(), views.is_empty())
+                (clients.size(), clients.remerge(), clients.is_empty())
             };
             if let Some((width, height)) = size {
-                let _ = self.to_host.send((id, InputEvent::Resize { width, height }));
+                let _ = self.to_host.send((from, InputEvent::Resize { width, height }));
             }
             for ev in remerged {
-                let _ = self.to_host.send((id, ev));
+                let _ = self.to_host.send((from, ev));
             }
             // Stamped from what is true now rather than from having just removed ourselves: the
             // question `neosh status` asks is whether *anybody* is looking.

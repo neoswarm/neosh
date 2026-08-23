@@ -95,7 +95,7 @@ impl Screen {
     }
 
     fn drain(&mut self) {
-        for e in self.editor.drain_ui() {
+        for e in self.editor.drain_events() {
             let UiEvent::BufferLines { buf, start, old_end, lines } = e else { continue };
             if buf != self.buf {
                 continue;

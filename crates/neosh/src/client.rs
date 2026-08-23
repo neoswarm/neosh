@@ -188,7 +188,7 @@ async fn run(
                 // workspace owns, and a round trip per animation frame would put the socket in the
                 // path of a twenty-hertz shimmer.
                 if matches!(ev, InputEvent::Repaint) {
-                    ui.send(vec![UiEvent::Flush]).await?;
+                    ui.send(vec![(None, UiEvent::Flush)]).await?;
                     continue;
                 }
                 if matches!(ev, InputEvent::Disconnected) {
@@ -213,7 +213,9 @@ async fn run(
                 match serde_json::from_str::<ServerMessage>(&l) {
                     Ok(ServerMessage::Events { batch }) => {
                         let leaving = batch.iter().any(|e| matches!(e, UiEvent::Shutdown));
-                        ui.send(batch).await?;
+                        // Untagged on the way in: the workspace already decided this batch was
+                        // for us, and what arrives here is one terminal's share of a frame.
+                        ui.send(batch.into_iter().map(|e| (None, e)).collect()).await?;
                         if leaving {
                             return Ok(Ended::Stopped);
                         }

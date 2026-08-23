@@ -299,6 +299,13 @@ pub struct Host {
     /// Set while a multi-key sequence is half typed, so the loop knows to arm the timeout that
     /// eventually gives up on it.
     keys_pending: bool,
+    /// Whose half-typed sequence it is.
+    ///
+    /// The timeout fires from a timer, and a timer is nobody's key press — so by the time it
+    /// arrives the terminal that typed the `g` has to have been written down rather than asked
+    /// for. Replayed into the wrong view, an abandoned prefix is a character appearing in a
+    /// composer nobody was typing in.
+    keys_view: neosh_proto::ViewId,
     /// A key was just fed, so the sequence timeout needs restarting.
     ///
     /// Every key restarts it, as in Neovim: the wait is for *the next* key, not for the whole
@@ -382,15 +389,16 @@ pub struct Host {
     /// Set by `quit` while serving; the run loop sends the viewer away and carries on.
     /// The terminal that asked to leave, if one has. `^Q` closes *that* window and no other.
     ///
-    /// Which view is not a guess from whoever spoke most recently: input arrives already tagged
-    /// with the view it came from, and this is set while that very event is being handled.
-    detaching: Option<crate::views::ViewId>,
-    /// The view whose input is being handled right now.
+    /// Which terminal is not a guess from whoever spoke most recently: input arrives already
+    /// tagged with the client it came from, and this is set while that very event is being
+    /// handled.
+    detaching: Option<crate::clients::ClientId>,
+    /// The terminal whose input is being handled right now, and the view it is looking at.
     ///
-    /// [`crate::views::ViewId::LOCAL`] between events and in a process that is its own terminal.
+    /// [`crate::clients::Source::LOCAL`] between events and in a process that is its own terminal.
     /// A command run from a plugin or a signal is nobody's key press, and lands here as the local
-    /// view — which in a served workspace names no terminal, and so closes none.
-    from_view: crate::views::ViewId,
+    /// one — which in a served workspace names no terminal, and so closes none.
+    from: crate::clients::Source,
     /// Where to report what this workspace is holding, when it is a workspace rather than a
     /// process somebody is watching.
     live: Option<std::sync::Arc<crate::daemon::Live>>,
@@ -817,7 +825,7 @@ impl Host {
         // a long prompt fold and the window grow to show it, instead of running off the right edge.
         let composer_win =
             editor.open_window(composer, WindowLayout::Docked { dock: Dock::Bottom, size: Some(4), gravity: Gravity::Start, wrap: Some(true) });
-        editor.set_mode(Mode::Chat);
+        editor.set_mode(neosh_proto::ViewId::LOCAL, Mode::Chat);
 
         let mut namespace = |name: &str| {
             match editor.apply(&PluginId::from(BUILTIN), ApiCall::NsCreate { name: name.into() }) {
@@ -877,7 +885,8 @@ impl Host {
             quitting: false,
             on_quit: OnQuit::Stop,
             detaching: None,
-            from_view: crate::views::ViewId::LOCAL,
+            from: crate::clients::Source::LOCAL,
+            keys_view: neosh_proto::ViewId::LOCAL,
             live: None,
             live_at: None,
             live_turns: 0,
@@ -2059,7 +2068,9 @@ impl Host {
                         self.bridge.notify(&plugin, PluginEvent::CommandInvoked { name, args, key });
                     }
                 }
-                CoreEffect::UnhandledKey { key, mode } => self.handle_unbound_key(key, mode),
+                CoreEffect::UnhandledKey { key, mode, view: _ } => {
+                    self.handle_unbound_key(key, mode)
+                }
                 CoreEffect::OptionChanged { name, value } => {
                     self.apply_option(&name, &value);
                     // Broadcast, not just to the owner: a setting is shared state, and the plugin
@@ -2734,7 +2745,7 @@ impl Host {
                 _ => "reading",
             }
         } else {
-            match self.editor.mode() {
+            match self.editor.mode(self.from.view) {
                 Mode::Chat => "chat",
                 Mode::Normal => "normal",
                 Mode::Insert => "insert",
@@ -3934,8 +3945,8 @@ impl Host {
         // set the host puts in *every* mode — `^C`, `^Q`, `^R`, `^S` — which is exactly the set you
         // want to keep working somewhere you did not intend to be. A plugin that wants a key while
         // reading binds it in `normal`, which needs nothing new.
-        self.mode_before_reading = self.editor.mode();
-        self.editor.set_mode(Mode::Normal);
+        self.mode_before_reading = self.editor.mode(self.from.view);
+        self.editor.set_mode(self.from.view, Mode::Normal);
         let plugin = PluginId::from(BUILTIN);
         let _ = self.editor.apply(&plugin, ApiCall::FocusPush { win: self.chat_win });
         let _ = self.editor.apply(&plugin, ApiCall::WinSelect { win: self.chat_win, on: false });
@@ -3963,7 +3974,7 @@ impl Host {
         self.reading_count.clear();
         self.reading_shape = SelectShape::Exclusive;
         self.reading_goal = None;
-        self.editor.set_mode(self.mode_before_reading);
+        self.editor.set_mode(self.from.view, self.mode_before_reading);
         self.clear_matches();
         let plugin = PluginId::from(BUILTIN);
         let _ = self.editor.apply(&plugin, ApiCall::WinCursorShape {
@@ -7136,8 +7147,13 @@ impl Host {
     fn handle_input_uncaptured(&mut self, input: InputEvent) -> bool {
         match input {
             InputEvent::Key { key } => {
-                let res = self.editor.feed_key(key);
+                let res = self.editor.feed_key(self.from.view, key);
                 self.keys_pending = matches!(res, neosh_core::KeyResolution::Pending);
+                // Whose chord it is, so the timeout that eventually gives up on it gives up on the
+                // right keyboard. The deadline fires on a timer rather than on a key, by which
+                // time `self.from` is nobody's — a half-typed `g` in one terminal would otherwise
+                // be replayed as an ordinary `g` into another.
+                self.keys_view = self.from.view;
                 self.keys_touched = true;
                 self.drain_effects();
             }
@@ -7185,12 +7201,23 @@ impl Host {
                 }
             }
             InputEvent::Attached { .. } => {
-                // A client that has never seen any of this. Whatever was queued was queued for
-                // whoever was looking before — and nobody may have been — so it is dropped rather
-                // than sent to a mirror it makes no sense against, and the whole state is said
-                // again in its place. See `Editor::republish`.
-                let _ = self.editor.drain_ui();
-                self.editor.republish();
+                // A client that has never seen any of this. Whatever was queued for *this view*
+                // was queued for whoever was looking before — and nobody may have been — so it is
+                // dropped rather than sent to a mirror it makes no sense against, and the whole
+                // state is said again in its place. See `Editor::republish`.
+                //
+                // Only this view's share, and the workspace's: a frame half-built for the terminal
+                // next door is a frame that terminal is still waiting for, and throwing all of it
+                // away because somebody else opened a window is how a view goes quiet.
+                let arriving = self.from.view;
+                let held: Vec<_> = self
+                    .editor
+                    .drain_ui()
+                    .into_iter()
+                    .filter(|(v, _)| v.is_some_and(|v| v != arriving))
+                    .collect();
+                self.editor.requeue(held);
+                self.editor.republish(arriving);
                 self.draw_welcome();
                 // Every plugin holding a surface has to paint it again: the editor forwards cells
                 // and does not keep them, so a claim is all that could be republished.
@@ -7261,19 +7288,21 @@ impl Host {
         // Anything worth drawing is something that might have changed what this workspace is
         // holding — a turn started, a conversation opened, an answer landed.
         self.report_live();
-        let mut batch = self.editor.drain_ui();
-        if batch.is_empty() {
+        let mut frame = self.editor.drain_ui();
+        if frame.is_empty() {
             return Ok(());
         }
-        batch.push(UiEvent::Flush);
-        self.frontend.send(batch).await
+        // The flush is nobody's in particular: it is the end of the frame, and every terminal that
+        // got something out of it has to be told to draw.
+        frame.push((None, UiEvent::Flush));
+        self.frontend.send(frame).await
     }
 
     pub async fn run(
         mut self,
         mut script_rx: mpsc::UnboundedReceiver<ScriptOutbound>,
         mut agent_rx: mpsc::UnboundedReceiver<AgentEvent>,
-        mut input_rx: mpsc::UnboundedReceiver<(crate::views::ViewId, InputEvent)>,
+        mut input_rx: mpsc::UnboundedReceiver<(crate::clients::Source, InputEvent)>,
     ) -> anyhow::Result<()> {
         // Send the initial state before anything else, so the frontend has a screen immediately.
         self.flush().await?;
@@ -7326,20 +7355,20 @@ impl Host {
                     }
                 } => self.on_swarm_event(ev),
                 Some(ev) = agent_rx.recv() => self.handle_agent_event(ev),
-                Some((view, input)) = input_rx.recv() => {
+                Some((from, input)) = input_rx.recv() => {
                     // A repaint changes nothing, so it must not go through the input path: the
                     // frontend is asking to draw the same state again while something on it moves.
                     // Answering with an empty batch is what makes an animation unable to
                     // desynchronise from the text it is drawn over.
                     if matches!(input, InputEvent::Repaint) {
-                        self.frontend.send(vec![UiEvent::Flush]).await?;
+                        self.frontend.send(vec![(None, UiEvent::Flush)]).await?;
                         continue;
                     }
                     // Set for the whole of handling, so anything this key reaches — a command, a
                     // keymap, a plugin — can be answered in the terminal it was pressed in.
-                    self.from_view = view;
+                    self.from = from;
                     let carry_on = self.handle_input(input);
-                    self.from_view = crate::views::ViewId::LOCAL;
+                    self.from = crate::clients::Source::LOCAL;
                     if !carry_on {
                         break;
                     }
@@ -7358,7 +7387,7 @@ impl Host {
                 () = &mut keys, if waiting => {
                     waiting = false;
                     self.keys_pending = false;
-                    if self.editor.flush_pending() {
+                    if self.editor.flush_pending(self.keys_view) {
                         self.drain_effects();
                     }
                 }
@@ -7432,10 +7461,10 @@ impl Host {
             }
             // The viewer asked to leave. The workspace does not: this is the whole difference
             // between closing a window and stopping the work in it.
-            if let Some(view) = self.detaching.take() {
+            if let Some(client) = self.detaching.take() {
                 self.persist_sessions();
                 self.flush().await?;
-                self.frontend.detach(view).await?;
+                self.frontend.detach(client).await?;
                 self.report_live_now();
             }
             if std::mem::take(&mut self.keys_touched) {
@@ -7463,7 +7492,7 @@ impl Host {
         // Last thing before the screen goes: whatever was said this session is on disk.
         self.persist_sessions();
         self.flush().await?;
-        self.frontend.send(vec![UiEvent::Shutdown]).await?;
+        self.frontend.send(vec![(None, UiEvent::Shutdown)]).await?;
         self.frontend.shutdown().await?;
         Ok(())
     }
@@ -8035,7 +8064,7 @@ impl Host {
     fn leave(&mut self) {
         match self.on_quit {
             OnQuit::Stop => self.quitting = true,
-            OnQuit::Detach => self.detaching = Some(self.from_view),
+            OnQuit::Detach => self.detaching = Some(self.from.client),
         }
     }
 
