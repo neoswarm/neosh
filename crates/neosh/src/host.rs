@@ -6262,20 +6262,6 @@ impl Host {
         at.max(0) as u32
     }
 
-    /// A blank row at the end of the transcript, unless there already is one.
-    fn chat_gap(&mut self) {
-        let at = self.chat_end();
-        let blank = at <= 0
-            || self
-                .editor
-                .buffer(self.chat)
-                .map(|b| b.get_lines((at - 1) as u32, at as u32).iter().all(|l| l.trim().is_empty()))
-                .unwrap_or(true);
-        if !blank {
-            self.chat_push(vec![String::new()]);
-        }
-    }
-
     /// Where new content goes: the end, or the line above the working line when there is one.
     fn chat_end(&self) -> i64 {
         let n = self.editor.buffer(self.chat).map(|b| b.line_count() as i64).unwrap_or(0);

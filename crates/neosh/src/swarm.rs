@@ -108,17 +108,9 @@ impl Swarm {
         self.peers.values().filter(|p| p.up).flat_map(|p| p.agents.iter().map(move |a| (&p.info, a)))
     }
 
-    pub fn find(&self, node: &NodeId, session: &SessionId) -> Option<&AgentSummary> {
-        self.peers.get(node)?.agents.iter().find(|a| &a.session == session)
-    }
-
     /// Tell the swarm which projects this machine has, so it can answer [`Self::hosts_of`].
     pub fn set_local_projects(&mut self, projects: HashMap<ProjectKey, String>) {
         self.local_projects = projects;
-    }
-
-    pub fn is_local_project(&self, key: &ProjectKey) -> bool {
-        self.local_projects.contains_key(key)
     }
 
     /// Which *other* machines have this project, by name.
