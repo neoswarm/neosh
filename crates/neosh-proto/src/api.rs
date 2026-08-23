@@ -1072,6 +1072,21 @@ pub enum ApiCall {
     GitCheckout {
         rev: String,
     },
+    /// Move a branch to another name — `git branch -m`.
+    ///
+    /// One ref write, so it is safe on the branch a worktree has checked out and safe while an
+    /// agent is mid-turn in that worktree: nothing about the files changes. What *does* change is
+    /// the label every project list is drawing, which is why the host refreshes what it knows
+    /// about the directory here rather than leaving a panel to say the old name until restart.
+    GitRenameBranch {
+        old: String,
+        new: String,
+        /// The checkout the branch belongs to. `git branch -m` runs *inside* a repository, and a
+        /// caller renaming the branch of a worktree other than the active conversation's has to
+        /// say which — the same reason [`Self::GitAddWorktree`] takes one.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cwd: Option<String>,
+    },
     /// Empty `paths` stages everything, matching `git add .` from the root.
     GitStage {
         #[serde(default)]

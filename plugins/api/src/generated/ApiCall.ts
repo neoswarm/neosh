@@ -372,6 +372,17 @@ export type ApiCall =
   | { "call": "git_default_branch" }
   | { "call": "git_create_branch"; name: string; from?: string | null }
   | { "call": "git_checkout"; rev: string }
+  | {
+    "call": "git_rename_branch";
+    old: string;
+    new: string;
+    /**
+     * The checkout the branch belongs to. `git branch -m` runs *inside* a repository, and a
+     * caller renaming the branch of a worktree other than the active conversation's has to
+     * say which — the same reason [`Self::GitAddWorktree`] takes one.
+     */
+    cwd?: string | null;
+  }
   | { "call": "git_stage"; paths: Array<string> }
   | { "call": "git_unstage"; paths: Array<string> }
   | { "call": "git_commit"; message: string }

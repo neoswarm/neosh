@@ -9,16 +9,30 @@
  *
  * ```toml
  * [options]
- * "git.branch.prefix" = "feature/"
  * "git.branch.instructions" = "Start with the Jira key when the message mentions one."
+ * "git.branch.model" = "anthropic/claude-haiku-4-5-20251001"  # empty uses the model you talk to
+ * "git.branch.auto" = false                            # keep the scratch name
  * ```
+ *
+ * **A worktree names itself once you have said what it is for.** `git.worktree.new.auto` creates a
+ * branch called `brisk-otter`, because a name chosen before the work is a decision made at the
+ * worst possible moment. The first message sent in it is that decision, arriving on its own, so
+ * the branch is renamed from it — `fix/composer-paste-truncation` — and never touched again.
  *
  * Nothing in this file is privileged. It is an ordinary plugin over `neosh.git` and `neosh.gen`,
  * and replacing it with your own is `plugins.disabled = ["git"]` plus a plugin directory.
  */
 
-import { byteLength } from "@neosh/api";
-import type { CommitInfo, Neosh, PluginContext, RepoStatus, WorktreeInfo } from "@neosh/api";
+import { byteLength, sessionScope } from "@neosh/api";
+import type {
+  CommitInfo,
+  ModelSelection,
+  Neosh,
+  PluginContext,
+  RepoStatus,
+  SessionId,
+  WorktreeInfo,
+} from "@neosh/api";
 import {
   confirm,
   confirmDestructive,
@@ -36,10 +50,19 @@ const BRANCH_PROMPT = `You generate git branch names.
 Return a JSON object with exactly one key: branch.
 
 Rules:
-- Describe the work in the message, not the act of asking for it.
-- 2 to 6 words, lowercase, hyphen separated.
-- No ticket prefixes, no punctuation, no trailing slash.
-- Prefer the noun the change is about over the verb used to request it.`;
+- Start with the type of work, as a prefix ending in a slash. Use exactly one of:
+  feature/ for something new, fix/ for a defect, refactor/ for a change that keeps behaviour,
+  chore/ for maintenance, docs/ for documentation, test/ for tests, perf/ for a speed-up.
+- Choose the type from what the work is, not from the words used to ask for it: "the sidebar
+  flickers" is fix/, "add a sidebar" is feature/.
+- After the prefix, 2 to 6 words describing the work, lowercase, hyphen separated.
+- Prefer the noun the change is about over the verb used to request it.
+- No ticket keys, no punctuation, no trailing slash, nothing after the words.
+
+Examples:
+- "the composer eats the last character when you paste" -> fix/composer-paste-truncation
+- "let people pin a project to the top" -> feature/pin-project
+- "bump the deno version" -> chore/bump-deno`;
 
 const COMMIT_PROMPT = `You write git commit messages.
 Return a JSON object with keys: subject, body.
@@ -75,7 +98,16 @@ export async function activate({ neosh, subscriptions }: PluginContext) {
     {
       name: "git.branch.prefix",
       description:
-        'Prepended to every generated branch name, e.g. "feature/". Applied after slugging, so it survives verbatim.',
+        'Prepended to a generated branch name that has no prefix of its own, e.g. "feature/". \
+Applied after slugging, so it survives verbatim — and skipped when the model already chose a \
+type, which the built-in prompt asks it to, so setting this does not produce "feature/fix/thing".',
+    },
+    {
+      name: "git.branch.model",
+      description:
+        "Model for naming branches, as `instance/model`. Empty falls back to `gen.model`, and \
+then to the model the conversation is using — so out of the box a branch is named by whatever you \
+are already talking to.",
     },
   ]) {
     await neosh.opt.declare({
@@ -86,6 +118,14 @@ export async function activate({ neosh, subscriptions }: PluginContext) {
     });
   }
 
+  await neosh.opt.declare({
+    name: "git.branch.auto",
+    type: { type: "bool" },
+    default: true,
+    description:
+      "Name an auto-created worktree's branch from the first message sent in it. Off leaves the \
+two-word scratch name it was created with.",
+  });
   await neosh.opt.declare({
     name: "git.commit.confirm",
     type: { type: "bool" },
@@ -194,6 +234,10 @@ export async function activate({ neosh, subscriptions }: PluginContext) {
   await footer();
   subscriptions.push(neosh.agent.onTurnEnd(() => void footer()));
   subscriptions.push(neosh.session.onChange(() => void footer()));
+  // The first thing asked in a scratch worktree is what its branch should have been called.
+  subscriptions.push(
+    neosh.agent.onTurnStart((e) => void nameScratchBranch(neosh, e.session as SessionId)),
+  );
   // The working tree changes whenever anything writes a file, including the agent.
   subscriptions.push(neosh.timer.every(5000, () => void footer()));
 }
@@ -263,28 +307,13 @@ async function newBranch(neosh: Neosh): Promise<void> {
   if (!description || !description.trim()) return;
 
   neosh.notify("naming the branch…");
-  let name: string;
+  let unique: string;
   try {
-    const answer = await neosh.gen.json<{ branch?: string }>(
-      `${await promptFor(neosh, "branch", BRANCH_PROMPT)}\n\nUser message:\n${description}`,
-    );
-    if (typeof answer.branch !== "string" || answer.branch.trim() === "") {
-      throw new Error("the model returned no branch name");
-    }
-    name = answer.branch;
+    unique = await nameBranch(neosh, description);
   } catch (e) {
     neosh.notify(`could not name the branch: ${e}`, "error");
     return;
   }
-
-  const prefix = (await neosh.opt.get<string>("git.branch.prefix")) ?? "";
-  // Slugged here rather than in the host, so the name shown for approval below is exactly the
-  // refname that will be created. "Why is my branch called that" is a question best answered
-  // before the branch exists.
-  const full = `${prefix}${slug(name)}`;
-
-  const taken = new Set((await neosh.git.branches({ includeRemote: true })).map((b) => b.name));
-  const unique = dedupe(full, taken);
 
   const edited = await prompt(neosh, "Branch name", { initial: unique, width: 76 });
   if (!edited || !edited.trim()) return;
@@ -295,6 +324,63 @@ async function newBranch(neosh: Neosh): Promise<void> {
   } catch (e) {
     neosh.notify(String(e), "error");
   }
+}
+
+/**
+ * A refname for `description`: generated, slugged, prefixed and not already taken.
+ *
+ * Every step of it happens here rather than in the host so that the name a caller shows for
+ * approval is exactly the name that will exist. "Why is my branch called that" is a question best
+ * answered before the branch does.
+ *
+ * Throws rather than returning a fallback. There is no useful default branch name, and the two
+ * callers want opposite things when this fails — one tells you, the other says nothing — which is
+ * a decision for them and not for this.
+ */
+async function nameBranch(neosh: Neosh, description: string, cwd?: string): Promise<string> {
+  const answer = await neosh.gen.json<{ branch?: string }>(
+    `${await promptFor(neosh, "branch", BRANCH_PROMPT)}\n\nUser message:\n${description}`,
+    await branchModel(neosh),
+  );
+  if (typeof answer.branch !== "string" || answer.branch.trim() === "") {
+    throw new Error("the model returned no branch name");
+  }
+  const name = slug(answer.branch);
+  const prefix = (await neosh.opt.get<string>("git.branch.prefix")) ?? "";
+  // Skipped when the model already chose a type. The built-in prompt asks for `fix/`, `feature/`
+  // and the rest, so a `git.branch.prefix` applied unconditionally on top of it would read
+  // `feature/fix/composer-paste` — a prefix nobody meant and a type that is now wrong. Somebody
+  // who wants the prefix *always* has the prompt: it is a setting for the same reason.
+  const full = name.includes("/") ? name : `${prefix}${name}`;
+
+  const taken = new Set(
+    (await neosh.git.branches({ includeRemote: true, ...(cwd ? { cwd } : {}) }).catch(() => []))
+      .flatMap((b) => [b.name, b.name.replace(/^[^/]+\//, "")]),
+  );
+  return dedupe(full, taken);
+}
+
+/**
+ * Which model names a branch, if anyone said.
+ *
+ * Three rungs and this is only the first: `git.branch.model`, then `gen.model`, then the model the
+ * conversation is using — and the last two are the host's, which is why an unset option returns
+ * nothing at all rather than a guess. Out of the box that means your own model names the branch,
+ * which is the right default for a workspace where the cheap model is not configured and the only
+ * alternative would be failing.
+ */
+async function branchModel(
+  neosh: Neosh,
+): Promise<{ selection: ModelSelection } | undefined> {
+  const spec = ((await neosh.opt.get<string>("git.branch.model")) ?? "").trim();
+  const cut = spec.indexOf("/");
+  if (cut <= 0 || cut === spec.length - 1) return undefined;
+  return {
+    selection: {
+      instance: spec.slice(0, cut) as ModelSelection["instance"],
+      model: spec.slice(cut + 1) as ModelSelection["model"],
+    },
+  };
 }
 
 async function commit(neosh: Neosh): Promise<void> {
@@ -651,8 +737,10 @@ interface WorktreeSpec {
  *
  * `auto` drops the last question too. Naming a branch before you know what the work is is a
  * decision you are not yet equipped to make, and every one of those is a reason not to start —
- * which is the opposite of what a key for "somewhere clean to try this" is for. The name is
- * generated, the branch is real, and renaming it later is `git branch -m` like any other.
+ * which is the opposite of what a key for "somewhere clean to try this" is for. So the branch is
+ * real and its name is two words from a list, and the decision is deferred rather than skipped:
+ * the first message sent in the tree is what it should have been called, so that is what it gets
+ * called. See [`nameScratchBranch`].
  *
  * Landing in it is the point. Creating a directory you then have to go and find is not a feature,
  * it is a chore with extra steps.
@@ -686,8 +774,81 @@ async function newWorktree(neosh: Neosh, spec: WorktreeSpec = {}): Promise<void>
     neosh.notify(String(e), "error");
     return;
   }
-  await neosh.session.create({ cwd: where });
+  const session = await neosh.session.create({ cwd: where });
+  // Only a name *nobody chose* is one this plugin may replace later. A branch somebody typed is
+  // theirs, and `git.worktree.new feat/thing` must not be quietly renamed the moment a message is
+  // sent — so the mark goes on here, where the difference is still known, rather than being
+  // guessed at afterwards from the shape of the name.
+  if (spec.auto && create) {
+    await neosh.vars.set(sessionScope(session.id), VAR_SCRATCH, name)
+      .catch((e: unknown) => neosh.log.info(`could not mark ${name} as scratch: ${e}`));
+  }
   neosh.notify(`${create ? "branched" : "checked out"} ${name} in ${where}`);
+}
+
+/**
+ * The branch this conversation's worktree was created on, while that is still a name nobody chose.
+ *
+ * A var rather than a pattern match on the name. t3code recognises its own temporary branches by
+ * their shape — `t3code/<8 hex>` — which works until somebody's real branch happens to look like
+ * one, and which cannot tell `brisk-otter` that we generated from `brisk-otter` that you typed.
+ * Writing it down at the one moment the difference is known costs a key and removes the guess.
+ *
+ * Session-scoped, so it is deleted with the conversation, and removed the moment the branch is
+ * named — after which this worktree is an ordinary worktree and nothing here will touch it again.
+ */
+const VAR_SCRATCH = "git.branch.scratch";
+
+/**
+ * Name the branch of a scratch worktree after the first thing asked in it.
+ *
+ * The alternative is asking before the work starts, and a branch named before you know what the
+ * work is is a decision made at the worst possible moment — which is the whole reason
+ * `git.worktree.new.auto` exists and gives you `brisk-otter` instead. This is the other half:
+ * `brisk-otter` is a fine thing to *start* on and a poor thing to find in `git branch` next week.
+ *
+ * On turn start rather than turn end, because the panel is drawn all through a turn and the row
+ * you are watching should say what you asked for, not what a word list picked. `git branch -m` is
+ * one ref write, so doing it under a running agent changes nothing about the files it is editing.
+ *
+ * **One attempt, ever.** The mark is removed before the model is asked, so a cheap model that
+ * hiccups costs one request rather than one per message for the life of the conversation — the
+ * rule the titles plugin arrived at the same way. Too *early* is not a failure and does not spend
+ * it: a turn with nothing to read yet leaves the mark alone and waits for the next one.
+ */
+async function nameScratchBranch(neosh: Neosh, session: SessionId): Promise<void> {
+  if (!((await neosh.opt.get<boolean>("git.branch.auto")) ?? true)) return;
+  const scope = sessionScope(session);
+  const scratch = await neosh.vars.get<string>(scope, VAR_SCRATCH).catch(() => null);
+  if (!scratch) return;
+
+  const info = (await neosh.session.list().catch(() => [])).find((x) => x.id === session);
+  // Somebody renamed it themselves, or moved off it. Either way the name is theirs now.
+  if (!info || info.branch !== scratch) {
+    await neosh.vars.remove(scope, VAR_SCRATCH).catch(() => {});
+    return;
+  }
+
+  const messages = await neosh.session.messages(session).catch(() => []);
+  const asked = messages
+    .filter((m) => m.role === "user")
+    .flatMap((m) => m.content.flatMap((b) => (b.type === "text" ? [b.text] : [])))
+    .join("\n\n")
+    .trim()
+    .slice(0, 4000);
+  if (asked === "") return;
+
+  await neosh.vars.remove(scope, VAR_SCRATCH).catch(() => {});
+  try {
+    const named = await nameBranch(neosh, asked, info.cwd);
+    if (named === scratch) return;
+    await neosh.git.renameBranch(scratch, named, { cwd: info.cwd });
+    neosh.notify(`branch is ${named}`);
+  } catch (e) {
+    // Not worth interrupting for: the worktree works, the branch has a name, and a popup every
+    // time a model hiccups would cost more than the name it failed to improve.
+    neosh.log.info(`could not name ${scratch}: ${e}`);
+  }
 }
 
 /**

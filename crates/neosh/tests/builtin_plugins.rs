@@ -873,6 +873,155 @@ fn a_branch_name_is_generated_slugged_and_prefixed_from_config() {
     s.wait_for("feature/fix-the-login-redirect");
 }
 
+/// A prefix the user configured and a type the model chose are the same decision, made twice.
+///
+/// The built-in prompt asks for `fix/`, `feature/`, `chore/` and the rest, so a
+/// `git.branch.prefix` bolted on unconditionally reads `feature/fix/the-login-redirect` — a
+/// namespace nobody meant, under a type that is now wrong. The prefix is for a name that arrived
+/// without one, which is what it does here and what it still does in the test above.
+#[test]
+fn a_configured_prefix_does_not_stack_on_a_type_the_model_chose() {
+    if !have_git() {
+        return;
+    }
+    let sb = Sandbox::new("branchtyped");
+    sb.git_init();
+    sb.write_config("[options]\n\"git.branch.prefix\" = \"feature/\"\n");
+
+    let mut s = sb.start_with(
+        &Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/branch_name_typed.jsonl"),
+    );
+    s.wait_for("PROJECTS");
+
+    s.send(&command("git.branch.new"));
+    s.wait_for("What are you about to work on?");
+    s.type_text("the login page bounces");
+    s.special("enter");
+
+    s.wait_for("fix/the-login-redirect");
+    assert!(
+        !s.saw("feature/fix/the-login-redirect"),
+        "and the configured prefix was not stacked on top of it\n{}",
+        s.transcript()
+    );
+}
+
+/// `git.branch.model` is a model, and an unset one is the fallback rather than a guess.
+///
+/// The option is `instance/model`, parsed in the plugin and handed to `gen.complete` as a
+/// selection — so a malformed or absent one has to mean "you decide" all the way down to the host,
+/// which then tries `gen.model` and finally the conversation's own. A plugin that filled in a
+/// default here would be a third place the precedence is written, and the first to disagree.
+#[test]
+fn the_model_that_names_a_branch_is_a_setting() {
+    if !have_git() {
+        return;
+    }
+    let sb = Sandbox::new("branchmodel");
+    sb.git_init();
+    sb.write_config("[options]\n\"git.branch.model\" = \"mock/mock\"\n");
+
+    let mut s = sb.start_with(&branch_fixture());
+    s.wait_for("PROJECTS");
+
+    s.send(&command("git.branch.new"));
+    s.wait_for("What are you about to work on?");
+    s.type_text("the login page bounces");
+    s.special("enter");
+
+    // Named at all is the assertion: a selection the host could not resolve fails the call, and
+    // the plugin says so instead of proposing a name.
+    s.wait_for("fix-the-login-redirect");
+}
+
+/// A scratch worktree is named by the first thing asked in it, and the panel says so.
+///
+/// The whole shape of this: `git.worktree.new.inside` gives you `brisk-otter` because naming a
+/// branch before the work is a decision made at the worst possible moment — and the first message
+/// *is* that decision, arriving on its own. Three things have to happen and the third is the one
+/// that was missing: git renames the branch, the host notices that the label it wrote down when it
+/// first saw the directory is now wrong, and the sidebar row — which is that label — redraws.
+#[test]
+fn a_scratch_worktree_is_named_by_the_first_message_and_the_sidebar_follows() {
+    if !have_git() {
+        return;
+    }
+    let sb = Sandbox::new("branchauto");
+    sb.git_init();
+
+    let mut s = sb.start_with(
+        &Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/branch_name_typed.jsonl"),
+    );
+    s.wait_for("PROJECTS");
+
+    s.send(&command("git.worktree.new.inside"));
+    let under = sb.work().join(".worktrees");
+    assert!(
+        s.pump(|_| std::fs::read_dir(&under).is_ok_and(|d| d.count() > 0)),
+        "the worktree exists, on a name nobody chose"
+    );
+    let tree = std::fs::read_dir(&under)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .next()
+        .expect("one worktree");
+
+    // Whatever two words it landed on. Named for us, which is exactly what makes it replaceable.
+    let scratch = head_of(&tree);
+    assert!(scratch.contains('-'), "a two-word scratch name, not {scratch:?}");
+
+    // Waited for rather than assumed: creating the tree also starts a conversation in it and
+    // switches to it, and a test that types before that lands is typing into the conversation in
+    // the *main* checkout — where there is no scratch branch and nothing to rename.
+    let row_says = |s: &Session, want: &str| s.sidebar_now().iter().any(|l| l.contains(want));
+    let named_scratch = scratch.clone();
+    assert!(
+        s.pump(move |s| row_says(s, &named_scratch)),
+        "the worktree is a row in the panel, under the name nobody chose\n{:?}",
+        s.sidebar_now()
+    );
+
+    // The first thing asked in it. The turn and the naming call both read the same fixture, so
+    // which of them the mock answers first does not decide the test.
+    s.type_text("the login page bounces");
+    s.special("enter");
+
+    assert!(
+        s.pump(|_| head_of(&tree) == "fix/the-login-redirect"),
+        "git renamed the branch — it is on {:?}\n{}",
+        head_of(&tree),
+        s.transcript()
+    );
+    // And the row followed. Without the host putting right the label it wrote down the first time
+    // it saw this directory, the panel says the scratch name until the workspace restarts.
+    //
+    // Matched on the start of the name, because the row is a branch in a narrow column and the
+    // panel elides the end of it — `⎇ fix/the-login-redire…`. Asserting the whole string would be
+    // asserting the sidebar's width.
+    assert!(
+        s.pump(move |s| row_says(s, "⎇ fix/the-login")),
+        "the sidebar row followed it\n{:?}",
+        s.sidebar_now()
+    );
+    let gone = scratch.clone();
+    assert!(
+        !s.sidebar_now().iter().any(|l| l.contains(&gone)),
+        "and the scratch name is not still a row beside it\n{:?}",
+        s.sidebar_now()
+    );
+}
+
+/// Which branch a checkout is on, asked of git rather than of anything under test.
+fn head_of(dir: &Path) -> String {
+    let out = Command::new("git")
+        .current_dir(dir)
+        .args(["rev-parse", "--abbrev-ref", "HEAD"])
+        .output()
+        .expect("git runs");
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
 #[test]
 fn the_generated_name_is_editable_before_the_branch_is_created() {
     if !have_git() {

@@ -259,3 +259,55 @@ async fn worktrees_report_which_one_we_are_in() {
 
     let _ = std::fs::remove_dir_all(&extra);
 }
+
+/// Renaming the branch a worktree is standing on moves the ref and leaves the tree alone.
+///
+/// The case this exists for: an agent is working in a scratch worktree, the first message has
+/// arrived, and the branch is about to be given the name that message implies. If `git branch -m`
+/// touched the working tree — reset it, stashed it, refused while it was dirty — the whole
+/// approach would be unavailable, because the one moment there is enough information to name the
+/// branch is the moment there is also uncommitted work sitting on it.
+#[tokio::test]
+async fn a_branch_is_renamed_under_the_worktree_standing_on_it() {
+    if !have_git() {
+        return;
+    }
+    let repo = Repo::new("renamebranch");
+    repo.write("a.txt", "1\n");
+    repo.git(&["add", "."]);
+    repo.git(&["commit", "-m", "initial"]);
+
+    let extra = repo
+        .path()
+        .parent()
+        .unwrap()
+        .join(format!("neosh-vcs-rename-tree-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&extra);
+
+    let git = Git::discover(repo.path()).await.expect("repo");
+    git.add_worktree(&extra, "wily-nimbus", true).await.expect("worktree add");
+
+    // Uncommitted work in the tree, which is the realistic state at the moment of naming.
+    std::fs::write(extra.join("a.txt"), "1\n2\n").expect("write");
+
+    let inside = Git::discover(&extra).await.expect("the worktree is a repo too");
+    inside.rename_branch("wily-nimbus", "fix/the-login").await.expect("rename");
+
+    let (branch, _) = inside.identity().await;
+    assert_eq!(branch.as_deref(), Some("fix/the-login"), "the tree is on the new name");
+    assert_eq!(
+        std::fs::read_to_string(extra.join("a.txt")).expect("read"),
+        "1\n2\n",
+        "and the uncommitted edit survived it"
+    );
+
+    // A name already taken is refused rather than overwritten: a generated name does not get to
+    // discard somebody's branch to have its first choice.
+    assert!(
+        inside.rename_branch("fix/the-login", "master").await.is_err()
+            || inside.rename_branch("fix/the-login", "main").await.is_err(),
+        "renaming onto the default branch is refused"
+    );
+
+    let _ = std::fs::remove_dir_all(&extra);
+}
