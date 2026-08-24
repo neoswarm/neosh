@@ -95,3 +95,13 @@ are what the row says, for the same reason.
 - One more chord is gone, and chat mode now has none left. The next capability that wants a global
   key has to take one, replace one, or live on `^K` — which is the constraint working, not the
   constraint failing.
+- The sweep missed one, and the miss turned into a refinement. `session.copy.path` landed on `⌥Y`
+  an hour before this was written — reachable on a Linux terminal, `¥` on a Mac, and mentioned
+  nowhere on screen. Chat mode has no chord to give it, and the rule above says it loses its key.
+  It keeps it instead, on the terms the fourth category already set for arrows: **Alt may be bound
+  where it means something, and never as the only way.** What made `⌥↑`/`⌥↓` and `F1` bugs was
+  that nothing else reached the same verb. Here everything does — `yp` in the reader beside `yc`,
+  `ym` and `ya` (printable letters in a mode that is not a text field are in the set), `y` on any
+  row of the project panel, `^K` and `/copy` by name — so a terminal that sends Alt gets a key in
+  the composer and one that does not has lost nothing. The test for the next Alt binding is the
+  same: name the route a Mac takes, or it does not ship.

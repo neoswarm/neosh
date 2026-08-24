@@ -47,7 +47,7 @@ not worked.
   is loaded at startup, and the rest sit on disk. A sweep — "delete archived things older than N" —
   is a thing someone will want and is not built, because deleting someone's history on a timer is
   precisely the move this ADR exists to avoid. *(Still true on the timer.
-  [0059](0059-an-archive-is-something-you-can-empty.md) builds the half that has a person in it:
+  [0060](0060-an-archive-is-something-you-can-empty.md) builds the half that has a person in it:
   one key that empties what the panel is showing, having asked, and a retention setting that only
   ever counts and reports. It also stops `RESTORE_LIMIT` hiding conversations from the one panel
   whose job is what has accumulated.)*

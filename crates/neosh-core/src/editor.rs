@@ -16,7 +16,7 @@ use neosh_proto::{
     ApiCall, ApiError, ApiOk, ApiResult, BufferId, Contribution, ExtmarkId, ExtmarkOpts,
     FloatConfig, KeyContext, KeyPress, KeymapEntry, KeymapScope, MessageLevel, Mode, NamespaceId,
     NoticeKind, OnDelete, OptionValue, PluginId, Rect, SelectShape, SurfaceId, TextEdit, UiEvent,
-    VirtTextPos, WindowId, WindowLayout,
+    ViewId, VirtTextPos, WindowId, WindowLayout,
 };
 
 use crate::buffer::{Buffer, LineEdit};
@@ -45,7 +45,11 @@ pub enum CoreEffect {
     },
     /// A key reached the bottom of the focus stack unclaimed. `<Esc>` arriving here is how an
     /// agent turn gets interrupted without any plugin having to cooperate.
-    UnhandledKey { key: KeyPress, mode: Mode },
+    ///
+    /// Carries the terminal it was pressed in, because what the host does with it — put a
+    /// character in the composer, scroll the transcript, interrupt the turn on screen — is about
+    /// one of them and not about the workspace.
+    UnhandledKey { key: KeyPress, mode: Mode, view: ViewId },
     /// A declared option was set or reset. The host acts on the ones it owns and broadcasts all of
     /// them, so a plugin reacting to a setting uses the same mechanism the core does.
     OptionChanged { name: String, value: OptionValue },
@@ -60,13 +64,43 @@ struct CommandReg {
     desc: Option<String>,
 }
 
+/// One terminal's place in the workspace.
+///
+/// Buffers are not in here and never will be: what the agent produced is the workspace's, so a
+/// conversation open in two terminals is one transcript with two cursors on it. What *is* in here
+/// is everything that answers "where am I" — which window has the keyboard, what the keyboard is
+/// currently for, and how far through a chord you are.
+///
+/// Keymaps, commands, options and highlights are shared for the same reason a buffer is: a binding
+/// is registered once and means the same thing wherever you press it. Only where you pressed it
+/// differs.
+#[derive(Debug)]
+struct ViewState {
+    focus: FocusStack,
+    mode: Mode,
+    /// Keys held while a multi-key sequence is still ambiguous.
+    ///
+    /// Per view, because a half-typed chord is a fact about one keyboard. Shared, `g` typed here
+    /// and `g` typed there would make `gg`.
+    pending_keys: Vec<KeyPress>,
+}
+
+impl Default for ViewState {
+    fn default() -> Self {
+        Self { focus: FocusStack::new(), mode: Mode::Normal, pending_keys: Vec::new() }
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct Editor {
     buffers: HashMap<BufferId, Buffer>,
     windows: HashMap<WindowId, Window>,
     namespaces: HashMap<NamespaceId, String>,
     highlights: HighlightRegistry,
-    focus: FocusStack,
+    /// Where each terminal is. Created on demand, so a view nothing has drawn into yet is an empty
+    /// place rather than an error, and dropped by [`Editor::close_view`] when its last terminal
+    /// goes.
+    views: HashMap<ViewId, ViewState>,
     keymaps: KeymapTable,
     commands: HashMap<String, CommandReg>,
     options: OptionRegistry,
@@ -97,11 +131,11 @@ pub struct Editor {
     /// refresh winning beats a per-window namespace nobody can clear.
     selection_ns: NamespaceId,
 
-    mode: Mode,
-    /// Keys held while a multi-key sequence is still ambiguous.
-    pending_keys: Vec<KeyPress>,
-
-    ui: Vec<UiEvent>,
+    /// The frame being built, each event tagged with the view it is about.
+    ///
+    /// `None` is everybody: buffer contents, highlights, messages. Anything shaped like a window
+    /// belongs to one view and is drawn only in the terminals looking at it.
+    ui: Vec<(Option<ViewId>, UiEvent)>,
     effects: Vec<CoreEffect>,
 
     next_buf: u32,
@@ -114,7 +148,6 @@ impl Editor {
     pub fn new() -> Self {
         let mut e = Self {
             highlights: HighlightRegistry::new(),
-            mode: Mode::Normal,
             next_buf: 1,
             next_win: 1,
             // 1 is taken by the selection namespace below.
@@ -124,11 +157,88 @@ impl Editor {
             ..Default::default()
         };
         e.namespaces.insert(e.selection_ns, "neosh.selection".to_string());
-        e.ui.push(UiEvent::Init { protocol_version: neosh_proto::PROTOCOL_VERSION });
+        e.ui.push((None, UiEvent::Init { protocol_version: neosh_proto::PROTOCOL_VERSION }));
         for (name, def) in e.highlights.iter() {
-            e.ui.push(UiEvent::HighlightDefined { name: name.clone(), def: def.clone() });
+            e.ui.push((None, UiEvent::HighlightDefined { name: name.clone(), def: def.clone() }));
         }
         e
+    }
+
+    // ---- views -----------------------------------------------------------
+
+    /// One terminal's place, made if it is new.
+    fn view(&mut self, view: ViewId) -> &mut ViewState {
+        self.views.entry(view).or_default()
+    }
+
+    /// What a view has, without making one. A question about a terminal that is not there has the
+    /// same answer as one about a terminal that has done nothing yet.
+    fn peek(&self, view: ViewId) -> Option<&ViewState> {
+        self.views.get(&view)
+    }
+
+    /// Hand one view's windows to another id.
+    ///
+    /// For a terminal reattaching to a workspace nobody was watching: the screen it left is still
+    /// there, mid-answer, and giving it to the connection that has just arrived is how it comes
+    /// back to exactly what it was rather than to a transcript rebuilt from messages, which is
+    /// missing everything the running turn has said and not yet committed.
+    pub fn rehome(&mut self, from: ViewId, to: ViewId) {
+        if from == to {
+            return;
+        }
+        for w in self.windows.values_mut().filter(|w| w.view == from) {
+            w.view = to;
+        }
+        if let Some(state) = self.views.remove(&from) {
+            self.views.insert(to, state);
+        }
+    }
+
+    /// Close every window in a view except the ones showing `keep`.
+    ///
+    /// For a screen nobody is attached to any more that is being kept for whoever comes back: the
+    /// host's own chrome stays, because that is what "come back to where you were" means, and
+    /// everything a plugin put there goes — it is about to be told the view closed, and a panel
+    /// left behind would still be on screen when the plugin opens its replacement.
+    pub fn close_others_in(&mut self, view: ViewId, keep: &[BufferId]) {
+        let doomed: Vec<WindowId> = self
+            .windows
+            .values()
+            .filter(|w| w.view == view && !keep.contains(&w.buf))
+            .map(|w| w.id)
+            .collect();
+        for win in doomed {
+            self.windows.remove(&win);
+            self.captures.remove(&win);
+            self.keymaps.remove_window(win);
+            self.surfaces.retain(|_, (w, _)| *w != win);
+            if let Some(v) = self.views.get_mut(&view) {
+                v.focus.remove(win);
+            }
+            self.push_ui_in(view, UiEvent::WindowClosed { win });
+        }
+    }
+
+    /// Forget a view and everything it had open.
+    ///
+    /// Its windows close — a window belongs to exactly one view, so nothing else is looking at
+    /// them — and its buffers do not: those are the workspace's, and the conversation in one of
+    /// them may be on screen in the terminal next door.
+    pub fn close_view(&mut self, view: ViewId) {
+        let mine: Vec<WindowId> = self
+            .windows
+            .values()
+            .filter(|w| w.view == view)
+            .map(|w| w.id)
+            .collect();
+        for win in mine {
+            self.windows.remove(&win);
+            self.captures.remove(&win);
+            self.surfaces.retain(|_, (w, _)| *w != win);
+            self.push_ui_in(view, UiEvent::WindowClosed { win });
+        }
+        self.views.remove(&view);
     }
 
     /// Say that a plugin ships with neosh, so its keymaps behave as defaults.
@@ -187,6 +297,7 @@ impl Editor {
                 | ApiCall::GitRemoveWorktree { .. }
                 | ApiCall::GenComplete { .. }
                 | ApiCall::SessionList { .. }
+                | ApiCall::ViewList
                 | ApiCall::SessionCurrent
                 | ApiCall::SessionNew { .. }
                 | ApiCall::SessionSwitch { .. }
@@ -244,10 +355,29 @@ impl Editor {
 
     // ---- draining -------------------------------------------------------
 
-    /// Take the queued UI events. The host calls this on a ~16 ms deadline armed by the first
-    /// mutation, then appends [`UiEvent::Flush`].
-    pub fn drain_ui(&mut self) -> Vec<UiEvent> {
+    /// Take the frame so far — every event, each tagged with the view it is about, `None` meaning
+    /// everybody. The host calls this on a ~16 ms deadline armed by the first mutation, then
+    /// appends [`UiEvent::Flush`].
+    pub fn drain_ui(&mut self) -> Vec<(Option<ViewId>, UiEvent)> {
         std::mem::take(&mut self.ui)
+    }
+
+    /// The frame's events with their tags dropped.
+    ///
+    /// For a caller that is one terminal by construction — the tests, and anything asking what was
+    /// drawn rather than where it went.
+    pub fn drain_events(&mut self) -> Vec<UiEvent> {
+        self.drain_ui().into_iter().map(|(_, ev)| ev).collect()
+    }
+
+    /// Put back events that were drained and not used.
+    ///
+    /// The one caller is a terminal attaching: the frame in hand is dropped and said again in
+    /// full, but only the part of it that was for the terminal arriving. What was already queued
+    /// for somebody else is still owed to them.
+    pub fn requeue(&mut self, events: Vec<(Option<ViewId>, UiEvent)>) {
+        let rest = std::mem::replace(&mut self.ui, events);
+        self.ui.extend(rest);
     }
 
     pub fn drain_effects(&mut self) -> Vec<CoreEffect> {
@@ -296,16 +426,39 @@ impl Editor {
     /// they are a grid a plugin owns, and re-emitting a copy would mean holding a second one that
     /// is wrong the moment the plugin draws again. The claim is republished, and
     /// [`crate::CoreEffect::ViewAttached`] tells the plugin to paint.
-    pub fn republish(&mut self) {
-        self.push_ui(UiEvent::Init { protocol_version: neosh_proto::PROTOCOL_VERSION });
+    /// Said *to one view*, because half of it is about one view: which windows are open, where
+    /// their cursors are, what has the keyboard. The buffers are the workspace's and are said again
+    /// regardless — a terminal joining is also the moment every other terminal is brought back
+    /// into step, and a mirror that had drifted is repaired by hearing the state a second time.
+    pub fn republish(&mut self, view: ViewId) {
+        self.push_ui_in(view, UiEvent::Init { protocol_version: neosh_proto::PROTOCOL_VERSION });
         self.republish_highlights();
 
-        let mut buffers: Vec<BufferId> = self.buffers.keys().copied().collect();
+        // What this terminal can see, and nothing else. Every buffer used to be said to everyone,
+        // which was right when a buffer was the workspace's — and is a transcript, a composer and
+        // a status line per terminal now, so it put the conversation you are reading and the
+        // sentence you are half-way through typing into the mirror of the window next door.
+        //
+        // A buffer with no window anywhere is included: its edits went to every terminal attached
+        // at the time, which this one was not, and a plugin filling a buffer before opening a
+        // window on it is ordinary.
+        let mut buffers: Vec<BufferId> = self
+            .buffers
+            .keys()
+            .copied()
+            .filter(|buf| {
+                let mut windows = self.windows.values().filter(|w| w.buf == *buf);
+                match windows.next() {
+                    None => true,
+                    Some(first) => first.view == view || windows.any(|w| w.view == view),
+                }
+            })
+            .collect();
         buffers.sort_by_key(|b| b.0);
         for buf in buffers {
             let Some(b) = self.buffers.get(&buf) else { continue };
             let (name, count) = (b.name.clone(), b.line_count());
-            self.push_ui(UiEvent::BufferOpened { buf, name });
+            self.push_ui_in(view, UiEvent::BufferOpened { buf, name });
             // `old_end: u32::MAX` — "however many rows you have, they are these now". Not `0`,
             // which would be an insertion at the top: correct for a mirror that has nothing and
             // silently doubling for one that already has the state. A mirror that already has it
@@ -315,29 +468,43 @@ impl Editor {
             // the buffer now has. The mirror clamps the range, so this is exactly "replace it all"
             // at either end.
             let lines = self.buffers[&buf].render_range(0, count);
-            self.push_ui(UiEvent::BufferLines { buf, start: 0, old_end: u32::MAX, lines });
+            self.push_ui_in(view, UiEvent::BufferLines { buf, start: 0, old_end: u32::MAX, lines });
         }
 
-        let mut windows: Vec<WindowId> = self.windows.keys().copied().collect();
+        // This view's windows and no others. A terminal has no use for the geometry of a panel
+        // open in the terminal next door, and telling it would put a window on its screen that
+        // nothing there can close.
+        let mut windows: Vec<WindowId> = self
+            .windows
+            .values()
+            .filter(|w| w.view == view)
+            .map(|w| w.id)
+            .collect();
         windows.sort_by_key(|w| w.0);
         for win in windows {
             let Some(w) = self.windows.get(&win) else { continue };
             let (buf, layout, cursor, top) = (w.buf, w.layout.clone(), w.cursor, w.top_line);
             let shape = w.cursor_shape;
-            self.push_ui(UiEvent::WindowOpened { win, buf, layout });
-            self.push_ui(UiEvent::CursorMoved { win, row: cursor.0, col: cursor.1 });
-            self.push_ui(UiEvent::ScrollTo { win, top_line: top });
-            self.push_ui(UiEvent::CursorShapeChanged { win, shape });
+            self.push_ui_in(view, UiEvent::WindowOpened { win, buf, layout });
+            self.push_ui_in(view, UiEvent::CursorMoved { win, row: cursor.0, col: cursor.1 });
+            self.push_ui_in(view, UiEvent::ScrollTo { win, top_line: top });
+            self.push_ui_in(view, UiEvent::CursorShapeChanged { win, shape });
         }
 
-        let mut surfaces: Vec<SurfaceId> = self.surfaces.keys().copied().collect();
+        let mut surfaces: Vec<SurfaceId> = self
+            .surfaces
+            .iter()
+            .filter(|(_, (win, _))| self.windows.get(win).is_some_and(|w| w.view == view))
+            .map(|(s, _)| *s)
+            .collect();
         surfaces.sort_by_key(|s| s.0);
         for surface in surfaces {
             let Some((win, rect)) = self.surfaces.get(&surface).copied() else { continue };
-            self.push_ui(UiEvent::SurfaceClaimed { surface, win, rect });
+            self.push_ui_in(view, UiEvent::SurfaceClaimed { surface, win, rect });
         }
 
-        self.push_ui(UiEvent::FocusChanged { win: self.focus.current() });
+        let focus = self.peek(view).and_then(|v| v.focus.current());
+        self.push_ui_in(view, UiEvent::FocusChanged { win: focus });
     }
 
     fn republish_highlights(&mut self) {
@@ -347,20 +514,82 @@ impl Editor {
         }
     }
 
-    /// Queue a UI event, coalescing consecutive edits to the same buffer region.
+    /// Queue a UI event, working out for itself which terminals it is about.
     ///
-    /// Streaming produces one `BufferLines` per token, all rewriting the same final line. Without
-    /// this merge the frontend would receive hundreds of redundant events per frame; with it, a
-    /// burst collapses to a single event carrying the final text.
+    /// Anything shaped like a window names one, and a window belongs to exactly one view — so the
+    /// answer is read off the window rather than passed in at two dozen call sites, where the one
+    /// that was forgotten would be a panel drawn on somebody else's screen. The events that name
+    /// no window are the workspace's: buffer contents, highlights, messages, the clipboard.
+    ///
+    /// Two cases cannot be derived and say so by calling [`Editor::push_ui_in`]: a window that has
+    /// just been *closed* is no longer in the map to be asked, and focus becoming `None` names no
+    /// window at all.
+    ///
+    /// Consecutive edits to the same buffer region are coalesced. Streaming produces one
+    /// `BufferLines` per token, all rewriting the same final line; without this merge the frontend
+    /// would receive hundreds of redundant events per frame.
     fn push_ui(&mut self, ev: UiEvent) {
+        let view = self.about(&ev);
+        self.queue(view, ev);
+    }
+
+    /// Queue a UI event about a terminal that has to be named — because the window it concerns has
+    /// gone, or because there is no window in it to read the answer off.
+    fn push_ui_in(&mut self, view: ViewId, ev: UiEvent) {
+        self.queue(Some(view), ev);
+    }
+
+    /// Which terminals an event is about. `None` is everybody.
+    fn about(&self, ev: &UiEvent) -> Option<ViewId> {
+        let win = match ev {
+            UiEvent::WindowOpened { win, .. }
+            | UiEvent::WindowConfigured { win, .. }
+            | UiEvent::WindowBuffer { win, .. }
+            | UiEvent::WindowClosed { win }
+            | UiEvent::CursorMoved { win, .. }
+            | UiEvent::CursorShapeChanged { win, .. }
+            | UiEvent::ScrollTo { win, .. }
+            | UiEvent::SurfaceClaimed { win, .. } => *win,
+            UiEvent::FocusChanged { win: Some(win) } => *win,
+            UiEvent::SurfaceCells { surface, .. } | UiEvent::SurfaceReleased { surface } => {
+                match self.surfaces.get(surface) {
+                    Some((win, _)) => *win,
+                    None => return None,
+                }
+            }
+            // A buffer is the workspace's, but with one window on it there is exactly one terminal
+            // that can see it — and a transcript is per view, so that is nearly all of them. Sent
+            // to everybody, every terminal would hold a copy of every other terminal's
+            // conversation, and a frontend looking a buffer up by name would find three called
+            // `[chat]`.
+            //
+            // Zero windows or several, and it goes to everybody: a plugin that fills a buffer
+            // before opening a window on it is ordinary, and a mirror missing the rows it was
+            // filled with would draw an empty panel.
+            UiEvent::BufferOpened { buf, .. }
+            | UiEvent::BufferLines { buf, .. }
+            | UiEvent::BufferClosed { buf } => {
+                let mut showing = self.windows.values().filter(|w| w.buf == *buf);
+                return match (showing.next(), showing.next()) {
+                    (Some(w), None) => Some(w.view),
+                    _ => None,
+                };
+            }
+            _ => return None,
+        };
+        self.windows.get(&win).map(|w| w.view)
+    }
+
+    fn queue(&mut self, view: Option<ViewId>, ev: UiEvent) {
         if let UiEvent::BufferLines { buf, start, old_end, lines } = &ev
-            && let Some(UiEvent::BufferLines {
+            && let Some((pview, UiEvent::BufferLines {
                 buf: pbuf,
                 start: pstart,
                 lines: plines,
                 ..
-            }) = self.ui.last_mut()
+            })) = self.ui.last_mut()
             && pbuf == buf
+            && *pview == view
         {
             // Mergeable only when the new edit lands entirely inside the region the previous
             // event already rewrote; otherwise the mirror would need both splices.
@@ -372,7 +601,7 @@ impl Editor {
                 return;
             }
         }
-        self.ui.push(ev);
+        self.ui.push((view, ev));
     }
 
     fn emit_edit(&mut self, buf: BufferId, edit: LineEdit) {
@@ -415,17 +644,28 @@ impl Editor {
         self.windows.values()
     }
 
-    pub fn mode(&self) -> Mode {
-        self.mode
+    /// What the keyboard is for, in one terminal.
+    ///
+    /// Per view because a mode is what the *keyboard* is doing: reading the transcript here while
+    /// typing a message there is two people's worth of one workspace, and one `Mode` between them
+    /// would make `j` a letter in whichever terminal lost the argument.
+    pub fn mode(&self, view: ViewId) -> Mode {
+        self.peek(view).map_or(Mode::Normal, |v| v.mode)
     }
 
-    pub fn set_mode(&mut self, mode: Mode) {
-        self.mode = mode;
-        self.pending_keys.clear();
+    pub fn set_mode(&mut self, view: ViewId, mode: Mode) {
+        let v = self.view(view);
+        v.mode = mode;
+        v.pending_keys.clear();
     }
 
-    pub fn focused(&self) -> Option<WindowId> {
-        self.focus.current()
+    pub fn focused(&self, view: ViewId) -> Option<WindowId> {
+        self.peek(view).and_then(|v| v.focus.current())
+    }
+
+    /// Which terminal a window is in. `None` for a window that has been closed.
+    pub fn view_of(&self, win: WindowId) -> Option<ViewId> {
+        self.windows.get(&win).map(|w| w.view)
     }
 
     pub fn options(&self) -> &OptionRegistry {
@@ -445,12 +685,49 @@ impl Editor {
         id
     }
 
+    /// Open a window in the one view a lone process has. See [`Editor::apply`] for why the two
+    /// spellings exist.
     pub fn open_window(&mut self, buf: BufferId, layout: WindowLayout) -> WindowId {
+        self.open_window_in(ViewId::LOCAL, buf, layout)
+    }
+
+    /// Open a window in a named terminal.
+    pub fn open_window_in(
+        &mut self,
+        view: ViewId,
+        buf: BufferId,
+        layout: WindowLayout,
+    ) -> WindowId {
         let id = WindowId(self.next_win);
         self.next_win += 1;
-        self.windows.insert(id, Window::new(id, buf, layout.clone()));
-        self.push_ui(UiEvent::WindowOpened { win: id, buf, layout });
+        // Before the window, and to this view alone: a buffer's rows are routed to whoever has a
+        // window on it, so everything written into this one while another terminal was the only
+        // one showing it never came here. Costs one event on a rare path and removes the whole
+        // class of "the panel opened empty in the second window".
+        self.show_buffer_in(view, buf);
+        self.windows.insert(id, Window::new(id, view, buf, layout.clone()));
+        // Made even if nothing focuses it, so that "which views are there" is answered by the
+        // same map whether a terminal has taken a key yet or only been drawn into.
+        self.views.entry(view).or_default();
+        self.push_ui_in(view, UiEvent::WindowOpened { win: id, buf, layout });
         id
+    }
+
+    /// Say a buffer's whole contents to one terminal, for one that is about to start showing it.
+    ///
+    /// Only when somebody else is already showing it. A buffer with no window has had every one of
+    /// its edits broadcast — that is what [`Editor::about`] does with one nobody can see — so the
+    /// arriving terminal already has them, and saying them again would be a "replace everything"
+    /// for content the mirror is holding correctly.
+    fn show_buffer_in(&mut self, view: ViewId, buf: BufferId) {
+        if !self.windows.values().any(|w| w.buf == buf) {
+            return;
+        }
+        let Some(b) = self.buffers.get(&buf) else { return };
+        let (name, count) = (b.name.clone(), b.line_count());
+        let lines = b.render_range(0, count);
+        self.push_ui_in(view, UiEvent::BufferOpened { buf, name });
+        self.push_ui_in(view, UiEvent::BufferLines { buf, start: 0, old_end: u32::MAX, lines });
     }
 
     /// Record realized geometry reported by the frontend.
@@ -472,9 +749,9 @@ impl Editor {
     /// *this* buffer is a statement about one thing on screen and has to beat one about every
     /// sidebar there will ever be; a binding on every sidebar has to beat one about the whole
     /// workspace, or a panel could never take a key back from a global default.
-    fn active_scopes(&self) -> Vec<KeymapScope> {
+    fn active_scopes(&self, view: ViewId) -> Vec<KeymapScope> {
         let mut scopes = Vec::new();
-        if let Some(win) = self.focus.current() {
+        if let Some(win) = self.focused(view) {
             scopes.push(KeymapScope::Window { win });
             if let Some(w) = self.windows.get(&win) {
                 scopes.push(KeymapScope::Buffer { buf: w.buf });
@@ -483,16 +760,15 @@ impl Editor {
                 }
             }
         }
-        if !self.focus_is_modal() {
+        if !self.focus_is_modal(view) {
             scopes.push(KeymapScope::Global);
         }
         scopes
     }
 
     /// Whether the focused window has declared itself modal. See [`FloatConfig::modal`].
-    fn focus_is_modal(&self) -> bool {
-        self.focus
-            .current()
+    fn focus_is_modal(&self, view: ViewId) -> bool {
+        self.focused(view)
             .and_then(|win| self.windows.get(&win))
             .is_some_and(crate::window::Window::modal)
     }
@@ -534,27 +810,29 @@ impl Editor {
     ///
     /// Routing is resolved entirely from the core's own tables — no round trip into a plugin
     /// runtime — so a keystroke never waits on plugin latency to find out where it goes.
-    pub fn feed_key(&mut self, key: KeyPress) -> KeyResolution {
-        self.pending_keys.push(key.clone());
-        let scopes = self.active_scopes();
-        let seq = self.pending_keys.clone();
-        let mut res = self.keymaps.resolve(self.mode, &scopes, &seq);
+    pub fn feed_key(&mut self, view: ViewId, key: KeyPress) -> KeyResolution {
+        self.view(view).pending_keys.push(key.clone());
+        let scopes = self.active_scopes(view);
+        let mode = self.mode(view);
+        let seq = self.view(view).pending_keys.clone();
+        let mut res = self.keymaps.resolve(mode, &scopes, &seq);
         // A modal drops `Global` from its scopes, so the escape hatches have to be let back in by
         // name. Consulted only once the panel's own scopes have declined the key: a modal that
         // binds `<C-r>` for something of its own keeps it, which is the same rule every other
         // scope follows.
         if matches!(res, KeyResolution::Unhandled)
-            && self.focus_is_modal()
+            && self.focus_is_modal(view)
             && self.is_modal_escape(&seq)
         {
-            res = self.keymaps.resolve(self.mode, &[KeymapScope::Global], &seq);
+            res = self.keymaps.resolve(mode, &[KeymapScope::Global], &seq);
         }
         match &res {
             KeyResolution::Pending => {}
             KeyResolution::Matched { command, .. } => {
-                self.pending_keys.clear();
+                self.view(view).pending_keys.clear();
                 let cmd = command.clone();
-                let ctx = KeyContext { key, mode: self.mode, win: self.focus.current() };
+                let ctx =
+                    KeyContext { key, mode, view, win: self.focused(view) };
                 self.invoke_command(&cmd, Vec::new(), Some(ctx));
             }
             KeyResolution::Unhandled => {
@@ -562,9 +840,9 @@ impl Editor {
                 //
                 // Dropping the prefix instead would mean that with `gd` bound, typing `gx` produces
                 // `x` — the composer eats characters and there is no way to tell why.
-                let held = std::mem::take(&mut self.pending_keys);
+                let held = std::mem::take(&mut self.view(view).pending_keys);
                 for k in held {
-                    self.unclaimed(k);
+                    self.unclaimed(view, k);
                 }
             }
         }
@@ -576,13 +854,13 @@ impl Editor {
     /// The other half of `Pending`: without a way out, binding a sequence whose prefix is a
     /// printable character makes that character untypeable. The host calls this on a `timeoutlen`
     /// deadline, which is how Neovim resolves the same ambiguity.
-    pub fn flush_pending(&mut self) -> bool {
-        let held = std::mem::take(&mut self.pending_keys);
+    pub fn flush_pending(&mut self, view: ViewId) -> bool {
+        let held = std::mem::take(&mut self.view(view).pending_keys);
         if held.is_empty() {
             return false;
         }
         for k in held {
-            self.unclaimed(k);
+            self.unclaimed(view, k);
         }
         true
     }
@@ -598,15 +876,17 @@ impl Editor {
     /// it; the only place left is the host, which would put a character in the composer behind the
     /// float or read `<Esc>` as "interrupt the turn". Typing into a field you cannot see is worse
     /// than a key that does nothing.
-    fn unclaimed(&mut self, key: KeyPress) {
-        let captured = self.focus.current().and_then(|w| self.captures.get(&w).cloned());
+    fn unclaimed(&mut self, view: ViewId, key: KeyPress) {
+        let focus = self.focused(view);
+        let mode = self.mode(view);
+        let captured = focus.and_then(|w| self.captures.get(&w).cloned());
         match captured {
             Some(command) => {
-                let ctx = KeyContext { key, mode: self.mode, win: self.focus.current() };
+                let ctx = KeyContext { key, mode, view, win: focus };
                 self.invoke_command(&command, Vec::new(), Some(ctx));
             }
-            None if self.focus_is_modal() => {}
-            None => self.effects.push(CoreEffect::UnhandledKey { key, mode: self.mode }),
+            None if self.focus_is_modal(view) => {}
+            None => self.effects.push(CoreEffect::UnhandledKey { key, mode, view }),
         }
     }
 
@@ -682,7 +962,24 @@ impl Editor {
 
     // ---- the dispatcher --------------------------------------------------
 
+    /// Apply a call on behalf of the one view a lone process has.
+    ///
+    /// The great majority of callers are the host drawing its own chrome and tests driving the
+    /// editor directly, and both of those are one terminal. Anything that has to answer *which*
+    /// terminal — a plugin's float, a key press — calls [`Editor::apply_in`], and the split is
+    /// deliberately visible so that a call site which ought to have said is greppable rather than
+    /// silently correct-looking.
     pub fn apply(&mut self, plugin: &PluginId, call: ApiCall) -> ApiResult {
+        self.apply_in(ViewId::LOCAL, plugin, call)
+    }
+
+    /// Apply a call on behalf of the terminal that caused it.
+    ///
+    /// The view matters for the handful of calls that are about a *place* rather than about a
+    /// thing: opening a window, taking or giving up focus, asking what has it. Everything else —
+    /// every buffer call, every mark, every option — is the workspace's and would give the same
+    /// answer whoever asked.
+    pub fn apply_in(&mut self, view: ViewId, plugin: &PluginId, call: ApiCall) -> ApiResult {
         match call {
             // ---- buffers ---------------------------------------------
             ApiCall::BufCreate { name, kind, .. } => {
@@ -768,17 +1065,19 @@ impl Editor {
             }
 
             // ---- windows & floats ------------------------------------
-            ApiCall::WinOpen { buf, layout } => {
+            ApiCall::WinOpen { buf, layout, view: named } => {
                 self.buf(buf)?;
-                Ok(ApiOk::Win { win: self.open_window(buf, layout) })
+                let view = named.unwrap_or(view);
+                Ok(ApiOk::Win { win: self.open_window_in(view, buf, layout) })
             }
-            ApiCall::FloatOpen { buf, config } => {
+            ApiCall::FloatOpen { buf, config, view: named } => {
                 self.buf(buf)?;
+                let view = named.unwrap_or(view);
                 let focusable = config.focusable;
-                let win = self.open_window(buf, WindowLayout::Float { config });
+                let win = self.open_window_in(view, buf, WindowLayout::Float { config });
                 if focusable {
-                    self.focus.push(win);
-                    self.push_ui(UiEvent::FocusChanged { win: Some(win) });
+                    self.view(view).focus.push(win);
+                    self.push_ui_in(view, UiEvent::FocusChanged { win: Some(win) });
                 }
                 Ok(ApiOk::Win { win })
             }
@@ -809,9 +1108,12 @@ impl Editor {
                 Ok(ApiOk::Unit)
             }
             ApiCall::WinClose { win } => {
-                self.win(win)?;
+                // The window's own view, not the caller's: closing something is a statement about
+                // where it *is*, and a plugin tidying up after a terminal that has gone is the
+                // ordinary case rather than a mistake.
+                let home = self.win(win)?.view;
                 self.windows.remove(&win);
-                self.focus.remove(win);
+                self.view(home).focus.remove(win);
                 self.surfaces.retain(|_, (w, _)| *w != win);
                 // A capture outliving its window would send every unbound key to a command whose
                 // picker is gone — the keyboard would appear to stop working.
@@ -819,15 +1121,18 @@ impl Editor {
                 // Same for the keys a widget claimed while it was up. They are never resolved once
                 // the window cannot be focused, but they would still be listed forever.
                 self.keymaps.remove_window(win);
-                self.push_ui(UiEvent::WindowClosed { win });
-                let now = self.focus.current();
-                self.push_ui(UiEvent::FocusChanged { win: now });
+                self.push_ui_in(home, UiEvent::WindowClosed { win });
+                let now = self.focused(home);
+                self.push_ui_in(home, UiEvent::FocusChanged { win: now });
                 Ok(ApiOk::Unit)
             }
             ApiCall::WinSetBuf { win, buf } => {
                 self.buf(buf)?;
+                let home = self.win(win)?.view;
                 self.win_mut(win)?.buf = buf;
-                self.push_ui(UiEvent::WindowBuffer { win, buf });
+                // Same reason as opening one: this terminal may never have been sent the rows.
+                self.show_buffer_in(home, buf);
+                self.push_ui_in(home, UiEvent::WindowBuffer { win, buf });
                 Ok(ApiOk::Unit)
             }
             ApiCall::WinGetCursor { win } => {
@@ -938,7 +1243,7 @@ impl Editor {
                 Ok(ApiOk::Unit)
             }
             ApiCall::WinList => {
-                let focused = self.focus.current();
+                let focused = self.focused(view);
                 let mut windows: Vec<neosh_proto::WindowInfo> = self
                     .windows
                     .values()
@@ -1119,13 +1424,16 @@ impl Editor {
 
             // ---- focus -------------------------------------------------
             ApiCall::FocusPush { win } => {
-                self.win(win)?;
-                self.focus.push(win);
-                self.push_ui(UiEvent::FocusChanged { win: Some(win) });
+                // Focus follows the window rather than the asker. A plugin raising a panel it
+                // opened in another terminal is giving *that* keyboard to it, which is the only
+                // reading that leaves both screens describing something true.
+                let home = self.win(win)?.view;
+                self.view(home).focus.push(win);
+                self.push_ui_in(home, UiEvent::FocusChanged { win: Some(win) });
                 Ok(ApiOk::Unit)
             }
             ApiCall::FocusPop => {
-                let popped = self.focus.pop();
+                let popped = self.view(view).focus.pop();
                 // A float that asked to close on blur is destroyed rather than merely hidden,
                 // otherwise pickers accumulate invisibly.
                 if let Some(w) = popped
@@ -1133,13 +1441,13 @@ impl Editor {
                 {
                     self.windows.remove(&w);
                     self.captures.remove(&w);
-                    self.push_ui(UiEvent::WindowClosed { win: w });
+                    self.push_ui_in(view, UiEvent::WindowClosed { win: w });
                 }
-                let now = self.focus.current();
-                self.push_ui(UiEvent::FocusChanged { win: now });
+                let now = self.focused(view);
+                self.push_ui_in(view, UiEvent::FocusChanged { win: now });
                 Ok(ApiOk::Unit)
             }
-            ApiCall::FocusCurrent => Ok(ApiOk::FocusedWin { win: self.focus.current() }),
+            ApiCall::FocusCurrent => Ok(ApiOk::FocusedWin { win: self.focused(view) }),
 
             // ---- options -----------------------------------------------
             ApiCall::OptDeclare { spec } => {
@@ -1414,6 +1722,7 @@ fn call_name(call: &ApiCall) -> &'static str {
         ApiCall::HintClear { .. } => "hint.clear",
         ApiCall::StatusClear { .. } => "status.clear",
         ApiCall::SessionList { .. } => "session.list",
+        ApiCall::ViewList => "view.list",
         ApiCall::SessionCurrent => "session.current",
         ApiCall::SessionNew { .. } => "session.new",
         ApiCall::SessionSwitch { .. } => "session.switch",

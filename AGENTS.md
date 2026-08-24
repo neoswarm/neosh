@@ -87,7 +87,9 @@ per decision, and records the *reasoning*, not the choice.
   key in a `ui.keys.*` list is the chord: the first one is what a hint row prints, and a legend is
   a promise about a keyboard. A capability that runs out of chords loses its key and keeps its
   command — `^K` runs it by name and `init.ts` can bind it — because inventing a prefix layer for
-  one verb costs every user a concept to save one of them a keystroke. See ADR 0048.
+  one verb costs every user a concept to save one of them a keystroke. Alt is bound on the terms
+  arrows are: only where a terminal-sendable route to the same thing already exists, so `⌥Y`
+  copies the directory in chat and `yp` does it in the reader. See ADR 0048.
 - **The cursor is on a character, and the frontend is the only thing that knows where that is.**
   Reading the transcript is a normal mode, so `$` is the last character rather than the space after
   it, `h` at column zero stays on its row, nothing parks past the end of one, and a selection
@@ -182,20 +184,40 @@ per decision, and records the *reasoning*, not the choice.
   running the only code it has ever had and cannot know it is behind. An unreadable stamp is
   *unknown* rather than old, or the warning fires every time and stops meaning anything. See ADR
   0058.
-- **However many terminals you open, you see everything.** Attaching joins; it does not take over.
-  Every attached terminal is a mirror of one `Editor` — same transcript, same composer, live — and
-  `^Q` closes the one it was pressed in. Which one is read off the tag input arrives with, never
-  from whoever spoke most recently: the host can be behind the channel, and "the last event sent"
-  is not "the event being handled". Three things follow and each was a bug. **`republish` goes to
-  every view, so it has to be idempotent** — it spliced at `old_end: 0`, an insertion, which is
-  right only against a mirror that has nothing and doubled every buffer in one that had the state.
-  **The workspace is the size of the smallest attached terminal**, because a card is one row of
-  buffer *content* shared by all of them, and a card measured for the wide window wraps in the
-  narrow one; sizes are re-merged when a view *leaves* too, since nobody reports a size when
-  somebody else closes a window. **`ViewportChanged` is where the host learns a width**, so
-  anything drawn to one is redrawn there. Independent views — a transcript here, a diff there —
-  are not this: they need `Host` split into a `Workspace` and a `View`, and an `ApiCall` that names
-  the view it draws into. See ADR 0042.
+- **What the agent produced is the workspace's; where you are looking is yours.** Attaching joins,
+  it does not take over, and it does not make a copy: every terminal has a **view** of its own —
+  its own conversation on screen, transcript, scroll, cursor, folded cards, composer and panels —
+  while the conversations, the turns running in them and everything a plugin registered are shared.
+  A window belongs to exactly one view and a buffer does not, which is the whole mechanism;
+  `neosh_core::Window` has always held the cursor, the anchor and the scroll, so the window map
+  only had to gain an owner. A **client** is a socket and a **view** is a set of windows: `^Q`
+  closes the client it was pressed in, read off the tag input arrives with and never from whoever
+  spoke most recently, because the host can be behind the channel. A frame is therefore *routed* —
+  `push_ui` reads the tag off the window an event names, and a terminal whose share is only the
+  trailing flush is not woken up at all. A transcript is per view rather than per conversation
+  because folding a card open is navigation: `⇥` on a diff must not move the rows under somebody
+  else in the same conversation. `on_screen` is gone and `views_showing` replaced it — a turn draws
+  once in each terminal showing its conversation, which may be none, and that is when the unread
+  mark is set. A terminal attaching lands in the most recent conversation nobody else is reading;
+  the last screen of all is kept for whoever comes back, which is what makes leaving mid-answer and
+  returning find the answer still arriving. **The smallest-terminal rule is gone** — it existed
+  because a card was shared content — and what is still merged is one window two terminals share.
+  `republish` says only what the arriving view can see and has to stay idempotent, and
+  `ViewportChanged` is still where the host learns a width. See ADR 0059, and ADR 0042 for the
+  connection half.
+- **A plugin says which terminal it is drawing into, and almost never has to.** Three rules in
+  order: a float anchored to a window goes where that window is; a buffer only one terminal shows
+  names it; otherwise it is the terminal being served, which for anything done in answer to a key
+  is exact. So every float that builds its window per invocation — the palette, the model sheet,
+  git — needed no change. A **dock** is the exception, because one that exists once exists in one
+  place: `view.onOpen` is when to make it (fired for the terminals already here as well as the ones
+  still to come) and `view.onClose` is when to let go. When it does have to be said, `KeyContext`
+  carries the view, `win.open`/`float.open`/`session.switch` take one, and a command handler's
+  third argument is the whole `neosh` namespace bound to the terminal the key was pressed in — so
+  `here.win.open(...)` lands where the person pressing the key is looking. `SessionChanged` names
+  the terminal that moved, because "the active conversation" has as many answers as there are
+  screens; a question waits until some terminal is reading its conversation and opens there.
+  See ADR 0059.
 - **Every view gets every event.** `Agent` fans its stream out to one queue per view. Never a
   `broadcast` channel: lagging consumers drop the oldest, silently, under load — and a view that
   missed one `ToolFinished` has a card that spins forever with nothing to put it right.
@@ -312,7 +334,7 @@ per decision, and records the *reasoning*, not the choice.
   moment any verb names it — otherwise "empty the archive" reports success over a directory it
   never touched. **Nothing here deletes on a timer**: `archive.auto_days` *archives* what has gone
   idle, because archiving is reversible and free, and `archive.retention_days` only ever counts —
-  `archive.sweep` is the same number with a person behind it. See ADR 0059.
+  `archive.sweep` is the same number with a person behind it. See ADR 0060.
 - **A notification is for something you did not ask for and cannot see.** Both halves, and a
   message that fails either is not one. `MessageLevel` says how *bad* a thing is and never whether
   you need to know about it, which is how one channel ended up carrying a hundred and seventy call
@@ -602,7 +624,7 @@ only way to do anything. See ADR 0048.
 | `^G` | Git status |
 | `^D` | Show what changed |
 | `^S` | Read the transcript — see below |
-| `⌥Y` | Copy this conversation's directory — in a worktree, the worktree's path |
+| `⌥Y` | Copy this conversation's directory — in a worktree, the worktree's path. The one Alt chord that ships, because it is never the only way: `yp` in the reader, `y` in the project panel, `^K` by name |
 | `^A` `^X` | Select everything, cut the selection |
 | `^C` | Copy the selection, or clear the draft, or (twice) quit |
 | `PgUp` `PgDn` `^End` | Scroll, and back to the newest message |
@@ -618,7 +640,10 @@ Composer editing is a text field: `←`/`→` by character and `^←`/`^→` by 
 `^Home`/`^End` for the ends, shift with any of them to select, `^W` and `^U` to delete a word or
 back to the start of the line. The capability ladder — `model.upgrade`, `model.downgrade` — has no
 default key: it had `⌥↑`/`⌥↓`, which is not a key every terminal sends, and `^K` runs both by
-name.
+name. Copying this conversation's directory — `session.copy.path`, which in a worktree is the
+worktree's path — keeps `⌥Y` on the terms arrows are bound on: a key that means something where it
+arrives and is never the only way — `^K` or `/copy` here, `y` on any row of the project panel, and
+`yp` in the reader.
 
 ## Reading the transcript — `^S`
 
@@ -674,6 +699,7 @@ on it, which after wrapping is not the window's height. See ADR 0051.
 | `yi` + an object | Copy one without selecting it first — `yiw`, `yi"` |
 | `yc` | Copy the **code block** the cursor is in, without its indent or language line |
 | `ym` | Copy the whole **turn** — the question and everything it produced |
+| `yp` | Copy this conversation's **directory** — in a worktree, the worktree's path. The one `y` that is not a piece of the transcript |
 | `ya` | Copy the entire transcript. Which is why `ya`*w* is the one thing here that is not Vim's — `viwy` is |
 | `i` `a` `o` `⏎` | Back to the composer. While selecting, `i` and `a` open a text object and `o` swaps ends |
 | `^S` | And back out, the way you came in |
@@ -740,7 +766,7 @@ What you have finished with, and the one place in the workspace where throwing t
 you came to do. **Nothing about it is on screen until you press the key**: no section, no row, no
 count — `archive.sidebar = true` if you want the count in the project panel. A popup, and a panel
 rather than a picker: it has marks, and every verb means what is marked or — with nothing marked —
-the row under the cursor. The strip at the foot says which. See ADR 0059.
+the row under the cursor. The strip at the foot says which. See ADR 0060.
 
 Conversations past `RESTORE_LIMIT` are in here too, and behave like any other row: the workspace
 brings one in from its file the first time a key names it. The header says how many are `on disk

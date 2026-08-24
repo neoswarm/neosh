@@ -46,6 +46,7 @@ import type {
   QuestionAnswer,
   SessionId,
   UserQuestion,
+  ViewId,
 } from "@neosh/api";
 import { byteLength } from "@neosh/api";
 import type { DrawnMark, DrawnRow } from "@neosh/api";
@@ -215,19 +216,43 @@ export async function activate({ neosh, subscriptions }: PluginContext) {
   /** The one on screen, if any. */
   let open: Open | null = null;
   /**
-   * Which conversation is being looked at, or `null` while that is still being asked.
+   * Where each terminal is.
    *
-   * `null` shows everything rather than nothing. Every `await` before the hook is registered is a
-   * window in which a question arrives and finds no blocking hook — which is answered as "nobody
-   * answered", instantly and wrongly — so the hook goes on first and this is filled in behind it.
-   * A question in that window belongs to whichever conversation is on screen, because on a
-   * workspace this young there is only one.
+   * "The conversation being looked at" used to be one session id, because there was one screen. A
+   * workspace can have several and each is somewhere, so a question is put in front of a terminal
+   * that is reading *its* conversation — and if none is, it waits, and the footer says how many
+   * are waiting.
+   *
+   * Empty until the first refresh, which is deliberate: every `await` before the hook is
+   * registered is a window in which a question arrives and finds no blocking hook — answered as
+   * "nobody answered", instantly and wrongly — so the hook goes on first and this is filled in
+   * behind it.
    */
-  let active: SessionId | null = null;
+  let where = new Map<ViewId, SessionId>();
+  const relocate = async () => {
+    const views = await neosh.view.list().catch(() => []);
+    where = new Map(views.map((v) => [v.view, v.session]));
+  };
 
-  /** Whichever queued question belongs to the conversation being looked at. */
-  const showable = () =>
-    queue.find((a) => a.session === null || active === null || a.session === active) ?? null;
+  /**
+   * The first queued question there is a terminal to show it in, and which terminal that is.
+   *
+   * A question raised with no conversation of its own — a plugin's `neosh.ask` — belongs wherever
+   * you are, so it takes the terminal being served if there is one and any terminal otherwise.
+   */
+  const showable = (): { ask: Ask; view: ViewId } | null => {
+    for (const ask of queue) {
+      if (ask.session === null) {
+        const anywhere = [...where.keys()][0];
+        if (anywhere !== undefined) return { ask, view: anywhere };
+        continue;
+      }
+      for (const [view, session] of where) {
+        if (session === ask.session) return { ask, view };
+      }
+    }
+    return null;
+  };
 
   // What is in the composer, mirrored — there is no call that reads it, only an event that says it
   // changed. Kept only while nothing is on screen: once the panel is up it is the panel writing the
@@ -258,7 +283,9 @@ export async function activate({ neosh, subscriptions }: PluginContext) {
 
   const step = async () => {
     const want = showable();
-    if (open && open.ask !== want) {
+    // Closed when the question changes *or* when the terminal reading it does — somebody switched
+    // away, and a panel left on their screen is a question they are no longer being asked.
+    if (open && (open.ask !== want?.ask || open.view !== want.view)) {
       await open.close();
       open = null;
     }
@@ -268,10 +295,12 @@ export async function activate({ neosh, subscriptions }: PluginContext) {
       // often exactly what they were about to say.
       const seed = draft;
       draft = "";
-      open = await draw(neosh, want, seed, () => {
+      // In the terminal reading the conversation that asked, which is what makes a question
+      // findable in a workspace with three windows open on three different things.
+      open = await draw(neosh.view.at(want.view), want.view, want.ask, seed, () => {
         // Answered, dismissed, or gone. Either way it leaves the queue and the next one — which
         // may belong to another conversation entirely — gets its turn at the screen.
-        const i = queue.indexOf(want);
+        const i = queue.indexOf(want.ask);
         if (i >= 0) queue.splice(i, 1);
         open = null;
         void sync();
@@ -349,12 +378,24 @@ export async function activate({ neosh, subscriptions }: PluginContext) {
   // that is already on screen — the theme is consulted when the row is drawn — so nothing is lost
   // by not making a question wait for fourteen round trips.
   await defineGroups(neosh);
-  active = await neosh.session.current().then((s) => s.id).catch(() => null);
+  await relocate();
   void sync();
 
   subscriptions.push(
-    neosh.session.onChange(({ session }) => {
-      active = session;
+    neosh.session.onChange(({ session, view }) => {
+      where.set(view, session);
+      void sync();
+    }),
+  );
+  // A terminal arriving is a screen a waiting question may now have. One leaving is a panel that
+  // has gone with it, and a question that has to go back in the queue.
+  subscriptions.push(
+    neosh.view.onOpen(() => void relocate().then(sync)),
+  );
+  subscriptions.push(
+    neosh.view.onClose((view) => {
+      where.delete(view);
+      if (open?.view === view) open = null;
       void sync();
     }),
   );
@@ -429,6 +470,8 @@ async function elsewhere(neosh: Neosh, queue: Ask[], shown: Ask | null): Promise
 
 interface Open {
   ask: Ask;
+  /** Which terminal it is on. A question is answered once, on one screen. */
+  view: ViewId;
   close(): Promise<void>;
 }
 
@@ -438,7 +481,13 @@ interface Open {
  * Returns as soon as it is drawn — the answering happens on keys, and `done` is called when the ask
  * has settled so the caller can move on to the next one.
  */
-async function draw(neosh: Neosh, ask: Ask, seed: string, done: () => void): Promise<Open> {
+async function draw(
+  neosh: Neosh,
+  view: ViewId,
+  ask: Ask,
+  seed: string,
+  done: () => void,
+): Promise<Open> {
   const buf = await neosh.buf.create({ name: "[question]", scratch: true, kind: KIND });
   const ns = await neosh.ns.create("neosh.questions");
 
@@ -783,7 +832,7 @@ async function draw(neosh: Neosh, ask: Ask, seed: string, done: () => void): Pro
   if (typed !== "") await neosh.agent.setDraft(typed).catch(() => {});
   await render();
 
-  return { ask, close };
+  return { ask, view, close };
 }
 
 /** Erase back to the start of the last word, as `^W` does everywhere else. */

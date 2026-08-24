@@ -13,9 +13,11 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicI8, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use neosh_proto::{InputEvent, UiEvent};
+use neosh_proto::InputEvent;
 use neosh_tui::{Mirror, TerminalFrontend, to_input_event};
 use tokio::sync::mpsc;
+
+use crate::clients::{ClientId, Frame};
 
 /// Whether anybody can see this workspace, which is what decides how a notification is delivered.
 ///
@@ -36,8 +38,12 @@ pub enum Presence {
 
 #[async_trait::async_trait]
 pub trait Frontend: Send {
-    /// Deliver one coalesced batch. The batch always ends with [`UiEvent::Flush`].
-    async fn send(&mut self, batch: Vec<UiEvent>) -> anyhow::Result<()>;
+    /// Deliver one coalesced frame. It always ends with [`UiEvent::Flush`].
+    ///
+    /// Every event carries the view it is about, or `None` for the ones that are the workspace's —
+    /// buffer contents, highlights, messages. A frontend that *is* one terminal ignores the tag and
+    /// applies the lot; a workspace serving several gives each of them their share.
+    async fn send(&mut self, frame: Frame) -> anyhow::Result<()>;
 
     /// Whether anybody is looking.
     ///
@@ -50,19 +56,20 @@ pub trait Frontend: Send {
     async fn presence(&mut self, _idle_after: Duration) -> Presence {
         Presence::Watching
     }
+
     async fn shutdown(&mut self) -> anyhow::Result<()> {
         Ok(())
     }
     /// Send one viewer away and keep going.
     ///
     /// Named, because a workspace can have several and `^Q` means "close *this* terminal". The key
-    /// arrives tagged with the view it was pressed in, so the answer never depends on which
+    /// arrives tagged with the client it was pressed in, so the answer never depends on which
     /// terminal happened to speak most recently.
     ///
     /// Nothing for a frontend that *is* the process — there is nobody to send away, and the run
     /// loop is about to end anyway. It means something only for a workspace serving terminals,
     /// which is the one place `quit` and `stop` are different words.
-    async fn detach(&mut self, _view: crate::views::ViewId) -> anyhow::Result<()> {
+    async fn detach(&mut self, _client: ClientId) -> anyhow::Result<()> {
         Ok(())
     }
 
@@ -206,9 +213,11 @@ impl TerminalUi {
 
 #[async_trait::async_trait]
 impl Frontend for TerminalUi {
-    async fn send(&mut self, batch: Vec<UiEvent>) -> anyhow::Result<()> {
+    async fn send(&mut self, frame: Frame) -> anyhow::Result<()> {
         let mut redraw = false;
-        for ev in batch {
+        // The tag is nobody's business here: this process is one terminal, so every view in the
+        // workspace is this one and every event in the frame is addressed to it.
+        for (_, ev) in frame {
             redraw |= self.mirror.apply(ev);
         }
         // Before the draw: an escape written after ratatui has painted and moved the cursor is an
@@ -364,11 +373,16 @@ fn classify(e: std::io::Error) -> anyhow::Error {
 
 #[async_trait::async_trait]
 impl Frontend for StdioFrontend {
-    async fn send(&mut self, batch: Vec<UiEvent>) -> anyhow::Result<()> {
+    async fn send(&mut self, frame: Frame) -> anyhow::Result<()> {
         // Serialized to a buffer first, so a write failure is an `io::Error` we can classify
         // rather than a serde error that happens to wrap one.
+        //
+        // The view tag is dropped rather than printed: this stream is what a single frontend
+        // renders, the same events a terminal would apply, and a consumer of it is one view by
+        // construction. Putting a number nobody can act on into every line would make the two
+        // frontends disagree about what the protocol is.
         let mut buf = Vec::new();
-        for ev in batch {
+        for (_, ev) in frame {
             serde_json::to_writer(&mut buf, &ev)?;
             buf.push(b'\n');
         }

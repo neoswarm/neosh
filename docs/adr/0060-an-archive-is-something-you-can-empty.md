@@ -1,4 +1,4 @@
-# 0059 — An archive is something you can empty
+# 0060 — An archive is something you can empty
 
 **Status:** accepted
 

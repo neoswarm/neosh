@@ -369,12 +369,15 @@ impl Agent {
         self.with(session, |s| s.permission_mode = Some(mode));
     }
 
-    /// The policy a question asked *outside* any turn is answered by: the conversation on screen.
+    /// The policy a question asked *outside* any turn is answered by: the most recent
+    /// conversation.
     ///
-    /// A plugin calling `neosh.permit` is not in a turn and has no conversation of its own, so the
-    /// one being looked at is the only conversation the question can be about.
+    /// A plugin calling `neosh.permit` is not in a turn and has no conversation of its own. With
+    /// one terminal that was "the one being looked at"; with several there is no such thing, so it
+    /// is the one most recently arrived in anywhere — which is the same answer whenever it
+    /// mattered, and an answer at all when nothing is attached.
     fn permissions_here(&self) -> Arc<PermissionLayer> {
-        let here = self.sessions().active_id().clone();
+        let here = self.sessions().current_id().clone();
         let base = self.permissions();
         match self.with(&here, |s| s.permission_mode).flatten().filter(|m| *m != base.mode()) {
             None => base,
@@ -511,7 +514,10 @@ impl Agent {
                         reason: "needs approval, and nothing is able to ask".into(),
                     };
                 }
-                let session = Some(self.sessions().active_id().clone());
+                // The most recent conversation anywhere: a permission asked outside a turn has no
+                // conversation of its own, and with several terminals there is no single one on
+                // screen to borrow. See `SessionStore::current`.
+                let session = Some(self.sessions().current_id().clone());
                 crate::tools::Approver::ask(
                     &HookApprover { hooks, bridge, turn, session },
                     capability,
@@ -537,7 +543,7 @@ impl Agent {
         prompt: impl Into<Prompt>,
         cancel: CancellationToken,
     ) -> TurnOutcome {
-        let session = self.sessions().active_id().clone();
+        let session = self.sessions().current_id().clone();
         self.run_turn_in(bridge, session, prompt.into(), cancel).await
     }
 
@@ -1057,24 +1063,28 @@ pub fn assistant_text(session: &Session) -> String {
 /// Re-exported so hosts can build a `ToolCallId` when synthesizing calls in tests.
 pub type CallId = ToolCallId;
 
-/// A lock on the store, presented as the active session.
+/// A lock on the store, presented as the most recent conversation.
 ///
-/// Exists so that `agent.session().messages` keeps meaning "the conversation on screen" after the
-/// store gained the ability to hold several. Without it every call site would have to say
-/// `agent.sessions().active()` and the borrow would be the caller's problem.
+/// Exists so that `agent.session().messages` reads as one conversation after the store gained the
+/// ability to hold several. Without it every call site would have to say
+/// `agent.sessions().current()` and the borrow would be the caller's problem.
+///
+/// It is *not* "the conversation on screen" — there may be several screens, each somewhere else,
+/// and which one a caller means is a question only the host can answer. Anything that has a view
+/// to ask should ask it and reach the session by id.
 pub struct ActiveSession<'a>(std::sync::MutexGuard<'a, SessionStore>);
 
 impl std::ops::Deref for ActiveSession<'_> {
     type Target = Session;
 
     fn deref(&self) -> &Session {
-        self.0.active()
+        self.0.current()
     }
 }
 
 impl std::ops::DerefMut for ActiveSession<'_> {
     fn deref_mut(&mut self) -> &mut Session {
-        self.0.active_mut()
+        self.0.current_mut()
     }
 }
 

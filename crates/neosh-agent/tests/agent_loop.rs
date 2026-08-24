@@ -370,7 +370,7 @@ async fn a_turn_runs_in_the_conversation_it_names_not_in_whichever_is_on_screen(
     // The whole point of addressing a turn by id: you can switch away from it, and it keeps
     // writing where it started rather than into whatever you are now reading.
     let (agent, mut rx) = agent_with_script(vec![text_script("answered")]);
-    let on_screen = agent.sessions().active_id().clone();
+    let on_screen = agent.sessions().current_id().clone();
 
     let mut other = Session::new(std::env::temp_dir());
     other.selection = agent.selection();
@@ -387,7 +387,7 @@ async fn a_turn_runs_in_the_conversation_it_names_not_in_whichever_is_on_screen(
         .await;
 
     let store = agent.sessions();
-    assert_eq!(store.active_id(), &on_screen, "running a turn does not switch conversations");
+    assert_eq!(store.current_id(), &on_screen, "running a turn does not move anybody");
     assert!(
         store.get(&on_screen).expect("still there").messages.is_empty(),
         "the conversation on screen was not part of this and must be untouched"
@@ -406,7 +406,7 @@ async fn a_turn_runs_in_the_conversation_it_names_not_in_whichever_is_on_screen(
 async fn steering_is_taken_by_the_conversation_it_was_typed_in() {
     // A single queue would hand what you typed here to whichever turn reached a gap first.
     let (agent, _rx) = agent_with_script(vec![]);
-    let here = agent.sessions().active_id().clone();
+    let here = agent.sessions().current_id().clone();
     let there = {
         let s = Session::new(std::env::temp_dir());
         let id = s.id.clone();

@@ -208,8 +208,21 @@ pub struct SessionInfo {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(type = "number | null")]
     pub context_window: Option<u64>,
+    /// Whether this is the conversation on screen **in the terminal that asked**.
+    ///
+    /// A workspace can have several terminals and each is somewhere, so this is a question with as
+    /// many answers as there are screens and the host stamps in the one for whoever is asking. A
+    /// panel drawing a list marks its own conversation with it; use [`Self::on_screen`] for "is
+    /// anybody looking at this".
     #[serde(default)]
     pub is_active: bool,
+    /// Whether *some* terminal is reading this conversation.
+    ///
+    /// The workspace-wide half of the question above, and the one an unread mark turns on: a turn
+    /// that ends where nobody could see it is news, and where nobody could see it means every
+    /// screen.
+    #[serde(default)]
+    pub on_screen: bool,
     /// A turn finished here while you were looking at something else.
     ///
     /// The one thing a list of conversations cannot say without being told. A turn takes minutes,
