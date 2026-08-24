@@ -113,4 +113,21 @@ pub trait AgentDriver: Send + Sync {
 pub trait Unasked: Send + Sync + std::fmt::Debug {
     /// The agent in this conversation has begun saying something nobody asked for.
     fn began(&self, conversation: &neosh_proto::SessionId);
+
+    /// Everything running unattended in this conversation, whole, said while no turn was reading.
+    ///
+    /// The same level [`neosh_proto::Activity::Background`] carries, and here for the reason that
+    /// one is a level: the set changes *between* turns — that is what a backgrounded shell is —
+    /// and a level nobody is told about is a mark on a row that nothing will ever put right.
+    /// [`Self::began`] is not a substitute, because it only fires when the agent goes on to *say*
+    /// something about it: the CLI usually does, and a conversation whose indicator depends on
+    /// whether it felt like talking is one that is wrong whenever it did not.
+    ///
+    /// Only when nothing is reading. A turn that is running forwards this itself, in order, on its
+    /// own stream — and two paths into one field is how `[a]` lands after `[a, b]`.
+    fn background(
+        &self,
+        conversation: &neosh_proto::SessionId,
+        tasks: Vec<neosh_proto::BackgroundTask>,
+    );
 }

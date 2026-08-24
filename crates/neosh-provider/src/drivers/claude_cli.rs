@@ -1229,6 +1229,61 @@ impl Watch {
         self.unread.attached.load(std::sync::atomic::Ordering::SeqCst) > 0
     }
 
+    /// The live set of background tasks, if that is what this line carries.
+    ///
+    /// Read in the detached case only, so an attached turn pays nothing for it — the same trade
+    /// [`Self::opens_a_turn`] makes.
+    ///
+    /// The substring is a gate and not the decision: what a line *is* still comes from the parser
+    /// below, and all this says is that a line without those characters in it cannot be one. It
+    /// earns its place because this sits between the CLI's stdout and the channel every turn reads
+    /// from — a second whole-line parse per line, on the one path where added latency shifts which
+    /// side of a turn boundary a line lands on.
+    fn level_in(&self, line: &str) -> Option<Vec<neosh_proto::BackgroundTask>> {
+        self.sink.as_ref()?;
+        if !line.contains("background_tasks_changed") {
+            return None;
+        }
+        crate::sse::background_tasks(&serde_json::from_str::<Value>(line).ok()?)
+    }
+
+    /// Say what is running, when nothing is reading the pipe it was said on.
+    ///
+    /// A turn's `result` is not the end of the process, and a detached shell is the whole reason:
+    /// it finishes minutes later, the CLI says so, and until now the only thing that could carry
+    /// that to the workspace was the turn the CLI usually — but not always — runs at itself
+    /// afterwards. Said here it does not depend on that. The set is a level, so saying it twice is
+    /// saying it once, and the turn loop goes on forwarding its own copy in order.
+    ///
+    /// Nothing is said while somebody is reading, and the check is after the line has gone into the
+    /// pipe so that a turn which attached in between is the one that reports it: two paths into one
+    /// field can arrive out of order, and out of order here means the *older* set wins and the mark
+    /// is wrong until the next change — which, for a conversation nobody goes back to, is forever.
+    fn background(&self, tasks: Vec<neosh_proto::BackgroundTask>) {
+        if self.reading() {
+            return;
+        }
+        if let Some(sink) = &self.sink {
+            sink.background(&self.conversation, tasks);
+        }
+    }
+
+    /// The process is gone, so nothing it was holding is running any more.
+    ///
+    /// Whatever it had reported dies with it: the shells it detached are its children, the account
+    /// of them was only ever in its head, and nothing that comes after can ask. Without this a
+    /// conversation whose CLI was killed — crashed, OOM, `kill -9` — wears a "still working on
+    /// something" mark until somebody happens to send it another message, which for the one it was
+    /// killed in the middle of is exactly the thing they are not about to do.
+    ///
+    /// Said even when the process is being replaced on purpose, where the fresh one says the same
+    /// thing a moment later. Empty twice is empty.
+    fn ended(&self) {
+        if let Some(sink) = &self.sink {
+            sink.background(&self.conversation, Vec::new());
+        }
+    }
+
     /// A turn has begun. Report it if nothing is reading, and otherwise leave the note that
     /// whoever is reading clears by getting to it. See [`Unread`].
     fn began(&self) {
@@ -1325,8 +1380,14 @@ impl Live {
             let mut l = BufReader::new(stdout).lines();
             while let Ok(Some(line)) = l.next_line().await {
                 let opens = watch.opens_a_turn(&line);
+                // Read before the send and reported after it, because the send is what moves the
+                // line and what gives a turn the chance to answer for it instead.
+                let level = watch.level_in(&line);
                 if line_tx.send(line).is_err() {
                     break;
+                }
+                if let Some(tasks) = level {
+                    watch.background(tasks);
                 }
                 // After the send, never before: the workspace answers this by opening a turn to
                 // read, and a turn that arrives before the line it was opened for finds an empty
@@ -1335,6 +1396,8 @@ impl Live {
                     watch.began();
                 }
             }
+            // Stdout closed, which for a process reading stdin forever means the process is over.
+            watch.ended();
         });
 
         Ok(Self {
@@ -1790,6 +1853,7 @@ done
             fn began(&self, _conversation: &SessionId) {
                 self.0.fetch_add(1, Ordering::SeqCst);
             }
+            fn background(&self, _conversation: &SessionId, _tasks: Vec<neosh_proto::BackgroundTask>) {}
         }
 
         let dir = std::env::temp_dir().join(format!("neosh-unprompted-{}", std::process::id()));
