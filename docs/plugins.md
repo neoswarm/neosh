@@ -446,7 +446,7 @@ happens on every cursor move — publish that as an event instead.
 
 ## Building on another plugin
 
-Neovim's `require("nvim-tree.api")`, in two spellings. See ADR 0060.
+Neovim's `require("nvim-tree.api")`, in two spellings. See ADR 0061.
 
 ```ts
 // Typed and free of round trips, for a plugin you `requires` in the manifest. Module-level state
@@ -492,7 +492,7 @@ over a verb the user had already decided to own.
 ## Putting something in somebody else's panel
 
 Four mechanisms, and between them you should not have to fork a bundled plugin to change it. See
-[ADR 0040](adr/0040-a-panel-is-a-surface-not-a-program.md) and ADR 0060.
+[ADR 0040](adr/0040-a-panel-is-a-surface-not-a-program.md) and ADR 0061.
 
 ### Bind a key inside a panel you did not open
 

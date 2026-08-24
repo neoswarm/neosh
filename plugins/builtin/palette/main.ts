@@ -232,6 +232,10 @@ async function showKeys(neosh: Neosh): Promise<void> {
     title: " keys ",
     closeOnBlur: true,
     focusable: true,
+    // Above the panels, because this is asked *from* one. `?` in a panel is the key that answers
+    // "what do the keys here do", and every panel worth asking it in is a float of its own — so at
+    // the default depth the answer opened underneath the question and read as nothing happening.
+    z: 300,
   });
   await neosh.focus.push(win);
 

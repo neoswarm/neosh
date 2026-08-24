@@ -31,6 +31,11 @@ pub struct Services {
     pub may_write_vcs: bool,
     /// Who is calling, for the refusal message.
     pub caller: String,
+    /// Where conversations are written, when they are written anywhere at all.
+    ///
+    /// `None` in a workspace with no state directory — the test harnesses, mostly — and then
+    /// there is nothing on disk to describe, which is an empty answer rather than an error.
+    pub state_dir: Option<PathBuf>,
     /// The plugin boundary, so a permission question can reach whoever answers it.
     pub bridge: StdArc<crate::bridge::ScriptBridge>,
     /// Models discovered from each endpoint this session.
@@ -83,6 +88,23 @@ impl Services {
                 self.caller
             ),
         })
+    }
+
+    // ---- conversations on disk ------------------------------------------
+
+    /// Every conversation in the state directory, loaded or not.
+    ///
+    /// Off the host loop because it parses every file, and off the *async* worker as well: this is
+    /// blocking file work, and a runtime thread sitting in `read_to_string` four hundred times is
+    /// one that is not driving anything else.
+    pub async fn sessions_stored(&self) -> ApiResult {
+        let Some(dir) = self.state_dir.clone() else {
+            return Ok(ApiOk::Sessions { sessions: Vec::new() });
+        };
+        let sessions = tokio::task::spawn_blocking(move || crate::sessions::scan(&dir))
+            .await
+            .map_err(|e| ApiError::Internal { message: e.to_string() })?;
+        Ok(ApiOk::Sessions { sessions })
     }
 
     // ---- git ------------------------------------------------------------

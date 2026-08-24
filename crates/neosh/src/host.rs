@@ -1107,9 +1107,36 @@ impl Host {
                 .get(plugin)
                 .is_some_and(|p| p.contains(&neosh_proto::PluginPermission::VcsWrite)),
             caller: plugin.0.clone(),
+            state_dir: self.state_dir.clone(),
             bridge: self.bridge.clone(),
             model_cache: self.model_cache.clone(),
         }
+    }
+
+    /// Bring a conversation in from disk, if that is where it still is.
+    ///
+    /// `RESTORE_LIMIT` makes the store a *window* onto the sessions directory rather than the whole
+    /// of it: past a few hundred conversations, a perfectly real one is a file and nothing else. So
+    /// every verb that names a conversation — open it, put it back, read it, delete it — asks this
+    /// first, and a conversation you found in the archive behaves like any other instead of
+    /// answering "no such session" to four keys out of five.
+    ///
+    /// A no-op for anything already loaded, which is all of them until somebody goes looking. It
+    /// loads rather than switching: what to do with it afterwards is the caller's, and `switch` on
+    /// something that is merely being read would move the workspace.
+    fn hydrate(&mut self, id: &neosh_proto::SessionId) -> bool {
+        let known = { self.agent.sessions().get(id).is_some() };
+        if known {
+            return true;
+        }
+        let Some(dir) = self.state_dir.clone() else {
+            return false;
+        };
+        let Some(session) = crate::sessions::read(&dir, id) else {
+            return false;
+        };
+        self.agent.sessions().insert(session);
+        true
     }
 
     /// Run a slow call off the host loop, answering the plugin when it finishes.
@@ -1143,6 +1170,7 @@ impl Host {
                 | ApiCall::PathComplete { .. }
                 | ApiCall::AskUser { .. }
                 | ApiCall::UsageHistory { .. }
+                | ApiCall::SessionsStored
         ) {
             return false;
         }
@@ -1861,6 +1889,10 @@ impl Host {
             // rebuilt from the conversation you switched to. Waiting for a model to finish before
             // you may look at something else is the workspace refusing to be a workspace.
             ApiCall::SessionSwitch { session, view } => {
+                // A conversation past the restore cap is a file until somebody asks for it, and
+                // opening one from the archive is exactly that ask. Before the view moves, so the
+                // terminal arrives somewhere that is in the store.
+                self.hydrate(&session);
                 // In the terminal that asked, unless the caller named another. `^T` in one window
                 // must not move the window next door — which is the whole of what independent
                 // views are — and an orchestrator steering somebody else's screen says so.
@@ -1894,6 +1926,27 @@ impl Host {
                 })
             }
             ApiCall::SessionClose { session } => {
+                // A conversation this workspace never loaded is still a conversation.
+                //
+                // `RESTORE_LIMIT` means the store is a window onto the directory rather than the
+                // whole of it, so past a few hundred conversations `close` on a perfectly real one
+                // answered "no such session" — and the archive, which is where anybody would go to
+                // deal with exactly those, had no verb that could touch them. One delete, whether
+                // the store is holding it or only the disk is. Everything below this line is about
+                // a *loaded* conversation: a turn to cancel, a driver to close, a terminal to step
+                // out of. A file has none of that, and no view can be sitting in it.
+                let known = { self.agent.sessions().get(&session).is_some() };
+                if !known {
+                    let Some(dir) = self.state_dir.clone() else {
+                        return Err(ApiError::NotFound { what: format!("session {}", session.0) });
+                    };
+                    if !crate::sessions::stored(&dir, &session) {
+                        return Err(ApiError::NotFound { what: format!("session {}", session.0) });
+                    }
+                    crate::sessions::forget(&dir, &session);
+                    self.vars.forget_session(&session);
+                    return Ok(ApiOk::Unit);
+                }
                 // Closing the conversation you are in has to land you somewhere first, because
                 // afterwards this terminal would name something that is not in the store. Same
                 // line as the archive path below and for the same reason: being unable to delete
@@ -1945,6 +1998,10 @@ impl Host {
             // read, not about the work: it keeps its messages, and it keeps whatever it was in the
             // middle of saying.
             ApiCall::SessionArchive { session, archived } => {
+                // Putting one *back* is the commonest thing done to a conversation the store has
+                // never held: everything past the cap is, by definition, something nobody has
+                // opened lately.
+                self.hydrate(&session);
                 // Archiving the only conversation you have is a reasonable thing to want, and
                 // "there is nowhere to go" is a bad answer to it. Somewhere to go is one line.
                 let leaving = archived && self.step_out_of(&session);
@@ -2001,6 +2058,12 @@ impl Host {
                 Ok(ApiOk::Unit)
             }
             ApiCall::SessionMessages { session } => {
+                // Reading one does not move the workspace, but it does need the conversation in
+                // hand — and an archive that can list something it cannot read is one whose export
+                // and preview verbs fail on exactly the oldest rows.
+                if let Some(id) = session.clone() {
+                    self.hydrate(&id);
+                }
                 let here = self.active_session();
                 let store = self.agent.sessions();
                 let target = store.get(session.as_ref().unwrap_or(&here));
@@ -10833,6 +10896,9 @@ async fn run_slow(svc: Services, call: ApiCall) -> ApiResult {
         ApiCall::UsageHistory { since, until, resolution, time_zone } => {
             svc.usage_history(since, until, resolution, time_zone).await
         }
+        // Off the loop for the same reason git is, and for a reason of its own: the number of
+        // files it reads is exactly the number of conversations somebody has never thrown away.
+        ApiCall::SessionsStored => svc.sessions_stored().await,
         other => Err(ApiError::Internal {
             message: format!("{other:?} is not a background call"),
         }),

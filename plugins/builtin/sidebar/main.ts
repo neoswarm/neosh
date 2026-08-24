@@ -88,8 +88,6 @@ type Target =
   /** The row that opens another directory. A row rather than only a key, because a verb nobody
    * can see is a verb nobody uses. */
   | { kind: "add" }
-  /** The way into what you have put away. Only present when there is something in it. */
-  | { kind: "browse"; count: number }
   /** A row somebody else contributed. `command` runs on `↵`, with `args` as given. */
   | { kind: "custom"; command?: string; args?: string[] }
   /** A conversation on another computer. Addressed as `(node, session)`; the session id alone is
@@ -123,7 +121,7 @@ const POINT_DECORATION = "sidebar.decoration";
  * Published rather than implied: `above`/`below` gave a contributor two slots and no way to land
  * between two of anybody else's sections. A section may also name another section's id.
  */
-const SLOTS = ["projects", "add", "archived"] as const;
+const SLOTS = ["projects", "add"] as const;
 type Slot = (typeof SLOTS)[number];
 
 /** The key a decoration is filed under: what the row is *about*. */
@@ -1210,10 +1208,11 @@ async function registerCommands(w: Wiring): Promise<void> {
   }, { redraw: false });
 
   // ---- doors out of the panel ----
-  await verb(`${NS}.browse`, "a", "What you have archived", async (p) => {
-    await browseArchive(neosh);
-    await p.draw();
-  }, { redraw: false });
+  //
+  // `a` is not here. What you have archived is the `archive` plugin's panel, and the key on these
+  // rows that opens it is an `archive.action` contribution — which is this panel's own extension
+  // point, used by somebody else, rather than a door drawn in by hand. Turn that plugin off and the
+  // key goes with it, instead of pointing at a command that is no longer there.
   await verb(`${NS}.add`, "o", "Add a project", async (p) => {
     await p.leave();
     await neosh.cmd.exec("project.open").catch(() => {});
@@ -1325,12 +1324,6 @@ async function registerCommands(w: Wiring): Promise<void> {
     }, { desc: "Bring an archived conversation back" }),
   );
   w.subscriptions.push(
-    await neosh.cmd.register("session.archived", async (_args, key) => {
-      await browseArchive(neosh);
-      await w.panel(key?.view)?.draw();
-    }, { desc: "Browse what you have archived" }),
-  );
-  w.subscriptions.push(
     await neosh.cmd.register("project.open", async (args) => {
       // Without this, a second project only ever appears by way of a worktree — which makes the
       // whole panel a thread list with extra steps.
@@ -1365,11 +1358,6 @@ async function registerCommands(w: Wiring): Promise<void> {
   await neosh.keymap.set("chat", "<C-t>", "sidebar.focus", { desc: "Projects and conversations" });
   await neosh.keymap.set("chat", "<C-n>", "session.new", { desc: "New conversation" });
   await neosh.keymap.set("chat", "<C-o>", "project.open", { desc: "Add a project" });
-  // The archive is a place you go, not a section you scroll past. It has a key of its own so that
-  // taking it out of the panel does not make it something you have to remember a command for.
-  await neosh.keymap.set("chat", "<C-f>", "session.archived", {
-    desc: "Archived conversations",
-  });
 
   // Watching a conversation on another machine.
   //
@@ -1764,11 +1752,6 @@ async function activateTarget(
     await neosh.cmd.exec("project.open").catch(() => {});
     return;
   }
-  if (target.kind === "browse") {
-    await browseArchive(neosh);
-    await p.draw();
-    return;
-  }
   if (target.kind === "project") {
     // A pinned project with nothing in it yet: `↵` should start something, not fold an empty list.
     // A repository whose conversations are all in its worktrees is not that — the row has children
@@ -1955,99 +1938,6 @@ function atStake(inside: SessionInfo[]): string {
   if (archived === 0) return `All ${inside.length} go from disk.`;
   const live = inside.length - archived;
   return `${live} of them ${live === 1 ? "is" : "are"} still in your list, and all ${inside.length} go from disk.`;
-}
-
-/**
- * What you have put away.
- *
- * A place you go rather than a section you scroll past. The archive used to be four dim rows at the
- * foot of the panel, which is the worst of both: in the way of the list you work in, and too small
- * to actually find anything in once there were twenty of them. As a picker it filters, it says which
- * project each one came from, and the verbs that only make sense here — put it back, or finally
- * throw it away — live on keys here instead of on the everyday list.
- *
- * `↵` restores *and* opens, because opening something you put away is a statement that you want it
- * back: leaving it archived while you work in it would mean the list you look at does not contain
- * the conversation you are in.
- */
-async function browseArchive(neosh: Neosh): Promise<void> {
-  const rows = async (): Promise<PickerItem<SessionInfo>[]> => {
-    const all = await neosh.session
-      .list({ includeArchived: true })
-      .catch(() => [] as SessionInfo[]);
-    const now = Date.now() / 1000;
-    return all
-      .filter((s) => s.archived)
-      // Most recently put away first: the one you want back is usually the one you last regretted.
-      .sort((a, b) => (b.archived_at ?? b.updated_at) - (a.archived_at ?? a.updated_at))
-      .map((s) => {
-        const count = s.message_count;
-        const when = ago(now - (s.archived_at ?? s.updated_at));
-        return {
-          label: clip(s.label, 44),
-          detail: [
-            s.project || basename(s.cwd),
-            `${count} ${count === 1 ? "message" : "messages"}`,
-            when === "" ? "" : `archived ${when}`,
-          ].filter((p) => p !== "").join("  ·  "),
-          // Filtered on but not shown: you look for a conversation by what it was about or which
-          // checkout it was in, and the path is the half of that the label never carries.
-          keywords: s.cwd,
-          value: s,
-        };
-      });
-  };
-
-  const items = await rows();
-  if (items.length === 0) {
-    neosh.notify("nothing is archived — `x` on a conversation puts it here", "info");
-    return;
-  }
-  // Mutated in place rather than rebuilt, because the picker ranks the array it was handed: acting
-  // on a row and saying `reload` is how the list catches up without losing your place in it.
-  const refill = async () => {
-    items.splice(0, items.length, ...(await rows()));
-  };
-
-  const chosen = await picker(neosh, items, {
-    title: "Archived conversations",
-    width: 82,
-    height: 12,
-    placeholder: "nothing archived matches that",
-    hints: "↵ restore   ^U put back   ^X delete   esc close",
-    // Chords, because every bare letter this takes is a letter its filter can never contain — and
-    // both of these are bound elsewhere, so they have to be claimed to arrive at all.
-    ownKeys: ["<C-u>", "<C-x>"],
-    async onKey(key, ctx) {
-      if (key.key.code.kind !== "char" || !key.key.mods.ctrl || key.key.mods.alt) return;
-      const s = ctx.item;
-      if (!s) return "handled";
-      switch (key.key.code.c.toLowerCase()) {
-        // Back in the list, without going there. The difference from `↵`: you are tidying, not
-        // switching, and being thrown into a conversation per row you restore is not tidying.
-        case "u":
-          await setArchived(neosh, s.id, false);
-          await refill();
-          return items.length === 0 ? "close" : "reload";
-        case "x": {
-          if (!(await deleteSession(neosh, s.id))) return "handled";
-          await refill();
-          return items.length === 0 ? "close" : "reload";
-        }
-        default:
-          return;
-      }
-    },
-  });
-  if (chosen === null) return;
-
-  try {
-    await neosh.session.archive(chosen.id, false);
-    await neosh.session.switch(chosen.id);
-    neosh.notify(`restored "${clip(chosen.label, 40)}"`);
-  } catch (e) {
-    neosh.notify(String(e), "warn");
-  }
 }
 
 /**
@@ -2654,7 +2544,6 @@ async function collect(
     .list({ includeArchived: true })
     .catch(() => [] as SessionInfo[]);
   const sessions = all.filter((s) => !s.archived);
-  const archived = all.filter((s) => s.archived);
   const running = sessions.some((s) => s.active_turn);
   const now = Date.now();
   // One list, favourites first. A separate `FAVORITES` section splits a short list in half and
@@ -2761,21 +2650,8 @@ async function collect(
         value: { kind: "add" },
       });
     },
-    archived: () => {
-      // One row, and only while there is something in it. What used to be here was a foldable
-      // section with every archived conversation under it — which put the things you have
-      // finished with in the same column as the things you are working on, and grew without
-      // limit. The point of archiving is that it goes away; a door is the most this panel should
-      // spend on saying where.
-      if (archived.length > 0) {
-        rows.push({
-          text: ` ${opts.ascii ? "-" : "┈"} Archived`,
-          hl: "Sidebar.Dim",
-          right: { text: `${archived.length} `, hl: "Sidebar.Dim" },
-          value: { kind: "browse", count: archived.length },
-        });
-      }
-    },
+    // No `archived` block any more: what you have put away is the archive plugin's panel, and its
+    // row in this column arrives as a `sidebar.section` contribution like any third party's.
   };
 
   // Everything after the last of our own blocks is the panel's foot: rows somebody contributed
@@ -3215,10 +3091,8 @@ function hints(opts: DrawOptions): ListRow<Target>[] {
       // project that outlives its conversations — which is the point of it — has to have a way off.
       ? ["↵ fold   f ★       JK move", "n new    y path     X remove  ? keys"]
       : kind === "session"
-        ? ["↵ open   r rename   x archive", "X delete y path     a archive  ? keys"]
-        : kind === "browse"
-          ? ["↵ what you have put away", "? keys"]
-          : ["↵ add project    a archive", "esc back         ? keys"];
+        ? ["↵ open   r rename   x archive", "X delete y path     ? keys"]
+        : ["↵ add project", "esc back         ? keys"];
 
   // Contributed verbs get their own line rather than being squeezed onto ours, because ours are
   // laid out in columns that a third party's label of unknown length would break — and because a
@@ -3246,8 +3120,19 @@ function hints(opts: DrawOptions): ListRow<Target>[] {
 function contributedHint(opts: DrawOptions): string {
   const applicable = opts.actions.filter((a) => applies(a.on ?? "any", opts.selected));
   if (applicable.length === 0) return "";
+  // The verbs about *this row* first, then the ones about any of them.
+  //
+  // One line, in a column that is 34 wide by default, and a third plugin's verb is what takes it
+  // past the edge. Which one gets clipped is therefore a decision this makes rather than one the
+  // order plugins happened to load in makes for it — and a key that only applies to the row you are
+  // standing on is the one that has to survive: a verb about every row is a verb you will see again
+  // the moment you move.
+  const ranked = [
+    ...applicable.filter((a) => (a.on ?? "any") !== "any"),
+    ...applicable.filter((a) => (a.on ?? "any") === "any"),
+  ];
   return clip(
-    applicable.map((a) => `${a.key} ${a.label}`).join("   "),
+    ranked.map((a) => `${a.key} ${a.label}`).join("   "),
     Math.max(4, opts.width - 2),
   );
 }

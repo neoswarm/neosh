@@ -1,4 +1,4 @@
-# 0060 — A plugin can build on a plugin
+# 0061 — A plugin can build on a plugin
 
 **Status:** accepted
 
