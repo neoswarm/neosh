@@ -331,6 +331,40 @@ fn activity(a: Activity) -> ProviderEvent {
     ProviderEvent::Activity { activity: a }
 }
 
+/// The live set of background tasks off a `background_tasks_changed` line, if that is what it is.
+///
+/// Public because there are two readers of this one line and they must not answer it differently:
+/// the turn loop, which forwards it as an event, and the reader that watches the pipe *between*
+/// turns and has no turn to forward anything on. A second reading of the same JSON is a second
+/// answer waiting to drift from the first.
+///
+/// An absent `tasks` is `None` and not an empty set: a line we cannot read says nothing rather than
+/// claiming that nothing is running.
+pub fn background_tasks(v: &Value) -> Option<Vec<BackgroundTask>> {
+    if v.get("type").and_then(Value::as_str) != Some("system")
+        || v.get("subtype").and_then(Value::as_str) != Some("background_tasks_changed")
+    {
+        return None;
+    }
+    Some(
+        v.get("tasks")?
+            .as_array()?
+            .iter()
+            .filter_map(|t| {
+                Some(BackgroundTask {
+                    id: TaskId(t.get("task_id").and_then(Value::as_str)?.to_string()),
+                    title: t
+                        .get("description")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string(),
+                    kind: t.get("task_type").and_then(Value::as_str).map(str::to_string),
+                })
+            })
+            .collect(),
+    )
+}
+
 /// The `{"type":"system"}` families — everything the CLI says about its own loop rather than about
 /// the message it is producing.
 ///
@@ -423,24 +457,10 @@ fn system_line(v: &Value, state: &mut ClaudeState) -> Vec<ProviderEvent> {
         //
         // An absent `tasks` is not an empty one: a line we cannot read says nothing rather than
         // claiming the set is empty.
-        Some("background_tasks_changed") => {
-            let Some(tasks) = v.get("tasks").and_then(Value::as_array) else { return Vec::new() };
-            let tasks = tasks
-                .iter()
-                .filter_map(|t| {
-                    Some(BackgroundTask {
-                        id: TaskId(t.get("task_id").and_then(Value::as_str)?.to_string()),
-                        title: t
-                            .get("description")
-                            .and_then(Value::as_str)
-                            .unwrap_or_default()
-                            .to_string(),
-                        kind: t.get("task_type").and_then(Value::as_str).map(str::to_string),
-                    })
-                })
-                .collect();
-            vec![activity(Activity::Background { tasks })]
-        }
+        Some("background_tasks_changed") => match background_tasks(v) {
+            Some(tasks) => vec![activity(Activity::Background { tasks })],
+            None => Vec::new(),
+        },
         // A request that failed with something retryable, and the wait before it is tried again.
         //
         // The single worst-looking thing a vendor CLI does: a 529 costs several silent minutes with

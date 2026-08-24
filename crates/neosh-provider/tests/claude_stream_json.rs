@@ -356,3 +356,152 @@ async fn a_request_to_leave_plan_mode_is_answered_rather_than_dropped() {
         "a control request nothing understood was dropped instead of refused"
     );
 }
+
+/// A `claude` that reports a finished background task and then says nothing else at all.
+///
+/// The half [`CHATTY`] does not cover, and the one the indicator's correctness cannot rest on the
+/// absence of. There, the CLI follows the empty set with a turn of its own — an `init`, a sentence,
+/// a `result` — and it is that `init` the workspace wakes for. Here there is no turn: the set moves
+/// and nothing is said about it, which is what a task the agent has nothing to add about looks
+/// like, and what a process that is about to exit looks like.
+///
+/// A second turn is never asked for, on purpose: waiting for one is exactly the bug. The
+/// conversation this happened in may be one nobody opens again for a week.
+const QUIET: &str = r#"#!/bin/sh
+say() { printf '%s\n' "$1"; }
+while IFS= read -r line; do
+  case "$line" in
+    *'"subtype":"get_context_usage"'*)
+      say '{"type":"control_response","response":{"subtype":"success","request_id":"x","response":{"totalTokens":10,"maxTokens":100}}}' ;;
+    *'"type":"user"'*)
+      say '{"type":"system","subtype":"background_tasks_changed","tasks":[{"task_id":"bq1","task_type":"local_bash","description":"npm run build"}]}'
+      say '{"type":"stream_event","session_id":"s","event":{"type":"message_start","message":{"model":"m","usage":{}}}}'
+      say '{"type":"stream_event","session_id":"s","event":{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}}'
+      say '{"type":"stream_event","session_id":"s","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"STARTED"}}}'
+      say '{"type":"stream_event","session_id":"s","event":{"type":"content_block_stop","index":0}}'
+      say '{"type":"stream_event","session_id":"s","event":{"type":"message_stop"}}'
+      say '{"type":"result","subtype":"success","is_error":false,"result":"STARTED","session_id":"s"}'
+      # The shell exits well after the turn was read to its end, and the CLI has nothing to say
+      # about it beyond the fact itself.
+      (
+        sleep 1
+        say '{"type":"system","subtype":"background_tasks_changed","tasks":[]}'
+        say '{"type":"system","subtype":"task_updated","task_id":"bq1","patch":{"status":"completed"}}'
+      ) &
+      ;;
+  esac
+done
+"#;
+
+/// A `claude` that starts something in the background and is then killed.
+///
+/// Nothing it was holding survives it: the shells were its children and the account of them was
+/// only ever in its head. It exits without a word, which is what a crash, an OOM kill and a
+/// `kill -9` all look like from here.
+const DOOMED: &str = r#"#!/bin/sh
+say() { printf '%s\n' "$1"; }
+while IFS= read -r line; do
+  case "$line" in
+    *'"subtype":"get_context_usage"'*)
+      say '{"type":"control_response","response":{"subtype":"success","request_id":"x","response":{"totalTokens":10,"maxTokens":100}}}' ;;
+    *'"type":"user"'*)
+      say '{"type":"system","subtype":"background_tasks_changed","tasks":[{"task_id":"bd1","task_type":"local_bash","description":"npm run build"}]}'
+      say '{"type":"stream_event","session_id":"s","event":{"type":"message_start","message":{"model":"m","usage":{}}}}'
+      say '{"type":"stream_event","session_id":"s","event":{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}}'
+      say '{"type":"stream_event","session_id":"s","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"STARTED"}}}'
+      say '{"type":"stream_event","session_id":"s","event":{"type":"content_block_stop","index":0}}'
+      say '{"type":"stream_event","session_id":"s","event":{"type":"message_stop"}}'
+      say '{"type":"result","subtype":"success","is_error":false,"result":"STARTED","session_id":"s"}'
+      (sleep 1; kill -9 $$) &
+      ;;
+  esac
+done
+"#;
+
+/// Everything the driver said about a conversation while no turn was reading it.
+#[derive(Debug, Default)]
+struct Heard(std::sync::Mutex<Vec<Vec<neosh_proto::BackgroundTask>>>);
+
+impl neosh_provider::drivers::Unasked for Heard {
+    fn began(&self, _conversation: &SessionId) {}
+    fn background(&self, _conversation: &SessionId, tasks: Vec<neosh_proto::BackgroundTask>) {
+        self.0.lock().expect("heard lock poisoned").push(tasks);
+    }
+}
+
+impl Heard {
+    /// Wait for the driver to say that nothing is running, and answer whether it ever did.
+    async fn saw_empty(&self, within: std::time::Duration) -> bool {
+        let deadline = tokio::time::Instant::now() + within;
+        while tokio::time::Instant::now() < deadline {
+            if self.0.lock().expect("heard lock poisoned").iter().any(Vec::is_empty) {
+                return true;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        false
+    }
+}
+
+fn heard_by(p: &ClaudeCliProvider) -> std::sync::Arc<Heard> {
+    let heard = std::sync::Arc::new(Heard::default());
+    neosh_provider::drivers::AgentDriver::set_unasked(p, heard.clone());
+    heard
+}
+
+/// The mark comes off without waiting for the agent to have an opinion about it.
+///
+/// A backgrounded shell finishes long after the turn that started it stopped being read, and the
+/// only thing on that pipe is a reader nothing was consuming. Until this, the news reached the
+/// workspace only when the CLI went on to *run a turn about it* — which it usually does, and which
+/// is not a thing to make a row's correctness depend on. Nobody sends a second message here: doing
+/// that is what used to be required, and a conversation nobody opens again keeps a "still working
+/// on something" mark for as long as the workspace lives.
+#[tokio::test]
+async fn a_background_task_that_ends_quietly_still_puts_the_mark_out() {
+    let fake = Fake::running("quiet", QUIET);
+    let p = ClaudeCliProvider::new(fake.program());
+    let heard = heard_by(&p);
+
+    let first: Vec<ProviderEvent> =
+        p.stream(&inst(), req(&fake.dir, "one"), CancellationToken::new()).collect().await;
+    assert!(text_of(&first).contains("STARTED"));
+    assert_eq!(
+        sets_of(&first).last().map(Vec::len),
+        Some(1),
+        "the turn ends knowing one thing is still going"
+    );
+
+    assert!(
+        heard.saw_empty(std::time::Duration::from_secs(5)).await,
+        "the shell finished and nothing ever said so: {:?}",
+        heard.0.lock().expect("heard lock poisoned")
+    );
+}
+
+/// A conversation whose CLI died is a conversation running nothing.
+///
+/// The process was the only thing that knew what it had detached, so its exit is the last word on
+/// the subject. Without this the row keeps the mark until somebody sends that conversation another
+/// message — and the conversation it was killed in the middle of is the one they are least likely
+/// to.
+#[tokio::test]
+async fn a_cli_that_dies_is_no_longer_running_anything() {
+    let fake = Fake::running("doomed", DOOMED);
+    let p = ClaudeCliProvider::new(fake.program());
+    let heard = heard_by(&p);
+
+    let first: Vec<ProviderEvent> =
+        p.stream(&inst(), req(&fake.dir, "one"), CancellationToken::new()).collect().await;
+    assert_eq!(
+        sets_of(&first).last().map(Vec::len),
+        Some(1),
+        "the turn ends knowing one thing is still going"
+    );
+
+    assert!(
+        heard.saw_empty(std::time::Duration::from_secs(5)).await,
+        "the process died holding a task nothing ever took back: {:?}",
+        heard.0.lock().expect("heard lock poisoned")
+    );
+}

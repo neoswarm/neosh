@@ -629,8 +629,8 @@ pub struct Host {
     /// Out of band, like the quota poll and for the same reason: it is news from a driver that
     /// arrives when no turn is running, so there is no stream for it to come back on. See
     /// [`neosh_provider::drivers::Unasked`] and ADR 0056.
-    unasked_rx: Option<tokio::sync::mpsc::UnboundedReceiver<neosh_proto::SessionId>>,
-    unasked_tx: tokio::sync::mpsc::UnboundedSender<neosh_proto::SessionId>,
+    unasked_rx: Option<tokio::sync::mpsc::UnboundedReceiver<Unheard>>,
+    unasked_tx: tokio::sync::mpsc::UnboundedSender<Unheard>,
     /// Set by a turn ending, cleared by the poll that follows it. See [`crate::quota::AFTER_TURN`].
     quota_due: bool,
     /// Conversations that were blocked on an answer as of the last `question.asking`.
@@ -7781,26 +7781,16 @@ impl Host {
             // away when the turn ends, and a shell that was put in the background is still running
             // after that.
             Activity::Background { tasks } => {
-                // `if let` and not `let ... else`: the temporary `sessions()` hands back does not
-                // outlive a `let`-else, and the borrow it yields is what is being written through.
-                let changed = if let Some(s) = self.agent.sessions().get_mut(&session) {
-                    let changed = s.background != tasks;
-                    s.background = tasks;
-                    changed
-                } else {
-                    return;
-                };
-                if !changed {
-                    return;
+                if self.take_background(&session, tasks) {
+                    // Nothing else is broadcast here: the activity itself already went out to every
+                    // plugin above, and that is the signal that means what it means.
+                    // `SessionChanged` means the conversation you are *in* changed, and borrowing
+                    // it to say "a row's state moved" would have every listener refreshing a footer
+                    // about a conversation nobody switched to.
+                    self.each_view_showing(&session, |me| {
+                        me.redraw_footer();
+                    });
                 }
-                // Nothing else is broadcast here: the activity itself already went out to every
-                // plugin above, and that is the signal that means what it means. `SessionChanged`
-                // means the conversation you are *in* changed, and borrowing it to say "a row's
-                // state moved" would have every listener refreshing a footer about a conversation
-                // nobody switched to.
-                self.each_view_showing(&session, |me| {
-                    me.redraw_footer();
-                });
             }
             Activity::TaskEnded { task, status, .. } => {
                 let Some(r) = self.rounds.get_mut(&session) else { return };
@@ -8325,6 +8315,66 @@ impl Host {
         true
     }
 
+    /// Write down what a conversation is still running, and say whether that is news.
+    ///
+    /// A **level**: the whole set replaces the whole set, and empty means nothing is running rather
+    /// than nothing was said. On the conversation and not the round, which is the entire point —
+    /// the round is thrown away when the turn ends, and a shell that was put in the background is
+    /// still running after that. See [`neosh_proto::Activity::Background`].
+    fn take_background(
+        &mut self,
+        session: &neosh_proto::SessionId,
+        tasks: Vec<neosh_proto::BackgroundTask>,
+    ) -> bool {
+        // `if let` and not `let ... else`: the temporary `sessions()` hands back does not outlive a
+        // `let`-else, and the borrow it yields is what is being written through.
+        if let Some(s) = self.agent.sessions().get_mut(session) {
+            let changed = s.background != tasks;
+            s.background = tasks;
+            changed
+        } else {
+            false
+        }
+    }
+
+    /// What is running in a conversation that has no turn in it.
+    ///
+    /// Between turns there is no stream for this to arrive on, and between turns is exactly when it
+    /// changes: a detached shell finishes long after the turn that started it was read to its end.
+    /// See [`neosh_provider::drivers::Unasked::background`].
+    ///
+    /// Declined while a turn is running, and that is not belt-and-braces. The driver only speaks
+    /// here when nothing is reading, but a turn can attach in the gap between it deciding that and
+    /// this being handled — and then the level queued a moment ago would land on top of the one the
+    /// turn has already forwarded. A running turn is reading that pipe and reports the set itself,
+    /// in order, so there is nothing to lose by leaving it to.
+    fn heard_background(
+        &mut self,
+        session: neosh_proto::SessionId,
+        tasks: Vec<neosh_proto::BackgroundTask>,
+    ) {
+        if self.turns.contains_key(&session) {
+            return;
+        }
+        if !self.take_background(&session, tasks.clone()) {
+            return;
+        }
+        // The same event a turn would have carried, to the same listeners. A plugin drawing a row
+        // about this has no way to tell — and no reason to care — whether a turn happened to be
+        // running when the set moved.
+        self.bridge.broadcast(PluginEvent::Activity {
+            session: session.clone(),
+            turn: neosh_proto::TurnId::default(),
+            activity: neosh_proto::Activity::Background { tasks },
+        });
+        // Every terminal looking at this conversation, not the one that happens to be first: a
+        // conversation can be on screen in several at once, and a footer redrawn in one of them is
+        // the other ones still saying it is working on something. See ADR 0042.
+        self.each_view_showing(&session, |me| {
+            me.redraw_footer();
+        });
+    }
+
     /// Open a turn to hold something the agent has already started saying.
     ///
     /// A backgrounded command finishing is a message `claude` enqueues to itself and answers, and
@@ -8481,13 +8531,16 @@ impl Host {
                         self.drain_effects();
                     }
                 }
-                Some(session) = async {
+                Some(unheard) = async {
                     match unasked_rx.as_mut() {
                         Some(rx) => rx.recv().await,
                         // Never ready, rather than ready-with-nothing: the latter would spin.
                         None => std::future::pending().await,
                     }
-                } => self.hear_out(session),
+                } => match unheard {
+                    Unheard::Began(session) => self.hear_out(session),
+                    Unheard::Background(session, tasks) => self.heard_background(session, tasks),
+                },
                 Some(polled) = async {
                     match quota_rx.as_mut() {
                         Some(rx) => rx.recv().await,
@@ -10249,14 +10302,35 @@ pub fn install_builtin_providers(
 /// A channel rather than a call into the host: this arrives from a reader task on a driver's own
 /// thread, and the host is a single writer that owns everything it would have to touch.
 #[derive(Debug)]
-struct UnaskedSink(tokio::sync::mpsc::UnboundedSender<neosh_proto::SessionId>);
+struct UnaskedSink(tokio::sync::mpsc::UnboundedSender<Unheard>);
 
 impl neosh_provider::drivers::Unasked for UnaskedSink {
     fn began(&self, conversation: &neosh_proto::SessionId) {
         // A closed channel is a workspace that has stopped. Nothing to report it to, and nothing
         // to be done about it.
-        let _ = self.0.send(conversation.clone());
+        let _ = self.0.send(Unheard::Began(conversation.clone()));
     }
+
+    fn background(
+        &self,
+        conversation: &neosh_proto::SessionId,
+        tasks: Vec<neosh_proto::BackgroundTask>,
+    ) {
+        let _ = self.0.send(Unheard::Background(conversation.clone(), tasks));
+    }
+}
+
+/// What a driver says about a conversation when no turn is running in it.
+///
+/// Both arrive from a reader task on the driver's own thread, and the host is a single writer that
+/// owns everything either of them would have to touch — so they come down a channel rather than
+/// through a call. See [`neosh_provider::drivers::Unasked`] and ADR 0056.
+#[derive(Debug)]
+enum Unheard {
+    /// The agent has started saying something nobody asked for, and needs a turn to say it in.
+    Began(neosh_proto::SessionId),
+    /// Everything still running there that no turn is waiting for, whole.
+    Background(neosh_proto::SessionId, Vec<neosh_proto::BackgroundTask>),
 }
 
 /// Route one slow call to its service.
