@@ -355,22 +355,47 @@ fn money(v: Option<&Value>) -> Option<String> {
     })
 }
 
+/// How full a window has to be for `allowed_warning` to be taken at its word.
+///
+/// Seventy percent, which is the figure the vendor's own client uses for the same decision on the
+/// same field. It is not a threshold of ours in the sense the doc on [`QuotaSeverity`] warns about
+/// — it is not deciding *when to worry*, it is deciding whether the flag beside the number is
+/// about the number or is left over from before the last reset.
+const CLAUDE_WARNING_THRESHOLD: f64 = 70.0;
+
 /// One `rate_limit_event` line of `claude --output-format stream-json`.
 ///
 /// A much thinner shape than the endpoint's: one window, the one that is closest to binding, with
 /// no scope and no idea what the others are at. So it *patches* rather than replaces — see
 /// [`Quota::is_empty`] and the store that applies it. It is worth having anyway, because it is the
 /// only figure that moves during the twenty minutes an agent driver can spend on one turn.
+///
+/// **Its `utilization` is a fraction, and the endpoint's is a percentage.** The same word, two
+/// scales, one type away from each other: `SDKRateLimitInfoSchema` carries the number the CLI read
+/// off an `anthropic-ratelimit-unified-*-utilization` response header, which is `0.56` for
+/// fifty-six percent — the vendor multiplies by a hundred at every use of it and compares it to a
+/// `0.7` threshold — while `/api/oauth/usage` answers with `percent` and a legacy `utilization`
+/// that are both already out of a hundred. Read as a percentage, a weekly limit at 56% patched the
+/// polled snapshot down to `0.56`, which is `1%` in the sidebar and `99% left` under it, and stayed
+/// that way until the next poll replaced it — which is what made opening the panel look like the
+/// thing that fixed it. It also meant the grade below was computed from a number that can never
+/// reach [`QuotaSeverity::Warn`], so nothing mid-turn ever crossed a threshold on its own.
 pub fn parse_claude_rate_limit_event(info: &Value) -> Quota {
     let Some(kind) = info.get("rateLimitType").and_then(Value::as_str) else {
         return Quota::default();
     };
-    let Some(pct) = info.get("utilization").and_then(Value::as_f64) else {
+    let Some(pct) = info.get("utilization").and_then(Value::as_f64).map(|u| u * 100.0) else {
         return Quota::default();
     };
+    // `allowed_warning` is only worth believing once the number agrees with it. The vendor's own
+    // client discards it below seventy percent and says why: the endpoint sends `allowed_warning`
+    // with stale data for a while after a window resets, so an account four percent into a fresh
+    // week gets told it is nearly out. Graded straight through, that is a red row and a
+    // notification about a limit that is further away than it has been all week — and `Critical`
+    // is the grade the strip spends its loudest colour on.
     let severity = match info.get("status").and_then(Value::as_str) {
         Some("rejected") => QuotaSeverity::Exhausted,
-        Some("allowed_warning") => QuotaSeverity::Critical,
+        Some("allowed_warning") if pct >= CLAUDE_WARNING_THRESHOLD => QuotaSeverity::Critical,
         _ => QuotaSeverity::of(pct as f32),
     };
     let window = QuotaWindow {
@@ -752,7 +777,7 @@ mod tests {
     fn a_rate_limit_event_carries_the_window_that_binds() {
         let info = serde_json::json!({
             "status": "allowed_warning", "rateLimitType": "seven_day",
-            "utilization": 91.0, "resetsAt": 1_787_400_000_i64,
+            "utilization": 0.91, "resetsAt": 1_787_400_000_i64,
         });
         let q = parse_claude_rate_limit_event(&info);
         assert_eq!(q.windows.len(), 1);
@@ -761,6 +786,89 @@ mod tests {
         assert!(q.windows[0].active);
         assert_eq!(q.windows[0].severity, QuotaSeverity::Critical);
         assert_eq!(q.windows[0].resets_at, Some(1_787_400_000));
+    }
+
+    /// The scale, on its own, because it is the whole bug and it is invisible in every other
+    /// assertion here: a mid-turn line says `0.56` where the endpoint says `56`.
+    #[test]
+    fn a_rate_limit_events_utilization_is_a_fraction() {
+        let info = serde_json::json!({ "rateLimitType": "seven_day", "utilization": 0.56 });
+        let q = parse_claude_rate_limit_event(&info);
+        assert_eq!(q.windows[0].used_percent, 56.0);
+        // And the grade comes off the same number, so it moves with it. Read as a percentage this
+        // was `Normal` at every value a fraction can take.
+        assert_eq!(q.windows[0].severity, QuotaSeverity::Normal);
+
+        let hot = serde_json::json!({ "rateLimitType": "five_hour", "utilization": 0.94 });
+        let q = parse_claude_rate_limit_event(&hot);
+        assert_eq!(q.windows[0].used_percent, 94.0);
+        assert_eq!(q.windows[0].severity, QuotaSeverity::Critical);
+    }
+
+    /// `allowed_warning` arriving on a window that is nowhere near full, which is what the endpoint
+    /// sends for a while after a reset. Graded on the flag alone this was a red row and a
+    /// notification about the emptiest allowance of the week.
+    #[test]
+    fn a_stale_warning_flag_does_not_outrank_the_number_beside_it() {
+        let stale = serde_json::json!({
+            "status": "allowed_warning", "rateLimitType": "seven_day", "utilization": 0.04,
+        });
+        assert_eq!(parse_claude_rate_limit_event(&stale).windows[0].severity, QuotaSeverity::Normal);
+
+        // At the threshold and above it, the flag is about the number and is believed — including
+        // where the number on its own would only have been `Warn`.
+        let real = serde_json::json!({
+            "status": "allowed_warning", "rateLimitType": "seven_day", "utilization": 0.7,
+        });
+        assert_eq!(
+            parse_claude_rate_limit_event(&real).windows[0].severity,
+            QuotaSeverity::Critical,
+        );
+
+        // `rejected` is never second-guessed: it is not a prediction, it is a refusal that already
+        // happened.
+        let out = serde_json::json!({
+            "status": "rejected", "rateLimitType": "seven_day", "utilization": 0.0,
+        });
+        assert_eq!(
+            parse_claude_rate_limit_event(&out).windows[0].severity,
+            QuotaSeverity::Exhausted,
+        );
+    }
+
+    /// The other side of the same coin, and the reason the two spellings are not interchangeable:
+    /// the endpoint's numbers are already out of a hundred, in both of its shapes.
+    #[test]
+    fn the_endpoints_percentages_are_left_alone() {
+        let limits = serde_json::json!({
+            "limits": [{ "kind": "weekly_all", "percent": 56.0 }],
+        });
+        assert_eq!(parse_claude_usage(&limits).windows[0].used_percent, 56.0);
+
+        let legacy = serde_json::json!({ "seven_day": { "utilization": 56.0 } });
+        assert_eq!(parse_claude_usage(&legacy).windows[0].used_percent, 56.0);
+    }
+
+    /// The two arriving one after the other, which is the sequence that was on screen: a poll, then
+    /// a turn moving the window it happens to be about. Patched by id, so the fixed scale is what
+    /// decides whether the row goes up by a point or falls off the bottom of the gauge.
+    #[test]
+    fn a_turn_patch_lands_on_the_same_scale_as_the_poll_it_patches() {
+        let polled = parse_claude_usage(&serde_json::json!({
+            "limits": [
+                { "kind": "session", "percent": 9.0 },
+                { "kind": "weekly_all", "percent": 56.0 },
+            ],
+        }));
+        let event = parse_claude_rate_limit_event(
+            &serde_json::json!({ "rateLimitType": "seven_day", "utilization": 0.57 }),
+        );
+        assert_eq!(polled.windows.len(), 2);
+        assert_eq!(event.windows[0].id, polled.windows[1].id);
+        assert!(
+            event.windows[0].used_percent > polled.windows[1].used_percent,
+            "a turn spends an allowance, so the patch has to read higher than the poll before it",
+        );
     }
 
     /// `status: allowed` with no type at all, which is what the line looks like before anything has

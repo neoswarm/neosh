@@ -505,3 +505,61 @@ async fn a_cli_that_dies_is_no_longer_running_anything() {
         heard.0.lock().expect("heard lock poisoned")
     );
 }
+
+/// A `claude` that reports a limit in the middle of an answer, the way the real one does.
+///
+/// The line is copied from a live run — `utilization` is the fraction the CLI carries, not the
+/// percentage `/api/oauth/usage` answers with — because the two are one field name apart and
+/// nothing downstream of the parse can tell which scale it was handed. End to end rather than only
+/// in the parser: this is the path a real turn takes, and the bug it pins was one where every unit
+/// test still passed while the sidebar read `1%`.
+const METERED: &str = r#"#!/bin/sh
+say() { printf '%s\n' "$1"; }
+while IFS= read -r line; do
+  case "$line" in
+    *'"type":"user"'*)
+      say '{"type":"stream_event","session_id":"s","event":{"type":"message_start","message":{"model":"m","usage":{}}}}'
+      say '{"type":"rate_limit_event","rate_limit_info":{"status":"allowed_warning","unifiedRateLimitFallbackAvailable":false,"rateLimitType":"seven_day","utilization":0.56,"resetsAt":1787965200}}'
+      say '{"type":"stream_event","session_id":"s","event":{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}}'
+      say '{"type":"stream_event","session_id":"s","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"METERED"}}}'
+      say '{"type":"stream_event","session_id":"s","event":{"type":"content_block_stop","index":0}}'
+      say '{"type":"stream_event","session_id":"s","event":{"type":"message_stop"}}'
+      say '{"type":"result","subtype":"success","is_error":false,"result":"METERED","session_id":"s"}' ;;
+  esac
+done
+"#;
+
+#[tokio::test]
+async fn a_limit_reported_mid_turn_arrives_on_the_scale_the_gauges_are_drawn_in() {
+    use neosh_proto::provider::Activity;
+
+    let fake = Fake::running("metered", METERED);
+    let p = ClaudeCliProvider::new(fake.program());
+    let events: Vec<ProviderEvent> =
+        p.stream(&inst(), req(&fake.dir, "one"), CancellationToken::new()).collect().await;
+
+    assert!(text_of(&events).contains("METERED"), "the answer still arrives: {events:?}");
+
+    let quotas: Vec<&Activity> = events
+        .iter()
+        .filter_map(|e| match e {
+            ProviderEvent::Activity { activity } => Some(activity),
+            _ => None,
+        })
+        .filter(|a| matches!(a, Activity::Quota { .. }))
+        .collect();
+    let [Activity::Quota { windows, .. }] = quotas[..] else {
+        panic!("one report of what the plan has left, got {quotas:?}")
+    };
+    assert_eq!(windows.len(), 1, "one window, patched over the rest rather than replacing them");
+    assert_eq!(windows[0].id, "weekly");
+    assert_eq!(
+        windows[0].used_percent, 56.0,
+        "fifty-six percent, not the `0.56` that reads as `1%` beside a polled `9%` session",
+    );
+    assert_eq!(
+        windows[0].severity,
+        neosh_proto::quota::QuotaSeverity::Normal,
+        "and a warning flag left over from before the reset does not outrank the number",
+    );
+}
