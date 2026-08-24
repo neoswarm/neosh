@@ -83,13 +83,15 @@ struct Roles {
     /// The favourite marker. Not a state hue: the star glyph carries the whole meaning, and a
     /// favourite is not a condition the workspace is in — it is a thing you said about a project.
     ///
-    /// Red, and therefore next door to `danger`, which is the obvious objection and is answered
-    /// the same way the old amber answered its collision with `attention`: these are told apart by
-    /// **shape**, never by hue. `danger` is only ever a `✗`, a word or a whole row it has taken
-    /// over; this is only ever the `★` after a project's name in the sidebar, and nothing else in
-    /// the workspace draws a star. It is also the more saturated of the two in both themes — the
-    /// error red is deliberately pale on dark and dark on light, because it lands on text you
-    /// still have to read, and this lands on one glyph that is nothing but itself.
+    /// Gold, because a star is gold everywhere else a star means this and a colour you have to
+    /// learn is a colour that is doing no work. That puts it next door to `attention`, which is
+    /// the obvious objection and is answered by **shape**, never by hue: `attention` in this panel
+    /// is a `●` or a `?` in the right-hand column, and this is only ever the `★` attached to a
+    /// project's name — nothing else in the workspace draws a star. The two are a step apart in
+    /// saturation as well as in shape, deliberately in opposite directions in the two themes: the
+    /// warning amber is pale on dark and deep on light because it lands on text you still have to
+    /// read, and this is the deeper of the two on dark and the deeper on light too, because it
+    /// lands on one glyph that is nothing but itself.
     favorite: Color,
     /// The faces of the logo, top row first: bright at the lit edge, falling away downward.
     logo: [Color; 6],
@@ -138,7 +140,7 @@ const DARK: Roles = Roles {
     success: rgb(0x6e, 0xe7, 0xb7),
     plan: rgb(0xc4, 0xb5, 0xfd),
     accent: rgb(0xa5, 0xb4, 0xfc),
-    favorite: rgb(0xef, 0x44, 0x44),
+    favorite: rgb(0xf5, 0x9e, 0x0b),
     logo: [
         rgb(0xf8, 0xfa, 0xfc),
         rgb(0xe2, 0xe8, 0xf0),
@@ -175,7 +177,7 @@ const LIGHT: Roles = Roles {
     success: rgb(0x05, 0x96, 0x69),
     plan: rgb(0x7c, 0x3a, 0xed),
     accent: rgb(0x4f, 0x46, 0xe5),
-    favorite: rgb(0xdc, 0x26, 0x26),
+    favorite: rgb(0xb4, 0x53, 0x09),
     // Reversed against a light background: the lit edge is the dark one, as a steel letter on
     // paper is darkest where it stands up.
     logo: [
