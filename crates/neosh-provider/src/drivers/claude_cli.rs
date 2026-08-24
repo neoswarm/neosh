@@ -1233,8 +1233,17 @@ impl Watch {
     ///
     /// Read in the detached case only, so an attached turn pays nothing for it — the same trade
     /// [`Self::opens_a_turn`] makes.
+    ///
+    /// The substring is a gate and not the decision: what a line *is* still comes from the parser
+    /// below, and all this says is that a line without those characters in it cannot be one. It
+    /// earns its place because this sits between the CLI's stdout and the channel every turn reads
+    /// from — a second whole-line parse per line, on the one path where added latency shifts which
+    /// side of a turn boundary a line lands on.
     fn level_in(&self, line: &str) -> Option<Vec<neosh_proto::BackgroundTask>> {
         self.sink.as_ref()?;
+        if !line.contains("background_tasks_changed") {
+            return None;
+        }
         crate::sse::background_tasks(&serde_json::from_str::<Value>(line).ok()?)
     }
 
