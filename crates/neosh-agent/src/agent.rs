@@ -18,8 +18,8 @@ use std::sync::Arc;
 use futures::StreamExt;
 use neosh_proto::{
     Activity, ContentBlock, HookName, HookOutcome, HookPayload, Message, MessageLevel,
-    ModelSelection, Role, SessionId, StopReason, ToolCall, ToolCallId, ToolResult, TurnId,
-    TurnRequest, Usage,
+    ModelSelection, ProviderEvent, Role, SessionId, StopReason, ToolCall, ToolCallId, ToolResult,
+    TurnId, TurnRequest, Usage,
 };
 use neosh_provider::ProviderRegistry;
 use tokio::sync::mpsc;
@@ -749,8 +749,9 @@ impl Agent {
             // difference between a transcript that says what is going on and one that catches up
             // at the end. Kept so a result can be matched back to the call it answers.
             let reporting = provider.delegates_agent_loop();
-            let mut announced: std::collections::HashMap<ToolCallId, ToolCall> =
-                std::collections::HashMap::new();
+            // In the order they were announced, because that is the order they are closed out in
+            // if the stream ends before they come back. See below `drop(stream)`.
+            let mut announced: Vec<ToolCall> = Vec::new();
 
             loop {
                 let next = tokio::select! {
@@ -784,7 +785,7 @@ impl Agent {
                         TurnUpdate::ToolReady { id, name, input } if reporting => {
                             let call =
                                 ToolCall { id: id.clone(), turn: turn.clone(), name, input };
-                            announced.insert(id, call.clone());
+                            announced.push(call.clone());
                             self.emit(AgentEvent::ToolStarted {
                                 session: session.clone(),
                                 turn: turn.clone(),
@@ -794,7 +795,8 @@ impl Agent {
                         TurnUpdate::ToolResult { id, content, is_error } => {
                             // Only a delegating driver sends these; our own tools report through
                             // `run_tool`, which knows a great deal more about the call.
-                            if let Some(call) = announced.remove(&id) {
+                            if let Some(k) = announced.iter().position(|c| c.id == id) {
+                                let call = announced.remove(k);
                                 self.emit(AgentEvent::ToolFinished {
                                     session: session.clone(),
                                     turn: turn.clone(),
@@ -817,6 +819,44 @@ impl Agent {
             drop(stream);
 
             let cancelled = cancel.is_cancelled();
+
+            // A call the driver announced and never answered.
+            //
+            // The stream it would have arrived on is closed, so nothing is coming: an interrupt
+            // taken while a tool was out, a turn whose round ended before the result was read, a
+            // CLI that went away mid-call. And a card with no result does not simply sit there —
+            // it *spins*, and goes on counting, for as long as the conversation is open. Worse, it
+            // does so again tomorrow: the call is in the messages with no result beside it, and a
+            // result-less call is what a rebuild draws as still running. What that looks like is
+            // the one thing a spinner is supposed to rule out — a turn that finished twenty
+            // minutes ago, in a conversation answering perfectly well, wearing a mark that says
+            // something is still happening in it.
+            //
+            // So the turn closes them itself, in the order they were announced. Through the
+            // assembler rather than as a bare event, because the conversation is what a switch
+            // away and back is drawn from: an event alone would settle the card on screen and
+            // leave the transcript on disk saying the opposite. It is an error, and says which
+            // kind — a call that was interrupted and a call the agent walked away from are
+            // different things to read about, and neither of them is "still running".
+            for call in std::mem::take(&mut announced) {
+                let content = if cancelled {
+                    "interrupted before it came back".to_string()
+                } else {
+                    "the agent ended the turn without saying how this call went".to_string()
+                };
+                assembler.push(ProviderEvent::ToolResult {
+                    id: call.id.clone(),
+                    content: content.clone(),
+                    is_error: true,
+                });
+                self.emit(AgentEvent::ToolFinished {
+                    session: session.clone(),
+                    turn: turn.clone(),
+                    call,
+                    result: ToolResult { content, is_error: true },
+                });
+            }
+
             let calls = assembler.tool_calls();
             let (produced, this_stop, usage) = assembler.finish();
             total.merge(&usage);
