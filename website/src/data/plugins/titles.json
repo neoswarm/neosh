@@ -3,5 +3,70 @@
   "description": "Names your conversations for you",
   "author": "neosh",
   "repo": "https://github.com/neoswarm/neosh/tree/main/plugins/builtin/titles",
-  "tags": ["builtin"]
+  "npm": "@neosh/titles",
+  "tags": [
+    "builtin"
+  ],
+  "image": "titles.png",
+  "preview": {
+    "title": "neosh",
+    "rows": [
+      {
+        "s": [
+          [
+            "ubar",
+            " ▌"
+          ],
+          " the retry test races the wall clock, fix it"
+        ]
+      },
+      {
+        "s": []
+      },
+      {
+        "s": [
+          [
+            "cmt",
+            " the sidebar, one turn later:"
+          ]
+        ]
+      },
+      {
+        "s": []
+      },
+      {
+        "s": [
+          "   ",
+          [
+            "cmt",
+            "⎇ wily-nimbus"
+          ],
+          "  →  ",
+          [
+            "acc",
+            "⎇ fix/retry-wall-clock-race"
+          ]
+        ]
+      },
+      {
+        "s": []
+      },
+      {
+        "s": [
+          [
+            "cmt",
+            " a worktree you did not name is named by your"
+          ]
+        ]
+      },
+      {
+        "s": [
+          [
+            "cmt",
+            " first message — and never touched again"
+          ]
+        ]
+      }
+    ]
+  }
 }

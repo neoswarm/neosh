@@ -3,5 +3,206 @@
   "description": "Status, diffs and worktrees on their own keys",
   "author": "neosh",
   "repo": "https://github.com/neoswarm/neosh/tree/main/plugins/builtin/git",
-  "tags": ["builtin"]
+  "npm": "@neosh/git",
+  "tags": [
+    "builtin"
+  ],
+  "image": "git.png",
+  "preview": {
+    "title": "neosh · ^D",
+    "rows": [
+      {
+        "s": [
+          " ",
+          [
+            "v-edit",
+            "Edited"
+          ],
+          "  crates/neosh-core/src/retry.rs"
+        ],
+        "r": [
+          [
+            "ok",
+            "+2"
+          ],
+          " ",
+          [
+            "err",
+            "-2"
+          ]
+        ]
+      },
+      {
+        "s": [
+          [
+            "cmt",
+            " └ "
+          ],
+          [
+            "gut",
+            "35 "
+          ],
+          "  ",
+          [
+            "k",
+            "impl"
+          ],
+          " ",
+          [
+            "ty",
+            "Retry"
+          ],
+          " {"
+        ]
+      },
+      {
+        "c": "band-del",
+        "s": [
+          "   ",
+          [
+            "gut-del",
+            "36 "
+          ],
+          [
+            "sign-del",
+            "-"
+          ],
+          "   ",
+          [
+            "k",
+            "fn"
+          ],
+          " ",
+          [
+            "fn2",
+            "delay"
+          ],
+          "(&",
+          [
+            "k",
+            "self"
+          ],
+          ") -> ",
+          [
+            "ty",
+            "Duration"
+          ],
+          " {"
+        ]
+      },
+      {
+        "c": "band-add",
+        "s": [
+          "   ",
+          [
+            "gut-add",
+            "36 "
+          ],
+          [
+            "sign-add",
+            "+"
+          ],
+          "   ",
+          [
+            "k",
+            "fn"
+          ],
+          " ",
+          [
+            "fn2",
+            "delay"
+          ],
+          "(&",
+          [
+            "k",
+            "self"
+          ],
+          ", clock: &",
+          [
+            "ty",
+            "Clock"
+          ],
+          ") -> ",
+          [
+            "ty",
+            "Duration"
+          ],
+          " {"
+        ]
+      },
+      {
+        "s": [
+          [
+            "cmt",
+            "     ⋮ 3 unchanged"
+          ]
+        ]
+      },
+      {
+        "c": "band-del",
+        "s": [
+          "   ",
+          [
+            "gut-del",
+            "41 "
+          ],
+          [
+            "sign-del",
+            "-"
+          ],
+          "       ",
+          [
+            "fn2",
+            "jitter"
+          ],
+          "(",
+          [
+            "ty",
+            "Instant"
+          ],
+          "::",
+          [
+            "fn2",
+            "now"
+          ],
+          "())"
+        ]
+      },
+      {
+        "c": "band-add",
+        "s": [
+          "   ",
+          [
+            "gut-add",
+            "41 "
+          ],
+          [
+            "sign-add",
+            "+"
+          ],
+          "       ",
+          [
+            "fn2",
+            "jitter"
+          ],
+          "(clock.",
+          [
+            "fn2",
+            "now"
+          ],
+          "())"
+        ]
+      },
+      {
+        "s": [
+          "   ",
+          [
+            "gut",
+            "42 "
+          ],
+          "  }"
+        ]
+      }
+    ]
+  }
 }
