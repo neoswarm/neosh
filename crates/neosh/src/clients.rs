@@ -185,6 +185,11 @@ impl Clients {
     }
 
     /// Which set of windows a terminal is looking at.
+    ///
+    /// Test-only for the same reason [`attach_to`](Self::attach_to) is: a connection is handed its
+    /// [`Source`] when it attaches and keeps it for its life, so nothing in the workspace has to
+    /// look the pairing back up. What the tests are for is that the pairing is what it says.
+    #[cfg(test)]
     pub fn view_of(&self, id: ClientId) -> Option<ViewId> {
         self.clients.iter().find(|(c, _)| *c == id).map(|(_, c)| c.view)
     }

@@ -186,10 +186,6 @@ impl SessionStore {
         Ok(())
     }
 
-    fn contains(&self, id: &SessionId) -> bool {
-        self.sessions.contains_key(id)
-    }
-
     /// You are looking at it, so whatever finished while you were away has been seen.
     ///
     /// Answers whether anything changed, because the caller's next move is a write to disk and
