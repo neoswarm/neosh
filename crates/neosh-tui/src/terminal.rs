@@ -197,12 +197,40 @@ impl TerminalFrontend {
         // Handed back as the protocol's own rectangle, not ratatui's: the binary wires the
         // frontend to the core and has no business depending on a rendering library.
         //
+        // What a window reports is the room it has for *content*, which on a bordered float is not
+        // the rectangle it was laid out into.
+        //
+        // `Extent` already says this from the other end — an extent measures content, and the
+        // border is chrome the frontend adds afterwards — precisely so that no caller has to
+        // subtract two from every number it computes. Reporting the outer box put the subtraction
+        // back, on the one axis nobody thinks to check: a panel that pads its key strip down to the
+        // height it was told it had ends up two lines longer than the window it is drawn in, and
+        // the strip is silently off the bottom of it. Rows and columns are the same mistake in two
+        // directions, so both come off here.
+        let content = |win: &neosh_proto::WindowId, r: Rect| -> Rect {
+            let bordered = matches!(
+                mirror.windows.get(win).map(|w| &w.layout),
+                Some(neosh_proto::WindowLayout::Float { config })
+                    if config.border != neosh_proto::BorderStyle::None
+            );
+            if !bordered {
+                return r;
+            }
+            Rect {
+                x: r.x.saturating_add(1),
+                y: r.y.saturating_add(1),
+                width: r.width.saturating_sub(2),
+                height: r.height.saturating_sub(2),
+            }
+        };
         // The top line comes off the frame rather than out of the mirror: a window whose scroll
         // was bent to keep its cursor on screen is showing a different first row than it was
         // asked to, and that is the number anything paging by a screenful has to page from.
         Ok(geometry
             .into_iter()
-            .map(|(win, r): (neosh_proto::WindowId, Rect)| crate::Geometry {
+            .map(|(win, outer): (neosh_proto::WindowId, Rect)| {
+                let r = content(&win, outer);
+                crate::Geometry {
                 win,
                 rect: neosh_proto::Rect { row: r.y, col: r.x, width: r.width, height: r.height },
                 top_line: drawn
@@ -218,6 +246,7 @@ impl TerminalFrontend {
                     .find(|(w, _)| *w == win)
                     .map(|(_, (_, n))| *n)
                     .unwrap_or(0),
+                }
             })
             .collect())
     }

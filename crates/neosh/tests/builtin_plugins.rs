@@ -2928,19 +2928,20 @@ fn archive_one(s: &mut Session) {
 #[test]
 fn archiving_takes_a_conversation_out_of_the_panel_altogether() {
     // The everyday verb, and it asks nothing, because there is nothing to lose. What it leaves
-    // behind is one row saying how many — not a section of dim rows in the column you work in.
+    // behind is *nothing at all* in this column: not a section of dim rows, and not a row saying
+    // how many either. The archive is a popup on `^F`, and the panel is the list you work in.
     let sb = Sandbox::new("archive");
     let mut s = sb.start();
     s.wait_for("PROJECTS");
 
     let panel_only = s.open_windows().len();
     archive_one(&mut s);
+    assert_eq!(s.open_windows().len(), panel_only, "and nothing asked");
     assert!(
-        s.pump(|s| s.sidebar_now().iter().any(|l| l.contains("Archived"))),
-        "a door to the archive appeared\n{:?}",
+        s.pump(|s| !s.sidebar_now().iter().any(|l| l.contains("Archived"))),
+        "nothing about the archive is in the column\n{:?}",
         s.sidebar_now()
     );
-    assert_eq!(s.open_windows().len(), panel_only, "and nothing asked");
 
     // Not folded away, not dimmed at the foot: gone. Every row of the panel is drained first, so
     // this is about what the panel says *now* rather than what it ever said.
@@ -2962,33 +2963,164 @@ fn archiving_takes_a_conversation_out_of_the_panel_altogether() {
 
 #[test]
 fn the_archive_is_a_place_you_go_and_come_back_from() {
-    // `a` in the panel — and `^F` from anywhere — opens what you have put away, as a list you can
-    // filter. `^U` on a row puts it back without switching to it, because tidying and going
-    // somewhere are different things.
+    // `a` in the panel — and `^F` from anywhere — opens what you have put away, as a panel you move
+    // in. `u` on a row puts it back without switching to it, because tidying and going somewhere
+    // are different things.
+    //
+    // `a` arrives as an `archive.action` contribution rather than as a key the sidebar draws for
+    // itself: the archive is another plugin's panel, and the door to it is that plugin's to put
+    // there. Which is also what this asserts by pressing it.
     let sb = Sandbox::new("browse");
     let mut s = sb.start();
     s.wait_for("PROJECTS");
 
     archive_one(&mut s);
-    assert!(s.pump(|s| s.sidebar_now().iter().any(|l| l.contains("Archived"))));
+    assert!(s.pump(|s| !s.sidebar_now().iter().any(|l| l.contains("keep"))), "it left the list");
 
     s.key("a");
     assert!(
-        s.pump(|s| s.picker_named("[Archived conversations]").iter().any(|l| l.contains("keep"))),
+        s.pump(|s| s.picker_named("[archive]").iter().any(|l| l.contains("keep"))),
         "the archive opened with it in\n{:?}",
-        s.picker_named("[Archived conversations]")
+        s.picker_named("[archive]")
+    );
+    // It says how many, and what the keys are — a panel with no verbs on it is a modal you have to
+    // guess your way out of.
+    assert!(
+        s.pump(|s| s.picker_named("[archive]").iter().any(|l| l.contains("1 archived"))),
+        "the header counts what is in it\n{:?}",
+        s.picker_named("[archive]")
+    );
+    assert!(
+        s.pump(|s| s.picker_named("[archive]").iter().any(|l| l.contains("^X empty"))),
+        "and the way to empty it is on screen\n{:?}",
+        s.picker_named("[archive]")
     );
 
-    s.ctrl("u");
+    s.key("u");
     assert!(
         s.pump(|s| s.sidebar_now().iter().any(|l| l.contains("keep"))),
-        "`^U` put it back in the list\n{:?}",
+        "`u` put it back in the list\n{:?}",
         s.sidebar_now()
     );
+}
+
+#[test]
+fn the_count_in_the_panel_is_something_you_ask_for() {
+    // Off by default: the column is your conversations, and a permanent line about the ones you are
+    // finished with is the space this panel can least afford. `archive.sidebar = true` is for
+    // somebody who wants the number on screen, and it is the *only* way that row appears.
+    let sb = Sandbox::new("archiverow");
+    sb.write_config("[options]\n\"archive.sidebar\" = true\n");
+    let mut s = sb.start();
+    s.wait_for("PROJECTS");
+
+    archive_one(&mut s);
     assert!(
-        s.pump(|s| !s.sidebar_now().iter().any(|l| l.contains("Archived"))),
-        "and the door went with the last thing behind it\n{:?}",
+        s.pump(|s| s.sidebar_now().iter().any(|l| l.contains("Archived"))),
+        "asked for, so the row is there\n{:?}",
         s.sidebar_now()
+    );
+    // The count and the key it opens with ride along as virtual text, so they are on the wire
+    // rather than in the buffer — a row with a number and no way in is a fact you cannot act on.
+    assert!(s.wire().contains("^F "), "with the key that opens it");
+}
+
+#[test]
+fn emptying_the_archive_asks_once_and_then_empties_it() {
+    // The verb the archive did not have: one key for everything in it, rather than a delete and a
+    // confirmation per conversation. It is irreversible, so it asks — and the question says how
+    // many and how much is in them, which is the part that makes it worth stopping for.
+    let sb = Sandbox::new("empty");
+    let mut s = sb.start();
+    s.wait_for("PROJECTS");
+
+    archive_one(&mut s);
+    let panel_only = s.open_windows().len();
+    s.key("a");
+    assert!(s.pump(|s| s.picker_named("[archive]").iter().any(|l| l.contains("keep"))));
+    let with_archive = s.open_windows().len();
+
+    s.ctrl("x");
+    assert!(s.pump(|s| s.open_windows().len() > with_archive), "it asked first");
+    assert!(
+        s.pump(|s| s.saw("Empty the archive")),
+        "and said what it was about to do\n{}",
+        s.transcript()
+    );
+    assert!(
+        s.pump(|s| s.saw("no undo")),
+        "including that it cannot be taken back\n{}",
+        s.transcript()
+    );
+
+    // The cursor starts on the answer that changes nothing, so the destructive one is chosen.
+    s.special("up");
+    s.enter();
+    assert!(
+        s.pump(|s| !s.sidebar_now().iter().any(|l| l.contains("keep"))),
+        "what was in it did not come back to the list\n{:?}",
+        s.sidebar_now()
+    );
+    // Nothing left behind it, so the panel takes itself off screen — waited for rather than
+    // assumed, because the key below *toggles* and pressing it into a panel that is still closing
+    // would shut it instead of reopening it.
+    assert!(
+        s.pump(|s| s.open_windows().len() == panel_only),
+        "the dialog and the panel both went"
+    );
+    // And it really is empty. Asked by going back rather than by reading the buffer the panel left
+    // behind: a scratch buffer keeps whatever was last drawn into it, so what it says after its
+    // window has gone is what it said before the delete.
+    s.key("a");
+    assert!(
+        s.pump(|s| s.saw("nothing is archived")),
+        "the archive is empty\n{}",
+        s.transcript()
+    );
+}
+
+#[test]
+fn a_verb_in_the_archive_is_about_everything_ticked() {
+    // Marks are what make this a panel rather than a picker: `<Space>` ticks a row, and every verb
+    // then means all of them. The strip says which, because a key whose arity you cannot see is one
+    // you press twice to find out.
+    let sb = Sandbox::new("marks");
+    let mut s = sb.start();
+    s.wait_for("PROJECTS");
+
+    archive_one(&mut s);
+    s.key("a");
+    assert!(s.pump(|s| s.picker_named("[archive]").iter().any(|l| l.contains("keep"))));
+    assert!(
+        s.pump(|s| s.picker_named("[archive]").iter().any(|l| l.contains("(this one)"))),
+        "with nothing ticked, a verb is about the row under the cursor\n{:?}",
+        s.picker_named("[archive]")
+    );
+
+    s.key(" ");
+    assert!(
+        s.pump(|s| s.picker_named("[archive]").iter().any(|l| l.contains("1 marked"))),
+        "ticking one says so, in the header and on the keys\n{:?}",
+        s.picker_named("[archive]")
+    );
+    assert!(
+        s.pump(|s| s.picker_named("[archive]").iter().any(|l| l.contains("(1 marked)"))),
+        "and the verbs are now about it\n{:?}",
+        s.picker_named("[archive]")
+    );
+
+    // `<Esc>` drops the marks before it drops the panel: one thing per press, so a mistyped key
+    // does not cost a selection and the window it was made in at the same time.
+    s.special("esc");
+    assert!(
+        s.pump(|s| s.picker_named("[archive]").iter().any(|l| l.contains("(this one)"))),
+        "the marks went\n{:?}",
+        s.picker_named("[archive]")
+    );
+    assert!(
+        s.pump(|s| s.picker_named("[archive]").iter().any(|l| l.contains("keep"))),
+        "and the panel did not\n{:?}",
+        s.picker_named("[archive]")
     );
 }
 

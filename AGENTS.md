@@ -292,10 +292,27 @@ per decision, and records the *reasoning*, not the choice.
   worktree does not rename it to `wt-fe3c0d93`), and leaves by `X` on its heading and nothing else.
   Empty, that asks nothing — `o` puts it back; with conversations still in it, it is a delete of
   every one of them and asks like one. See ADR 0039.
-- **What you have archived is not in the sidebar.** The panel is the list you work in; a section of
-  things you are finished with is the only part of that column that is never the answer, and it
-  grows forever. One row with a count, `a` in the panel or `^F` anywhere, and it opens as a picker
-  you can filter — because a flat list of dim rows is not a way to find anything. See ADR 0039.
+- **What you have archived is not in the sidebar at all, and it is something you can empty.** The
+  panel is the list you work in; a section of things you are finished with is the only part of that
+  column that is never the answer, and it grows forever. ADR 0039 left one dim row with a count
+  behind — a door rather than a drawer — and that row is now **off by default** too, for the same
+  argument one step further: a permanent line about what you are *not* doing is the line that
+  column can least spare, and the way in was never the row. `^F` from anywhere, `a` from the panel
+  — advertised in its key strip — or `^K`; `archive.sidebar = true` puts the count back for anybody
+  who wants it. It opens as a **popup panel of its own** — its own plugin, its own buffer kind, every key
+  an ordinary binding, `archive.action` for somebody else's verb, and the row you are on unfolds.
+  A picker was the right shape for the conversation you archived this morning and regret, and forty
+  minutes of dialogs for a workspace you have used since spring: so rows can be *ticked*
+  (`<Space>`), every verb means what is ticked or the row under the cursor, and `^X` empties
+  **what the panel is currently listing** — which is what the filter is for, since narrowing to one
+  project and pressing it is that project and nothing else. It asks, in numbers, by ADR 0039's
+  rule. What is on disk is in scope: `RESTORE_LIMIT` means a workspace loads the most recent two
+  hundred conversations and the rest are files nothing could show, open or delete, so the panel
+  reads `session.stored` as well as `session.list` and the host brings one in from its file the
+  moment any verb names it — otherwise "empty the archive" reports success over a directory it
+  never touched. **Nothing here deletes on a timer**: `archive.auto_days` *archives* what has gone
+  idle, because archiving is reversible and free, and `archive.retention_days` only ever counts —
+  `archive.sweep` is the same number with a person behind it. See ADR 0059.
 - **A notification is for something you did not ask for and cannot see.** Both halves, and a
   message that fails either is not one. `MessageLevel` says how *bad* a thing is and never whether
   you need to know about it, which is how one channel ended up carrying a hundred and seventy call
@@ -575,7 +592,7 @@ only way to do anything. See ADR 0048.
 | `⇧⇥` | Permission mode — full access to start with, then ask, allow-listed, deny. Belongs to this conversation, saved with it, and takes effect on the turn that is running |
 | `^T` | Projects and conversations. Switching is never refused — turns keep running where they are |
 | `^J` | The computers in this workspace. Add one by its address, allow one that is asking, or open what it is running |
-| `^F` | What you have archived. Filter it, put one back, or finally throw it away |
+| `^F` | What you have archived — see below. Filter it, put some back, or finally empty it |
 | `^N` | New conversation. In a repository it asks where: here, a worktree you need not name, one kept inside the project, one you do name, an existing one, another machine, elsewhere. A worktree you did not name is named by your first message — `fix/composer-paste-truncation`, not `wily-nimbus` |
 | `^O` | Add a project |
 | `^B` | Toggle the sidebar |
@@ -712,10 +729,45 @@ says how many are asking, `^T` is where you go, and it opens when you get there.
 | `p` | Pull that repository from its remote (a git-plugin contribution) |
 | `d` | Remove a worktree from disk — its branch stays, and it asks first (a git-plugin contribution) |
 | `x` `X` | Archive, delete. On a project heading, `X` takes the project off the list — the only thing that does |
-| `a` | The archive. Nothing archived is ever a row in this panel — `↵` restores one, `^U` puts it back without going there, `^X` deletes |
+| `a` | The archive — the popup below. Nothing archived is ever a row in *this* panel, and by default not even a count. An `archive.action` contribution, not a key this panel owns |
 | `⇥` | On the plan rows: how much of it to show — the limit that binds, every limit, or all of it with the account and the sentence. `usage.sidebar.style` is where it starts, `usage.sidebar` turns it off |
 | `?` | The keys for whatever row you are on |
 | `Esc` | Back to the composer |
+
+## The archive — `^F`, or `a` in the project panel
+
+What you have finished with, and the one place in the workspace where throwing things away is what
+you came to do. **Nothing about it is on screen until you press the key**: no section, no row, no
+count — `archive.sidebar = true` if you want the count in the project panel. A popup, and a panel
+rather than a picker: it has marks, and every verb means what is marked or — with nothing marked —
+the row under the cursor. The strip at the foot says which. See ADR 0059.
+
+Conversations past `RESTORE_LIMIT` are in here too, and behave like any other row: the workspace
+brings one in from its file the first time a key names it. The header says how many are `on disk
+only` when any are.
+
+| Key | Does |
+|---|---|
+| `↵` | Put this one back and go to it |
+| `u` | Put these back, and stay here. Tidying and travelling are different intentions. Not `^U` — that is half a screen, here as everywhere |
+| `X` | Delete these, for good. It asks, and says how many messages and which projects |
+| `^X` | Empty it — everything the panel is **currently showing**, so a filter first is how you empty one project's worth. Asks like the delete it is |
+| `<Space>` `⇥` | Tick this row, and step down. Tick a run of them with one key repeated |
+| `a` | Tick everything showing, or untick it |
+| `e` | Copy these conversations to the clipboard, as markdown |
+| `y` | Copy this conversation's directory |
+| `/` | Filter — on the title, the project and the path. Every word, in any order |
+| `s` `S` | The next ordering along; the next grouping along. They are `archive.sort` and `archive.group`, so `config.toml` and these keys say the same thing |
+| `j` `k`, `^D` `^U`, `gg` `G` | Move, with counts — `5j`, `12G` — exactly as in the project panel |
+| `?` | The keys |
+| `Esc` | One thing per press: the marks, then the filter, then the panel |
+| `^F` `q` `^C` | Close it |
+
+The settings: `archive.sidebar` (the count in the project panel, off), `archive.sort`,
+`archive.group`, `archive.width`, `archive.height`, and three about time — `archive.auto_days` archives what has been idle that long (reversible, so it may happen on
+its own), `archive.retention_days` is what counts as old, and `archive.remind` says so once a day.
+`archive.sweep` deletes what is older than that, and only when you run it. Nothing in here deletes
+on a timer.
 
 ## Pickers
 

@@ -225,6 +225,73 @@ pub fn save_all(state: &Path, store: &SessionStore) -> std::io::Result<()> {
     std::fs::rename(&tmp, &path)
 }
 
+/// Everything on disk, described rather than restored — newest first.
+///
+/// [`load`] is about starting a workspace, and is capped by [`RESTORE_LIMIT`]: the conversations
+/// past the cap stay as files and are in no list, which is fine right up until somebody asks what
+/// they have accumulated. That question is the archive's, and an archive that cannot see what is
+/// on the disk it is supposed to be able to empty is an archive that reports a lie after it has
+/// finished. So this reads the directory, and nothing here truncates.
+///
+/// Each file is parsed, described and dropped, so what is held is one description per conversation
+/// rather than every message in every one of them. It is still a parse per file: this belongs off
+/// the host loop, and the one caller puts it there.
+///
+/// A file that does not parse is skipped, exactly as loading skips it. A conversation nothing can
+/// read is not one this can describe, and refusing to answer at all would mean one corrupt file
+/// hiding the other four hundred.
+pub fn scan(state: &Path) -> Vec<neosh_proto::SessionInfo> {
+    let Ok(entries) = std::fs::read_dir(dir(state)) else {
+        return Vec::new();
+    };
+    let mut out: Vec<neosh_proto::SessionInfo> = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("json") {
+            continue;
+        }
+        if path.file_name().and_then(|n| n.to_str()) == Some("order.json") {
+            continue;
+        }
+        match std::fs::read_to_string(&path).ok().map(|t| serde_json::from_str::<Stored>(&t)) {
+            Some(Ok(stored)) => out.push(stored.into_session().info()),
+            Some(Err(e)) => tracing::warn!("{}: not a readable session ({e})", path.display()),
+            None => {}
+        }
+    }
+    out.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+    out
+}
+
+/// One conversation off disk, whether or not this workspace ever loaded it.
+///
+/// The single-file half of [`load`], for the verbs that name a conversation the store has never
+/// heard of: past the restore cap a perfectly real conversation is a file and nothing else, and
+/// "no such session" is the wrong answer to being asked to open one.
+pub fn read(state: &Path, id: &SessionId) -> Option<Session> {
+    if !is_safe_id(&id.0) {
+        return None;
+    }
+    let text = std::fs::read_to_string(session_path(state, id)).ok()?;
+    match serde_json::from_str::<Stored>(&text) {
+        Ok(stored) => Some(stored.into_session()),
+        Err(e) => {
+            tracing::warn!("{}: not a readable session ({e})", id.0);
+            None
+        }
+    }
+}
+
+/// Whether there is a file for this conversation.
+///
+/// Asked before deleting one the store has never heard of: a conversation past the restore cap is
+/// still a conversation, and `close` on it should remove it rather than answer "no such thing".
+/// What this is *not* is a way to turn any string into a delete — an id with a path in it is
+/// refused here for the same reason it is refused on the way in.
+pub fn stored(state: &Path, id: &SessionId) -> bool {
+    is_safe_id(&id.0) && session_path(state, id).is_file()
+}
+
 pub fn forget(state: &Path, id: &SessionId) {
     if is_safe_id(&id.0) {
         let _ = std::fs::remove_file(session_path(state, id));
@@ -480,6 +547,60 @@ mod tests {
         let text = std::fs::read_to_string(session_path(&t.0, &s.id)).expect("read");
         assert!(!text.contains("pirate"), "found it in {text}");
         assert_eq!(load(&t.0).0[0].system, None);
+    }
+
+    #[test]
+    fn scanning_finds_what_the_restore_cap_left_behind() {
+        // The hole this exists to close: past `RESTORE_LIMIT` a conversation is a file and nothing
+        // else, so a list built on what was *loaded* reports a number that is not the number — and
+        // an archive that emptied itself by that number would leave the directory full.
+        let t = tmp("scan");
+        for i in 0..(RESTORE_LIMIT + 5) {
+            let mut s = session(&format!("thread {i}"));
+            s.id = SessionId(format!("scan{i:04}"));
+            // Newest last, so the ones that fall off the cap are a known set.
+            s.updated_at = i as i64;
+            s.archived = i < 5;
+            save(&t.0, &s).expect("save");
+        }
+
+        let (loaded, _) = load(&t.0);
+        assert_eq!(loaded.len(), RESTORE_LIMIT, "loading is capped, which is the whole premise");
+        assert!(
+            !loaded.iter().any(|s| s.id.0 == "scan0000"),
+            "and the oldest are the ones it left"
+        );
+
+        let seen = scan(&t.0);
+        assert_eq!(seen.len(), RESTORE_LIMIT + 5, "scanning is not");
+        assert_eq!(seen.iter().filter(|s| s.archived).count(), 5, "and it can tell which are away");
+        assert!(
+            seen.first().is_some_and(|s| s.updated_at > seen.last().expect("last").updated_at),
+            "newest first, like every other list of conversations"
+        );
+    }
+
+    #[test]
+    fn one_conversation_can_be_read_back_without_loading_the_rest() {
+        // What every verb aimed at a row in the archive needs: open it, put it back, read it. The
+        // alternative is a panel that can list something it cannot act on.
+        let t = tmp("read-one");
+        let mut s = session("still here");
+        s.title = Some("Cold".into());
+        save(&t.0, &s).expect("save");
+
+        assert!(stored(&t.0, &s.id), "the file is there");
+        let back = read(&t.0, &s.id).expect("read it back");
+        assert_eq!(back.id, s.id);
+        assert_eq!(back.title.as_deref(), Some("Cold"));
+        assert_eq!(back.messages.len(), 1);
+
+        assert!(read(&t.0, &SessionId("nothing-here".into())).is_none());
+        assert!(!stored(&t.0, &SessionId("nothing-here".into())));
+        // An id with a path in it is refused on the way out as well as on the way in: this is what
+        // a delete asks before it removes a file.
+        assert!(!stored(&t.0, &SessionId("../../escape".into())));
+        assert!(read(&t.0, &SessionId("../../escape".into())).is_none());
     }
 
     #[test]

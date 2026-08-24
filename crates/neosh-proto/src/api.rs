@@ -679,6 +679,22 @@ pub enum ApiCall {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         session: Option<SessionId>,
     },
+    /// Every conversation *on disk*, including the ones this workspace never loaded.
+    ///
+    /// [`SessionList`](Self::SessionList) answers about the store, and the store is capped: a
+    /// workspace restores the most recent conversations and leaves the rest as files. Those files
+    /// are then in no list at all — nothing can show them, and nothing can reclaim them, which is a
+    /// hole directly under the one verb that is supposed to be able to empty an archive. This reads
+    /// the directory instead of the store.
+    ///
+    /// It answers with the same [`SessionInfo`] the store does, so a caller renders one kind of
+    /// row. Which of them are *loaded* is the difference between this and `SessionList`, and a
+    /// caller that needs to know asks both and compares ids — rather than this inventing a second
+    /// shape of conversation for the sake of one boolean.
+    ///
+    /// Off the host loop: it parses every file in the directory, and the whole point is that there
+    /// may be a great many of them.
+    SessionsStored,
 
     // ---- tools ---------------------------------------------------------
     /// Register a tool. Lands in the same namespace and shape as a built-in or MCP tool.

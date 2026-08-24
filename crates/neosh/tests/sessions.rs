@@ -317,6 +317,36 @@ export async function activate({ neosh }: PluginContext) {
       neosh.notify(`archive failed: ${e}`);
     }
   });
+  // What is on disk rather than what was loaded — the archive's question, and the one the store
+  // cannot answer past its own restore cap.
+  await neosh.cmd.register("t.stored", async () => {
+    const stored = await neosh.session.stored();
+    const loaded = new Set((await neosh.session.list({ includeArchived: true })).map((s) => s.id));
+    const cold = stored.filter((s) => !loaded.has(s.id));
+    neosh.notify(
+      `stored: ${stored.length} on disk, ${cold.length} not loaded, ` +
+        `${stored.filter((s) => s.archived).length} archived`,
+    );
+  });
+  await neosh.cmd.register("t.closeCold", async () => {
+    const loaded = new Set((await neosh.session.list({ includeArchived: true })).map((s) => s.id));
+    const cold = (await neosh.session.stored()).filter((s) => !loaded.has(s.id));
+    for (const s of cold) await neosh.session.close(s.id);
+    neosh.notify(`closed ${cold.length} cold`);
+  });
+  await neosh.cmd.register("t.openCold", async () => {
+    const loaded = new Set((await neosh.session.list({ includeArchived: true })).map((s) => s.id));
+    const cold = (await neosh.session.stored()).filter((s) => !loaded.has(s.id));
+    const one = cold[0];
+    if (!one) {
+      neosh.notify("nothing cold");
+      return;
+    }
+    await neosh.session.archive(one.id, false);
+    await neosh.session.switch(one.id);
+    const back = await neosh.session.messages(one.id);
+    neosh.notify(`opened cold: ${one.label} with ${back.length} messages`);
+  });
   await neosh.cmd.register("t.unread", async () => {
     const all = await neosh.session.list();
     neosh.notify(`unread: [${all.filter((s) => s.unread).map((s) => s.label).join(", ")}]`);
@@ -605,6 +635,82 @@ fn archiving_the_only_conversation_lands_you_somewhere_rather_than_nowhere() {
     s.wait_for("count: 0 open, 1 in all");
     s.command("t.listAll");
     s.wait_for("~the only one");
+}
+
+/// Write `n` conversations straight into the state directory, oldest first.
+///
+/// Faster than making them through the UI, and the point of the test is what a *workspace that has
+/// been used for a year* looks like — which is more conversations than anybody will sit and type.
+fn seed_sessions(sb: &Sandbox, n: usize, archived_before: usize) {
+    let dir = sb.root.join("state/sessions");
+    std::fs::create_dir_all(&dir).expect("sessions dir");
+    let mut order = Vec::new();
+    for i in 0..n {
+        let id = format!("seed{i:04}");
+        order.push(id.clone());
+        let doc = serde_json::json!({
+            "id": id,
+            "cwd": sb.work().display().to_string(),
+            "title": format!("Seeded thread {i}"),
+            "created_at": i as i64,
+            "updated_at": i as i64,
+            "messages": [{ "role": "user", "content": [{ "type": "text", "text": "hello" }] }],
+            "archived": i < archived_before,
+            "archived_at": if i < archived_before { Some(i as i64) } else { None },
+        });
+        std::fs::write(dir.join(format!("{id}.json")), doc.to_string()).expect("write session");
+    }
+    let order = serde_json::json!({ "order": order, "active": order.last() });
+    std::fs::write(dir.join("order.json"), order.to_string()).expect("write order");
+}
+
+#[test]
+fn a_conversation_past_the_restore_cap_is_still_a_conversation() {
+    // The store is a window onto the sessions directory, not the whole of it: a workspace restores
+    // the most recent few hundred and leaves the rest as files. Everything that asked the *store*
+    // therefore could not see them — which is fine for a thread list and not fine for an archive,
+    // whose entire job is what has accumulated and whose one destructive verb would otherwise
+    // report that it had emptied a directory it had not touched.
+    let sb = Sandbox::new("pastthecap");
+    install_driver(&sb);
+    // Comfortably past `RESTORE_LIMIT`, with the oldest — the ones that fall off — archived.
+    seed_sessions(&sb, 210, 8);
+
+    let mut s = sb.start();
+    s.wait_for("driver ready");
+
+    s.command("t.count");
+    assert!(
+        s.pump(|s| s.saw("200 in all")),
+        "the store loaded its cap and no more\n{}",
+        s.transcript()
+    );
+
+    s.command("t.stored");
+    assert!(
+        s.pump(|s| s.saw("210 on disk, 10 not loaded, 8 archived")),
+        "and the directory answers for all of them, archived ones included\n{}",
+        s.transcript()
+    );
+
+    // Opening one works: the host brings it in from its file rather than answering "no such
+    // session", so a row in the archive behaves like a row anywhere else.
+    s.command("t.openCold");
+    assert!(
+        s.pump(|s| s.saw("opened cold: Seeded thread") && s.saw("with 1 messages")),
+        "a conversation nothing had loaded opened, with what was said in it\n{}",
+        s.transcript()
+    );
+
+    // And so does deleting one, which is what emptying an archive is made of.
+    s.command("t.closeCold");
+    assert!(s.pump(|s| s.saw("closed 9 cold")), "the rest went\n{}", s.transcript());
+    s.command("t.stored");
+    assert!(
+        s.pump(|s| s.saw("201 on disk, 0 not loaded")),
+        "from the disk, not just from a list\n{}",
+        s.transcript()
+    );
 }
 
 #[test]

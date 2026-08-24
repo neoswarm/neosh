@@ -61,3 +61,4 @@ implementation — and in two cases (0005, 0008) it did not, which is itself rec
 | [0055](0055-a-plugin-being-ready-is-not-the-workspace-being-ready.md) | A plugin being ready is not the workspace being ready | Accepted |
 | [0056](0056-an-agent-that-speaks-when-nobody-asked.md) | An agent that speaks when nobody asked | Accepted |
 | [0058](0058-the-workspace-you-are-looking-at-is-not-the-binary-you-built.md) | The workspace you are looking at is not the binary you built | Accepted |
+| [0059](0059-an-archive-is-something-you-can-empty.md) | An archive is something you can empty | Accepted |
