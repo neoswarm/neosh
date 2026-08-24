@@ -26,6 +26,26 @@ description = "…"
 # Everything else — windows, buffers, keys, floats, options, vars — needs nothing declared: it is
 # no more privileged than what the person sitting there can already do.
 permissions = ["vcs_write"]
+
+# Plugins this one builds on. Each loads and activates first, `import … from "plugin:<name>"`
+# resolves to it, and a name nothing provides fails at startup with the name in the message.
+requires = ["sidebar"]
+# Soft ordering: load after these if they are present, without needing them.
+after = ["usage"]
+
+# What this plugin offers others — listed by `ext.points()` and the plugins panel, and how a
+# contribution to a point nobody reads gets reported instead of silently ignored.
+[provides]
+points = ["acme.tasks.section", "acme.tasks.action", "acme.tasks.decoration"]
+kinds = ["acme.tasks"]
+vars = ["acme.task.due"]
+
+# Omit for a plugin that loads at startup. Present, it is held until one of these fires: the
+# command is registered on its behalf and the press replayed once it is up.
+[activation]
+on_command = ["acme.tasks.toggle"]
+on_event = ["neosh.win.enter"]
+on_kind = ["neosh.sidebar"]
 ```
 
 ```ts
@@ -39,7 +59,7 @@ export async function activate({ neosh, subscriptions }: PluginContext) {
   await neosh.keymap.set("chat", "<C-h>", "my.hello");
 }
 
-export function deactivate() {}     // optional
+export async function deactivate() {}   // optional: runs on unload and at shutdown, bounded to a second
 ```
 
 `neosh init` writes the API types next to your config, emitted by the binary you are running, so
@@ -424,10 +444,55 @@ happens on every cursor move — publish that as an event instead.
 
 ---
 
+## Building on another plugin
+
+Neovim's `require("nvim-tree.api")`, in two spellings. See ADR 0061.
+
+```ts
+// Typed and free of round trips, for a plugin you `requires` in the manifest. Module-level state
+// is shared: this is the very module the host activated, not a second copy of its source.
+import { api as sidebar } from "plugin:sidebar";
+const row = sidebar.cursor();            // the Target under the sidebar's cursor, or null
+for (const t of sidebar.rows()) { /* … */ }
+
+// Through the host, for a plugin you would rather not depend on, or for the host's own commands.
+// Whatever the handler returned, as JSON; `null` for one that returned nothing; rejects with the
+// handler's error, or `not found`.
+const row = await neosh.cmd.call<Target | null>("sidebar.cursor");
+```
+
+A command *returns* now: `cmd.register("acme.count", () => ({ n }))` is a question anybody can ask
+with `cmd.call`, and `cmd.exec` is still the key press that does not wait. Registrations stay data
+so they can be listed and disabled; *queries* get an answer, because faking one out of an event, a
+correlation id and a reply command is a worse RPC written once per plugin.
+
+`init.ts` loads before every plugin, so a static `plugin:` import there would find nothing. Use a
+dynamic one once the workspace is up:
+
+```ts
+neosh.event.on("neosh.ready", async () => {
+  const { api } = await import("plugin:sidebar");
+});
+```
+
+Type-checking resolves `plugin:<name>` against `plugins/<name>/main.ts` beside your config, the
+plugins `neosh plugin add` installed, and — for the bundled ones — `types/builtin/<name>/main.ts`,
+written by `neosh init` and refreshed at startup from the binary you are running.
+
+**Who wins a name.** One rule for keys, commands and highlights: a bundled plugin offers *defaults*,
+a plugin you installed is a *choice*, your own `init.ts` is the *last word*. A lower tier never
+takes a key, a command or a colour a higher one holds — silently, because a default finding its
+key taken is the ordinary case — and within a tier the later registration wins, which is load
+order. A command name a higher tier holds is not refused to the lower one: the registration is
+kept in the wings and comes back when the higher tier lets go, so a panel's `activate` never fails
+over a verb the user had already decided to own.
+
+---
+
 ## Putting something in somebody else's panel
 
-Three mechanisms, and between them you should not have to fork a bundled plugin to change it. See
-[ADR 0040](adr/0040-a-panel-is-a-surface-not-a-program.md).
+Four mechanisms, and between them you should not have to fork a bundled plugin to change it. See
+[ADR 0040](adr/0040-a-panel-is-a-surface-not-a-program.md) and ADR 0061.
 
 ### Bind a key inside a panel you did not open
 
@@ -454,16 +519,25 @@ const buf = await neosh.buf.create({ name: "[tasks]", scratch: true, kind: "acme
 const open = await neosh.win.ofKind("neosh.sidebar");   // find somebody else's, too
 ```
 
-### Contribute rows and verbs
+### Contribute rows, verbs and marks
 
-A contribution point is a name a plugin agrees to read. The sidebar reads two:
+A contribution point is a name a plugin agrees to read. The sidebar reads three:
 
 ```ts
 // Rows in the column. Re-contributing under the same id replaces, so this is also how you update.
 await neosh.ext.contribute("sidebar.section", "todo", {
   title: "ACME",
-  at: "below",                                    // or "above" the project list
+  before: "add",                                  // a slot — projects, add, archived — or another
+                                                  // section's id; `at: "above" | "below"` is coarser
   rows: [{ text: "Ship the thing", command: "acme.open", args: ["thing"] }],
+});
+
+// A mark on a row the panel already draws, keyed by what the row is about. The git plugin's
+// dirty count is exactly this. The name is clipped to make room for the badge; `hl` colours a
+// row the panel left plain; `right` replaces the count or the age on a row that is not busy.
+await neosh.ext.contribute("sidebar.decoration", `prs:${cwd}`, {
+  target: { project: cwd },                       // or { session: id }
+  badge: { text: "2 PRs", hl: "Accent" },
 });
 
 // A verb on a row. The panel binds the key and invokes your command with the row under the cursor:
@@ -478,7 +552,42 @@ await neosh.ext.contribute("sidebar.action", "touch", {
 
 Your contributions go when your plugin does, so `plugins.disabled` takes your rows with it. A point
 is just a string: reading one in a panel of your own is `ext.list(point)` plus a redraw on
-`ext.onChange`, and that is the whole protocol.
+`ext.onChange`, and that is the whole protocol. Declare the points you read under `[provides]` so
+`ext.points()` can say who reads what, and a contribution to a point nobody reads is reported at
+startup with the nearest real one — `did you mean "sidebar.section"?`.
+
+### Follow its cursor
+
+The sidebar says where it is: `sidebar.cursor` on the event bus on every move, with the row under
+the cursor as `data`; `sidebar.cursor` and `sidebar.rows` as commands for `cmd.call`; `cursor()`
+and `rows()` on `plugin:sidebar`.
+
+### A panel of your own, on `ListPanel`
+
+Everything above, for the price of a kind and a `rows` function:
+
+```ts
+import { ListPanel } from "@neosh/api/ui";
+
+const panel = await ListPanel.create<Task>(neosh, {
+  kind: "acme.tasks",
+  dock: "right",
+  size: () => 30,
+  rows: () => tasks.map((t) => ({ text: ` ▸ ${t.title}`, value: t })),
+  key: (t) => ({ task: t.id }),          // what decorations target, and what anchors the cursor
+  kindOf: () => "task",                  // what a contributed action's `on` may name
+  onOpen: (t) => openTask(t),
+});
+subscriptions.push({ dispose: () => panel.dispose() });
+```
+
+That is a buffer of kind `acme.tasks` in a dock; `acme.tasks.down`, `.up`, `.first`, `.last`,
+`.open`, `.leave`, `.toggle`, `.focus`, `.refresh`, `.cursor` and `.rows` as commands, bound at
+`buf_kind` scope so `^Z` lists them and `init.ts` moves them; `acme.tasks.section`, `.action` and
+`.decoration` read exactly as the sidebar reads its own; the cursor published as the buffer var
+`cursor` and the event `acme.tasks.cursor`; and a redraw when any of it changes. The shared pickers
+publish kinds too — `neosh.picker`, `neosh.confirm`, `neosh.prompt` — so a key bound against one
+binds inside every picker at once.
 
 ### Say that something happened
 
@@ -490,6 +599,55 @@ neosh.event.on("acme.indexed", (e) => { /* e.data, e.from */ });
 Broadcast, plugin-defined, and with no reply by construction — an emitter that could be blocked is an
 emitter with every listener on its critical path. When you need an answer, register a command or read
 a contribution point. `from` is stamped by the host and cannot be forged.
+
+The workspace's own events travel the same way, `from: "neosh"` — Neovim's autocmds:
+
+| event | data |
+|---|---|
+| `neosh.ready` | once every plugin has loaded, and again after a reload |
+| `neosh.win.enter`, `neosh.win.leave`, `neosh.win.open` | `{ win, buf, kind }` |
+| `neosh.win.close` | `{ win }` |
+| `neosh.cursor` | `{ win, row, col }` |
+| `neosh.mode` | `{ mode }` |
+| `neosh.viewport` | `{ win, width, height }` — the one size only the frontend knows |
+
+`event.on(name, cb, { kind: "neosh.sidebar" })` keeps only the events about one kind. The host's
+`focus.onChange`, `onViewAttached` and `onShutdown` are the same facts as listeners.
+
+### Colour a window, or ship a theme
+
+```ts
+// Your own groups: `default` is `:hi default` — define only if nobody has, so init.ts wins
+// whichever of you loaded first. A group is yours until you reset it or your plugin unloads,
+// when it goes back to the theme's or away.
+await neosh.hl.define("Acme.Due", { link: "Status.Unread" }, { default: true });
+const { resolved } = await neosh.hl.get("Normal");     // read a colour rather than guess at it
+neosh.hl.onChange(({ names }) => { /* a theme switch lists them all */ });
+
+// One window, or every window of a kind — Neovim's `winhighlight`. Nothing else on screen changes.
+await neosh.hl.define("Acme.Panel", { bg: { kind: "rgb", r: 26, g: 27, b: 38 } });
+await neosh.win.setHighlights({ kind: "neosh.sidebar" }, { Normal: "Acme.Panel" });
+
+// A theme is a contribution: listed beside `dark` and `light` on `ui.theme`, applied when chosen,
+// gone with the plugin. Groups it does not name come from `base`.
+await neosh.ext.contribute("ui.theme", "gruvbox", {
+  base: "dark",
+  groups: { Comment: { fg: { kind: "rgb", r: 146, g: 131, b: 116 } }, "Gruv.Extra": { link: "Normal" } },
+});
+```
+
+### A var about a buffer or a window
+
+`vars` has two more scopes, `{ scope: "buffer", buf }` and `{ scope: "window", win }` — Neovim's
+`b:` and `w:`. In memory only, dropped with the buffer or window, and whoever was watching is told.
+The answer to "a var write is a file write": what changes per keystroke is about a buffer or a
+window, and those are never written down.
+
+### See what is there
+
+`neosh.ext.points()` lists every point with who reads and who writes it; `neosh.ext.plugins()`
+every plugin with its manifest and what became of it — loaded, held, failed; `hl.list()` every
+group with its owner. `plugins.list` in `^K` draws all of it: the `:checkhealth` of this workspace.
 
 ---
 

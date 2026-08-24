@@ -6,11 +6,13 @@
 
 pub mod loader;
 pub mod manifest;
+pub mod order;
 pub mod runtime;
 
 pub use loader::{
     API_SOURCE, API_SPECIFIER, API_TREE, BUILTIN_TREE, BuiltinPlugin, NeoshModuleLoader,
-    api_types_are_current, builtin_plugins, write_api_types,
+    api_types_are_current, builtin_plugins, write_api_types, write_builtin_sources,
 };
 pub use manifest::{DiscoverError, DiscoveredPlugin, discover, load_manifest};
+pub use order::{Candidate, Refused, order};
 pub use runtime::{ScriptInbound, ScriptOutbound, ScriptRuntime};

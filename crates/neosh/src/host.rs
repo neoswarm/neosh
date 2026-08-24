@@ -47,6 +47,22 @@ const COALESCE: Duration = Duration::from_millis(16);
 const BUILTIN: &str = "neosh";
 
 /// Broadcast once every plugin has loaded. See [`Host::announce_ready`].
+/// Where a theme plugin puts its theme. See [`Host::contributed_theme`].
+const THEME_POINT: &str = "ui.theme";
+/// The owner of the commands registered on a held plugin's behalf. See [`Host::wake`].
+const LAZY: &str = "neosh.lazy";
+
+/// A plugin discovered but not loaded, waiting for one of its triggers.
+#[derive(Debug, Clone)]
+struct Lazy {
+    url: String,
+    manifest: neosh_proto::PluginManifest,
+    bundled: bool,
+}
+/// The kinds of the host's own buffers. See [`Editor::create_buffer_of_kind`].
+pub const KIND_TRANSCRIPT: &str = "neosh.transcript";
+pub const KIND_COMPOSER: &str = "neosh.composer";
+pub const KIND_STATUS: &str = "neosh.status";
 const READY_EVENT: &str = "neosh.ready";
 
 /// The workspace var naming every conversation blocked on an answer.
@@ -360,7 +376,7 @@ impl ViewState {
         view: neosh_proto::ViewId,
         session: neosh_proto::SessionId,
     ) -> Self {
-        let chat = editor.create_buffer("[chat]");
+        let chat = editor.create_buffer_of_kind("[chat]", KIND_TRANSCRIPT);
         let chat_win = editor.open_window_in(view, chat, WindowLayout::Docked {
             dock: Dock::Main,
             size: None,
@@ -375,7 +391,7 @@ impl ViewState {
         // Docked before the composer, so it takes the bottom-most row and the composer sits above
         // it. Without a status line the startup screen renders literally nothing — two empty
         // buffers — and "it opened an empty terminal" is indistinguishable from "it crashed".
-        let status = editor.create_buffer("[status]");
+        let status = editor.create_buffer_of_kind("[status]", KIND_STATUS);
         editor.open_window_in(view, status, WindowLayout::Docked {
             dock: Dock::Bottom,
             size: Some(1),
@@ -383,7 +399,7 @@ impl ViewState {
             wrap: None,
         });
 
-        let composer = editor.create_buffer("[composer]");
+        let composer = editor.create_buffer_of_kind("[composer]", KIND_COMPOSER);
         // Four rows at rest: a rule, up to three lines of what you are writing, and the shortcut
         // row that lives on the last of them as a virtual line. The rule is what makes the
         // composer read as a field rather than as the last paragraph of the transcript. `wrap` is
@@ -396,6 +412,9 @@ impl ViewState {
             wrap: Some(true),
         });
         editor.set_mode(view, Mode::Chat);
+        // The field you type in is where unpushed focus lands, so a key bound against
+        // `neosh.composer` resolves at rest. See [`Editor::set_home`].
+        editor.set_home(view, Some(composer_win));
 
         Self {
             session,
@@ -569,7 +588,20 @@ pub struct Host {
     /// Consulted for capabilities enforced per plugin rather than per model action — repository
     /// writes today. Cleared and rebuilt on reload, so removing a permission from a manifest takes
     /// it away rather than leaving the previous grant in place.
+    /// Plugins held until something asks for them. See [`neosh_proto::PluginManifest::activation`].
+    lazy: std::collections::HashMap<PluginId, Lazy>,
+    /// Every plugin discovered this generation, for `plugins.list`: its manifest, whether it is
+    /// bundled, and what became of it.
+    plugin_infos: std::collections::BTreeMap<String, neosh_proto::PluginInfo>,
+    /// Commands that woke a plugin and are waiting for it to come up, to be run then.
+    waking: std::collections::HashMap<PluginId, Vec<(String, Vec<String>)>>,
+    /// What the bus was last told about focus and mode, per view, so a frame says only what moved.
+    last_focus: std::collections::HashMap<neosh_proto::ViewId, Option<WindowId>>,
+    last_mode: std::collections::HashMap<neosh_proto::ViewId, Mode>,
     plugin_permissions: std::collections::HashMap<PluginId, Vec<neosh_proto::PluginPermission>>,
+    /// What each plugin said it offers — points, kinds, vars — from its manifest. Read by
+    /// `ext.points()` and by the check that a contribution lands on a point somebody reads.
+    plugin_provides: std::collections::HashMap<PluginId, neosh_proto::PluginProvides>,
     /// Models discovered from each endpoint, for the life of the session. Cleared on reload,
     /// because a reload may have added, removed or repointed an instance.
     model_cache: crate::services::ModelCache,
@@ -1010,6 +1042,12 @@ impl Host {
             live_turns: 0,
             plugin_drivers: Default::default(),
             plugin_permissions: Default::default(),
+            plugin_provides: Default::default(),
+            lazy: Default::default(),
+            plugin_infos: Default::default(),
+            waking: Default::default(),
+            last_focus: Default::default(),
+            last_mode: Default::default(),
             model_cache: Default::default(),
             state_dir: None,
             attached: Default::default(),
@@ -1112,7 +1150,7 @@ impl Host {
         let call = call.clone();
         if !matches!(
             call,
-            ApiCall::GitStatus
+            ApiCall::GitStatus { .. }
                 | ApiCall::GitBranches { .. }
                 | ApiCall::GitWorktrees { .. }
                 | ApiCall::GitLog { .. }
@@ -1156,6 +1194,186 @@ impl Host {
             }
         });
         true
+    }
+
+    /// Every contribution point, with who reads it and who writes to it.
+    ///
+    /// Readers come from manifests (`[provides] points`), writers from the registry. The host's
+    /// own point — `ui.theme` — is declared here, because the host has no manifest to say so in.
+    fn points(&self) -> Vec<neosh_proto::PointInfo> {
+        let mut readers: std::collections::BTreeMap<String, Vec<String>> = Default::default();
+        readers.entry(THEME_POINT.to_string()).or_default().push(BUILTIN.to_string());
+        for (plugin, provides) in &self.plugin_provides {
+            for point in &provides.points {
+                readers.entry(point.clone()).or_default().push(plugin.0.clone());
+            }
+        }
+        let mut contributors: std::collections::BTreeMap<String, Vec<String>> =
+            self.editor.contributors().into_iter().collect();
+        let mut names: Vec<String> = readers.keys().chain(contributors.keys()).cloned().collect();
+        names.sort();
+        names.dedup();
+        names
+            .into_iter()
+            .map(|point| {
+                let mut r = readers.remove(&point).unwrap_or_default();
+                r.sort();
+                neosh_proto::PointInfo {
+                    readers: r,
+                    contributors: contributors.remove(&point).unwrap_or_default(),
+                    point,
+                }
+            })
+            .collect()
+    }
+
+    /// Say, once the workspace is up, which contributions landed on a point nothing reads.
+    ///
+    /// A point is a bare string and contributing to a misspelt one succeeds silently forever.
+    /// Checked at `neosh.ready` rather than at contribute time, because the reader may load after
+    /// the writer — and a plugin that reads a point without saying so in its manifest is only
+    /// ever a warning, never a refusal, because nothing here is a rule a plugin had to follow
+    /// before today.
+    fn report_unread_points(&mut self) {
+        let points = self.points();
+        let known: Vec<String> =
+            points.iter().filter(|q| !q.readers.is_empty()).map(|q| q.point.clone()).collect();
+        for p in points {
+            if !p.readers.is_empty() || p.contributors.is_empty() {
+                continue;
+            }
+            let hint = nearest(&p.point, &known)
+                .map(|n| format!(" — did you mean {n:?}?"))
+                .unwrap_or_default();
+            let msg = format!(
+                "{} contributes to {:?}, which no plugin declares it reads{hint}",
+                p.contributors.join(", "),
+                p.point
+            );
+            tracing::warn!("{msg}");
+            self.editor_message(MessageLevel::Warn, msg);
+        }
+    }
+
+    /// A contributed theme by name: the variant it is laid over, and its groups.
+    ///
+    /// A theme is a contribution on `ui.theme` — `{ base: "dark", groups: { Comment: { link:
+    /// "NonText" }, Normal: { fg: … } } }` — which is what makes it a thing that can be listed,
+    /// chosen in the option sheet, and taken away with its plugin. Each group is checked rather
+    /// than trusted; one that does not parse is skipped and named in the log, because a theme
+    /// that refuses to load over one bad colour is a theme nobody can fix from inside neosh.
+    fn contributed_theme(
+        &mut self,
+        name: &str,
+    ) -> Option<(neosh_core::palette::Variant, Vec<(String, neosh_proto::HighlightDef)>)> {
+        let item = self.theme_contributions().into_iter().find(|c| c.id == name)?.item;
+        let base = item
+            .get("base")
+            .and_then(|v| v.as_str())
+            .and_then(neosh_core::palette::Variant::parse)
+            .unwrap_or_default();
+        let mut groups = Vec::new();
+        if let Some(map) = item.get("groups").and_then(|g| g.as_object()) {
+            for (group, def) in map {
+                match parse_highlight(def) {
+                    Some(def) => groups.push((group.clone(), def)),
+                    None => tracing::warn!(theme = name, group, "theme group does not parse; skipped"),
+                }
+            }
+        }
+        Some((base, groups))
+    }
+
+    fn theme_contributions(&mut self) -> Vec<neosh_proto::Contribution> {
+        let plugin = PluginId::from(BUILTIN);
+        match self.editor.apply(&plugin, ApiCall::ExtList { point: THEME_POINT.into() }) {
+            Ok(ApiOk::Contributions { contributions }) => contributions,
+            _ => Vec::new(),
+        }
+    }
+
+    /// Keep `ui.theme`'s list of values equal to the themes that exist.
+    ///
+    /// Re-declared, under the host's own id, so the option sheet offers every contributed theme
+    /// beside `dark` and `light`; the registry keeps the chosen value across a re-declaration as
+    /// long as it still fits. A theme in use that has just gone — its plugin disabled — no longer
+    /// fits, which is what puts the workspace back on a built-in variant rather than leaving it
+    /// drawn in colours nothing defines any more.
+    fn sync_themes(&mut self) {
+        let mut values = vec!["dark".to_string(), "light".to_string()];
+        for c in self.theme_contributions() {
+            if !values.contains(&c.id) {
+                values.push(c.id);
+            }
+        }
+        let plugin = PluginId::from(BUILTIN);
+        let current = self.editor.options().get("ui.theme").cloned();
+        let Some(entry) = self.editor.options().entry("ui.theme") else { return };
+        let spec = OptionSpec {
+            name: entry.name,
+            ty: OptionType::Enum { values: values.clone() },
+            default: entry.default,
+            description: entry.description,
+        };
+        if let Err(e) = self.editor.apply(&plugin, ApiCall::OptDeclare { spec }) {
+            tracing::warn!("ui.theme: {e}");
+            return;
+        }
+        match current {
+            Some(OptionValue::Str(name)) if !values.contains(&name) => {
+                // The theme in use was withdrawn. Back to the built-in default — the
+                // re-declaration already dropped the value that no longer fits, so the registry
+                // reads `dark`; this is what makes the screen, and every plugin listening, agree.
+                let _ = self.editor.apply(&plugin, ApiCall::OptReset { name: "ui.theme".into() });
+                self.drain_effects();
+            }
+            Some(OptionValue::Str(name)) if self.editor.custom_theme() == Some(name.as_str()) => {
+                // The theme in use was re-contributed — its plugin reloaded, or its author is
+                // iterating on it. Apply the new groups.
+                self.apply_option("ui.theme", &OptionValue::Str(name));
+            }
+            _ => {}
+        }
+    }
+
+    /// Answer `cmd.call`: run the command where it lives and hand back what it returned.
+    ///
+    /// The host's own commands are answered here and now with `null` — they return nothing and
+    /// run on this loop anyway. A plugin's is asked over the bridge off the loop, and the caller's
+    /// request stays open until the owner answers, throws, unloads or times out.
+    fn begin_command_call(
+        &mut self,
+        caller: PluginId,
+        id: RequestId,
+        name: String,
+        args: Vec<String>,
+    ) {
+        let response: ApiResponse = match self.editor.command_owner(&name) {
+            None => Err(ApiError::NotFound { what: format!("command {name}") }).into(),
+            Some(owner) if owner.0 == BUILTIN => {
+                self.run_builtin(&name, args);
+                Ok(ApiOk::Json { value: serde_json::Value::Null }).into()
+            }
+            Some(owner) => {
+                let bridge = self.bridge.clone();
+                tokio::spawn(async move {
+                    let result = bridge.call_command(&owner, &name, args).await;
+                    let response: ApiResponse = result
+                        .map(|value| ApiOk::Json { value })
+                        .map_err(|message| ApiError::Internal { message })
+                        .into();
+                    let _ = bridge.script().send(ScriptInbound::Plugin {
+                        plugin: caller,
+                        msg: PluginInbound::Response { id, response },
+                    });
+                });
+                return;
+            }
+        };
+        let _ = self.bridge.script().send(ScriptInbound::Plugin {
+            plugin: caller,
+            msg: PluginInbound::Response { id, response },
+        });
     }
 
     fn chat_line(&mut self, text: impl Into<String>) {
@@ -1338,6 +1556,17 @@ impl Host {
             }
             ApiCall::AgentCancel => {
                 self.cancel_turn_here();
+                Ok(ApiOk::Unit)
+            }
+            ApiCall::ExtPoints => Ok(ApiOk::Points { points: self.points() }),
+            ApiCall::PluginList => {
+                Ok(ApiOk::Plugins { plugins: self.plugin_infos.values().cloned().collect() })
+            }
+            // A call with an answer is taken over before dispatch, where the request id still is.
+            // Arriving here means it came as a notify — nobody is waiting — so it is an exec.
+            ApiCall::CmdCall { name, args } => {
+                self.editor.exec_command(&name, args);
+                self.drain_effects();
                 Ok(ApiOk::Unit)
             }
             ApiCall::AgentGetSelection => {
@@ -1571,6 +1800,7 @@ impl Host {
             // `from` is stamped here rather than taken from the call, so "who said this" is one of
             // the few things in a plugin message that cannot be forged.
             ApiCall::EventEmit { name, data } => {
+                self.wake_on_event(&name);
                 self.bridge.broadcast(PluginEvent::Event {
                     name,
                     data,
@@ -2862,6 +3092,9 @@ impl Host {
                     // itself rather than sending them to a JS plugin that does not exist.
                     if plugin.0 == BUILTIN {
                         self.run_builtin(&name, args);
+                    } else if plugin.0 == LAZY {
+                        // A key for a plugin that is not up yet: load it, and press again for it.
+                        self.wake_on_command(&name, args);
                     } else {
                         self.bridge.notify(&plugin, PluginEvent::CommandInvoked { name, args, key });
                     }
@@ -2876,10 +3109,19 @@ impl Host {
                     self.bridge.broadcast(PluginEvent::OptionChanged { name, value });
                 }
                 CoreEffect::ContributionsChanged { point } => {
+                    // A theme came or went: the option that lists them has to say so, and a
+                    // theme in use that has just been withdrawn has to give way.
+                    if point == THEME_POINT {
+                        self.sync_themes();
+                    }
                     // Broadcast for the same reason: the plugin that *renders* a point is never the
                     // one that just contributed to it, and it is the one that has to redraw.
                     self.bridge.broadcast(PluginEvent::ContributionsChanged { point });
                 }
+                CoreEffect::HighlightsChanged { names } => {
+                    self.bridge.broadcast(PluginEvent::HighlightChanged { names });
+                }
+                CoreEffect::KindSeen { kind } => self.wake_on_kind(&kind),
             }
         }
     }
@@ -3461,7 +3703,11 @@ impl Host {
             }
             "ui.theme" => {
                 let Some(name) = value.as_str() else { return };
-                let Some(variant) = neosh_core::palette::Variant::parse(name) else {
+                let changed = if let Some(variant) = neosh_core::palette::Variant::parse(name) {
+                    self.editor.set_theme(variant)
+                } else if let Some((base, groups)) = self.contributed_theme(name) {
+                    self.editor.set_custom_theme(name, base, groups)
+                } else {
                     // Unreachable through the option registry, which validates the enum; reachable
                     // if the host ever sets this itself.
                     self.editor_message(
@@ -3470,7 +3716,7 @@ impl Host {
                     );
                     return;
                 };
-                if self.editor.set_theme(variant) {
+                if changed {
                     self.refresh_status();
                 }
             }
@@ -8027,6 +8273,10 @@ impl Host {
                     Some(e) => {
                         tracing::error!(%plugin, "failed to activate: {e}");
                         self.editor_message(MessageLevel::Error, format!("{plugin}: {e}"));
+                        if let Some(info) = self.plugin_infos.get_mut(&plugin.0) {
+                            info.state = "failed".into();
+                            info.error = Some(e.clone());
+                        }
                         // It threw *during* activation, which means it may already have armed
                         // timers and registered commands, tools and hooks — and is on the
                         // broadcast list, having been put there when its load was asked for.
@@ -8036,6 +8286,7 @@ impl Host {
                     }
                 }
                 self.advance_startup(&plugin);
+                self.woke(&plugin);
             }
             ScriptOutbound::Log { level, message } => match level {
                 MessageLevel::Error => tracing::error!("plugin runtime: {message}"),
@@ -8064,6 +8315,7 @@ impl Host {
                 PluginOutbound::Response { id, response } => match response {
                     PluginResponse::Tool { result } => self.bridge.resolve_tool(&id, result),
                     PluginResponse::Hook { outcome } => self.bridge.resolve_hook(&id, outcome),
+                    PluginResponse::Command { value } => self.bridge.resolve_command(&id, value),
                     PluginResponse::ProviderAccepted => self.bridge.resolve_accept(&id),
                     PluginResponse::Error { message } => {
                         tracing::warn!(%plugin, "{message}");
@@ -8102,6 +8354,13 @@ impl Host {
         // taking as long as it likes.
         if let ApiCall::ChatAttach { path: None } = &call {
             self.begin_paste(Some((plugin.clone(), id.clone())));
+            return;
+        }
+        // Answered when the command's owner answers. Waiting for that on the loop would freeze
+        // typing for as long as the handler takes, and a handler is allowed to open a picker and
+        // wait for a person.
+        if let ApiCall::CmdCall { name, args } = &call {
+            self.begin_command_call(plugin, id, name.clone(), args.clone());
             return;
         }
         if let ApiCall::SwarmProbe { addr } = &call {
@@ -8229,7 +8488,17 @@ impl Host {
             }
             InputEvent::ViewportChanged { win, width, height, top_line, rows } => {
                 let was = self.chat_width();
+                let before = self.editor.window(win).and_then(|w| w.viewport.as_ref()).map(|v| (v.width, v.height));
                 self.editor.set_viewport(win, neosh_core::Viewport { width, height, top_line, rows });
+                // A size is the one thing only the frontend knows; a plugin that sized a meter to
+                // it hears here that it has to size it again.
+                if before != Some((width, height)) {
+                    self.bridge.broadcast(PluginEvent::Event {
+                        name: "neosh.viewport".to_string(),
+                        data: Some(serde_json::json!({ "win": win, "width": width, "height": height })),
+                        from: BUILTIN.to_string(),
+                    });
+                }
                 // What the frontend *drew*, which is not always what was asked for: a window whose
                 // scroll had to bend to keep its cursor on screen is showing a different first row.
                 // Taking it back means the next page starts from where the screen is rather than
@@ -8361,10 +8630,190 @@ impl Host {
         if frame.is_empty() {
             return Ok(());
         }
+        self.say_what_moved(&frame);
         // The flush is nobody's in particular: it is the end of the frame, and every terminal that
         // got something out of it has to be told to draw.
         frame.push((None, UiEvent::Flush));
         self.frontend.send(frame).await
+    }
+
+    /// Tell plugins what the frontend is about to be told, in the words a plugin uses.
+    ///
+    /// Neovim's autocmds — `WinEnter`, `WinLeave`, `CursorMoved`, `ModeChanged` — as ordinary
+    /// events on the ordinary bus, `from: "neosh"`, read off the same batch the screen is drawn
+    /// from so the two can never disagree about what happened. A plugin decorating somebody else's
+    /// panel needs exactly these: the sidebar's cursor is the sidebar's to publish, but which
+    /// window has the keyboard and where its cursor is are facts about the workspace.
+    fn say_what_moved(&mut self, frame: &[(Option<neosh_proto::ViewId>, UiEvent)]) {
+        let mut said: Vec<(&'static str, serde_json::Value)> = Vec::new();
+        for (tag, ev) in frame {
+            // Which terminal an event is about. Focus and mode are per view now — two terminals
+            // are two places — so the bus says which place moved, and a listener that cares about
+            // "the one I am drawn in" filters like it filters on a kind.
+            let view = tag.unwrap_or(neosh_proto::ViewId::LOCAL);
+            match ev {
+                UiEvent::FocusChanged { win } => {
+                    let last = self.last_focus.get(&view).copied().flatten();
+                    if *win == last {
+                        continue;
+                    }
+                    if let Some(from) = last {
+                        said.push(("neosh.win.leave", self.describe_window(from)));
+                    }
+                    if let Some(to) = *win {
+                        said.push(("neosh.win.enter", self.describe_window(to)));
+                    }
+                    self.last_focus.insert(view, *win);
+                }
+                UiEvent::WindowOpened { win, .. } => {
+                    said.push(("neosh.win.open", self.describe_window(*win)));
+                }
+                UiEvent::WindowClosed { win } => {
+                    said.push(("neosh.win.close", serde_json::json!({ "win": win })));
+                    self.last_focus.retain(|_, w| *w != Some(*win));
+                    // Its vars go with it, and whoever was watching them is told.
+                    let scope = neosh_proto::VarScope::Window { win: *win };
+                    for key in self.vars.forget_window(*win) {
+                        self.bridge.broadcast(PluginEvent::VarChanged {
+                            scope: scope.clone(),
+                            key,
+                            value: None,
+                        });
+                    }
+                }
+                UiEvent::CursorMoved { win, row, col } => {
+                    said.push((
+                        "neosh.cursor",
+                        serde_json::json!({ "win": win, "row": row, "col": col }),
+                    ));
+                }
+                _ => {}
+            }
+        }
+        let views: Vec<neosh_proto::ViewId> = self.views.keys().copied().collect();
+        for view in views {
+            let mode = self.editor.mode(view);
+            if self.last_mode.get(&view) != Some(&mode) {
+                self.last_mode.insert(view, mode);
+                said.push(("neosh.mode", serde_json::json!({ "mode": mode, "view": view })));
+            }
+        }
+        self.last_mode.retain(|v, _| self.views.contains_key(v));
+        for (name, data) in said {
+            self.wake_on_event(name);
+            self.bridge.broadcast(PluginEvent::Event {
+                name: name.to_string(),
+                data: Some(data),
+                from: BUILTIN.to_string(),
+            });
+        }
+    }
+
+    // ---- lazy plugins ------------------------------------------------------
+
+    /// Keep a plugin back until one of its triggers fires, registering its commands on its behalf
+    /// so a key bound to one of them works from the first press.
+    fn hold_plugin(&mut self, id: PluginId, lazy: Lazy) {
+        let owner = PluginId::from(LAZY);
+        for name in &lazy.manifest.activation.on_command {
+            let desc = Some(format!("{} (loads the plugin)", lazy.manifest.description.clone().unwrap_or_default()).trim().to_string());
+            if let Err(e) = self.editor.apply(&owner, ApiCall::CmdRegister { name: name.clone(), desc }) {
+                tracing::warn!(plugin = %id, command = name, "{e}");
+            }
+        }
+        tracing::info!(plugin = %id, "held until needed");
+        if let Some(info) = self.plugin_infos.get_mut(&id.0) {
+            info.state = "held".into();
+        }
+        self.lazy.insert(id, lazy);
+    }
+
+    /// Load a held plugin now. Anything it `requires` that is also held is woken first.
+    fn wake(&mut self, id: &PluginId) {
+        let Some(lazy) = self.lazy.remove(id) else { return };
+        let owner = PluginId::from(LAZY);
+        for name in &lazy.manifest.activation.on_command {
+            // Its own registration is about to arrive, and a name the stub still held would
+            // refuse it.
+            let _ = self.editor.apply(&owner, ApiCall::CmdUnregister { name: name.clone() });
+        }
+        for dep in &lazy.manifest.requires {
+            let dep = PluginId(dep.clone());
+            if self.lazy.contains_key(&dep) {
+                self.wake(&dep);
+            }
+        }
+        if lazy.bundled {
+            self.editor.mark_bundled(id);
+        }
+        self.plugin_permissions.insert(id.clone(), lazy.manifest.permissions.clone());
+        self.plugin_provides.insert(id.clone(), lazy.manifest.provides.clone());
+        tracing::info!(plugin = %id, "waking");
+        if let Some(info) = self.plugin_infos.get_mut(&id.0) {
+            info.state = "loaded".into();
+        }
+        self.load_url(id, &lazy.url, lazy.manifest.requires.clone());
+    }
+
+    fn wake_on_command(&mut self, name: &str, args: Vec<String>) {
+        let who: Option<PluginId> = self
+            .lazy
+            .iter()
+            .find(|(_, l)| l.manifest.activation.on_command.iter().any(|c| c == name))
+            .map(|(id, _)| id.clone());
+        let Some(id) = who else { return };
+        self.waking.entry(id.clone()).or_default().push((name.to_string(), args));
+        self.wake(&id);
+    }
+
+    fn wake_on_event(&mut self, event: &str) {
+        let who: Vec<PluginId> = self
+            .lazy
+            .iter()
+            .filter(|(_, l)| l.manifest.activation.on_event.iter().any(|e| e == event))
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in who {
+            self.wake(&id);
+        }
+    }
+
+    fn wake_on_kind(&mut self, kind: &str) {
+        let who: Vec<PluginId> = self
+            .lazy
+            .iter()
+            .filter(|(_, l)| l.manifest.activation.on_kind.iter().any(|k| k == kind))
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in who {
+            self.wake(&id);
+        }
+    }
+
+    /// A woken plugin is up: it missed `neosh.ready`, so it is told now, and the press that
+    /// woke it is replayed.
+    fn woke(&mut self, id: &PluginId) {
+        if self.startup_in_flight() {
+            return;
+        }
+        self.bridge.notify(id, PluginEvent::Event {
+            name: READY_EVENT.to_string(),
+            data: None,
+            from: BUILTIN.to_string(),
+        });
+        for (name, args) in self.waking.remove(id).unwrap_or_default() {
+            self.editor.exec_command(&name, args);
+            self.drain_effects();
+        }
+    }
+
+    /// A window as an event describes it: its id, its buffer, and the buffer's kind — the field
+    /// a listener filters on, so a plugin interested in the sidebar ignores everything else.
+    fn describe_window(&self, win: WindowId) -> serde_json::Value {
+        let w = self.editor.window(win);
+        let buf = w.map(|w| w.buf);
+        let kind = buf.and_then(|b| self.editor.buffer(b)).and_then(|b| b.kind.clone());
+        serde_json::json!({ "win": win, "buf": buf, "kind": kind })
     }
 
     pub async fn run(
@@ -8592,6 +9041,14 @@ impl Host {
             }
         }
 
+        // Plugins first: `deactivate` runs while the host is still here to answer a last call —
+        // flushing state, saying goodbye to a server — and nothing can wedge it, because the
+        // runtime is dropped a moment later whether or not anybody has finished.
+        self.bridge.broadcast(PluginEvent::Shutdown);
+        for plugin in self.bridge.loaded() {
+            let _ = self.bridge.script().send(ScriptInbound::Unload { plugin });
+        }
+        tokio::time::sleep(Duration::from_millis(150)).await;
         // Last thing before the screen goes: whatever was said this session is on disk.
         self.persist_sessions();
         // Anything gathered and not yet spoken. Waiting out the burst window here means never —
@@ -9099,6 +9556,13 @@ impl Host {
 
     /// Everything that has to happen when a plugin stops being loaded, whether it is being
     /// reloaded or its `activate` threw partway through registering things.
+    /// Forget the held plugins, for a reload that is about to discover them again.
+    fn drop_held_plugins(&mut self) {
+        self.lazy.clear();
+        self.waking.clear();
+        self.editor.remove_plugin(&PluginId::from(LAZY));
+    }
+
     fn tear_down_plugin(&mut self, id: &PluginId) {
         let _ = self.bridge.script().send(ScriptInbound::Unload { plugin: id.clone() });
         self.editor.remove_plugin(id);
@@ -9107,6 +9571,7 @@ impl Host {
         // Dropped with the plugin, so a reload that removes `vcs_write` from a manifest actually
         // removes the capability rather than leaving the previous grant behind.
         self.plugin_permissions.remove(id);
+        self.plugin_provides.remove(id);
         // A segment outliving its plugin would leave a stale model name in the footer after a
         // reload removed the plugin that put it there.
         let prefix = format!("{id}:");
@@ -9372,6 +9837,7 @@ impl Host {
         for id in self.bridge.loaded() {
             self.tear_down_plugin(&id);
         }
+        self.drop_held_plugins();
         // A reload may have added, removed or repointed a provider instance, so what was discovered
         // from the old set is no longer an answer to anything.
         self.model_cache.lock().expect("model cache poisoned").clear();
@@ -9890,6 +10356,9 @@ impl Host {
         match self.startup.scripts.pop_front() {
             Some((id, path)) => {
                 self.startup.active = Some(id.clone());
+                // The user's own configuration: the last word on every key, command and colour,
+                // even though it is the first thing to load.
+                self.editor.mark_user(&id);
                 if !self.load_script(&id, &path) {
                     self.startup.active = None;
                     self.next_config_script();
@@ -9952,6 +10421,7 @@ impl Host {
     /// host is what said it. It is announced again after a reload, which is the same fact about the
     /// same workspace being true a second time.
     fn announce_ready(&mut self) {
+        self.report_unread_points();
         self.bridge.broadcast(PluginEvent::Event {
             name: READY_EVENT.to_string(),
             data: None,
@@ -10056,7 +10526,9 @@ impl Host {
 
         // Bundled plugins load first, so a user plugin registering the same command or key wins by
         // loading after. Disabling one is `plugins.disabled = ["sidebar"]` rather than deleting a
-        // file the user does not own.
+        // file the user does not own — and it applies to every plugin, not only the bundled ones,
+        // because "remove it from the directory" is not an answer for a plugin `neosh plugin add`
+        // put there.
         let disabled: Vec<String> = self
             .editor
             .options()
@@ -10066,6 +10538,16 @@ impl Host {
                 _ => None,
             })
             .unwrap_or_default();
+
+        // Everything that could load, in the default order, before anything does: a plugin's
+        // `requires` is about another plugin that may sit in a later directory.
+        struct Found {
+            id: PluginId,
+            url: String,
+            manifest: neosh_proto::PluginManifest,
+            bundled: bool,
+        }
+        let mut found: Vec<Found> = Vec::new();
         let builtins =
             if self.startup.no_builtin_plugins { Vec::new() } else { neosh_script::builtin_plugins() };
         for builtin in builtins {
@@ -10073,23 +10555,18 @@ impl Host {
                 tracing::info!(plugin = %builtin.name, "bundled plugin disabled by config");
                 continue;
             }
-            let id = PluginId(builtin.name.clone());
-            // Its keymaps are defaults from here on: they will not take a key something else has
-            // already bound, which is the only way `init.ts` running first can also mean it wins.
-            self.editor.mark_bundled(&id);
             match toml::from_str::<neosh_proto::PluginManifest>(&builtin.manifest) {
-                Ok(m) => {
-                    self.plugin_permissions.insert(id.clone(), m.permissions);
-                }
+                Ok(manifest) => found.push(Found {
+                    id: PluginId(builtin.name.clone()),
+                    url: builtin.url.clone(),
+                    manifest,
+                    bundled: true,
+                }),
                 Err(e) => {
                     // A bundled manifest that does not parse is a build mistake. Skip it rather
                     // than loading code whose declared capabilities are unknown.
                     tracing::error!(plugin = %builtin.name, "bundled manifest is invalid: {e}");
-                    continue;
                 }
-            }
-            if self.load_url(&id, &builtin.url) {
-                self.startup.loading += 1;
             }
         }
 
@@ -10099,17 +10576,90 @@ impl Host {
             if !seen.insert(dir.clone()) {
                 continue;
             }
-            let (found, errors) = neosh_script::discover(&dir);
+            let (plugins, errors) = neosh_script::discover(&dir);
             for e in errors {
                 tracing::error!("plugin discovery: {e}");
                 self.editor_message(MessageLevel::Error, e.to_string());
             }
-            for plugin in found {
-                self.plugin_permissions
-                    .insert(plugin.id.clone(), plugin.manifest.permissions.clone());
-                if self.load_script(&plugin.id, &plugin.entry) {
-                    self.startup.loading += 1;
+            for plugin in plugins {
+                if disabled.iter().any(|d| d == &plugin.id.0) {
+                    tracing::info!(plugin = %plugin.id, "plugin disabled by config");
+                    continue;
                 }
+                if found.iter().any(|f| f.id == plugin.id) {
+                    // Two directories, one name: the second would share the first's registry
+                    // bucket and be torn down with it. The first found wins, and the second is
+                    // said out loud rather than silently merged.
+                    let msg = format!(
+                        "plugin {} in {} is already loaded from elsewhere; skipping it",
+                        plugin.id,
+                        plugin.dir.display()
+                    );
+                    tracing::warn!("{msg}");
+                    self.editor_message(MessageLevel::Warn, msg);
+                    continue;
+                }
+                let Some(url) = self.script_url(&plugin.entry) else { continue };
+                found.push(Found { id: plugin.id, url, manifest: plugin.manifest, bundled: false });
+            }
+        }
+
+        let candidates: Vec<neosh_script::Candidate> = found
+            .iter()
+            .map(|f| neosh_script::Candidate {
+                name: f.id.0.clone(),
+                requires: f.manifest.requires.clone(),
+                after: f.manifest.after.clone(),
+            })
+            .collect();
+        let (order, refused) = neosh_script::order(&candidates);
+        self.plugin_infos.clear();
+        for f in &found {
+            self.plugin_infos.insert(f.id.0.clone(), neosh_proto::PluginInfo {
+                name: f.id.0.clone(),
+                manifest: f.manifest.clone(),
+                bundled: f.bundled,
+                state: "loaded".into(),
+                error: None,
+            });
+        }
+        for r in refused {
+            tracing::error!("{r}");
+            self.editor_message(MessageLevel::Error, r.to_string());
+            let name = match &r {
+                neosh_script::Refused::MissingRequirement { plugin, .. }
+                | neosh_script::Refused::Cycle { plugin } => plugin.clone(),
+            };
+            if let Some(info) = self.plugin_infos.get_mut(&name) {
+                info.state = "failed".into();
+                info.error = Some(r.to_string());
+            }
+        }
+        // A plugin something eager requires is eager too: holding it would hold the other.
+        let eager_needs: std::collections::HashSet<String> = found
+            .iter()
+            .filter(|f| f.manifest.activation.is_empty())
+            .flat_map(|f| f.manifest.requires.iter().cloned())
+            .collect();
+        for i in order {
+            let f = &found[i];
+            let id = f.id.clone();
+            if !f.manifest.activation.is_empty() && !eager_needs.contains(&id.0) {
+                self.hold_plugin(id, Lazy { url: f.url.clone(), manifest: f.manifest.clone(), bundled: f.bundled });
+                continue;
+            }
+            if f.bundled {
+                // Its keymaps are defaults from here on: they will not take a key something else
+                // has already bound, which is the only way `init.ts` running first can also mean
+                // it wins.
+                self.editor.mark_bundled(&id);
+            }
+            self.plugin_permissions.insert(id.clone(), f.manifest.permissions.clone());
+            self.plugin_provides.insert(id.clone(), f.manifest.provides.clone());
+            let requires = f.manifest.requires.clone();
+            let url = f.url.clone();
+            if self.load_url(&id, &url, requires) {
+                self.startup.loading += 1;
             }
         }
 
@@ -10137,24 +10687,31 @@ impl Host {
     /// what order they finished. It cost a held `[options]` value its `option_changed`, and the
     /// only reason it had never been seen is that the plugin declaring one was usually last.
     fn load_script(&mut self, id: &PluginId, entry: &std::path::Path) -> bool {
+        let Some(url) = self.script_url(entry) else { return false };
+        self.load_url(id, &url, Vec::new())
+    }
+
+    /// The URL an entry file loads from, with this generation's cache-busting query on it.
+    ///
+    /// On a reload, the generation makes this a URL deno_core has not cached, so the file is read
+    /// again. The loader strips it before touching the filesystem and propagates it to relative
+    /// imports.
+    fn script_url(&mut self, entry: &std::path::Path) -> Option<String> {
         let Ok(mut url) = url::Url::from_file_path(entry) else {
             self.editor_message(
                 MessageLevel::Error,
                 format!("{}: not an absolute path", entry.display()),
             );
-            return false;
+            return None;
         };
-        // On a reload, the generation makes this a URL deno_core has not cached, so the file is
-        // read again. The loader strips it before touching the filesystem and propagates it to
-        // relative imports.
         if self.startup.generation > 0 {
             url.set_query(Some(&format!("v={}", self.startup.generation)));
         }
-        self.load_url(id, url.as_str())
+        Some(url.into())
     }
 
     /// Load an entry module by URL, whether it lives on disk or inside the binary.
-    fn load_url(&mut self, id: &PluginId, url: &str) -> bool {
+    fn load_url(&mut self, id: &PluginId, url: &str, requires: Vec<String>) -> bool {
         let url = if self.startup.generation > 0 && !url.contains("?v=") {
             format!("{url}?v={}", self.startup.generation)
         } else {
@@ -10165,6 +10722,7 @@ impl Host {
             url,
             config: serde_json::Value::Object(Default::default()),
             version: neosh_proto::PROTOCOL_VERSION,
+            requires,
         }) {
             Ok(()) => {
                 // Reachable from here, not from its `Loaded`. See [`Self::load_script`].
@@ -10178,6 +10736,47 @@ impl Host {
         }
     }
 
+}
+
+/// One group of a contributed theme, in the shape `hl.define` takes: `{ link: "Name" }` or a
+/// highlight spec (`{ fg, bg, bold, … }`), with the wire form (`{ kind: "link", to }`) accepted too.
+fn parse_highlight(v: &serde_json::Value) -> Option<neosh_proto::HighlightDef> {
+    if let Some(to) = v.get("link").and_then(|l| l.as_str()) {
+        return Some(neosh_proto::HighlightDef::Link { to: to.to_string() });
+    }
+    if v.get("kind").is_some()
+        && let Ok(def) = serde_json::from_value::<neosh_proto::HighlightDef>(v.clone())
+    {
+        return Some(def);
+    }
+    serde_json::from_value::<neosh_proto::HighlightSpec>(v.clone())
+        .ok()
+        .map(|spec| neosh_proto::HighlightDef::Spec { spec })
+}
+
+/// The closest of `candidates` to `name`, when it is close enough to be a typo.
+fn nearest<'a>(name: &str, candidates: &'a [String]) -> Option<&'a str> {
+    candidates
+        .iter()
+        .map(|c| (levenshtein(name, c), c.as_str()))
+        .filter(|(d, _)| *d <= 3)
+        .min_by_key(|(d, _)| *d)
+        .map(|(_, c)| c)
+}
+
+fn levenshtein(a: &str, b: &str) -> usize {
+    let a: Vec<char> = a.chars().collect();
+    let b: Vec<char> = b.chars().collect();
+    let mut prev: Vec<usize> = (0..=b.len()).collect();
+    for (i, ca) in a.iter().enumerate() {
+        let mut cur = vec![i + 1];
+        for (j, cb) in b.iter().enumerate() {
+            let cost = usize::from(ca != cb);
+            cur.push((prev[j] + cost).min(prev[j + 1] + 1).min(cur[j] + 1));
+        }
+        prev = cur;
+    }
+    prev[b.len()]
 }
 
 /// Turn a refused option into something a user can act on.
@@ -10266,7 +10865,7 @@ impl neosh_provider::drivers::Unasked for UnaskedSink {
 async fn run_slow(svc: Services, call: ApiCall) -> ApiResult {
     match call {
         ApiCall::PathComplete { prefix } => svc.path_complete(prefix).await,
-        ApiCall::GitStatus => svc.git_status().await,
+        ApiCall::GitStatus { cwd } => svc.git_status(cwd).await,
         ApiCall::GitBranches { include_remote, cwd } => {
             svc.git_branches(include_remote, cwd).await
         }

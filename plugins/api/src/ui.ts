@@ -15,6 +15,7 @@
 import { byteLength, byteOffsets, clipToWidth, padToWidth, width } from "@neosh/api";
 import type {
   BufferId,
+  Contribution,
   Disposable,
   DrawnMark,
   DrawnRow,
@@ -26,6 +27,18 @@ import type {
   Neosh,
   WindowId,
 } from "@neosh/api";
+
+/**
+ * The buffer kinds the shared widgets publish.
+ *
+ * A picker used to have no kind, which by ADR 0040's own rule made it the one panel in the
+ * workspace you could only replace and never extend. With one, `keymap.set` at `buf_kind` scope
+ * binds inside every picker at once, `win.ofKind` finds the open one, and `win.setHighlights`
+ * restyles them all.
+ */
+export const KIND_PICKER = "neosh.picker";
+export const KIND_CONFIRM = "neosh.confirm";
+export const KIND_PROMPT = "neosh.prompt";
 
 // ---------------------------------------------------------------------------
 // Fuzzy matching
@@ -491,7 +504,7 @@ export async function picker<T>(
   const width = Math.max(20, opts.width ?? 64);
   const filtering = opts.filter !== false;
 
-  const buf = await neosh.buf.create({ name: `[${opts.title ?? "picker"}]`, scratch: true });
+  const buf = await neosh.buf.create({ name: `[${opts.title ?? "picker"}]`, scratch: true, kind: KIND_PICKER });
   const ns = await neosh.ns.create(NS);
 
   watchKeys(neosh);
@@ -979,7 +992,7 @@ export async function confirm(
   // On the answer that changes nothing, when the other one cannot be taken back.
   let cursor = opts.dangerous ? 1 : 0;
 
-  const buf = await neosh.buf.create({ name: "[confirm]", scratch: true });
+  const buf = await neosh.buf.create({ name: "[confirm]", scratch: true, kind: KIND_CONFIRM });
   const ns = await neosh.ns.create(CONFIRM_NS);
 
   watchKeys(neosh);
@@ -1342,7 +1355,7 @@ export async function prompt(
   opts: { initial?: string; width?: number } = {},
 ): Promise<string | null> {
   const width = Math.max(24, opts.width ?? 60);
-  const buf = await neosh.buf.create({ name: "[prompt]", scratch: true });
+  const buf = await neosh.buf.create({ name: "[prompt]", scratch: true, kind: KIND_PROMPT });
   const win = await neosh.float.open(buf, {
     anchor: { kind: "screen" },
     width: { kind: "fixed", n: width },
@@ -1803,6 +1816,11 @@ export class CursoredList<T = unknown> {
     return this.rows[this.cursor]?.value;
   }
 
+  /** Every row's value, top to bottom, skipping rows that have none. What a panel publishes. */
+  get values(): T[] {
+    return this.rows.flatMap((r) => (r.value === undefined ? [] : [r.value]));
+  }
+
   get length(): number {
     return this.rows.length;
   }
@@ -2161,7 +2179,7 @@ export async function railPicker<G, T>(
   const railWidth = Math.min(Math.max(12, opts.railWidth ?? 22), total - 24);
   const paneWidth = total - railWidth - 1; // the rule takes a column
 
-  const buf = await neosh.buf.create({ name: `[${opts.title ?? "select"}]`, scratch: true });
+  const buf = await neosh.buf.create({ name: `[${opts.title ?? "select"}]`, scratch: true, kind: KIND_PICKER });
   const ns = await neosh.ns.create(RAIL_NS);
   const win = await neosh.float.open(buf, {
     anchor: { kind: "screen" },
@@ -2666,4 +2684,571 @@ export async function railPicker<G, T>(
   await load();
   await render();
   return done;
+}
+
+
+// ---------------------------------------------------------------------------
+// What a panel owes the plugins that build on it
+//
+// A section somebody contributed, placed by name; a decoration somebody put on one of the panel's
+// own rows; the row itself with the decoration applied. Three functions any list panel can use —
+// the bundled sidebar does — so that `sidebar.section`, `acme.tasks.section` and every other
+// `<kind>.section` mean exactly the same thing to the plugin contributing to them.
+// ---------------------------------------------------------------------------
+
+/** A block of rows somebody else contributed to a panel. Data, so it can be listed and disabled. */
+export interface SectionItem {
+  /** Drawn as a heading with a rule under it. Omit for rows with no heading. */
+  title?: string;
+  /** The way in, drawn dim at the right of the heading: `^L`, `^G`. */
+  hint?: string;
+  /** Coarse placement relative to the panel's own blocks. Defaults to `below`. */
+  at?: "above" | "below";
+  /** Finer: sit directly before or after one of the panel's slots, or another section's id. */
+  before?: string;
+  after?: string;
+  rows?: Array<{
+    text: string;
+    hl?: string;
+    /** Highlights for pieces of the row: UTF-8 byte offsets into *your* `text`. */
+    spans?: Array<{ from: number; to: number; hl: string }>;
+    right?: { text: string; hl?: string };
+    /** Run on `↵`. Without one the row is inert — a label rather than a verb. */
+    command?: string;
+    args?: string[];
+  }>;
+}
+
+/** A verb on a panel's rows, contributed by somebody else and bound by the panel. */
+export interface ActionItem {
+  /** Key notation, as `keymap.set` takes it. */
+  key: string;
+  /** For the hint strip and `^Z`. */
+  label: string;
+  command: string;
+  /** Which rows it applies to — a row kind the panel names, `custom` for contributed rows, or `any`. */
+  on?: string;
+}
+
+/** A mark on a row a panel already draws, keyed by what the row is about. */
+export interface DecorationItem {
+  /** The row it is about, in the panel's own terms: `{ project: cwd }`, `{ task: id }`. */
+  target: Record<string, string>;
+  /** A short mark after the name, in `hl`. The name is clipped to make room. */
+  badge?: { text: string; hl?: string };
+  /** The row's highlight, when the panel has no opinion of its own. */
+  hl?: string;
+  /** The right-hand column, on a row that is not busy. */
+  right?: { text: string; hl?: string };
+}
+
+/** Every decoration on one target, merged. */
+export interface Decoration {
+  badge?: { text: string; hl?: string };
+  hl?: string;
+  right?: { text: string; hl?: string };
+}
+
+/** The key a decoration's `target` files under: `project:/w/x`, `task:17`. */
+export function decorationKey(target: unknown): string | null {
+  if (!target || typeof target !== "object") return null;
+  const entries = Object.entries(target as Record<string, unknown>)
+    .filter(([, v]) => typeof v === "string")
+    .sort(([a], [b]) => a.localeCompare(b));
+  const first = entries[0];
+  return first ? `${first[0]}:${first[1] as string}` : null;
+}
+
+/**
+ * Every decoration on a point, folded by target: later contributions (lower priority) fill in what
+ * earlier ones left unsaid, and badges are joined with a space, because two plugins each with one
+ * word to say about a row are both right.
+ */
+export function mergeDecorations(
+  items: Array<Contribution & { item: DecorationItem }>,
+): Map<string, Decoration> {
+  const out = new Map<string, Decoration>();
+  for (const c of items) {
+    const key = decorationKey(c.item?.target);
+    if (key === null) continue;
+    const d = out.get(key) ?? {};
+    const badge = c.item.badge;
+    if (typeof badge?.text === "string" && badge.text !== "") {
+      d.badge = d.badge
+        ? { text: `${d.badge.text} ${badge.text}`, hl: d.badge.hl }
+        : { text: badge.text, hl: badge.hl };
+    }
+    if (d.hl === undefined && typeof c.item.hl === "string") d.hl = c.item.hl;
+    if (d.right === undefined && typeof c.item.right?.text === "string") {
+      d.right = { text: c.item.right.text, hl: c.item.right.hl };
+    }
+    out.set(key, d);
+  }
+  return out;
+}
+
+/** How many columns a decoration's badge will take, for a row builder to leave free. */
+export function badgeWidth(d: Decoration | undefined): number {
+  return d?.badge ? byteLength(` ${d.badge.text}`) : 0;
+}
+
+/**
+ * A decoration, applied to a row the panel built.
+ *
+ * The badge goes on the end of the clipped text with its own span — the builder left room for it
+ * with {@link badgeWidth}. `hl` only fills a row the panel left plain; `right` only replaces the
+ * column on a row that is not `busy`, because a row's own state — working, asking, failed — is
+ * what the column exists to show.
+ */
+export function decorateRow<T>(
+  row: ListRow<T>,
+  d: Decoration | undefined,
+  busy = false,
+): ListRow<T> {
+  if (!d) return row;
+  if (d.badge) {
+    const mark = ` ${d.badge.text}`;
+    const from = byteLength(row.text);
+    row.text = `${row.text}${mark}`;
+    if (row.full !== undefined) row.full = `${row.full}${mark}`;
+    if (d.badge.hl) {
+      row.spans = [...(row.spans ?? []), { from, to: from + byteLength(mark), hl: d.badge.hl }];
+    }
+  }
+  if (d.hl && row.hl === undefined) row.hl = d.hl;
+  if (d.right && !busy) row.right = { text: `${d.right.text} `, hl: d.right.hl };
+  return row;
+}
+
+/**
+ * Where every contributed section goes, as a walk over a panel's slots.
+ *
+ * `before`/`after` names a slot or another section's id; `at` is the coarse version. An anchor on
+ * another section resolves once that section has found its place, so a chain settles in a pass or
+ * two, and a section whose anchor never appears falls back to `at`. Sections with the same
+ * placement keep the registry's priority order.
+ */
+export function placeSections<S extends string>(
+  slots: readonly S[],
+  sections: Array<Contribution & { item: SectionItem }>,
+): Array<S | (Contribution & { item: SectionItem })> {
+  type Entry = S | (Contribution & { item: SectionItem });
+  const order: Entry[] = [...slots];
+  const idOf = (e: Entry) => (typeof e === "string" ? e : e.id);
+  const indexOf = (name: string) => order.findIndex((e) => idOf(e) === name);
+  const first = slots[0];
+
+  let pending = sections.filter((c) => c.item && typeof c.item === "object");
+  for (let pass = 0; pass < 8 && pending.length > 0; pass++) {
+    const next: typeof pending = [];
+    for (const c of pending) {
+      const before = typeof c.item.before === "string" ? indexOf(c.item.before) : -1;
+      const after = typeof c.item.after === "string" ? indexOf(c.item.after) : -1;
+      if (before >= 0) order.splice(before, 0, c);
+      else if (after >= 0) order.splice(after + 1, 0, c);
+      else if (typeof c.item.before === "string" || typeof c.item.after === "string") {
+        next.push(c);
+      } else if ((c.item.at ?? "below") === "above" && first !== undefined) {
+        order.splice(indexOf(first), 0, c);
+      } else {
+        order.push(c);
+      }
+    }
+    if (next.length === pending.length) {
+      for (const c of next) {
+        if ((c.item.at ?? "below") === "above" && first !== undefined) {
+          order.splice(indexOf(first), 0, c);
+        } else order.push(c);
+      }
+      break;
+    }
+    pending = next;
+  }
+  return order;
+}
+
+/**
+ * Rows for a contributed section, every field checked rather than trusted.
+ *
+ * A contribution is JSON from a plugin the panel has never heard of, and a panel that throws on a
+ * missing `text` is a panel a third party can break by getting one row wrong.
+ */
+export function sectionRows<T>(
+  c: Contribution & { item: SectionItem },
+  opts: { width: number; custom: (command: string, args: string[]) => T },
+): ListRow<T>[] {
+  const rows: ListRow<T>[] = [];
+  const contributed = Array.isArray(c.item?.rows) ? c.item.rows : [];
+  if (contributed.length === 0 && !c.item?.title) return rows;
+  rows.push({ text: "", inert: true });
+  if (typeof c.item.title === "string" && c.item.title !== "") {
+    const hint = typeof c.item.hint === "string" ? c.item.hint : undefined;
+    rows.push({
+      text: ` ${clipToWidth(c.item.title, Math.max(1, opts.width - 2))}`,
+      hl: "Sidebar.Heading",
+      right: hint ? { text: `${hint} `, hl: "Sidebar.Dim" } : undefined,
+      inert: true,
+    });
+    rows.push({ text: "─".repeat(Math.max(1, opts.width)), hl: "Separator", inert: true });
+  }
+  const margin = " ";
+  for (const r of contributed) {
+    if (typeof r?.text !== "string") continue;
+    const text = `${margin}${clipToWidth(r.text, Math.max(4, opts.width - 2 - margin.length))}`;
+    const eol = byteLength(text);
+    const spans = Array.isArray(r.spans)
+      ? r.spans.flatMap((sp) => {
+        if (typeof sp?.from !== "number" || typeof sp?.to !== "number" || typeof sp?.hl !== "string") {
+          return [];
+        }
+        const from = Math.max(0, Math.floor(sp.from)) + byteLength(margin);
+        const to = Math.min(Math.max(0, Math.floor(sp.to)) + byteLength(margin), eol);
+        return to > from ? [{ from, to, hl: sp.hl }] : [];
+      })
+      : [];
+    const args = Array.isArray(r.args) ? r.args.filter((a): a is string => typeof a === "string") : [];
+    rows.push({
+      text,
+      full: `${margin}${r.text}`,
+      indent: margin.length,
+      hl: typeof r.hl === "string" ? r.hl : undefined,
+      spans: spans.length > 0 ? spans : undefined,
+      right: typeof r.right?.text === "string" ? { text: `${r.right.text} `, hl: r.right.hl } : undefined,
+      inert: typeof r.command !== "string",
+      value: typeof r.command === "string" ? opts.custom(r.command, args) : undefined,
+    });
+  }
+  return rows;
+}
+
+// ---------------------------------------------------------------------------
+// ListPanel
+// ---------------------------------------------------------------------------
+
+/** What a {@link ListPanel} needs to know about its own rows. */
+export interface ListPanelOptions<T> {
+  /** The buffer kind — `acme.tasks`. Everything else hangs off it: the points are
+   * `<kind>.section`, `<kind>.action`, `<kind>.decoration`; the verbs are `<kind>.up` and so on;
+   * the cursor event is `<kind>.cursor`. */
+  kind: string;
+  /** Buffer name. Defaults to `[<kind>]`. */
+  name?: string;
+  dock?: "left" | "right" | "bottom";
+  /** Columns (or rows, for a bottom dock). Asked on every open and draw. */
+  size?: () => number | Promise<number>;
+  /** The panel's own rows, rebuilt on every draw. A row's `value` is what every verb receives. */
+  rows: () => ListRow<T>[] | Promise<ListRow<T>[]>;
+  /** A row's identity, for anchoring the cursor across redraws and filing decorations:
+   * `{ project: cwd }` becomes `project:<cwd>`. */
+  key?: (value: T) => Record<string, string> | null;
+  /** The row kind a contributed action's `on` may name: `"project"`, `"session"`. */
+  kindOf?: (value: T) => string;
+  /** The arguments a contributed action receives for a row. Defaults to `[kindOf(value), ...key values]`. */
+  argsFor?: (value: T) => string[];
+  /** `↵` on a row. A contributed row runs its own command instead. */
+  onOpen?: (value: T) => void | Promise<void>;
+  /** Named blocks a section may sit `before`/`after`. Defaults to `["main"]`; `rows` fill the first. */
+  slots?: readonly string[];
+  cursorHl?: string;
+  /** Open the panel as soon as it is created. Default true. */
+  open?: boolean;
+}
+
+/** A contributed row's value, for panels whose own rows are something else. */
+export type CustomRow = { kind: "custom"; command: string; args: string[] };
+
+/**
+ * A docked list panel that is a surface, not a program — ADR 0040's three mechanisms, and a
+ * published cursor, for the price of a kind and a `rows` function.
+ *
+ * Given `kind: "acme.tasks"`, this creates the buffer with that kind, opens it in a dock, binds
+ * every verb as a named command at `buf_kind` scope (`acme.tasks.down`, `.up`, `.first`, `.last`,
+ * `.open`, `.leave`, `.toggle`, `.focus`, `.refresh`, `.cursor`, `.rows`) so `^Z` lists them and
+ * `init.ts` can move them, reads `acme.tasks.section` / `.action` / `.decoration` exactly as the
+ * sidebar reads its own, publishes the row under the cursor as the buffer var `cursor` and the
+ * event `acme.tasks.cursor`, and redraws when any of that changes. What is left for the plugin is
+ * what the rows say.
+ */
+export class ListPanel<T> {
+  private buf!: BufferId;
+  private ns!: number;
+  private list!: CursoredList<T | CustomRow>;
+  private win: WindowId | null = null;
+  private focused = false;
+  private capture: Disposable | null = null;
+  private width = 30;
+  private actions: Array<Contribution & { item: ActionItem }> = [];
+  private bound: Array<{ key: string; command: string }> = [];
+  private registered: Disposable[] = [];
+  private drawing = false;
+  private again = false;
+  readonly subscriptions: Disposable[] = [];
+
+  private constructor(
+    private readonly neosh: Neosh,
+    private readonly opts: ListPanelOptions<T>,
+  ) {}
+
+  /** Create the panel: buffer, verbs, points, and — unless `open: false` — the window. */
+  static async create<T>(neosh: Neosh, opts: ListPanelOptions<T>): Promise<ListPanel<T>> {
+    const p = new ListPanel<T>(neosh, opts);
+    await p.setup();
+    if (opts.open !== false) await p.open();
+    return p;
+  }
+
+  get kind(): string {
+    return this.opts.kind;
+  }
+
+  /** The contribution points this panel reads. */
+  get points(): { section: string; action: string; decoration: string } {
+    const k = this.opts.kind;
+    return { section: `${k}.section`, action: `${k}.action`, decoration: `${k}.decoration` };
+  }
+
+  /** The row under the cursor, or `null`. */
+  get cursor(): T | CustomRow | null {
+    return this.list.value ?? null;
+  }
+
+  /** Every row that can be landed on. */
+  get rows(): Array<T | CustomRow> {
+    return this.list.values;
+  }
+
+  isOpen(): boolean {
+    return this.win !== null;
+  }
+
+  private keyOf(value: T | CustomRow): string | null {
+    if (this.isCustom(value)) return null;
+    return decorationKey(this.opts.key?.(value) ?? null);
+  }
+
+  private isCustom(value: T | CustomRow): value is CustomRow {
+    return typeof value === "object" && value !== null && (value as CustomRow).kind === "custom" &&
+      typeof (value as CustomRow).command === "string";
+  }
+
+  private async setup(): Promise<void> {
+    const { neosh, opts } = this;
+    const k = opts.kind;
+    this.buf = await neosh.buf.create({ name: opts.name ?? `[${k}]`, scratch: true, kind: k });
+    this.ns = await neosh.ns.create(k);
+    this.list = new CursoredList<T | CustomRow>(neosh, this.buf, this.ns, {
+      cursorHl: opts.cursorHl,
+      width: () => this.width,
+      onMove: () => this.published(),
+    });
+
+    const scope = { kind: "buf_kind", name: k } as const;
+    const verb = async (name: string, keys: string[], desc: string, fn: () => void | Promise<void>, redraw = true) => {
+      this.subscriptions.push(
+        await neosh.cmd.register(`${k}.${name}`, async () => {
+          await fn();
+          if (redraw) await this.draw();
+        }, { desc }),
+      );
+      for (const key of keys) {
+        await neosh.keymap.set("chat", key, `${k}.${name}`, { scope, desc });
+      }
+    };
+    await verb("down", ["j", "<Down>", "<C-n>"], "Next row", () => this.list.move(1));
+    await verb("up", ["k", "<Up>", "<C-p>"], "Previous row", () => this.list.move(-1));
+    await verb("first", ["gg"], "First row", () => this.list.toEnd("first"));
+    await verb("last", ["G"], "Last row", () => this.list.toEnd("last"));
+    await verb("open", ["<CR>"], "Open the row under the cursor", async () => {
+      const v = this.list.value;
+      if (v === undefined) return;
+      if (this.isCustom(v)) {
+        await neosh.cmd.exec(v.command, v.args).catch((e: unknown) => neosh.notify(String(e), "warn"));
+      } else {
+        await opts.onOpen?.(v);
+      }
+    });
+    await verb("leave", ["<Esc>", "q"], "Back to the composer", () => this.leave(), false);
+    await verb("refresh", [], "Redraw the panel now", () => {}, true);
+    this.subscriptions.push(
+      await neosh.cmd.register(`${k}.toggle`, () => (this.isOpen() ? this.close() : this.open()), {
+        desc: "Show or hide the panel",
+      }),
+    );
+    this.subscriptions.push(
+      await neosh.cmd.register(`${k}.focus`, () => this.enter(), { desc: "Move into the panel" }),
+    );
+    this.subscriptions.push(
+      await neosh.cmd.register(`${k}.cursor`, () => this.cursor, { desc: "The row under the cursor" }),
+    );
+    this.subscriptions.push(
+      await neosh.cmd.register(`${k}.rows`, () => this.rows, { desc: "Every row you can land on" }),
+    );
+    // A sink for the keys nothing claimed, so an unbound letter does not fall through to the
+    // composer and start a message.
+    this.subscriptions.push(
+      await neosh.cmd.register(`${k}.key`, () => {}, { desc: "Swallow an unbound key in the panel" }),
+    );
+
+    const { section, action, decoration } = this.points;
+    this.subscriptions.push(
+      neosh.ext.onChange((e) => {
+        if (e.point === section || e.point === decoration) void this.draw();
+        if (e.point === action) void this.syncActions();
+      }),
+    );
+    this.subscriptions.push(
+      neosh.event.on("neosh.viewport", (e) => {
+        const d = e.data as { win?: number; width?: number } | null;
+        if (d?.win === this.win && typeof d.width === "number") {
+          this.width = d.width;
+          void this.draw();
+        }
+      }),
+    );
+    await this.syncActions();
+    this.subscriptions.push({
+      dispose: () => {
+        for (const d of this.registered) d.dispose();
+        for (const b of this.bound) void neosh.keymap.del("chat", b.key, scope).catch(() => {});
+      },
+    });
+  }
+
+  /** Bind the verbs other plugins contributed, on their behalf, with the row as arguments. */
+  private async syncActions(): Promise<void> {
+    const { neosh, opts } = this;
+    const k = opts.kind;
+    const scope = { kind: "buf_kind", name: k } as const;
+    const got = await neosh.ext.list<ActionItem>(this.points.action).catch(() => []);
+    for (const b of this.bound) await neosh.keymap.del("chat", b.key, scope).catch(() => {});
+    for (const d of this.registered) d.dispose();
+    this.bound = [];
+    this.registered = [];
+    const mine = new Set(
+      (await neosh.keymap.list("chat").catch(() => []))
+        .filter((m) => m.scope.kind === "buf_kind" && m.scope.name === k && !m.command.startsWith(`${k}.action.`))
+        .map((m) => m.lhs),
+    );
+    this.actions = got.filter((c) => typeof c.item?.key === "string" && typeof c.item?.command === "string");
+    for (const c of this.actions) {
+      const name = `${k}.action.${c.plugin}.${c.id}`;
+      const reg = await neosh.cmd.register(name, async () => {
+        const v = this.list.value;
+        if (v === undefined) return;
+        const on = c.item.on ?? "any";
+        const rowKind = this.isCustom(v) ? "custom" : opts.kindOf?.(v) ?? "row";
+        if (on !== "any" && on !== rowKind) return;
+        const args = this.isCustom(v)
+          ? ["custom", ...v.args]
+          : opts.argsFor?.(v) ?? [rowKind, ...Object.values(opts.key?.(v) ?? {})];
+        await neosh.cmd.exec(c.item.command, args).catch((e: unknown) => neosh.notify(String(e), "warn"));
+        await this.draw();
+      }, { desc: c.item.label }).catch(() => null);
+      if (reg) this.registered.push(reg);
+      if (mine.has(c.item.key)) {
+        neosh.log.warn(`${c.plugin} asked for '${c.item.key}' in ${k}, which is already a panel key`);
+        continue;
+      }
+      await neosh.keymap.set("chat", c.item.key, name, { scope, desc: c.item.label }).catch(() => {});
+      this.bound.push({ key: c.item.key, command: name });
+    }
+    await this.draw();
+  }
+
+  private published(): void {
+    const v = this.list.value ?? null;
+    void this.neosh.vars.set({ scope: "buffer", buf: this.buf }, "cursor", v).catch(() => {});
+    void this.neosh.event.emit(`${this.opts.kind}.cursor`, v);
+  }
+
+  /** Redraw: the plugin's rows, decorated, with contributed sections placed among the slots. */
+  async draw(): Promise<void> {
+    if (this.win === null) return;
+    if (this.drawing) {
+      this.again = true;
+      return;
+    }
+    this.drawing = true;
+    try {
+      do {
+        this.again = false;
+        const { neosh, opts } = this;
+        const own = await opts.rows();
+        const [sections, decorations] = await Promise.all([
+          neosh.ext.list<SectionItem>(this.points.section).catch(() => []),
+          neosh.ext.list<DecorationItem>(this.points.decoration).catch(() => []),
+        ]);
+        const merged = mergeDecorations(decorations);
+        const slots = opts.slots ?? ["main"];
+        const order = placeSections(slots, sections);
+        const rows: ListRow<T | CustomRow>[] = [];
+        let body = 0;
+        for (const entry of order) {
+          if (typeof entry === "string") {
+            if (entry === slots[0]) {
+              for (const r of own) {
+                const key = r.value === undefined ? null : this.keyOf(r.value);
+                rows.push(key === null ? r : decorateRow(r, merged.get(key)));
+              }
+            }
+            body = rows.length;
+          } else {
+            rows.push(...sectionRows<T | CustomRow>(entry, {
+              width: this.width,
+              custom: (command, args) => ({ kind: "custom", command, args }),
+            }));
+          }
+        }
+        this.list.setRows(rows, (a, b) => {
+          const ka = this.keyOf(a);
+          return ka !== null && ka === this.keyOf(b);
+        });
+        await this.list.render({ showCursor: this.focused, win: this.win ?? undefined, pinned: rows.length - body });
+      } while (this.again);
+    } finally {
+      this.drawing = false;
+    }
+  }
+
+  async open(): Promise<void> {
+    if (this.win !== null) return;
+    const size = (await this.opts.size?.()) ?? 30;
+    this.width = size;
+    this.win = await this.neosh.win.open(this.buf, this.opts.dock ?? "left", { size });
+    await this.draw();
+  }
+
+  async close(): Promise<void> {
+    if (this.win === null) return;
+    if (this.focused) await this.leave();
+    await this.neosh.win.close(this.win).catch(() => {});
+    this.win = null;
+  }
+
+  /** Take the keyboard. */
+  async enter(): Promise<void> {
+    if (this.win === null) await this.open();
+    if (this.win === null || this.focused) return;
+    await this.neosh.focus.push(this.win);
+    this.capture = await this.neosh.keymap.capture(this.win, `${this.opts.kind}.key`);
+    this.focused = true;
+    this.published();
+    await this.draw();
+  }
+
+  /** Give it back. */
+  async leave(): Promise<void> {
+    if (!this.focused) return;
+    this.focused = false;
+    this.capture?.dispose();
+    this.capture = null;
+    await this.neosh.focus.pop();
+    await this.draw();
+  }
+
+  /** Close the window and unregister everything. */
+  dispose(): void {
+    void this.close();
+    for (const d of this.subscriptions) d.dispose();
+  }
 }

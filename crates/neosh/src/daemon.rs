@@ -299,6 +299,11 @@ impl Handle {
                         Source::LOCAL,
                         InputEvent::Command { name: "stop".into(), args: Vec::new() },
                     ));
+                    // And the connection stays open until the host has actually gone: `neosh
+                    // stop` reads "stopped" off this socket closing, and closing it here, with
+                    // the host still writing conversations to disk and saying goodbye to its
+                    // plugins, made `neosh stop && neosh --serve` find the old socket answering.
+                    self.to_host.closed().await;
                     break;
                 }
                 ClientMessage::Attach { protocol_version, width, height, build } => {

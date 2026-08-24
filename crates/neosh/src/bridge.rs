@@ -22,11 +22,20 @@ use tokio_util::sync::CancellationToken;
 /// A plugin tool that never answers must not hang the turn forever.
 const TOOL_TIMEOUT: Duration = Duration::from_secs(120);
 
+/// A command asked for its answer and never giving one must not hang the caller forever either.
+///
+/// Longer than a tool's because a command is allowed to open a picker and wait for a person —
+/// `cmd.call("session.new")` is a legitimate thing to want the result of — and a person is slower
+/// than a model.
+const COMMAND_TIMEOUT: Duration = Duration::from_secs(600);
+
 #[derive(Default)]
 struct Pending {
     tools: HashMap<RequestId, oneshot::Sender<ToolResult>>,
     hooks: HashMap<RequestId, oneshot::Sender<HookOutcome>>,
     accepts: HashMap<RequestId, oneshot::Sender<()>>,
+    /// Callers waiting on what a command returns. See [`ScriptBridge::call_command`].
+    commands: HashMap<RequestId, oneshot::Sender<Result<serde_json::Value, String>>>,
     /// Sinks for in-flight plugin-driven provider streams.
     streams: HashMap<StreamId, mpsc::Sender<ProviderEvent>>,
 }
@@ -89,6 +98,44 @@ impl ScriptBridge {
         }
     }
 
+    pub fn resolve_command(&self, id: &RequestId, value: serde_json::Value) {
+        if let Some(tx) = self.pending.lock().expect("bridge lock poisoned").commands.remove(id) {
+            let _ = tx.send(Ok(value));
+        }
+    }
+
+    /// Run a command in the plugin that owns it and wait for what the handler returns.
+    ///
+    /// The question form of [`PluginEvent::CommandInvoked`]. A handler that throws fails the call
+    /// with its message; one that never answers fails it after [`COMMAND_TIMEOUT`]; a plugin that
+    /// is unloaded mid-call fails it at once, because the channel it would have answered on is
+    /// dropped with the waiter.
+    pub async fn call_command(
+        &self,
+        plugin: &PluginId,
+        name: &str,
+        args: Vec<String>,
+    ) -> Result<serde_json::Value, String> {
+        let id = RequestId::new();
+        let (tx, rx) = oneshot::channel();
+        self.pending.lock().expect("bridge lock poisoned").commands.insert(id.clone(), tx);
+        self.send(plugin, PluginInbound::Request {
+            id: id.clone(),
+            request: PluginRequest::Command { name: name.to_string(), args },
+        });
+        match tokio::time::timeout(COMMAND_TIMEOUT, rx).await {
+            Ok(Ok(r)) => r,
+            Ok(Err(_)) => Err(format!("plugin {plugin} did not answer {name}")),
+            Err(_) => {
+                self.pending.lock().expect("bridge lock poisoned").commands.remove(&id);
+                Err(format!(
+                    "command {name} from {plugin} did not answer within {}s",
+                    COMMAND_TIMEOUT.as_secs()
+                ))
+            }
+        }
+    }
+
     /// A plugin reported an error instead of an answer. Fail the waiter rather than leaving it to
     /// time out, so the reason reaches the user promptly.
     pub fn fail(&self, id: &RequestId, message: String) {
@@ -98,6 +145,9 @@ impl ScriptBridge {
         }
         if let Some(tx) = p.hooks.remove(id) {
             let _ = tx.send(HookOutcome::Veto { reason: message.clone() });
+        }
+        if let Some(tx) = p.commands.remove(id) {
+            let _ = tx.send(Err(message.clone()));
         }
         p.accepts.remove(id);
     }

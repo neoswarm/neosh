@@ -42,11 +42,20 @@ pub fn init_user(paths: &Paths, force: bool) -> anyhow::Result<Report> {
 
     r.write(paths.init_script(), INIT_TS, force)?;
     r.write(paths.config_file(), CONFIG_TOML, force)?;
-    // Generated: always current, never merged.
-    r.write(paths.tsconfig(), TSCONFIG, true)?;
+    // Generated: always current, never merged. The installed-plugin directory is absolute, so
+    // `plugin:<name>` type-checks against a plugin `neosh plugin add` put there as well as one in
+    // the config directory and one bundled in the binary.
+    let installed = paths.installed_plugin_dir();
+    let tsconfig = TSCONFIG.replace("__INSTALLED__", &json_path(&installed));
+    r.write(paths.tsconfig(), &tsconfig, true)?;
 
     let types = paths.api_types();
     neosh_script::write_api_types(&types)
+        .map_err(|e| anyhow::anyhow!("{}: {e}", types.display()))?;
+    // The bundled plugins' source beside the API's, so `import { api } from "plugin:sidebar"`
+    // resolves for `tsc` to the very code the binary runs — the same reason the API types come
+    // from the binary rather than a package.
+    neosh_script::write_builtin_sources(&types.join("builtin"))
         .map_err(|e| anyhow::anyhow!("{}: {e}", types.display()))?;
     r.written.push(types);
 
@@ -279,12 +288,19 @@ const TSCONFIG: &str = r#"{
     "baseUrl": ".",
     "paths": {
       "@neosh/api": ["./types/index.ts"],
-      "@neosh/api/*": ["./types/*.ts"]
+      "@neosh/api/*": ["./types/*.ts"],
+      "plugin:*": ["./plugins/*/main.ts", __INSTALLED__, "./types/builtin/*/main.ts"]
     }
   },
   "include": ["init.ts", "plugins/**/*.ts", "types/globals.d.ts"]
 }
 "#;
+
+/// A path as a JSON string literal, with a `/*/main.ts` glob on the end for `paths`.
+fn json_path(dir: &Path) -> String {
+    let joined = dir.join("*").join("main.ts");
+    serde_json::to_string(&joined.to_string_lossy()).unwrap_or_else(|_| "\"\"".into())
+}
 
 #[cfg(test)]
 mod tests {

@@ -67,31 +67,84 @@ function reportTimerError(e) {
   ops.op_neosh_send({ type: "log", level: "error", message: `timer callback: ${describe(e)}` });
 }
 
+// ---------------------------------------------------------------------------
+// Activation order
+//
+// A plugin that `requires` another waits for that one's `activate` to settle before its own runs,
+// so `import { api } from "plugin:sidebar"` sees a sidebar that has set itself up. The promise is
+// recorded synchronously, before the first await, because the host sends the required plugin's
+// load first and this loop handles messages in order — so by the time a dependent looks, its
+// dependency is here. A dependency that failed fails the dependent, with the name in the error.
+// ---------------------------------------------------------------------------
+
+const activations = new Map();
+// Each plugin's entry module, kept so `unload` can call its `deactivate` — which the docs had
+// promised for as long as the docs existed, and which nothing had ever called.
+const modules = new Map();
+
+async function activate(msg) {
+  for (const name of msg.requires ?? []) {
+    const dep = activations.get(name);
+    if (!dep) {
+      throw new Error(`requires plugin "${name}", which is not loaded`);
+    }
+    const error = await dep;
+    if (error) {
+      throw new Error(`requires plugin "${name}", which failed to activate: ${error}`);
+    }
+  }
+  // Dynamic import goes through the host's module loader, which transpiles TypeScript and
+  // resolves `@neosh/api` to the embedded source.
+  const mod = await import(msg.url);
+  const ctx = __createContext(msg.plugin, msg.config, msg.version);
+  if (typeof mod.activate !== "function") {
+    throw new Error(`${msg.url} does not export an \`activate\` function`);
+  }
+  modules.set(msg.plugin, mod);
+  await mod.activate(ctx);
+}
+
+// `deactivate`, then the teardown that was always there. Bounded: a plugin that never returns
+// from its goodbye must not hold a reload — or a shutdown — hostage, so after a moment the
+// subscriptions are disposed under it.
+async function unload(plugin) {
+  activations.delete(plugin);
+  const mod = modules.get(plugin);
+  modules.delete(plugin);
+  if (mod && typeof mod.deactivate === "function") {
+    try {
+      await Promise.race([
+        Promise.resolve(mod.deactivate()),
+        new Promise((r) => setTimeout(r, 1000)),
+      ]);
+    } catch (e) {
+      ops.op_neosh_send({ type: "log", level: "warn", message: `${plugin} deactivate: ${describe(e)}` });
+    }
+  }
+  __teardown(plugin);
+}
+
 async function handle(msg) {
   switch (msg.type) {
     case "load": {
-      try {
-        // Dynamic import goes through the host's module loader, which transpiles TypeScript and
-        // resolves `@neosh/api` to the embedded source.
-        const mod = await import(msg.url);
-        const ctx = __createContext(msg.plugin, msg.config, msg.version);
-        if (typeof mod.activate !== "function") {
-          throw new Error(`${msg.url} does not export an \`activate\` function`);
-        }
-        await mod.activate(ctx);
-        ops.op_neosh_send({ type: "loaded", plugin: msg.plugin, error: null });
-      } catch (e) {
-        // A plugin that throws during activation is reported and skipped; it must not take the
-        // editor down with it.
-        ops.op_neosh_send({ type: "loaded", plugin: msg.plugin, error: describe(e) });
-      }
+      // Settles to `null` on success and to the error text on failure; never rejects, so a
+      // dependent awaiting it cannot become an unhandled rejection.
+      const done = activate(msg).then(
+        () => null,
+        (e) => describe(e),
+      );
+      activations.set(msg.plugin, done);
+      const error = await done;
+      // A plugin that throws during activation is reported and skipped; it must not take the
+      // editor down with it.
+      ops.op_neosh_send({ type: "loaded", plugin: msg.plugin, error });
       break;
     }
     case "plugin":
       await __dispatch(msg.plugin, msg.msg);
       break;
     case "unload":
-      __teardown(msg.plugin);
+      await unload(msg.plugin);
       break;
     case "timer":
       fireTimers(msg.ids);

@@ -11,6 +11,7 @@ import type { ExtmarkOpts } from "./ExtmarkOpts";
 import type { FloatConfig } from "./FloatConfig";
 import type { HighlightDef } from "./HighlightDef";
 import type { Hint } from "./Hint";
+import type { HlTarget } from "./HlTarget";
 import type { HookName } from "./HookName";
 import type { InstanceConfig } from "./InstanceConfig";
 import type { InstanceId } from "./InstanceId";
@@ -166,13 +167,22 @@ export type ApiCall =
   }
   | { "call": "mark_get"; ns: NamespaceId; buf: BufferId; id: ExtmarkId }
   | { "call": "mark_all"; ns: NamespaceId; buf: BufferId }
-  | { "call": "hl_define"; name: string; def: HighlightDef }
+  | { "call": "hl_define"; name: string; def: HighlightDef; default: boolean }
+  | { "call": "hl_get"; name: string }
+  | { "call": "hl_list" }
+  | { "call": "hl_reset"; name: string }
+  | {
+    "call": "win_set_highlights";
+    target: HlTarget;
+    map: Record<string, string>;
+  }
   | { "call": "surface_claim"; win: WindowId; rect: Rect }
   | { "call": "surface_put"; surface: SurfaceId; cells: Array<SurfaceCell> }
   | { "call": "surface_release"; surface: SurfaceId }
   | { "call": "cmd_register"; name: string; desc?: string | null }
   | { "call": "cmd_unregister"; name: string }
   | { "call": "cmd_exec"; name: string; args?: Array<string> }
+  | { "call": "cmd_call"; name: string; args?: Array<string> }
   | { "call": "cmd_list" }
   | {
     "call": "keymap_set";
@@ -334,6 +344,8 @@ export type ApiCall =
   }
   | { "call": "ext_remove"; point: string; id: string }
   | { "call": "ext_list"; point: string }
+  | { "call": "ext_points" }
+  | { "call": "plugin_list" }
   | { "call": "event_emit"; name: string; data?: unknown }
   | { "call": "var_get"; scope: VarScope; key: string }
   | { "call": "var_set"; scope: VarScope; key: string; value: unknown }
@@ -389,7 +401,7 @@ export type ApiCall =
   | { "call": "rtp_add"; path: string }
   | { "call": "rtp_list" }
   | { "call": "path_complete"; prefix: string }
-  | { "call": "git_status" }
+  | { "call": "git_status"; cwd?: string | null }
   | {
     "call": "git_branches";
     include_remote: boolean;

@@ -63,3 +63,4 @@ implementation — and in two cases (0005, 0008) it did not, which is itself rec
 | [0058](0058-the-workspace-you-are-looking-at-is-not-the-binary-you-built.md) | The workspace you are looking at is not the binary you built | Accepted |
 | [0059](0059-a-terminal-is-a-place-you-are.md) | A terminal is a place you are, not a copy of somebody else's screen | Accepted |
 | [0060](0060-an-archive-is-something-you-can-empty.md) | An archive is something you can empty | Accepted |
+| [0061](0061-a-plugin-can-build-on-a-plugin.md) | A plugin can build on a plugin | Accepted |

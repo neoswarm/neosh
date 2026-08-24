@@ -66,6 +66,25 @@ per decision, and records the *reasoning*, not the choice.
   key in a panel is an ordinary binding pointed at a named command, so `^Z` lists it and `init.ts`
   can move it; a `switch` on `KeyContext` inside a plugin is the thing this replaced. Keep the
   capture, but only as a sink for keys nothing claimed. See ADR 0040.
+- **A plugin can build on a plugin, and the four ways are named.** *Ask* it: `cmd.call` returns
+  what a handler returned, and `import { api } from "plugin:<name>"` is the very module the host
+  activated — declared with `requires` in the manifest, which is also what orders loading, so a
+  name nothing provides fails at startup with the name in it. *Decorate* it: `<kind>.decoration`
+  is a mark on a row the panel already draws, keyed by what the row is *about* and merged at draw
+  time — data, never a row-renderer callback, because one slow decorator would be a panel that
+  lags on `j`; sections sit `before`/`after` a named slot. *Recolour* it: highlights have owners
+  and leave with them, `default: true` is `:hi default`, a window or a kind reads group names
+  through a `winhighlight` map, and a theme is a contribution on `ui.theme` laid over a built-in
+  variant. *Hear* it: the workspace's own events — `neosh.win.enter`, `neosh.cursor`,
+  `neosh.mode`, `neosh.viewport` — are on the bus, and buffer/window vars are in memory and die
+  with their buffer or window. One tier rule for keys, commands and colours — `builtin < plugin <
+  user` — so `init.ts`, loaded first, still has the last word; a lower tier's command registration
+  waits in the wings rather than failing. The host's own buffers have kinds
+  (`neosh.transcript`, `neosh.composer`, `neosh.status`), the pickers do too, `deactivate` runs,
+  `plugins.disabled` disables anything, `[activation]` holds a plugin until a command, event or
+  kind asks for it, `[provides]` is how `ext.points()` knows who reads what and how a typo'd point
+  gets reported, and `ListPanel` gives a third party's panel all of this for a kind and a `rows`
+  function. See ADR 0061.
 - **A panel you are in the middle of using has the keyboard.** `FloatConfig::modal` takes
   `KeymapScope::Global` out of the chain, and a key nothing claimed is swallowed rather than reaching
   the composer behind the float. Shadowing the keys a widget wants is the other half and not a
@@ -203,7 +222,7 @@ per decision, and records the *reasoning*, not the choice.
   returning find the answer still arriving. **The smallest-terminal rule is gone** — it existed
   because a card was shared content — and what is still merged is one window two terminals share.
   `republish` says only what the arriving view can see and has to stay idempotent, and
-  `ViewportChanged` is still where the host learns a width. See ADR 0059, and ADR 0042 for the
+  `ViewportChanged` is still where the host learns a width. See ADR 0061, and ADR 0042 for the
   connection half.
 - **A plugin says which terminal it is drawing into, and almost never has to.** Three rules in
   order: a float anchored to a window goes where that window is; a buffer only one terminal shows
@@ -217,7 +236,7 @@ per decision, and records the *reasoning*, not the choice.
   `here.win.open(...)` lands where the person pressing the key is looking. `SessionChanged` names
   the terminal that moved, because "the active conversation" has as many answers as there are
   screens; a question waits until some terminal is reading its conversation and opens there.
-  See ADR 0059.
+  See ADR 0061.
 - **Every view gets every event.** `Agent` fans its stream out to one queue per view. Never a
   `broadcast` channel: lagging consumers drop the oldest, silently, under load — and a view that
   missed one `ToolFinished` has a card that spins forever with nothing to put it right.
@@ -334,7 +353,7 @@ per decision, and records the *reasoning*, not the choice.
   moment any verb names it — otherwise "empty the archive" reports success over a directory it
   never touched. **Nothing here deletes on a timer**: `archive.auto_days` *archives* what has gone
   idle, because archiving is reversible and free, and `archive.retention_days` only ever counts —
-  `archive.sweep` is the same number with a person behind it. See ADR 0060.
+  `archive.sweep` is the same number with a person behind it. See ADR 0061.
 - **A notification is for something you did not ask for and cannot see.** Both halves, and a
   message that fails either is not one. `MessageLevel` says how *bad* a thing is and never whether
   you need to know about it, which is how one channel ended up carrying a hundred and seventy call
@@ -766,7 +785,7 @@ What you have finished with, and the one place in the workspace where throwing t
 you came to do. **Nothing about it is on screen until you press the key**: no section, no row, no
 count — `archive.sidebar = true` if you want the count in the project panel. A popup, and a panel
 rather than a picker: it has marks, and every verb means what is marked or — with nothing marked —
-the row under the cursor. The strip at the foot says which. See ADR 0060.
+the row under the cursor. The strip at the foot says which. See ADR 0061.
 
 Conversations past `RESTORE_LIMIT` are in here too, and behave like any other row: the workspace
 brings one in from its file the first time a key names it. The header says how many are `on disk

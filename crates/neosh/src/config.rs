@@ -421,6 +421,10 @@ pub fn refresh_api_types(paths: &Paths) {
         Ok(n) => tracing::info!(path = %dir.display(), "refreshed {n} @neosh/api type files"),
         Err(e) => tracing::warn!(path = %dir.display(), "could not refresh API types: {e}"),
     }
+    // The bundled plugins' source goes stale with the same upgrade, for the same reader.
+    if let Err(e) = neosh_script::write_builtin_sources(&dir.join("builtin")) {
+        tracing::warn!(path = %dir.display(), "could not refresh bundled plugin sources: {e}");
+    }
 }
 
 /// Load the trust store for these paths.

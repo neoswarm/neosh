@@ -191,6 +191,23 @@ fn format_key(k: &KeyPress) -> String {
     s
 }
 
+/// Who outranks whom when two registrations want one name or one key.
+///
+/// One rule for every registry — keys, commands, highlights — where there used to be a different
+/// one each. A bundled plugin offers defaults; a plugin you installed is a choice; your own
+/// `init.ts` is the last word. Within a tier the later registration wins, which is the order
+/// plugins load in and what "a plugin that loads after wins" has always meant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+pub enum Tier {
+    /// Ships inside the binary.
+    Builtin,
+    /// Installed by the user, written by somebody else.
+    #[default]
+    Plugin,
+    /// The user's own configuration: `init.ts`, and a trusted `.neosh/init.ts`.
+    User,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Binding {
     pub command: String,
@@ -222,12 +239,13 @@ impl KeymapTable {
         Self::default()
     }
 
-    /// Bind a key, unless a bundled plugin is trying to take one somebody else already claimed.
+    /// Bind a key, unless somebody who outranks the caller already has it.
     ///
-    /// `bundled` is the set of plugins that ship with neosh. Their bindings are *defaults*, and a
-    /// default that overwrites a choice is not a default. This matters because `init.ts` runs
-    /// **before** plugin discovery — it decides what else loads — so without this rule every
-    /// bundled plugin silently steals whichever key the user's configuration had just bound.
+    /// `tier` ranks the owners: a bundled plugin's bindings are *defaults*, a user's `init.ts` is
+    /// a *choice*, and a default that overwrites a choice is not a default. This matters because
+    /// `init.ts` runs **before** plugin discovery — it decides what else loads — so without this
+    /// rule every plugin silently steals whichever key the user's configuration had just bound.
+    /// Equal tiers: last wins, which is how a plugin that loads after another replaces its key.
     ///
     /// Returns whether the binding was made, so the caller can say so rather than leaving a
     /// keystroke that quietly does something else.
@@ -237,19 +255,37 @@ impl KeymapTable {
         scope: KeymapScope,
         lhs: &str,
         binding: Binding,
-        bundled: &std::collections::HashSet<String>,
+        tier: &dyn Fn(&str) -> Tier,
     ) -> Result<bool, ApiError> {
         let seq = parse_keys(lhs)?;
         let key = (mode, scope, seq);
-        let new_is_bundled = binding.owner.as_ref().is_some_and(|o| bundled.contains(o));
-        if new_is_bundled
-            && let Some(existing) = self.maps.get(&key)
-            && existing.owner.as_ref().is_some_and(|o| !bundled.contains(o))
+        let mine = binding.owner.as_deref().map(tier).unwrap_or(Tier::Plugin);
+        if let Some(existing) = self.maps.get(&key)
+            && existing.owner.as_deref().map(tier).unwrap_or(Tier::Plugin) > mine
         {
             return Ok(false);
         }
         self.maps.insert(key, binding);
         Ok(true)
+    }
+
+    /// Unbind a key, unless somebody who outranks the caller owns it. Returns whether it went.
+    pub fn del_by(
+        &mut self,
+        mode: Mode,
+        scope: KeymapScope,
+        lhs: &str,
+        caller: &str,
+        tier: &dyn Fn(&str) -> Tier,
+    ) -> Result<bool, ApiError> {
+        let seq = parse_keys(lhs)?;
+        let key = (mode, scope, seq);
+        if let Some(existing) = self.maps.get(&key)
+            && existing.owner.as_deref().map(tier).unwrap_or(Tier::Plugin) > tier(caller)
+        {
+            return Ok(false);
+        }
+        Ok(self.maps.remove(&key).is_some())
     }
 
     pub fn del(&mut self, mode: Mode, scope: KeymapScope, lhs: &str) -> Result<(), ApiError> {
@@ -309,11 +345,38 @@ impl KeymapTable {
 mod tests {
     use super::*;
 
-    /// No plugin is bundled, so every binding simply takes the key. The rule that bundled defaults
-    /// defer to somebody else's choice is tested in `neosh` end to end, where there is a real
-    /// `init.ts` and real bundled plugins to be in the wrong order about.
-    fn none() -> std::collections::HashSet<String> {
-        std::collections::HashSet::new()
+    /// Everybody is an ordinary plugin, so every binding simply takes the key. The rule that a
+    /// default defers to a choice is tested below and in `neosh` end to end, where there is a
+    /// real `init.ts` and real bundled plugins to be in the wrong order about.
+    fn none() -> impl Fn(&str) -> Tier {
+        |_| Tier::Plugin
+    }
+
+    #[test]
+    fn a_lower_tier_cannot_take_a_key_from_a_higher_one() {
+        let tier = |o: &str| match o {
+            "sidebar" => Tier::Builtin,
+            "user" => Tier::User,
+            _ => Tier::Plugin,
+        };
+        let mut t = KeymapTable::default();
+        let bind = |cmd: &str, owner: &str| Binding {
+            command: cmd.into(),
+            desc: None,
+            owner: Some(owner.into()),
+        };
+        // The user's choice goes first, as `init.ts` does.
+        assert!(t.set(Mode::Chat, KeymapScope::Global, "<C-t>", bind("mine", "user"), &tier).unwrap());
+        // A bundled default and a third-party plugin both lose to it.
+        assert!(!t.set(Mode::Chat, KeymapScope::Global, "<C-t>", bind("theirs", "sidebar"), &tier).unwrap());
+        assert!(!t.set(Mode::Chat, KeymapScope::Global, "<C-t>", bind("theirs", "acme"), &tier).unwrap());
+        // And neither can unbind it.
+        assert!(!t.del_by(Mode::Chat, KeymapScope::Global, "<C-t>", "acme", &tier).unwrap());
+        // A plugin beats a bundled default, and a later plugin beats an earlier one.
+        assert!(t.set(Mode::Chat, KeymapScope::Global, "<C-g>", bind("git", "sidebar"), &tier).unwrap());
+        assert!(t.set(Mode::Chat, KeymapScope::Global, "<C-g>", bind("acme", "acme"), &tier).unwrap());
+        assert!(t.set(Mode::Chat, KeymapScope::Global, "<C-g>", bind("other", "other"), &tier).unwrap());
+        assert!(!t.set(Mode::Chat, KeymapScope::Global, "<C-g>", bind("git", "sidebar"), &tier).unwrap());
     }
 
     #[test]

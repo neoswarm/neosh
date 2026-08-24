@@ -98,6 +98,60 @@ pub enum VarScope {
     /// A directory some conversation lives in — what the sidebar calls a project. Keyed by path
     /// rather than by an id because a project has no identity beyond where it is.
     Project { cwd: String },
+    /// One buffer. In memory only, dropped with the buffer — Neovim's `b:`.
+    ///
+    /// The answer to "a var write is a file write": what changes per keystroke is about a buffer
+    /// or a window, and those two scopes are never persisted, so a panel can publish its cursor
+    /// here at no cost.
+    Buffer { buf: BufferId },
+    /// One window. In memory only, dropped with the window — Neovim's `w:`.
+    Window { win: WindowId },
+}
+
+/// What a highlight remap applies to. See [`ApiCall::WinSetHighlights`].
+#[derive(TS, Serialize, Deserialize, Clone, PartialEq, Eq, Hash, Debug)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+#[ts(export)]
+pub enum HlTarget {
+    Window { win: WindowId },
+    /// Every window showing a buffer of this kind, including ones opened later.
+    Kind { name: String },
+}
+
+/// One highlight group as [`ApiCall::HlList`] reports it.
+#[derive(TS, Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
+#[ts(export)]
+pub struct HighlightEntry {
+    pub name: String,
+    pub def: HighlightDef,
+    /// The plugin that defined it, or `None` for the theme's own.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner: Option<String>,
+}
+
+/// One plugin as [`ApiCall::PluginList`] reports it.
+#[derive(TS, Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
+#[ts(export)]
+pub struct PluginInfo {
+    pub name: String,
+    pub manifest: crate::PluginManifest,
+    /// Ships inside the binary.
+    pub bundled: bool,
+    /// `loaded`, `held` (lazy, waiting for a trigger), or `failed` with the reason in `error`.
+    pub state: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// A contribution point as [`ApiCall::ExtPoints`] reports it.
+#[derive(TS, Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
+#[ts(export)]
+pub struct PointInfo {
+    pub point: String,
+    /// Plugins whose manifest says they read it.
+    pub readers: Vec<String>,
+    /// Plugins with something on it now.
+    pub contributors: Vec<String>,
 }
 
 /// One item somebody put on a contribution point.
@@ -468,9 +522,40 @@ pub enum ApiCall {
     },
 
     // ---- highlights ----------------------------------------------------
+    /// Define a highlight group, or link it to another.
+    ///
+    /// Owned by the caller from then on: a theme switch leaves it alone, and unloading the plugin
+    /// takes it away — back to the theme's definition if the theme has one, gone otherwise.
+    /// `default` is Neovim's `:hi default`: define only if nobody has, which is what a plugin that
+    /// ships a *look* for its own groups uses so that `init.ts` wins whichever of them loaded
+    /// first.
     HlDefine {
         name: String,
         def: HighlightDef,
+        #[serde(default)]
+        default: bool,
+    },
+    /// A group's definition and what it resolves to, or nothing for a name nobody defined.
+    HlGet {
+        name: String,
+    },
+    /// Every group, with who owns it. A settings panel, a theme editor, `neosh plugin health`.
+    HlList,
+    /// Undo your own definition: the theme's version comes back, or the name goes away.
+    HlReset {
+        name: String,
+    },
+    /// Remap group names for a window, or for every window of a buffer kind.
+    ///
+    /// Neovim's `winhighlight`. `{ "Normal": "Acme.Panel", "Sidebar.Selected": "Acme.Sel" }` on
+    /// `neosh.sidebar` recolours the sidebar's window without redefining groups anything else
+    /// draws with — which is the difference between theming a panel and theming the workspace.
+    /// Resolved window → kind, so a remap on one window beats one on every window of its kind.
+    /// An empty map clears. Owned by the caller; gone when the plugin is.
+    WinSetHighlights {
+        target: HlTarget,
+        #[ts(type = "Record<string, string>")]
+        map: std::collections::BTreeMap<String, String>,
     },
 
     // ---- raw cells -----------------------------------------------------
@@ -496,6 +581,22 @@ pub enum ApiCall {
         name: String,
     },
     CmdExec {
+        name: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        args: Vec<String>,
+    },
+    /// Run a command and wait for what it returns.
+    ///
+    /// `CmdExec` is a key press: fire, forget, nothing comes back. This is a *question* — "what row
+    /// is the sidebar on", "which models does this provider serve" — and it answers with whatever
+    /// JSON the handler returned, routed through the host so the caller never needs to know which
+    /// plugin owns the name or whether it is the host itself. A handler that returns nothing
+    /// answers `null`, and one that throws fails the call with its message.
+    ///
+    /// The other half of ADR 0040's "data, not callbacks": a *registration* stays data so it can be
+    /// listed and disabled, and a *query* gets an answer, because faking one with an event, a
+    /// correlation id and a reply command is a worse RPC written once per plugin.
+    CmdCall {
         name: String,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         args: Vec<String>,
@@ -895,6 +996,13 @@ pub enum ApiCall {
     ExtList {
         point: String,
     },
+    /// Every contribution point anybody reads or writes: who declared it (`provides.points` in
+    /// their manifest) and who has put something on it. A point with contributors and no reader
+    /// is almost always a typo, and this is how `neosh plugin health` finds it.
+    ExtPoints,
+    /// Every plugin the workspace knows about — loaded, held until needed, or refused — with its
+    /// manifest. What a plugins panel and `neosh plugin health` are drawn from.
+    PluginList,
 
     // ---- events --------------------------------------------------------
     /// Say that something happened, to whoever cares.
@@ -1091,7 +1199,12 @@ pub enum ApiCall {
     // The script runtime has no process access, so `git` lives here. One vocabulary means a
     // sidebar, a branch picker and a commit UI are three plugins over one implementation rather
     // than three shell-outs with three parsers.
-    GitStatus,
+    /// The working tree's state. `cwd` as on [`ApiCall::GitBranches`]: `None` is this
+    /// conversation's checkout; a panel decorating every project it lists asks about each.
+    GitStatus {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cwd: Option<String>,
+    },
     GitBranches {
         #[serde(default)]
         include_remote: bool,
@@ -1353,6 +1466,17 @@ pub enum ApiOk {
     },
     Contributions { contributions: Vec<Contribution> },
     Windows { windows: Vec<WindowInfo> },
+    /// A group's own definition and the concrete spec its links lead to. Both absent for a name
+    /// nobody defined; `resolved` alone absent for a link to nothing or a cycle.
+    Highlight {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        def: Option<HighlightDef>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        resolved: Option<crate::HighlightSpec>,
+    },
+    Highlights { groups: Vec<HighlightEntry> },
+    Points { points: Vec<PointInfo> },
+    Plugins { plugins: Vec<PluginInfo> },
     Attachments { attachments: Vec<AttachmentInfo> },
     // ---- the swarm ----
     SwarmSelf { node: Option<NodeInfo> },

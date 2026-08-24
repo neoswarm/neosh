@@ -48,11 +48,24 @@ pub struct Theme {
     /// in one place — and so a group that animates still renders its colours when it is off, rather
     /// than disappearing along with the movement.
     motion: bool,
+    /// The window's `winhighlight`: a name asked for is looked up here first, and the name it
+    /// maps to is what resolves. Empty for the workspace theme; see [`Self::remapped`].
+    remap: BTreeMap<String, String>,
 }
 
 impl Theme {
     pub fn new(depth: ColorDepth) -> Self {
-        Self { groups: BTreeMap::new(), depth, motion: true }
+        Self { groups: BTreeMap::new(), depth, motion: true, remap: BTreeMap::new() }
+    }
+
+    /// This theme as one window sees it, with its group names remapped.
+    ///
+    /// A copy, made only for a window that has a remap — which is a panel somebody restyled, not
+    /// every window on every frame. The remap is one level deep on purpose: `Normal → Acme.Panel`
+    /// resolves `Acme.Panel` through the ordinary groups, never through the remap again, so a map
+    /// cannot loop and a panel cannot be made to read `Acme.Panel` as something else by accident.
+    pub fn remapped(&self, remap: &BTreeMap<String, String>) -> Self {
+        Self { remap: remap.clone(), ..self.clone() }
     }
 
     pub fn set_motion(&mut self, on: bool) {
@@ -105,7 +118,7 @@ impl Theme {
     }
 
     fn resolve(&self, name: &str) -> Option<HighlightSpec> {
-        let mut cur = name;
+        let mut cur = self.remap.get(name).map(String::as_str).unwrap_or(name);
         for _ in 0..MAX_LINK_DEPTH {
             match self.groups.get(cur)? {
                 HighlightDef::Spec { spec } => return Some(*spec),

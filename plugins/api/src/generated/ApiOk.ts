@@ -9,6 +9,9 @@ import type { CredentialInfo } from "./CredentialInfo";
 import type { DriverCommand } from "./DriverCommand";
 import type { ExtmarkId } from "./ExtmarkId";
 import type { ExtmarkInfo } from "./ExtmarkInfo";
+import type { HighlightDef } from "./HighlightDef";
+import type { HighlightEntry } from "./HighlightEntry";
+import type { HighlightSpec } from "./HighlightSpec";
 import type { InstanceConfig } from "./InstanceConfig";
 import type { KeymapEntry } from "./KeymapEntry";
 import type { Message } from "./Message";
@@ -19,6 +22,8 @@ import type { NodeInfo } from "./NodeInfo";
 import type { OptionEntry } from "./OptionEntry";
 import type { PermissionDecision } from "./PermissionDecision";
 import type { PermissionMode } from "./PermissionMode";
+import type { PluginInfo } from "./PluginInfo";
+import type { PointInfo } from "./PointInfo";
 import type { QuestionAnswer } from "./QuestionAnswer";
 import type { QuotaSample } from "./QuotaSample";
 import type { QuotaSnapshot } from "./QuotaSnapshot";
@@ -87,6 +92,14 @@ export type ApiOk =
   | { "ok": "vars"; vars: Record<string, unknown> }
   | { "ok": "contributions"; contributions: Array<Contribution> }
   | { "ok": "windows"; windows: Array<WindowInfo> }
+  | {
+    "ok": "highlight";
+    def?: HighlightDef | null;
+    resolved?: HighlightSpec | null;
+  }
+  | { "ok": "highlights"; groups: Array<HighlightEntry> }
+  | { "ok": "points"; points: Array<PointInfo> }
+  | { "ok": "plugins"; plugins: Array<PluginInfo> }
   | { "ok": "attachments"; attachments: Array<AttachmentInfo> }
   | { "ok": "swarm_self"; node: NodeInfo | null }
   | { "ok": "swarm_nodes"; nodes: Array<SwarmNode> }

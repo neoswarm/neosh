@@ -29,43 +29,75 @@ use serde_json::{Map, Value};
 pub struct Vars {
     path: Option<PathBuf>,
     scopes: BTreeMap<String, Map<String, Value>>,
+    /// Buffer and window scopes: never written to disk, because the things they are about do not
+    /// survive the process either.
+    transient: BTreeMap<String, Map<String, Value>>,
     loaded: bool,
 }
 
 impl Vars {
     pub fn new(state_dir: Option<PathBuf>) -> Self {
-        Self { path: state_dir.map(|d| d.join("vars.json")), scopes: BTreeMap::new(), loaded: false }
+        Self {
+            path: state_dir.map(|d| d.join("vars.json")),
+            scopes: BTreeMap::new(),
+            transient: BTreeMap::new(),
+            loaded: false,
+        }
+    }
+
+    fn is_transient(scope: &VarScope) -> bool {
+        matches!(scope, VarScope::Buffer { .. } | VarScope::Window { .. })
+    }
+
+    fn table(&mut self, scope: &VarScope) -> &mut BTreeMap<String, Map<String, Value>> {
+        if Self::is_transient(scope) { &mut self.transient } else { &mut self.scopes }
     }
 
     pub fn get(&mut self, scope: &VarScope, key: &str) -> Value {
         self.load();
-        self.scopes.get(&Self::key(scope)).and_then(|m| m.get(key)).cloned().unwrap_or(Value::Null)
+        let id = Self::key(scope);
+        self.table(scope).get(&id).and_then(|m| m.get(key)).cloned().unwrap_or(Value::Null)
     }
 
     /// Everything on one scope, so a panel reads its whole arrangement in one call rather than one
     /// round trip per project.
     pub fn all(&mut self, scope: &VarScope) -> Map<String, Value> {
         self.load();
-        self.scopes.get(&Self::key(scope)).cloned().unwrap_or_default()
+        let id = Self::key(scope);
+        self.table(scope).get(&id).cloned().unwrap_or_default()
     }
 
     pub fn set(&mut self, scope: &VarScope, key: String, value: Value) {
         self.load();
-        self.scopes.entry(Self::key(scope)).or_default().insert(key, value);
-        self.flush();
+        let id = Self::key(scope);
+        self.table(scope).entry(id).or_default().insert(key, value);
+        if !Self::is_transient(scope) {
+            self.flush();
+        }
     }
 
     pub fn delete(&mut self, scope: &VarScope, key: &str) {
         self.load();
         let id = Self::key(scope);
-        let Some(map) = self.scopes.get_mut(&id) else { return };
+        let transient = Self::is_transient(scope);
+        let Some(map) = self.table(scope).get_mut(&id) else { return };
         map.remove(key);
         // An empty scope is removed rather than left behind, or a workspace accumulates one entry
         // per conversation anybody ever set a var on and never dropped one.
         if map.is_empty() {
-            self.scopes.remove(&id);
+            self.table(scope).remove(&id);
         }
-        self.flush();
+        if !transient {
+            self.flush();
+        }
+    }
+
+    /// Drop a closed window's vars. Returns the keys that went, so their listeners can be told.
+    pub fn forget_window(&mut self, win: neosh_proto::WindowId) -> Vec<String> {
+        self.transient
+            .remove(&Self::key(&VarScope::Window { win }))
+            .map(|m| m.keys().cloned().collect())
+            .unwrap_or_default()
     }
 
     /// Drop everything about a conversation that has been deleted.
@@ -88,6 +120,8 @@ impl Vars {
             VarScope::Global => "global".to_string(),
             VarScope::Session { session } => format!("session:{session}"),
             VarScope::Project { cwd } => format!("project:{cwd}"),
+            VarScope::Buffer { buf } => format!("buf:{}", buf.0),
+            VarScope::Window { win } => format!("win:{}", win.0),
         }
     }
 
