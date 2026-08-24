@@ -2232,6 +2232,63 @@ fn a_new_conversation_in_a_repository_offers_a_worktree() {
     );
 }
 
+/// The trees it offers under "an existing one" are the ones on the panel's list, not every
+/// checkout `git worktree list` can see.
+///
+/// A scratch branch you finished with in March is still a worktree on disk long after `X` took it
+/// off the panel, so this picker was handing back every project you had ever removed — twenty rows
+/// of finished work above the three you are in — and choosing one put it straight into the sidebar
+/// again. The list is the workspace's answer to *which places do I work in* (ADR 0039), and this
+/// question asks exactly that.
+///
+/// Two worktrees, alike in every way git can see and differing only in whether anything was ever
+/// started in one of them, which is what makes this a statement about the list rather than about
+/// worktrees.
+#[test]
+fn a_worktree_that_is_not_on_the_list_is_not_offered() {
+    if !have_git() {
+        return;
+    }
+    let sb = Sandbox::new("newwherelist");
+    sb.git_init();
+    let add = |branch: &str| {
+        let at = sb.root.join(branch);
+        let out = Command::new("git")
+            .current_dir(sb.work())
+            .args(["worktree", "add", "-b", branch, &at.display().to_string()])
+            .output()
+            .expect("git runs");
+        assert!(out.status.success(), "worktree add: {}", String::from_utf8_lossy(&out.stderr));
+        at
+    };
+    let onlist = add("onlist");
+    add("offlist");
+
+    let mut s = sb.start();
+    s.wait_for("PROJECTS");
+    // A conversation started in a directory is how it joins the list. The other tree gets nothing,
+    // which is the state `X` leaves behind: on the disk, in git, on nobody's list.
+    s.send(&command_with("project.open", &onlist.display().to_string()));
+    assert!(s.pump(|s| s.sidebar_rows() >= 2), "it is a project now\n{:?}", s.sidebar_now());
+    // Asked from the checkout rather than from inside the new tree — the tree you are standing in
+    // is never one of the answers, so asking there could not tell the two rules apart.
+    s.send(&command_with("project.open", &sb.work().display().to_string()));
+    assert!(s.pump(|s| s.sidebar_rows() >= 3), "and we are back\n{:?}", s.sidebar_now());
+
+    s.ctrl("n");
+    assert!(
+        s.pump(|s| s.picker_named("[New conversation]").iter().any(|l| l.contains("onlist"))),
+        "the tree on the list is a row\n{:?}",
+        s.picker_named("[New conversation]")
+    );
+    let rows = s.picker_named("[New conversation]");
+    assert!(rows.iter().any(|l| l.contains("Here")), "the question is still asked\n{rows:?}");
+    assert!(
+        !rows.iter().any(|l| l.contains("offlist")),
+        "and the one nobody kept is not\n{rows:?}"
+    );
+}
+
 /// The picker's in-project row works with nothing configured: the tree lands in `.worktrees/`
 /// and `.gitignore` keeps it out of `git status` — no `worktree.root` edit required.
 ///
@@ -7293,9 +7350,10 @@ import type { PluginContext } from "@neosh/api";
 export async function activate({ neosh }: PluginContext) {
   neosh.event.on("neosh.ready", async () => {
     await neosh.hl.define("Acme.Panel", { bg: { kind: "rgb", r: 9, g: 9, b: 9 } });
+    // By *kind*, deliberately before the sidebar has opened a window in any terminal: the remap
+    // has to reach windows opened later, or a restyling plugin would have to race every attach.
     await neosh.win.setHighlights({ kind: "neosh.sidebar" }, { Normal: "Acme.Panel" });
-    const wins = await neosh.win.ofKind("neosh.sidebar");
-    neosh.notify(`restyled ${wins.length} window(s)`);
+    neosh.notify("restyled");
   });
 }
 "#;
@@ -7305,22 +7363,29 @@ fn a_kind_remap_reaches_the_sidebars_window() {
     let sb = Sandbox::new("restyle");
     install_plugin(&sb, "restyle", "", RESTYLE);
     let mut s = sb.start();
-    s.wait_for("restyled 1 window(s)");
-    s.drain_for(Duration::from_millis(300));
-    let sidebar = s.buffer_named("[sidebar]").expect("the sidebar exists");
-    let win = s
-        .events
-        .iter()
-        .find(|e| e["type"] == "window_opened" && e["buf"].as_u64() == Some(sidebar))
-        .and_then(|e| e["win"].as_u64())
-        .expect("the sidebar is in a window");
-    let remap = s
-        .events
-        .iter()
-        .filter(|e| e["type"] == "window_highlights" && e["win"].as_u64() == Some(win))
-        .last()
-        .expect("the window was told its remap");
-    assert_eq!(remap["map"]["Normal"], "Acme.Panel", "{remap}");
+    s.wait_for("restyled");
+    // The sidebar's window may open after the remap was set — a view attaching is what opens a
+    // panel now — and the point of a *kind* remap is that it reaches those too.
+    assert!(
+        s.pump(|s| {
+            let Some(sidebar) = s.buffer_named("[sidebar]") else { return false };
+            let Some(win) = s
+                .events
+                .iter()
+                .find(|e| e["type"] == "window_opened" && e["buf"].as_u64() == Some(sidebar))
+                .and_then(|e| e["win"].as_u64())
+            else {
+                return false;
+            };
+            s.events.iter().any(|e| {
+                e["type"] == "window_highlights"
+                    && e["win"].as_u64() == Some(win)
+                    && e["map"]["Normal"] == "Acme.Panel"
+            })
+        }),
+        "the sidebar's window was told its remap\n{}",
+        s.transcript()
+    );
 }
 
 /// The workspace's own events — windows gaining and losing the keyboard, the mode changing —

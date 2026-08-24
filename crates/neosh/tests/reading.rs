@@ -441,6 +441,34 @@ fn yank_turn_takes_the_question_and_its_whole_answer() {
     assert!(got.contains("That is all."), "and the end of it: {got:?}");
 }
 
+/// `yp` takes the conversation's directory — in a worktree, the worktree's path — which is the
+/// other thing you take out of a conversation: what your shell wants to `cd` to. The one `y`
+/// target that is not a piece of the transcript, and the route a Mac takes — `⌥Y` in chat is `¥`
+/// there, and is allowed as a default only because this exists (ADR 0048).
+#[test]
+fn yank_path_takes_the_conversations_directory() {
+    let sb = Sandbox::new("yankpath");
+    let mut s = sb.start();
+    s.answered_and_reading();
+
+    s.ch("y");
+    s.ch("p");
+    assert!(s.pump(|s| !s.copied().is_empty()), "copied\n{:?}", s.messages());
+    let want = sb.root.join("work");
+    let got = PathBuf::from(s.last_copy());
+    // Canonicalised on both sides: a temp dir on macOS is a symlink into `/private`.
+    assert_eq!(
+        got.canonicalize().unwrap_or(got.clone()),
+        want.canonicalize().unwrap_or(want.clone()),
+        "the directory, not a row of the transcript: {got:?}"
+    );
+    assert!(
+        s.pump(|s| s.messages().iter().any(|m| m.starts_with("copied ") && !m.contains("line"))),
+        "and it says which path, not how many lines\n{:?}",
+        s.messages()
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Getting to the piece you want
 // ---------------------------------------------------------------------------

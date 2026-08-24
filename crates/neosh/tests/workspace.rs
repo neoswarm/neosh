@@ -330,6 +330,16 @@ impl Client {
         self.text().iter().any(|l| l.contains(needle))
     }
 
+    /// Whether a buffer whose name contains `name` is actually *on screen* here.
+    ///
+    /// Not the same question as [`Self::shows`], which reads buffer contents: a panel that has been
+    /// hidden still has its buffer, and a buffer with no window is a buffer nothing draws.
+    fn windowed(&self, name: &str) -> bool {
+        self.mirror.windows.values().any(|w| {
+            self.mirror.buffers.get(&w.buf).is_some_and(|b| b.name.contains(name))
+        })
+    }
+
     /// Wait until the workspace is actually ready to be typed at.
     ///
     /// Not the welcome screen, which is drawn before the plugins are up — the sidebar's heading,
@@ -455,8 +465,10 @@ fn a_second_terminal_joins_rather_than_taking_the_workspace_over() {
 
 #[test]
 fn what_happens_in_one_terminal_happens_in_the_other() {
-    // "Synced everywhere" is the whole claim: there is one editor, and every terminal is a mirror
-    // of it. A question asked here is a question on screen there, live and without asking for it.
+    // A conversation open in two terminals is one conversation: a question asked here is a
+    // question on screen there, live and without asking for it. What is *not* shared is where you
+    // are in it — two transcripts, two scroll positions, two drafts — but the rows say the same
+    // thing, because the rows are what the agent produced.
     let sb = Sandbox::new("mirrored");
     let ws = sb.serve("hello_turn.jsonl");
 
@@ -472,6 +484,135 @@ fn what_happens_in_one_terminal_happens_in_the_other() {
     });
     second.until("and the answer it produced", |c| c.shows("All done."));
     first.until("in the terminal that asked, too", |c| c.shows("All done."));
+}
+
+#[test]
+fn a_second_terminal_lands_somewhere_the_first_one_is_not() {
+    // The reason to open a second window is that the first one is busy. Landing in the same
+    // conversation would make it a copy of the thing you were trying to get away from, so it takes
+    // the most recent conversation nobody is reading.
+    let sb = Sandbox::new("elsewhere");
+    let ws = sb.serve("two_conversations.jsonl");
+
+    let mut first = Client::attach(&ws.socket, neosh_proto::PROTOCOL_VERSION);
+    first.ready();
+    first.ask("about the first thing");
+
+    // A second conversation, which the first terminal is now the one reading.
+    first.send(ClientMessage::Input {
+        event: InputEvent::Command { name: "session.new".into(), args: Vec::new() },
+    });
+    first.until("the new conversation to be empty", |c| {
+        !c.transcript().iter().any(|l| l.contains("about the first thing"))
+    });
+    first.ask("about the second thing");
+
+    let mut second = Client::attach(&ws.socket, neosh_proto::PROTOCOL_VERSION);
+    second.ready();
+    second.until("the other conversation, not this one", |c| {
+        c.transcript().iter().any(|l| l.contains("about the first thing"))
+    });
+
+    // And the first terminal did not move to make room.
+    first.pump_once();
+    assert!(
+        first.transcript().iter().any(|l| l.contains("about the second thing")),
+        "the first terminal was moved out of the conversation it was in\n{:#?}",
+        first.transcript()
+    );
+    assert!(
+        !second.transcript().iter().any(|l| l.contains("about the second thing")),
+        "the second terminal is reading the first one's conversation\n{:#?}",
+        second.transcript()
+    );
+}
+
+#[test]
+fn typing_in_one_terminal_stays_in_that_terminal() {
+    // Two terminals in two conversations are two drafts. It is the same rule as the transcript:
+    // what the agent produced is the workspace's, and what you are in the middle of writing is
+    // yours.
+    let sb = Sandbox::new("twodrafts");
+    let ws = sb.serve("two_conversations.jsonl");
+
+    let mut first = Client::attach(&ws.socket, neosh_proto::PROTOCOL_VERSION);
+    first.ready();
+    first.key("half a sentence");
+    first.until("the draft to appear here", |c| c.shows("half a sentence"));
+
+    let mut second = Client::attach(&ws.socket, neosh_proto::PROTOCOL_VERSION);
+    second.ready();
+    second.pump_once();
+    assert!(
+        !second.shows("half a sentence"),
+        "somebody else's draft turned up in this terminal\n{:#?}",
+        second.text()
+    );
+}
+
+#[test]
+fn a_turn_running_in_one_terminal_is_visible_from_the_other() {
+    // The whole point of the second window: you opened it because something is running in the
+    // first. So what is *happening* has to reach it — the panel lists every conversation in the
+    // workspace, whoever is reading them — while what you are reading does not.
+    let sb = Sandbox::new("watching");
+    let ws = sb.serve_paced("two_answers.jsonl", 700);
+
+    let mut first = Client::attach(&ws.socket, neosh_proto::PROTOCOL_VERSION);
+    first.ready();
+    first.ask("the quiet one");
+
+    // A second conversation, and a turn running in it. The first terminal is now the one reading
+    // that, which leaves the quiet conversation for whoever attaches next.
+    first.send(ClientMessage::Input {
+        event: InputEvent::Command { name: "session.new".into(), args: Vec::new() },
+    });
+    first.until("the new conversation to be empty", |c| {
+        !c.transcript().iter().any(|l| l.contains("the quiet one"))
+    });
+    first.ask("go and do the thing");
+
+    let mut second = Client::attach(&ws.socket, neosh_proto::PROTOCOL_VERSION);
+    second.ready();
+    second.until("the quiet conversation here", |c| {
+        c.transcript().iter().any(|l| l.contains("the quiet one"))
+    });
+
+    // The working conversation is in this terminal's panel, and not in its transcript.
+    second.until("the working conversation listed in the panel", |c| {
+        c.shows("go and do the thing")
+    });
+    assert!(
+        !second.transcript().iter().any(|l| l.contains("go and do the thing")),
+        "the second terminal is reading the first one's conversation\n{:#?}",
+        second.transcript()
+    );
+    // And the turn finishes where it started.
+    first.until("the answer, in the terminal that asked", |c| c.shows("ANSWER-LATER"));
+}
+
+#[test]
+fn each_terminal_has_a_panel_of_its_own() {
+    // A dock exists once per terminal or it exists in one of them. `^B` hides the column in front
+    // of you and says nothing about anybody else's.
+    let sb = Sandbox::new("twopanels");
+    let ws = sb.serve("two_conversations.jsonl");
+
+    let mut first = Client::attach(&ws.socket, neosh_proto::PROTOCOL_VERSION);
+    first.ready();
+    let mut second = Client::attach(&ws.socket, neosh_proto::PROTOCOL_VERSION);
+    second.ready();
+
+    assert!(first.windowed("sidebar"), "no panel to hide");
+    first.ctrl('b');
+    first.until("the panel to go here", |c| !c.windowed("sidebar"));
+
+    second.pump_once();
+    assert!(
+        second.windowed("sidebar"),
+        "hiding one terminal's panel hid the other's\n{:#?}",
+        second.text()
+    );
 }
 
 #[test]
@@ -522,10 +663,12 @@ fn the_last_terminal_leaving_makes_the_workspace_idle_not_gone() {
 }
 
 #[test]
-fn a_narrow_terminal_joining_makes_the_transcript_fit_it() {
-    // Every view lays out its own geometry, but a tool card is one row of buffer *content* and the
-    // content is shared. Measured for the widest terminal, it wraps in the narrow one — and a card
-    // that wraps is the failure `chat_width` exists to prevent. So the smallest one wins.
+fn each_terminal_fits_a_card_to_its_own_width() {
+    // A tool card is one row, so it is fitted to a width rather than wrapped — and it used to be
+    // fitted to the *smallest* attached terminal's, because every view shared one transcript
+    // buffer and content measured for the wide one wrapped in the narrow one. A transcript belongs
+    // to a view now, so there is nothing left to share: the wide window gets the whole path and the
+    // narrow one gets it elided, and each is right about the terminal it is in.
     let sb = Sandbox::new("smallest");
     let ws = sb.serve("wide_card.jsonl");
 
@@ -537,18 +680,28 @@ fn a_narrow_terminal_joining_makes_the_transcript_fit_it() {
     narrow.ready();
     narrow.report_viewports();
 
-    narrow.until("the welcome to be redrawn for the narrow terminal", |c| {
+    narrow.until("the welcome to be drawn for the narrow terminal", |c| {
         c.transcript().iter().all(|l| l.chars().count() <= 60)
     });
     wide.ask("how wide");
-    narrow.until("the answer", |c| c.shows("All done."));
     wide.until("the answer", |c| c.shows("All done."));
 
-    // Identical content, and it is content the narrow terminal can print without wrapping.
-    let rows = wide.transcript();
-    assert_eq!(rows, narrow.transcript(), "two mirrors of one editor disagreed");
-    let widest = rows.iter().map(|l| l.chars().count()).max().unwrap_or(0);
-    assert!(widest <= 60, "a row of {widest} columns does not fit the narrow terminal: {rows:#?}");
+    // Both terminals are in the one conversation there is, so both show the card — each fitted to
+    // itself, and neither wrapping.
+    narrow.until("the answer next door", |c| c.shows("All done."));
+    let narrow_rows = narrow.transcript();
+    let widest = narrow_rows.iter().map(|l| l.chars().count()).max().unwrap_or(0);
+    assert!(
+        widest <= 60,
+        "a row of {widest} columns does not fit the narrow terminal: {narrow_rows:#?}"
+    );
+
+    let wide_rows = wide.transcript();
+    let longest = wide_rows.iter().map(|l| l.chars().count()).max().unwrap_or(0);
+    assert!(
+        longest > 60,
+        "the wide terminal was still clamped to the narrow one's width: {wide_rows:#?}"
+    );
 }
 
 #[test]

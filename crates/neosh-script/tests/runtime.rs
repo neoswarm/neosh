@@ -44,7 +44,7 @@ async fn activate(
         match next(rx).await {
             ScriptOutbound::Loaded { error, .. } => return (calls, error),
             ScriptOutbound::Plugin { msg, .. } => match msg {
-                PluginOutbound::Call { id, call } => {
+                PluginOutbound::Call { id, call, .. } => {
                     let value = answer(&call);
                     calls.push(call);
                     rt.send(ScriptInbound::Plugin {
@@ -53,7 +53,7 @@ async fn activate(
                     })
                     .unwrap();
                 }
-                PluginOutbound::Notify { call } => calls.push(call),
+                PluginOutbound::Notify { call, .. } => calls.push(call),
                 other => panic!("unexpected outbound message {other:?}"),
             },
             ScriptOutbound::Log { level, message } => {
@@ -516,7 +516,7 @@ export async function activate(ctx: PluginContext): Promise<void> {
                 assert_eq!(error, None, "{plugin} should activate");
                 loaded += 1;
             }
-            ScriptOutbound::Plugin { msg: PluginOutbound::Notify { call: ApiCall::Log { message, .. } }, .. } => {
+            ScriptOutbound::Plugin { msg: PluginOutbound::Notify { call: ApiCall::Log { message, .. }, .. }, .. } => {
                 logs.push(message)
             }
             ScriptOutbound::Plugin { msg: PluginOutbound::Call { id, .. }, plugin } => {
@@ -637,7 +637,7 @@ export async function deactivate(): Promise<void> {
 
     rt.send(ScriptInbound::Unload { plugin: PluginId::from("bye") }).unwrap();
     match next(&mut rx).await {
-        ScriptOutbound::Plugin { msg: PluginOutbound::Notify { call: ApiCall::Log { message, .. } }, .. } => {
+        ScriptOutbound::Plugin { msg: PluginOutbound::Notify { call: ApiCall::Log { message, .. }, .. }, .. } => {
             assert_eq!(message, "goodbye")
         }
         other => panic!("expected the goodbye, got {other:?}"),

@@ -36,6 +36,7 @@ import type { SwarmNode } from "./SwarmNode";
 import type { SwarmStranger } from "./SwarmStranger";
 import type { ToolDef } from "./ToolDef";
 import type { UsageHistory } from "./UsageHistory";
+import type { ViewInfo } from "./ViewInfo";
 import type { Viewport } from "./Viewport";
 import type { WindowId } from "./WindowId";
 import type { WindowInfo } from "./WindowInfo";
@@ -50,6 +51,7 @@ export type ApiOk =
   | { "ok": "bool"; value: boolean }
   | { "ok": "buf"; buf: BufferId }
   | { "ok": "win"; win: WindowId }
+  | { "ok": "views"; views: Array<ViewInfo> }
   | { "ok": "ns"; ns: NamespaceId }
   | { "ok": "mark"; id: ExtmarkId }
   | { "ok": "surface"; surface: SurfaceId }

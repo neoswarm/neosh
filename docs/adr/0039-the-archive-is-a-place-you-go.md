@@ -172,3 +172,35 @@ the directory of a conversation that no longer existed.
 - **A fresh start is still a conversation.** The session a new workspace is constructed with is not
   a placeholder: nothing was cleared out, and `neosh` in a directory you have never opened should
   read as a conversation waiting rather than as a workspace you emptied.
+
+## What was corrected afterwards: a project you removed was still an answer to "where"
+
+`X` took a project off the list and the list stayed off it — that part worked. But the list is not
+the only place a directory is offered from, and the other one was not asking it anything.
+
+`^N` in a repository asks where the conversation goes, and among its answers are the worktrees you
+already have. Those rows came from `git worktree list`, which is every checkout on the disk. A
+worktree outlives the work in it: the branch is merged, the conversations are deleted, `X` takes the
+project off the panel, and the directory is still there — so after a few months of scratch branches
+the question "where does this conversation go" was answered with two dozen rows of finished work
+above the two or three places you are actually in. Choosing one put it straight back in the sidebar,
+which made `X` look like something that had not worked rather than something that had.
+
+**So the picker asks the list.** The trees it offers are `git worktree list` narrowed to the
+directories `sidebar.projects` knows, which is the same sentence as the one above: the list is the
+workspace's answer to which places you work in, and this question is asking exactly that. `X` now
+takes a project out of both, because there was only ever supposed to be one list.
+
+A worktree neosh has never heard of — one you made in a shell — is not on it either, and that is
+the rule rather than a casualty of it: `Another directory…`, on the bottom of the same picker, lists
+every tree git knows and is how a directory joins the list in the first place. One row for
+everything not on the list is what stops the list from being decoration.
+
+### Consequences
+
+- **`X` on a worktree row still leaves the checkout on the disk.** That is `d`'s job — the git
+  plugin's contribution — and this changes nothing about it. Taking a place off your list and
+  deleting a directory of work are different sizes of decision, and the second one asks.
+- **A tree you removed comes back the way any directory does.** `o`, or `Another directory…`, and a
+  conversation started in it puts it on the list again. Nothing is written down about the removal,
+  so nothing has to be cleared.

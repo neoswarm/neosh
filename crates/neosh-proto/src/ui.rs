@@ -960,6 +960,16 @@ pub enum InputEvent {
     /// nothing is nothing). Folding the two together and always re-announcing would mean the
     /// in-process case sends its whole state twice at startup, into a mirror that already has it.
     Attached { width: u16, height: u16 },
+    /// The last terminal looking at a view has gone.
+    ///
+    /// Not something a client sends — it cannot know whether it was the last, and a client whose
+    /// socket simply died sends nothing at all. It is synthesised by the workspace when the set of
+    /// connections changes, and it is what lets a view's windows and buffers be taken down instead
+    /// of accumulating one screenful per terminal ever opened.
+    ///
+    /// A view is not a conversation: whatever was running in it keeps running, and the mark saying
+    /// a turn ended where nobody could see it is exactly what covers the gap.
+    Detached,
     Key { key: KeyPress },
     /// Bracketed paste arrives whole rather than as synthetic keystrokes.
     Paste { text: String },

@@ -316,6 +316,7 @@ impl Session {
             context_window: self.context_window,
             // Filled in by the store, which is the only thing that knows.
             is_active: false,
+            on_screen: false,
             unread: self.unread,
             interrupted: self.interrupted,
             background: self.background.clone(),

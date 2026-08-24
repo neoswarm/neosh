@@ -16,10 +16,12 @@ fn plugin(name: &str) -> PluginId {
     PluginId::from(name)
 }
 
-fn window_highlights(events: &[UiEvent]) -> Vec<(u32, BTreeMap<String, String>)> {
+fn window_highlights(
+    events: &[(Option<neosh_proto::ViewId>, UiEvent)],
+) -> Vec<(u32, BTreeMap<String, String>)> {
     events
         .iter()
-        .filter_map(|e| match e {
+        .filter_map(|e| match &e.1 {
             UiEvent::WindowHighlights { win, map } => Some((win.0, map.clone())),
             _ => None,
         })
@@ -45,11 +47,11 @@ fn a_plugins_groups_leave_with_it_and_the_theme_comes_back() {
     e.remove_plugin(&acme);
     let ui = e.drain_ui();
     assert!(
-        ui.iter().any(|ev| matches!(ev, UiEvent::HighlightDefined { name, def } if name == "Comment" && *def != link("Accent"))),
+        ui.iter().any(|ev| matches!(&ev.1, UiEvent::HighlightDefined { name, def } if name == "Comment" && *def != link("Accent"))),
         "the theme's Comment is said again: {ui:?}"
     );
     assert!(
-        ui.iter().any(|ev| matches!(ev, UiEvent::HighlightCleared { name } if name == "Acme.Row")),
+        ui.iter().any(|ev| matches!(&ev.1, UiEvent::HighlightCleared { name } if name == "Acme.Row")),
         "a group the theme never had is cleared: {ui:?}"
     );
     let effects = e.drain_effects();
@@ -175,7 +177,7 @@ fn a_kind_remap_reaches_every_window_of_the_kind_including_later_ones() {
     })
     .expect("sets");
     e.drain_ui();
-    e.republish();
+    e.republish(neosh_proto::ViewId::LOCAL);
     assert!(window_highlights(&e.drain_ui()).contains(&(win.0, map(&[("Normal", "Acme.Focused")]))));
     let _ = BufferId(0);
 }

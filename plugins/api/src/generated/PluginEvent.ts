@@ -17,6 +17,7 @@ import type { ToolResult } from "./ToolResult";
 import type { TurnId } from "./TurnId";
 import type { Usage } from "./Usage";
 import type { VarScope } from "./VarScope";
+import type { ViewId } from "./ViewId";
 import type { WindowId } from "./WindowId";
 
 export type PluginEvent =
@@ -26,7 +27,8 @@ export type PluginEvent =
     args?: Array<string>;
     key?: KeyContext | null;
   }
-  | { "type": "view_attached" }
+  | { "type": "view_attached"; view: ViewId }
+  | { "type": "view_closed"; view: ViewId }
   | {
     "type": "buffer_changed";
     buf: BufferId;
@@ -55,7 +57,7 @@ export type PluginEvent =
   | { "type": "hook_observed"; hook: HookName; payload: HookPayload }
   | { "type": "focus_changed"; win?: WindowId | null }
   | { "type": "option_changed"; name: string; value: OptionValue }
-  | { "type": "session_changed"; session: SessionId }
+  | { "type": "session_changed"; session: SessionId; view: ViewId }
   | { "type": "selection_changed"; selection: ModelSelection }
   | { "type": "activity"; session: SessionId; turn: TurnId; activity: Activity }
   | { "type": "composer_changed"; text: string }

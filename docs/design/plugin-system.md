@@ -1,6 +1,6 @@
 # Plugins on top of plugins
 
-**Status:** implemented, 2026-08-23 — see [ADR 0059](../adr/0059-a-plugin-can-build-on-a-plugin.md)
+**Status:** implemented, 2026-08-23 — see [ADR 0060](../adr/0060-a-plugin-can-build-on-a-plugin.md)
 for what was decided and why, and `docs/plugins.md` for how to use it. This document is the audit
 that preceded it, kept because the gap analysis is the reasoning. Of the proposal, A–I landed
 except: per-buffer/window *options* (vars have the scopes), the transcript card / footer / composer

@@ -70,7 +70,7 @@ fn a_repaint_is_one_event_and_never_a_row_without_its_marks() {
         })
         .expect("render");
 
-        let drained = e.drain_ui();
+        let drained = e.drain_events();
         let events = drained
             .iter()
             .filter(|ev| matches!(ev, UiEvent::BufferLines { buf: b, .. } if *b == buf))
@@ -108,7 +108,7 @@ fn a_repaint_does_not_inherit_the_marks_of_the_one_before_it() {
         .expect("render");
     }
 
-    let drawn = rows(&e.drain_ui(), buf);
+    let drawn = rows(&e.drain_events(), buf);
     assert!(
         drawn.iter().all(|(_, marks)| *marks == 1),
         "twenty frames left more than one mark on a row: {drawn:?}",
@@ -135,12 +135,12 @@ fn another_namespace_survives_the_panel_underneath_it_redrawing() {
         opts: ExtmarkOpts { hl_group: Some("Search".into()), end_col: Some(4), ..Default::default() },
     })
     .expect("overlay");
-    e.drain_ui();
+    e.drain_events();
 
     e.apply(&plugin, ApiCall::BufRender { buf, ns: sidebar, start: 0, end: -1, lines: panel() })
         .expect("redraw");
 
-    let drawn = rows(&e.drain_ui(), buf);
+    let drawn = rows(&e.drain_events(), buf);
     assert_eq!(drawn[2].1, 2, "the overlay was cleared by somebody else's repaint: {drawn:?}");
     assert_eq!(drawn[0].1, 1, "an untouched row grew a mark: {drawn:?}");
 }
@@ -154,7 +154,7 @@ fn a_partial_repaint_leaves_the_rows_it_did_not_write_alone() {
 
     e.apply(&plugin, ApiCall::BufRender { buf, ns: sidebar, start: 0, end: -1, lines: panel() })
         .expect("render");
-    e.drain_ui();
+    e.drain_events();
 
     e.apply(&plugin, ApiCall::BufRender {
         buf,
@@ -165,7 +165,7 @@ fn a_partial_repaint_leaves_the_rows_it_did_not_write_alone() {
     })
     .expect("one row");
 
-    let drawn = rows(&e.drain_ui(), buf);
+    let drawn = rows(&e.drain_events(), buf);
     assert_eq!(drawn.len(), 1, "only the row that changed travels: {drawn:?}");
     assert_eq!(drawn[0].0, "     * conversation 1 (working)");
     assert_eq!(drawn[0].1, 1);

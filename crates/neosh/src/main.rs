@@ -14,6 +14,7 @@ mod notify;
 mod bridge;
 mod build;
 mod client;
+mod clients;
 mod daemon;
 mod cards;
 mod diff;
@@ -34,7 +35,6 @@ mod trust;
 mod usage;
 mod vars;
 mod vim;
-mod views;
 
 use bridge::ScriptBridge;
 use frontend::{Disconnected, Frontend, StdioFrontend, TerminalUi};
@@ -405,18 +405,18 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
     result
 }
 
-/// Tag a lone frontend's input as coming from the one view there is.
+/// Tag a lone frontend's input as coming from the one terminal there is.
 ///
-/// A process that *is* its own terminal has exactly one view and it never goes away, so the tag is
-/// a constant. It exists so that "which terminal was that key pressed in" has the same answer
-/// everywhere rather than being a question only the daemon build knows how to ask.
+/// A process that *is* its own terminal has exactly one client and one view, and neither ever goes
+/// away, so the tag is a constant. It exists so that "which terminal was that key pressed in" has
+/// the same answer everywhere rather than being a question only the daemon build knows how to ask.
 fn from_the_only_view(
     mut rx: tokio::sync::mpsc::UnboundedReceiver<InputEvent>,
-) -> tokio::sync::mpsc::UnboundedReceiver<(views::ViewId, InputEvent)> {
+) -> tokio::sync::mpsc::UnboundedReceiver<(clients::Source, InputEvent)> {
     let (tx, tagged) = tokio::sync::mpsc::unbounded_channel();
     tokio::spawn(async move {
         while let Some(ev) = rx.recv().await {
-            if tx.send((views::ViewId::LOCAL, ev)).is_err() {
+            if tx.send((clients::Source::LOCAL, ev)).is_err() {
                 break;
             }
         }
@@ -430,8 +430,8 @@ fn from_the_only_view(
 /// are the *other* ways a session ends: `kill`, a closing SSH connection, a supervisor stopping the
 /// service. Reusing the command rather than exiting directly means shutdown has exactly one path.
 fn with_signals(
-    mut from_frontend: tokio::sync::mpsc::UnboundedReceiver<(views::ViewId, InputEvent)>,
-) -> tokio::sync::mpsc::UnboundedReceiver<(views::ViewId, InputEvent)> {
+    mut from_frontend: tokio::sync::mpsc::UnboundedReceiver<(clients::Source, InputEvent)>,
+) -> tokio::sync::mpsc::UnboundedReceiver<(clients::Source, InputEvent)> {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
 
     let forward = tx.clone();
@@ -451,7 +451,8 @@ fn with_signals(
         // workspace did nothing at all and the `SIGKILL` behind it was what actually stopped it,
         // with whatever had not been written to disk still in memory. This is also the path a
         // machine shutting down takes.
-        let quit = (views::ViewId::LOCAL, InputEvent::Command { name: "stop".into(), args: Vec::new() });
+        let quit =
+            (clients::Source::LOCAL, InputEvent::Command { name: "stop".into(), args: Vec::new() });
         #[cfg(unix)]
         {
             use tokio::signal::unix::{SignalKind, signal};

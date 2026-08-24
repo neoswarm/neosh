@@ -41,6 +41,7 @@ import type { ToolDef } from "./ToolDef";
 import type { UsageResolution } from "./UsageResolution";
 import type { UserQuestion } from "./UserQuestion";
 import type { VarScope } from "./VarScope";
+import type { ViewId } from "./ViewId";
 import type { WindowId } from "./WindowId";
 import type { WindowLayout } from "./WindowLayout";
 
@@ -86,7 +87,21 @@ export type ApiCall =
   | { "call": "buf_get_kind"; buf: BufferId }
   | { "call": "buf_attach"; buf: BufferId }
   | { "call": "buf_detach"; buf: BufferId }
-  | { "call": "win_open"; buf: BufferId; layout: WindowLayout }
+  | {
+    "call": "win_open";
+    buf: BufferId;
+    layout: WindowLayout;
+    /**
+     * Which terminal to open it in.
+     *
+     * Almost never worth saying. The host works it out from the call — a float anchored to a
+     * window goes where that window is, and a buffer only one terminal is showing names it —
+     * and otherwise from the terminal whose key press is being served, which for anything a
+     * plugin does in answer to a key is exact. What this is for is the case none of that
+     * covers: an orchestrator putting something on a screen other than the one you are at.
+     */
+    view?: ViewId | null;
+  }
   | { "call": "win_close"; win: WindowId }
   | { "call": "win_resize"; win: WindowId; size: number | null }
   | { "call": "win_set_buf"; win: WindowId; buf: BufferId }
@@ -114,7 +129,21 @@ export type ApiCall =
   | { "call": "win_cursor_shape"; win: WindowId; shape: CursorShape }
   | { "call": "win_selection"; win: WindowId }
   | { "call": "clipboard_write"; text: string }
-  | { "call": "float_open"; buf: BufferId; config: FloatConfig }
+  | {
+    "call": "float_open";
+    buf: BufferId;
+    config: FloatConfig;
+    /**
+     * Which terminal to open it in.
+     *
+     * Almost never worth saying. The host works it out from the call — a float anchored to a
+     * window goes where that window is, and a buffer only one terminal is showing names it —
+     * and otherwise from the terminal whose key press is being served, which for anything a
+     * plugin does in answer to a key is exact. What this is for is the case none of that
+     * covers: an orchestrator putting something on a screen other than the one you are at.
+     */
+    view?: ViewId | null;
+  }
   | { "call": "float_configure"; win: WindowId; config: FloatConfig }
   | { "call": "ns_create"; name: string }
   | {
@@ -244,7 +273,16 @@ export type ApiCall =
      */
     activate: boolean;
   }
-  | { "call": "session_switch"; session: SessionId }
+  | {
+    "call": "session_switch";
+    session: SessionId;
+    /**
+     * Which terminal moves. Defaults to the one being served, which is what a key press in a
+     * panel means; an orchestrator sending somebody else's screen somewhere says so.
+     */
+    view?: ViewId | null;
+  }
+  | { "call": "view_list" }
   | { "call": "session_close"; session: SessionId }
   | { "call": "session_rename"; session: SessionId; title?: string | null }
   | { "call": "session_archive"; session: SessionId; archived: boolean }
