@@ -112,6 +112,53 @@ fn agent_with_script(
     Agent::new(session, perms, providers)
 }
 
+/// A driver that runs its own loop, which is the only kind that reports tool calls as they happen.
+///
+/// `claude`, `codex`, anything speaking ACP: the calls are made in another process, so the stream
+/// is the only place they exist and [`AgentEvent::ToolStarted`] is said for each one as it is
+/// announced. Whether the matching [`AgentEvent::ToolFinished`] is always said is what the test
+/// below is about, so this has to be a delegating driver — a model driver never populates that
+/// bookkeeping at all.
+struct Delegating(MockProvider);
+
+#[async_trait::async_trait]
+impl neosh_provider::Provider for Delegating {
+    fn driver(&self) -> DriverKind {
+        self.0.driver()
+    }
+
+    fn delegates_agent_loop(&self) -> bool {
+        true
+    }
+
+    fn stream(
+        &self,
+        instance: &InstanceConfig,
+        request: neosh_proto::TurnRequest,
+        cancel: tokio_util::sync::CancellationToken,
+    ) -> neosh_provider::ProviderStream {
+        self.0.stream(instance, request, cancel)
+    }
+}
+
+/// An agent whose driver runs its own loop and replays exactly the given turns.
+fn agent_with_delegating_script(
+    script: Vec<Vec<neosh_proto::ProviderEvent>>,
+) -> (Agent, tokio::sync::mpsc::UnboundedReceiver<AgentEvent>) {
+    let mut providers = ProviderRegistry::new();
+    providers.register_driver(Arc::new(Delegating(MockProvider::new(script))));
+    providers.add_instance(mock_instance());
+
+    let mut session = Session::new(std::env::temp_dir());
+    session.selection = Some(ModelSelection {
+        instance: InstanceId::from("mock"),
+        model: ModelId::from("mock"),
+        options: vec![],
+    });
+    let perms = Arc::new(PermissionLayer::new(std::env::temp_dir()));
+    Agent::new(session, perms, providers)
+}
+
 fn drain(rx: &mut tokio::sync::mpsc::UnboundedReceiver<AgentEvent>) -> Vec<AgentEvent> {
     let mut v = Vec::new();
     while let Ok(e) = rx.try_recv() {
@@ -400,6 +447,84 @@ async fn a_turn_runs_in_the_conversation_it_names_not_in_whichever_is_on_screen(
         drain(&mut rx).iter().all(|e| e.session() == &elsewhere),
         "every event says which conversation it came from, and it is not the one on screen"
     );
+}
+
+#[tokio::test]
+async fn a_call_the_driver_never_answered_is_closed_out_rather_than_left_running() {
+    // A card with no result does not sit still — it spins, and goes on counting, for as long as
+    // the conversation is open. And it does it again after a restart: the call is in the messages
+    // with no result beside it, and a result-less call is what a rebuild draws as still running.
+    // So a turn that walked away from a call has to say so before it ends.
+    //
+    // A stream that announces two calls, answers the first, and closes.
+    let script = vec![vec![
+        neosh_proto::ProviderEvent::MessageStart {
+            model: Some("mock".into()),
+            usage: neosh_proto::Usage::default(),
+        },
+        neosh_proto::ProviderEvent::BlockStart {
+            index: 0,
+            block: neosh_proto::BlockStartKind::ToolUse {
+                id: neosh_proto::ToolCallId("answered".into()),
+                name: "Bash".into(),
+            },
+        },
+        neosh_proto::ProviderEvent::ToolInputDelta { index: 0, partial_json: "{}".into() },
+        neosh_proto::ProviderEvent::BlockStop { index: 0 },
+        neosh_proto::ProviderEvent::ToolResult {
+            id: neosh_proto::ToolCallId("answered".into()),
+            content: "ok".into(),
+            is_error: false,
+        },
+        neosh_proto::ProviderEvent::BlockStart {
+            index: 1,
+            block: neosh_proto::BlockStartKind::ToolUse {
+                id: neosh_proto::ToolCallId("abandoned".into()),
+                name: "Bash".into(),
+            },
+        },
+        neosh_proto::ProviderEvent::ToolInputDelta { index: 1, partial_json: "{}".into() },
+        neosh_proto::ProviderEvent::BlockStop { index: 1 },
+        neosh_proto::ProviderEvent::MessageStop,
+    ]];
+    let (agent, mut rx) = agent_with_delegating_script(script);
+    let here = agent.sessions().current_id().clone();
+    let bridge = TestBridge::default();
+    agent.run_turn(&bridge, "go on then").await;
+
+    let events = drain(&mut rx);
+    let started: Vec<_> = events
+        .iter()
+        .filter_map(|e| match e {
+            AgentEvent::ToolStarted { call, .. } => Some(call.id.0.clone()),
+            _ => None,
+        })
+        .collect();
+    let finished: Vec<_> = events
+        .iter()
+        .filter_map(|e| match e {
+            AgentEvent::ToolFinished { call, result, .. } => {
+                Some((call.id.0.clone(), result.is_error))
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(started, vec!["answered".to_string(), "abandoned".to_string()]);
+    assert_eq!(
+        finished,
+        vec![("answered".to_string(), false), ("abandoned".to_string(), true)],
+        "every call that was announced came back, and the one nobody answered says it failed"
+    );
+
+    // And the conversation agrees, or switching away and back would draw the spinner again from
+    // messages that never got the result the event carried.
+    let store = agent.sessions();
+    let s = store.get(&here).expect("the conversation is still there");
+    let answered = s.messages.iter().flat_map(|m| &m.content).any(|b| {
+        matches!(b, neosh_proto::ContentBlock::ToolResult { tool_use_id, is_error, .. }
+            if tool_use_id.0 == "abandoned" && *is_error)
+    });
+    assert!(answered, "the unanswered call has a result in the transcript too");
 }
 
 #[tokio::test]
