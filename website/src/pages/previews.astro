@@ -1,0 +1,57 @@
+---
+/**
+ * Not a page anybody browses to: this is the sheet `scripts/gen-shots.mjs`
+ * photographs. Every plugin that describes its screen as `preview` data is
+ * drawn here at one fixed width, and the script screenshots each block into
+ * `public/plugins/<name>.png` — which is the picture its card wears.
+ */
+import TermPreview from "../components/TermPreview.astro";
+import "../styles/global.css";
+
+const modules = import.meta.glob<{ default: any }>("../data/plugins/*.json", { eager: true });
+const shots = Object.entries(modules)
+  .filter(([path]) => !path.includes("_template"))
+  .map(([, m]) => m.default)
+  .filter((p) => p.preview);
+---
+
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="robots" content="noindex" />
+    <title>plugin previews — render sheet</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500&display=swap"
+      rel="stylesheet"
+    />
+  </head>
+  <body>
+    {
+      shots.map((p) => (
+        <div class="shot" data-shot={p.name}>
+          <TermPreview {...p.preview} />
+        </div>
+      ))
+    }
+  </body>
+</html>
+
+<style>
+  body {
+    margin: 0;
+    padding: 24px;
+    background: #0a0a0c;
+    display: flex;
+    flex-direction: column;
+    gap: 24px;
+    align-items: flex-start;
+  }
+
+  .shot {
+    width: 470px;
+    overflow: hidden;
+  }
+</style>

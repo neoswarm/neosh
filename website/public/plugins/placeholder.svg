@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="470" height="170" viewBox="0 0 470 170">
+  <defs>
+    <pattern id="g" width="36" height="36" patternUnits="userSpaceOnUse">
+      <path d="M36 0H0v36" fill="none" stroke="rgba(255,255,255,0.045)"/>
+    </pattern>
+  </defs>
+  <rect width="470" height="170" fill="#0c0e11"/>
+  <rect width="470" height="170" fill="url(#g)"/>
+  <text x="26" y="94" font-family="ui-monospace,SFMono-Regular,Menlo,monospace" font-size="15" fill="#4b5263">› no screenshot yet</text>
+</svg>

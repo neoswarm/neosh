@@ -1,0 +1,188 @@
+---
+/**
+ * A plugin card's screenshot, drawn as rows of text rather than pixels — the
+ * same window chrome and the same default palette as the hero demo, small.
+ *
+ * The rows come from plugin JSON, which arrives by pull request — so this is
+ * data, never markup. Text is escaped by Astro, and a class is only applied
+ * if it names a highlight group listed here; anything else renders plain.
+ *
+ * A row is either an array of segments, or `{ c?, s, r? }` where `c` is a
+ * row-level group (cursor line, diff band), `s` the left-aligned segments and
+ * `r` segments flushed to the right edge — no space-counting required.
+ * A segment is a plain string, or `["group", "text"]`.
+ */
+export type Segment = string | [string, string];
+export type Row = Segment[] | { c?: string; s: Segment[]; r?: Segment[] };
+
+interface Props {
+  title?: string;
+  rows: Row[];
+}
+
+const SPAN = new Set([
+  "hd", "cmt", "faint", "sep", "acc", "key", "fav", "ok", "warn", "err",
+  "unread", "anthropic", "openai", "google", "orouter", "live-fg", "live-dim",
+  "spin", "prompt", "ph", "caret", "ubar", "k", "ty", "fn2", "co",
+  "gut", "gut-add", "gut-del", "sign-add", "sign-del",
+  "v-read", "v-run", "v-edit",
+]);
+const ROW = new Set(["cursor", "band-add", "band-del"]);
+
+const { title = "neosh", rows } = Astro.props;
+
+const norm = rows.map((r) => (Array.isArray(r) ? { c: undefined, s: r, r: undefined } : r));
+const spanCls = (c: string) => (SPAN.has(c) ? c : undefined);
+const seg = (s: Segment) => (Array.isArray(s) ? s : (["", s] as [string, string]));
+---
+
+<div class="tp" aria-hidden="true">
+  <div class="tp-cap">{title}</div>
+  <div class="tp-body">
+    {
+      /* the spans keep the template's whitespace (`white-space: pre`), so the
+         expressions sit flush against the tags — an indented newline here is a
+         second line inside every row, clipped by the row's fixed height */
+      norm.map((row) => (
+        <div class:list={["tp-row", row.c && ROW.has(row.c) ? row.c : undefined]}>
+          <span class="tp-l">{row.s.map((s) => {
+            const [c, t] = seg(s);
+            return c === "spin" ? (
+              <span class="spin" data-spin>{t || "⠋"}</span>
+            ) : c === "caret" ? (
+              <span class="caret" />
+            ) : (
+              <span class={spanCls(c)}>{t}</span>
+            );
+          })}</span>
+          {row.r && (
+            <span class="tp-r">{row.r.map((s) => {
+              const [c, t] = seg(s);
+              return <span class={spanCls(c)}>{t}</span>;
+            })}</span>
+          )}
+        </div>
+      ))
+    }
+  </div>
+</div>
+
+<style>
+  .tp {
+    /* the exact default palette from neosh-core/src/palette.rs */
+    --tfg: #c9ced6;
+    --tmuted: #8b94a3;
+    --tfaint: #4b5263;
+    --tactive: #38bdf8;
+    --tattn: #fcd34d;
+    --tdanger: #fca5a5;
+    --tsuccess: #6ee7b7;
+    --taccent: #a5b4fc;
+    --tfav: #f5a524;
+
+    font-family: var(--mono);
+    font-size: 11px;
+    line-height: 1.5;
+    background: #0c0e11;
+    border-bottom: 1px solid var(--line);
+    color: var(--tfg);
+    overflow: hidden;
+    user-select: none;
+    -webkit-user-select: none;
+  }
+
+  /* the label a modern code block wears, not a fake window: one dim line,
+     right-aligned, saying which surface this is and the key that opens it */
+  .tp-cap {
+    text-align: right;
+    padding: 8px 12px 2px;
+    font-size: 10.5px;
+    color: var(--tmuted);
+    opacity: 0.55;
+  }
+
+  .tp-body {
+    padding: 4px 10px 8px;
+    height: calc(8 * 1.5em + 12px);
+  }
+
+  .tp-row {
+    display: flex;
+    white-space: pre;
+    overflow: hidden;
+    height: 1.5em;
+  }
+  .tp-l { white-space: pre; }
+  .tp-r { margin-left: auto; white-space: pre; }
+
+  /* highlight groups — names and colours from the hero demo */
+  .tp .hd { color: #e9edf3; }
+  .tp .cmt { color: var(--tmuted); opacity: 0.62; }
+  .tp .faint { color: var(--tfaint); opacity: 0.62; }
+  .tp .sep { color: var(--tfaint); opacity: 0.62; }
+  .tp .acc { color: var(--taccent); }
+  .tp .key { color: var(--taccent); }
+  .tp .fav { color: var(--tfav); }
+  .tp .ok { color: var(--tsuccess); }
+  .tp .warn { color: var(--tattn); }
+  .tp .err { color: var(--tdanger); }
+  .tp .unread { color: var(--tattn); }
+  .tp .anthropic { color: #d97a57; }
+  .tp .openai { color: #74aa9c; }
+  .tp .google { color: #669df6; }
+  .tp .orouter { color: #8b8ba7; }
+  .tp .live-fg { color: var(--tactive); }
+  .tp .live-dim { color: var(--tactive); opacity: 0.55; }
+  .tp .spin { color: var(--tactive); display: inline-block; width: 1ch; }
+  .tp .ubar { color: var(--taccent); }
+  .tp .prompt { color: var(--taccent); }
+  .tp .ph { color: var(--tfaint); opacity: 0.7; }
+
+  .tp .v-read { color: var(--tactive); }
+  .tp .v-run { color: var(--tattn); }
+  .tp .v-edit { color: var(--tsuccess); }
+
+  .tp .k { color: #c68fe6; }
+  .tp .ty { color: #e5c07b; }
+  .tp .fn2 { color: #61afef; }
+  .tp .co { color: #38bdf8; }
+
+  /* diff bands: the row is the background, the code keeps its colours */
+  .tp-row.cursor { background: #2a303c; }
+  .tp-row.band-add { background: #142b1e; }
+  .tp-row.band-del { background: #381b1c; }
+  .tp .gut { color: var(--tmuted); }
+  .tp .gut-add { color: var(--tmuted); background: #1d3d2a; }
+  .tp .gut-del { color: var(--tmuted); background: #4c2426; }
+  .tp .sign-add { color: var(--tsuccess); }
+  .tp .sign-del { color: var(--tdanger); }
+
+  .tp .caret {
+    display: inline-block;
+    width: 1ch;
+    height: 1.15em;
+    vertical-align: text-bottom;
+    background: var(--tfg);
+    opacity: 0.85;
+    animation: tp-blink 1.1s steps(1) infinite;
+  }
+  @keyframes tp-blink {
+    50% { opacity: 0; }
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    .tp .caret { animation: none; }
+  }
+</style>
+
+<script>
+  // one shared clock for every preview's spinner — Astro runs this once per page
+  const reduced = matchMedia("(prefers-reduced-motion: reduce)").matches;
+  const BRAILLE = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+  if (!reduced) {
+    setInterval(() => {
+      const f = BRAILLE[Math.floor(Date.now() / 100) % 10];
+      document.querySelectorAll("[data-spin]").forEach((el) => (el.textContent = f));
+    }, 80);
+  }
+</script>
