@@ -1,0 +1,20 @@
+{
+  "name": "@neosh/titles",
+  "version": "0.1.0",
+  "description": "Names a conversation after what it turned out to be about.",
+  "license": "MIT",
+  "type": "module",
+  "keywords": [
+    "neosh",
+    "neosh-plugin"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/neoswarm/neosh.git",
+    "directory": "plugins/builtin/titles"
+  },
+  "files": [
+    "main.ts",
+    "plugin.toml"
+  ]
+}

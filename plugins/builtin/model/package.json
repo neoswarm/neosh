@@ -1,0 +1,20 @@
+{
+  "name": "@neosh/model",
+  "version": "0.1.0",
+  "description": "Model and reasoning-effort switchers, in the status line and behind a picker.",
+  "license": "MIT",
+  "type": "module",
+  "keywords": [
+    "neosh",
+    "neosh-plugin"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/neoswarm/neosh.git",
+    "directory": "plugins/builtin/model"
+  },
+  "files": [
+    "main.ts",
+    "plugin.toml"
+  ]
+}

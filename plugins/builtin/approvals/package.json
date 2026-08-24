@@ -1,0 +1,20 @@
+{
+  "name": "@neosh/approvals",
+  "version": "0.1.0",
+  "description": "Asks before the agent does something the policy says to ask about.",
+  "license": "MIT",
+  "type": "module",
+  "keywords": [
+    "neosh",
+    "neosh-plugin"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/neoswarm/neosh.git",
+    "directory": "plugins/builtin/approvals"
+  },
+  "files": [
+    "main.ts",
+    "plugin.toml"
+  ]
+}

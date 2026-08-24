@@ -1,0 +1,20 @@
+{
+  "name": "@neosh/questions",
+  "version": "0.1.0",
+  "description": "Draws the question an agent asks you, and sends back what you said.",
+  "license": "MIT",
+  "type": "module",
+  "keywords": [
+    "neosh",
+    "neosh-plugin"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/neoswarm/neosh.git",
+    "directory": "plugins/builtin/questions"
+  },
+  "files": [
+    "main.ts",
+    "plugin.toml"
+  ]
+}
