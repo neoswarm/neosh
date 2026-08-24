@@ -3,5 +3,135 @@
   "description": "Projects, conversations and worktrees in one column",
   "author": "neosh",
   "repo": "https://github.com/neoswarm/neosh/tree/main/plugins/builtin/sidebar",
-  "tags": ["builtin"]
+  "npm": "@neosh/sidebar",
+  "tags": [
+    "builtin"
+  ],
+  "image": "sidebar.png",
+  "preview": {
+    "title": "neosh · ^T",
+    "rows": [
+      {
+        "s": [
+          [
+            "hd",
+            " PROJECTS"
+          ]
+        ]
+      },
+      {
+        "s": [
+          [
+            "sep",
+            " ────────────────────────────────────────────────────────────────────"
+          ]
+        ]
+      },
+      {
+        "s": [
+          " ",
+          [
+            "fav",
+            "★ "
+          ],
+          [
+            "acc",
+            "▾ neosh"
+          ]
+        ],
+        "r": [
+          [
+            "cmt",
+            "6"
+          ]
+        ]
+      },
+      {
+        "s": [
+          "    ",
+          [
+            "acc",
+            "▾ ⎇ glad-sparrow"
+          ]
+        ],
+        "r": [
+          [
+            "cmt",
+            "2"
+          ]
+        ]
+      },
+      {
+        "c": "cursor",
+        "s": [
+          "      ",
+          [
+            "spin",
+            "⠋"
+          ],
+          " ",
+          [
+            "live-fg",
+            "make the flaky test…"
+          ]
+        ],
+        "r": [
+          [
+            "live-fg",
+            "12s"
+          ]
+        ]
+      },
+      {
+        "s": [
+          "      ",
+          [
+            "unread",
+            "● website copy pass"
+          ]
+        ],
+        "r": [
+          [
+            "unread",
+            "12h"
+          ]
+        ]
+      },
+      {
+        "s": [
+          "   ",
+          [
+            "cmt",
+            "▸ blog"
+          ]
+        ],
+        "r": [
+          [
+            "cmt",
+            "3"
+          ]
+        ]
+      },
+      {
+        "s": [
+          "   ",
+          [
+            "acc",
+            "+ Add project"
+          ],
+          "   ",
+          [
+            "cmt",
+            "┈ Archived"
+          ]
+        ],
+        "r": [
+          [
+            "cmt",
+            "23"
+          ]
+        ]
+      }
+    ]
+  }
 }

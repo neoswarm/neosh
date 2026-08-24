@@ -3,5 +3,85 @@
   "description": "Every command, one key away",
   "author": "neosh",
   "repo": "https://github.com/neoswarm/neosh/tree/main/plugins/builtin/palette",
-  "tags": ["builtin"]
+  "npm": "@neosh/palette",
+  "tags": [
+    "builtin"
+  ],
+  "image": "palette.png",
+  "preview": {
+    "title": "neosh · ^K",
+    "rows": [
+      {
+        "s": [
+          [
+            "prompt",
+            " › "
+          ],
+          "wor",
+          [
+            "caret",
+            ""
+          ]
+        ]
+      },
+      {
+        "s": [
+          [
+            "sep",
+            " ────────────────────────────────────────────────────────────────────"
+          ]
+        ]
+      },
+      {
+        "c": "cursor",
+        "s": [
+          " worktree: add"
+        ],
+        "r": [
+          [
+            "key",
+            "^N"
+          ]
+        ]
+      },
+      {
+        "s": [
+          " worktree: copy path"
+        ],
+        "r": [
+          [
+            "key",
+            "⌥Y"
+          ]
+        ]
+      },
+      {
+        "s": [
+          " worktree: remove"
+        ],
+        "r": [
+          [
+            "key",
+            "d"
+          ]
+        ]
+      },
+      {
+        "s": [
+          " workspace: stop"
+        ]
+      },
+      {
+        "s": []
+      },
+      {
+        "s": [
+          [
+            "cmt",
+            " 4 of 214 — every command, bound or not"
+          ]
+        ]
+      }
+    ]
+  }
 }

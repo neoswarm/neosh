@@ -3,5 +3,22 @@
   "description": "One short line about what it does",
   "author": "your-github-name",
   "repo": "https://github.com/you/your-plugin",
-  "tags": ["ui"]
+  "npm": "",
+  "tags": ["ui"],
+  "//": "either a screenshot in website/public/plugins/ …",
+  "image": "",
+  "//2": "… or preview data the site renders to a PNG — delete whichever you are not using",
+  "preview": {
+    "title": "neosh · your-plugin",
+    "rows": [
+      { "s": [["hd", " WHAT IT DRAWS"]] },
+      { "s": [["sep", " ────────────────────────────────────────────────────────────────────"]] },
+      { "c": "cursor", "s": [" the row the cursor is on"], "r": [["key", "↵"]] },
+      { "s": [" an ordinary row"], "r": [["cmt", "right-flushed"]] },
+      { "s": [" ", ["acc", "accent"], "  ", ["ok", "good"], "  ", ["warn", "attention"], "  ", ["err", "bad"]] },
+      { "s": [] },
+      { "s": [["prompt", " › "], "typed text", ["caret", ""]] },
+      { "s": [["cmt", " a comment-coloured hint row"]] }
+    ]
+  }
 }

@@ -1,0 +1,20 @@
+{
+  "name": "@neosh/palette",
+  "version": "0.1.0",
+  "description": "One key to everything: commands, conversations, and what they are bound to.",
+  "license": "MIT",
+  "type": "module",
+  "keywords": [
+    "neosh",
+    "neosh-plugin"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/neoswarm/neosh.git",
+    "directory": "plugins/builtin/palette"
+  },
+  "files": [
+    "main.ts",
+    "plugin.toml"
+  ]
+}

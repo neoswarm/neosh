@@ -3,5 +3,124 @@
   "description": "What the plan has left, live",
   "author": "neosh",
   "repo": "https://github.com/neoswarm/neosh/tree/main/plugins/builtin/usage",
-  "tags": ["builtin"]
+  "npm": "@neosh/usage",
+  "tags": [
+    "builtin"
+  ],
+  "image": "usage.png",
+  "preview": {
+    "title": "neosh · ^L",
+    "rows": [
+      {
+        "s": [
+          [
+            "hd",
+            " PLAN"
+          ]
+        ],
+        "r": [
+          [
+            "key",
+            "^L"
+          ]
+        ]
+      },
+      {
+        "s": [
+          [
+            "sep",
+            " ────────────────────────────────────────────────────────────────────"
+          ]
+        ]
+      },
+      {
+        "s": [
+          " ",
+          [
+            "anthropic",
+            "✳"
+          ],
+          " Claude   ",
+          [
+            "hd",
+            "██████░░░░"
+          ],
+          "  66%"
+        ],
+        "r": [
+          [
+            "cmt",
+            "resets 3h"
+          ]
+        ]
+      },
+      {
+        "s": [
+          " ",
+          [
+            "anthropic",
+            "✳"
+          ],
+          " week     ",
+          [
+            "hd",
+            "████░░░░░░"
+          ],
+          "  41%"
+        ],
+        "r": [
+          [
+            "cmt",
+            "5d"
+          ]
+        ]
+      },
+      {
+        "s": [
+          " ",
+          [
+            "openai",
+            "⬢"
+          ],
+          " Codex    ",
+          [
+            "hd",
+            "███░░░░░░░"
+          ],
+          "  31%"
+        ],
+        "r": [
+          [
+            "cmt",
+            "12d"
+          ]
+        ]
+      },
+      {
+        "s": []
+      },
+      {
+        "s": [
+          " ",
+          [
+            "ok",
+            "▁▂▄▃▆█▅▇"
+          ],
+          "  ",
+          [
+            "cmt",
+            "the last 30 days"
+          ]
+        ]
+      },
+      {
+        "s": [
+          [
+            "cmt",
+            " from the agents' own transcripts, not ours"
+          ]
+        ]
+      }
+    ]
+  }
 }

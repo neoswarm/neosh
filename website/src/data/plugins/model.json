@@ -3,5 +3,144 @@
   "description": "Pick a model mid turn",
   "author": "neosh",
   "repo": "https://github.com/neoswarm/neosh/tree/main/plugins/builtin/model",
-  "tags": ["builtin"]
+  "npm": "@neosh/model",
+  "tags": [
+    "builtin"
+  ],
+  "image": "model.png",
+  "preview": {
+    "title": "neosh · ^P",
+    "rows": [
+      {
+        "s": [
+          [
+            "prompt",
+            " › "
+          ],
+          [
+            "ph",
+            "Pick a model"
+          ]
+        ]
+      },
+      {
+        "s": [
+          [
+            "sep",
+            " ────────────────────────────────────────────────────────────────────"
+          ]
+        ]
+      },
+      {
+        "c": "cursor",
+        "s": [
+          " ",
+          [
+            "anthropic",
+            "✳"
+          ],
+          " claude-fable-5"
+        ],
+        "r": [
+          [
+            "cmt",
+            "1M"
+          ]
+        ]
+      },
+      {
+        "s": [
+          " ",
+          [
+            "anthropic",
+            "✳"
+          ],
+          " claude-opus-5"
+        ],
+        "r": [
+          [
+            "cmt",
+            "200k"
+          ]
+        ]
+      },
+      {
+        "s": [
+          " ",
+          [
+            "anthropic",
+            "✳"
+          ],
+          " claude-sonnet-5"
+        ],
+        "r": [
+          [
+            "cmt",
+            "200k"
+          ]
+        ]
+      },
+      {
+        "s": [
+          " ",
+          [
+            "openai",
+            "⬢"
+          ],
+          " gpt-5.2-codex"
+        ],
+        "r": [
+          [
+            "cmt",
+            "400k"
+          ]
+        ]
+      },
+      {
+        "s": [
+          " ",
+          [
+            "ok",
+            "▲"
+          ],
+          " qwen3-coder"
+        ],
+        "r": [
+          [
+            "cmt",
+            "local"
+          ]
+        ]
+      },
+      {
+        "s": [
+          " ",
+          [
+            "key",
+            "↵"
+          ],
+          [
+            "cmt",
+            " choose  "
+          ],
+          [
+            "key",
+            "^S"
+          ],
+          [
+            "cmt",
+            " sign in  "
+          ],
+          [
+            "key",
+            "^A"
+          ],
+          [
+            "cmt",
+            " add a model"
+          ]
+        ]
+      }
+    ]
+  }
 }

@@ -1,0 +1,20 @@
+{
+  "name": "@neosh/usage",
+  "version": "0.1.0",
+  "description": "How full the context window is, what the conversation has cost, and what the plan has left.",
+  "license": "MIT",
+  "type": "module",
+  "keywords": [
+    "neosh",
+    "neosh-plugin"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/neoswarm/neosh.git",
+    "directory": "plugins/builtin/usage"
+  },
+  "files": [
+    "main.ts",
+    "plugin.toml"
+  ]
+}

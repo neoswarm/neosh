@@ -3,5 +3,83 @@
   "description": "Slash commands in the composer",
   "author": "neosh",
   "repo": "https://github.com/neoswarm/neosh/tree/main/plugins/builtin/slash",
-  "tags": ["builtin"]
+  "npm": "@neosh/slash",
+  "tags": [
+    "builtin"
+  ],
+  "image": "slash.png",
+  "preview": {
+    "title": "neosh",
+    "rows": [
+      {
+        "s": []
+      },
+      {
+        "c": "cursor",
+        "s": [
+          " /compact"
+        ],
+        "r": [
+          [
+            "cmt",
+            "claude"
+          ]
+        ]
+      },
+      {
+        "s": [
+          " /commit"
+        ],
+        "r": [
+          [
+            "cmt",
+            "git"
+          ]
+        ]
+      },
+      {
+        "s": [
+          " /context"
+        ],
+        "r": [
+          [
+            "cmt",
+            "claude"
+          ]
+        ]
+      },
+      {
+        "s": [
+          [
+            "sep",
+            " ────────────────────────────────────────────────────────────────────"
+          ]
+        ]
+      },
+      {
+        "s": [
+          [
+            "prompt",
+            " › "
+          ],
+          "/c",
+          [
+            "caret",
+            ""
+          ]
+        ]
+      },
+      {
+        "s": []
+      },
+      {
+        "s": [
+          [
+            "cmt",
+            " the composer is still the field — ↵ sends what you typed"
+          ]
+        ]
+      }
+    ]
+  }
 }

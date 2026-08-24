@@ -3,5 +3,76 @@
   "description": "Permission prompts as cards",
   "author": "neosh",
   "repo": "https://github.com/neoswarm/neosh/tree/main/plugins/builtin/approvals",
-  "tags": ["builtin"]
+  "npm": "@neosh/approvals",
+  "tags": [
+    "builtin"
+  ],
+  "image": "approvals.png",
+  "preview": {
+    "title": "neosh · approvals",
+    "rows": [
+      {
+        "s": [
+          " Run this command?"
+        ]
+      },
+      {
+        "s": [
+          [
+            "cmt",
+            " └ "
+          ],
+          "git push --force-with-lease origin main"
+        ]
+      },
+      {
+        "s": []
+      },
+      {
+        "c": "cursor",
+        "s": [
+          " ",
+          [
+            "ok",
+            "Allow once"
+          ]
+        ]
+      },
+      {
+        "s": [
+          "   Allow git push, and stop asking"
+        ]
+      },
+      {
+        "s": [
+          "   ",
+          [
+            "err",
+            "Deny, and say why"
+          ]
+        ]
+      },
+      {
+        "s": []
+      },
+      {
+        "s": [
+          [
+            "cmt",
+            " irreversible asks, reversible never does"
+          ]
+        ],
+        "r": [
+          [
+            "key",
+            "esc"
+          ],
+          [
+            "cmt",
+            " deny"
+          ]
+        ]
+      }
+    ]
+  }
 }

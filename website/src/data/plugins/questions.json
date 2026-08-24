@@ -3,5 +3,95 @@
   "description": "The agent asks, you answer over the composer",
   "author": "neosh",
   "repo": "https://github.com/neoswarm/neosh/tree/main/plugins/builtin/questions",
-  "tags": ["builtin"]
+  "npm": "@neosh/questions",
+  "tags": [
+    "builtin"
+  ],
+  "image": "questions.png",
+  "preview": {
+    "title": "neosh · a question",
+    "rows": [
+      {
+        "s": [
+          " Which database should sessions live in?"
+        ]
+      },
+      {
+        "s": []
+      },
+      {
+        "c": "cursor",
+        "s": [
+          " ",
+          [
+            "acc",
+            "1"
+          ],
+          " SQLite — already vendored, zero setup"
+        ]
+      },
+      {
+        "s": [
+          " ",
+          [
+            "acc",
+            "2"
+          ],
+          " Postgres — shared, needs a server"
+        ]
+      },
+      {
+        "s": []
+      },
+      {
+        "s": [
+          [
+            "sep",
+            " ────────────────────────────────────────────────────────────────────"
+          ]
+        ]
+      },
+      {
+        "s": [
+          [
+            "prompt",
+            " › "
+          ],
+          [
+            "ph",
+            "typing is answering"
+          ]
+        ]
+      },
+      {
+        "s": [
+          " ",
+          [
+            "key",
+            "↵"
+          ],
+          [
+            "cmt",
+            " answer  "
+          ],
+          [
+            "key",
+            "⇧⇥"
+          ],
+          [
+            "cmt",
+            " previous  "
+          ],
+          [
+            "key",
+            "esc"
+          ],
+          [
+            "cmt",
+            " nobody answered"
+          ]
+        ]
+      }
+    ]
+  }
 }
