@@ -136,6 +136,13 @@ pub async fn stop(socket: &Path) -> anyhow::Result<bool> {
     // loses the last turn about one time in twenty.
     let mut lines = tokio::io::BufReader::new(read).lines();
     while lines.next_line().await?.is_some() {}
+    // And then until nothing answers on the socket at all. The far end closing is the host
+    // having finished; the listener going is the process having finished, and "stopped" is a
+    // promise about the second one — the next `neosh --serve` tests the socket, not the host.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while std::time::Instant::now() < deadline && UnixStream::connect(socket).await.is_ok() {
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
     Ok(true)
 }
 
