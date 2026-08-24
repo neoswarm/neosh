@@ -46,7 +46,11 @@ not worked.
 - **Nothing is reclaimed.** An archive is a place things accumulate. `RESTORE_LIMIT` still caps what
   is loaded at startup, and the rest sit on disk. A sweep — "delete archived things older than N" —
   is a thing someone will want and is not built, because deleting someone's history on a timer is
-  precisely the move this ADR exists to avoid.
+  precisely the move this ADR exists to avoid. *(Still true on the timer.
+  [0060](0060-an-archive-is-something-you-can-empty.md) builds the half that has a person in it:
+  one key that empties what the panel is showing, having asked, and a retention setting that only
+  ever counts and reports. It also stops `RESTORE_LIMIT` hiding conversations from the one panel
+  whose job is what has accumulated.)*
 - **`session.close` is unchanged and still means delete.** Archiving is a new verb beside it, not a
   redefinition of an old one, so a plugin that meant delete still gets delete.
 - **The archived section only appears when there is something in it**, and starts shut. An empty

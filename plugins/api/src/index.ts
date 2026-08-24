@@ -1085,6 +1085,10 @@ export interface SessionApi {
    * last one is an error, because there is always somewhere for the next thing you type.
    *
    * A turn running in it is cancelled: there is about to be nowhere to put its answer.
+   *
+   * A conversation this workspace never loaded — one past the restore cap, which {@link stored}
+   * is how you find — is deleted from disk just the same. One verb, whether the store is holding it
+   * or only the directory is.
    */
   close(session: SessionId): Promise<void>;
   /** Pass `null` to clear a title and go back to the first-message label. */
@@ -1097,6 +1101,23 @@ export interface SessionApi {
    * one — or to a fresh empty one if there is no other.
    */
   archive(session: SessionId, archived?: boolean): Promise<void>;
+  /**
+   * Every conversation *on disk*, loaded or not — newest first.
+   *
+   * {@link list} answers about the workspace's store, and the store is a window rather than the
+   * whole directory: a workspace restores the most recent few hundred conversations and leaves the
+   * rest as files. Those files are in no list, which is fine until something has to say what has
+   * accumulated or take it away — so an archive that only ever asked `list` would report a number
+   * that was not the number, and empty itself down to a directory that was still full.
+   *
+   * The rows are ordinary {@link SessionInfo}s, so one renderer draws both. Which of them this
+   * workspace is actually holding is the difference between the two calls, and a caller that cares
+   * asks both and compares ids.
+   *
+   * It reads and parses every file, so it is answered off the host loop and is not something to put
+   * on a redraw.
+   */
+  stored(): Promise<SessionInfo[]>;
   /** The conversation itself, for a transcript view that renders rather than replays. */
   messages(session?: SessionId): Promise<Message[]>;
   /**
@@ -2434,6 +2455,9 @@ function build(
       },
       async archive(session, archived) {
         await c({ call: "session_archive", session, archived: archived ?? true });
+      },
+      async stored() {
+        return expect(await c({ call: "sessions_stored" }), "sessions").sessions;
       },
       async messages(session) {
         const v = await c({ call: "session_messages", session: session ?? null });

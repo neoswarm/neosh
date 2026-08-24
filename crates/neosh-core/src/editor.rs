@@ -308,6 +308,7 @@ impl Editor {
                 | ApiCall::ProviderSetCredential { .. }
                 | ApiCall::ProviderForgetCredential { .. }
                 | ApiCall::SessionMessages { .. }
+                | ApiCall::SessionsStored
                 | ApiCall::StatusSet { .. }
                 | ApiCall::StatusClear { .. }
                 | ApiCall::HintSet { .. }

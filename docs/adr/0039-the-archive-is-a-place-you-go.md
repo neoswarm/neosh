@@ -1,6 +1,8 @@
 # 0039 — The archive is a place you go, and the question is worth asking
 
-**Status:** accepted
+**Status:** accepted — extended by [0060](0060-an-archive-is-something-you-can-empty.md), which
+makes the place a panel rather than a picker, gives it marks and a verb that empties it, and lets it
+see the conversations the restore cap had been hiding from it.
 
 Supersedes the last section of [0023](0023-archive-not-delete.md), which put the archive at the foot
 of the sidebar and made the delete dialog conditional.

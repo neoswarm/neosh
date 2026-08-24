@@ -277,6 +277,7 @@ export type ApiCall =
   | { "call": "session_rename"; session: SessionId; title?: string | null }
   | { "call": "session_archive"; session: SessionId; archived: boolean }
   | { "call": "session_messages"; session?: SessionId | null }
+  | { "call": "sessions_stored" }
   | { "call": "tool_register"; def: ToolDef }
   | { "call": "tool_unregister"; name: string }
   | { "call": "tool_list" }
