@@ -214,6 +214,45 @@ two-word scratch name it was created with.",
   await neosh.keymap.set("chat", "<C-g>", "git.status", { desc: "Git status" });
   await neosh.keymap.set("chat", "<C-d>", "git.diff", { desc: "Show what changed" });
 
+  // What changed, on the project's own row. A decoration rather than a section of our own: the
+  // row already exists, the sidebar already knows how to draw a mark on it, and the whole point of
+  // the point is that this plugin never imports the panel. Keyed by the project's directory, and
+  // withdrawn when the tree is clean — a `0` on every row is a column of noise.
+  const decorate = async () => {
+    const projects = await neosh.vars
+      .get<unknown>({ scope: "global" }, "sidebar.projects")
+      .catch(() => null);
+    const cwds = Array.isArray(projects)
+      ? projects.filter((p): p is string => typeof p === "string")
+      : [];
+    for (const cwd of cwds) {
+      const status = await neosh.git.status({ cwd }).catch(() => null);
+      const dirty = status?.changes.length ?? 0;
+      if (dirty === 0) {
+        await neosh.ext.remove("sidebar.decoration", `dirty:${cwd}`).catch(() => {});
+        continue;
+      }
+      await neosh.ext.contribute("sidebar.decoration", `dirty:${cwd}`, {
+        target: { project: cwd },
+        badge: { text: `${dirty === 1 ? "●" : `●${dirty}`}`, hl: "Git.Modified" },
+      }).catch(() => {});
+    }
+  };
+  // Listeners before the first read: the sidebar writes `sidebar.projects` from its first draw,
+  // which can land while this plugin is still awaiting its own `git status`, and a change that
+  // arrives before the listener exists is a change nobody hears.
+  subscriptions.push(neosh.agent.onTurnEnd(() => void decorate()));
+  subscriptions.push(neosh.session.onChange(() => void decorate()));
+  subscriptions.push(
+    neosh.vars.onChange((e) => {
+      if (e.scope.scope === "global" && e.key === "sidebar.projects") void decorate();
+    }),
+  );
+  // And once the workspace is up: the project list is somebody else's, so it is read when they
+  // have had their say rather than when we have had ours. See ADR 0055.
+  neosh.event.on("neosh.ready", () => void decorate());
+  await decorate();
+
   // Which branch you are on belongs beside the model: both answer "where is what I type going".
   const footer = async () => {
     const status = await neosh.git.status().catch(() => null);

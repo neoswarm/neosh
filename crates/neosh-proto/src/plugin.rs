@@ -47,6 +47,11 @@ pub enum PluginOutbound {
 pub enum PluginResponse {
     Tool { result: ToolResult },
     Hook { outcome: HookOutcome },
+    /// What a command handler returned, answering a [`PluginRequest::Command`].
+    Command {
+        #[ts(type = "unknown")]
+        value: serde_json::Value,
+    },
     /// The plugin accepted a provider stream and will push
     /// [`ApiCall::ProviderEmit`](crate::api::ApiCall::ProviderEmit) until `MessageStop`.
     ProviderAccepted,
@@ -80,6 +85,13 @@ pub enum PluginRequest {
     /// Ask a hook. Only sent for hooks registered as blocking; observers get
     /// [`PluginEvent::HookObserved`] instead and cannot influence the outcome.
     Hook { hook: HookName, payload: HookPayload },
+    /// Run a command this plugin registered and answer with what it returned. The request form of
+    /// [`PluginEvent::CommandInvoked`], sent for [`ApiCall::CmdCall`] rather than a key press.
+    Command {
+        name: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        args: Vec<String>,
+    },
     /// Drive a provider this plugin registered. The plugin answers
     /// [`PluginResponse::ProviderAccepted`] immediately and then pushes events tagged with
     /// `stream`, because a stream cannot be returned across the RPC boundary.
@@ -232,6 +244,14 @@ pub enum PluginEvent {
         #[ts(type = "unknown")]
         value: Option<serde_json::Value>,
     },
+    /// Highlight groups were defined, reset, or replaced by a theme switch.
+    ///
+    /// Broadcast, because the plugin that cached a colour — a panel that computed a blend, a
+    /// status segment that read `Normal` — is never the one that changed it. `names` is every
+    /// group that moved; a theme switch lists them all.
+    HighlightChanged {
+        names: Vec<String>,
+    },
     /// Somebody added to or withdrew from a contribution point.
     ///
     /// The signal a panel redraws on. Without it, a plugin that loads after the sidebar has drawn
@@ -333,6 +353,73 @@ pub struct PluginManifest {
     pub api_version: u32,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub permissions: Vec<PluginPermission>,
+    /// Plugins this one cannot run without.
+    ///
+    /// Each is loaded and activated first, `import ... from "plugin:<name>"` resolves to its entry
+    /// module, and a name nothing provides is an error with the name in it rather than an
+    /// `undefined` three calls later. A cycle is reported and neither side loads. Load order used
+    /// to be a filesystem sort that the code leaned on; this is the same order, said out loud.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub requires: Vec<String>,
+    /// Plugins to load after if they are present, without needing them.
+    ///
+    /// For "my section goes under theirs" and "my default key should lose to theirs": a soft
+    /// ordering, satisfied by an absent plugin, that does not make the other plugin a dependency.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub after: Vec<String>,
+    /// What this plugin offers for others to build on — the contribution points it reads, the
+    /// buffer kinds it publishes, the shared vars it writes. Declared so they can be listed, and
+    /// so a contribution to a point nobody reads can be reported instead of silently ignored.
+    #[serde(default, skip_serializing_if = "PluginProvides::is_empty")]
+    pub provides: PluginProvides,
+    /// When to load, for a plugin that need not be there from the start.
+    ///
+    /// Absent means at startup, as every plugin always has. Present, the plugin is held until one
+    /// of its triggers fires: one of `on_command` is run (the name is registered on its behalf
+    /// and the press replayed once it is up), one of `on_event` is emitted, or a buffer of one of
+    /// `on_kind` appears. lazy.nvim's `cmd`/`event`/`ft`. A plugin something eager `requires` is
+    /// loaded eagerly whatever this says.
+    #[serde(default, skip_serializing_if = "PluginActivation::is_empty")]
+    pub activation: PluginActivation,
+}
+
+/// The triggers that wake a lazily loaded plugin. See [`PluginManifest::activation`].
+#[derive(TS, Serialize, Deserialize, Clone, PartialEq, Eq, Debug, Default)]
+#[ts(export)]
+pub struct PluginActivation {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub on_command: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub on_event: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub on_kind: Vec<String>,
+}
+
+impl PluginActivation {
+    pub fn is_empty(&self) -> bool {
+        self.on_command.is_empty() && self.on_event.is_empty() && self.on_kind.is_empty()
+    }
+}
+
+/// The names a plugin publishes for other plugins to use. See [`PluginManifest::provides`].
+#[derive(TS, Serialize, Deserialize, Clone, PartialEq, Eq, Debug, Default)]
+#[ts(export)]
+pub struct PluginProvides {
+    /// Contribution points this plugin reads (`sidebar.section`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub points: Vec<String>,
+    /// Buffer kinds it creates (`neosh.sidebar`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub kinds: Vec<String>,
+    /// Shared vars it writes (`sidebar.favorite`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub vars: Vec<String>,
+}
+
+impl PluginProvides {
+    pub fn is_empty(&self) -> bool {
+        self.points.is_empty() && self.kinds.is_empty() && self.vars.is_empty()
+    }
 }
 
 fn default_api_version() -> u32 {

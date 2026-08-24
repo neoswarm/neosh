@@ -40,6 +40,8 @@ export type UiEvent =
   | { "type": "cursor_shape_changed"; win: WindowId; shape: CursorShape }
   | { "type": "scroll_to"; win: WindowId; top_line: number | null }
   | { "type": "highlight_defined"; name: string; def: HighlightDef }
+  | { "type": "highlight_cleared"; name: string }
+  | { "type": "window_highlights"; win: WindowId; map: Record<string, string> }
   | { "type": "surface_claimed"; surface: SurfaceId; win: WindowId; rect: Rect }
   | { "type": "surface_cells"; surface: SurfaceId; cells: Array<SurfaceCell> }
   | { "type": "surface_released"; surface: SurfaceId }

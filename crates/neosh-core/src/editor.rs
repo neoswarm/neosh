@@ -12,17 +12,19 @@
 
 use std::collections::{HashMap, HashSet};
 
+use std::collections::BTreeMap;
+
 use neosh_proto::{
     ApiCall, ApiError, ApiOk, ApiResult, BufferId, Contribution, ExtmarkId, ExtmarkOpts,
-    FloatConfig, KeyContext, KeyPress, KeymapEntry, KeymapScope, MessageLevel, Mode, NamespaceId,
-    NoticeKind, OnDelete, OptionValue, PluginId, Rect, SelectShape, SurfaceId, TextEdit, UiEvent,
-    VirtTextPos, WindowId, WindowLayout,
+    FloatConfig, HlTarget, KeyContext, KeyPress, KeymapEntry, KeymapScope, MessageLevel, Mode,
+    NamespaceId, NoticeKind, OnDelete, OptionValue, PluginId, Rect, SelectShape, SurfaceId,
+    TextEdit, UiEvent, VirtTextPos, WindowId, WindowLayout,
 };
 
 use crate::buffer::{Buffer, LineEdit};
 use crate::focus::FocusStack;
-use crate::highlight::HighlightRegistry;
-use crate::keymap::{Binding, KeyResolution, KeymapTable, format_keys};
+use crate::highlight::{HighlightRegistry, Restored};
+use crate::keymap::{Binding, KeyResolution, KeymapTable, Tier, format_keys};
 use crate::options::OptionRegistry;
 use crate::text;
 use crate::window::{Viewport, Window};
@@ -52,6 +54,11 @@ pub enum CoreEffect {
     /// A contribution point gained or lost an item. Broadcast by the host so whoever renders the
     /// point redraws, including for a plugin that loaded long after the panel first drew.
     ContributionsChanged { point: String },
+    /// Highlight groups changed — defined, reset, or replaced by a theme. Broadcast so a plugin
+    /// that cached a colour reads it again.
+    HighlightsChanged { names: Vec<String> },
+    /// A buffer of this kind now exists. What wakes a plugin whose manifest says `on_kind`.
+    KindSeen { kind: String },
 }
 
 #[derive(Debug, Clone)]
@@ -85,10 +92,18 @@ pub struct Editor {
     /// contribution the sidebar still renders after its author was unloaded is a row that invokes a
     /// command which no longer exists.
     contributions: HashMap<String, Vec<Contribution>>,
-    /// Plugins that ship with neosh. Their keymaps are *defaults*, and a default that overwrites a
-    /// choice is not a default — `init.ts` runs before plugin discovery, so without this every
-    /// bundled plugin would silently take a key the user's configuration had just bound.
-    bundled: HashSet<String>,
+    /// Group-name remaps per window and per buffer kind — Neovim's `winhighlight` — with who set
+    /// each, so they go when the plugin does. See [`ApiCall::WinSetHighlights`].
+    win_hl: HashMap<WindowId, (String, BTreeMap<String, String>)>,
+    kind_hl: HashMap<String, (String, BTreeMap<String, String>)>,
+    /// Who outranks whom. A bundled plugin's registrations are *defaults*, `init.ts`'s are the
+    /// last word, and a default that overwrites a choice is not a default — `init.ts` runs before
+    /// plugin discovery — so without this every plugin would silently take a key the user's
+    /// configuration had just bound. One rule for keys, commands and highlights; see [`Tier`].
+    tiers: HashMap<String, Tier>,
+    /// Commands a higher tier has taken the name of, so that unregistering the winner gives the
+    /// name back rather than leaving it unbound. See [`ApiCall::CmdRegister`].
+    shadowed: HashMap<String, Vec<CommandReg>>,
     /// Where the selection highlight is drawn.
     ///
     /// Reserved at construction rather than exposed, so a selection is an ordinary extmark from the
@@ -100,6 +115,8 @@ pub struct Editor {
     mode: Mode,
     /// Keys held while a multi-key sequence is still ambiguous.
     pending_keys: Vec<KeyPress>,
+    /// The window that has the keys when nothing has pushed focus. See [`Self::set_home`].
+    home: Option<WindowId>,
 
     ui: Vec<UiEvent>,
     effects: Vec<CoreEffect>,
@@ -133,7 +150,38 @@ impl Editor {
 
     /// Say that a plugin ships with neosh, so its keymaps behave as defaults.
     pub fn mark_bundled(&mut self, plugin: &PluginId) {
-        self.bundled.insert(plugin.0.clone());
+        self.tiers.insert(plugin.0.clone(), Tier::Builtin);
+    }
+
+    /// Say that a plugin is the user's own configuration, so its choices outrank every plugin's.
+    pub fn mark_user(&mut self, plugin: &PluginId) {
+        self.tiers.insert(plugin.0.clone(), Tier::User);
+    }
+
+    pub fn tier(&self, plugin: &str) -> Tier {
+        self.tiers.get(plugin).copied().unwrap_or_default()
+    }
+
+    /// Every point anything has contributed to, with who contributed. Sorted, for a listing.
+    pub fn contributors(&self) -> Vec<(String, Vec<String>)> {
+        let mut out: Vec<(String, Vec<String>)> = self
+            .contributions
+            .iter()
+            .filter(|(_, list)| !list.is_empty())
+            .map(|(point, list)| {
+                let mut who: Vec<String> = list.iter().map(|c| c.plugin.clone()).collect();
+                who.sort();
+                who.dedup();
+                (point.clone(), who)
+            })
+            .collect();
+        out.sort();
+        out
+    }
+
+    /// Which plugin registered a command, if anything has.
+    pub fn command_owner(&self, name: &str) -> Option<PluginId> {
+        self.commands.get(name).map(|r| r.plugin.clone())
     }
 
     /// Whether this call is UI-domain and belongs to the core.
@@ -170,7 +218,7 @@ impl Editor {
                 | ApiCall::RtpAdd { .. }
                 | ApiCall::RtpList
                 | ApiCall::PathComplete { .. }
-                | ApiCall::GitStatus
+                | ApiCall::GitStatus { .. }
                 | ApiCall::GitBranches { .. }
                 | ApiCall::GitWorktrees { .. }
                 | ApiCall::GitLog { .. }
@@ -213,6 +261,13 @@ impl Editor {
                 | ApiCall::VarAll { .. }
                 // Emitting is a broadcast to every plugin, and the bridge is what holds them.
                 | ApiCall::EventEmit { .. }
+                // A call that waits for a plugin's answer: the core knows who owns the name
+                // (`command_owner`), the host is what can ask and wait.
+                | ApiCall::CmdCall { .. }
+                // Who *reads* a point is in the manifests, which the host holds; the core only
+                // knows who wrote to one (`contributors`).
+                | ApiCall::ExtPoints
+                | ApiCall::PluginList
                 // The swarm is sockets and other machines. None of it is UI state.
                 | ApiCall::SwarmSelf
                 | ApiCall::SwarmNodes
@@ -266,7 +321,77 @@ impl Editor {
             return false;
         }
         self.republish_highlights();
+        self.announce_all_highlights();
         true
+    }
+
+    /// Use a theme somebody contributed. See [`HighlightRegistry::set_custom`].
+    pub fn set_custom_theme(
+        &mut self,
+        name: &str,
+        base: crate::palette::Variant,
+        groups: Vec<(String, neosh_proto::HighlightDef)>,
+    ) -> bool {
+        let before: Vec<String> = self.highlights.iter().map(|(n, _)| n.clone()).collect();
+        if !self.highlights.set_custom(name, base, groups) {
+            return false;
+        }
+        // Groups the previous theme had and this one does not are cleared on the frontend too,
+        // or a link into one of them keeps resolving to a colour the theme no longer has.
+        for name in before {
+            if self.highlights.get(&name).is_none() {
+                self.push_ui(UiEvent::HighlightCleared { name });
+            }
+        }
+        self.republish_highlights();
+        self.announce_all_highlights();
+        true
+    }
+
+    /// The contributed theme in use, if any.
+    pub fn custom_theme(&self) -> Option<&str> {
+        self.highlights.custom()
+    }
+
+    fn announce_all_highlights(&mut self) {
+        let mut names: Vec<String> = self.highlights.iter().map(|(n, _)| n.clone()).collect();
+        names.sort();
+        self.effects.push(CoreEffect::HighlightsChanged { names });
+    }
+
+    /// Everything a window's groups are read through: its kind's remap under its own.
+    fn window_highlights(&self, win: WindowId) -> BTreeMap<String, String> {
+        let Some(w) = self.windows.get(&win) else { return BTreeMap::new() };
+        let mut map = self
+            .buffers
+            .get(&w.buf)
+            .and_then(|b| b.kind.as_deref())
+            .and_then(|k| self.kind_hl.get(k))
+            .map(|(_, m)| m.clone())
+            .unwrap_or_default();
+        if let Some((_, own)) = self.win_hl.get(&win) {
+            map.extend(own.iter().map(|(k, v)| (k.clone(), v.clone())));
+        }
+        map
+    }
+
+    /// Say again how a window reads its groups. Called whenever what feeds into it moved: the
+    /// remap itself, the window's buffer, or that buffer's kind.
+    fn republish_window_highlights(&mut self, win: WindowId) {
+        if !self.windows.contains_key(&win) {
+            return;
+        }
+        let map = self.window_highlights(win);
+        self.push_ui(UiEvent::WindowHighlights { win, map });
+    }
+
+    /// Every window showing `buf`, for when the buffer's kind changes under them.
+    fn republish_highlights_of_buffer(&mut self, buf: BufferId) {
+        let wins: Vec<WindowId> =
+            self.windows.values().filter(|w| w.buf == buf).map(|w| w.id).collect();
+        for win in wins {
+            self.republish_window_highlights(win);
+        }
     }
 
     /// Turn motion on or off. Returns whether anything changed.
@@ -275,6 +400,7 @@ impl Editor {
             return false;
         }
         self.republish_highlights();
+        self.announce_all_highlights();
         true
     }
 
@@ -327,6 +453,10 @@ impl Editor {
             self.push_ui(UiEvent::CursorMoved { win, row: cursor.0, col: cursor.1 });
             self.push_ui(UiEvent::ScrollTo { win, top_line: top });
             self.push_ui(UiEvent::CursorShapeChanged { win, shape });
+            let map = self.window_highlights(win);
+            if !map.is_empty() {
+                self.push_ui(UiEvent::WindowHighlights { win, map });
+            }
         }
 
         let mut surfaces: Vec<SurfaceId> = self.surfaces.keys().copied().collect();
@@ -427,6 +557,16 @@ impl Editor {
         self.focus.current()
     }
 
+    /// Say which window has the keys when nothing holds focus — the composer.
+    ///
+    /// The focus stack is for panels and floats that *take* the keyboard; at rest, nothing is on
+    /// it and the keys go to the field you type in. That field is a buffer with a kind, and a
+    /// key bound against `neosh.composer` has to resolve at rest, which means resolution needs a
+    /// window to read the kind off. Window- and buffer-scoped bindings on it resolve too.
+    pub fn set_home(&mut self, win: Option<WindowId>) {
+        self.home = win;
+    }
+
     pub fn options(&self) -> &OptionRegistry {
         &self.options
     }
@@ -444,11 +584,31 @@ impl Editor {
         id
     }
 
+    /// A host-owned buffer with a published kind.
+    ///
+    /// The transcript, the composer and the status line are the three surfaces a plugin most
+    /// wants to put a key on or find, and they had no kind — so the host's own UI was the one
+    /// part of the workspace ADR 0040's promise did not reach. `neosh.transcript`,
+    /// `neosh.composer`, `neosh.status`: bind at `buf_kind` scope, find with `win.ofKind`,
+    /// remap with `win.setHighlights`, like any panel.
+    pub fn create_buffer_of_kind(&mut self, name: &str, kind: &str) -> BufferId {
+        let id = self.create_buffer(name);
+        if let Some(b) = self.buffers.get_mut(&id) {
+            b.kind = Some(kind.to_string());
+        }
+        id
+    }
+
     pub fn open_window(&mut self, buf: BufferId, layout: WindowLayout) -> WindowId {
         let id = WindowId(self.next_win);
         self.next_win += 1;
         self.windows.insert(id, Window::new(id, buf, layout.clone()));
         self.push_ui(UiEvent::WindowOpened { win: id, buf, layout });
+        // A remap on the buffer's kind applies to this window from its first frame.
+        let map = self.window_highlights(id);
+        if !map.is_empty() {
+            self.push_ui(UiEvent::WindowHighlights { win: id, map });
+        }
         id
     }
 
@@ -473,7 +633,10 @@ impl Editor {
     /// workspace, or a panel could never take a key back from a global default.
     fn active_scopes(&self) -> Vec<KeymapScope> {
         let mut scopes = Vec::new();
-        if let Some(win) = self.focus.current() {
+        // Nothing holding focus means the home window — the composer — has the keys, and a
+        // binding on *its* kind has to resolve there or `neosh.composer` is a kind nothing can
+        // bind against.
+        if let Some(win) = self.focus.current().or(self.home) {
             scopes.push(KeymapScope::Window { win });
             if let Some(w) = self.windows.get(&win) {
                 scopes.push(KeymapScope::Buffer { buf: w.buf });
@@ -658,6 +821,16 @@ impl Editor {
             .collect();
         self.captures.retain(|_, cmd| !gone.contains(cmd));
         self.commands.retain(|_, r| &r.plugin != plugin);
+        // Names it had taken go back to whoever it took them from; its own waiting registrations
+        // go away.
+        for name in gone {
+            if let Some(back) = self.shadowed.get_mut(&name).and_then(|v| v.pop()) {
+                self.commands.insert(name, back);
+            }
+        }
+        for list in self.shadowed.values_mut() {
+            list.retain(|r| &r.plugin != plugin);
+        }
         self.keymaps.remove_owner(&plugin.0);
         self.options.remove_owner(&plugin.0);
         // Its rows go with it. A contribution outliving its author is a row in somebody's panel
@@ -677,6 +850,48 @@ impl Editor {
         for set in self.attached.values_mut() {
             set.remove(plugin);
         }
+        // Its colours. A group a disabled plugin defined used to outlive it for the session —
+        // and an override deleted from `init.ts` survived `^R` — because nothing here knew whose
+        // it was.
+        let restored = self.highlights.remove_owner(&plugin.0);
+        if !restored.is_empty() {
+            let names = restored.iter().map(|(n, _)| n.clone()).collect();
+            for (name, what) in restored {
+                match what {
+                    Restored::Theme(def) => self.push_ui(UiEvent::HighlightDefined { name, def }),
+                    Restored::Cleared => self.push_ui(UiEvent::HighlightCleared { name }),
+                }
+            }
+            self.effects.push(CoreEffect::HighlightsChanged { names });
+        }
+        let wins: Vec<WindowId> = self
+            .win_hl
+            .iter()
+            .filter(|(_, (o, _))| o == &plugin.0)
+            .map(|(w, _)| *w)
+            .collect();
+        let kinds: Vec<String> = self
+            .kind_hl
+            .iter()
+            .filter(|(_, (o, _))| o == &plugin.0)
+            .map(|(k, _)| k.clone())
+            .collect();
+        if !wins.is_empty() || !kinds.is_empty() {
+            self.win_hl.retain(|_, (o, _)| o != &plugin.0);
+            self.kind_hl.retain(|_, (o, _)| o != &plugin.0);
+            let mut affected: Vec<WindowId> = wins;
+            for w in self.windows.values() {
+                let kind = self.buffers.get(&w.buf).and_then(|b| b.kind.as_deref());
+                if kind.is_some_and(|k| kinds.iter().any(|x| x == k)) {
+                    affected.push(w.id);
+                }
+            }
+            affected.sort_by_key(|w| w.0);
+            affected.dedup();
+            for win in affected {
+                self.republish_window_highlights(win);
+            }
+        }
     }
 
     // ---- the dispatcher --------------------------------------------------
@@ -687,13 +902,20 @@ impl Editor {
             ApiCall::BufCreate { name, kind, .. } => {
                 let name = name.unwrap_or_else(|| format!("[scratch {}]", self.next_buf));
                 let buf = self.create_buffer(&name);
-                if kind.is_some() {
-                    self.buf_mut(buf)?.kind = kind;
+                if let Some(kind) = kind {
+                    self.buf_mut(buf)?.kind = Some(kind.clone());
+                    self.effects.push(CoreEffect::KindSeen { kind });
                 }
                 Ok(ApiOk::Buf { buf })
             }
             ApiCall::BufSetKind { buf, kind } => {
-                self.buf_mut(buf)?.kind = kind;
+                self.buf_mut(buf)?.kind = kind.clone();
+                if let Some(kind) = kind {
+                    self.effects.push(CoreEffect::KindSeen { kind });
+                }
+                // A kind remap follows the kind: windows on this buffer read their groups
+                // differently from here on.
+                self.republish_highlights_of_buffer(buf);
                 Ok(ApiOk::Unit)
             }
             ApiCall::BufGetKind { buf } => {
@@ -818,6 +1040,7 @@ impl Editor {
                 // Same for the keys a widget claimed while it was up. They are never resolved once
                 // the window cannot be focused, but they would still be listed forever.
                 self.keymaps.remove_window(win);
+                self.win_hl.remove(&win);
                 self.push_ui(UiEvent::WindowClosed { win });
                 let now = self.focus.current();
                 self.push_ui(UiEvent::FocusChanged { win: now });
@@ -827,6 +1050,7 @@ impl Editor {
                 self.buf(buf)?;
                 self.win_mut(win)?.buf = buf;
                 self.push_ui(UiEvent::WindowBuffer { win, buf });
+                self.republish_window_highlights(win);
                 Ok(ApiOk::Unit)
             }
             ApiCall::WinGetCursor { win } => {
@@ -999,9 +1223,108 @@ impl Editor {
             }
 
             // ---- highlights -------------------------------------------
-            ApiCall::HlDefine { name, def } => {
-                self.highlights.define(name.clone(), def.clone());
-                self.push_ui(UiEvent::HighlightDefined { name, def });
+            ApiCall::HlDefine { name, def, default } => {
+                // The same rule as a key: a plugin's colour does not overwrite the user's, and a
+                // bundled plugin's does not overwrite a plugin's. Silently, like a default key
+                // that finds its key taken, because the ordinary case is exactly that.
+                if let Some(owner) = self.highlights.owner(&name)
+                    && owner != plugin.0
+                    && self.tier(owner) > self.tier(&plugin.0)
+                {
+                    tracing::debug!(%plugin, name, owner, "highlight owned by a higher tier; kept");
+                    return Ok(ApiOk::Unit);
+                }
+                if self.highlights.define(name.clone(), def.clone(), &plugin.0, default) {
+                    self.push_ui(UiEvent::HighlightDefined { name: name.clone(), def });
+                    self.effects.push(CoreEffect::HighlightsChanged { names: vec![name] });
+                }
+                Ok(ApiOk::Unit)
+            }
+            ApiCall::HlGet { name } => Ok(ApiOk::Highlight {
+                def: self.highlights.get(&name).cloned(),
+                resolved: self.highlights.resolve(&name),
+            }),
+            ApiCall::HlList => {
+                let mut groups: Vec<neosh_proto::HighlightEntry> = self
+                    .highlights
+                    .iter()
+                    .map(|(name, def)| neosh_proto::HighlightEntry {
+                        name: name.clone(),
+                        def: def.clone(),
+                        owner: self.highlights.owner(name).map(str::to_string),
+                    })
+                    .collect();
+                groups.sort_by(|a, b| a.name.cmp(&b.name));
+                Ok(ApiOk::Highlights { groups })
+            }
+            ApiCall::HlReset { name } => {
+                // Your own, or nothing: resetting a group another plugin owns would be the one
+                // way left to take a colour off somebody without being able to be listed doing it.
+                if self.highlights.owner(&name).is_some_and(|o| o != plugin.0) {
+                    return Err(ApiError::InvalidArgument {
+                        message: format!(
+                            "highlight {name:?} is defined by {}",
+                            self.highlights.owner(&name).unwrap_or_default()
+                        ),
+                    });
+                }
+                match self.highlights.reset(&name) {
+                    Some(Restored::Theme(def)) => {
+                        self.push_ui(UiEvent::HighlightDefined { name: name.clone(), def });
+                    }
+                    Some(Restored::Cleared) => {
+                        self.push_ui(UiEvent::HighlightCleared { name: name.clone() });
+                    }
+                    None => return Ok(ApiOk::Unit),
+                }
+                self.effects.push(CoreEffect::HighlightsChanged { names: vec![name] });
+                Ok(ApiOk::Unit)
+            }
+            ApiCall::WinSetHighlights { target, map } => {
+                match target {
+                    HlTarget::Window { win } => {
+                        self.win(win)?;
+                        if let Some((owner, _)) = self.win_hl.get(&win)
+                            && owner != &plugin.0
+                        {
+                            return Err(ApiError::InvalidArgument {
+                                message: format!("window {win}'s highlights are set by {owner}"),
+                            });
+                        }
+                        if map.is_empty() {
+                            self.win_hl.remove(&win);
+                        } else {
+                            self.win_hl.insert(win, (plugin.0.clone(), map));
+                        }
+                        self.republish_window_highlights(win);
+                    }
+                    HlTarget::Kind { name } => {
+                        if let Some((owner, _)) = self.kind_hl.get(&name)
+                            && owner != &plugin.0
+                        {
+                            return Err(ApiError::InvalidArgument {
+                                message: format!("highlights for kind {name:?} are set by {owner}"),
+                            });
+                        }
+                        if map.is_empty() {
+                            self.kind_hl.remove(&name);
+                        } else {
+                            self.kind_hl.insert(name.clone(), (plugin.0.clone(), map));
+                        }
+                        let wins: Vec<WindowId> = self
+                            .windows
+                            .values()
+                            .filter(|w| {
+                                self.buffers.get(&w.buf).and_then(|b| b.kind.as_deref())
+                                    == Some(name.as_str())
+                            })
+                            .map(|w| w.id)
+                            .collect();
+                        for win in wins {
+                            self.republish_window_highlights(win);
+                        }
+                    }
+                }
                 Ok(ApiOk::Unit)
             }
 
@@ -1029,22 +1352,45 @@ impl Editor {
 
             // ---- commands & keymaps -----------------------------------
             ApiCall::CmdRegister { name, desc } => {
-                if let Some(existing) = self.commands.get(&name)
-                    && &existing.plugin != plugin
-                {
-                    return Err(ApiError::InvalidArgument {
-                        message: format!(
-                            "command {name:?} is already registered by {}",
-                            existing.plugin
-                        ),
-                    });
+                let reg = CommandReg { plugin: plugin.clone(), desc };
+                match self.commands.get(&name) {
+                    Some(existing) if existing.plugin == *plugin => {}
+                    Some(existing) => {
+                        let (mine, theirs) = (self.tier(&plugin.0), self.tier(&existing.plugin.0));
+                        if mine > theirs {
+                            // The user's `init.ts` registering `sidebar.toggle` before the
+                            // sidebar loads: the user wins, and the sidebar's registration is
+                            // kept in the wings rather than refused, so its `activate` does not
+                            // fail over a name it was always going to lose.
+                            let was = self.commands.insert(name.clone(), reg);
+                            self.shadowed.entry(name).or_default().extend(was);
+                            return Ok(ApiOk::Unit);
+                        }
+                        if mine < theirs {
+                            self.shadowed.entry(name).or_default().push(reg);
+                            return Ok(ApiOk::Unit);
+                        }
+                        return Err(ApiError::InvalidArgument {
+                            message: format!(
+                                "command {name:?} is already registered by {}",
+                                existing.plugin
+                            ),
+                        });
+                    }
+                    None => {}
                 }
-                self.commands.insert(name, CommandReg { plugin: plugin.clone(), desc });
+                self.commands.insert(name, reg);
                 Ok(ApiOk::Unit)
             }
             ApiCall::CmdUnregister { name } => {
                 if self.commands.get(&name).is_some_and(|r| &r.plugin == plugin) {
                     self.commands.remove(&name);
+                    // The name goes back to whoever it was taken from.
+                    if let Some(back) = self.shadowed.get_mut(&name).and_then(|v| v.pop()) {
+                        self.commands.insert(name.clone(), back);
+                    }
+                } else if let Some(list) = self.shadowed.get_mut(&name) {
+                    list.retain(|r| &r.plugin != plugin);
                 }
                 Ok(ApiOk::Unit)
             }
@@ -1070,12 +1416,14 @@ impl Editor {
             }
             ApiCall::KeymapSet { mode, lhs, command, scope, desc } => {
                 let lhs = self.with_leader(&lhs);
+                let tiers = &self.tiers;
+                let tier = |o: &str| tiers.get(o).copied().unwrap_or_default();
                 let took = self.keymaps.set(
                     mode,
                     scope.unwrap_or(KeymapScope::Global),
                     &lhs,
                     Binding { command: command.clone(), desc, owner: Some(plugin.0.clone()) },
-                    &self.bundled,
+                    &tier,
                 )?;
                 if !took {
                     // Not an error: a bundled plugin offering a default for a key somebody has
@@ -1087,7 +1435,20 @@ impl Editor {
             }
             ApiCall::KeymapDel { mode, lhs, scope } => {
                 let lhs = self.with_leader(&lhs);
-                self.keymaps.del(mode, scope.unwrap_or(KeymapScope::Global), &lhs)?;
+                let tiers = &self.tiers;
+                let tier = |o: &str| tiers.get(o).copied().unwrap_or_default();
+                // A plugin may unbind its own keys, another plugin's, and a bundled default —
+                // never the user's. The same rule as binding one.
+                let went = self.keymaps.del_by(
+                    mode,
+                    scope.unwrap_or(KeymapScope::Global),
+                    &lhs,
+                    &plugin.0,
+                    &tier,
+                )?;
+                if !went {
+                    tracing::debug!(%plugin, lhs, "key bound by a higher tier; not unbound");
+                }
                 Ok(ApiOk::Unit)
             }
             ApiCall::KeymapCapture { win, command } => {
@@ -1390,7 +1751,7 @@ fn call_name(call: &ApiCall) -> &'static str {
         ApiCall::WinSelectShape { .. } => "win.selectShape",
         ApiCall::WinCursorShape { .. } => "win.cursorShape",
         ApiCall::RtpList => "rtp.list",
-        ApiCall::GitStatus => "git.status",
+        ApiCall::GitStatus { .. } => "git.status",
         ApiCall::GitBranches { .. } => "git.branches",
         ApiCall::GitWorktrees { .. } => "git.worktrees",
         ApiCall::GitLog { .. } => "git.log",

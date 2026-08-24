@@ -718,6 +718,22 @@ pub enum UiEvent {
         name: String,
         def: HighlightDef,
     },
+    /// A group a plugin had defined is gone — the plugin unloaded, or reset it — and nothing in
+    /// the theme stands behind the name. Links to it resolve to plain from here on.
+    HighlightCleared {
+        name: String,
+    },
+    /// How this window reads group names: `Normal` is drawn as whatever `map["Normal"]` names.
+    ///
+    /// Neovim's `winhighlight`. The whole map every time, empty to clear, because a frontend
+    /// attaching later has to be able to be told it in one event. Computed by the core from the
+    /// remaps on the window and on its buffer's kind, so the frontend never needs to know about
+    /// kinds at all.
+    WindowHighlights {
+        win: WindowId,
+        #[ts(type = "Record<string, string>")]
+        map: std::collections::BTreeMap<String, String>,
+    },
 
     SurfaceClaimed {
         surface: SurfaceId,

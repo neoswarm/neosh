@@ -64,11 +64,16 @@ async fn activate(
 }
 
 fn load(rt: &ScriptRuntime, plugin: &str, url: String) {
+    load_requiring(rt, plugin, url, &[]);
+}
+
+fn load_requiring(rt: &ScriptRuntime, plugin: &str, url: String, requires: &[&str]) {
     rt.send(ScriptInbound::Load {
         plugin: PluginId::from(plugin),
         url,
         config: serde_json::json!({}),
         version: neosh_proto::PROTOCOL_VERSION,
+        requires: requires.iter().map(|s| s.to_string()).collect(),
     })
     .unwrap();
 }
@@ -399,5 +404,248 @@ export async function activate(ctx: PluginContext): Promise<void> {
         format!("pad=[{}  ]", "\u{65e5}\u{672c}"),
         "padding counts columns, not characters"
     );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// One plugin imports another's module by name and gets the *same* instance the host activated.
+///
+/// Two checks in one: the import resolves at all, and the state it sees is the state `activate`
+/// set — which is only true if `plugin:lib` is the very module the host loaded rather than a
+/// fresh copy of its source.
+#[tokio::test]
+async fn a_plugin_imports_another_by_name_and_shares_its_state() {
+    let lib_dir = workspace("import-lib");
+    let lib_url = write_plugin(
+        &lib_dir,
+        r#"
+import type { PluginContext } from "@neosh/api";
+export const api = { ready: false, answer: () => 42 };
+export async function activate(_ctx: PluginContext): Promise<void> {
+    api.ready = true;
+}
+"#,
+    );
+    let app_dir = workspace("import-app");
+    let app_url = write_plugin(
+        &app_dir,
+        r#"
+import type { PluginContext } from "@neosh/api";
+import { api } from "plugin:lib";
+export async function activate(ctx: PluginContext): Promise<void> {
+    ctx.neosh.log.info(`lib ready=${api.ready} answer=${api.answer()}`);
+}
+"#,
+    );
+
+    let (rt, mut rx) = ScriptRuntime::spawn();
+    load(&rt, "lib", lib_url);
+    load_requiring(&rt, "app", app_url, &["lib"]);
+
+    let (_, error) = activate(&rt, &mut rx, "lib", |_| ApiOk::Unit).await;
+    assert_eq!(error, None);
+    let (calls, error) = activate(&rt, &mut rx, "app", |_| ApiOk::Unit).await;
+    assert_eq!(error, None, "the import should resolve");
+    match &calls[0] {
+        ApiCall::Log { message, .. } => {
+            assert_eq!(message, "lib ready=true answer=42", "same module instance, already activated")
+        }
+        other => panic!("expected a log, got {other:?}"),
+    }
+    std::fs::remove_dir_all(&lib_dir).ok();
+    std::fs::remove_dir_all(&app_dir).ok();
+}
+
+/// Importing a plugin that is not loaded fails with the plugin's name and the fix in the message.
+#[tokio::test]
+async fn importing_an_unloaded_plugin_names_it() {
+    let dir = workspace("import-missing");
+    let url = write_plugin(
+        &dir,
+        r#"
+import { api } from "plugin:nothing";
+export async function activate(): Promise<void> { api; }
+"#,
+    );
+    let (rt, mut rx) = ScriptRuntime::spawn();
+    load(&rt, "app", url);
+    let (_, error) = activate(&rt, &mut rx, "app", |_| ApiOk::Unit).await;
+    let error = error.expect("activation fails");
+    assert!(error.contains("\"nothing\""), "names the plugin: {error}");
+    assert!(error.contains("requires"), "says where the fix goes: {error}");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// A dependent does not activate until what it requires has — even when the dependency's
+/// `activate` is slow — and a failed dependency fails the dependent with its name.
+#[tokio::test]
+async fn a_dependent_waits_for_its_requirement_to_activate() {
+    let lib_dir = workspace("wait-lib");
+    let lib_url = write_plugin(
+        &lib_dir,
+        r#"
+import type { PluginContext } from "@neosh/api";
+export const state = { activated: false };
+export async function activate(ctx: PluginContext): Promise<void> {
+    await new Promise((r) => setTimeout(r, 50));
+    state.activated = true;
+    ctx.neosh.log.info("lib activated");
+}
+"#,
+    );
+    let app_dir = workspace("wait-app");
+    let app_url = write_plugin(
+        &app_dir,
+        r#"
+import type { PluginContext } from "@neosh/api";
+import { state } from "plugin:lib";
+export async function activate(ctx: PluginContext): Promise<void> {
+    ctx.neosh.log.info(`app sees activated=${state.activated}`);
+}
+"#,
+    );
+    let (rt, mut rx) = ScriptRuntime::spawn();
+    load(&rt, "lib", lib_url);
+    load_requiring(&rt, "app", app_url, &["lib"]);
+
+    // Both activations are in flight; collect every message until both have reported.
+    let mut logs = Vec::new();
+    let mut loaded = 0;
+    while loaded < 2 {
+        match next(&mut rx).await {
+            ScriptOutbound::Loaded { error, plugin } => {
+                assert_eq!(error, None, "{plugin} should activate");
+                loaded += 1;
+            }
+            ScriptOutbound::Plugin { msg: PluginOutbound::Notify { call: ApiCall::Log { message, .. } }, .. } => {
+                logs.push(message)
+            }
+            ScriptOutbound::Plugin { msg: PluginOutbound::Call { id, .. }, plugin } => {
+                rt.send(ScriptInbound::Plugin {
+                    plugin,
+                    msg: PluginInbound::Response { id, response: ApiResponse::Ok { value: ApiOk::Unit } },
+                })
+                .unwrap();
+            }
+            ScriptOutbound::Plugin { .. } => {}
+            ScriptOutbound::Log { level, message } => panic!("runtime error [{level:?}]: {message}"),
+        }
+    }
+    assert_eq!(logs, ["lib activated", "app sees activated=true"]);
+
+    let bad_dir = workspace("wait-bad");
+    let bad_url = write_plugin(&bad_dir, r#"export async function activate() { throw new Error("nope"); }"#);
+    let dep_dir = workspace("wait-dep");
+    let dep_url = write_plugin(&dep_dir, r#"export async function activate() {}"#);
+    load(&rt, "bad", bad_url);
+    load_requiring(&rt, "dep", dep_url, &["bad"]);
+    let (_, e1) = activate(&rt, &mut rx, "bad", |_| ApiOk::Unit).await;
+    assert!(e1.is_some());
+    let (_, e2) = activate(&rt, &mut rx, "dep", |_| ApiOk::Unit).await;
+    let e2 = e2.expect("the dependent fails too");
+    assert!(e2.contains("\"bad\"") && e2.contains("nope"), "{e2}");
+    for d in [lib_dir, app_dir, bad_dir, dep_dir] {
+        std::fs::remove_dir_all(&d).ok();
+    }
+}
+
+/// `cmd.call` reaches the handler as a request and carries back what it returned; a handler that
+/// throws fails the call with its message.
+#[tokio::test]
+async fn a_command_called_for_its_answer_returns_one() {
+    let dir = workspace("cmd-call");
+    let url = write_plugin(
+        &dir,
+        r#"
+import type { PluginContext } from "@neosh/api";
+export async function activate(ctx: PluginContext): Promise<void> {
+    await ctx.neosh.cmd.register("demo.answer", (args) => ({ got: args, n: 7 }));
+    await ctx.neosh.cmd.register("demo.throws", () => { throw new Error("no answer"); });
+    await ctx.neosh.cmd.register("demo.nothing", () => {});
+}
+"#,
+    );
+    let (rt, mut rx) = ScriptRuntime::spawn();
+    load(&rt, "demo", url);
+    let (_, error) = activate(&rt, &mut rx, "demo", |_| ApiOk::Unit).await;
+    assert_eq!(error, None);
+
+    async fn ask(
+        rt: &ScriptRuntime,
+        rx: &mut UnboundedReceiver<ScriptOutbound>,
+        name: &str,
+    ) -> neosh_proto::PluginResponse {
+        let id = neosh_proto::RequestId::new();
+        rt.send(ScriptInbound::Plugin {
+            plugin: PluginId::from("demo"),
+            msg: PluginInbound::Request {
+                id: id.clone(),
+                request: PluginRequest::Command { name: name.into(), args: vec!["x".into()] },
+            },
+        })
+        .unwrap();
+        match next(rx).await {
+            ScriptOutbound::Plugin { msg: PluginOutbound::Response { id: back, response }, .. } => {
+                assert_eq!(back, id);
+                response
+            }
+            other => panic!("expected a response, got {other:?}"),
+        }
+    }
+
+    match ask(&rt, &mut rx, "demo.answer").await {
+        neosh_proto::PluginResponse::Command { value } => {
+            assert_eq!(value, serde_json::json!({ "got": ["x"], "n": 7 }))
+        }
+        other => panic!("{other:?}"),
+    }
+    match ask(&rt, &mut rx, "demo.nothing").await {
+        neosh_proto::PluginResponse::Command { value } => assert_eq!(value, serde_json::Value::Null),
+        other => panic!("{other:?}"),
+    }
+    match ask(&rt, &mut rx, "demo.throws").await {
+        neosh_proto::PluginResponse::Error { message } => assert!(message.contains("no answer"), "{message}"),
+        other => panic!("{other:?}"),
+    }
+    match ask(&rt, &mut rx, "demo.unknown").await {
+        neosh_proto::PluginResponse::Error { message } => assert!(message.contains("demo.unknown"), "{message}"),
+        other => panic!("{other:?}"),
+    }
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// `deactivate` runs on unload, before the plugin's subscriptions are disposed, and a goodbye
+/// that never returns does not hold the unload hostage.
+#[tokio::test]
+async fn deactivate_runs_on_unload_and_is_bounded() {
+    let dir = workspace("deactivate");
+    let url = write_plugin(
+        &dir,
+        r#"
+import type { PluginContext } from "@neosh/api";
+let ctx: PluginContext;
+export async function activate(c: PluginContext): Promise<void> { ctx = c; }
+export async function deactivate(): Promise<void> {
+    ctx.neosh.log.info("goodbye");
+    await new Promise(() => {});   // never settles
+}
+"#,
+    );
+    let (rt, mut rx) = ScriptRuntime::spawn();
+    load(&rt, "bye", url);
+    let (_, error) = activate(&rt, &mut rx, "bye", |_| ApiOk::Unit).await;
+    assert_eq!(error, None);
+
+    rt.send(ScriptInbound::Unload { plugin: PluginId::from("bye") }).unwrap();
+    match next(&mut rx).await {
+        ScriptOutbound::Plugin { msg: PluginOutbound::Notify { call: ApiCall::Log { message, .. } }, .. } => {
+            assert_eq!(message, "goodbye")
+        }
+        other => panic!("expected the goodbye, got {other:?}"),
+    }
+    // And the runtime is still answering afterwards: the hung deactivate was abandoned.
+    let again = write_plugin(&workspace("deactivate-2"), r#"export async function activate() {}"#);
+    load(&rt, "next", again);
+    let (_, error) = activate(&rt, &mut rx, "next", |_| ApiOk::Unit).await;
+    assert_eq!(error, None);
     std::fs::remove_dir_all(&dir).ok();
 }

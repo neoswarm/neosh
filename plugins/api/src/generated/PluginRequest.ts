@@ -7,4 +7,5 @@ import type { TurnRequest } from "./TurnRequest";
 export type PluginRequest =
   | { "type": "run_tool"; name: string; input: unknown }
   | { "type": "hook"; hook: HookName; payload: HookPayload }
+  | { "type": "command"; name: string; args?: Array<string> }
   | { "type": "provider_stream"; stream: StreamId; request: TurnRequest };

@@ -2,3 +2,10 @@ name = "sidebar"
 version = "0.1.0"
 entry = "main.ts"
 description = "A docked panel: where you are, what changed, and what is answering."
+
+# What other plugins build on. Listed so `ext.points()` can say who reads a point, and so a
+# contribution to a point nobody reads is reported rather than silently ignored.
+[provides]
+points = ["sidebar.section", "sidebar.action", "sidebar.decoration"]
+kinds = ["neosh.sidebar", "neosh.swarm.view"]
+vars = ["sidebar.projects", "sidebar.favorite", "sidebar.rank", "sidebar.folded", "sidebar.name", "sidebar.root"]

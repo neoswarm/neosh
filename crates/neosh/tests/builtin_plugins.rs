@@ -7122,3 +7122,429 @@ export async function activate({ neosh }: PluginContext) {
         assert!(s.saw(want), "the refusal names {want}\n{}", s.transcript());
     }
 }
+
+// ---------------------------------------------------------------------------
+// Plugins on top of plugins
+// ---------------------------------------------------------------------------
+
+/// A plugin that builds on another: `requires` it, imports it by name, and asks it a question
+/// through `cmd.call`. Everything a decorator of somebody else's panel needs, end to end through
+/// the real host.
+const ON_TOP: &str = r#"
+import type { PluginContext } from "@neosh/api";
+import * as sidebar from "plugin:sidebar";
+
+export async function activate({ neosh }: PluginContext) {
+  await neosh.cmd.register("ontop.answer", (args) => ({ echoed: args, from: "ontop" }));
+  neosh.event.on("neosh.ready", async () => {
+    const imported = typeof sidebar.activate === "function" ? "imports sidebar" : "no sidebar";
+    const self = await neosh.cmd.call<{ echoed: string[]; from: string }>("ontop.answer", ["x"]);
+    const host = await neosh.cmd.call("sidebar.refresh");
+    let missing = "";
+    try { await neosh.cmd.call("nothing.here"); } catch (e) { missing = e instanceof Error ? e.message : String(e); }
+    neosh.notify(`${imported}; self=${self.from}:${self.echoed.join(",")}; host=${host === null}; missing=${missing.includes("nothing.here")}`);
+  });
+}
+"#;
+
+fn install_plugin(sb: &Sandbox, name: &str, manifest_extra: &str, source: &str) {
+    let dir = sb.root.join("config/plugins").join(name);
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    std::fs::write(
+        dir.join("plugin.toml"),
+        format!("name = \"{name}\"\nversion = \"0.1.0\"\nentry = \"main.ts\"\n{manifest_extra}"),
+    )
+    .expect("manifest");
+    std::fs::write(dir.join("main.ts"), source).expect("plugin");
+}
+
+#[test]
+fn a_plugin_can_require_import_and_ask_another_plugin() {
+    let sb = Sandbox::new("ontop");
+    install_plugin(&sb, "ontop", "requires = [\"sidebar\"]\n", ON_TOP);
+    let mut s = sb.start();
+    s.wait_for("imports sidebar; self=ontop:x; host=true; missing=true");
+}
+
+/// Requiring something that is not there is said at startup, with the name, and the rest of the
+/// workspace loads anyway.
+#[test]
+fn a_missing_requirement_is_reported_and_does_not_stop_the_rest() {
+    let sb = Sandbox::new("ontop-missing");
+    install_plugin(&sb, "ontop", "requires = [\"no-such-plugin\"]\n", ON_TOP);
+    let mut s = sb.start();
+    s.wait_for("requires \"no-such-plugin\"");
+    s.wait_for("PROJECTS");
+}
+
+/// `plugins.disabled` applies to a plugin you installed, not only to the bundled ones.
+#[test]
+fn a_third_party_plugin_can_be_switched_off_from_config() {
+    let sb = Sandbox::new("disable-third");
+    install_plugin(&sb, "ontop", "requires = [\"sidebar\"]\n", ON_TOP);
+    sb.write_config("[options]\n\"plugins.disabled\" = [\"ontop\"]\n");
+    let mut s = sb.start();
+    s.wait_for("PROJECTS");
+    s.drain_for(Duration::from_secs(2));
+    assert!(!s.saw("imports sidebar"), "the plugin should not have run\n{}", s.transcript());
+}
+
+/// A plugin puts a mark on a row the sidebar drew — the git plugin's dirty count on the project
+/// row — without the sidebar knowing git exists. The badge sits after the name, in the row.
+#[test]
+fn a_decoration_lands_on_the_project_row() {
+    if !have_git() {
+        return;
+    }
+    let sb = Sandbox::new("decorate");
+    sb.git_init();
+    std::fs::write(sb.work().join("new.txt"), "x\n").expect("write");
+    std::fs::write(sb.work().join("README.md"), "changed\n").expect("write");
+    let mut s = sb.start();
+    s.wait_for("work ●2");
+}
+
+/// A third-party decoration: a badge on a conversation and a section anchored by name between
+/// two of the panel's own blocks — neither of which the panel had to be told about.
+const DECORATOR: &str = r#"
+import type { PluginContext } from "@neosh/api";
+
+export async function activate({ neosh }: PluginContext) {
+  neosh.event.on("neosh.ready", async () => {
+    const here = await neosh.session.current();
+    await neosh.ext.contribute("sidebar.decoration", "mine", {
+      target: { session: here.id },
+      badge: { text: "2 PRs", hl: "Accent" },
+    });
+    await neosh.ext.contribute("sidebar.section", "between", {
+      title: "BETWEEN",
+      before: "add",
+      rows: [{ text: "anchored here" }],
+    });
+    const cursor = await neosh.cmd.call<{ kind: string } | null>("sidebar.cursor");
+    neosh.notify(`cursor=${cursor === null ? "none" : cursor.kind}`);
+  });
+}
+"#;
+
+#[test]
+fn a_third_party_decorates_a_conversation_and_anchors_a_section_by_name() {
+    let sb = Sandbox::new("decorate-third");
+    install_plugin(&sb, "deco", "after = [\"sidebar\"]\n", DECORATOR);
+    let mut s = sb.start();
+    s.wait_for("2 PRs");
+    s.wait_for("anchored here");
+    s.wait_for("cursor=");
+    // The section sits between the project list and the `+ Add project` row, where `before:
+    // "add"` put it — not at the foot, where `at: "below"` would have.
+    let texts = s.texts();
+    let between = texts.iter().rposition(|t| t.contains("anchored here")).expect("drawn");
+    let add = texts.iter().rposition(|t| t.contains("+ Add project")).expect("drawn");
+    let projects = texts.iter().rposition(|t| t.contains("PROJECTS")).expect("drawn");
+    assert!(projects < between && between < add, "order: projects={projects} between={between} add={add}");
+}
+
+/// A theme is a plugin: contributed on `ui.theme`, listed beside `dark` and `light`, chosen with
+/// the option, and gone — with the workspace back on a built-in — when the plugin is.
+const THEME: &str = r#"
+import type { PluginContext } from "@neosh/api";
+
+export async function activate({ neosh }: PluginContext) {
+  await neosh.ext.contribute("ui.theme", "gruvbox", {
+    base: "dark",
+    groups: {
+      Comment: { fg: { kind: "rgb", r: 1, g: 2, b: 3 } },
+      "Gruv.Extra": { link: "Normal" },
+    },
+  });
+  neosh.event.on("neosh.ready", async () => {
+    const entry = await neosh.opt.entry("ui.theme");
+    const values = entry?.type.type === "enum" ? entry.type.values.join(",") : "?";
+    neosh.notify(`themes: ${values}`);
+    await neosh.opt.set("ui.theme", "gruvbox");
+    const comment = await neosh.hl.get("Comment");
+    const extra = await neosh.hl.get("Gruv.Extra");
+    neosh.notify(`comment=${JSON.stringify(comment.resolved?.fg)} extra=${extra.resolved !== null}`);
+    // A plugin's own definition still wins over the theme's, and leaves when reset.
+    await neosh.hl.define("Comment", { link: "Accent" });
+    const mine = await neosh.hl.get("Comment");
+    await neosh.hl.reset("Comment");
+    const back = await neosh.hl.get("Comment");
+    neosh.notify(`mine=${mine.def?.kind === "link"} back=${JSON.stringify(back.resolved?.fg)}`);
+  });
+}
+"#;
+
+#[test]
+fn a_theme_is_a_plugin() {
+    let sb = Sandbox::new("theme");
+    install_plugin(&sb, "gruvbox", "", THEME);
+    let mut s = sb.start();
+    s.wait_for("themes: dark,light,gruvbox");
+    s.wait_for("comment={\"kind\":\"rgb\",\"r\":1,\"g\":2,\"b\":3} extra=true");
+    s.wait_for("mine=true back={\"kind\":\"rgb\",\"r\":1,\"g\":2,\"b\":3}");
+}
+
+/// Recolouring one panel's window: a remap on the sidebar's *kind* reaches the window it is drawn
+/// in, and the frontend is told the whole map.
+const RESTYLE: &str = r#"
+import type { PluginContext } from "@neosh/api";
+
+export async function activate({ neosh }: PluginContext) {
+  neosh.event.on("neosh.ready", async () => {
+    await neosh.hl.define("Acme.Panel", { bg: { kind: "rgb", r: 9, g: 9, b: 9 } });
+    await neosh.win.setHighlights({ kind: "neosh.sidebar" }, { Normal: "Acme.Panel" });
+    const wins = await neosh.win.ofKind("neosh.sidebar");
+    neosh.notify(`restyled ${wins.length} window(s)`);
+  });
+}
+"#;
+
+#[test]
+fn a_kind_remap_reaches_the_sidebars_window() {
+    let sb = Sandbox::new("restyle");
+    install_plugin(&sb, "restyle", "", RESTYLE);
+    let mut s = sb.start();
+    s.wait_for("restyled 1 window(s)");
+    s.drain_for(Duration::from_millis(300));
+    let sidebar = s.buffer_named("[sidebar]").expect("the sidebar exists");
+    let win = s
+        .events
+        .iter()
+        .find(|e| e["type"] == "window_opened" && e["buf"].as_u64() == Some(sidebar))
+        .and_then(|e| e["win"].as_u64())
+        .expect("the sidebar is in a window");
+    let remap = s
+        .events
+        .iter()
+        .filter(|e| e["type"] == "window_highlights" && e["win"].as_u64() == Some(win))
+        .last()
+        .expect("the window was told its remap");
+    assert_eq!(remap["map"]["Normal"], "Acme.Panel", "{remap}");
+}
+
+/// The workspace's own events — windows gaining and losing the keyboard, the mode changing —
+/// arrive on the bus a plugin already listens to, with the buffer kind to filter on; a window
+/// var lives in memory and goes with its window, and whoever was watching is told.
+const AUTOCMD: &str = r#"
+import type { PluginContext, WindowEvent } from "@neosh/api";
+
+export async function activate({ neosh, subscriptions }: PluginContext) {
+  subscriptions.push(neosh.event.on("neosh.win.enter", (e) => {
+    const w = e.data as WindowEvent;
+    neosh.notify(`entered ${w.kind}`);
+  }, { kind: "neosh.sidebar" }));
+  subscriptions.push(neosh.event.on("neosh.win.leave", (e) => {
+    const w = e.data as WindowEvent;
+    neosh.notify(`left ${w.kind}`);
+  }));
+  subscriptions.push(neosh.event.on("neosh.mode", (e) => {
+    neosh.notify(`mode ${JSON.stringify(e.data)}`);
+  }));
+  subscriptions.push(neosh.vars.onChange((e) => {
+    if (e.scope.scope === "window") neosh.notify(`winvar ${e.key}=${JSON.stringify(e.value)}`);
+  }));
+  await neosh.cmd.register("autocmd.winvar", async () => {
+    const [w] = await neosh.win.ofKind("neosh.sidebar");
+    if (!w) return;
+    await neosh.vars.set({ scope: "window", win: w.win }, "acme.note", "hello");
+    const back = await neosh.vars.get({ scope: "window", win: w.win }, "acme.note");
+    neosh.notify(`winvar read ${back}`);
+  });
+  await neosh.keymap.set("chat", "<C-y>", "autocmd.winvar");
+}
+"#;
+
+#[test]
+fn the_workspaces_own_events_are_on_the_bus() {
+    let sb = Sandbox::new("autocmd");
+    install_plugin(&sb, "autocmd", "", AUTOCMD);
+    let mut s = sb.start();
+    s.wait_for("PROJECTS");
+    s.ctrl("y");
+    s.wait_for("winvar acme.note=\"hello\"");
+    s.wait_for("winvar read hello");
+    s.ctrl("t");
+    s.wait_for("entered neosh.sidebar");
+    s.send(r#"{"type":"key","key":{"code":{"kind":"esc"},"mods":{}}}"#);
+    s.wait_for("left neosh.sidebar");
+    s.ctrl("b");
+    // Closing the sidebar's window drops its vars, and says so.
+    s.wait_for("winvar acme.note=undefined");
+}
+
+/// A contribution to a point nobody reads is said at startup, with the nearest real point.
+const TYPO: &str = r#"
+import type { PluginContext } from "@neosh/api";
+
+export async function activate({ neosh }: PluginContext) {
+  await neosh.ext.contribute("sidebar.sektion", "mine", { title: "X", rows: [] });
+  neosh.event.on("neosh.ready", async () => {
+    const points = await neosh.ext.points();
+    const section = points.find((p) => p.point === "sidebar.section");
+    neosh.notify(`readers of sidebar.section: ${section?.readers.join(",")}`);
+  });
+}
+"#;
+
+#[test]
+fn a_contribution_to_a_point_nothing_reads_is_reported() {
+    let sb = Sandbox::new("typo-point");
+    install_plugin(&sb, "typo", "", TYPO);
+    let mut s = sb.start();
+    s.wait_for("typo contributes to \"sidebar.sektion\", which no plugin declares it reads — did you mean \"sidebar.section\"?");
+    s.wait_for("readers of sidebar.section: sidebar");
+}
+
+/// A plugin with `[activation]` is not loaded at startup. Its command exists from the first press
+/// — registered on its behalf — and the press that wakes it is replayed once it is up, with
+/// `neosh.ready` delivered to it even though the workspace was ready long before.
+const LAZY_PLUGIN: &str = r#"
+import type { PluginContext } from "@neosh/api";
+
+export async function activate({ neosh }: PluginContext) {
+  neosh.notify("lazy activated");
+  await neosh.cmd.register("lazy.hello", (args) => neosh.notify(`lazy hello ${args.join(" ")}`));
+  neosh.event.on("neosh.ready", () => neosh.notify("lazy saw ready"));
+}
+"#;
+
+#[test]
+fn a_lazy_plugin_loads_on_its_command_and_the_press_is_replayed() {
+    let sb = Sandbox::new("lazy");
+    install_plugin(
+        &sb,
+        "lazy",
+        "[activation]\non_command = [\"lazy.hello\"]\n",
+        LAZY_PLUGIN,
+    );
+    std::fs::write(
+        sb.root.join("config/init.ts"),
+        r#"import type { PluginContext } from "@neosh/api";
+export async function activate({ neosh }: PluginContext) {
+  await neosh.keymap.set("chat", "<C-y>", "lazy.hello");
+}
+"#,
+    )
+    .expect("init.ts");
+    let mut s = sb.start();
+    s.wait_for("PROJECTS");
+    s.drain_for(Duration::from_secs(1));
+    assert!(!s.saw("lazy activated"), "held at startup\n{}", s.transcript());
+    s.ctrl("y");
+    s.wait_for("lazy activated");
+    s.wait_for("lazy saw ready");
+    s.wait_for("lazy hello");
+}
+
+/// `on_event` and `on_kind` wake a plugin too — here, a buffer kind another plugin creates.
+#[test]
+fn a_lazy_plugin_loads_when_its_kind_appears() {
+    let sb = Sandbox::new("lazy-kind");
+    install_plugin(
+        &sb,
+        "lazy",
+        "[activation]\non_kind = [\"acme.thing\"]\n",
+        LAZY_PLUGIN,
+    );
+    install_plugin(
+        &sb,
+        "maker",
+        "",
+        r#"import type { PluginContext } from "@neosh/api";
+export async function activate({ neosh }: PluginContext) {
+  await neosh.cmd.register("maker.make", async () => { await neosh.buf.create({ kind: "acme.thing" }); });
+  await neosh.keymap.set("chat", "<C-y>", "maker.make");
+}
+"#,
+    );
+    let mut s = sb.start();
+    s.wait_for("PROJECTS");
+    s.drain_for(Duration::from_millis(500));
+    assert!(!s.saw("lazy activated"), "held at startup\n{}", s.transcript());
+    s.ctrl("y");
+    s.wait_for("lazy activated");
+}
+
+/// A third-party panel on `ListPanel` gets the whole surface for a kind and a `rows` function:
+/// named verbs at `buf_kind` scope, contribution points, decorations, a published cursor. A
+/// second plugin that has never heard of it decorates a row and puts a key on the panel.
+const TASKS_PANEL: &str = r#"
+import type { PluginContext } from "@neosh/api";
+import { ListPanel } from "@neosh/api/ui";
+
+export async function activate({ neosh, subscriptions }: PluginContext) {
+  const panel = await ListPanel.create<{ id: string; title: string }>(neosh, {
+    kind: "acme.tasks",
+    dock: "right",
+    size: () => 30,
+    rows: () => [
+      { text: " TASKS", hl: "Sidebar.Heading", inert: true },
+      { text: " ▸ write the docs", value: { id: "t1", title: "write the docs" } },
+      { text: " ▸ ship it", value: { id: "t2", title: "ship it" } },
+    ],
+    key: (v) => ({ task: v.id }),
+    kindOf: () => "task",
+    onOpen: (v) => neosh.notify(`opened ${v.title}`),
+  });
+  subscriptions.push({ dispose: () => panel.dispose() });
+  subscriptions.push(neosh.event.on("acme.tasks.cursor", (e) => {
+    const v = e.data as { id: string } | null;
+    neosh.notify(`tasks cursor ${v?.id ?? "none"}`);
+  }));
+  await neosh.keymap.set("chat", "<C-y>", "acme.tasks.focus");
+}
+"#;
+
+const TASKS_DECORATOR: &str = r#"
+import type { PluginContext } from "@neosh/api";
+
+export async function activate({ neosh }: PluginContext) {
+  await neosh.ext.contribute("acme.tasks.decoration", "due", {
+    target: { task: "t2" },
+    badge: { text: "due today", hl: "Status.Unread" },
+  });
+  await neosh.cmd.register("deco.done", (args) => neosh.notify(`done ${args.join(" ")}`));
+  await neosh.ext.contribute("acme.tasks.action", "done", {
+    key: "x", label: "mark done", command: "deco.done", on: "task",
+  });
+}
+"#;
+
+#[test]
+fn a_third_party_panel_on_list_panel_is_a_surface() {
+    let sb = Sandbox::new("listpanel");
+    install_plugin(&sb, "tasks", "[provides]\nkinds = [\"acme.tasks\"]\npoints = [\"acme.tasks.section\", \"acme.tasks.action\", \"acme.tasks.decoration\"]\n", TASKS_PANEL);
+    install_plugin(&sb, "deco", "after = [\"tasks\"]\n", TASKS_DECORATOR);
+    let mut s = sb.start();
+    s.wait_for("ship it due today");
+    s.ctrl("y");
+    s.wait_for("tasks cursor t1");
+    s.key("j");
+    s.wait_for("tasks cursor t2");
+    s.key("x");
+    s.wait_for("done task t2");
+    s.send(r#"{"type":"key","key":{"code":{"kind":"enter"},"mods":{}}}"#);
+    s.wait_for("opened ship it");
+}
+
+/// The plugins panel: every plugin and what became of it, then what one registered.
+#[test]
+fn the_plugins_panel_lists_what_loaded_and_what_each_registered() {
+    let sb = Sandbox::new("plugins-panel");
+    install_plugin(&sb, "lazy", "[activation]\non_command = [\"lazy.hello\"]\n", LAZY_PLUGIN);
+    let mut s = sb.start();
+    s.wait_for("PROJECTS");
+    s.ctrl("k");
+    assert!(s.pump(|s| !s.picker_named("[Go to]").is_empty()), "the palette opened");
+    s.type_text("plugins.list");
+    s.wait_for("plugins.list");
+    s.send(r#"{"type":"key","key":{"code":{"kind":"enter"},"mods":{}}}"#);
+    assert!(s.pump(|s| !s.picker_named("[Plugins]").is_empty()), "the plugins panel opened");
+    s.wait_for("held");
+    s.type_text("sidebar");
+    s.send(r#"{"type":"key","key":{"code":{"kind":"enter"},"mods":{}}}"#);
+    s.wait_for("points read");
+    s.wait_for("sidebar.decoration");
+    s.wait_for("neosh.sidebar");
+}

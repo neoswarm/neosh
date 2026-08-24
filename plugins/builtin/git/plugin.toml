@@ -6,3 +6,10 @@ description = "Branch, commit and status, with model-written names and messages 
 # Creates branches, stages and commits. Declared so `plugin.toml` answers "what can this
 # do to my repository" without reading the source.
 permissions = ["vcs_write"]
+
+# Puts a dirty-count badge on the sidebar's project rows and verbs on its rows. Soft ordering:
+# the sidebar is not needed for anything else here, so this is `after` rather than `requires`.
+after = ["sidebar"]
+
+[provides]
+vars = ["git.branch.scratch"]

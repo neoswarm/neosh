@@ -159,8 +159,9 @@ impl Services {
         Ok(ApiOk::Paths { paths })
     }
 
-    pub async fn git_status(&self) -> ApiResult {
-        Ok(ApiOk::Status { status: self.repo()?.status().await.map_err(vcs_err)? })
+    pub async fn git_status(&self, cwd: Option<String>) -> ApiResult {
+        let repo = self.repo_at(cwd).await?;
+        Ok(ApiOk::Status { status: repo.status().await.map_err(vcs_err)? })
     }
 
     pub async fn git_branches(&self, include_remote: bool, cwd: Option<String>) -> ApiResult {

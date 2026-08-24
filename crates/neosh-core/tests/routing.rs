@@ -258,3 +258,63 @@ fn windows_are_listed_with_what_is_in_them() {
     assert_eq!(windows[0].kind.as_deref(), Some("acme.tasks"));
     assert_eq!(windows[0].name, "[tasks]");
 }
+
+/// A command *call* waits for a plugin's answer, and the core cannot wait for anything: it applies
+/// a call and returns. `CmdExec` stays in the core — it is a key press, queued as an effect — and
+/// `CmdCall` goes to the host, which knows how to ask a plugin a question and hold the caller's
+/// request open until it is answered.
+#[test]
+fn calling_a_command_for_its_answer_is_the_hosts_business() {
+    let call = ApiCall::CmdCall { name: "sidebar.cursor".into(), args: vec![] };
+    assert!(!Editor::handles(&call), "{call:?} has to wait for a plugin, which the core cannot");
+    assert!(
+        Editor::handles(&ApiCall::CmdExec { name: "sidebar.cursor".into(), args: vec![] }),
+        "exec is fire-and-forget and stays an effect",
+    );
+}
+
+#[test]
+fn the_core_says_who_owns_a_command() {
+    let mut e = Editor::new();
+    let plugin = neosh_proto::PluginId::from("sidebar");
+    e.apply(&plugin, ApiCall::CmdRegister { name: "sidebar.cursor".into(), desc: None })
+        .expect("registers");
+    assert_eq!(e.command_owner("sidebar.cursor"), Some(plugin));
+    assert_eq!(e.command_owner("nothing"), None);
+}
+
+/// One rule for every name: the user's `init.ts` outranks a plugin, a plugin outranks a bundled
+/// default — and a lower tier registering a name a higher one holds is *kept waiting* rather than
+/// refused, so a bundled panel's `activate` does not fail over a command the user had already
+/// decided to own.
+#[test]
+fn a_higher_tier_owns_a_command_name_and_gives_it_back() {
+    let mut e = Editor::new();
+    let user = neosh_proto::PluginId::from("user");
+    let sidebar = neosh_proto::PluginId::from("sidebar");
+    e.mark_user(&user);
+    e.mark_bundled(&sidebar);
+
+    // `init.ts` first, as it loads; the sidebar's registration then succeeds but does not win.
+    e.apply(&user, ApiCall::CmdRegister { name: "sidebar.toggle".into(), desc: None }).expect("user");
+    e.apply(&sidebar, ApiCall::CmdRegister { name: "sidebar.toggle".into(), desc: None })
+        .expect("a default does not fail over a name it was always going to lose");
+    assert_eq!(e.command_owner("sidebar.toggle"), Some(user.clone()));
+
+    // The other order — the plugin first, the user later — ends the same way.
+    e.apply(&sidebar, ApiCall::CmdRegister { name: "sidebar.focus".into(), desc: None }).expect("sidebar");
+    e.apply(&user, ApiCall::CmdRegister { name: "sidebar.focus".into(), desc: None }).expect("user");
+    assert_eq!(e.command_owner("sidebar.focus"), Some(user.clone()));
+
+    // Two plugins of one tier: the first keeps it and the second is told.
+    let a = neosh_proto::PluginId::from("a");
+    let b = neosh_proto::PluginId::from("b");
+    e.apply(&a, ApiCall::CmdRegister { name: "shared".into(), desc: None }).expect("a");
+    assert!(e.apply(&b, ApiCall::CmdRegister { name: "shared".into(), desc: None }).is_err());
+
+    // When the user lets go, the name goes back to the sidebar rather than to nobody.
+    e.apply(&user, ApiCall::CmdUnregister { name: "sidebar.toggle".into() }).expect("unregisters");
+    assert_eq!(e.command_owner("sidebar.toggle"), Some(sidebar.clone()));
+    e.remove_plugin(&user);
+    assert_eq!(e.command_owner("sidebar.focus"), Some(sidebar));
+}

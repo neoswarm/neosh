@@ -66,6 +66,25 @@ per decision, and records the *reasoning*, not the choice.
   key in a panel is an ordinary binding pointed at a named command, so `^Z` lists it and `init.ts`
   can move it; a `switch` on `KeyContext` inside a plugin is the thing this replaced. Keep the
   capture, but only as a sink for keys nothing claimed. See ADR 0040.
+- **A plugin can build on a plugin, and the four ways are named.** *Ask* it: `cmd.call` returns
+  what a handler returned, and `import { api } from "plugin:<name>"` is the very module the host
+  activated — declared with `requires` in the manifest, which is also what orders loading, so a
+  name nothing provides fails at startup with the name in it. *Decorate* it: `<kind>.decoration`
+  is a mark on a row the panel already draws, keyed by what the row is *about* and merged at draw
+  time — data, never a row-renderer callback, because one slow decorator would be a panel that
+  lags on `j`; sections sit `before`/`after` a named slot. *Recolour* it: highlights have owners
+  and leave with them, `default: true` is `:hi default`, a window or a kind reads group names
+  through a `winhighlight` map, and a theme is a contribution on `ui.theme` laid over a built-in
+  variant. *Hear* it: the workspace's own events — `neosh.win.enter`, `neosh.cursor`,
+  `neosh.mode`, `neosh.viewport` — are on the bus, and buffer/window vars are in memory and die
+  with their buffer or window. One tier rule for keys, commands and colours — `builtin < plugin <
+  user` — so `init.ts`, loaded first, still has the last word; a lower tier's command registration
+  waits in the wings rather than failing. The host's own buffers have kinds
+  (`neosh.transcript`, `neosh.composer`, `neosh.status`), the pickers do too, `deactivate` runs,
+  `plugins.disabled` disables anything, `[activation]` holds a plugin until a command, event or
+  kind asks for it, `[provides]` is how `ext.points()` knows who reads what and how a typo'd point
+  gets reported, and `ListPanel` gives a third party's panel all of this for a kind and a `rows`
+  function. See ADR 0059.
 - **A panel you are in the middle of using has the keyboard.** `FloatConfig::modal` takes
   `KeymapScope::Global` out of the chain, and a key nothing claimed is swallowed rather than reaching
   the composer behind the float. Shadowing the keys a widget wants is the other half and not a

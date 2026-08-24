@@ -612,6 +612,15 @@ pub fn draw(frame: &mut Frame, mirror: &Mirror, theme: &Theme) -> Drawn {
         if rect.width == 0 || rect.height == 0 {
             continue;
         }
+        // A window somebody restyled reads every group name through its own map — border, title,
+        // `Normal`, every mark — and the rest of the screen never knows.
+        let local;
+        let theme = if w.highlights.is_empty() {
+            theme
+        } else {
+            local = theme.remapped(&w.highlights);
+            &local
+        };
 
         let (inner, block) = match &w.layout {
             WindowLayout::Float { config } if config.border != neosh_proto::BorderStyle::None => {

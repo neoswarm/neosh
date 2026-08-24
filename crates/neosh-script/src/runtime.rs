@@ -38,6 +38,10 @@ pub enum ScriptInbound {
         url: String,
         config: serde_json::Value,
         version: u32,
+        /// Plugins whose activation this one waits for. The host has already put their `Load`
+        /// ahead of this one; the bootstrap holds `activate` until theirs have settled.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        requires: Vec<String>,
     },
     Plugin {
         plugin: PluginId,
@@ -434,9 +438,13 @@ async fn run(
     let wake: Waker = Default::default();
     let closed: Closed = Default::default();
     let timers: TimerState = Default::default();
+    // What `plugin:<name>` resolves to. Written here, as each load is received and before JS sees
+    // it, so a plugin's static import of another resolves even when the two are activating in the
+    // same breath.
+    let plugins: crate::loader::PluginUrls = Default::default();
 
     let mut js = JsRuntime::new(RuntimeOptions {
-        module_loader: Some(Rc::new(NeoshModuleLoader::new())),
+        module_loader: Some(Rc::new(NeoshModuleLoader::with_plugins(plugins.clone()))),
         extensions: vec![extension(
             queue.clone(),
             wake.clone(),
@@ -471,11 +479,22 @@ async fn run(
     let opts = PollEventLoopOptions::default();
     let recv_into = |msg: Option<ScriptInbound>,
                          inbox: &mut mpsc::UnboundedReceiver<ScriptInbound>| {
+        let note = |m: &ScriptInbound| match m {
+            ScriptInbound::Load { plugin, url, .. } => {
+                plugins.borrow_mut().insert(plugin.0.clone(), url.clone());
+            }
+            ScriptInbound::Unload { plugin } => {
+                plugins.borrow_mut().remove(&plugin.0);
+            }
+            ScriptInbound::Plugin { .. } => {}
+        };
         match msg {
             Some(m) => {
+                note(&m);
                 queue.borrow_mut().push_back(m);
                 // Drain whatever else is buffered so a burst costs one wakeup, not N.
                 while let Ok(more) = inbox.try_recv() {
+                    note(&more);
                     queue.borrow_mut().push_back(more);
                 }
             }
@@ -692,6 +711,7 @@ mod tests {
             url: "file:///p/main.ts".into(),
             config: serde_json::json!({"a": 1}),
             version: 1,
+            requires: Vec::new(),
         };
         let s = serde_json::to_string(&m).unwrap();
         assert!(s.contains("\"type\":\"load\""));

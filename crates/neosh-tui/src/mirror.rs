@@ -27,6 +27,8 @@ pub struct MirrorWindow {
     pub cursor_shape: neosh_proto::CursorShape,
     /// `None` is unscrolled: the end of a window that follows its tail, the start of every other.
     pub top_line: Option<u32>,
+    /// How this window reads group names — `winhighlight`. Empty for almost every window.
+    pub highlights: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone)]
@@ -124,6 +126,7 @@ impl Mirror {
                     cursor: (0, 0),
                     cursor_shape: Default::default(),
                     top_line: None,
+                    highlights: BTreeMap::new(),
                 });
                 if !self.window_order.contains(&win) {
                     self.window_order.push(win);
@@ -164,6 +167,14 @@ impl Mirror {
             }
             UiEvent::HighlightDefined { name, def } => {
                 self.highlights.insert(name, def);
+            }
+            UiEvent::HighlightCleared { name } => {
+                self.highlights.remove(&name);
+            }
+            UiEvent::WindowHighlights { win, map } => {
+                if let Some(w) = self.windows.get_mut(&win) {
+                    w.highlights = map;
+                }
             }
             UiEvent::SurfaceClaimed { surface, win, rect } => {
                 self.surfaces.insert(surface, MirrorSurface { win, rect, cells: Vec::new() });

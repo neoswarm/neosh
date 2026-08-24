@@ -38,6 +38,14 @@ export async function activate({ neosh, subscriptions }: PluginContext) {
     }),
   );
 
+  // `:checkhealth`: every plugin, what became of it, and what each one put in the registries.
+  // No default key — `^K` runs it by name.
+  subscriptions.push(
+    await neosh.cmd.register("plugins.list", () => showPlugins(neosh), {
+      desc: "Every plugin: loaded, held or failed, and what each registered",
+    }),
+  );
+
   await neosh.keymap.set("chat", "<C-k>", "commandPalette.toggle", { desc: "Command palette" });
   // `^Z` rather than `<F1>`. A function key is not a key everybody has: Apple's top row is
   // brightness and volume until somebody goes into the settings, so the key that lists every key
@@ -279,3 +287,88 @@ const READING_KEYS: [string, string][] = [
   ["Esc q", "leave"],
 ];
 
+
+
+/**
+ * The plugins panel: one row per plugin, and on `↵` what that plugin put on the surface.
+ *
+ * Drawn from the registries — `cmd.list`, `keymap.list`, `hl.list`, `ext.points` — rather than
+ * from anything a plugin says about itself, so a plugin that registered a command it does not
+ * mention in its manifest is listed with it anyway. The manifest's `provides` is shown beside,
+ * which is how a point nobody reads and a reader nobody declared both become visible.
+ */
+async function showPlugins(neosh: Neosh): Promise<void> {
+  const plugins = await neosh.ext.plugins();
+  const mark = (state: string) =>
+    state === "loaded" ? { icon: "●", hl: "Diagnostic.Ok" }
+    : state === "held" ? { icon: "○", hl: "Sidebar.Dim" }
+    : { icon: "✗", hl: "Diagnostic.Error" };
+  const chosen = await picker<string>(
+    neosh,
+    plugins.map((p) => ({
+      label: p.name,
+      detail: `${p.state}${p.bundled ? " · bundled" : ""}${p.manifest.description ? ` · ${p.manifest.description}` : ""}`,
+      keywords: p.state,
+      ...mark(p.state),
+      value: p.name,
+    })),
+    { title: "Plugins", width: 80 },
+  );
+  if (chosen === null) return;
+  const info = plugins.find((p) => p.name === chosen);
+  if (!info) return;
+
+  const [commands, keymaps, groups, points] = await Promise.all([
+    neosh.cmd.list(),
+    neosh.keymap.list(),
+    neosh.hl.list(),
+    neosh.ext.points(),
+  ]);
+  const mine = commands.filter((c) => c.plugin === chosen).map((c) => c.name);
+  const keys = keymaps.filter((k) => mine.includes(k.command));
+  const colours = groups.filter((g) => g.owner === chosen).map((g) => g.name);
+  const reads = points.filter((p) => p.readers.includes(chosen)).map((p) => p.point);
+  const writes = points.filter((p) => p.contributors.includes(chosen)).map((p) => p.point);
+
+  const rows: Array<{ label: string; detail?: string; hl?: string; icon?: string }> = [];
+  const section = (title: string, items: string[], detail?: (s: string) => string | undefined) => {
+    if (items.length === 0) return;
+    rows.push({ label: title, hl: "Sidebar.Heading", icon: " " });
+    for (const it of items) rows.push({ label: `  ${it}`, detail: detail?.(it) });
+  };
+  if (info.error) rows.push({ label: info.error, hl: "Diagnostic.Error", icon: "✗" });
+  // Every list on a manifest is optional on the wire — absent when empty.
+  const m = info.manifest;
+  const list = (v: string[] | null | undefined) => v ?? [];
+  const act = m.activation ?? {};
+  const provides = m.provides ?? {};
+  section("manifest", [
+    `version ${m.version}`,
+    ...(list(m.requires).length ? [`requires ${list(m.requires).join(", ")}`] : []),
+    ...(list(m.after).length ? [`after ${list(m.after).join(", ")}`] : []),
+    ...(list(m.permissions).length ? [`permissions ${list(m.permissions).join(", ")}`] : []),
+    ...(list(act.on_command).length ? [`loads on command ${list(act.on_command).join(", ")}`] : []),
+    ...(list(act.on_event).length ? [`loads on event ${list(act.on_event).join(", ")}`] : []),
+    ...(list(act.on_kind).length ? [`loads on kind ${list(act.on_kind).join(", ")}`] : []),
+  ]);
+  section("kinds", list(provides.kinds));
+  section("points read", reads);
+  section("points written", writes, (p) => {
+    const r = points.find((q) => q.point === p);
+    return r && r.readers.length === 0 ? "nothing reads this" : undefined;
+  });
+  section("vars", list(provides.vars));
+  section("highlights", colours);
+  // Last, because it is the longest: a panel has forty verbs and one manifest.
+  section("commands", mine, (name) => {
+    const bound = keys.filter((k) => k.command === name).map((k) => k.lhs);
+    return bound.length ? bound.join("  ") : undefined;
+  });
+  if (rows.length === 0) rows.push({ label: "registered nothing", hl: "Sidebar.Dim" });
+
+  await picker<number>(
+    neosh,
+    rows.map((r, i) => ({ label: r.label, detail: r.detail, hl: r.hl, icon: r.icon, value: i })),
+    { title: chosen, width: 80, height: 24, filter: false, hints: "" },
+  );
+}

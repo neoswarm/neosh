@@ -59,8 +59,16 @@ import {
   confirmDestructive,
   configureMotion,
   CursoredList,
+  type Decoration,
+  type DecorationItem,
+  badgeWidth as badgeColumns,
+  decorateRow,
   elapsed,
   type ListRow,
+  mergeDecorations,
+  placeSections,
+  type SectionItem,
+  sectionRows as contributedRows,
   money,
   onTick,
   pathPicker,
@@ -96,40 +104,32 @@ type Target =
  */
 const POINT_SECTION = "sidebar.section";
 const POINT_ACTION = "sidebar.action";
+/**
+ * Something to put *on* a row this panel already draws — a git badge on a project, a colour on a
+ * conversation — keyed by what the row is about rather than where it is.
+ *
+ * The third kind of thing a plugin can do to a panel it did not write, and the one ADR 0040 left
+ * out: a section is rows of your own, an action is a verb on ours, and this is a mark on ours. Pure
+ * data, merged at draw time, so a decorator costs the panel nothing on the paint path and can be
+ * listed and disabled like any contribution. It is nvim-tree's decorator API as a contribution.
+ */
+const POINT_DECORATION = "sidebar.decoration";
 
-/** A block of rows somebody else owns. Contributed as data, so it survives being listed and disabled. */
-interface SectionItem {
-  /** Drawn as a heading with a rule under it, matching `PROJECTS`. Omit for rows with no heading. */
-  title?: string;
-  /**
-   * The way in, drawn dim at the right of the heading: `^L`, `^G`.
-   *
-   * A section here is a summary of something that has a real panel behind it, and a summary with no
-   * way out of it is one you read and then have to go and find the rest of by guessing. The heading
-   * is where it goes because that costs no row and is the first thing the eye lands on — a hint on
-   * the last row is one you have already scrolled past by the time you want it.
-   */
-  hint?: string;
-  /** Where it goes relative to the project list. Defaults to `below`. */
-  at?: "above" | "below";
-  rows?: Array<{
-    text: string;
-    hl?: string;
-    /**
-     * Highlights for pieces of the row, over the top of `hl`: a brand mark, a matched substring, a
-     * state glyph.
-     *
-     * `from`/`to` are UTF-8 byte offsets into *your* `text` — this panel adds its own indent and
-     * shifts them. One group per row is not enough for a row that is a measurement in one colour
-     * with somebody's mark on the front of it, and the alternative is a plugin drawing its own
-     * window beside ours.
-     */
-    spans?: Array<{ from: number; to: number; hl: string }>;
-    right?: { text: string; hl?: string };
-    /** Run on `↵`. Without one the row is inert — a label rather than a verb. */
-    command?: string;
-    args?: string[];
-  }>;
+/**
+ * The blocks this panel draws, in order, for a section to sit `before` or `after`.
+ *
+ * Published rather than implied: `above`/`below` gave a contributor two slots and no way to land
+ * between two of anybody else's sections. A section may also name another section's id.
+ */
+const SLOTS = ["projects", "add", "archived"] as const;
+type Slot = (typeof SLOTS)[number];
+
+/** The key a decoration is filed under: what the row is *about*. */
+function targetKey(t: Target | undefined): string | null {
+  if (!t) return null;
+  if (t.kind === "project") return `project:${t.cwd}`;
+  if (t.kind === "session") return `session:${t.id}`;
+  return null;
 }
 
 /**
@@ -181,6 +181,32 @@ interface Project {
 const NS = "neosh.sidebar";
 /** What this panel's buffer says it is. Everything a third party binds or finds hangs off this. */
 const KIND = "neosh.sidebar";
+
+/** Emitted on every cursor move, with the row under it as `data` — a {@link Target} or `null`. */
+const EVENT_CURSOR = "sidebar.cursor";
+
+/**
+ * What this panel offers a plugin that imports it: `import { api } from "plugin:sidebar"`.
+ *
+ * The same answers are on the commands `sidebar.cursor` and `sidebar.rows` for a plugin that would
+ * rather `cmd.call` than depend on us; this is the typed, zero-round-trip form for one that has
+ * put `requires = ["sidebar"]` in its manifest. Filled in by `activate`, so a caller that reads it
+ * before then sees a panel that is not open and has no rows — which is true.
+ */
+export const api = {
+  /** The buffer kind, for `keymap.set` at `buf_kind` scope and `win.ofKind`. */
+  kind: KIND,
+  /** The contribution points this panel reads. */
+  points: { section: POINT_SECTION, action: POINT_ACTION, decoration: POINT_DECORATION },
+  /** The blocks a section may sit `before` or `after`, in the order they are drawn. */
+  slots: SLOTS as readonly string[],
+  /** The row under the cursor, or `null` when the panel is closed or on nothing. */
+  cursor: (): Target | null => null,
+  /** Every row that can be landed on, top to bottom. */
+  rows: (): Target[] => [],
+  /** Redraw now rather than on the next tick. */
+  refresh: async (): Promise<void> => {},
+};
 
 /**
  * Project vars, which are shared rather than ours.
@@ -244,6 +270,13 @@ const VAR_ROOT = "sidebar.root";
  * having to know the other one exists.
  */
 const VAR_ASKING = "question.asking";
+/**
+ * The same, for a permission prompt. Written by whatever serves `permission_pre` — the bundled
+ * `approvals` plugin — and folded into the same set: a conversation blocked on "may I run this" is
+ * blocked exactly as one blocked on "which database", and drew as an ordinary spinner until this
+ * was read.
+ */
+const VAR_PERMITTING = "permission.asking";
 
 export async function activate({ neosh, subscriptions }: PluginContext) {
   await declareOptions(neosh);
@@ -267,9 +300,15 @@ export async function activate({ neosh, subscriptions }: PluginContext) {
   // Read once and then kept current from `vars.onChange`, like the arrangement and for the same
   // reason: a draw runs on a 100 ms tick while a turn is in flight and must not spend a round trip
   // per frame asking a question whose answer changes twice an hour.
-  let asking = asked(
-    await neosh.vars.get<string[]>({ scope: "global" }, VAR_ASKING).catch(() => null),
-  );
+  const waiting = {
+    questions: asked(
+      await neosh.vars.get<string[]>({ scope: "global" }, VAR_ASKING).catch(() => null),
+    ),
+    permissions: asked(
+      await neosh.vars.get<string[]>({ scope: "global" }, VAR_PERMITTING).catch(() => null),
+    ),
+  };
+  let asking = new Set([...waiting.questions, ...waiting.permissions]);
 
   // The kind is what makes this panel something other plugins can act on: it is the scope their
   // keymaps bind at and the handle `win.ofKind` finds it by. One argument, and the difference
@@ -279,7 +318,15 @@ export async function activate({ neosh, subscriptions }: PluginContext) {
   // The panel's own width, as of the last frame. The list needs it to unfold the row under the
   // cursor, and reading the option again per render would be a round trip inside a redraw.
   let panelWidth = 34;
-  const list = new CursoredList<Target>(neosh, buf, ns, { width: () => panelWidth });
+  const list = new CursoredList<Target>(neosh, buf, ns, {
+    width: () => panelWidth,
+    // Said out loud on every move, so a plugin can follow the cursor without polling — a preview
+    // of the conversation under it, a status segment naming the project. One event per keystroke,
+    // which is what the composer already costs.
+    onMove: () => void neosh.event.emit(EVENT_CURSOR, list.value ?? null),
+  });
+  api.cursor = () => list.value ?? null;
+  api.rows = () => list.values;
   let win: WindowId | null = null;
   let focused = false;
   // Typed before a motion and consumed by it. Shared with the key table and with the draw, which
@@ -321,7 +368,8 @@ export async function activate({ neosh, subscriptions }: PluginContext) {
           actions: actions(),
           asking,
           count: count.pending,
-          // Filled in by `collect`, which is what reads the swarm.
+          // Filled in by `collect`, which is what reads the swarm and the decorations.
+          decorations: new Map(),
           remote: new Map(),
           hosts: new Map(),
         });
@@ -395,6 +443,7 @@ export async function activate({ neosh, subscriptions }: PluginContext) {
   const actions = installed.actions;
   subscriptions.push(installed.dispose);
 
+  api.refresh = draw;
   await registerCommands({
     neosh,
     subscriptions,
@@ -436,8 +485,10 @@ export async function activate({ neosh, subscriptions }: PluginContext) {
       if (arrangement.observe(e.scope, e.key, e.value)) void draw();
       // Somebody started waiting on an answer, or stopped. Deleting the var is how "nobody is
       // asking" arrives, and it comes through here with `value` unset rather than as an empty list.
-      if (e.scope.scope === "global" && e.key === VAR_ASKING) {
-        asking = asked(e.value);
+      if (e.scope.scope === "global" && (e.key === VAR_ASKING || e.key === VAR_PERMITTING)) {
+        if (e.key === VAR_ASKING) waiting.questions = asked(e.value);
+        else waiting.permissions = asked(e.value);
+        asking = new Set([...waiting.questions, ...waiting.permissions]);
         void draw();
       }
     }),
@@ -446,7 +497,7 @@ export async function activate({ neosh, subscriptions }: PluginContext) {
   // after us contributing rows nobody sees until the next unrelated refresh.
   subscriptions.push(
     neosh.ext.onChange((e) => {
-      if (e.point === POINT_SECTION) void draw();
+      if (e.point === POINT_SECTION || e.point === POINT_DECORATION) void draw();
     }),
   );
   subscriptions.push(
@@ -558,6 +609,13 @@ class Arrangement {
     );
     this.known.forEach((cwd, i) => this.cache.set(cwd, all[i] ?? {}));
     if (stored === null) await this.migrate();
+    // Written back whenever the startup list added to it — including the very first start, when
+    // nothing was stored. The var is the list other plugins are told to read (a decorator asks it
+    // which projects to decorate), and a list that only reached the disk once a *second* project
+    // appeared was a list that said nothing on the day it mattered most.
+    if (this.known.length !== strings(stored).length) {
+      await this.neosh.vars.set({ scope: "global" }, VAR_KNOWN, this.known);
+    }
   }
 
   /**
@@ -1071,6 +1129,18 @@ async function registerCommands(w: Wiring): Promise<void> {
   w.subscriptions.push(
     await neosh.cmd.register("sidebar.refresh", w.draw, { desc: "Redraw the sidebar now" }),
   );
+  // The two questions a plugin on top of this panel asks, as commands so `cmd.call` answers them
+  // without a dependency. What a key press passes as arguments, a call gets as the answer.
+  w.subscriptions.push(
+    await neosh.cmd.register("sidebar.cursor", () => list.value ?? null, {
+      desc: "The row under the sidebar's cursor",
+    }),
+  );
+  w.subscriptions.push(
+    await neosh.cmd.register("sidebar.rows", () => api.rows(), {
+      desc: "Every row in the sidebar you can land on",
+    }),
+  );
   w.subscriptions.push(
     await neosh.cmd.register("session.new", (args) => newConversation(neosh, args[0]), {
       desc: "Start a new conversation — here, or in a worktree of its own",
@@ -1233,6 +1303,7 @@ function installActions(
     for (const d of registered) d.dispose();
     bound = [];
     registered = [];
+    const reserved = await reservedKeys(neosh);
 
     for (const c of valid) {
       const name = `${NS}.action.${c.plugin}.${c.id}`;
@@ -1250,7 +1321,7 @@ function installActions(
       // the binding on a third party's behalf, so that rule points the wrong way and the check is
       // ours to make. The command stays registered either way — `^K` still runs it, and the
       // contributor is told which key it did not get.
-      if (RESERVED.has(c.item.key)) {
+      if (reserved.has(c.item.key)) {
         neosh.log.warn(
           `${c.plugin} asked for '${c.item.key}' in the sidebar, which is already a panel key`,
         );
@@ -1281,11 +1352,25 @@ function installActions(
   };
 }
 
-/** The keys this panel has already spoken for. A contribution asking for one of these is a bug in it. */
-const RESERVED = new Set([
-  "j", "k", "q", "f", "J", "K", "r", "x", "X", "n", "a", "o", "y", "?", " ",
-  "<Esc>", "<CR>", "<Up>", "<Down>", "<Space>", "<C-n>", "<C-p>", "<C-c>",
-]);
+/**
+ * The keys this panel has already spoken for. A contribution asking for one of these is a bug in it.
+ *
+ * Read off the registry rather than kept in a list here: the list this replaced was missing
+ * `gg`, `G`, `^D`, `^U`, `⇥` and every digit — keys the panel binds a few hundred lines up — so a
+ * contributed `G` silently replaced *go to the bottom* with no warning to anybody. A fact about
+ * which keys are bound is a fact the keymap table already has.
+ */
+async function reservedKeys(neosh: Neosh): Promise<Set<string>> {
+  const all = await neosh.keymap.list("chat").catch(() => []);
+  return new Set(
+    all
+      .filter((k) =>
+        k.scope.kind === "buf_kind" && k.scope.name === KIND &&
+        !k.command.startsWith(`${NS}.action.`)
+      )
+      .map((k) => k.lhs),
+  );
+}
 
 function applies(
   on: "project" | "session" | "custom" | "any",
@@ -2377,6 +2462,8 @@ interface DrawOptions {
   actions: ActionItem[];
   /** Which conversations are waiting on an answer from you. See [`VAR_ASKING`]. */
   asking: Set<string>;
+  /** Marks other plugins put on our rows, by [`targetKey`]. See [`POINT_DECORATION`]. */
+  decorations: Map<string, Decoration>;
   /** A count typed but not yet spent, drawn at the foot the way Vim draws it. */
   count: string;
   /** Conversations on other computers, grouped by the project key they share with ours. */
@@ -2434,7 +2521,12 @@ async function collect(
   for (const r of swarm) {
     if (!keys.has(r.agent.cwd)) keys.set(r.agent.cwd, r.agent.project);
   }
-  opts = { ...opts, remote, hosts };
+  // Marks other plugins put on our rows. Read every frame for the reason sections are: a
+  // decorator re-contributes in place when its data changes, and the read is one call.
+  const decorations = mergeDecorations(
+    await neosh.ext.list<DecorationItem>(POINT_DECORATION).catch(() => []),
+  );
+  opts = { ...opts, remote, hosts, decorations };
   const projects = group(sessions, arrangement, keys).flat();
 
   // A directory that turned up in the conversation list and we had not seen before. Noted rather
@@ -2452,164 +2544,103 @@ async function collect(
   // Rows other plugins own. Read every frame rather than cached, because a contribution is replaced
   // in place when its author's data changes and re-reading is one call.
   const sections = await neosh.ext.list<SectionItem>(POINT_SECTION).catch(() => []);
-  rows.push(...sectionRows(sections, "above", opts));
+  const order = placeSections(SLOTS, sections);
+  const section = (c: Contribution & { item: SectionItem }) =>
+    rows.push(...contributedRows<Target>(c, {
+      width: opts.width,
+      custom: (command, args) => ({ kind: "custom", command, args }),
+    }));
 
-  rows.push(...heading("PROJECTS", opts.width));
-  for (const p of projects) {
-    rows.push(projectRow(p, arrangement, opts, now));
-    if (arrangement.isFolded(p.cwd)) continue;
-    for (const s of p.sessions) rows.push(sessionRow(s, now, opts));
-    // Its worktrees, inside it. Each is a project row one level down — its own fold, its own
-    // rank, `n` makes another conversation in it — because a worktree of a repository is not a
-    // neighbour of the repository, and the column should say so.
-    for (const t of p.worktrees) {
-      rows.push(worktreeRow(t, arrangement, opts, now));
-      if (arrangement.isFolded(t.cwd)) continue;
-      for (const s of t.sessions) rows.push(sessionRow(s, now, opts, 1));
+  // The blocks this panel draws, each the same shape: so that a section can sit before or after
+  // any of them by name, and the foot is whatever lands after the last one.
+  const blocks: Record<Slot, () => void> = {
+    projects: () => {
+      rows.push(...heading("PROJECTS", opts.width));
+      for (const p of projects) {
+        rows.push(projectRow(p, arrangement, opts, now));
+        if (arrangement.isFolded(p.cwd)) continue;
+        for (const s of p.sessions) rows.push(sessionRow(s, now, opts));
+        // Its worktrees, inside it. Each is a project row one level down — its own fold, its own
+        // rank, `n` makes another conversation in it — because a worktree of a repository is not a
+        // neighbour of the repository, and the column should say so.
+        for (const t of p.worktrees) {
+          rows.push(worktreeRow(t, arrangement, opts, now));
+          if (arrangement.isFolded(t.cwd)) continue;
+          for (const s of t.sessions) rows.push(sessionRow(s, now, opts, 1));
+        }
+        // The same project, being worked on elsewhere. Under the same heading rather than in a
+        // section of their own: they are not a different kind of thing, they are the same work on
+        // a different computer, and a separate `REMOTE` block would make you check two places for
+        // one project.
+        for (const r of remote.get(p.key) ?? []) rows.push(remoteRow(r, opts, now));
+        if (
+          p.sessions.length === 0 && p.worktrees.length === 0 &&
+          (remote.get(p.key) ?? []).length === 0
+        ) {
+          rows.push({ text: "     nothing here yet", hl: "Sidebar.Dim", inert: true });
+        }
+      }
+
+      // Projects that exist only on other machines. Without these, a repository you have not
+      // cloned here is invisible — and "which computers is this on" cannot answer "not this one".
+      for (const [key, list] of remote) {
+        if (projects.some((p) => p.key === key)) continue;
+        const first = list[0];
+        if (!first) continue;
+        rows.push({
+          text: ` ${opts.ascii ? "~" : "▹"} ${clip(first.agent.project_name, opts.width - 10)}`,
+          hl: "Sidebar.Remote",
+          right: { text: `${clip((hosts.get(key) ?? []).join(" "), 12)} `, hl: "Sidebar.Remote" },
+          inert: true,
+        });
+        for (const r of list) rows.push(remoteRow(r, opts, now));
+      }
+    },
+    add: () => {
+      rows.push(blank());
+      rows.push({
+        text: " + Add project",
+        hl: "Accent",
+        value: { kind: "add" },
+      });
+    },
+    archived: () => {
+      // One row, and only while there is something in it. What used to be here was a foldable
+      // section with every archived conversation under it — which put the things you have
+      // finished with in the same column as the things you are working on, and grew without
+      // limit. The point of archiving is that it goes away; a door is the most this panel should
+      // spend on saying where.
+      if (archived.length > 0) {
+        rows.push({
+          text: ` ${opts.ascii ? "-" : "┈"} Archived`,
+          hl: "Sidebar.Dim",
+          right: { text: `${archived.length} `, hl: "Sidebar.Dim" },
+          value: { kind: "browse", count: archived.length },
+        });
+      }
+    },
+  };
+
+  // Everything after the last of our own blocks is the panel's foot: rows somebody contributed
+  // below the list, and the key strip. Counted so the list can hold them against the bottom edge —
+  // a plan gauge that sits under the last project is in a different place every time a project is
+  // added or folded, which is the one thing a status strip must not be.
+  let body = 0;
+  for (const entry of order) {
+    if (typeof entry === "string") {
+      blocks[entry]();
+      body = rows.length;
+    } else {
+      section(entry);
     }
-    // The same project, being worked on elsewhere. Under the same heading rather than in a section
-    // of their own: they are not a different kind of thing, they are the same work on a different
-    // computer, and a separate `REMOTE` block would make you check two places for one project.
-    for (const r of remote.get(p.key) ?? []) rows.push(remoteRow(r, opts, now));
-    if (
-      p.sessions.length === 0 && p.worktrees.length === 0 &&
-      (remote.get(p.key) ?? []).length === 0
-    ) {
-      rows.push({ text: "     nothing here yet", hl: "Sidebar.Dim", inert: true });
-    }
   }
-
-  // Projects that exist only on other machines. Without these, a repository you have not cloned
-  // here is invisible — and "which computers is this on" cannot answer "not this one".
-  for (const [key, list] of remote) {
-    if (projects.some((p) => p.key === key)) continue;
-    const first = list[0];
-    if (!first) continue;
-    rows.push({
-      text: ` ${opts.ascii ? "~" : "▹"} ${clip(first.agent.project_name, opts.width - 10)}`,
-      hl: "Sidebar.Remote",
-      right: { text: `${clip((hosts.get(key) ?? []).join(" "), 12)} `, hl: "Sidebar.Remote" },
-      inert: true,
-    });
-    for (const r of list) rows.push(remoteRow(r, opts, now));
-  }
-
-  rows.push(blank());
-  rows.push({
-    text: " + Add project",
-    hl: "Accent",
-    value: { kind: "add" },
-  });
-
-  // One row, and only while there is something in it. What used to be here was a foldable section
-  // with every archived conversation under it — which put the things you have finished with in the
-  // same column as the things you are working on, and grew without limit. The point of archiving is
-  // that it goes away; a door is the most this panel should spend on saying where.
-  if (archived.length > 0) {
-    rows.push({
-      text: ` ${opts.ascii ? "-" : "┈"} Archived`,
-      hl: "Sidebar.Dim",
-      right: { text: `${archived.length} `, hl: "Sidebar.Dim" },
-      value: { kind: "browse", count: archived.length },
-    });
-  }
-
-  // Everything from here down is the panel's foot: rows somebody contributed below the list, and
-  // the key strip. Counted so the list can hold them against the bottom edge — a plan gauge that
-  // sits under the last project is in a different place every time a project is added or folded,
-  // which is the one thing a status strip must not be.
-  const body = rows.length;
-  rows.push(...sectionRows(sections, "below", opts));
 
   if (opts.hints) rows.push(...hints(opts));
 
   return { rows, running, pinned: rows.length - body };
 }
 
-/**
- * Rows somebody else contributed, in the half of the column they asked for.
- *
- * Every field is checked rather than trusted. A contribution is JSON from a plugin this one has
- * never heard of, and a panel that throws on a missing `text` is a panel a third party can break by
- * getting one row wrong — which would make contributing feel like a risk rather than the ordinary
- * way to add something.
- */
-function sectionRows(
-  sections: Array<Contribution & { item: SectionItem }>,
-  at: "above" | "below",
-  opts: DrawOptions,
-): ListRow<Target>[] {
-  const rows: ListRow<Target>[] = [];
-  for (const c of sections) {
-    if ((c.item?.at ?? "below") !== at) continue;
-    const contributed = Array.isArray(c.item?.rows) ? c.item.rows : [];
-    if (contributed.length === 0 && !c.item?.title) continue;
-
-    rows.push(blank());
-    if (typeof c.item.title === "string" && c.item.title !== "") {
-      const hint = typeof c.item.hint === "string" ? c.item.hint : undefined;
-      rows.push(
-        ...heading(clip(c.item.title, opts.width - 2), opts.width, hint),
-      );
-    }
-    // One column, the same as this panel's own headings and top-level rows — a section is a
-    // section, not something indented under one. The three it used to be were three columns of a
-    // gauge, on every row of the strip, saying nothing.
-    const margin = " ";
-    for (const r of contributed) {
-      if (typeof r?.text !== "string") continue;
-      const text = `${margin}${clip(r.text, Math.max(4, opts.width - 2 - margin.length))}`;
-      rows.push({
-        text,
-        // A third party's row gets the same treatment ours do: we have no idea how long its text
-        // is, and a plugin's row cut at our column is our bug rather than theirs.
-        full: `${margin}${r.text}`,
-        indent: margin.length,
-        hl: typeof r.hl === "string" ? r.hl : undefined,
-        // Shifted by our indent and clamped to what survived the clip. Checked rather than
-        // trusted, like every other field here: a span running off the end of a row this panel
-        // shortened is a mark on a column that is not there.
-        spans: shift(r.spans, byteLength(margin), byteLength(text)),
-        right: typeof r.right?.text === "string"
-          ? { text: `${r.right.text} `, hl: r.right.hl }
-          : undefined,
-        // No command means a label. A row you can land on that does nothing when you press `↵` is
-        // worse than one the cursor skips.
-        inert: typeof r.command !== "string",
-        value: typeof r.command === "string"
-          ? { kind: "custom", command: r.command, args: strings(r.args) }
-          : undefined,
-      });
-    }
-  }
-  return rows;
-}
-
-/**
- * A section heading, with a rule under it.
- *
- * The rule is what turns a column of text into sections. Without it every row reads at the same
- * weight and the eye has to parse the words to find the structure — which is exactly the work a
- * layout is supposed to have already done.
- */
-/** Somebody else's spans, in this panel's coordinates. */
-function shift(
-  spans: unknown,
-  by: number,
-  eol: number,
-): Array<{ from: number; to: number; hl: string }> | undefined {
-  if (!Array.isArray(spans)) return undefined;
-  const out = spans.flatMap((s) => {
-    if (typeof s?.from !== "number" || typeof s?.to !== "number" || typeof s?.hl !== "string") {
-      return [];
-    }
-    const from = Math.max(0, Math.floor(s.from)) + by;
-    const to = Math.min(Math.max(0, Math.floor(s.to)) + by, eol);
-    return to > from ? [{ from, to, hl: s.hl }] : [];
-  });
-  return out.length > 0 ? out : undefined;
-}
-
+/** A section heading, with a rule under it — what turns a column of text into sections. */
 function heading(text: string, width: number, hint?: string): ListRow<Target>[] {
   return [
     {
@@ -2724,11 +2755,13 @@ function projectRow(
   // The star's two columns come off the name that is about to carry it, so a favourite and the
   // project under it still end in the same place — clipping the name is what a panel this narrow
   // does, and letting the mark run two columns past everything else is not.
+  const target: Target = { kind: "project", cwd: p.cwd };
   const name = clip(
     p.name,
     Math.max(
       6,
-      opts.width - 8 - byteLength(mark) - byteLength(star) - (elsewhere.length ? 8 : 0),
+      opts.width - 8 - byteLength(mark) - byteLength(star) - (elsewhere.length ? 8 : 0) -
+        badgeColumns(opts.decorations.get(targetKey(target) ?? "")),
     ),
   );
   const spans: Array<{ from: number; to: number; hl: string }> = [];
@@ -2740,7 +2773,7 @@ function projectRow(
     const from = byteLength(` ${arrow} ${name}${star}`);
     spans.push({ from, to: from + byteLength(mark), hl: markHl });
   }
-  return {
+  return decorateRow({
     text: ` ${arrow} ${name}${star}${mark}`,
     // A project's name is a directory name, and directory names are long. Clipped it is the same
     // eight characters as the three others you have open beside it, which is the panel failing at
@@ -2748,15 +2781,16 @@ function projectRow(
     // survived the clip and are already on the row.
     full: ` ${arrow} ${p.name}`,
     indent: 3,
-    hl: here ? "Directory" : "Sidebar.Dim",
+    // `here` is this panel's opinion; everything else is a decorator's to colour.
+    hl: here ? "Directory" : opts.decorations.get(targetKey(target) ?? "")?.hl ?? "Sidebar.Dim",
     spans: spans.length > 0 ? spans : undefined,
     right: elsewhere.length > 0
       // The machines take the column the count would have used. A project that is in two places is
       // a more useful thing to know than how many conversations are in it here.
       ? { text: `${clip(elsewhere.join(" "), 14)} `, hl: "Sidebar.Remote" }
       : right,
-    value: { kind: "project", cwd: p.cwd },
-  };
+    value: target,
+  }, opts.decorations.get(targetKey(target) ?? ""), Boolean(busy) || elsewhere.length > 0);
 }
 
 /**
@@ -2800,9 +2834,10 @@ function worktreeRow(
   // conversation takes from the project it is in. Three, when the star was on the left, made the
   // nesting read as two levels where there is one.
   const pad = "   ";
+  const target: Target = { kind: "project", cwd: p.cwd };
   const name = clip(
     p.name,
-    Math.max(6, opts.width - 8 - byteLength(glyph) - byteLength(mark)),
+    Math.max(6, opts.width - 8 - byteLength(glyph) - byteLength(mark) - badgeColumns(opts.decorations.get(targetKey(target) ?? ""))),
   );
   const spans: Array<{ from: number; to: number; hl: string }> = [];
   if (glyph !== "") {
@@ -2817,18 +2852,18 @@ function worktreeRow(
       hl: cut > 0 ? "Diagnostic.Error" : "Status.Unread",
     });
   }
-  return {
+  return decorateRow({
     text: `${pad}${arrow} ${glyph}${name}${mark}`,
     // A branch name is as long as somebody made it, and this row is two columns narrower than a
     // project's. The unread mark is left off the unfolded form: it survived the clip and is
     // already on the row.
     full: `${pad}${arrow} ${glyph}${p.name}`,
     indent: byteLength(`${pad}${arrow} `),
-    hl: here ? "Directory" : "Sidebar.Dim",
+    hl: here ? "Directory" : opts.decorations.get(targetKey(target) ?? "")?.hl ?? "Sidebar.Dim",
     spans: spans.length > 0 ? spans : undefined,
     right,
-    value: { kind: "project", cwd: p.cwd },
-  };
+    value: target,
+  }, opts.decorations.get(targetKey(target) ?? ""), Boolean(busy));
 }
 
 /**
@@ -2923,6 +2958,7 @@ function sessionRow(
   // Two more columns per level: a conversation inside a worktree sits inside the worktree's row
   // the way the worktree sits inside its repository's.
   const pad = "   " + "  ".repeat(depth);
+  const target: Target = { kind: "session", id: s.id, cwd: s.cwd };
   // What is left for the title, counted rather than guessed at. The indent, the glyph and the
   // space after it come off the front; the age column and the space keeping it off the panel edge
   // come off the end, plus one column of air so a title cannot run into a timestamp. The old
@@ -2930,9 +2966,10 @@ function sessionRow(
   // of every title in the panel spent on nothing.
   const room = Math.max(
     8,
-    opts.width - pad.length - 2 - (right === "" ? 0 : right.length + 2),
+    opts.width - pad.length - 2 - (right === "" ? 0 : right.length + 2) -
+      badgeColumns(opts.decorations.get(targetKey(target) ?? "")),
   );
-  return {
+  return decorateRow({
     text: `${pad}${glyph} ${clip(s.label, room)}`,
     // The title is the only thing telling two conversations in one project apart, and a generated
     // title is a sentence rather than a word — so the column cuts it at about the point where it
@@ -2983,8 +3020,8 @@ function sessionRow(
             ? "Status.Unread"
             : running ? "Status.Monitoring" : "Sidebar.Dim",
     },
-    value: { kind: "session", id: s.id, cwd: s.cwd },
-  };
+    value: target,
+  }, opts.decorations.get(targetKey(target) ?? ""), Boolean(s.active_turn));
 }
 
 /**

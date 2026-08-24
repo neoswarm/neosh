@@ -5,5 +5,6 @@ import type { ToolResult } from "./ToolResult";
 export type PluginResponse =
   | { "type": "tool"; result: ToolResult }
   | { "type": "hook"; outcome: HookOutcome }
+  | { "type": "command"; value: unknown }
   | { "type": "provider_accepted" }
   | { "type": "error"; message: string };

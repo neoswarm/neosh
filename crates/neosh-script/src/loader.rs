@@ -130,6 +130,24 @@ pub fn write_api_types(dest: &std::path::Path) -> std::io::Result<usize> {
     Ok(n)
 }
 
+/// Write the bundled plugins' source to `dest`, one directory per plugin, so a plugin author can
+/// type-check `import ... from "plugin:sidebar"` against the code this binary actually runs.
+pub fn write_builtin_sources(dest: &std::path::Path) -> std::io::Result<usize> {
+    std::fs::create_dir_all(dest)?;
+    let mut n = 0;
+    for entry in BUILTIN_TREE.dirs() {
+        for file in entry.files() {
+            let path = dest.join(file.path());
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::write(&path, file.contents())?;
+            n += 1;
+        }
+    }
+    Ok(n)
+}
+
 /// Whether a previously written tree still matches this binary.
 pub fn api_types_are_current(dest: &std::path::Path) -> bool {
     fn check(dir: &include_dir::Dir<'_>, dest: &std::path::Path) -> bool {
@@ -180,14 +198,33 @@ fn api_submodule(name: &str) -> Option<&'static str> {
 
 type SourceMaps = Rc<RefCell<HashMap<String, Vec<u8>>>>;
 
+/// Loaded plugins by name, and the entry URL each one was loaded from. What `plugin:<name>`
+/// resolves to.
+pub type PluginUrls = Rc<RefCell<HashMap<String, String>>>;
+
+/// What a plugin writes to import another plugin's module: `import { api } from "plugin:sidebar"`.
+///
+/// Resolves to the other plugin's *entry* URL, generation query included, so deno_core hands back
+/// the very module instance the host activated — the same module-level state, not a second copy
+/// of it. One isolate for every plugin is what makes this free; it is Neovim's `require`, and it
+/// is why a plugin can ask the sidebar a question without a round trip through the host.
+pub const PLUGIN_SCHEME: &str = "plugin:";
+
 #[derive(Default)]
 pub struct NeoshModuleLoader {
     source_maps: SourceMaps,
+    plugins: PluginUrls,
 }
 
 impl NeoshModuleLoader {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// A loader that can resolve `plugin:<name>` against the plugins the runtime has been asked
+    /// to load.
+    pub fn with_plugins(plugins: PluginUrls) -> Self {
+        Self { plugins, ..Default::default() }
     }
 
     fn transpile(specifier: &ModuleSpecifier, code: String, media_type: MediaType, maps: &SourceMaps) -> Result<String, ModuleLoaderError> {
@@ -253,6 +290,17 @@ impl ModuleLoader for NeoshModuleLoader {
             }
             return ModuleSpecifier::parse(&format!("neosh:{sub}")).map_err(JsErrorBox::from_err);
         }
+        if let Some(name) = specifier.strip_prefix(PLUGIN_SCHEME) {
+            let url = self.plugins.borrow().get(name).cloned();
+            return match url {
+                Some(url) => ModuleSpecifier::parse(&url).map_err(JsErrorBox::from_err),
+                // Named here rather than failing as `undefined` later: the fix is one line in
+                // the manifest, and the message says which line.
+                None => Err(JsErrorBox::generic(format!(
+                    "cannot import {specifier:?}: no plugin named {name:?} is loaded. Add it to                      `requires` in plugin.toml so it loads first, and check it is installed and                      not in `plugins.disabled`."
+                ))),
+            };
+        }
         // Relative and absolute paths resolve against the referrer.
         if specifier.starts_with('.') || specifier.starts_with('/') {
             let mut resolved = resolve_import(specifier, referrer).map_err(JsErrorBox::from_err)?;
@@ -279,8 +327,8 @@ impl ModuleLoader for NeoshModuleLoader {
         // importing `lodash` must fail loudly at load rather than mysteriously at runtime.
         Err(JsErrorBox::generic(format!(
             "cannot resolve {specifier:?}: neosh plugins may import only relative paths, \
-             \"{API_SPECIFIER}\" and its submodules ({}). Bundle third-party code into your \
-             plugin.",
+             \"{API_SPECIFIER}\" and its submodules ({}), and \"plugin:<name>\" for a plugin \
+             named in `requires`. Bundle third-party code into your plugin.",
             available_submodules().join(", ")
         )))
     }

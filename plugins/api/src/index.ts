@@ -43,7 +43,9 @@ import type { ExtmarkInfo } from "./generated/ExtmarkInfo";
 import type { ExtmarkOpts } from "./generated/ExtmarkOpts";
 import type { FloatConfig } from "./generated/FloatConfig";
 import type { HighlightDef } from "./generated/HighlightDef";
+import type { HighlightEntry } from "./generated/HighlightEntry";
 import type { HighlightSpec } from "./generated/HighlightSpec";
+import type { HlTarget } from "./generated/HlTarget";
 import type { HookName } from "./generated/HookName";
 import type { HookOutcome } from "./generated/HookOutcome";
 import type { HookPayload } from "./generated/HookPayload";
@@ -72,6 +74,9 @@ import type { QuestionAnswer } from "./generated/QuestionAnswer";
 import type { QuestionOption } from "./generated/QuestionOption";
 import type { UserQuestion } from "./generated/UserQuestion";
 import type { PluginEvent } from "./generated/PluginEvent";
+import type { PointInfo } from "./generated/PointInfo";
+import type { PluginInfo } from "./generated/PluginInfo";
+import type { PluginManifest } from "./generated/PluginManifest";
 import type { Pricing } from "./generated/Pricing";
 import type { QuotaCredits } from "./generated/QuotaCredits";
 import type { QuotaSample } from "./generated/QuotaSample";
@@ -128,12 +133,12 @@ export type {
   AccountKind, Activity, ApiError, BranchInfo, Brand, BufferId, Capability, CommandEntry, CommitInfo,
   AgentCommand, AgentState, AgentSummary,
   Contribution, CredentialInfo, CredentialSource, CursorShape, DiffTarget, Dock, CursorMotion, ExtmarkId, ExtmarkInfo, ExtmarkOpts, FileChange, FileState, FloatConfig,
-  Gravity, HighlightDef, HighlightSpec, Hint, HookName, HookOutcome, HookPayload, InstanceConfig, KeyContext,
+  Gravity, HighlightDef, HighlightEntry, HighlightSpec, Hint, HlTarget, HookName, HookOutcome, HookPayload, InstanceConfig, KeyContext,
   AttachmentInfo,
   KeymapEntry, KeymapScope, MessageLevel, Mode, ModelEntry, ModelInfo, ModelSelection, ModelTier, NamespaceId,
   OptionChoice, OptionEntry, OptionSelection, OptionSpec, OptionType, OptionValue,
   DriverCommand, PlanState, PlanStep, TaskId, TaskStatus,
-  Message, PermissionDecision, PermissionMode, PermissionOption, PermissionOptionKind, PluginEvent, Pricing, ProviderEvent, ProviderOptionDescriptor,
+  Message, PermissionDecision, PermissionMode, PermissionOption, PermissionOptionKind, PluginEvent, PluginInfo, PluginManifest, PointInfo, Pricing, ProviderEvent, ProviderOptionDescriptor,
   QuestionAnswer, QuestionOption, UserQuestion,
   CostBasis, QuotaCredits, QuotaSample, QuotaSeverity, QuotaSnapshot, QuotaSource, QuotaWindow,
   UsageBucket, UsageHistory, UsageResolution, UsageScanSource,
@@ -468,6 +473,17 @@ export interface Neosh {
    */
   ask(questions: UserQuestion[]): Promise<QuestionAnswer[] | null>;
   /**
+   * A terminal attached to a workspace that was already running. Only a plugin drawing raw cells
+   * needs this — the core forwards a surface's cells and keeps no copy, so they have to be painted
+   * again; everything in a buffer is republished without help.
+   */
+  onViewAttached(cb: () => void): Disposable;
+  /**
+   * The workspace is stopping. `deactivate` is called after this; both are bounded, so say your
+   * goodbye quickly. Reload is not this: a reloaded plugin gets `deactivate` and nothing here.
+   */
+  onShutdown(cb: () => void): Disposable;
+  /**
    * What the agent is allowed to do without asking, and how to change it.
    *
    * `setMode` lasts for this session only. A mode switched on to get through one task should not
@@ -591,6 +607,17 @@ export interface WindowApi {
   list(): Promise<WindowInfo[]>;
   /** The open windows showing a buffer of this kind. Sugar over `list()`, which is the common case. */
   ofKind(kind: string): Promise<WindowInfo[]>;
+  /**
+   * Remap group names for one window, or for every window of a buffer kind — Neovim's
+   * `winhighlight`. `{ Normal: "Acme.Panel", "Sidebar.Selected": "Acme.Sel" }` on
+   * `{ kind: "neosh.sidebar" }` recolours the sidebar without redefining the groups anything else
+   * draws with. A window's map sits over its kind's. An empty map clears; the remap is yours and
+   * goes when your plugin does.
+   */
+  setHighlights(
+    target: { win: WindowId } | { kind: string },
+    map: Record<string, string>,
+  ): Promise<void>;
 }
 
 /**
@@ -655,8 +682,34 @@ export interface NamespaceApi {
 }
 
 export interface HighlightApi {
-  /** Declare a semantic group. Prefer `link` so an unknown theme still looks right. */
-  define(name: string, def: { link: string } | HighlightSpec): Promise<void>;
+  /**
+   * Declare a semantic group. Prefer `link` so an unknown theme still looks right.
+   *
+   * Yours from then on: a theme switch leaves it alone, and unloading your plugin takes it back to
+   * the theme's definition or away. `default: true` is Neovim's `:hi default` — define only if
+   * nobody has — which is what to use for the groups your plugin introduces, so a user's `init.ts`
+   * wins whichever of you loaded first.
+   */
+  define(
+    name: string,
+    def: { link: string } | HighlightSpec,
+    opts?: { default?: boolean },
+  ): Promise<void>;
+  /**
+   * What a group is, and what it resolves to after following links. Both `null` for a name nobody
+   * defined. The way to compute "a little dimmer than `Normal`" rather than guess at it.
+   */
+  get(name: string): Promise<{ def: HighlightDef | null; resolved: HighlightSpec | null }>;
+  /** Every group, with which plugin owns it (`owner` absent for the theme's own). */
+  list(): Promise<HighlightEntry[]>;
+  /** Undo your definition of a group. Rejects for a group another plugin owns. */
+  reset(name: string): Promise<void>;
+  /**
+   * Groups changed — defined, reset, or all of them on a theme switch. `names` says which. A
+   * panel that cached a colour reads it again here; nothing else needs to, because the frontend
+   * redraws on its own.
+   */
+  onChange(cb: (e: { names: string[] }) => void): Disposable;
 }
 
 export interface RawCellApi {
@@ -665,9 +718,30 @@ export interface RawCellApi {
   release(surface: SurfaceId): Promise<void>;
 }
 
+/** What a command handler is given and what it may give back. */
+export type CommandHandler = (args: string[], key?: KeyContext) => unknown | Promise<unknown>;
+
 export interface CommandApi {
-  register(name: string, fn: (args: string[], key?: KeyContext) => void | Promise<void>, opts?: { desc?: string }): Promise<Disposable>;
+  /**
+   * Register a command by name. Keys bind to the name; `cmd.exec` runs it; `cmd.call` runs it and
+   * returns what the handler returned, so a command is also how one plugin asks another a
+   * question — `sidebar.cursor`, `git.status.of` — without importing it.
+   */
+  register(name: string, fn: CommandHandler, opts?: { desc?: string }): Promise<Disposable>;
+  /** Run a command and do not wait for it. A key press, from code. */
   exec(name: string, args?: string[]): Promise<void>;
+  /**
+   * Run a command and wait for its answer.
+   *
+   * Whatever the handler returned, as JSON — `null` for a handler that returned nothing. Rejects
+   * with the handler's error if it threw, with `not found` if nothing registered the name, and
+   * after a long timeout if the owner never answered. Routed through the host, so it works for
+   * the host's own commands (which answer `null`) and does not care which plugin owns the name.
+   *
+   * For a typed, zero-round-trip call into a plugin you depend on, `import { api } from
+   * "plugin:<name>"` instead — see the `requires` manifest field.
+   */
+  call<T = unknown>(name: string, args?: string[]): Promise<T>;
   list(): Promise<CommandEntry[]>;
 }
 
@@ -704,6 +778,12 @@ export interface FocusApi {
   push(win: WindowId): Promise<void>;
   pop(): Promise<void>;
   current(): Promise<WindowId | null>;
+  /**
+   * The keyboard moved. `win` is `null` when nothing has it — the composer. The same fact also
+   * arrives as `neosh.win.enter` / `neosh.win.leave` on the event bus, with the buffer's kind,
+   * which is the form to use when you only care about one panel.
+   */
+  onChange(cb: (e: { win: WindowId | null }) => void): Disposable;
 }
 
 export interface AgentApi {
@@ -932,7 +1012,8 @@ export interface ProviderApi {
  * `status()` rather than guarding each call.
  */
 export interface GitApi {
-  status(): Promise<RepoStatus>;
+  /** The working tree's state. `cwd` is any checkout; omitted, the one this conversation is in. */
+  status(opts?: { cwd?: string }): Promise<RepoStatus>;
   /** Local branches, most recently committed first. */
   branches(opts?: { includeRemote?: boolean; cwd?: string }): Promise<BranchInfo[]>;
   /**
@@ -1242,6 +1323,18 @@ export interface ExtensionApi {
    * half of itself.
    */
   onChange(cb: (e: { point: string }) => void): Disposable;
+  /**
+   * Every point anybody reads or writes: who declared it (`[provides] points` in their manifest)
+   * and who has something on it. A point with contributors and no readers is almost always a
+   * typo, and neosh says so at startup.
+   */
+  points(): Promise<PointInfo[]>;
+  /**
+   * Every plugin the workspace knows about, with its manifest and what became of it — `loaded`,
+   * `held` until one of its activation triggers, or `failed` with the reason. The list a plugins
+   * panel is drawn from.
+   */
+  plugins(): Promise<PluginInfo[]>;
 }
 
 /**
@@ -1261,6 +1354,14 @@ export interface ExtensionApi {
  * the *rest* of the workspace goes in a `neosh.ready` listener rather than at the end of
  * `activate`. It is said again after `^R`, which is the same fact being true a second time.
  */
+/** What the host says about a window on the bus: `neosh.win.enter`, `.leave`, `.open`. */
+export interface WindowEvent {
+  win: WindowId;
+  buf: BufferId | null;
+  /** The buffer's kind — the field to filter on. */
+  kind: string | null;
+}
+
 export interface EventApi {
   emit(name: string, data?: unknown): Promise<void>;
   /**
@@ -1271,7 +1372,16 @@ export interface EventApi {
    * is deliberately your choice: a panel that reacts to its own writes uniformly has one code path
    * instead of two.
    */
-  on(name: string, cb: (e: { data: unknown; from: string }) => void): Disposable;
+  /**
+   * Hear one event by name. `kind` keeps only events whose `data.kind` matches — the way to
+   * listen for `neosh.win.enter` on the sidebar and nothing else.
+   *
+   * The host's own, `from: "neosh"`: `neosh.ready`; `neosh.win.enter` / `neosh.win.leave` /
+   * `neosh.win.open` (a {@link WindowEvent}); `neosh.win.close` (`{ win }`); `neosh.cursor`
+   * (`{ win, row, col }`); `neosh.mode` (`{ mode }`); `neosh.viewport` (`{ win, width, height }`).
+   * Neovim's autocmds, on the same bus a plugin's own events travel.
+   */
+  on(name: string, cb: (e: { data: unknown; from: string }) => void, opts?: { kind?: string }): Disposable;
   /** Every event, whatever it is called. For a logger or a debugger, rarely for a feature. */
   onAny(cb: (e: { name: string; data: unknown; from: string }) => void): Disposable;
 }
@@ -1501,6 +1611,10 @@ interface Registered {
     (e: { node: NodeId; session: string; event: StreamEvent }) => void
   >;
   contributionListeners: Array<(e: { point: string }) => void>;
+  highlightListeners: Array<(e: { names: string[] }) => void>;
+  focusListeners: Array<(e: { win: WindowId | null }) => void>;
+  viewListeners: Array<() => void>;
+  shutdownListeners: Array<() => void>;
   /**
    * Listeners by event name, plus `null` for the ones that asked for everything.
    *
@@ -1538,6 +1652,10 @@ function reg(plugin: string): Registered {
       quotaListeners: [],
       swarmStreamListeners: [],
       contributionListeners: [],
+      highlightListeners: [],
+      focusListeners: [],
+      viewListeners: [],
+      shutdownListeners: [],
       eventListeners: new Map(),
       options: new Set(),
       timers: new Set(),
@@ -1630,6 +1748,12 @@ export function __createContext(plugin: string, config: unknown, version: number
     },
     async permit(capability) {
       return expect(await c({ call: "permission_check", capability }), "permission").decision;
+    },
+    onViewAttached(cb) {
+      return listener(r.viewListeners, cb);
+    },
+    onShutdown(cb) {
+      return listener(r.shutdownListeners, cb);
     },
     async ask(questions) {
       return expect(await c({ call: "ask_user", questions }), "answers").answers ?? null;
@@ -1738,6 +1862,12 @@ export function __createContext(plugin: string, config: unknown, version: number
       onChange(cb) {
         return listener(r.contributionListeners, cb);
       },
+      async points() {
+        return expect(await c({ call: "ext_points" }), "points").points;
+      },
+      async plugins() {
+        return expect(await c({ call: "plugin_list" }), "plugins").plugins;
+      },
     },
     swarm: {
       async self() {
@@ -1824,8 +1954,15 @@ export function __createContext(plugin: string, config: unknown, version: number
       async emit(name, data) {
         await c({ call: "event_emit", name, data: data ?? null });
       },
-      on(name, cb) {
-        return eventListener(r, name, (e) => cb({ data: e.data, from: e.from }));
+      on(name, cb, opts) {
+        const kind = opts?.kind;
+        return eventListener(r, name, (e) => {
+          if (kind !== undefined) {
+            const d = e.data as { kind?: unknown } | null | undefined;
+            if (d?.kind !== kind) return;
+          }
+          cb({ data: e.data, from: e.from });
+        });
       },
       onAny(cb) {
         return eventListener(r, null, cb);
@@ -1986,6 +2123,12 @@ export function __createContext(plugin: string, config: unknown, version: number
         const windows = expect(await c({ call: "win_list" }), "windows").windows;
         return windows.filter((w) => w.kind === kind);
       },
+      async setHighlights(target, map) {
+        const t: HlTarget = "win" in target
+          ? { kind: "window", win: target.win }
+          : { kind: "kind", name: target.kind };
+        await c({ call: "win_set_highlights", target: t, map });
+      },
     },
     float: {
       async open(buf, opts) {
@@ -2019,10 +2162,23 @@ export function __createContext(plugin: string, config: unknown, version: number
       },
     },
     hl: {
-      async define(name, def) {
+      async define(name, def, opts) {
         const d: HighlightDef =
           "link" in def ? { kind: "link", to: def.link } : { kind: "spec", spec: def };
-        await c({ call: "hl_define", name, def: d });
+        await c({ call: "hl_define", name, def: d, default: opts?.default ?? false });
+      },
+      async get(name) {
+        const v = expect(await c({ call: "hl_get", name }), "highlight");
+        return { def: v.def ?? null, resolved: v.resolved ?? null };
+      },
+      async list() {
+        return expect(await c({ call: "hl_list" }), "highlights").groups;
+      },
+      async reset(name) {
+        await c({ call: "hl_reset", name });
+      },
+      onChange(cb) {
+        return listener(r.highlightListeners, cb);
       },
     },
     ui: {
@@ -2049,6 +2205,9 @@ export function __createContext(plugin: string, config: unknown, version: number
       },
       async exec(name, args) {
         await c({ call: "cmd_exec", name, args: args ?? [] });
+      },
+      async call(name, args) {
+        return expect(await c({ call: "cmd_call", name, args: args ?? [] }), "json").value as never;
       },
       async list() {
         return expect(await c({ call: "cmd_list" }), "commands").commands;
@@ -2078,6 +2237,9 @@ export function __createContext(plugin: string, config: unknown, version: number
       },
       async current() {
         return expect(await c({ call: "focus_current" }), "focused_win").win;
+      },
+      onChange(cb) {
+        return listener(r.focusListeners, cb);
       },
     },
     agent: {
@@ -2213,8 +2375,8 @@ export function __createContext(plugin: string, config: unknown, version: number
       },
     },
     git: {
-      async status() {
-        return expect(await c({ call: "git_status" }), "status").status;
+      async status(opts) {
+        return expect(await c({ call: "git_status", cwd: opts?.cwd ?? null }), "status").status;
       },
       async branches(opts) {
         const v = await c({
@@ -2420,6 +2582,16 @@ export async function __dispatch(plugin: string, msg: Record<string, unknown>): 
           return;
         }
         respond({ type: "tool", result: await h(req.input) });
+      } else if (req.type === "command") {
+        const name = req.name as string;
+        const h = r.commands.get(name);
+        if (!h) {
+          respond({ type: "error", message: `plugin ${plugin} has no command ${name}` });
+          return;
+        }
+        const value = await h((req.args as string[]) ?? [], undefined);
+        // `undefined` is not JSON; a handler that returned nothing answers `null`.
+        respond({ type: "command", value: value === undefined ? null : value });
       } else if (req.type === "hook") {
         const h = r.hooks.get(req.hook as HookName);
         // A hook the plugin no longer has must not block the action: continue, do not veto.
@@ -2546,6 +2718,18 @@ export async function __dispatch(plugin: string, msg: Record<string, unknown>): 
       case "contributions_changed":
         for (const cb of r.contributionListeners) cb({ point: ev.point });
         break;
+      case "focus_changed":
+        for (const cb of r.focusListeners) cb({ win: ev.win ?? null });
+        break;
+      case "view_attached":
+        for (const cb of r.viewListeners) cb();
+        break;
+      case "shutdown":
+        for (const cb of r.shutdownListeners) cb();
+        break;
+      case "highlight_changed":
+        for (const cb of r.highlightListeners) cb({ names: ev.names });
+        break;
       case "event": {
         // Copied before iterating: a listener that unsubscribes itself — the ordinary shape of
         // "wait for the thing to happen once" — would otherwise shorten the array underneath the
@@ -2557,9 +2741,6 @@ export async function __dispatch(plugin: string, msg: Record<string, unknown>): 
         for (const cb of all) cb(e);
         break;
       }
-      case "focus_changed":
-      case "shutdown":
-        break;
     }
   }
 }

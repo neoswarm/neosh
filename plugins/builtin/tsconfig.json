@@ -12,7 +12,8 @@
     "allowImportingTsExtensions": true,
     "paths": {
       "@neosh/api": ["../api/src/index.ts"],
-      "@neosh/api/ui": ["../api/src/ui.ts"]
+      "@neosh/api/ui": ["../api/src/ui.ts"],
+      "plugin:*": ["./*/main.ts"]
     }
   },
   "include": ["*/main.ts", "../api/src/globals.d.ts"]
