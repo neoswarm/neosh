@@ -1,68 +1,632 @@
 ---
+import { execSync } from "node:child_process";
+import { fileURLToPath } from "node:url";
+import type { Row } from "./TermPreview.astro";
+
 interface Plugin {
   name: string;
   description: string;
   author: string;
   repo: string;
   tags: string[];
+  image?: string;
+  // the npm package this plugin is also published as — installs come from it
+  npm?: string;
+  // not drawn here — the source scripts/gen-shots.mjs renders into `image`
+  preview?: { title?: string; rows: Row[] };
 }
 
+// Click counting is optional and needs somewhere to count. Set this to a
+// GoatCounter site code (yours.goatcounter.com → "yours") and the cards start
+// counting outbound clicks and showing the totals — see the README beside the
+// plugin JSONs for the two settings to flip on the GoatCounter side.
+const GOATCOUNTER = "";
+
+// Dates come from git, not from a field somebody has to remember to bump:
+// "added" is when the plugin's JSON landed in this repo, "updated" is the last
+// commit touching a builtin's source. Third-party updates arrive client-side
+// from the GitHub API (pushed_at), which no listing file could know. A missing
+// history (shallow CI clone, tarball build) degrades to no dates, not a crash.
+const git = (args: string): string => {
+  try {
+    return execSync(`git ${args}`, {
+      cwd: fileURLToPath(new URL(".", import.meta.url)),
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "ignore"],
+    }).trim();
+  } catch {
+    return "";
+  }
+};
+const repoRoot = git("rev-parse --show-toplevel");
+// At build time this module runs from a compiled chunk, so a glob key like
+// "../data/plugins/git.json" no longer resolves relative to src/ — the one
+// stable way back to the file git knows is down from the repository root.
+const dataDir = `${repoRoot}/website/src/data/plugins`;
+
 const modules = import.meta.glob<{ default: Plugin }>("../data/plugins/*.json", { eager: true });
-const plugins = Object.entries(modules)
+const listed = Object.entries(modules)
   .filter(([path]) => !path.includes("_template"))
-  .map(([, m]) => m.default)
+  .map(([path, m]) => {
+    const p = m.default;
+    const file = `${dataDir}/${path.split("/").pop()}`;
+    const added = Number(git(`log --diff-filter=A --format=%ct -- "${file}"`).split("\n").pop()) || null;
+    const inTree = p.repo.match(/^https:\/\/github\.com\/neoswarm\/neosh\/tree\/[^/]+\/(.+?)\/?$/);
+    const updated =
+      inTree && repoRoot ? Number(git(`log -1 --format=%ct -- "${repoRoot}/${inTree[1]}"`)) || null : null;
+    return { ...p, added, updated, host: !!inTree };
+  })
   .sort((a, b) => a.name.localeCompare(b.name));
+
+// Stars are fetched once per deploy so the count is on the page, not a badge
+// that appears if an API call succeeds; the browser refreshes it hourly. A
+// builtin wears the host repo's count — it is the repo the card links to.
+const slugOf = (repo: string) => repo.match(/^https:\/\/github\.com\/([^/]+\/[^/]+)/)?.[1] ?? null;
+const starCounts = new Map<string, number>();
+await Promise.all(
+  [...new Set(listed.map((p) => slugOf(p.repo)).filter(Boolean))].map(async (slug) => {
+    try {
+      const r = await fetch(`https://api.github.com/repos/${slug}`, {
+        headers: { "User-Agent": "neosh-website-build" },
+      });
+      if (!r.ok) return;
+      const n = (await r.json()).stargazers_count;
+      if (typeof n === "number") starCounts.set(slug!, n);
+    } catch {}
+  }),
+);
+// Installs are npm's monthly download count for the package a plugin says it
+// is published as — the one popularity number npm hands to anybody, no token,
+// CORS open, so the browser can keep it fresh the same way it does stars.
+const npmDownloads = new Map<string, number>();
+await Promise.all(
+  [...new Set(listed.map((p) => p.npm).filter(Boolean))].map(async (pkg) => {
+    try {
+      const r = await fetch(`https://api.npmjs.org/downloads/point/last-month/${pkg}`);
+      if (!r.ok) return;
+      const n = (await r.json()).downloads;
+      if (typeof n === "number") npmDownloads.set(pkg!, n);
+    } catch {}
+  }),
+);
+
+const plugins = listed.map((p) => ({
+  ...p,
+  stars: starCounts.get(slugOf(p.repo) ?? "") ?? null,
+  dl: p.npm ? (npmDownloads.get(p.npm) ?? null) : null,
+}));
+
+const fmt = (n: number) =>
+  n >= 1_000_000
+    ? `${(n / 1_000_000).toFixed(1)}M`
+    : n >= 10_000
+      ? `${Math.round(n / 1000)}k`
+      : n >= 1000
+        ? `${(n / 1000).toFixed(1)}k`
+        : `${n}`;
+const ago = (epoch: number): string => {
+  const d = (Date.now() / 1000 - epoch) / 86_400;
+  if (d < 1) return "today";
+  if (d < 30) return `${Math.floor(d)}d ago`;
+  if (d < 365) return `${Math.floor(d / 30)}mo ago`;
+  return `${Math.floor(d / 365)}y ago`;
+};
+
+// "builtin" is not a choice: it is every bundled plugin, and a filter whose
+// answer is "most of the page" filters nothing — the cards say it by being
+// slightly faded instead, because installed is not something you shop for
+const tagCounts = new Map<string, number>();
+for (const p of plugins) for (const t of p.tags) if (t !== "builtin") tagCounts.set(t, (tagCounts.get(t) ?? 0) + 1);
+const tags = [...tagCounts.keys()].sort();
+
+const byAdded = [...plugins].sort((a, b) => (b.added ?? 0) - (a.added ?? 0));
+
+// A picture in the JSON is a file in website/public/plugins/ — or a full URL,
+// for an image that lives in the plugin's own repo. A card that brought
+// neither a screenshot nor preview data wears the placeholder.
+const imgOf = (p: Plugin) =>
+  p.image ? (/^https?:\/\//.test(p.image) ? p.image : `/plugins/${p.image}`) : "/plugins/placeholder.svg";
+
+// the install line every third-party card carries, and the copy button copies
+const addCmd = (p: Plugin) => `neosh plugin add ${p.repo.replace("https://github.com/", "")}`;
 
 const GUIDE = "https://github.com/neoswarm/neosh/blob/main/website/src/data/plugins/README.md";
 ---
 
 <section id="plugins">
   <div class="wrap">
-    <p class="eyebrow">Plugins</p>
-    <h2>The ones everyone runs.</h2>
-    <p class="lede">
-      Most starred first, straight from GitHub. Every plugin here arrived as a pull request — yours can too.
-    </p>
-    <div class="grid" id="plugin-grid">
+    <h2 class="headline">Plugins made by <span class="hl">the community.</span></h2>
+
+    <div class="panel strips" id="plugin-strips" data-reveal>
+      <p class="p-hd"><span><span class="dot-new">●</span> Recently published</span></p>
+      <div class="strows" data-metric="added">
+        {
+          byAdded.map((p, i) => (
+            <a
+              class="card strow-link"
+              href={p.repo}
+              target="_blank"
+              rel="noopener"
+              hidden={i >= 8}
+              data-name={p.name}
+              data-goatcounter-click={`plugin-${p.name}`}
+            >
+              <span class="srow">
+                <span class="sname">{p.npm || p.name}</span>
+                <span class="stime" data-epoch={p.added ?? ""}>{p.added ? ago(p.added) : ""}</span>
+              </span>
+              <span class="sdesc">{p.description}</span>
+              <span class="smeta">
+                <span class="sauthor">{p.author}</span>
+                {p.dl != null && <span class="sstars">↓ {fmt(p.dl)}/mo</span>}
+                {p.stars != null && <span class="sstars">★ {fmt(p.stars)}</span>}
+                {(p.updated ?? p.added) && <span class="supd">↻ {ago((p.updated ?? p.added)!)}</span>}
+              </span>
+            </a>
+          ))
+        }
+      </div>
+    </div>
+
+    <div class="panel main" data-reveal>
+      <p class="p-hd">
+        <span>All plugins</span>
+        <span class="count" id="plugin-count">{plugins.length} plugins</span>
+      </p>
+      <div class="p-body">
+        <div class="toolbar">
+          <label class="search">
+            <span class="s-prompt">›</span>
+            <input id="plugin-q" type="search" placeholder="filter plugins" autocomplete="off" spellcheck="false" />
+          </label>
+          <div class="opts" id="plugin-tags" aria-label="Filter by tag">
+            <button class="opt on" data-tag=""><span class="cur">›</span>all</button>
+            {
+              tags.map((t) => (
+                <button class="opt" data-tag={t}>
+                  <span class="cur">›</span>{t}
+                  <span class="n">{tagCounts.get(t)}</span>
+                </button>
+              ))
+            }
+          </div>
+          <div class="opts views" id="plugin-views" aria-label="Sort">
+            <button class="opt on" data-view="all"><span class="cur">›</span>popular</button>
+            <button class="opt" data-view="az"><span class="cur">›</span>a–z</button>
+            <button class="opt" data-view="new"><span class="cur">›</span>just added</button>
+            <button class="opt" data-view="updated"><span class="cur">›</span>recently updated</button>
+          </div>
+          <button class="reset" id="plugin-reset" type="button">reset</button>
+        </div>
+
+        <div class="grid" id="plugin-grid" data-gc={GOATCOUNTER}>
       {
         plugins.map((p, i) => (
-          <a class="card plug" target="_blank" rel="noopener" href={p.repo} data-repo={p.repo} data-reveal style={`transition-delay:${(i % 3) * 60}ms`}>
-            <div class="head">
-              <span class="name">{p.name}</span>
-              <span class="author">{p.author}</span>
+          <article
+            class="card plug"
+            data-name={p.name}
+            data-repo={p.repo}
+            data-host={p.host ? "1" : undefined}
+            data-search={[p.name, p.description, p.author, p.repo.replace("https://", ""), p.npm ?? "", ...p.tags]
+              .join(" ")
+              .toLowerCase()}
+            data-tags={p.tags.join(" ")}
+            data-added={p.added ?? ""}
+            data-updated={p.updated ?? ""}
+            data-stars={p.stars ?? ""}
+            data-npm={p.npm}
+            data-dl={p.dl ?? ""}
+            data-reveal
+            style={`transition-delay:${(i % 2) * 60}ms`}
+          >
+            <div class="shotbox">
+              <img src={imgOf(p)} alt={`${p.name} screenshot`} loading="lazy" />
             </div>
-            <p>{p.description}</p>
-            <div class="foot">
-              <span class="tags">{p.tags.join(" · ")}</span>
-              <span class="stars" hidden></span>
+            <div class="body">
+              <div class="head">
+                <a
+                  class="name"
+                  href={p.repo}
+                  target="_blank"
+                  rel="noopener"
+                  data-goatcounter-click={`plugin-${p.name}`}
+                >
+                  {p.npm || p.name}
+                </a>
+                <span class="author">{p.author}</span>
+              </div>
+              <p>{p.description}</p>
+              <div class="foot">
+                <span class="tags">
+                  {p.host && <span class="bundled">bundled</span>}
+                  {p.tags.filter((t) => t !== "builtin").map((t) => <span class="chip">{t}</span>)}
+                </span>
+                <span class="meta">
+                  <span class="clicks" hidden></span>
+                  {
+                    p.npm && (
+                      <a
+                        class="dl"
+                        href={`https://www.npmjs.com/package/${p.npm}`}
+                        target="_blank"
+                        rel="noopener"
+                        title={`${p.npm} on npm — installs last month`}
+                        hidden={p.dl == null}
+                      >
+                        {p.dl != null ? `↓ ${fmt(p.dl)}/mo` : ""}
+                      </a>
+                    )
+                  }
+                  <span class="upd" hidden={!(p.updated ?? p.added)}>
+                    {(p.updated ?? p.added) ? `↻ ${ago((p.updated ?? p.added)!)}` : ""}
+                  </span>
+                  <span class="stars" hidden={p.stars == null}>{p.stars != null ? `★ ${fmt(p.stars)}` : ""}</span>
+                </span>
+              </div>
+              {
+                !p.host && (
+                  <div class="inst">
+                    <code>
+                      <span class="i-p">$</span> {addCmd(p)}
+                    </code>
+                    <button class="copy" type="button" data-cmd={addCmd(p)} aria-label={`Copy: ${addCmd(p)}`}>
+                      copy
+                    </button>
+                  </div>
+                )
+              }
             </div>
-          </a>
+          </article>
         ))
       }
-      <a class="card plug add" target="_blank" rel="noopener" href={GUIDE} data-reveal>
-        <span class="plus">+</span>
-        <span>Add yours</span>
-        <p>One file, one pull request</p>
-      </a>
+          <a class="card plug add" target="_blank" rel="noopener" href={GUIDE} data-reveal>
+            <span class="plus">+</span>
+            <span>Add yours</span>
+            <p>One file, one pull request</p>
+          </a>
+        </div>
+        <p class="empty" id="plugin-empty" hidden>
+          Nothing called that — yet.
+          <a href={GUIDE} target="_blank" rel="noopener">It is one file and one pull request.</a>
+        </p>
+        <div class="pager" id="plugin-pager" hidden>
+          <button class="pg-step" id="plugin-prev" type="button">‹ prev</button>
+          <span class="pg-nums" id="plugin-nums"></span>
+          <button class="pg-step" id="plugin-next" type="button">next ›</button>
+        </div>
+      </div>
     </div>
+
+    <dialog class="detail" id="plugin-detail">
+      <p class="p-hd">
+        <span><span class="d-name" id="d-name"></span><span class="d-author" id="d-author"></span></span>
+        <button class="d-close" id="d-close" type="button" aria-label="Close">esc ✕</button>
+      </p>
+      <div class="d-body">
+        <div class="d-stage"><img id="d-shot" src="" alt="" /></div>
+        <p class="d-desc" id="d-desc"></p>
+        <div class="d-row">
+          <span class="d-meta" id="d-meta"></span>
+          <span class="d-links">
+            <a id="d-gh" href="#" target="_blank" rel="noopener">github ↗</a>
+            <a id="d-npm" href="#" target="_blank" rel="noopener" hidden>npm ↗</a>
+          </span>
+        </div>
+        <div class="inst" id="d-inst" hidden>
+          <code><span class="i-p">$</span> <span id="d-cmd"></span></code>
+          <button class="copy" id="d-copy" type="button">copy</button>
+        </div>
+        <div class="d-readme" id="d-readme"></div>
+      </div>
+    </dialog>
   </div>
 </section>
 
 <style>
-  .lede {
-    margin-bottom: 72px;
+  section {
+    padding: 150px 0 150px;
+  }
+
+  .sr-only {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    overflow: hidden;
+    clip: rect(0 0 0 0);
+    white-space: nowrap;
+  }
+
+  /* a catalogue, not a hero: no graph paper behind the boxes */
+  :global(.grid-bg) {
+    display: none;
+  }
+
+  /* the front page's voice, one size down: Geist, the same two-tone fade */
+  .headline {
+    font-family: "Geist", var(--sans);
+    font-size: clamp(26px, 2.6vw, 38px);
+    font-weight: 600;
+    letter-spacing: normal;
+    line-height: 1.12;
+    margin: 0 0 40px;
+    background: linear-gradient(180deg, #a4a4b0 20%, #6e6e7a);
+    -webkit-background-clip: text;
+    background-clip: text;
+    color: transparent;
+  }
+
+  .headline .hl {
+    background: linear-gradient(180deg, #ffffff 30%, #c2c2d0);
+    -webkit-background-clip: text;
+    background-clip: text;
+    color: transparent;
+  }
+
+  /* every section is a panel drawn like the hero's terminal: the same
+     surface, the same hairline, the same depth — this page is more windows
+     of the same workspace, not a dashboard visiting from somewhere else */
+  .panel {
+    border: 1px solid rgba(255, 255, 255, 0.09);
+    border-radius: 2px;
+    background: #0c0e11;
+    box-shadow: 0 18px 60px rgba(0, 0, 0, 0.4);
+  }
+
+  section :global(.card),
+  .search,
+  .inst,
+  .copy,
+  .reset {
+    border-radius: 2px;
+  }
+
+  /* the header the hero's window wears: a quiet mono title, not a label
+     shouting in small caps */
+  .p-hd {
+    display: flex;
+    justify-content: space-between;
+    align-items: baseline;
+    gap: 16px;
+    margin: 0;
+    padding: 12px 17px;
+    border-bottom: 1px solid rgba(255, 255, 255, 0.07);
+    font-family: var(--mono);
+    font-size: 12.5px;
+    font-weight: 400;
+    color: var(--muted);
+  }
+
+  .p-body {
+    padding: 16px;
+  }
+
+  /* what just arrived: one wide shelf, four cards, each wearing its picture */
+  .strips {
+    margin-bottom: 20px;
+    transition: opacity 0.7s ease, transform 0.7s ease;
+  }
+
+  .strips.off {
+    display: none;
+  }
+
+  .dot-new {
+    color: var(--warn);
+  }
+
+  .strows {
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    gap: 12px;
+    padding: 14px;
+  }
+
+  .strow-link[hidden] {
+    display: none;
+  }
+
+  /* the information, the way a registry says it: name and when it landed,
+     what it does, who by and how it is doing — everything but the picture */
+  .strow-link {
+    display: flex;
+    flex-direction: column;
+    gap: 7px;
+    min-width: 0;
+    padding: 15px 17px;
+    background: #11141a;
+    border-color: rgba(255, 255, 255, 0.07);
+    transition: border-color 0.25s ease, background 0.25s ease;
+  }
+
+  .strow-link:hover {
+    border-color: var(--line-strong);
+    background: #161a22;
+  }
+
+  .srow {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: 10px;
+  }
+
+  .sname {
+    font-family: var(--mono);
+    font-size: 13.5px;
+    font-weight: 500;
+    color: var(--fg);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .sdesc {
+    font-size: 13.5px;
+    line-height: 1.55;
+    color: var(--muted);
+    display: -webkit-box;
+    -webkit-line-clamp: 2;
+    -webkit-box-orient: vertical;
+    overflow: hidden;
+  }
+
+  /* when, said the way the sidebar says it: `12h`, dim, on the right */
+  .stime {
+    flex: none;
+    font-family: var(--mono);
+    font-size: 11.5px;
+    color: var(--dim);
+  }
+
+  .smeta {
+    margin-top: auto;
+    padding-top: 2px;
+    display: flex;
+    align-items: baseline;
+    gap: 12px;
+    font-family: var(--mono);
+    font-size: 11px;
+    color: var(--dim);
+    overflow: hidden;
+    white-space: nowrap;
+  }
+
+  .smeta .sstars,
+  .smeta .supd {
+    flex: none;
+    color: var(--muted);
+  }
+
+  .count {
+    font-size: 12px;
+    letter-spacing: 0.06em;
+    color: var(--dim);
+    text-transform: none;
+  }
+
+  /* the finder: one row inside the panel — a real field, the tags beside it,
+     the order, and a way back to zero */
+  .toolbar {
+    display: flex;
+    align-items: center;
+    gap: 22px;
+    flex-wrap: wrap;
+    margin-bottom: 16px;
+    font-family: var(--mono);
+  }
+
+  .search {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    flex: 1 1 260px;
+    max-width: 480px;
+    padding: 10px 14px;
+    border: 1px solid rgba(255, 255, 255, 0.1);
+    background: rgba(255, 255, 255, 0.02);
+    transition: border-color 0.15s ease;
+  }
+
+  .search:focus-within {
+    border-color: rgba(255, 255, 255, 0.22);
+  }
+
+  .s-prompt {
+    color: var(--accent);
+    font-size: 13px;
+  }
+
+  .search input {
+    flex: 1;
+    min-width: 0;
+    background: none;
+    border: none;
+    outline: none;
+    color: var(--fg);
+    font-family: var(--mono);
+    font-size: 13px;
+  }
+
+  .search input::placeholder {
+    color: var(--dim);
+  }
+
+  .reset {
+    background: none;
+    border: 1px solid rgba(255, 255, 255, 0.1);
+    padding: 8px 14px;
+    font-family: var(--mono);
+    font-size: 12px;
+    color: var(--muted);
+    cursor: pointer;
+    transition: color 0.15s ease, border-color 0.15s ease;
+  }
+
+  .reset:hover {
+    color: var(--fg);
+    border-color: rgba(255, 255, 255, 0.3);
+  }
+
+  .opts {
+    display: flex;
+    align-items: baseline;
+    gap: 20px;
+    flex-wrap: wrap;
+  }
+
+  .opt {
+    display: inline-flex;
+    align-items: baseline;
+    gap: 5px;
+    background: none;
+    border: none;
+    padding: 0;
+    font-family: var(--mono);
+    font-size: 13px;
+    color: var(--dim);
+    cursor: pointer;
+    transition: color 0.15s ease;
+  }
+
+  .opt:hover {
+    color: var(--fg);
+  }
+
+  .opt .cur {
+    color: var(--accent);
+    display: none;
+  }
+
+  .opt .n {
+    color: var(--dim);
+    font-size: 11.5px;
+  }
+
+  .opt.on {
+    color: var(--fg);
+  }
+
+  .opt.on .cur {
+    display: inline;
+  }
+
+  .views {
+    margin-left: auto;
   }
 
   .grid {
     display: grid;
-    grid-template-columns: repeat(3, 1fr);
-    gap: 22px;
+    grid-template-columns: repeat(2, 1fr);
+    gap: 16px;
   }
 
   .plug {
+    position: relative;
     display: flex;
-    flex-direction: column;
-    padding: 32px 34px;
+    overflow: hidden;
+    cursor: pointer;
+    background: #11141a;
+    border-color: rgba(255, 255, 255, 0.07);
     transition:
       opacity 0.7s ease,
       transform 0.7s ease,
@@ -72,48 +636,212 @@ const GUIDE = "https://github.com/neoswarm/neosh/blob/main/website/src/data/plug
 
   .plug:hover {
     border-color: var(--line-strong);
-    background: #131318;
+    background: #161a22;
+  }
+
+  .plug.off {
+    display: none;
+  }
+
+  /* a bundled plugin is already in your neosh, so its card sits back a
+     little — there is nothing here to go and get. Faded on its contents, not
+     the card, so the scroll-reveal keeps owning the card's own opacity. */
+  .plug[data-host] .shotbox,
+  .plug[data-host] .body {
+    opacity: 0.68;
+    transition: opacity 0.25s ease;
+  }
+
+  .plug[data-host]:hover .shotbox,
+  .plug[data-host]:hover .body {
+    opacity: 1;
+  }
+
+  /* the picture is staged the way the hero stages its terminal: a little
+     window floating on the same warm backdrop — the tiny thumbnail of the
+     front page's photograph, so the tones are literally the same — bleeding
+     off the card's right edge */
+  .shotbox {
+    position: relative;
+    width: 320px;
+    flex: none;
+    background: #22211d
+      url("data:image/jpeg;base64,/9j/2wBDABQUFBQVFBcZGRcfIh4iHy4rJycrLkYyNjI2MkZqQk5CQk5Cal5yXVZdcl6phXZ2hanDpJukw+zT0+z/////////2wBDARQUFBQVFBcZGRcfIh4iHy4rJycrLkYyNjI2MkZqQk5CQk5Cal5yXVZdcl6phXZ2hanDpJukw+zT0+z/////////wgARCAANABgDASIAAhEBAxEB/8QAGAAAAgMAAAAAAAAAAAAAAAAAAAQDBQb/xAAVAQEBAAAAAAAAAAAAAAAAAAAAAf/aAAwDAQACEAMQAAAAz06VgAuR/8QAGxAAAgIDAQAAAAAAAAAAAAAAAQIAEQMSITH/2gAIAQEAAT8AUbeRcRMONBdsLmPYHjERF2HWMdaJ7P/EABURAQEAAAAAAAAAAAAAAAAAAAEQ/9oACAECAQE/AGf/xAAUEQEAAAAAAAAAAAAAAAAAAAAQ/9oACAEDAQE/AD//2Q==")
+      center / cover no-repeat;
+    border-right: 1px solid rgba(255, 255, 255, 0.07);
+    overflow: hidden;
+  }
+
+  /* an img's auto size is its intrinsic one even with all four insets set,
+     so the little window is sized explicitly: full box + a right-edge bleed */
+  .shotbox img {
+    position: absolute;
+    top: 14px;
+    left: 14px;
+    width: calc(100% + 18px);
+    height: calc(100% - 28px);
+    object-fit: cover;
+    object-position: left top;
+    background: #0c0e11;
+    border: 1px solid rgba(255, 255, 255, 0.09);
+    border-radius: 2px;
+    box-shadow: 0 10px 32px rgba(0, 0, 0, 0.5);
+  }
+
+  .body {
+    display: flex;
+    flex-direction: column;
+    flex: 1;
+    min-width: 0;
+    padding: 18px 20px 18px;
   }
 
   .head {
     display: flex;
     justify-content: space-between;
     align-items: baseline;
-    margin-bottom: 8px;
+    margin-bottom: 9px;
   }
 
+  /* the card's one link, stretched over the whole card — which is what lets
+     the copy button be a real button rather than a link wearing a costume */
   .name {
     font-family: var(--mono);
-    font-size: 16.5px;
+    font-size: 15.5px;
     font-weight: 500;
+    transition: color 0.15s ease;
+  }
+
+  .plug:hover .name {
+    color: var(--accent);
+  }
+
+  .name::after {
+    content: "";
+    position: absolute;
+    inset: 0;
   }
 
   .author {
-    font-size: 13px;
+    font-family: var(--mono);
+    font-size: 12px;
     color: var(--dim);
   }
 
-  .plug p {
+  .body p {
     color: var(--muted);
-    font-size: 15px;
+    font-size: 14.5px;
+    line-height: 1.55;
     margin: 0;
+    display: -webkit-box;
+    -webkit-line-clamp: 2;
+    -webkit-box-orient: vertical;
+    overflow: hidden;
   }
 
   .foot {
     display: flex;
     justify-content: space-between;
     align-items: baseline;
-    margin-top: 18px;
+    margin-top: auto;
+    padding-top: 14px;
     font-family: var(--mono);
-    font-size: 12.5px;
+    font-size: 12px;
     color: var(--dim);
   }
 
-  .stars {
+  .tags {
+    display: flex;
+    gap: 10px;
+    flex-wrap: wrap;
+  }
+
+  /* tags the way the workspace writes labels: dim words, no boxes */
+  .chip {
+    font-size: 12px;
+    color: var(--dim);
+  }
+
+  .bundled {
+    font-size: 12px;
+    color: var(--dim);
+  }
+
+  .meta {
+    display: flex;
+    gap: 14px;
+  }
+
+  .stars,
+  .upd,
+  .clicks {
     color: var(--muted);
   }
 
+  /* installs link to the npm page, above the card's stretched link */
+  .meta .dl {
+    position: relative;
+    z-index: 2;
+    color: var(--muted);
+    transition: color 0.15s ease;
+  }
+
+  .meta .dl:hover {
+    color: var(--fg);
+  }
+
+  /* how you get it — or the dot that says you already have it */
+  .inst {
+    position: relative;
+    z-index: 2;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    margin-top: 13px;
+    padding: 8px 8px 8px 12px;
+    background: #0a0c0f;
+    border: 1px solid rgba(255, 255, 255, 0.07);
+    font-family: var(--mono);
+    font-size: 12px;
+    color: var(--muted);
+  }
+
+  .inst code {
+    flex: 1;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .inst .i-p {
+    color: var(--accent);
+  }
+
+  .copy {
+    flex: none;
+    background: none;
+    border: 1px solid rgba(255, 255, 255, 0.1);
+    padding: 4px 10px;
+    font-family: var(--mono);
+    font-size: 11.5px;
+    color: var(--muted);
+    cursor: pointer;
+    transition: color 0.15s ease, border-color 0.15s ease;
+  }
+
+  .copy:hover {
+    color: var(--fg);
+    border-color: rgba(255, 255, 255, 0.3);
+  }
+
+  .copy.did {
+    color: var(--ok);
+    border-color: rgba(74, 222, 128, 0.35);
+  }
+
   .add {
+    flex-direction: column;
     align-items: center;
     justify-content: center;
     gap: 4px;
@@ -121,6 +849,8 @@ const GUIDE = "https://github.com/neoswarm/neosh/blob/main/website/src/data/plug
     text-align: center;
     color: var(--muted);
     font-size: 16px;
+    min-height: 200px;
+    padding: 32px 34px;
   }
 
   .add:hover {
@@ -138,43 +868,722 @@ const GUIDE = "https://github.com/neoswarm/neosh/blob/main/website/src/data/plug
     color: var(--dim);
   }
 
-  @media (max-width: 820px) {
+  .empty {
+    margin: 22px 4px 6px;
+    font-size: 15.5px;
+    color: var(--muted);
+  }
+
+  /* a hundred cards, then pages */
+  .pager {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 10px;
+    margin-top: 20px;
+    font-family: var(--mono);
+  }
+
+  .pager[hidden] {
+    display: none;
+  }
+
+  .pg-step {
+    background: none;
+    border: 1px solid rgba(255, 255, 255, 0.1);
+    border-radius: 2px;
+    padding: 5px 11px;
+    font-family: var(--mono);
+    font-size: 11.5px;
+    color: var(--muted);
+    cursor: pointer;
+    transition: color 0.15s ease, border-color 0.15s ease;
+  }
+
+  .pg-step:not(:disabled):hover {
+    color: var(--fg);
+    border-color: rgba(255, 255, 255, 0.3);
+  }
+
+  .pg-step:disabled {
+    opacity: 0.35;
+    cursor: default;
+  }
+
+  .pg-nums {
+    display: flex;
+    align-items: baseline;
+    gap: 2px;
+  }
+
+  .pg-nums :global(.pg-n) {
+    background: none;
+    border: none;
+    padding: 4px 7px;
+    font-family: var(--mono);
+    font-size: 12px;
+    color: var(--dim);
+    cursor: pointer;
+    transition: color 0.15s ease;
+  }
+
+  .pg-nums :global(.pg-n:hover) {
+    color: var(--fg);
+  }
+
+  .pg-nums :global(.pg-n.on) {
+    color: var(--fg);
+    text-decoration: underline;
+    text-underline-offset: 4px;
+  }
+
+  .pg-nums :global(.pg-gap) {
+    color: var(--dim);
+    padding: 0 3px;
+  }
+
+  .empty a {
+    color: var(--accent);
+  }
+
+  /* clicking a card opens the plugin the way the workspace opens anything:
+     a float over the list, its README inside, esc to leave */
+  .detail {
+    width: min(860px, calc(100vw - 40px));
+    max-height: calc(100vh - 90px);
+    padding: 0;
+    border: 1px solid rgba(255, 255, 255, 0.12);
+    border-radius: 2px;
+    background: #0c0e11;
+    color: var(--fg);
+    box-shadow: 0 32px 100px rgba(0, 0, 0, 0.65);
+    overflow: hidden;
+  }
+
+  .detail::backdrop {
+    background: rgba(5, 5, 8, 0.72);
+  }
+
+  .d-name {
+    color: var(--fg);
+    font-weight: 500;
+  }
+
+  .d-author {
+    margin-left: 12px;
+    color: var(--dim);
+  }
+
+  .d-close {
+    background: none;
+    border: none;
+    padding: 0;
+    font-family: var(--mono);
+    font-size: 12px;
+    color: var(--dim);
+    cursor: pointer;
+    transition: color 0.15s ease;
+  }
+
+  .d-close:hover {
+    color: var(--fg);
+  }
+
+  .d-body {
+    padding: 18px 22px 26px;
+    overflow-y: auto;
+    max-height: calc(100vh - 90px - 45px);
+  }
+
+  /* the same warm stage the cards use, wider: the picture, properly visible */
+  .d-stage {
+    position: relative;
+    height: 300px;
+    border: 1px solid rgba(255, 255, 255, 0.07);
+    border-radius: 2px;
+    overflow: hidden;
+    background: #22211d
+      url("data:image/jpeg;base64,/9j/2wBDABQUFBQVFBcZGRcfIh4iHy4rJycrLkYyNjI2MkZqQk5CQk5Cal5yXVZdcl6phXZ2hanDpJukw+zT0+z/////////2wBDARQUFBQVFBcZGRcfIh4iHy4rJycrLkYyNjI2MkZqQk5CQk5Cal5yXVZdcl6phXZ2hanDpJukw+zT0+z/////////wgARCAANABgDASIAAhEBAxEB/8QAGAAAAgMAAAAAAAAAAAAAAAAAAAQDBQb/xAAVAQEBAAAAAAAAAAAAAAAAAAAAAf/aAAwDAQACEAMQAAAAz06VgAuR/8QAGxAAAgIDAQAAAAAAAAAAAAAAAQIAEQMSITH/2gAIAQEAAT8AUbeRcRMONBdsLmPYHjERF2HWMdaJ7P/EABURAQEAAAAAAAAAAAAAAAAAAAEQ/9oACAECAQE/AGf/xAAUEQEAAAAAAAAAAAAAAAAAAAAQ/9oACAEDAQE/AD//2Q==")
+      center / cover no-repeat;
+  }
+
+  .d-stage img {
+    position: absolute;
+    top: 22px;
+    left: 26px;
+    width: calc(100% - 52px);
+    height: calc(100% - 22px);
+    object-fit: cover;
+    object-position: left top;
+    background: #0c0e11;
+    border: 1px solid rgba(255, 255, 255, 0.09);
+    border-radius: 2px 2px 0 0;
+    box-shadow: 0 14px 44px rgba(0, 0, 0, 0.55);
+  }
+
+  .d-desc {
+    margin: 18px 2px 10px;
+    font-size: 15.5px;
+    color: var(--muted);
+  }
+
+  .d-row {
+    display: flex;
+    justify-content: space-between;
+    align-items: baseline;
+    gap: 16px;
+    flex-wrap: wrap;
+    margin: 0 2px;
+    font-family: var(--mono);
+    font-size: 12.5px;
+  }
+
+  .d-meta {
+    color: var(--muted);
+  }
+
+  .d-links {
+    display: flex;
+    gap: 18px;
+  }
+
+  .d-links a {
+    color: var(--muted);
+    transition: color 0.15s ease;
+  }
+
+  .d-links a:hover {
+    color: var(--fg);
+  }
+
+  .detail .inst {
+    margin-top: 16px;
+  }
+
+  /* display:flex would out-argue the hidden attribute */
+  .inst[hidden] {
+    display: none;
+  }
+
+  /* the README, in the site's own type — GitHub already rendered and
+     sanitised the HTML, this only dresses it */
+  .d-readme {
+    margin-top: 22px;
+    padding-top: 18px;
+    border-top: 1px solid rgba(255, 255, 255, 0.07);
+    font-size: 14.5px;
+    line-height: 1.65;
+    color: var(--muted);
+  }
+
+  .d-readme :global(h1),
+  .d-readme :global(h2),
+  .d-readme :global(h3),
+  .d-readme :global(h4) {
+    color: var(--fg);
+    font-size: 1.05em;
+    font-weight: 600;
+    letter-spacing: normal;
+    line-height: 1.3;
+    margin: 1.4em 0 0.5em;
+  }
+
+  .d-readme :global(h1:first-child),
+  .d-readme :global(h2:first-child),
+  .d-readme :global(p:first-child) {
+    margin-top: 0;
+  }
+
+  .d-readme :global(h1) {
+    font-size: 1.25em;
+  }
+
+  .d-readme :global(p) {
+    margin: 0.7em 0;
+  }
+
+  .d-readme :global(a) {
+    color: var(--accent);
+  }
+
+  .d-readme :global(code) {
+    font-family: var(--mono);
+    font-size: 0.88em;
+    background: rgba(255, 255, 255, 0.05);
+    border-radius: 2px;
+    padding: 1px 5px;
+  }
+
+  .d-readme :global(pre) {
+    background: #0a0c0f;
+    border: 1px solid rgba(255, 255, 255, 0.07);
+    border-radius: 2px;
+    padding: 12px 14px;
+    overflow-x: auto;
+  }
+
+  .d-readme :global(pre code) {
+    background: none;
+    padding: 0;
+  }
+
+  .d-readme :global(img) {
+    max-width: 100%;
+    border-radius: 2px;
+  }
+
+  .d-readme :global(ul),
+  .d-readme :global(ol) {
+    padding-left: 1.4em;
+    margin: 0.7em 0;
+  }
+
+  .d-readme :global(table) {
+    border-collapse: collapse;
+    margin: 0.8em 0;
+    font-size: 0.92em;
+  }
+
+  .d-readme :global(th),
+  .d-readme :global(td) {
+    border: 1px solid rgba(255, 255, 255, 0.09);
+    padding: 5px 10px;
+    text-align: left;
+  }
+
+  .d-readme :global(blockquote) {
+    margin: 0.8em 0;
+    padding-left: 14px;
+    border-left: 2px solid rgba(255, 255, 255, 0.14);
+  }
+
+  .d-loading,
+  .d-none {
+    font-family: var(--mono);
+    font-size: 12.5px;
+    color: var(--dim);
+  }
+
+  @media (max-width: 1100px) {
     .grid {
+      grid-template-columns: 1fr;
+    }
+  }
+
+  @media (max-width: 900px) {
+    .strows {
+      grid-template-columns: 1fr 1fr;
+    }
+    .views {
+      margin-left: 0;
+    }
+    .p-body {
+      padding: 14px;
+    }
+  }
+
+  @media (max-width: 640px) {
+    .plug {
+      flex-direction: column;
+    }
+    .shotbox {
+      width: 100%;
+      height: 150px;
+      border-right: none;
+      border-bottom: 1px solid var(--line);
+    }
+  }
+
+  @media (max-width: 560px) {
+    .strows {
       grid-template-columns: 1fr;
     }
   }
 </style>
 
 <script>
-  // Popularity is the plugin repo's own star count. Builtins live inside
-  // neoswarm/neosh (a /tree/ URL), and the host repo's stars say nothing
-  // about one plugin in it — those cards keep their tags and no badge.
   const grid = document.getElementById("plugin-grid")!;
   const cards = [...grid.querySelectorAll<HTMLElement>("[data-repo]")];
+  const addCard = grid.querySelector<HTMLElement>(".add")!;
+  const q = document.getElementById("plugin-q") as HTMLInputElement;
+  const viewRows = [...document.querySelectorAll<HTMLButtonElement>("#plugin-views .opt")];
+  const tagRows = [...document.querySelectorAll<HTMLButtonElement>("#plugin-tags .opt")];
+  const count = document.getElementById("plugin-count")!;
+  const empty = document.getElementById("plugin-empty")!;
+  const strips = document.getElementById("plugin-strips")!;
+  const pager = document.getElementById("plugin-pager")!;
+  const nums = document.getElementById("plugin-nums")!;
+  const prev = document.getElementById("plugin-prev") as HTMLButtonElement;
+  const next = document.getElementById("plugin-next") as HTMLButtonElement;
 
+  const PER_PAGE = 100;
+  let view = "all";
+  let tag = "";
+  let page = 0;
+
+  const num = (v: string | undefined) => (v ? Number(v) : null);
   const fmt = (n: number) =>
-    n >= 10_000 ? `${Math.round(n / 1000)}k` : n >= 1000 ? `${(n / 1000).toFixed(1)}k` : `${n}`;
+    n >= 1_000_000
+      ? `${(n / 1_000_000).toFixed(1)}M`
+      : n >= 10_000
+        ? `${Math.round(n / 1000)}k`
+        : n >= 1000
+          ? `${(n / 1000).toFixed(1)}k`
+          : `${n}`;
 
+  function ago(epoch: number): string {
+    const d = (Date.now() / 1000 - epoch) / 86_400;
+    if (d < 1) return "today";
+    if (d < 30) return `${Math.floor(d)}d ago`;
+    if (d < 365) return `${Math.floor(d / 30)}mo ago`;
+    return `${Math.floor(d / 365)}y ago`;
+  }
+
+  // popularity is everything the page can honestly count — npm installs,
+  // stars, and clicks once a counter is configured — with arrival as the
+  // tiebreak, which is what sorts a page of builtins wearing one shared count
+  const addedOf = (c: HTMLElement) => num(c.dataset.added) ?? 0;
+  const popOf = (c: HTMLElement) =>
+    (num(c.dataset.dl) ?? 0) + (num(c.dataset.stars) ?? 0) + (num(c.dataset.clicks) ?? 0);
+  const VIEWS: Record<string, (a: HTMLElement, b: HTMLElement) => number> = {
+    all: (a, b) => popOf(b) - popOf(a) || addedOf(b) - addedOf(a),
+    az: (a, b) => a.dataset.name!.localeCompare(b.dataset.name!),
+    new: (a, b) => addedOf(b) - addedOf(a),
+    updated: (a, b) =>
+      (num(b.dataset.updated) ?? addedOf(b)) - (num(a.dataset.updated) ?? addedOf(a)),
+  };
+
+  function apply() {
+    const needle = q.value.trim().toLowerCase();
+    const key = VIEWS[view];
+    const hits: HTMLElement[] = [];
+    for (const card of cards) {
+      const hit =
+        (!needle || card.dataset.search!.includes(needle)) &&
+        (!tag || card.dataset.tags!.split(" ").includes(tag));
+      if (hit) hits.push(card);
+      else card.classList.add("off");
+    }
+    hits.sort(key);
+    hits.forEach((card) => grid.insertBefore(card, addCard));
+
+    // a hundred to a page; past that the count turns into a range
+    const pages = Math.max(1, Math.ceil(hits.length / PER_PAGE));
+    if (page >= pages) page = pages - 1;
+    const from = page * PER_PAGE;
+    const to = Math.min(from + PER_PAGE, hits.length);
+    hits.forEach((card, i) => card.classList.toggle("off", i < from || i >= to));
+
+    // the strips repeat the grid's answer once it is filtered or re-sorted
+    strips.classList.toggle("off", view !== "all" || !!needle || !!tag);
+    count.textContent =
+      pages > 1
+        ? `${from + 1}–${to} / ${hits.length}`
+        : hits.length === cards.length
+          ? `${cards.length} plugins`
+          : `${hits.length} of ${cards.length}`;
+    empty.hidden = hits.length > 0;
+    // the invitation closes the list, so it stands on the last page
+    addCard.classList.toggle("off", hits.length === 0 || page !== pages - 1);
+
+    pager.hidden = pages <= 1;
+    if (pages > 1) {
+      prev.disabled = page === 0;
+      next.disabled = page === pages - 1;
+      // every page when they fit, first and last with a window when they don't
+      const want: (number | "…")[] = [];
+      if (pages <= 7) {
+        for (let i = 0; i < pages; i++) want.push(i);
+      } else {
+        want.push(0);
+        if (page > 2) want.push("…");
+        for (let i = Math.max(1, page - 1); i <= Math.min(pages - 2, page + 1); i++) want.push(i);
+        if (page < pages - 3) want.push("…");
+        want.push(pages - 1);
+      }
+      nums.replaceChildren(
+        ...want.map((w) => {
+          if (w === "…") {
+            const s = document.createElement("span");
+            s.className = "pg-gap";
+            s.textContent = "…";
+            return s;
+          }
+          const b = document.createElement("button");
+          b.type = "button";
+          b.className = w === page ? "pg-n on" : "pg-n";
+          b.textContent = String(w + 1);
+          b.addEventListener("click", () => goTo(w));
+          return b;
+        }),
+      );
+    }
+  }
+
+  function goTo(p: number) {
+    page = p;
+    apply();
+    document.querySelector(".panel.main")?.scrollIntoView({ behavior: "smooth", block: "start" });
+  }
+
+  function sortStrips() {
+    for (const box of strips.querySelectorAll<HTMLElement>(".strows")) {
+      const metric = box.dataset.metric!;
+      const rows = [...box.querySelectorAll<HTMLAnchorElement>(".strow-link")];
+      const byName = new Map(cards.map((c) => [c.dataset.name!, c]));
+      const keyOf = (r: HTMLElement) => {
+        const c = byName.get(r.dataset.name!);
+        if (!c) return 0;
+        return metric === "added"
+          ? (num(c.dataset.added) ?? 0)
+          : (num(c.dataset.updated) ?? num(c.dataset.added) ?? 0);
+      };
+      rows
+        .sort((a, b) => keyOf(b) - keyOf(a))
+        .forEach((r, i) => {
+          r.hidden = i >= 8;
+          box.appendChild(r);
+          const t = r.querySelector<HTMLElement>(".stime")!;
+          const e = keyOf(r);
+          t.textContent = e ? ago(e) : "";
+        });
+    }
+  }
+
+  function fillTimes() {
+    for (const card of cards) {
+      const upd = num(card.dataset.updated) ?? num(card.dataset.added);
+      const badge = card.querySelector<HTMLElement>(".upd")!;
+      if (upd) {
+        badge.textContent = `↻ ${ago(upd)}`;
+        badge.hidden = false;
+      }
+    }
+  }
+
+  // any change of question goes back to the first page of the new answer
+  q.addEventListener("input", () => {
+    page = 0;
+    apply();
+  });
+  for (const row of viewRows) {
+    row.addEventListener("click", () => {
+      view = row.dataset.view!;
+      page = 0;
+      viewRows.forEach((r) => r.classList.toggle("on", r === row));
+      apply();
+    });
+  }
+  for (const row of tagRows) {
+    row.addEventListener("click", () => {
+      tag = row.dataset.tag!;
+      page = 0;
+      tagRows.forEach((r) => r.classList.toggle("on", r === row));
+      apply();
+    });
+  }
+  document.getElementById("plugin-reset")!.addEventListener("click", () => {
+    q.value = "";
+    tag = "";
+    view = "all";
+    page = 0;
+    tagRows.forEach((r) => r.classList.toggle("on", r.dataset.tag === ""));
+    viewRows.forEach((r) => r.classList.toggle("on", r.dataset.view === "all"));
+    apply();
+  });
+  prev.addEventListener("click", () => page > 0 && goTo(page - 1));
+  next.addEventListener("click", () => goTo(page + 1));
+
+  // the copy button says what it did, briefly, then goes back to being a button
+  function wireCopy(b: HTMLButtonElement) {
+    b.addEventListener("click", () => {
+      navigator.clipboard.writeText(b.dataset.cmd!).then(() => {
+        b.textContent = "copied";
+        b.classList.add("did");
+        setTimeout(() => {
+          b.textContent = "copy";
+          b.classList.remove("did");
+        }, 1400);
+      });
+    });
+  }
+  grid.querySelectorAll<HTMLButtonElement>(".copy").forEach(wireCopy);
+
+  // A card opens the plugin here — its README and its numbers — rather than
+  // throwing you to GitHub; the links to leave are inside. GitHub renders and
+  // sanitises the README HTML, so injecting it is injecting GitHub's output.
+  const detail = document.getElementById("plugin-detail") as HTMLDialogElement;
+  const dName = document.getElementById("d-name")!;
+  const dAuthor = document.getElementById("d-author")!;
+  const dShot = document.getElementById("d-shot") as HTMLImageElement;
+  const dDesc = document.getElementById("d-desc")!;
+  const dMeta = document.getElementById("d-meta")!;
+  const dGh = document.getElementById("d-gh") as HTMLAnchorElement;
+  const dNpm = document.getElementById("d-npm") as HTMLAnchorElement;
+  const dInst = document.getElementById("d-inst")!;
+  const dCmd = document.getElementById("d-cmd")!;
+  const dCopy = document.getElementById("d-copy") as HTMLButtonElement;
+  const dReadme = document.getElementById("d-readme")!;
+  wireCopy(dCopy);
+
+  const readmeCache = new Map<string, string | null>();
+  let showing = "";
+
+  function metaLine(card: HTMLElement, extra: string[] = []) {
+    const bits = [...extra];
+    const dl = num(card.dataset.dl);
+    const stars = num(card.dataset.stars);
+    const upd = num(card.dataset.updated) ?? num(card.dataset.added);
+    if (dl != null) bits.push(`↓ ${fmt(dl)}/mo`);
+    if (stars != null) bits.push(`★ ${fmt(stars)}`);
+    if (upd) bits.push(`↻ ${ago(upd)}`);
+    return bits.join("  ·  ");
+  }
+
+  function openDetail(card: HTMLElement) {
+    const name = card.dataset.name!;
+    showing = name;
+    dName.textContent = card.dataset.npm || name;
+    dAuthor.textContent = card.querySelector(".author")?.textContent?.trim() ?? "";
+    dShot.src = card.querySelector<HTMLImageElement>(".shotbox img")!.src;
+    dShot.alt = `${name} screenshot`;
+    dDesc.textContent = card.querySelector(".body p")?.textContent?.trim() ?? "";
+    dMeta.textContent = metaLine(card);
+    dGh.href = card.dataset.repo!;
+    // shown only once the registry answers for it — a package named but not
+    // yet published must not become a dead link
+    const pkg = card.dataset.npm;
+    dNpm.hidden = true;
+    const bundled = !!card.dataset.host;
+    dInst.hidden = bundled;
+    if (!bundled) {
+      const cmd = `neosh plugin add ${card.dataset.repo!.replace("https://github.com/", "")}`;
+      dCmd.textContent = cmd;
+      dCopy.dataset.cmd = cmd;
+    }
+    dReadme.innerHTML = '<p class="d-loading">reading…</p>';
+    detail.showModal();
+    loadReadme(card, name);
+    if (pkg) loadNpmMeta(card, pkg, name);
+  }
+
+  // the version and licence, off the npm registry the card already trusts
+  async function loadNpmMeta(card: HTMLElement, pkg: string, token: string) {
+    try {
+      const r = await fetch(`https://registry.npmjs.org/${pkg}`);
+      if (!r.ok) return;
+      const j = await r.json();
+      const v = j["dist-tags"]?.latest;
+      const extra: string[] = [];
+      if (v) extra.push(`v${v}`);
+      if (j.license) extra.push(String(j.license));
+      if (showing === token) {
+        dMeta.textContent = metaLine(card, extra);
+        dNpm.href = `https://www.npmjs.com/package/${pkg}`;
+        dNpm.hidden = false;
+      }
+    } catch {}
+  }
+
+  async function loadReadme(card: HTMLElement, token: string) {
+    const cached = readmeCache.get(token);
+    if (cached !== undefined) return renderReadme(cached, card, token);
+    const m = card.dataset.repo!.match(/github\.com\/([^/]+\/[^/]+?)(?:\/tree\/[^/]+\/(.+?))?\/?$/);
+    if (!m) return renderReadme(null, card, token);
+    const url = m[2]
+      ? `https://api.github.com/repos/${m[1]}/readme/${m[2]}`
+      : `https://api.github.com/repos/${m[1]}/readme`;
+    let html: string | null = null;
+    try {
+      const r = await fetch(url, { headers: { Accept: "application/vnd.github.html" } });
+      if (r.ok) html = await r.text();
+    } catch {}
+    readmeCache.set(token, html);
+    renderReadme(html, card, token);
+  }
+
+  function renderReadme(html: string | null, card: HTMLElement, token: string) {
+    if (showing !== token) return; // another card was opened while this loaded
+    if (!html) {
+      dReadme.innerHTML = "";
+      const p = document.createElement("p");
+      p.className = "d-none";
+      p.textContent = "no README here yet — the repository is the documentation";
+      dReadme.appendChild(p);
+      return;
+    }
+    dReadme.innerHTML = html;
+    // a README's relative links are relative to its repo, not to this page
+    const m = card.dataset.repo!.match(/github\.com\/([^/]+\/[^/]+?)(?:\/tree\/[^/]+\/(.+?))?\/?$/)!;
+    const base = `${m[1]}${m[2] ? `/${m[2]}` : ""}`;
+    for (const img of dReadme.querySelectorAll<HTMLImageElement>("img")) {
+      const s = img.getAttribute("src") ?? "";
+      if (s && !/^(https?:|data:|\/\/)/.test(s))
+        img.src = `https://github.com/${m[1]}/raw/HEAD/${m[2] ? `${m[2]}/` : ""}${s.replace(/^\.?\//, "")}`;
+    }
+    for (const a of dReadme.querySelectorAll<HTMLAnchorElement>("a")) {
+      const h = a.getAttribute("href") ?? "";
+      if (h && !/^(https?:|#|mailto:|\/\/)/.test(h))
+        a.href = `https://github.com/${base.split("/").slice(0, 2).join("/")}/blob/HEAD/${m[2] ? `${m[2]}/` : ""}${h.replace(/^\.?\//, "")}`;
+      a.target = "_blank";
+      a.rel = "noopener";
+    }
+  }
+
+  document.getElementById("d-close")!.addEventListener("click", () => detail.close());
+  detail.addEventListener("click", (e) => {
+    if (e.target === detail) detail.close(); // the backdrop is the dialog's own box
+  });
+
+  const byNameCard = (name: string) => cards.find((c) => c.dataset.name === name);
+  for (const card of cards) {
+    card.addEventListener("click", (e) => {
+      const t = e.target as HTMLElement;
+      if (t.closest(".copy, .dl")) return; // those are their own buttons
+      if (e.metaKey || e.ctrlKey || e.shiftKey) return; // open-in-tab still works
+      e.preventDefault();
+      openDetail(card);
+    });
+  }
+  for (const row of strips.querySelectorAll<HTMLAnchorElement>(".strow-link")) {
+    row.addEventListener("click", (e) => {
+      if (e.metaKey || e.ctrlKey || e.shiftKey) return;
+      const card = byNameCard(row.dataset.name!);
+      if (!card) return;
+      e.preventDefault();
+      openDetail(card);
+    });
+  }
+
+  // The build stamped stars and dates into the page; the browser keeps them
+  // fresh, cached for an hour so thirty cards are not thirty API calls per
+  // visit. A builtin (data-host) shares the host repo's stars, but its
+  // "updated" stays the git date of its own directory — the host's last push
+  // says nothing about one plugin in it.
+  const TTL = 3_600_000;
   const bySlug = new Map<string, HTMLElement[]>();
   for (const card of cards) {
-    const m = card.dataset.repo!.match(/^https:\/\/github\.com\/([^/]+\/[^/]+?)\/?$/);
+    const m = card.dataset.repo!.match(/^https:\/\/github\.com\/([^/]+\/[^/]+)/);
     if (!m) continue;
     const list = bySlug.get(m[1]) ?? [];
     list.push(card);
     bySlug.set(m[1], list);
   }
 
-  async function stars(slug: string): Promise<number | null> {
-    const key = `gh-stars:${slug}`;
-    const cached = sessionStorage.getItem(key);
-    if (cached !== null) return Number(cached);
+  async function repoInfo(slug: string): Promise<{ s: number; p: number | null } | null> {
+    const key = `gh-repo:${slug}`;
+    try {
+      const cached = JSON.parse(localStorage.getItem(key) ?? "null");
+      if (cached && Date.now() - cached.t < TTL) return cached;
+    } catch {}
     try {
       const r = await fetch(`https://api.github.com/repos/${slug}`);
       if (!r.ok) return null;
-      const n = (await r.json()).stargazers_count;
-      if (typeof n !== "number") return null;
-      sessionStorage.setItem(key, String(n));
-      return n;
+      const j = await r.json();
+      if (typeof j.stargazers_count !== "number") return null;
+      const info = { t: Date.now(), s: j.stargazers_count, p: j.pushed_at ? Date.parse(j.pushed_at) / 1000 : null };
+      localStorage.setItem(key, JSON.stringify(info));
+      return info;
     } catch {
       return null;
     }
@@ -182,19 +1591,94 @@ const GUIDE = "https://github.com/neoswarm/neosh/blob/main/website/src/data/plug
 
   Promise.all(
     [...bySlug].map(async ([slug, list]) => {
-      const n = await stars(slug);
-      if (n === null) return;
+      const info = await repoInfo(slug);
+      if (!info) return;
       for (const card of list) {
-        card.dataset.stars = String(n);
+        card.dataset.stars = String(info.s);
+        if (info.p && !card.dataset.host) card.dataset.updated = String(Math.floor(info.p));
         const badge = card.querySelector<HTMLElement>(".stars")!;
-        badge.textContent = `★ ${fmt(n)}`;
+        badge.textContent = `★ ${fmt(info.s)}`;
         badge.hidden = false;
       }
     }),
   ).then(() => {
-    const add = grid.querySelector(".add");
-    [...cards]
-      .sort((a, b) => Number(b.dataset.stars ?? -1) - Number(a.dataset.stars ?? -1))
-      .forEach((card) => grid.insertBefore(card, add));
+    fillTimes();
+    sortStrips();
+    apply();
   });
+
+  // installs refresh the same way stars do — npm's downloads API is public
+  // and CORS-open, cached for the same hour so a page is not a request per card
+  Promise.all(
+    cards
+      .filter((c) => c.dataset.npm)
+      .map(async (card) => {
+        const pkg = card.dataset.npm!;
+        const key = `npm-dl:${pkg}`;
+        let n: number | null = null;
+        try {
+          const cached = JSON.parse(localStorage.getItem(key) ?? "null");
+          if (cached && Date.now() - cached.t < TTL) n = cached.n;
+        } catch {}
+        if (n === null) {
+          try {
+            const r = await fetch(`https://api.npmjs.org/downloads/point/last-month/${pkg}`);
+            if (!r.ok) return;
+            n = (await r.json()).downloads;
+            if (typeof n !== "number") return;
+            localStorage.setItem(key, JSON.stringify({ t: Date.now(), n }));
+          } catch {
+            return;
+          }
+        }
+        card.dataset.dl = String(n);
+        const badge = card.querySelector<HTMLElement>(".dl");
+        if (badge) {
+          badge.textContent = `↓ ${fmt(n)}/mo`;
+          badge.hidden = false;
+        }
+      }),
+  ).then(apply); // installs are the loudest part of "popular"
+
+  fillTimes();
+  sortStrips();
+  apply();
+
+  // Clicks, when a GoatCounter site is configured: count.js turns every
+  // data-goatcounter-click into an event, and the public counter endpoint
+  // hands the totals back. Without a site code none of this runs and the
+  // cards simply do not show a click count.
+  const gc = grid.dataset.gc;
+  if (gc) {
+    const s = document.createElement("script");
+    s.src = "https://gc.zgo.at/count.js";
+    s.async = true;
+    s.dataset.goatcounter = `https://${gc}.goatcounter.com/count`;
+    document.head.appendChild(s);
+
+    Promise.all(
+      cards.map(async (card) => {
+        const key = `gc-clicks:${card.dataset.name}`;
+        let n: number | null = null;
+        try {
+          const cached = JSON.parse(localStorage.getItem(key) ?? "null");
+          if (cached && Date.now() - cached.t < 600_000) n = cached.n;
+        } catch {}
+        if (n === null) {
+          try {
+            const r = await fetch(`https://${gc}.goatcounter.com/counter/plugin-${card.dataset.name}.json`);
+            if (!r.ok) return;
+            n = Number(String((await r.json()).count).replace(/\D/g, "")) || 0;
+            localStorage.setItem(key, JSON.stringify({ t: Date.now(), n }));
+          } catch {
+            return;
+          }
+        }
+        card.dataset.clicks = String(n);
+        const badge = card.querySelector<HTMLElement>(".clicks")!;
+        badge.textContent = `↗ ${fmt(n)}`;
+        badge.hidden = false;
+      }),
+    ).then(apply); // clicks are part of "popular", so the order follows them
+  }
 </script>
