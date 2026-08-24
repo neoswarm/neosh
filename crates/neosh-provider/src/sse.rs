@@ -1020,6 +1020,31 @@ mod tests {
         );
     }
 
+    /// The whole line, on the scale it really arrives on.
+    ///
+    /// Captured from a live run: `utilization` here is the fraction the CLI read off an
+    /// `anthropic-ratelimit-unified-*-utilization` header, not the percentage `/api/oauth/usage`
+    /// answers with. Pinned at this level as well as in the parser because the two numbers are the
+    /// same field name one type apart, and nothing between here and the sidebar can tell them
+    /// apart once the mistake has been made.
+    #[test]
+    fn a_rate_limit_line_arrives_as_a_percentage() {
+        let events = cli(&[
+            r#"{"type":"rate_limit_event","rate_limit_info":{"status":"allowed_warning","unifiedRateLimitFallbackAvailable":false,"rateLimitType":"seven_day","utilization":0.56,"resetsAt":1787965200}}"#,
+        ]);
+        let [Activity::Quota { windows, .. }] = only_activity(&events)[..] else {
+            panic!("one quota activity, got {events:?}")
+        };
+        assert_eq!(windows.len(), 1, "one window, and it says nothing about the others");
+        assert_eq!(windows[0].id, "weekly");
+        assert_eq!(windows[0].used_percent, 56.0);
+        assert_eq!(
+            windows[0].severity,
+            neosh_proto::quota::QuotaSeverity::Normal,
+            "and 56% is not the emergency the stale flag beside it claims",
+        );
+    }
+
     /// A real capture of a turn that ran the `Agent` tool. The sub-agent's three calls arrive as
     /// whole `assistant` messages the CLI never streams, so reading its `user` lines put results
     /// in the transcript with no card to sit under; its report comes back on the parent's own
