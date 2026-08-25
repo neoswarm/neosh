@@ -624,7 +624,7 @@ async fn unpairing_disconnects_and_stops_dialling() {
 
     p.a.send(SwarmRequest::Unpair { id: b_id.clone() });
     let reason = wait_for(&mut p.a_rx, |e| match e {
-        SwarmEvent::PeerDown { node, reason } if node == &b_id => Some(reason.clone()),
+        SwarmEvent::PeerDown { node, reason, .. } if node == &b_id => Some(reason.clone()),
         _ => None,
     })
     .await;
@@ -642,4 +642,110 @@ async fn unpairing_disconnects_and_stops_dialling() {
     })
     .await;
     assert!(returned.is_err(), "an unpaired machine stays unpaired");
+}
+
+/// Disconnecting holds the door shut in both directions — the dialler stops, and a peer that
+/// dials *us* is turned away — and `Redial` is the one thing that opens it again.
+#[tokio::test]
+async fn a_disconnect_holds_until_a_redial_lifts_it() {
+    let mut p = pair(true).await;
+    let b_id = wait_for(&mut p.a_rx, |e| match e {
+        SwarmEvent::PeerUp { node, .. } => Some(node.id.clone()),
+        _ => None,
+    })
+    .await;
+
+    p.a.send(SwarmRequest::Disconnect { id: b_id.clone() });
+    let (reason, will_retry) = wait_for(&mut p.a_rx, |e| match e {
+        SwarmEvent::PeerDown { node, reason, will_retry } if node == &b_id => {
+            Some((reason.clone(), *will_retry))
+        }
+        _ => None,
+    })
+    .await;
+    assert_eq!(reason, "disconnected by you");
+    assert!(!will_retry, "nothing is dialling a machine you told to stop");
+
+    // `b` keeps dialling nobody here — `a` dialled it — but even if it did, the pause holds. What
+    // must not happen is `a`'s own dialler bringing it straight back.
+    let returned = tokio::time::timeout(Duration::from_millis(800), async {
+        loop {
+            match p.a_rx.recv().await {
+                Some(SwarmEvent::PeerUp { .. }) => return true,
+                Some(_) => continue,
+                None => return false,
+            }
+        }
+    })
+    .await;
+    assert!(returned.is_err(), "disconnected means disconnected, not ten seconds of quiet");
+
+    // The pairing survived, so reconnecting is one request, not a ceremony.
+    p.a.send(SwarmRequest::Redial { id: b_id.clone() });
+    let name = wait_for(&mut p.a_rx, |e| match e {
+        SwarmEvent::PeerUp { node, .. } if node.id == b_id => Some(node.name.clone()),
+        _ => None,
+    })
+    .await;
+    assert_eq!(name, "linux-box");
+}
+
+/// A dial that fails is reported, with a count that moves — which is what lets a board say
+/// `connecting — try 3` instead of pretending nothing is happening.
+#[tokio::test]
+async fn failed_dials_are_reported_with_a_moving_attempt_count() {
+    // An address nothing listens on: bind to learn a free port, then close it.
+    let probe = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("probe");
+    let addr = probe.local_addr().expect("addr");
+    drop(probe);
+
+    let a_id = Identity::ephemeral();
+    let expect = Identity::ephemeral().id().clone();
+    let cfg = SwarmConfig {
+        name: "mac-studio".into(),
+        peers: vec![PeerAddress { addr: addr.to_string(), expect: Some(expect.clone()) }],
+        heartbeat: Duration::from_millis(200),
+        ..Default::default()
+    };
+    let (_a, mut a_rx) = neosh_swarm::node::spawn(Arc::new(a_id), Allowed::load(None), cfg, "0.1.0".into());
+
+    let first = wait_for(&mut a_rx, |e| match e {
+        SwarmEvent::DialFailed { node, attempt, .. } if node.as_ref() == Some(&expect) => {
+            Some(*attempt)
+        }
+        _ => None,
+    })
+    .await;
+    assert_eq!(first, 1);
+
+    let second = wait_for(&mut a_rx, |e| match e {
+        SwarmEvent::DialFailed { attempt, .. } if *attempt > 1 => Some(*attempt),
+        _ => None,
+    })
+    .await;
+    assert_eq!(second, 2, "the count is per run of failures, not per event");
+}
+
+/// The listener says what it managed, which is what a board's "this computer" row shows.
+#[tokio::test]
+async fn the_listener_reports_the_address_it_bound() {
+    let probe = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("probe");
+    let addr = probe.local_addr().expect("addr");
+    drop(probe);
+
+    let id = Identity::ephemeral();
+    let cfg = SwarmConfig {
+        name: "linux-box".into(),
+        listen: Some(addr),
+        heartbeat: Duration::from_millis(200),
+        ..Default::default()
+    };
+    let (_h, mut rx) = neosh_swarm::node::spawn(Arc::new(id), Allowed::load(None), cfg, "0.1.0".into());
+
+    let bound = wait_for(&mut rx, |e| match e {
+        SwarmEvent::Listening { addr } => Some(*addr),
+        _ => None,
+    })
+    .await;
+    assert_eq!(bound, addr);
 }

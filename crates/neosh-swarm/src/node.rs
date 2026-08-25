@@ -90,15 +90,33 @@ pub enum SwarmRequest {
     Pair { id: NodeId, name: String, addr: Option<String> },
     /// Withdraw authorisation. The connection, if there is one, goes with it.
     Unpair { id: NodeId },
+    /// Dial a down peer again now, resetting its backoff, rather than waiting the delay out.
+    Redial { id: NodeId },
+    /// Close the connection to a peer and stop dialling it, keeping the pairing.
+    ///
+    /// [`SwarmRequest::Redial`] is the way back. The peer may still dial in — it is still on the
+    /// allow-list — and a restart dials it again; this is for this workspace's lifetime only.
+    Disconnect { id: NodeId },
     Shutdown,
 }
 
 /// Something the host needs to know.
 #[derive(Debug, Clone)]
 pub enum SwarmEvent {
+    /// The listening socket is bound, on this address. Said once, at start.
+    Listening { addr: SocketAddr },
+    /// The listening socket could not be bound — most often a port another workspace holds.
+    /// Dialling still works; a board should say the machine cannot be *reached*, not that the
+    /// swarm is broken.
+    ListenFailed { addr: SocketAddr, error: String },
     PeerUp { node: NodeInfo, capabilities: NodeCapabilities },
-    /// A peer went away. `reason` is for the log and for a board that says why.
-    PeerDown { node: NodeId, reason: String },
+    /// A peer went away. `reason` is for the log and for a board that says why. `will_retry` says
+    /// whether a dialler is still working on it — the difference between "reconnecting" and
+    /// "gone", which is the whole of what a person would do differently.
+    PeerDown { node: NodeId, reason: String, will_retry: bool },
+    /// A dial did not produce a connection. `attempt` counts since the last success, so a board
+    /// can say `try 4`; `node` is absent for an address whose machine we have never identified.
+    DialFailed { node: Option<NodeId>, addr: String, attempt: u32, error: String },
     Inventory { node: NodeId, full: bool, agents: Vec<AgentSummary>, gone: Vec<SessionId> },
     Stream { node: NodeId, session: SessionId, event: StreamEvent },
     /// A peer asked us to do something. The host must answer with [`SwarmRequest::Answer`].
@@ -152,10 +170,18 @@ enum Wire {
     Up {
         info: NodeInfo,
         capabilities: NodeCapabilities,
+        /// The **only** sender for this connection once the loop holds it: `serve` gives its own
+        /// clone up at announce time, so the loop dropping this is what actually closes the
+        /// writer, sends the FIN, and lets both ends unwind. A serve that kept a clone was a
+        /// connection nothing could close — dropped peers stayed as idle sockets for ever.
         out: mpsc::UnboundedSender<AscpMessage>,
         /// Whether this end opened the connection. Decides which of two simultaneous connections
         /// survives; see the tie-break where this is read.
         dialled: bool,
+        /// The address this end dialled, when it did — how the loop learns which address a node
+        /// id lives at, for a `Redial` or `Disconnect` aimed at a peer the allow-list only knows
+        /// by key.
+        addr: Option<String>,
     },
     Message { node: NodeId, message: AscpMessage },
     Down { node: Option<NodeId>, reason: String },
@@ -206,7 +232,11 @@ async fn run(
     if let Some(addr) = config.listen {
         match TcpListener::bind(addr).await {
             Ok(sock) => {
-                tracing::info!(%addr, node = %identity.id().short(), "swarm listening");
+                // The socket's own answer, not the config's: `:0` binds a port the config
+                // never named, and the board should show the one a peer could actually dial.
+                let bound = sock.local_addr().unwrap_or(addr);
+                tracing::info!(addr = %bound, node = %identity.id().short(), "swarm listening");
+                let _ = events.send(SwarmEvent::Listening { addr: bound });
                 tokio::spawn(listen(
                     sock,
                     identity.clone(),
@@ -218,7 +248,10 @@ async fn run(
             }
             // Not fatal. A machine that cannot listen can still dial, and refusing to start the
             // workspace because a port was taken would be a swarm feature breaking the editor.
-            Err(e) => tracing::warn!(%addr, "swarm could not listen: {e}"),
+            Err(e) => {
+                tracing::warn!(%addr, "swarm could not listen: {e}");
+                let _ = events.send(SwarmEvent::ListenFailed { addr, error: e.to_string() });
+            }
         }
     }
 
@@ -240,6 +273,7 @@ async fn run(
                     info.clone(),
                     caps.clone(),
                     wire_tx.clone(),
+                    events.clone(),
                     config.heartbeat,
                 ));
                 diallers.insert(addr, handle);
@@ -251,6 +285,14 @@ async fn run(
     }
 
     let mut peers: HashMap<NodeId, Connected> = HashMap::new();
+    // Disconnected by the person, and not to be readmitted until they say so: a peer that dials
+    // *us* would otherwise be back on its next heartbeat, which makes "disconnect" a button that
+    // works for at most ten seconds. Still on the allow-list — this is "leave me alone for now",
+    // and unpairing is the other, stronger verb.
+    let mut paused: std::collections::HashSet<NodeId> = std::collections::HashSet::new();
+    // Where each node was last reachable, learned from the dial that found it. The allow-list is
+    // the first answer; this is the fallback for a peer it only knows by key.
+    let mut addr_of: HashMap<NodeId, String> = HashMap::new();
     // The last full picture of our own agents, kept so a peer that connects five minutes in gets a
     // snapshot rather than whatever delta happens next — which for an idle workspace is nothing at
     // all, so the board would stay empty until somebody typed.
@@ -283,6 +325,7 @@ async fn run(
                     }
                     SwarmRequest::Projects { projects } => caps.projects = projects,
                     SwarmRequest::Pair { id, name, addr } => {
+                        paused.remove(&id);
                         allowed.add(id.clone(), crate::allow::Peer {
                             name,
                             addr: addr.clone(),
@@ -296,6 +339,7 @@ async fn run(
                         }
                     }
                     SwarmRequest::Unpair { id } => {
+                        paused.remove(&id);
                         let addr = allowed.get(&id).and_then(|p| p.addr);
                         let _ = allowed.remove(&id);
                         if let Some(addr) = addr
@@ -312,8 +356,52 @@ async fn run(
                             let _ = events.send(SwarmEvent::PeerDown {
                                 node: id,
                                 reason: "unpaired".into(),
+                                will_retry: false,
                             });
                         }
+                    }
+                    SwarmRequest::Redial { id } => {
+                        // Whatever a disconnect held back is welcome again — for a peer that
+                        // dials us, this is the whole of what "reconnect" can do.
+                        paused.remove(&id);
+                        // Already connected means there is nothing to hurry. Otherwise restart the
+                        // dialler: a fresh task begins with a fresh backoff, which is the whole
+                        // point of somebody pressing the key.
+                        if !peers.contains_key(&id)
+                            && let Some(addr) = allowed
+                                .get(&id)
+                                .and_then(|p| p.addr)
+                                .or_else(|| addr_of.get(&id).cloned())
+                        {
+                            if let Some(task) = diallers.remove(&addr) {
+                                task.abort();
+                            }
+                            start_dialling!(PeerAddress { addr, expect: Some(id) });
+                        }
+                    }
+                    SwarmRequest::Disconnect { id } => {
+                        paused.insert(id.clone());
+                        if let Some(addr) = allowed
+                            .get(&id)
+                            .and_then(|p| p.addr)
+                            .or_else(|| addr_of.get(&id).cloned())
+                            && let Some(task) = diallers.remove(&addr)
+                        {
+                            task.abort();
+                        }
+                        if let Some(p) = peers.remove(&id) {
+                            let _ = p.out.send(AscpMessage::Goodbye {
+                                message: Some("disconnected".into()),
+                            });
+                        }
+                        // Said even when there was no live connection: a peer mid-retry that is
+                        // told to stop has still changed state, and a board that keeps saying
+                        // "reconnecting" about a dialler that is gone is lying.
+                        let _ = events.send(SwarmEvent::PeerDown {
+                            node: id,
+                            reason: "disconnected by you".into(),
+                            will_retry: false,
+                        });
                     }
                     SwarmRequest::Command { node, id, session, command } => {
                         match peers.get(&node) {
@@ -323,9 +411,14 @@ async fn run(
                             // Answered locally rather than dropped: a command with no reply is a
                             // keystroke you cannot tell from a slow network.
                             None => {
+                                let will_retry = allowed
+                                    .get(&node)
+                                    .and_then(|p| p.addr)
+                                    .is_some_and(|a| diallers.contains_key(&a));
                                 let _ = events.send(SwarmEvent::PeerDown {
                                     node,
                                     reason: "not connected".into(),
+                                    will_retry,
                                 });
                             }
                         }
@@ -364,8 +457,17 @@ async fn run(
                 }
             }
             Some(w) = wire_rx.recv() => match w {
-                Wire::Up { info: peer_info, capabilities, out, dialled } => {
+                Wire::Up { info: peer_info, capabilities, out, dialled, addr } => {
                     let id = peer_info.id.clone();
+                    if let Some(addr) = addr {
+                        addr_of.insert(id.clone(), addr);
+                    }
+                    // Disconnected by the person, and it dialled back in. Shut the door quietly:
+                    // no `PeerDown`, because it never came up.
+                    if paused.contains(&id) {
+                        drop(out);
+                        continue;
+                    }
                     // Two nodes that both dial each other end up with two connections, and both of
                     // them work. Something has to drop one, and *both ends have to drop the same
                     // one* — the first version of this kept whichever arrived later, which each
@@ -418,7 +520,11 @@ async fn run(
                         && peers.get(&id).is_some_and(|p| p.out.is_closed())
                     {
                         peers.remove(&id);
-                        let _ = events.send(SwarmEvent::PeerDown { node: id, reason });
+                        let will_retry = allowed
+                            .get(&id)
+                            .and_then(|p| p.addr)
+                            .is_some_and(|a| diallers.contains_key(&a));
+                        let _ = events.send(SwarmEvent::PeerDown { node: id, reason, will_retry });
                     }
                 }
                 Wire::Message { node, message } => match message {
@@ -485,9 +591,14 @@ async fn run(
                     }
                     AscpMessage::Goodbye { message } => {
                         if peers.remove(&node).is_some() {
+                            let will_retry = allowed
+                                .get(&node)
+                                .and_then(|p| p.addr)
+                                .is_some_and(|a| diallers.contains_key(&a));
                             let _ = events.send(SwarmEvent::PeerDown {
                                 node,
                                 reason: message.unwrap_or_else(|| "said goodbye".into()),
+                                will_retry,
                             });
                         }
                     }
@@ -538,7 +649,11 @@ async fn listen(
         tokio::spawn(async move {
             let mut stream = stream;
             match accept(&mut stream, &identity, &allowed, &info, &caps).await {
-                Ok(peer) => serve(stream, peer, wire, false).await,
+                // No address: where an inbound connection happened to arrive from is not
+                // necessarily somewhere it could be dialled back on.
+                Ok(peer) => {
+                    serve(stream, peer, wire, false, None).await;
+                }
                 // A machine that proved itself and is not on the list is somebody asking to pair,
                 // not an error. It reaches the host, which can offer to add it.
                 Err(crate::SwarmError::Stranger(s)) => {
@@ -553,6 +668,12 @@ async fn listen(
 }
 
 /// Keep one configured peer connected, retrying for as long as the node runs.
+///
+/// The retry schedule backs off — 1s, 2s, 4s… capped at the heartbeat or 30s, whichever is longer
+/// — and resets the moment a connection actually serves, so a machine that reboots is back within
+/// seconds while one that is gone for the weekend is asked about twice a minute. Every failed dial
+/// is reported with its attempt number, which is what lets a board say `try 4` instead of drawing
+/// a spinner that never resolves.
 async fn keep_dialled(
     peer: PeerAddress,
     identity: Arc<Identity>,
@@ -560,10 +681,23 @@ async fn keep_dialled(
     info: NodeInfo,
     caps: NodeCapabilities,
     wire: mpsc::UnboundedSender<Wire>,
+    events: mpsc::UnboundedSender<SwarmEvent>,
     every: Duration,
 ) {
+    enum Outcome {
+        /// Connected, accepted, and served until it ended.
+        Served,
+        /// Reached the machine, and it has not allowed this one (yet).
+        Refused,
+        /// Reached a machine we have not paired with. What "add a computer" is waiting for.
+        Stranger,
+        Failed(String),
+    }
+
+    let cap = every.max(Duration::from_secs(30));
+    let mut attempt: u32 = 0;
     loop {
-        match TcpStream::connect(&peer.addr).await {
+        let outcome = match TcpStream::connect(&peer.addr).await {
             Ok(mut stream) => match dial(&mut stream, &identity, &allowed, &info, &caps).await {
                 Ok(found) => {
                     // The address said one machine and another answered. Worth refusing rather
@@ -579,32 +713,84 @@ async fn keep_dialled(
                             want.short(),
                             found.node.id.short()
                         );
+                        Outcome::Failed(format!(
+                            "another machine answered ({})",
+                            found.node.id.short()
+                        ))
+                    } else if serve(stream, found, wire.clone(), true, Some(peer.addr.clone())).await
+                    {
+                        Outcome::Served
                     } else {
-                        serve(stream, found, wire.clone(), true).await;
+                        Outcome::Refused
                     }
                 }
                 Err(crate::SwarmError::Stranger(s)) => {
-                    // We dialled an address and something genuine answered that we have not paired
-                    // with. This is what "add a computer" is waiting for.
                     let _ = wire.send(Wire::Stranger { node: s.node, dialled: true });
+                    Outcome::Stranger
                 }
-                Err(e) => tracing::debug!(addr = %peer.addr, "swarm handshake failed: {e}"),
+                Err(e) => {
+                    tracing::debug!(addr = %peer.addr, "swarm handshake failed: {e}");
+                    Outcome::Failed(e.to_string())
+                }
             },
-            Err(e) => tracing::debug!(addr = %peer.addr, "swarm could not connect: {e}"),
-        }
-        // Whether it failed to connect or connected and later dropped, the answer is the same and
-        // the delay stops a machine that is off from being a busy loop.
-        tokio::time::sleep(every).await;
+            Err(e) => {
+                tracing::debug!(addr = %peer.addr, "swarm could not connect: {e}");
+                Outcome::Failed(e.to_string())
+            }
+        };
+
+        let delay = match outcome {
+            // It connected and served. Whatever ended it may be a blip, so the next dial is
+            // nearly immediate and the backoff starts over.
+            Outcome::Served => {
+                attempt = 0;
+                Duration::from_secs(1)
+            }
+            // The machine is *there*, so backing off would only slow down the pairing it is
+            // probably in the middle of; the flat heartbeat is the pace. Refused is still worth a
+            // row on the board — "it has not allowed this machine" names the key to press, over
+            // there, where a person is presumably sitting.
+            Outcome::Refused => {
+                attempt = 0;
+                let _ = events.send(SwarmEvent::DialFailed {
+                    node: peer.expect.clone(),
+                    addr: peer.addr.clone(),
+                    attempt: 0,
+                    error: "reached it — it has not allowed this machine yet".into(),
+                });
+                every
+            }
+            Outcome::Stranger => {
+                attempt = 0;
+                every
+            }
+            Outcome::Failed(error) => {
+                attempt = attempt.saturating_add(1);
+                let _ = events.send(SwarmEvent::DialFailed {
+                    node: peer.expect.clone(),
+                    addr: peer.addr.clone(),
+                    attempt,
+                    error,
+                });
+                cap.min(Duration::from_secs(1u64 << (attempt - 1).min(6)))
+            }
+        };
+        tokio::time::sleep(delay).await;
     }
 }
 
 /// Pump one authenticated connection until it ends.
+///
+/// Returns whether the connection was ever announced — for a dialler, whether the far end accepted
+/// us. `false` from a dial means "reached it, and it has not allowed this machine", which is a
+/// different fact from the address being dead and is paced differently by the caller.
 async fn serve(
     stream: TcpStream,
     peer: crate::Peer,
     wire: mpsc::UnboundedSender<Wire>,
     dialled: bool,
-) {
+    addr: Option<String>,
+) -> bool {
     let id = peer.node.id.clone();
     let (mut read, mut write) = stream.into_split();
     let (out_tx, mut out_rx) = mpsc::unbounded_channel::<AscpMessage>();
@@ -634,29 +820,33 @@ async fn serve(
     // So a dialler waits for one message. The listener's node sends a full inventory the instant it
     // accepts, so a real connection announces itself within a round trip, and a refused one never
     // announces at all.
-    let mut announced = if dialled {
-        None
-    } else {
+    //
+    // The sender is *moved* into the announce rather than cloned, so once the loop has it, it has
+    // the only one — and the loop dropping it is what closes the writer, sends the FIN and lets
+    // both ends unwind. A serve that kept a clone was a connection nothing could ever close: a
+    // dropped peer stayed as an idle socket, and its dialler stayed wedged inside it.
+    let mut announce = Some(out_tx);
+    if !dialled {
         let _ = wire.send(Wire::Up {
             info: peer.node.clone(),
             capabilities: peer.capabilities.clone(),
-            out: out_tx.clone(),
+            out: announce.take().expect("first take"),
             dialled,
+            addr: addr.clone(),
         });
-        Some(())
-    };
+    }
 
     let reason = loop {
         match read_message(&mut read).await {
             Ok(Some(message)) => {
-                if announced.is_none() {
+                if let Some(out) = announce.take() {
                     let _ = wire.send(Wire::Up {
                         info: peer.node.clone(),
                         capabilities: peer.capabilities.clone(),
-                        out: out_tx.clone(),
+                        out,
                         dialled,
+                        addr: addr.clone(),
                     });
-                    announced = Some(());
                 }
                 if wire.send(Wire::Message { node: id.clone(), message }).is_err() {
                     break "the swarm stopped".to_string();
@@ -668,12 +858,13 @@ async fn serve(
     };
     // Nothing to report down if nothing was ever reported up: a dialler the far end refused is a
     // stranger, which was already said, not a peer that went away.
-    if announced.is_none() {
+    if announce.is_some() {
         writer.abort();
-        return;
+        return false;
     }
     writer.abort();
     let _ = wire.send(Wire::Down { node: Some(id), reason });
+    true
 }
 
 #[cfg(test)]
