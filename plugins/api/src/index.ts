@@ -1247,11 +1247,21 @@ export interface StatusApi {
    * `keys` is drawn immediately after `text`, dimmed — the key that changes this thing, beside the
    * thing it changes. Write it the way the user would press it (`^P`, `^Z`), not the way a keymap
    * spells it.
+   *
+   * `short` is the same thing said in less room, and the strip asks for it before it drops your
+   * segment. Give one to anything wide: without it a segment costs its full width or nothing, so
+   * the widest thing in the strip is the first thing to vanish on a narrow terminal — which is
+   * usually the thing worth the most. It is not a truncation and the host will not invent one; it
+   * is the fact with a part left out, and only you know which part that is.
+   *
+   * `priority` is where the segment sits *and* what the strip gives up first, in reverse.
    */
   set(
     key: string,
     segment: {
       text: string;
+      /** The same fact in fewer columns, used before this segment is dropped for want of room. */
+      short?: string;
       keys?: string;
       hl?: string;
       align?: StatusAlign;
@@ -2654,6 +2664,7 @@ function build(
           key,
           segment: {
             text: segment.text,
+            short: segment.short ?? null,
             keys: segment.keys ?? null,
             hl: segment.hl ?? null,
             align: segment.align ?? "left",

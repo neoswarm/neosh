@@ -1539,7 +1539,9 @@ async function drawContext(neosh: Neosh, session: SessionInfo) {
   // Nothing to be a percentage of. Better to say the number than to invent a denominator.
   if (!window) {
     if (used > 0) {
-      await neosh.status.set("context", { text: `${short(used)} ctx`, priority: 20 });
+      // Same rank as the meter below: it is the same fact, said without a denominator because
+      // there is not one to be had.
+      await neosh.status.set("context", { text: `${short(used)} ctx`, priority: 8 });
     } else {
       await neosh.status.clear("context");
     }
@@ -1548,10 +1550,25 @@ async function drawContext(neosh: Neosh, session: SessionInfo) {
   const ascii = (await neosh.opt.get<boolean>("ui.ascii_only").catch(() => false)) ?? false;
   const fraction = Math.min(1, used / window);
   const percent = fraction * 100;
+  const bar = meter(fraction, CELLS, { ascii });
   await neosh.status.set("context", {
-    text: `${meter(fraction, CELLS, { ascii })} ${percent.toFixed(0)}% of ${short(window)}`,
+    text: `${bar} ${percent.toFixed(0)}% of ${short(window)}`,
+    // What to give up when the strip runs out of room: the denominator. It is the one part of
+    // this that does not change all conversation — the window is a property of the model, and it
+    // is on the model picker, in `/usage` and in the sidebar — whereas the bar and the percentage
+    // are the whole reason anybody looks here. Not a truncation: `███░░░░░ 34%` is true.
+    short: `${bar} ${percent.toFixed(0)}%`,
     hl: percent > 90 ? "Meter.Full" : percent > 70 ? "Meter.Warn" : "Comment",
-    priority: 20,
+    // Ahead of the branch, the cost and the token counts, and this is the point rather than a
+    // detail of the ordering. Priority is also what a narrow strip gives up first, and this used
+    // to sit on 20 — tied with the git branch, separated only by the fact that "context" sorts
+    // after "branch" — which made it the second thing out of the line after the token counts. So
+    // on a terminal a few columns short, the meter vanished; and because a running turn adds its
+    // own segment to the right-hand end, a terminal wide enough at rest was several columns too
+    // narrow the moment an answer started, which is precisely when the number matters. It is the
+    // most valuable thing on this strip: it is the one that says whether the conversation is
+    // about to stop working.
+    priority: 8,
   });
 }
 

@@ -751,6 +751,21 @@ async fn run_turn(
     let mut abandoned = false;
     // Whether the context question in flight is the one that ends the turn.
     let mut ending = false;
+    // How many "how full is it" questions have been asked and not yet answered, and how many of
+    // those answers are about a context that no longer exists.
+    //
+    // The question is asked on a five-second clock and a compaction takes twenty, so when the
+    // boundary lands there are several of them outstanding — each one a measurement of the
+    // conversation *before* it was compacted, arriving after the line that said it had been. The
+    // last of them won, and `/compact` ended with the meter back at the number it started from,
+    // under a card saying `180k → 12k`. Answers are matched by shape rather than by request id, so
+    // this counts rather than names: every answer outstanding at the boundary is stale, in order.
+    //
+    // Per turn, deliberately. If the CLI never answers one of them the count does not come back
+    // down, and the cost of that is a meter that stops moving until the turn ends — which is a
+    // meter showing the boundary's own `post_tokens`, and therefore still right.
+    let mut asked = 0usize;
+    let mut stale = 0usize;
     // Lines read during that wait, which belong to whatever comes next. Held here rather than put
     // straight back where the next turn will find them, because this loop reads from there too —
     // put back, the same line is read, put back and read again, forever.
@@ -805,7 +820,9 @@ async fn run_turn(
                 }
             }
             _ = clock.tick(), if !interrupted && !ending => {
-                let _ = live.control(&json!({"subtype": "get_context_usage"})).await;
+                if live.control(&json!({"subtype": "get_context_usage"})).await.is_ok() {
+                    asked += 1;
+                }
             }
             // Asked to stop, not killed. A killed CLI takes the conversation with it, and the next
             // turn would resume into a history that has never heard of the work it interrupted.
@@ -947,11 +964,36 @@ async fn run_turn(
                 // of these are asked over a long turn, they all answer the same question, and the
                 // only one that matters is the newest.
                 if let Some(ev) = context_usage(&v) {
+                    asked = asked.saturating_sub(1);
+                    // Unless it is an answer about a context a compaction has since thrown away.
+                    // Dropped rather than corrected, because there is nothing here to correct it
+                    // with: the next tick asks again and the boundary's own `post_tokens` is what
+                    // the meter reads until it does. See `stale`.
+                    if stale > 0 {
+                        stale -= 1;
+                        // Still the line the ending was waiting for, even though nothing is sent
+                        // on: the turn is over either way, and a turn that hangs on for want of a
+                        // number is worse than a turn that ends without one.
+                        if ending {
+                            break;
+                        }
+                        continue;
+                    }
                     let _ = tx.send(ev).await;
                     if ending {
                         break;
                     }
                     continue;
+                }
+                // The boundary. Everything asked before it measured a conversation the CLI has
+                // just thrown away, so the answers still to come are about nothing. Read here
+                // rather than off the `Compacted` this line becomes, because what has to be
+                // counted is *when the line arrived*, and by the time an activity is an activity
+                // it has left this loop.
+                if v.get("type").and_then(Value::as_str) == Some("system")
+                    && v.get("subtype").and_then(Value::as_str) == Some("compact_boundary")
+                {
+                    stale = asked;
                 }
                 for ev in control_failure(&v).into_iter().chain(sse::claude_cli_line(&v, &mut live.state)) {
                     if abandoned {
@@ -1016,6 +1058,7 @@ async fn run_turn(
                         && live.control(&json!({"subtype": "get_context_usage"})).await.is_ok()
                     {
                         ending = true;
+                        asked += 1;
                         // Bounded, because an install that will not answer must not hold the turn
                         // open. Two seconds is far more than a local answer takes.
                         giveup.as_mut().reset(
@@ -1826,6 +1869,92 @@ done
             "the background command finished / answer 2",
             "the ending that arrives first belongs to the turn this one was queued behind, and the \
              message that was actually sent is still answered after it"
+        );
+
+        p.shutdown(&neosh_proto::SessionId::from("test"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A measurement of a context that no longer exists does not get to be the meter.
+    ///
+    /// How full the context is is asked on a five-second clock; a compaction takes twenty. So when
+    /// the boundary lands there are several of those questions outstanding, and their answers —
+    /// each one a count of the conversation the CLI has just thrown away — are read after the line
+    /// saying it threw it away. The last of them won, so `/compact` finished with the meter back
+    /// at the number it started from, directly under a card reading `20.3k → 1.6k`. ADR 0050 made
+    /// the boundary move the meter; this stops the answers behind it moving it back.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_context_answer_from_before_a_compaction_does_not_undo_it() {
+        use futures::StreamExt;
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join(format!("neosh-compactrace-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("dirs");
+        let script = dir.join("fake-claude");
+        // The prompt starts a compaction and nothing else. The next question about the context is
+        // held — which is what a CLI busy compacting for twenty seconds does with it — and answered
+        // only after the boundary has gone out, with the count from before it. The question the
+        // *ending* asks is answered with the truth, because it was asked after the boundary and is
+        // the one answer here that is not stale.
+        std::fs::write(
+            &script,
+            r#"#!/bin/sh
+armed=
+while IFS= read -r line; do
+  case "$line" in
+    *get_context_usage*)
+      id=`printf '%s' "$line" | sed 's/.*"request_id":"\([^"]*\)".*/\1/'`
+      if [ -n "$armed" ]; then
+        armed=
+        printf '{"type":"system","subtype":"compact_boundary","compact_metadata":{"trigger":"manual","pre_tokens":20317,"post_tokens":1597}}\n'
+        printf '{"type":"control_response","response":{"subtype":"success","request_id":"%s","response":{"totalTokens":20317,"maxTokens":200000}}}\n' "$id"
+        printf '{"type":"result","subtype":"success","is_error":false,"session_id":"s","result":"Compacted the conversation."}\n'
+      else
+        printf '{"type":"control_response","response":{"subtype":"success","request_id":"%s","response":{"totalTokens":1597,"maxTokens":200000}}}\n' "$id"
+      fi
+      continue
+      ;;
+    *control_request*)
+      id=`printf '%s' "$line" | sed 's/.*"request_id":"\([^"]*\)".*/\1/'`
+      printf '{"type":"control_response","response":{"subtype":"success","request_id":"%s","response":{}}}\n' "$id"
+      continue
+      ;;
+  esac
+  armed=1
+  printf '{"type":"system","subtype":"init","session_id":"s","slash_commands":[]}\n'
+  printf '{"type":"system","subtype":"status","status":"compacting"}\n'
+done
+"#,
+        )
+        .expect("script");
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+
+        let p = ClaudeCliProvider::new(script.display().to_string());
+        let events: Vec<_> =
+            p.stream(&inst(), req("claude-opus-5"), CancellationToken::new()).collect().await;
+        let acts: Vec<&Activity> = events
+            .iter()
+            .filter_map(|e| match e {
+                ProviderEvent::Activity { activity } => Some(activity),
+                _ => None,
+            })
+            .collect();
+
+        let boundary = acts
+            .iter()
+            .position(|a| matches!(a, Activity::Compacted { .. }))
+            .unwrap_or_else(|| panic!("the boundary is reported at all\n{acts:?}"));
+        assert_eq!(
+            acts[boundary],
+            &Activity::Compacted { before: Some(20317), after: Some(1597) },
+            "with the counts either side of it\n{acts:?}"
+        );
+        assert!(
+            !acts[boundary + 1..]
+                .iter()
+                .any(|a| matches!(a, Activity::Context { used: 20317, .. })),
+            "and nothing after it says the window still holds what the compaction removed\n{acts:?}"
         );
 
         p.shutdown(&neosh_proto::SessionId::from("test"));

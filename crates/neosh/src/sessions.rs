@@ -47,6 +47,14 @@ struct Stored {
     /// meter whose denominator changed on reload would move without anything having happened.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     context_window: Option<u64>,
+    /// And whether that count came from a driver rather than from a prompt size.
+    ///
+    /// Persisted for the reason the other two are: a reopened conversation that started estimating
+    /// again would move its meter on the next turn with nothing having happened. Absent in a file
+    /// written before this existed, where `context_window` being set is what the answer used to
+    /// be — see [`Stored::into_session`].
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    context_counted: bool,
     /// A turn finished here and nobody has been back to look at it.
     ///
     /// Persisted because that is exactly the case it exists for: the workspace ran the turn while
@@ -132,6 +140,7 @@ impl From<&Session> for Stored {
             usage: s.usage,
             context_tokens: s.context_tokens,
             context_window: s.context_window,
+            context_counted: s.context_counted,
             unread: s.unread,
             running_since: s.running_since,
             interrupted: s.interrupted,
@@ -156,6 +165,10 @@ impl Stored {
         s.usage = self.usage;
         s.context_tokens = self.context_tokens;
         s.context_window = self.context_window;
+        // A file written before this field existed says so by not having it, and there the window
+        // being known *was* the answer. Reading it as `false` would turn the estimate back on for
+        // every conversation that has ever been reopened.
+        s.context_counted = self.context_counted || self.context_window.is_some();
         s.unread = self.unread;
         // A turn that was in flight when this was written is a turn nobody ended: the only process
         // that could have ended it is the one that wrote this and is now gone. Loading is the only

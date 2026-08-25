@@ -4364,6 +4364,78 @@ export async function activate({ neosh }: PluginContext) {
 }
 "#;
 
+/// A driver that compacts without ever having said how big its window is.
+///
+/// Which is most of them, and `claude` whenever the control question goes unanswered: a boundary
+/// carries `post_tokens` and no denominator. The turn then ends carrying the usage of the request
+/// that did the compacting — the whole pre-compaction conversation — and that is what used to land
+/// on the meter.
+const AMNESIAC: &str = r#"
+import type { PluginContext } from "@neosh/api";
+
+export async function activate({ neosh }: PluginContext) {
+  await neosh.provider.register("amnesiac", [{
+    id: "amnesiac", driver: "amnesiac", display_name: "Amnesiac",
+    models: [{ id: "amnesiac", display_name: "Amnesiac", context_window: 300000 }],
+  }], async (_req, emit) => {
+    emit({ type: "message_start", model: "amnesiac", usage: {} });
+    emit({ type: "activity", activity: { kind: "compacted", before: 180000, after: 12000 } });
+    emit({ type: "block_start", index: 0, block: { kind: "text" } });
+    emit({ type: "text_delta", index: 0, text: "Carrying on." });
+    emit({ type: "block_stop", index: 0 });
+    emit({
+      type: "message_delta",
+      stop_reason: { kind: "end_turn" },
+      usage: { input_tokens: 180000, output_tokens: 20 },
+    });
+    emit({ type: "message_stop" });
+  }, { agentLoop: true });
+  neosh.event.on("neosh.ready", () => neosh.notify("amnesiac ready"));
+}
+"#;
+
+fn install_amnesiac(sb: &Sandbox) {
+    let dir = sb.root.join("config/plugins/amnesiac");
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    std::fs::write(
+        dir.join("plugin.toml"),
+        "name = \"amnesiac\"\nversion = \"0.1.0\"\nentry = \"main.ts\"\npermissions = [\"providers\"]\n",
+    )
+    .expect("manifest");
+    std::fs::write(dir.join("main.ts"), AMNESIAC).expect("plugin");
+}
+
+/// A count from a driver turns the guess off, even when it comes without a window.
+///
+/// "A driver has answered how full it is" and "the window is known" were one field, and a
+/// compaction boundary is the case that tells them apart: it is the first without being the
+/// second. Read as *nobody has told us*, it turned `add_usage`'s estimate back on — so the turn
+/// ended, the prompt that did the compacting was counted, and the meter went back to the number
+/// the compaction had just removed. See ADR 0050, which is the same failure through another door.
+#[test]
+fn a_compaction_without_a_window_still_stops_the_meter_being_guessed() {
+    let sb = Sandbox::new("ctxamnesia");
+    install_amnesiac(&sb);
+    sb.write_config("[options]\n\"agent.model\" = \"amnesiac/amnesiac\"\n");
+    let mut s = sb.start_letting_config_choose();
+    s.wait_for("amnesiac ready");
+    s.type_text("go");
+    s.enter();
+    assert!(
+        s.pump(|s| s.chat_now().iter().any(|l| l.contains("Carrying on."))),
+        "the turn finished\n{:?}",
+        s.chat_now()
+    );
+    // Past the turn's end, which is where the estimate used to be applied. The failure is not that
+    // the wrong number is drawn once; it is that it settles there.
+    s.drain_for(Duration::from_millis(2000));
+    let line = s.status_now().join("");
+    assert!(
+        line.contains("4% of 300k") && !line.contains("60%"),
+        "and the meter keeps what the compaction left, not the prompt that did it\n{line:?}"
+    );
+}
+
 /// A driver that fills its context and then compacts it, reporting both the way `claude` does.
 ///
 /// `Activity::Context` is the driver answering "how full is it"; `Activity::Compacted` carries the
@@ -4454,6 +4526,97 @@ fn the_context_meter_is_there_before_the_first_turn() {
     assert!(
         s.status_now().iter().any(|l| l.contains('\u{2588}')),
         "with filled cells\n{:?}",
+        s.status_now()
+    );
+}
+
+/// The same driver, holding the turn open, so the strip can be read while one is actually running.
+///
+/// The bug this exists for only happens mid-turn: a running turn puts a segment of its own on the
+/// right-hand end, and a strip that fitted at rest is several columns too long the moment there is
+/// something to watch.
+const SLOW_WIDE: &str = r#"
+import type { PluginContext } from "@neosh/api";
+const nap = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+export async function activate({ neosh }: PluginContext) {
+  await neosh.provider.register("wide", [{
+    id: "wide", driver: "wide", display_name: "Wide",
+    models: [{ id: "wide-1", display_name: "Wide One", context_window: 300000 }],
+  }], async (_req, emit) => {
+    emit({ type: "message_start", model: "wide-1", usage: { input_tokens: 100000 } });
+    emit({ type: "text_delta", index: 0, text: "ok" });
+    await nap(12000);
+    emit({
+      type: "message_delta",
+      stop_reason: { kind: "end_turn" },
+      usage: { input_tokens: 100000, output_tokens: 20 },
+    });
+    emit({ type: "message_stop" });
+  });
+  neosh.event.on("neosh.ready", () => neosh.notify("slow wide ready"));
+}
+"#;
+
+fn install_slow_wide(sb: &Sandbox) {
+    let dir = sb.root.join("config/plugins/wide");
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    std::fs::write(
+        dir.join("plugin.toml"),
+        "name = \"wide\"\nversion = \"0.1.0\"\nentry = \"main.ts\"\npermissions = [\"providers\"]\n",
+    )
+    .expect("manifest");
+    std::fs::write(dir.join("main.ts"), SLOW_WIDE).expect("plugin");
+}
+
+/// The meter says less rather than nothing, and it is the last thing on the strip to go.
+///
+/// Two bugs, one line. A segment used to cost its full width or nothing, so the widest thing in
+/// the strip was the first thing to disappear from a narrow one — and the widest thing is the
+/// context meter, which is also the only number here that says whether the conversation is about
+/// to stop working. It sat on priority 20, tied with the git branch and separated from it only by
+/// the fact that `context` sorts after `branch`, which made it the second segment out of the line.
+/// And a running turn adds a segment, so a terminal wide enough at rest lost the meter for exactly
+/// the length of every answer — the one time anybody is watching it.
+///
+/// Now it carries a short form of itself: the denominator comes off before the segment does, and
+/// `██░░░░░░ 33%` is as true as `██░░░░░░ 33% of 300k`.
+#[test]
+fn a_narrow_strip_shortens_the_context_meter_rather_than_dropping_it() {
+    let sb = Sandbox::new("ctxnarrow");
+    install_slow_wide(&sb);
+    sb.write_config("[options]\n\"agent.model\" = \"wide/wide-1\"\n");
+    let mut s = sb.start_letting_config_choose();
+    s.wait_for("slow wide ready");
+
+    // A stdio frontend has no geometry, so the strip is unfitted until a width is said out loud —
+    // which is the whole subject here.
+    s.viewport("[status]", 50, 1);
+
+    s.type_text("go");
+    s.enter();
+    assert!(
+        s.pump(|s| s.status_now().iter().any(|l| l.contains("33%"))),
+        "the meter is on a 50-column strip with a turn in flight\n{:?}",
+        s.status_now()
+    );
+    assert!(
+        !s.status_now().iter().any(|l| l.contains("of 300k")),
+        "shortened rather than dropped — the denominator is what it gave up\n{:?}",
+        s.status_now()
+    );
+    assert!(
+        s.status_now().iter().any(|l| l.contains('\u{2588}') || l.contains('\u{2591}')),
+        "and it is still a bar, not only a number\n{:?}",
+        s.status_now()
+    );
+
+    // And the strip is fitted *here*, on the width arriving, rather than whenever a plugin next
+    // happens to rewrite a segment. Widening used to leave the old, narrower line in place.
+    s.viewport("[status]", 200, 1);
+    assert!(
+        s.pump(|s| s.status_now().iter().any(|l| l.contains("33% of 300k"))),
+        "and a terminal made wider says the whole thing again\n{:?}",
         s.status_now()
     );
 }
@@ -4796,6 +4959,12 @@ fn compacting_updates_the_context_meter() {
 
 /// A strip too narrow for everything drops whole segments, least important first, rather than
 /// writing the right half over the end of the left one.
+///
+/// Shortening comes first and dropping is what is left — see
+/// [`a_narrow_strip_shortens_the_context_meter_rather_than_dropping_it`] — so at forty columns the
+/// meter has already given up its denominator and it is the model name that goes. What must never
+/// happen either way is the thing this test is named for: a right-hand segment written over the end
+/// of a left-hand one, which reads as a corrupted line rather than as a full one.
 #[test]
 fn a_narrow_status_strip_drops_segments_rather_than_overlapping_them() {
     let sb = Sandbox::new("narrowstatus");
@@ -4811,7 +4980,7 @@ fn a_narrow_status_strip_drops_segments_rather_than_overlapping_them() {
             let line = s.status_now().join("");
             !line.contains("of 300k") && line.contains("chat")
         }),
-        "the meter went and the mode stayed\n{:?}",
+        "the denominator went and the mode stayed\n{:?}",
         s.status_now()
     );
     let line = s.status_now().join("");
@@ -4819,6 +4988,12 @@ fn a_narrow_status_strip_drops_segments_rather_than_overlapping_them() {
         line.chars().count() <= 41,
         "and the line still fits the window: {} chars of 40\n{line:?}",
         line.chars().count()
+    );
+    // Something was dropped — forty columns is not enough for what is left even shortened — and
+    // what went is the model name rather than the meter.
+    assert!(
+        line.contains('%') && !line.contains("^P"),
+        "and what went is the model name, not the number the meter exists for\n{line:?}"
     );
 }
 
