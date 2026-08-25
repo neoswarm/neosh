@@ -1426,6 +1426,40 @@ pub enum ApiCall {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         session: Option<SessionId>,
     },
+
+    // ---- updating itself ------------------------------------------------
+    /// What version is running, what version is published, and what updating would mean here.
+    ///
+    /// *What it would mean here* is the whole reason this is a host call rather than a plugin
+    /// fetching a JSON file: how neosh was installed decides how it may be replaced. A binary
+    /// under a Homebrew prefix is Homebrew's, and overwriting it leaves `brew` describing a
+    /// version that is not on disk; one under `node_modules` is npm's. Only a binary nobody else
+    /// is managing may be swapped in place, and only the host can see which of those it is.
+    UpdateCheck {
+        /// Ask the network again rather than answering from the last check.
+        #[serde(default)]
+        force: bool,
+    },
+    /// Update, by whichever route [`UpdateCheck`](ApiCall::UpdateCheck) said this install takes.
+    ///
+    /// Self-replacement downloads the release for this platform, checks it against the published
+    /// checksum, and swaps it in with a rename — atomic, so a half-written binary is never what
+    /// the next start finds. A managed install is *not* replaced: the answer names the command
+    /// that would do it, because running somebody's package manager for them behind a keypress is
+    /// how a machine ends up in a state its owner cannot explain.
+    UpdateApply,
+    /// Restart the workspace so a downloaded update takes effect.
+    ///
+    /// Refused, with what is running, while any turn is in flight in any conversation — the answer
+    /// is workspace-wide rather than about the view that asked, because a restart ends turns
+    /// belonging to terminals this one cannot see. A restart is the one thing `^Q` must never do,
+    /// so it is asked for by name and never bound to a key that means "close this".
+    UpdateRestart {
+        /// Restart even with turns running. Never a default; a caller sets it only after saying
+        /// out loud what would be lost.
+        #[serde(default)]
+        force: bool,
+    },
 }
 
 /// Successful results. One variant per shape rather than a bag of JSON, so the TS side gets real
@@ -1521,6 +1555,10 @@ pub enum ApiOk {
     Quotas { quotas: Vec<QuotaSnapshot> },
     QuotaHistory { samples: Vec<QuotaSample> },
     UsageHistory { history: UsageHistory },
+
+    // ---- updating itself ----
+    Update { update: UpdateStatus },
+    UpdateApplied { outcome: UpdateOutcome },
 }
 
 /// An image the composer is holding, as far as anything outside the host is concerned.
@@ -1744,4 +1782,103 @@ pub struct KeyContext {
     pub view: ViewId,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub win: Option<WindowId>,
+}
+
+/// How this neosh got onto the machine, which is what decides how it may be replaced.
+///
+/// Detected from the path of the running executable and never configured: a setting would be a
+/// thing to get wrong, and getting it wrong means writing over a file some other program believes
+/// it owns.
+#[derive(TS, Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
+#[serde(rename_all = "snake_case")]
+#[ts(export)]
+pub enum InstallMethod {
+    /// Under a Homebrew prefix. `brew upgrade` owns it.
+    Homebrew,
+    /// Inside a `node_modules`, so it arrived as an `@neosh/cli-*` package.
+    Npm,
+    /// Under a cargo bin directory, from `cargo install`.
+    Cargo,
+    /// A binary nobody else is managing — `install.sh`, or one taken off the releases page. The
+    /// only kind neosh may overwrite itself.
+    Standalone,
+    /// A `target/` directory: somebody's checkout, mid-development. Never updated, because the
+    /// newest neosh is the one they are about to build.
+    Development,
+}
+
+impl InstallMethod {
+    /// Whether neosh may replace its own binary, or has to name a command instead.
+    pub fn self_updatable(self) -> bool {
+        matches!(self, Self::Standalone)
+    }
+
+    /// The command that updates this install, for the kinds neosh will not do itself.
+    pub fn upgrade_command(self) -> Option<&'static str> {
+        match self {
+            Self::Homebrew => Some("brew upgrade neosh"),
+            Self::Npm => Some("npm install -g neosh@latest"),
+            Self::Cargo => Some("cargo install neosh --force"),
+            Self::Standalone | Self::Development => None,
+        }
+    }
+}
+
+/// What an update would be, if there is one.
+#[derive(TS, Serialize, Deserialize, Clone, PartialEq, Debug)]
+#[ts(export)]
+pub struct UpdateStatus {
+    /// The version running now.
+    pub current: String,
+    /// The newest published version, or `None` when the check has not run or could not reach the
+    /// network. Absent is *unknown* rather than up to date — a failed check that reads as "you are
+    /// current" is a machine that never updates and never says why.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latest: Option<String>,
+    /// Whether `latest` is newer than `current`.
+    pub behind: bool,
+    pub method: InstallMethod,
+    /// Whether [`ApiCall::UpdateApply`] would replace the binary, rather than name a command.
+    pub self_updatable: bool,
+    /// The command to run by hand, when neosh will not do it itself.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upgrade_command: Option<String>,
+    /// Why the last check failed, when it did. Kept so the UI can say *unknown, and here is why*.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    /// Whether an update has been downloaded and is waiting for a restart.
+    pub restart_pending: bool,
+}
+
+/// What [`ApiCall::UpdateApply`] did.
+#[derive(TS, Serialize, Deserialize, Clone, PartialEq, Debug)]
+#[serde(tag = "outcome", rename_all = "snake_case")]
+#[ts(export)]
+pub enum UpdateOutcome {
+    /// Already newest. Not an error, and worth saying rather than doing nothing visible.
+    UpToDate { version: String },
+    /// The new binary is on disk and takes effect on the next start.
+    Applied {
+        version: String,
+        /// Always true today, and a field rather than an assumption: a workspace holds running
+        /// turns, so what happens next is a question for whoever pressed the key.
+        restart_required: bool,
+    },
+    /// A managed install. neosh did not touch it, and this is what would.
+    Delegated {
+        version: String,
+        command: String,
+        method: InstallMethod,
+    },
+    /// It did not work, and this is why in a sentence somebody can act on.
+    Failed { reason: String },
+}
+
+/// What a refused [`ApiCall::UpdateRestart`] was refused for.
+#[derive(TS, Serialize, Deserialize, Clone, PartialEq, Debug)]
+#[ts(export)]
+pub struct RestartRefusal {
+    /// The conversations with a turn in flight, workspace-wide — not just the ones this view can
+    /// see, because a restart ends every one of them.
+    pub running: Vec<String>,
 }

@@ -29,6 +29,17 @@ use crate::theme::{ColorDepth, Theme};
 /// on terminals with the Kitty protocol would otherwise deliver every keystroke twice.
 pub fn to_input_event(ev: Event) -> Option<InputEvent> {
     match ev {
+        // One notch is one notch. How many rows that *means* is the host's decision
+        // (`ui.scroll_rows`), because the frontend does not know what it is scrolling — a
+        // transcript, a panel, a picker — and three rows is a different distance in each.
+        Event::Mouse(crossterm::event::MouseEvent { kind, .. }) => match kind {
+            crossterm::event::MouseEventKind::ScrollUp => Some(InputEvent::Scroll { rows: -1 }),
+            crossterm::event::MouseEventKind::ScrollDown => Some(InputEvent::Scroll { rows: 1 }),
+            // Clicks, drags and motion are deliberately dropped. Capture is on for the wheel, and
+            // a frontend that started acting on clicks would be one that has to answer where every
+            // cell is — which is the host's map, not this one's.
+            _ => None,
+        },
         Event::Key(KeyEvent { code, modifiers, kind, .. }) => {
             if kind == KeyEventKind::Release {
                 return None;
@@ -140,6 +151,12 @@ impl TerminalFrontend {
         // never replies, which is exactly the state the host reads as "cannot say" and falls back
         // to idleness for — so there is nothing to detect and nothing to degrade.
         execute!(stdout, EnterAlternateScreen, EnableBracketedPaste, EnableFocusChange)?;
+        // The wheel, and nothing else. Without this a terminal in the alternate screen turns each
+        // notch into arrow keys — which are bindings — so scrolling fired `ui.keys.prev` thirty
+        // times and the screen jumped everywhere. The cost is that the terminal's own text
+        // selection now needs a modifier held (Option on macOS, Shift most elsewhere), which is
+        // why it is a setting: `ui.mouse = false` gives the selection back.
+        let _ = execute!(stdout, crossterm::event::EnableMouseCapture);
         let enhanced = enable_enhanced_keys(&mut stdout);
         let terminal = Terminal::new(CrosstermBackend::new(stdout))?;
         Ok(Self {
@@ -356,6 +373,9 @@ impl TerminalFrontend {
         self.terminal.backend_mut().execute(SetCursorStyle::DefaultUserShape)?;
         self.terminal.backend_mut().execute(DisableBracketedPaste)?;
         self.terminal.backend_mut().execute(DisableFocusChange)?;
+        // Not `?`: a terminal that never enabled capture has nothing to disable, and failing the
+        // whole teardown over it would leave the alternate screen up.
+        let _ = self.terminal.backend_mut().execute(crossterm::event::DisableMouseCapture);
         self.terminal.backend_mut().execute(LeaveAlternateScreen)?;
         self.terminal.show_cursor()?;
         Ok(())
@@ -570,6 +590,7 @@ pub fn restore_terminal() {
     let mut out = io::stdout();
     let _ = out.execute(DisableBracketedPaste);
     let _ = out.execute(DisableFocusChange);
+    let _ = out.execute(crossterm::event::DisableMouseCapture);
     let _ = out.execute(LeaveAlternateScreen);
     let _ = out.execute(crossterm::cursor::Show);
 }

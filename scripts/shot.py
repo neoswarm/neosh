@@ -48,6 +48,15 @@ def encode(tok: str) -> str:
     # Raw bytes, as hex: <raw:1b5b313b3341>. The escape hatch for keys whose encoding is the
     # question — a control character no name covers, or the sequence one particular terminal sends
     # for a chord. Without it, "does neosh see Ctrl+/" is unanswerable except by pressing it.
+    # A mouse wheel notch, in SGR encoding: <wheel:up>, <wheel:down>. A wheel is not a key and
+    # cannot be typed — and until neosh captured the mouse, a terminal faked one by sending three
+    # arrows per notch, which fired three of somebody's bindings. Testing that it no longer does
+    # means sending the real thing.
+    if name.startswith("wheel:"):
+        button = {"up": 64, "down": 65}.get(name[6:])
+        if button is None:
+            raise SystemExit(f"unknown wheel direction {tok}")
+        return f"\x1b[<{button};10;10M"
     if name.startswith("raw:"):
         return bytes.fromhex(name[4:]).decode("latin-1")
     raise SystemExit(f"unknown key {tok}")

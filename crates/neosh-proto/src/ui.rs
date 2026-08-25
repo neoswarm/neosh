@@ -974,6 +974,14 @@ pub enum InputEvent {
     /// Bracketed paste arrives whole rather than as synthetic keystrokes.
     Paste { text: String },
     Resize { width: u16, height: u16 },
+    /// A wheel notch, in buffer rows and signed — negative is towards the top of the transcript.
+    ///
+    /// Its own event rather than a synthetic `<Up>`: without mouse reporting a terminal turns each
+    /// notch into three arrow keys, and arrows are *bindings* — `ui.keys.prev` in a picker, the
+    /// composer's cursor otherwise — so a flick of the wheel fired thirty of somebody's keybinds
+    /// and the screen went everywhere at once. A wheel is not a key. It scrolls, it does not move
+    /// the cursor, and nothing a plugin bound to an arrow can be triggered by it.
+    Scroll { rows: i16 },
     /// Layout feedback. The core needs this to resolve cursor-anchored floats and to know how far a
     /// `PageDown` should scroll; it is the only thing the core learns about real geometry.
     ViewportChanged {

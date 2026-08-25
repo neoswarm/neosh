@@ -616,6 +616,9 @@ pub struct Host {
     /// What plugins remember between runs: pinned projects, fold state, whatever a panel needs to
     /// still be arranged the way you left it.
     pstate: crate::pstate::PluginState,
+    /// Whether there is a newer neosh, and what replacing this one would mean here. Held rather
+    /// than made per call, because the check is network and the answer is kept.
+    updater: crate::update::Updater,
     /// What *everybody* remembers about a project or a conversation — favourites, colours, tags.
     ///
     /// Separate from `pstate` because it is separate in kind: state is private to whoever wrote it,
@@ -1056,6 +1059,12 @@ impl Host {
             state_dir: None,
             attached: Default::default(),
             pstate: crate::pstate::PluginState::new(None),
+            // From the build identity captured at startup: a workspace outlives the file it was
+            // loaded from, so `current_exe` asked later is a path with `(deleted)` on the end.
+            updater: crate::update::Updater::new(
+                crate::build::exe_path().unwrap_or_default(),
+                crate::build::capture().version.clone(),
+            ),
             vars: crate::vars::Vars::new(None),
             swarm: Default::default(),
             swarm_node: None,
@@ -1115,6 +1124,7 @@ impl Host {
             state_dir: self.state_dir.clone(),
             bridge: self.bridge.clone(),
             model_cache: self.model_cache.clone(),
+            updater: self.updater.clone(),
         }
     }
 
@@ -1176,6 +1186,11 @@ impl Host {
                 | ApiCall::AskUser { .. }
                 | ApiCall::UsageHistory { .. }
                 | ApiCall::SessionsStored
+                // Network, and a download that can run for a minute. On the loop either of these
+                // would stop every terminal attached to this workspace for the length of an HTTP
+                // request to somebody else's server.
+                | ApiCall::UpdateCheck { .. }
+                | ApiCall::UpdateApply
         ) {
             return false;
         }
@@ -1607,6 +1622,37 @@ impl Host {
             ApiCall::AgentListInstances => Ok(ApiOk::Instances {
                 instances: self.agent.providers().usable_instances().cloned().collect(),
             }),
+            // ---- updating itself ---------------------------------------
+            // On the loop, unlike the check and the download, because the question it has to
+            // answer is "is anything running *here*" and `self.rounds` is the only authoritative
+            // answer to it. Workspace-wide, not per view: a restart ends turns belonging to
+            // terminals the one that asked cannot see.
+            ApiCall::UpdateRestart { force } => {
+                let store = self.agent.sessions();
+                let running: Vec<String> = self
+                    .rounds
+                    .keys()
+                    .filter_map(|id| store.get(id).map(|s| s.label()))
+                    .collect();
+                drop(store);
+                if !running.is_empty() && !force {
+                    // `Busy` rather than `Denied`: nothing refused this on principle, and it will
+                    // work in a minute. The names are in the message because "something is
+                    // running" sends somebody hunting through conversations for which one.
+                    return Err(ApiError::Busy {
+                        message: format!(
+                            "{} still running. Wait for it, interrupt it, or restart anyway.",
+                            running.join(", ")
+                        ),
+                    });
+                }
+                // The same flag `stop` sets, so the workspace leaves the way it always does —
+                // conversations flushed, plugins torn down. Restarting *in place* is not this
+                // process's to do: it is the terminal that runs `neosh`, and `neosh` starts a
+                // workspace when there is none, which by then is the new binary.
+                self.quitting = true;
+                Ok(ApiOk::Unit)
+            }
             // ---- plugin state ------------------------------------------
             // Keyed by the caller, which the plugin does not get to choose. Cheap enough to answer
             // on the host loop: reads come from memory after the first touch, and a write is one
@@ -8723,6 +8769,22 @@ impl Host {
                     .broadcast(neosh_proto::PluginEvent::ViewAttached { view: self.from.view });
                 self.draw_welcome();
             }
+            // A notch, turned into rows here because only the host knows what is under the
+            // pointer and how far a step should be. It scrolls and never moves the cursor: a wheel
+            // is not a key, and the whole bug it replaces was arrow keys firing bindings.
+            InputEvent::Scroll { rows } => {
+                let step = self
+                    .editor
+                    .options()
+                    .int("ui.scroll_rows")
+                    .unwrap_or(3)
+                    .clamp(1, 20) as i32;
+                let by = i32::from(rows) * step;
+                // While reading, the cursor has to stay on screen, so this goes through the same
+                // path the reader's own scrolling does rather than moving the window out from
+                // under it.
+                self.scroll_chat_by(by, false);
+            }
             InputEvent::Ready { .. } | InputEvent::Resize { .. } => {
                 // A resize changes nothing the core owns; the frontend re-lays-out from the
                 // declarative geometry it already has. Redraw so it takes effect.
@@ -9880,7 +9942,33 @@ impl Host {
     /// rather than a seek: the renderer already shows the last screenful when nothing has scrolled.
     /// Row zero is `Some(0)` and means the top — paging up to it used to ask for "follow" and land
     /// back at the end, one page short of the beginning every time.
+    /// Scroll the transcript a screen at a time. `0` goes back to following the newest.
     fn scroll_chat(&mut self, direction: i32) {
+        let page = self.chat_page();
+        match direction {
+            0 => self.scroll_chat_by(0, true),
+            d if d < 0 => self.scroll_chat_by(-(page as i32), false),
+            _ => self.scroll_chat_by(page as i32, false),
+        }
+    }
+
+    /// How many buffer rows fit in the transcript window right now.
+    fn chat_page(&self) -> u32 {
+        self.editor
+            .window(self.v().chat_win)
+            .and_then(|w| w.viewport)
+            .map(|v| v.height as u32)
+            .unwrap_or(10)
+            .max(1)
+    }
+
+    /// Scroll by `rows`, or back to following when `to_end`.
+    ///
+    /// Rows rather than screens because a wheel notch is not a page: the terminal sends one event
+    /// per notch and a page each was the whole of "my eyes cannot follow it". The end test still
+    /// uses the page — scrolling *down* past the last screenful means following again, whatever
+    /// the step was that got there.
+    fn scroll_chat_by(&mut self, rows: i32, to_end: bool) {
         let plugin = PluginId::from(BUILTIN);
         let lines = self.editor.buffer(self.v().chat).map(|b| b.line_count() as u32).unwrap_or(0);
         let win = self.v().chat_win;
@@ -9893,23 +9981,23 @@ impl Host {
             .max(1);
         let current = self.v().chat_top;
 
-        let top = match direction {
-            0 => None,
-            d if d < 0 => {
-                // From "following", scrolling up starts from where the tail actually begins.
-                let from = current.unwrap_or_else(|| lines.saturating_sub(page));
-                Some(from.saturating_sub(page))
-            }
-            _ => match current {
+        let top = if to_end || rows == 0 {
+            None
+        } else if rows < 0 {
+            // From "following", scrolling up starts from where the tail actually begins.
+            let from = current.unwrap_or_else(|| lines.saturating_sub(page));
+            Some(from.saturating_sub(rows.unsigned_abs()))
+        } else {
+            match current {
                 // Already at the end, and there is nowhere past it to scroll into.
                 None => None,
                 Some(c) => {
-                    let next = c.saturating_add(page);
+                    let next = c.saturating_add(rows as u32);
                     // Past the end means back to following, so a user cannot scroll into blank
                     // space.
                     if next + page >= lines { None } else { Some(next) }
                 }
-            },
+            }
         };
         self.vm().chat_top = top;
         let _ = self.editor.apply(&plugin, ApiCall::WinScrollTo { win, top_line: top });
@@ -10198,6 +10286,17 @@ impl Host {
                 description: Some(
                     "What `<leader>` means in a key binding. Read when the binding is made, as in \
                      Neovim — set it in `init.ts` before you use it."
+                        .into(),
+                ),
+            },
+            OptionSpec {
+                name: "ui.scroll_rows".into(),
+                ty: OptionType::Int { min: Some(1), max: Some(20) },
+                default: OptionValue::Int(3),
+                description: Some(
+                    "Buffer rows the transcript moves for one notch of the mouse wheel. Three is \
+                     what a terminal sends per notch when it has to fake the wheel with arrow \
+                     keys, so it is the distance a hand already expects."
                         .into(),
                 ),
             },
@@ -11115,6 +11214,12 @@ enum Unheard {
 async fn run_slow(svc: Services, call: ApiCall) -> ApiResult {
     match call {
         ApiCall::PathComplete { prefix } => svc.path_complete(prefix).await,
+        ApiCall::UpdateCheck { force } => {
+            Ok(ApiOk::Update { update: svc.updater.check(force).await })
+        }
+        ApiCall::UpdateApply => {
+            Ok(ApiOk::UpdateApplied { outcome: svc.updater.apply().await })
+        }
         ApiCall::GitStatus { cwd } => svc.git_status(cwd).await,
         ApiCall::GitBranches { include_remote, cwd } => {
             svc.git_branches(include_remote, cwd).await

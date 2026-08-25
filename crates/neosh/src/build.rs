@@ -24,6 +24,17 @@ use neosh_proto::BuildId;
 /// is is one nobody can be warned about.
 static ID: OnceLock<BuildId> = OnceLock::new();
 
+/// The executable behind this process, resolved at startup for the same reason the stamp is.
+///
+/// Asked later the answer is a path ending `(deleted)` that nothing can stat or rename — and
+/// renaming onto it is exactly what an update does.
+static EXE: OnceLock<Option<std::path::PathBuf>> = OnceLock::new();
+
+/// Where this process's executable was when it started.
+pub fn exe_path() -> Option<std::path::PathBuf> {
+    EXE.get_or_init(|| std::env::current_exe().ok().and_then(|p| p.canonicalize().ok())).clone()
+}
+
 /// Read this process's build identity now, while its executable is still on disk.
 pub fn capture() -> &'static BuildId {
     ID.get_or_init(|| BuildId {
