@@ -147,7 +147,7 @@ with the Neovim project, just built in its spirit.
 
 A star helps more people find neosh, and it is the one metric a non profit project has.
 
-<!-- star gif goes here -->
+<img width="1316" height="720" alt="star" src="https://github.com/user-attachments/assets/e26610c6-ff8a-4995-900c-509682b9a86e" />
 
 ## Contributing
 
@@ -165,4 +165,4 @@ opening a public issue.
 
 ## License
 
-[MIT](LICENSE). The mark is derived from the Neovim logo by Jason Long, CC BY 3.0.
+[MIT](LICENSE). Free forever.
