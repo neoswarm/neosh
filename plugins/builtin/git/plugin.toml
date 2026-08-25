@@ -1,5 +1,5 @@
 name = "git"
-version = "0.1.0"
+version = "0.2.0"
 entry = "main.ts"
 description = "Branch, commit and status, with model-written names and messages you can re-prompt."
 

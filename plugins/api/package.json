@@ -1,11 +1,13 @@
 {
   "name": "@neosh/api",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "The neosh plugin API. Types are generated from the Rust side and drift-checked in CI.",
   "license": "MIT",
   "type": "module",
   "types": "src/index.ts",
-  "exports": { ".": "./src/index.ts" },
+  "exports": {
+    ".": "./src/index.ts"
+  },
   "keywords": [
     "neosh",
     "neosh-plugin",

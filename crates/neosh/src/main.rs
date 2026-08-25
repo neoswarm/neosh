@@ -29,6 +29,7 @@ mod pstate;
 mod scaffold;
 mod services;
 mod sessions;
+mod update;
 mod quota;
 mod swarm;
 mod trust;

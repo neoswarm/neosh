@@ -82,6 +82,9 @@ import type { QuotaCredits } from "./generated/QuotaCredits";
 import type { QuotaSample } from "./generated/QuotaSample";
 import type { QuotaSeverity } from "./generated/QuotaSeverity";
 import type { QuotaSnapshot } from "./generated/QuotaSnapshot";
+import type { InstallMethod } from "./generated/InstallMethod";
+import type { UpdateOutcome } from "./generated/UpdateOutcome";
+import type { UpdateStatus } from "./generated/UpdateStatus";
 import type { QuotaSource } from "./generated/QuotaSource";
 import type { QuotaWindow } from "./generated/QuotaWindow";
 import type { UsageBucket } from "./generated/UsageBucket";
@@ -143,6 +146,7 @@ export type {
   Message, PermissionDecision, PermissionMode, PermissionOption, PermissionOptionKind, PluginEvent, PluginInfo, PluginManifest, PointInfo, Pricing, ProviderEvent, ProviderOptionDescriptor,
   QuestionAnswer, QuestionOption, UserQuestion,
   CostBasis, QuotaCredits, QuotaSample, QuotaSeverity, QuotaSnapshot, QuotaSource, QuotaWindow,
+  InstallMethod, UpdateOutcome, UpdateStatus,
   UsageBucket, UsageHistory, UsageResolution, UsageScanSource,
   Rect, RepoInfo, RepoStatus, SelectShape, SessionId, SessionInfo, StatusAlign, StatusSegment, StopReason,
   SurfaceCell, SurfaceId, TextEdit, ToolCall, ToolDef, ToolResult, TurnRequest, Usage,
@@ -406,6 +410,8 @@ export interface Neosh {
   readonly event: EventApi;
   readonly swarm: SwarmApi;
   readonly quota: QuotaApi;
+  /** Whether there is a newer neosh, and becoming it. */
+  readonly update: UpdateApi;
   readonly rtp: RuntimePathApi;
   readonly path: PathApi;
   readonly timer: TimerApi;
@@ -1482,6 +1488,45 @@ export interface EventApi {
  * Everything here is data. Nothing in this API draws, which is what makes the bundled strip
  * replaceable by a panel of your own that reads exactly the same calls.
  */
+/**
+ * Finding out there is a newer neosh, and becoming it.
+ *
+ * The half that decides everything is not *is there something newer* but *may I replace this file*.
+ * A binary under a Homebrew prefix belongs to Homebrew, and writing over it leaves `brew` describing
+ * a version that is not on disk. So {@link UpdateStatus.method} is read off the running executable's
+ * path, and only a `standalone` install is ever overwritten — everything else is handed the command
+ * that would do it, for a person to run.
+ */
+export interface UpdateApi {
+  /**
+   * What is running, what is published, and what updating would mean on this machine.
+   *
+   * Answers from the last check unless `force`, so a panel row asking on every redraw costs
+   * nothing. `latest` absent is *unknown* rather than up to date — a failed check that reads as
+   * "you are current" is a machine that never updates and never says why, so draw
+   * {@link UpdateStatus.error} when it is there.
+   */
+  check(force?: boolean): Promise<UpdateStatus>;
+  /**
+   * Update, by whichever route this install takes.
+   *
+   * Never runs somebody's package manager for them: a managed install comes back as
+   * `delegated` with the command on it. A `standalone` one is downloaded, checked against the
+   * published sha256 and swapped in with a rename — which is atomic and is allowed while the old
+   * binary is still executing, and is why the answer carries `restart_required` rather than the
+   * new version simply being live.
+   */
+  apply(): Promise<UpdateOutcome>;
+  /**
+   * Restart the workspace so a downloaded update takes effect.
+   *
+   * Rejects with `Busy`, naming them, while any turn is in flight in *any* conversation — a
+   * restart ends turns belonging to terminals the caller cannot see. `force` goes ahead anyway,
+   * and is for a caller that has said out loud what would be lost.
+   */
+  restart(force?: boolean): Promise<void>;
+}
+
 export interface QuotaApi {
   /**
    * The latest snapshot for every instance that has one, freshest observation first.
@@ -2034,6 +2079,17 @@ function build(
       },
       onStream(cb) {
         return listener(r.swarmStreamListeners, cb);
+      },
+    },
+    update: {
+      async check(force) {
+        return expect(await c({ call: "update_check", force: force ?? false }), "update").update;
+      },
+      async apply() {
+        return expect(await c({ call: "update_apply" }), "update_applied").outcome;
+      },
+      async restart(force) {
+        await c({ call: "update_restart", force: force ?? false });
       },
     },
     quota: {

@@ -302,7 +302,12 @@ impl Editor {
     pub fn handles(call: &ApiCall) -> bool {
         !matches!(
             call,
-            ApiCall::AgentSend { .. }
+            // Updating is the host's: it is network, it is a file on disk, and it can end the
+            // process. The core has no I/O and no opinion about any of them.
+            ApiCall::UpdateCheck { .. }
+                | ApiCall::UpdateApply
+                | ApiCall::UpdateRestart { .. }
+                | ApiCall::AgentSend { .. }
                 | ApiCall::AgentCommand { .. }
                 | ApiCall::AgentCancel
                 | ApiCall::AgentGetSelection

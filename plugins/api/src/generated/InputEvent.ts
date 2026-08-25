@@ -9,6 +9,7 @@ export type InputEvent =
   | { "type": "key"; key: KeyPress }
   | { "type": "paste"; text: string }
   | { "type": "resize"; width: number; height: number }
+  | { "type": "scroll"; rows: number }
   | {
     "type": "viewport_changed";
     win: WindowId;

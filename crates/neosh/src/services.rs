@@ -21,6 +21,11 @@ use tokio_util::sync::CancellationToken;
 #[derive(Clone)]
 pub struct Services {
     pub agent: Arc<Agent>,
+    /// Finding out whether there is a newer neosh, and becoming it.
+    ///
+    /// Shared with the host rather than made per call, because the answer is *kept*: a check is
+    /// network and must not happen on every redraw of a sidebar row that wants to know.
+    pub updater: crate::update::Updater,
     /// `None` when neosh was started outside a repository. Every git call then answers with a
     /// `NotFound` naming the directory, rather than the host pretending git is broken.
     pub git: Option<Git>,

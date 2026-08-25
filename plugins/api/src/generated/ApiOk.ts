@@ -35,6 +35,8 @@ import type { SwarmAgent } from "./SwarmAgent";
 import type { SwarmNode } from "./SwarmNode";
 import type { SwarmStranger } from "./SwarmStranger";
 import type { ToolDef } from "./ToolDef";
+import type { UpdateOutcome } from "./UpdateOutcome";
+import type { UpdateStatus } from "./UpdateStatus";
 import type { UsageHistory } from "./UsageHistory";
 import type { ViewInfo } from "./ViewInfo";
 import type { Viewport } from "./Viewport";
@@ -107,4 +109,6 @@ export type ApiOk =
   | { "ok": "swarm_strangers"; strangers: Array<SwarmStranger> }
   | { "ok": "quotas"; quotas: Array<QuotaSnapshot> }
   | { "ok": "quota_history"; samples: Array<QuotaSample> }
-  | { "ok": "usage_history"; history: UsageHistory };
+  | { "ok": "usage_history"; history: UsageHistory }
+  | { "ok": "update"; update: UpdateStatus }
+  | { "ok": "update_applied"; outcome: UpdateOutcome };

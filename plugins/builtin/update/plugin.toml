@@ -1,0 +1,12 @@
+name = "update"
+version = "0.2.0"
+entry = "main.ts"
+description = "Says when there is a newer neosh, and becomes it."
+
+# Raises the one thing here you did not ask for and cannot see: a version newer than the one you
+# are running. Everything else this plugin does is a row in a panel or a command you invoked.
+permissions = ["notify"]
+
+# Puts a row under the plan strip and a verb on it. Soft: without the sidebar this is still a
+# command and still an alert, so there is nothing to require.
+after = ["sidebar"]
