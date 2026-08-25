@@ -14,7 +14,8 @@
     "directory": "plugins/builtin/approvals"
   },
   "files": [
-    "main.ts",
-    "plugin.toml"
+    "*.ts",
+    "plugin.toml",
+    "!._*"
   ]
 }

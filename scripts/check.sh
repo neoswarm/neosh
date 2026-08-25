@@ -69,4 +69,24 @@ if grep -qE '(^|/)(\._|node_modules/)' <<<"$packaged"; then
   exit 1
 fi
 
+# Every bundled plugin is an ordinary npm package, and what npm ships is the `files` list rather
+# than the directory. `@neosh/model` is two files — `main.ts` imports `./options.ts` — and a list
+# naming only `main.ts` publishes a package that cannot start, which nothing here would have caught
+# because the *binary* embeds the whole directory regardless. The other half is that a `*.ts` glob
+# matches `._main.ts` on a non-HFS+ volume, so the negation earns its place too.
+step "every bundled plugin publishes all of itself and none of the junk"
+for dir in plugins/builtin/*/; do
+  name=$(basename "$dir")
+  on_disk=$(ls "$dir" | grep -E '\.ts$' | sort | tr '\n' ' ')
+  packed=$( (cd "$dir" && npm pack --dry-run 2>&1) \
+    | grep -E '^npm notice [0-9]' | awk '{print $4}' | grep -E '\.ts$' | sort | tr '\n' ' ' || true)
+  if [ "$on_disk" != "$packed" ]; then
+    echo "error: @neosh/$name would publish the wrong files." >&2
+    echo "       on disk: $on_disk" >&2
+    echo "       packed : $packed" >&2
+    echo "       fix the \"files\" list in $dir/package.json" >&2
+    exit 1
+  fi
+done
+
 printf '\n\033[32mall checks passed\033[0m\n'
