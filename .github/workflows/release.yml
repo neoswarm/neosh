@@ -78,7 +78,20 @@ jobs:
           (cd dist && shasum -a 256 "$name.tar.gz" > "$name.tar.gz.sha256")
           echo "asset=dist/$name.tar.gz" >> "$GITHUB_OUTPUT"
 
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event.inputs.tag || github.ref_name }}
+          files: |
+            ${{ steps.package.outputs.asset }}
+            ${{ steps.package.outputs.asset }}.sha256
+
+      # Gated, because a trusted publisher cannot be attached to a package that does not exist, so
+      # the very first release necessarily runs before there is one. Unset, this skips loudly
+      # instead of failing the job red for a reason that is expected — and the assets are already
+      # attached by the step above either way. Set it with:
+      #   gh variable set NPM_TRUSTED_PUBLISHING --body true
       - name: Publish the npm platform package
+        if: vars.NPM_TRUSTED_PUBLISHING == 'true'
         run: |
           set -euo pipefail
           version=$(cargo metadata --format-version 1 --no-deps \
@@ -91,13 +104,6 @@ jobs:
           else
             (cd dist/npm && npm publish --access public --provenance)
           fi
-
-      - uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ github.event.inputs.tag || github.ref_name }}
-          files: |
-            ${{ steps.package.outputs.asset }}
-            ${{ steps.package.outputs.asset }}.sha256
 
   # The launcher goes up only once every binary it points at is on npm. Its `optionalDependencies`
   # name all four by exact version, and npm resolves them at install time rather than at publish
@@ -122,7 +128,15 @@ jobs:
 
       - run: npm install -g npm@latest
 
+      - name: Say so when npm publishing is skipped
+        if: vars.NPM_TRUSTED_PUBLISHING != 'true'
+        run: |
+          echo "::warning::NPM_TRUSTED_PUBLISHING is not set — nothing was published to npm."
+          echo "Configure trusted publishers for 'neosh' and the four '@neosh/cli-*' packages,"
+          echo "then: gh variable set NPM_TRUSTED_PUBLISHING --body true"
+
       - name: Publish neosh
+        if: vars.NPM_TRUSTED_PUBLISHING == 'true'
         run: |
           set -euo pipefail
           version=$(node -p "require('./npm/neosh/package.json').version")
