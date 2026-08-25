@@ -47,4 +47,26 @@ trap 'rm -rf "$scaffold"' EXIT
 cargo run --quiet -p neosh -- --config-dir "$scaffold" init >/dev/null
 ./plugins/api/node_modules/.bin/tsc --noEmit --project "$scaffold/tsconfig.json"
 
+# The plugin tree is embedded with `include_dir!`, which reads the filesystem — so it embeds
+# whatever is next to the checkout and says nothing about what a *published* crate would carry.
+# `neosh-script` used to reach two directories up for it: that built here and packaged to nothing,
+# and the crate would have gone to crates.io with no plugins and no API source in it. `plugins/` is
+# a crate of its own now so the tree sits inside a package root, and this is what proves it still
+# does. A file list, not a build — the real proof is `cargo publish --dry-run` at release time, and
+# that one costs a quarter of an hour.
+step "the published crate would actually contain the plugins"
+packaged="$(cargo package --list --allow-dirty -p neosh-plugins)"
+for required in "api/src/index.ts" "builtin/sidebar/plugin.toml" "api/src/generated"; do
+  if ! grep -q "$required" <<<"$packaged"; then
+    echo "error: '$required' is missing from the packaged neosh-plugins crate." >&2
+    echo "       the binary would build here and ship empty from crates.io." >&2
+    exit 1
+  fi
+done
+# The other half: `include` globs override .gitignore, so junk gets published rather than skipped.
+if grep -qE '(^|/)(\._|node_modules/)' <<<"$packaged"; then
+  echo "error: the packaged neosh-plugins crate contains node_modules or macOS ._ sidecars." >&2
+  exit 1
+fi
+
 printf '\n\033[32mall checks passed\033[0m\n'

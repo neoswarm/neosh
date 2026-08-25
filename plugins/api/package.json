@@ -6,6 +6,22 @@
   "type": "module",
   "types": "src/index.ts",
   "exports": { ".": "./src/index.ts" },
+  "keywords": [
+    "neosh",
+    "neosh-plugin",
+    "agent",
+    "typescript"
+  ],
+  "homepage": "https://github.com/neoswarm/neosh",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/neoswarm/neosh.git",
+    "directory": "plugins/api"
+  },
+  "files": [
+    "src",
+    "tsconfig.json"
+  ],
   "scripts": {
     "typecheck": "tsc --noEmit"
   },

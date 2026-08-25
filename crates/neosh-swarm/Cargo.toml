@@ -5,6 +5,10 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
+homepage.workspace = true
+description = "ASCP: the protocol neosh workspaces use to describe agents to one another across machines."
+keywords = ["neosh", "ascp", "protocol", "ed25519"]
+categories = ["network-programming"]
 
 [dependencies]
 neosh-proto = { workspace = true }

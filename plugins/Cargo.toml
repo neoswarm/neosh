@@ -1,0 +1,27 @@
+[package]
+name = "neosh-plugins"
+description = "The @neosh/api source tree and the plugins that ship inside the neosh binary, embedded at build time."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords = ["neosh", "plugin", "agent", "terminal"]
+categories = ["development-tools"]
+
+# The package root is the plugin tree itself, and that is the whole point of this crate existing.
+# `include_dir!` may only read what is under the package root and cargo may only package what is
+# under it, so a `neosh-script` that embedded `../../plugins` built here and nowhere else: the
+# `.crate` it uploaded carried no plugins at all. Nothing moved to fix it — the directory the
+# plugins already live in became a package.
+#
+# Deliberately no `include`: the git-tracked file list is already exactly what belongs here, and an
+# `include` glob *overrides* .gitignore rather than narrowing it — on a non-HFS+ volume it swept up
+# all 380 macOS `._` sidecars, and one `npm install` in `api/` would have published node_modules.
+
+[lib]
+path = "lib.rs"
+
+[dependencies]
+include_dir = { workspace = true }

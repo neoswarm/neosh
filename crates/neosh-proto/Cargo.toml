@@ -5,6 +5,10 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
+homepage.workspace = true
+description = "Every wire type neosh speaks, with the TypeScript bindings generated from them."
+keywords = ["neosh", "protocol", "agent", "typescript"]
+categories = ["development-tools", "api-bindings"]
 
 [dependencies]
 serde = { workspace = true }

@@ -1,6 +1,8 @@
 [workspace]
 resolver = "3"
 members = [
+    # `plugins/` is a crate because its own directory is what gets embedded — see plugins/lib.rs.
+    "plugins",
     "crates/neosh-proto",
     "crates/neosh-core",
     "crates/neosh-provider",
@@ -18,18 +20,23 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.90"
 license = "MIT"
-repository = "https://github.com/neosh-org/neosh"
+repository = "https://github.com/neoswarm/neosh"
+homepage = "https://github.com/neoswarm/neosh"
 
 [workspace.dependencies]
-neosh-proto = { path = "crates/neosh-proto" }
-neosh-core = { path = "crates/neosh-core" }
-neosh-provider = { path = "crates/neosh-provider" }
-neosh-vcs = { path = "crates/neosh-vcs" }
-neosh-swarm = { path = "crates/neosh-swarm" }
-neosh-agent = { path = "crates/neosh-agent" }
-neosh-script = { path = "crates/neosh-script" }
-neosh-tui = { path = "crates/neosh-tui" }
-neosh-syntax = { path = "crates/neosh-syntax" }
+# Every one of these carries a `version` as well as a `path`: cargo refuses to package a crate whose
+# dependency has only a path, and the published crate is built against the registry version while
+# a checkout is built against the directory next door.
+neosh-proto = { path = "crates/neosh-proto", version = "0.1.0" }
+neosh-core = { path = "crates/neosh-core", version = "0.1.0" }
+neosh-provider = { path = "crates/neosh-provider", version = "0.1.0" }
+neosh-vcs = { path = "crates/neosh-vcs", version = "0.1.0" }
+neosh-swarm = { path = "crates/neosh-swarm", version = "0.1.0" }
+neosh-agent = { path = "crates/neosh-agent", version = "0.1.0" }
+neosh-script = { path = "crates/neosh-script", version = "0.1.0" }
+neosh-tui = { path = "crates/neosh-tui", version = "0.1.0" }
+neosh-syntax = { path = "crates/neosh-syntax", version = "0.1.0" }
+neosh-plugins = { path = "plugins", version = "0.1.0" }
 
 # async
 tokio = { version = "1.53", features = ["rt", "rt-multi-thread", "macros", "sync", "time", "process", "io-util", "fs", "signal", "net"] }

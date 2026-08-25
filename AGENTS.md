@@ -25,9 +25,14 @@ turn off.
 | `neosh-syntax` | Syntax highlighting: what a token *is*, never what colour it is. The only crate that knows a grammar exists. |
 | `neosh-tui` | Terminal frontend. Owns **all** display-width maths. |
 | `neosh` | The binary. Wires the tasks, owns config, hosts the chat — and is both the workspace (`daemon.rs`) and the terminal that views it (`client.rs`). |
+| `neosh-plugins` | `plugins/` itself. One file of Rust holding the `include_dir!`s, because the tree an `include_dir!` reads has to be under the package root or it embeds here and publishes empty. |
 
 `plugins/api/` is `@neosh/api` — generated protocol types plus a hand-written ergonomic layer.
-`plugins/builtin/` are ordinary plugins that happen to ship in the binary.
+`plugins/builtin/` are ordinary plugins that happen to ship in the binary. The directory is also a
+crate (`plugins/Cargo.toml`, `plugins/lib.rs`) and nothing moved to make it one: `cargo package`
+carries only what is under a package root, so a `neosh-script` embedding `../../plugins` built fine
+in a checkout and would have uploaded a crate with no plugins and no API source in it. Publishing
+is `docs/releasing.md`.
 
 ## Rules that are not negotiable
 
@@ -593,8 +598,8 @@ the menu, a pasted `<esc>` that must not interrupt: none of it is reachable by t
 Several real bugs — a float silently losing two rows of content, a binding that had never once
 fired — were invisible to the test suite and obvious on screen.
 
-After editing anything under `plugins/`, `touch crates/neosh-script/src/loader.rs` before building:
-the plugin tree is embedded with `include_dir!` and cargo will not notice otherwise.
+After editing anything under `plugins/`, `touch plugins/lib.rs` before building: the plugin tree is
+embedded with `include_dir!` and cargo will not notice otherwise.
 
 ---
 

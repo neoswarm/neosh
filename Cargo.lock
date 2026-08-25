@@ -2433,6 +2433,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "neosh-plugins"
+version = "0.1.0"
+dependencies = [
+ "include_dir",
+]
+
+[[package]]
 name = "neosh-proto"
 version = "0.1.0"
 dependencies = [
@@ -2475,6 +2482,7 @@ dependencies = [
  "deno_error",
  "futures",
  "include_dir",
+ "neosh-plugins",
  "neosh-proto",
  "serde",
  "serde_json",

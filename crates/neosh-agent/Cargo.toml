@@ -5,6 +5,10 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
+homepage.workspace = true
+description = "The neosh agent loop: sessions, turns, the tool registry and the permission layer."
+keywords = ["neosh", "agent", "llm", "tools"]
+categories = ["development-tools", "asynchronous"]
 
 [dependencies]
 neosh-proto = { workspace = true }

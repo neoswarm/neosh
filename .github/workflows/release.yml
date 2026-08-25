@@ -1,0 +1,71 @@
+name: release
+
+# Prebuilt binaries, which are how almost everybody actually installs neosh: `cargo install neosh`
+# builds deno_core from source and takes about a quarter of an hour, and a Homebrew tap or an AUR
+# `-bin` package has to have something to point at.
+#
+# macOS and Linux only, deliberately: the workspace talks to its terminals over a Unix socket
+# (`daemon.rs`), so there is nothing to ship for Windows yet.
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Tag to build and upload to
+        required: true
+
+jobs:
+  build:
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            os: macos-14
+          - target: x86_64-apple-darwin
+            os: macos-13
+          # 22.04 rather than latest: the binary is linked against that runner's glibc, and
+          # building on the newest image is how you ship something that will not start on a
+          # distribution two years old.
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-22.04
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-22.04-arm
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - run: cargo build --release --locked --target ${{ matrix.target }} -p neosh
+
+      - name: Tar it up, with a checksum
+        id: package
+        run: |
+          set -euo pipefail
+          name="neosh-${{ matrix.target }}"
+          mkdir -p "dist/$name"
+          cp "target/${{ matrix.target }}/release/neosh" "dist/$name/"
+          cp README.md LICENSE "dist/$name/"
+          tar -C dist -czf "dist/$name.tar.gz" "$name"
+          # shasum is on both runners; sha256sum is not on macOS.
+          (cd dist && shasum -a 256 "$name.tar.gz" > "$name.tar.gz.sha256")
+          echo "asset=dist/$name.tar.gz" >> "$GITHUB_OUTPUT"
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event.inputs.tag || github.ref_name }}
+          files: |
+            ${{ steps.package.outputs.asset }}
+            ${{ steps.package.outputs.asset }}.sha256

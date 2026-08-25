@@ -5,11 +5,16 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
+homepage.workspace = true
+description = "The deno_core host for neosh plugins, and the whole of its op surface."
+keywords = ["neosh", "plugin", "deno", "typescript"]
+categories = ["development-tools"]
 
 [dependencies]
 unicode-width = { workspace = true }
 unicode-segmentation = { workspace = true }
 include_dir = { workspace = true }
+neosh-plugins = { workspace = true }
 neosh-proto = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

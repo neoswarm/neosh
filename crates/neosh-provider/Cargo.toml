@@ -5,6 +5,10 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
+homepage.workspace = true
+description = "Model providers for neosh: the Provider trait, a shared SSE parser and one driver per transport."
+keywords = ["neosh", "llm", "provider", "sse", "agent"]
+categories = ["api-bindings", "asynchronous"]
 
 [dependencies]
 neosh-proto = { workspace = true }

@@ -5,6 +5,10 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
+homepage.workspace = true
+description = "The neosh terminal frontend, and the only place display-width maths happens."
+keywords = ["neosh", "tui", "terminal", "ratatui"]
+categories = ["command-line-interface"]
 
 [dependencies]
 neosh-proto = { workspace = true }
