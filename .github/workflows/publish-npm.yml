@@ -35,7 +35,10 @@ jobs:
       - name: Publish what npm does not have yet
         run: |
           set -euo pipefail
-          for dir in npm/neosh plugins/api plugins/builtin/*/; do
+          # `npm/neosh` is not in this list on purpose: the launcher's optional dependencies are
+          # the four binaries, so it goes up in release.yml after they do. Publishing it here would
+          # put a launcher on npm before there was anything for it to launch.
+          for dir in plugins/api plugins/builtin/*/; do
             [ -f "$dir/package.json" ] || continue
             name=$(node -p "require('./$dir/package.json').name")
             version=$(node -p "require('./$dir/package.json').version")
