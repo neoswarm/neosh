@@ -1587,6 +1587,21 @@ export interface SwarmApi {
   /** Withdraw authorisation and stop connecting. Refuses for a machine your config declared. */
   unpair(node: NodeId): Promise<void>;
   /**
+   * Dial a down peer again now, rather than waiting out its retry delay.
+   *
+   * Also what lifts a {@link disconnect}: for a peer that dials *this* machine, being willing to
+   * answer again is the whole of what "reconnect" can mean.
+   */
+  reconnect(node: NodeId): Promise<void>;
+  /**
+   * Close the connection to a peer and stop dialling it, keeping the pairing.
+   *
+   * Holds until {@link reconnect} or a restart — the peer stays authorised, so this is "leave it
+   * alone for now", and {@link unpair} is the stronger verb. Its `SwarmNode` row goes
+   * `link: down`, with its agents still described.
+   */
+  disconnect(node: NodeId): Promise<void>;
+  /**
    * Machines that proved who they are and have not been paired with.
    *
    * `dialled` says which question to ask: `true` is "this is what is at that address — add it?",
@@ -1982,6 +1997,12 @@ function build(
       },
       async unpair(node) {
         await c({ call: "swarm_unpair", node });
+      },
+      async reconnect(node) {
+        await c({ call: "swarm_reconnect", node });
+      },
+      async disconnect(node) {
+        await c({ call: "swarm_disconnect", node });
       },
       async strangers() {
         return expect(await c({ call: "swarm_strangers" }), "swarm_strangers").strangers;

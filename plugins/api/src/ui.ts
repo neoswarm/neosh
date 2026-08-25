@@ -469,6 +469,19 @@ export interface PickerOptions<T> {
     key: KeyContext,
     ctx: { item: T | undefined; query: string },
   ): Promise<"handled" | "reload" | "close" | undefined> | "handled" | "reload" | "close" | undefined;
+  /**
+   * Watch something outside the picker, and reload the rows when it moves.
+   *
+   * Called once as the picker opens; the `Disposable` it returns is disposed with it. Calling
+   * `reload` does what `onKey`'s `"reload"` does — re-run `source`, or re-rank `items`, the very
+   * array you passed in — for a change no key caused: a peer connecting while the list of
+   * computers is open is a row that should change under you, not on the next press.
+   *
+   * ```ts
+   * subscribe: (reload) => neosh.swarm.onChange(reload)
+   * ```
+   */
+  subscribe?(reload: () => void): Disposable;
 }
 
 const NS = "neosh.ui.picker";
@@ -797,6 +810,18 @@ export async function picker<T>(
     await refetch();
     opts.onQuery?.(query);
   };
+
+  if (opts.subscribe) {
+    disposers.push(
+      opts.subscribe(() => {
+        if (closed) return;
+        void (async () => {
+          await refetch();
+          if (!closed) await render();
+        })().catch(() => {});
+      }),
+    );
+  }
 
   disposers.push(
     await neosh.cmd.register(command, async (_args, key) => {
