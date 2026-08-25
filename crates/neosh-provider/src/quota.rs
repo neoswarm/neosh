@@ -12,7 +12,9 @@
 //!
 //! # Reading another program's credential
 //!
-//! [`claude_usage`] reads `~/.claude/.credentials.json`, which belongs to the `claude` CLI. That is
+//! [`claude_usage`] reads the login the `claude` CLI keeps — `~/.claude/.credentials.json` where
+//! that is where it keeps it, and the login keychain on macOS, where the CLI writes no file at
+//! all. That is
 //! the same trade this crate already makes everywhere else: the `claude-cli` driver exists because
 //! reusing a login you already have is what makes neosh useful the minute it is installed, and a
 //! plan gauge that demanded a second sign-in for a number the first login already entitles you to
@@ -70,6 +72,72 @@ fn dirs_home() -> Option<PathBuf> {
     std::env::var_os("HOME").map(PathBuf::from).filter(|p| !p.as_os_str().is_empty())
 }
 
+/// The service name `claude` files its login under in the macOS keychain.
+#[cfg(target_os = "macos")]
+const CLAUDE_KEYCHAIN_SERVICE: &str = "Claude Code-credentials";
+
+/// The raw credential JSON, from wherever this machine's `claude` keeps it.
+///
+/// The file first, because it is cheaper than a process and because `CLAUDE_CONFIG_DIR` can point
+/// at one on any platform; the keychain second, because on macOS the CLI writes no file at all —
+/// which is why a gauge that only knew about the file worked on Linux and sat empty on a Mac.
+async fn claude_credentials_json() -> Option<String> {
+    if let Some(path) = claude_credentials_path() {
+        if let Ok(raw) = tokio::fs::read_to_string(&path).await {
+            return Some(raw);
+        }
+    }
+    claude_keychain_json().await
+}
+
+/// The same JSON, out of the login keychain.
+///
+/// `security` is the supported way for another process to ask, and what it prints *is* the
+/// credential — so it goes straight into parsing and never near a log line. A locked keychain, a
+/// declined prompt or no item at all are one answer: cannot say, which the gauge draws as its age.
+#[cfg(target_os = "macos")]
+async fn claude_keychain_json() -> Option<String> {
+    let out = Command::new("/usr/bin/security")
+        .args(["find-generic-password", "-s", CLAUDE_KEYCHAIN_SERVICE, "-w"])
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .await
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    String::from_utf8(out.stdout).ok()
+}
+
+#[cfg(not(target_os = "macos"))]
+async fn claude_keychain_json() -> Option<String> {
+    None
+}
+
+/// Whether the keychain has the item, without reading it.
+///
+/// Asked by [`can_poll`], which runs on a timer for the life of the workspace — so it asks for the
+/// item's existence and not its value, and the secret only ever crosses a process boundary when a
+/// request is actually about to use it.
+#[cfg(target_os = "macos")]
+async fn claude_keychain_present() -> bool {
+    Command::new("/usr/bin/security")
+        .args(["find-generic-password", "-s", CLAUDE_KEYCHAIN_SERVICE])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .await
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+#[cfg(not(target_os = "macos"))]
+async fn claude_keychain_present() -> bool {
+    false
+}
+
 /// The access token, if there is a live subscription login on this machine.
 ///
 /// Deliberately not refreshed. A token that has expired means the `claude` CLI will mint a new one
@@ -77,8 +145,7 @@ fn dirs_home() -> Option<PathBuf> {
 /// other's session. An expired token is simply "cannot answer right now", which is a state a gauge
 /// showing its own age already knows how to draw.
 async fn claude_token() -> Option<(SecretString, Option<String>)> {
-    let path = claude_credentials_path()?;
-    let raw = tokio::fs::read_to_string(&path).await.ok()?;
+    let raw = claude_credentials_json().await?;
     let v: Value = serde_json::from_str(&raw).ok()?;
     let oauth = v.get("claudeAiOauth")?;
 
@@ -654,10 +721,13 @@ pub enum Pollable {
 /// CLIs installed — does not pay for the other one on every poll.
 pub async fn can_poll(which: Pollable, program: &str) -> bool {
     match which {
-        Pollable::Claude => match claude_credentials_path() {
-            Some(p) => tokio::fs::try_exists(&p).await.unwrap_or(false),
-            None => false,
-        },
+        Pollable::Claude => {
+            let file = match claude_credentials_path() {
+                Some(p) => tokio::fs::try_exists(&p).await.unwrap_or(false),
+                None => false,
+            };
+            file || claude_keychain_present().await
+        }
         Pollable::Codex => which_on_path(program).is_some(),
     }
 }
