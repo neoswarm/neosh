@@ -1,6 +1,6 @@
 {
   "name": "@neosh/usage",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "How full the context window is, what the conversation has cost, and what the plan has left.",
   "license": "MIT",
   "type": "module",

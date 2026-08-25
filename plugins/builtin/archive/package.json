@@ -1,6 +1,6 @@
 {
   "name": "@neosh/archive",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "What you have finished with: a panel to find it in, and the verbs that empty it.",
   "license": "MIT",
   "type": "module",

@@ -1,4 +1,4 @@
 name = "palette"
-version = "0.1.0"
+version = "0.2.0"
 entry = "main.ts"
 description = "One key to everything: commands, conversations, and what they are bound to."

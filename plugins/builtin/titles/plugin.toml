@@ -1,4 +1,4 @@
 name = "titles"
-version = "0.1.0"
+version = "0.2.0"
 entry = "main.ts"
 description = "Names a conversation after what it turned out to be about."

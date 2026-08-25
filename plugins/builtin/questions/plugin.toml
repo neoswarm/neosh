@@ -1,5 +1,5 @@
 name = "questions"
-version = "0.1.0"
+version = "0.2.0"
 entry = "main.ts"
 description = "Draws the question an agent asks you, and sends back what you said."
 permissions = ["hooks_blocking"]
