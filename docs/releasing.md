@@ -144,7 +144,20 @@ four binaries onto the release, four `@neosh/cli-*` packages onto npm, and then 
 launcher once all four are up. That is the same property that lets you re-run a release which died
 halfway through.
 
-### 8. Write the Homebrew formula
+### 8. Let the workflows publish to npm from now on
+
+The first release necessarily ran before its trusted publishers existed, so `release.yml` skipped
+npm and the five binary packages went up by hand. Once the trusted publishers in step 5 are in
+place, turn the workflow's half on:
+
+```sh
+gh variable set NPM_TRUSTED_PUBLISHING --body true
+```
+
+Unset, `release.yml` still builds and attaches the binaries — it just says in the log that it
+published nothing to npm, rather than failing red for a reason that was expected.
+
+### 9. Write the Homebrew formula
 
 Only once the release has finished building, because the checksums come out of it:
 
