@@ -1,0 +1,108 @@
+name: Bug report
+description: Something is broken, drawn wrong, or not doing what the docs say
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the report. neosh is a terminal app, so **a picture or a short recording of the
+        broken screen is the single most useful thing you can give us**. You can drag an image or a
+        video file straight into any text box below.
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: What did you see, and what did you expect to see instead?
+      placeholder: The sidebar shows ... but I expected ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      description: The exact keys and actions, from a fresh start if possible.
+      placeholder: |
+        1. Start neosh in a git repository
+        2. Press ^N and pick a worktree
+        3. ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: media
+    attributes:
+      label: Screenshot or recording
+      description: |
+        Drag an image, gif, or video here. For terminal recordings, an
+        [asciinema](https://asciinema.org) link also works. If the bug is about colours or layout,
+        a picture says more than any description of it.
+    validations:
+      required: false
+
+  - type: input
+    id: version
+    attributes:
+      label: neosh version
+      description: The output of `neosh --version`. If the workspace has been running a while, note that too, since a running workspace keeps executing the binary it started with.
+      placeholder: neosh 0.1.0
+    validations:
+      required: true
+
+  - type: dropdown
+    id: install
+    attributes:
+      label: How you installed it
+      options:
+        - install.sh
+        - cargo / built from source
+        - other
+    validations:
+      required: true
+
+  - type: dropdown
+    id: os
+    attributes:
+      label: Operating system
+      options:
+        - macOS
+        - Linux
+        - other
+    validations:
+      required: true
+
+  - type: input
+    id: terminal
+    attributes:
+      label: Terminal
+      description: The emulator, and anything between it and neosh (tmux, zellij, ssh).
+      placeholder: Ghostty, inside tmux, over ssh
+    validations:
+      required: true
+
+  - type: input
+    id: model
+    attributes:
+      label: Model and driver
+      description: Only if the bug involves an agent. The footer shows both.
+      placeholder: claude-fable-5 via claude-cli
+    validations:
+      required: false
+
+  - type: textarea
+    id: config
+    attributes:
+      label: Relevant config
+      description: The part of your `config.toml` or `init.ts` involved, if any. Remove anything secret before pasting.
+      render: toml
+    validations:
+      required: false
+
+  - type: textarea
+    id: extra
+    attributes:
+      label: Anything else
+      description: Logs, other terminals attached to the same workspace, plugins you have installed, a pattern in when it happens.
+    validations:
+      required: false

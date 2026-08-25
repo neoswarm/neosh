@@ -1,0 +1,42 @@
+name: Feature request
+description: Something neosh should be able to do
+labels: [enhancement]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        One thing to know first: every feature in neosh ships on the public plugin API, and the
+        built-ins are plugins themselves. So the question is rarely "should neosh do this" and
+        usually "can a plugin do this yet". Both answers are useful to us.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: The problem
+      description: What are you trying to do, and what gets in the way today? A concrete moment ("every time I ...") beats a general wish.
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: What you would like
+      description: How should it work? Keys, panels, config, whatever shape you imagine. A sketch or a mockup image helps, you can drag one straight in.
+    validations:
+      required: true
+
+  - type: textarea
+    id: plugin
+    attributes:
+      label: Could it be a plugin?
+      description: If you tried building it on the API and hit a wall, say where the wall was. A missing API is a bug in the API, and that is often the better issue.
+    validations:
+      required: false
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: What you do instead today
+      description: Workarounds, other tools, or nothing.
+    validations:
+      required: false
