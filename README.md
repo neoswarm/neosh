@@ -40,10 +40,11 @@ built-in feature is written on. If you can see it, a plugin can replace it.
 curl -fsSL https://neoswarm.dev/install.sh | sh
 ```
 
-Or with Homebrew, or from crates.io:
+Or with Homebrew, npm, or from crates.io:
 
 ```bash
 brew install neoswarm/tap/neosh
+npm install -g neosh
 cargo install neosh          # builds deno_core from source, so give it a quarter of an hour
 ```
 

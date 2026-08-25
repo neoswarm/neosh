@@ -1,8 +1,9 @@
 # Releasing neosh
 
-Three registries and one of them is the point: crates.io carries the eleven Rust crates, npm carries
-the plugin API and the builtins, and GitHub Releases carries the binaries almost everybody actually
-installs.
+Four places, and the last one is how almost everybody actually installs it: crates.io carries the
+eleven Rust crates, npm carries the plugin API and the builtins *and* a launcher that pulls down a
+binary, Homebrew carries a formula in a tap of ours, and GitHub Releases carries the binaries the
+other two point at.
 
 After the first release, all three are **tokenless**: publishing is a GitHub Actions job whose OIDC
 identity crates.io and npm have been told to trust. There is no `CARGO_REGISTRY_TOKEN` and no
@@ -20,8 +21,9 @@ once.
 |---|---|---|
 | crates.io | `neosh`, `neosh-proto`, `neosh-core`, `neosh-provider`, `neosh-vcs`, `neosh-swarm`, `neosh-agent`, `neosh-script`, `neosh-syntax`, `neosh-tui`, `neosh-plugins` | 11 |
 | npm | `@neosh/api`, and `@neosh/<name>` for each of the ten bundled plugins | 11 |
-| npm | `neosh` — a name reservation that installs nothing (`npm/neosh`) | 1 |
-| GitHub Releases | `neosh-<target>.tar.gz` for four macOS and Linux targets | 4 |
+| npm | `neosh` — the launcher, and `@neosh/cli-<os>-<cpu>` carrying the binary for each of four platforms | 5 |
+| GitHub Releases | `neosh-<target>.tar.gz` plus a `.sha256` for four macOS and Linux targets | 8 |
+| Homebrew | `Formula/neosh.rb` in `neoswarm/homebrew-tap`, generated from the release | 1 |
 
 Not PyPI: the name is taken by an unrelated Python shell, and a Rust binary has no business there.
 Not Windows: the workspace talks to its terminals over a Unix socket, so there is nothing to ship.
@@ -72,13 +74,29 @@ on the `@neosh` scope and on the package `neosh`.
 
 ```sh
 npm install -g npm@latest        # trusted publishing needs npm >= 11.5.1
-NODE_AUTH_TOKEN=npm_... bash -c '
-  for dir in npm/neosh plugins/api plugins/builtin/*/; do
-    (cd "$dir" && npm publish --access public)
-  done'
+npm config set //registry.npmjs.org/:_authToken npm_...
+
+for dir in plugins/api plugins/builtin/*/; do
+  (cd "$dir" && npm publish --access public)
+done
 ```
 
-### 5. Turn on trusted publishing, eleven times and then twelve more
+A **token**, not `npm login`: an interactive login cannot publish unattended under 2FA — npm asks
+for a one-time password and prints a browser URL — and there are sixteen of these.
+
+The five binary packages are not in that loop. `neosh` and the four `@neosh/cli-*` are published by
+`release.yml` from a release that does not exist yet, so they only need to *exist* for a trusted
+publisher to be attachable. Placeholders do that:
+
+```sh
+for t in aarch64-apple-darwin x86_64-apple-darwin \
+         x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu; do
+  ./scripts/npm-platform-package.sh "$t" 0.0.0 "/tmp/plat/$t"
+  (cd "/tmp/plat/$t" && npm publish --access public)
+done
+```
+
+### 5. Turn on trusted publishing, eleven times and then sixteen more
 
 This is the tedious part and it only happens once.
 
@@ -92,7 +110,7 @@ add a Trusted Publisher, and fill in:
 | Workflow filename | `publish-crates.yml` |
 | Environment | *(leave empty)* |
 
-**npm** — for each of the twelve packages, go to the package's Settings tab, and under Publishing
+**npm** — for each of the sixteen packages, go to the package's Settings tab, and under Publishing
 access choose a trusted publisher:
 
 | Field | Value |
@@ -119,10 +137,25 @@ git tag v0.1.0 && git push --follow-tags
 gh release create v0.1.0 --title v0.1.0 --generate-notes
 ```
 
-Publishing the release is what builds the binaries. It also fires the two publish workflows over
-versions you have just put up by hand — both are written to skip whatever the registry already has,
-so they run green and do nothing, and the only job that does real work is `release.yml`. That is the
-same property that lets you re-run a release which died halfway through.
+Publishing the release is what builds the binaries. It also fires the publish workflows over
+versions you have just put up by hand — all of them are written to skip whatever the registry
+already has, so they run green and do nothing, and the job that does the real work is `release.yml`:
+four binaries onto the release, four `@neosh/cli-*` packages onto npm, and then the `neosh`
+launcher once all four are up. That is the same property that lets you re-run a release which died
+halfway through.
+
+### 8. Write the Homebrew formula
+
+Only once the release has finished building, because the checksums come out of it:
+
+```sh
+gh run watch                      # wait for release.yml
+scripts/brew-formula.sh v0.1.0 > ../homebrew-tap/Formula/neosh.rb
+cd ../homebrew-tap && git commit -am "neosh 0.1.0" && git push
+```
+
+Then `brew install neoswarm/tap/neosh` works. The formula is generated and never hand-edited: a
+checksum somebody typed is a formula that installs whatever is at that URL now.
 
 ---
 
@@ -131,6 +164,7 @@ same property that lets you re-run a release which died halfway through.
 ```sh
 # 1. Bump the one version.
 $EDITOR Cargo.toml                       # [workspace.package] version
+$EDITOR npm/neosh/package.json          # version AND the four optionalDependencies
 $EDITOR plugins/api/package.json plugins/builtin/*/package.json
 
 # 2. Prove it.
@@ -141,9 +175,13 @@ git commit -am "release: v0.2.0" && git tag v0.2.0 && git push --follow-tags
 ```
 
 Then publish the GitHub release for that tag. Publishing it is the trigger: `release.yml` builds
-the four binaries and attaches them, `publish-crates.yml` pushes the eleven crates, and
-`publish-npm.yml` pushes the npm packages, skipping anything the registry already has — so it is
+the four binaries and attaches them, `publish-crates.yml` pushes the eleven crates,
+`release.yml` pushes the four platform packages and then the `neosh` launcher, and
+`publish-npm.yml` pushes the plugin packages, skipping anything the registry already has — so it is
 safe to re-run a half-failed release.
+
+Then regenerate the Homebrew formula, as in step 8 — a release nobody points Homebrew at is a
+release `brew upgrade` cannot see.
 
 A new crate or a new bundled plugin needs its own first manual publish and its own trusted
 publisher, exactly as above. Nothing else does.
@@ -152,9 +190,9 @@ publisher, exactly as above. Nothing else does.
 
 ## Later, and not on the critical path
 
-- **A Homebrew tap.** `neoswarm/homebrew-tap`, with a formula pointing at the release tarballs, so
-  `brew install neoswarm/tap/neosh` works. homebrew-core has notability thresholds a new project
-  will not meet; the tap has none and is the same command to the user.
+- **homebrew-core**, so that `brew install neosh` needs no tap at all. It has notability
+  thresholds — roughly 75 stars, 30 forks, 30 watchers — that a young project does not meet, and
+  nothing about the formula would change when it does.
 - **AUR.** A `neosh-bin` package built from the same tarballs.
 - **Nix.** A flake in the repository, then nixpkgs when it settles.
 

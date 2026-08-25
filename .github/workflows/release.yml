@@ -1,8 +1,11 @@
 name: release
 
 # Prebuilt binaries, which are how almost everybody actually installs neosh: `cargo install neosh`
-# builds deno_core from source and takes about a quarter of an hour, and a Homebrew tap or an AUR
-# `-bin` package has to have something to point at.
+# builds deno_core from source and takes about a quarter of an hour, and a Homebrew formula or an
+# npm platform package has to have something to point at.
+#
+# Three things come out of one build: a tarball on the GitHub release, an `@neosh/cli-<os>-<cpu>`
+# package on npm, and the checksum a Homebrew formula is written from.
 #
 # macOS and Linux only, deliberately: the workspace talks to its terminals over a Unix socket
 # (`daemon.rs`), so there is nothing to ship for Windows yet.
@@ -20,6 +23,9 @@ jobs:
     name: ${{ matrix.target }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 90
+    permissions:
+      contents: write # attach assets to the release
+      id-token: write # npm trusted publishing
     strategy:
       fail-fast: false
       matrix:
@@ -48,6 +54,15 @@ jobs:
         with:
           key: ${{ matrix.target }}
 
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org
+
+      # Trusted publishing needs npm >= 11.5.1, and setup-node with Node 22 ships npm 10. Without
+      # this the OIDC exchange never happens and npm falls back to a token that is not there.
+      - run: npm install -g npm@latest
+
       - run: cargo build --release --locked --target ${{ matrix.target }} -p neosh
 
       - name: Tar it up, with a checksum
@@ -63,9 +78,56 @@ jobs:
           (cd dist && shasum -a 256 "$name.tar.gz" > "$name.tar.gz.sha256")
           echo "asset=dist/$name.tar.gz" >> "$GITHUB_OUTPUT"
 
+      - name: Publish the npm platform package
+        run: |
+          set -euo pipefail
+          version=$(cargo metadata --format-version 1 --no-deps \
+            | jq -r '.packages[] | select(.name=="neosh") | .version')
+          ./scripts/npm-platform-package.sh "${{ matrix.target }}" "$version" dist/npm \
+            "target/${{ matrix.target }}/release/neosh"
+          name=$(node -p "require('./dist/npm/package.json').name")
+          if npm view "$name@$version" version >/dev/null 2>&1; then
+            echo "skip $name@$version — npm already has it"
+          else
+            (cd dist/npm && npm publish --access public --provenance)
+          fi
+
       - uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ github.event.inputs.tag || github.ref_name }}
           files: |
             ${{ steps.package.outputs.asset }}
             ${{ steps.package.outputs.asset }}.sha256
+
+  # The launcher goes up only once every binary it points at is on npm. Its `optionalDependencies`
+  # name all four by exact version, and npm resolves them at install time rather than at publish
+  # time — so publishing this first is a window in which `npm i -g neosh` installs a launcher with
+  # nothing to launch, and says so at the first run rather than at the install that caused it.
+  launcher:
+    name: npm launcher
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org
+
+      - run: npm install -g npm@latest
+
+      - name: Publish neosh
+        run: |
+          set -euo pipefail
+          version=$(node -p "require('./npm/neosh/package.json').version")
+          if npm view "neosh@$version" version >/dev/null 2>&1; then
+            echo "skip neosh@$version — npm already has it"
+            exit 0
+          fi
+          (cd npm/neosh && npm publish --access public --provenance)
