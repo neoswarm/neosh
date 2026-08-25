@@ -4,8 +4,8 @@
 //!
 //! ACP is JSON-RPC 2.0 over stdio, newline-delimited, and it is what Cursor's `cursor-agent`,
 //! xAI's `grok` and Google's `gemini --experimental-acp` all speak. One driver, three plans, and
-//! the fourth costs a line in the catalogue rather than a file here. That is the same bet ADR 0010
-//! makes about MCP: a protocol worth adopting is one that turns "support vendor X" into
+//! the fourth costs a line in the catalogue rather than a file here. That is the same bet neosh
+//! makes on MCP: a protocol worth adopting is one that turns "support vendor X" into
 //! configuration.
 //!
 //! # What it actually is
@@ -23,7 +23,7 @@
 //! Now the request goes to a [`crate::approval::PermissionAsker`], which is the same prompt a
 //! built-in tool call reaches, and the agent's own options travel with it — an agent that offers
 //! "allow, and don't ask again for `cargo`" is offering something no client-side yes/no could
-//! reproduce, so it is offered verbatim. See ADR 0032.
+//! reproduce, so it is offered verbatim.
 //!
 //! With no asker installed the old behaviour is exactly what remains, which is what a test or a
 //! headless run gets: policy answers, and where policy wanted a person, the answer is no.
@@ -346,7 +346,7 @@ fn content_text(update: &Value) -> String {
 /// neosh reads edits off a call's input, in the handful of shapes editing tools use, so the diff
 /// goes in there under `old_text`/`new_text`/`path`, and only where the input has nothing of its
 /// own to say. An agent that sends the diff later, in a `tool_call_update`, is still out of reach:
-/// the block is closed by then. See ADR 0033.
+/// the block is closed by then.
 fn fold_diff(input: &mut Value, update: &Value) {
     let Some(items) = update.get("content").and_then(|c| c.as_array()) else { return };
     let Some(diff) = items.iter().find(|c| c.get("type").and_then(|t| t.as_str()) == Some("diff"))
@@ -574,7 +574,7 @@ async fn permission_outcome(
     let answer = match asker {
         Some(a) => a.ask(req).await,
         // Nobody to ask. The mode is all there is, and where the mode wanted a person the answer
-        // is no — the same direction a blocking hook times out in, per ADR 0009.
+        // is no — the same direction a blocking hook times out in.
         None => match permission_answer(params, mode) {
             Some(id) => PermissionAnswer::Option(id),
             None => PermissionAnswer::Deny,
@@ -807,7 +807,7 @@ impl Provider for AcpProvider {
                 let notes = notes.clone();
                 let workdir = workdir.clone();
                 // Which conversation is blocked, so a prompt waiting in one you are not looking at
-                // can say which one it is. See ADR 0057.
+                // can say which one it is.
                 let conversation = request.conversation.clone();
                 move |method: &str, params: &Value| -> Note {
                     match method {
@@ -1134,7 +1134,7 @@ mod tests {
     #[test]
     fn a_plan_and_a_command_list_are_no_longer_dropped() {
         // Both were read past, because there was nowhere to put something that is not a content
-        // block. See ADR 0034.
+        // block.
         let mut i = 0;
         let mut blocks = Default::default();
         let plan = acp_events(

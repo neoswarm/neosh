@@ -12,8 +12,7 @@ before you write code, so nobody builds something twice.
 Every feature in neosh ships on the same public API a third party plugin would use. The sidebar,
 the palette, git: all plugins. So before adding a capability to the core, ask "could a plugin do
 this?" If yes, it should be one. If it almost could but the API is missing something, the API is
-what to extend. [AGENTS.md](AGENTS.md) records the rules and the reasoning, and `docs/adr/` holds
-one file per decision.
+what to extend. [AGENTS.md](AGENTS.md) records the rules and the reasoning behind them.
 
 ## Setup
 

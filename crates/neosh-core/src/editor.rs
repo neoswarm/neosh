@@ -406,7 +406,6 @@ impl Editor {
                 // screen, which views are attached and whether any of them has focus. The core
                 // knows none of those: a view is a socket and focus is a fact about somebody
                 // else's window manager. It draws the corner and the host decides the rest.
-                // See ADR 0057.
                 | ApiCall::Alert { .. }
         )
     }
@@ -837,7 +836,7 @@ impl Editor {
     ///
     /// The transcript, the composer and the status line are the three surfaces a plugin most
     /// wants to put a key on or find, and they had no kind — so the host's own UI was the one
-    /// part of the workspace ADR 0040's promise did not reach. `neosh.transcript`,
+    /// part of the workspace the buffer-kind promise did not reach. `neosh.transcript`,
     /// `neosh.composer`, `neosh.status`: bind at `buf_kind` scope, find with `win.ofKind`,
     /// remap with `win.setHighlights`, like any panel.
     pub fn create_buffer_of_kind(&mut self, name: &str, kind: &str) -> BufferId {
@@ -1886,7 +1885,7 @@ impl Editor {
                 // A progress row without a key is a row nothing can ever replace or take away,
                 // which is the one failure mode `Progress` exists to remove. Demoted rather than
                 // refused: the caller had something to say and the corner is still the place for
-                // it. See ADR 0057.
+                // it.
                 let kind = match (kind, &key) {
                     (NoticeKind::Progress, None) => NoticeKind::Reply,
                     (k, _) => k,

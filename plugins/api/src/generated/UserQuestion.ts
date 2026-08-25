@@ -9,7 +9,7 @@ import type { QuestionOption } from "./QuestionOption";
  * with more than one answer each, sometimes with an answer nobody listed. Squeezing it into the
  * permission family would mean a prompt whose "options" are not decisions about the thing being
  * asked, and a policy layer that could answer `full access` to a question about which database to
- * use. See ADR 0043.
+ * use.
  */
 export type UserQuestion = {
   /**

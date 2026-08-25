@@ -372,8 +372,7 @@ pub enum PluginPermission {
     /// Drawing in the corner is free, like every other kind of drawing — `neosh.notify` needs
     /// nothing. This is the other thing: a plugin that can put a notification on somebody's
     /// desktop while they are in another application is a plugin that can interrupt them, and that
-    /// is exactly the kind of capability the manifest exists to make you agree to in advance. See
-    /// ADR 0057.
+    /// is exactly the kind of capability the manifest exists to make you agree to in advance.
     Notify,
 }
 

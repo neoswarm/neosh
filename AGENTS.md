@@ -27,8 +27,7 @@ turn off.
 | `neosh` | The binary. Wires the tasks, owns config, hosts the chat — and is both the workspace (`daemon.rs`) and the terminal that views it (`client.rs`). |
 
 `plugins/api/` is `@neosh/api` — generated protocol types plus a hand-written ergonomic layer.
-`plugins/builtin/` are ordinary plugins that happen to ship in the binary. `docs/adr/` is one file
-per decision, and records the *reasoning*, not the choice.
+`plugins/builtin/` are ordinary plugins that happen to ship in the binary.
 
 ## Rules that are not negotiable
 
@@ -50,12 +49,12 @@ per decision, and records the *reasoning*, not the choice.
 - **Every public API has a TS type generated from or checked against the Rust side.** Drift fails
   the build.
 - **Streaming markdown caches to the last *complete* block boundary** and re-parses only the
-  trailing partial block. See ADR 0026.
+  trailing partial block.
 - **Which way a diff line went is a background; what the code says is the foreground.**
   `ExtmarkOpts::line_hl_group` bands the whole row and every ranged group is patched over it. A
   `Diff.*Line` group that sets a foreground silently un-highlights the code on it. Colours for code
   come from `neosh-syntax`, which maps grammar scopes onto `Syntax.*` and never loads a theme of its
-  own — the palette owns colour, here as everywhere. See ADR 0035.
+  own — the palette owns colour, here as everywhere.
 - **A panel is a surface, not a program.** Anything a bundled plugin draws, a third party must be
   able to add to and take keys in without forking it. Three mechanisms, and a new panel of ours uses
   all three or it is not finished: a buffer **kind** (`buf.create({ kind })`), which is what
@@ -65,7 +64,7 @@ per decision, and records the *reasoning*, not the choice.
   about a thing rather than about us — `state` stays private and a favourite is not private. Every
   key in a panel is an ordinary binding pointed at a named command, so `^Z` lists it and `init.ts`
   can move it; a `switch` on `KeyContext` inside a plugin is the thing this replaced. Keep the
-  capture, but only as a sink for keys nothing claimed. See ADR 0040.
+  capture, but only as a sink for keys nothing claimed.
 - **A plugin can build on a plugin, and the four ways are named.** *Ask* it: `cmd.call` returns
   what a handler returned, and `import { api } from "plugin:<name>"` is the very module the host
   activated — declared with `requires` in the manifest, which is also what orders loading, so a
@@ -84,7 +83,7 @@ per decision, and records the *reasoning*, not the choice.
   `plugins.disabled` disables anything, `[activation]` holds a plugin until a command, event or
   kind asks for it, `[provides]` is how `ext.points()` knows who reads what and how a typo'd point
   gets reported, and `ListPanel` gives a third party's panel all of this for a kind and a `rows`
-  function. See ADR 0061.
+  function.
 - **A panel you are in the middle of using has the keyboard.** `FloatConfig::modal` takes
   `KeymapScope::Global` out of the chain, and a key nothing claimed is swallowed rather than reaching
   the composer behind the float. Shadowing the keys a widget wants is the other half and not a
@@ -96,7 +95,7 @@ per decision, and records the *reasoning*, not the choice.
   thing between a broken panel and a lost terminal must not depend on somebody having declared a
   default. A modal that borrows a global key to open itself owes a binding to close itself, which is
   why `^E` shuts the sheet from inside. Answering a question is not this: `^T` is how you reach a
-  question waiting in another conversation. See ADR 0047.
+  question waiting in another conversation.
 - **A default binding is a key every terminal sends.** Not "a key most people can press once they
   have found the setting": `F1` is brightness on a Mac out of the box, `⌥V` is `√`, and a key
   neosh never receives is a key no amount of rebinding will fix. That leaves Ctrl-with-a-letter,
@@ -108,7 +107,7 @@ per decision, and records the *reasoning*, not the choice.
   command — `^K` runs it by name and `init.ts` can bind it — because inventing a prefix layer for
   one verb costs every user a concept to save one of them a keystroke. Alt is bound on the terms
   arrows are: only where a terminal-sendable route to the same thing already exists, so `⌥Y`
-  copies the directory in chat and `yp` does it in the reader. See ADR 0048.
+  copies the directory in chat and `yp` does it in the reader.
 - **The cursor is on a character, and the frontend is the only thing that knows where that is.**
   Reading the transcript is a normal mode, so `$` is the last character rather than the space after
   it, `h` at column zero stays on its row, nothing parks past the end of one, and a selection
@@ -124,7 +123,7 @@ per decision, and records the *reasoning*, not the choice.
   window and therefore not drawn at all, which is a mode with no cursor in it. A window bends its
   own scroll to keep its cursor on screen and reports back what it actually drew, including `rows`,
   the buffer rows on the screen — which is what `^D` and `H`/`M`/`L` are counted in and is not the
-  height. See ADR 0051.
+  height.
 - **A list is a place you move in.** Anywhere there is a cursor over rows and no text field — the
   project panel, the transcript reader — the motions are Vim's and they take a count: `5j` is five
   rows you can *land on*, `^D`/`^U` are half of the panel's real height, `12G` is a row rather than
@@ -142,7 +141,7 @@ per decision, and records the *reasoning*, not the choice.
   because three bars and a name and a sentence is five rows of a column whose job is your
   conversations. `⇥` steps it up to every window and then to all of it — contributed as a
   `sidebar.action` with `on: "custom"`, which is how a plugin puts a key on rows it owns rather
-  than on every row in somebody else's panel. See ADR 0049.
+  than on every row in somebody else's panel.
 - **Pairing is a decision each machine makes, and neither of them restarts.** A node presents its
   identity to anyone who connects — as an SSH server presents a host key — so adding a computer is
   typing an address and being shown a name and a fingerprint that came from the far end. The other
@@ -158,13 +157,12 @@ per decision, and records the *reasoning*, not the choice.
   NAT traversal — plain TCP, with Tailscale or the like underneath — and does not trust the network
   to say who may steer an agent: a node is its ed25519 public key, and authorisation is a list you
   wrote. `accepts_approvals` is separate from `accepts_commands` and off by default, because
-  steering is a message and approving is a write to that machine's disk. See ADR 0041.
+  steering is a message and approving is a write to that machine's disk.
 - `Editor::handles` is a **deny-list**. A new API call that is not added to it silently routes to
   the core.
 - **A driver's account of its own loop is not a content block.** Sub-agents, plans, compaction and
   the commands a driver accepts go in `ProviderEvent::Activity`; `TurnAssembler` never reads it. If
-  something new has to be squeezed into `TextDelta` to be seen, the family is what to extend. See
-  ADR 0034.
+  something new has to be squeezed into `TextDelta` to be seen, the family is what to extend.
 - **An agent driver keeps one process per conversation, keyed by `TurnRequest::conversation`.** Not
   per turn, and never one per driver — several conversations run at once, and a driver holding a
   single session id resumes the second into the first one's history. (ACP is the exception and says
@@ -182,14 +180,12 @@ per decision, and records the *reasoning*, not the choice.
   keeps the history and hands back a handle; a driver that only remembers it in memory remembers it
   until the workspace stops, and then reopening a conversation starts an agent that has never heard
   of it — full transcript, empty model, and nothing on either side that reports it. It travels as
-  `Activity::Resume`, is kept in `Session::resume`, and comes back as `TurnRequest::resume`. See ADR
-  0039.
+  `Activity::Resume`, is kept in `Session::resume`, and comes back as `TurnRequest::resume`.
 - **The workspace is a process; the terminal is a viewer of it.** `neosh` attaches to the workspace
   for your config directory, starting one if there is none. Closing a terminal detaches — turns keep
   running. `neosh stop` is what ends a workspace, and `^Q` must never be able to. `UiEvent` is a
   delta stream, so anything a client needs on reattach has to be *kept* by the editor and said again
-  by `Editor::republish`; a value that is only forwarded is a value that comes back wrong. See ADR
-  0036.
+  by `Editor::republish`; a value that is only forwarded is a value that comes back wrong.
 - **The workspace you are looking at is not necessarily the binary you just built.** `cargo run`
   unlinks `target/debug/neosh`, writes a new one and then *attaches to the workspace already
   serving this config directory* — which goes on executing the inode it started with, now marked
@@ -201,8 +197,7 @@ per decision, and records the *reasoning*, not the choice.
   is the worse answer — it is **captured at startup** or there is nothing left to stat by the
   time it is asked for, and the **terminal** is what says it, because a stale workspace is
   running the only code it has ever had and cannot know it is behind. An unreadable stamp is
-  *unknown* rather than old, or the warning fires every time and stops meaning anything. See ADR
-  0058.
+  *unknown* rather than old, or the warning fires every time and stops meaning anything.
 - **What the agent produced is the workspace's; where you are looking is yours.** Attaching joins,
   it does not take over, and it does not make a copy: every terminal has a **view** of its own —
   its own conversation on screen, transcript, scroll, cursor, folded cards, composer and panels —
@@ -222,8 +217,7 @@ per decision, and records the *reasoning*, not the choice.
   returning find the answer still arriving. **The smallest-terminal rule is gone** — it existed
   because a card was shared content — and what is still merged is one window two terminals share.
   `republish` says only what the arriving view can see and has to stay idempotent, and
-  `ViewportChanged` is still where the host learns a width. See ADR 0061, and ADR 0042 for the
-  connection half.
+  `ViewportChanged` is still where the host learns a width.
 - **A plugin says which terminal it is drawing into, and almost never has to.** Three rules in
   order: a float anchored to a window goes where that window is; a buffer only one terminal shows
   names it; otherwise it is the terminal being served, which for anything done in answer to a key
@@ -236,7 +230,6 @@ per decision, and records the *reasoning*, not the choice.
   `here.win.open(...)` lands where the person pressing the key is looking. `SessionChanged` names
   the terminal that moved, because "the active conversation" has as many answers as there are
   screens; a question waits until some terminal is reading its conversation and opens there.
-  See ADR 0061.
 - **Every view gets every event.** `Agent` fans its stream out to one queue per view. Never a
   `broadcast` channel: lagging consumers drop the oldest, silently, under load — and a view that
   missed one `ToolFinished` has a card that spins forever with nothing to put it right.
@@ -251,8 +244,7 @@ per decision, and records the *reasoning*, not the choice.
   about one decision — they travel as `prompt_injected_values`, and the injection happens once,
   above every driver, on the copy of the message this turn sends — never on the transcript, never on a tool
   round, and always with a sendable value put back in the selection's place. `^E` shows *all* of
-  them at once and applies as you move, because a knob you cannot see is a knob you do not have. See
-  ADR 0043.
+  them at once and applies as you move, because a knob you cannot see is a knob you do not have.
 - **Take the transport that can do the most.** `claude` in stream-json mode with the control
   protocol; `codex app-server`, not `codex exec`. The cheaper one is not simpler for long — it is
   the one where streaming, approvals and interrupts turn out to be impossible rather than missing.
@@ -260,12 +252,12 @@ per decision, and records the *reasoning*, not the choice.
   completes what is being typed mirrors it back with `onQuery`, matches on the *name* rather than
   fuzzily over descriptions — an accept key that runs things must never be pointed at a row nobody
   aimed at — and sits on `Anchor::Dock { dock: Bottom }`, which places a float flush against the
-  strip so no caller subtracts its own height. See ADR 0037.
+  strip so no caller subtracts its own height.
 - **A conversation owns its permission mode**, and `None` means "nobody chose here, use the
   configured one" rather than a mode of its own. The shared `PermissionLayer` therefore holds the
   *configured* mode and is never written by `⇧⇥` — the moment it follows the active conversation,
   every conversation without a mode inherits the last one you touched. The configured default is
-  full access. See ADR 0038.
+  full access.
 - **A question is not a permission.** *May this happen* has one question, a yes-or-no answer, and a
   policy that can answer it without waking anybody; *which of these* has a list of them, sometimes
   several answers each, sometimes an answer nobody listed, and nothing in a mode or an allow-list
@@ -278,7 +270,7 @@ per decision, and records the *reasoning*, not the choice.
   it. **The question text is its own key** — the agent looks an answer up by the question it answers,
   so a generated id is an answer to nothing — and **nobody answering is a denial with a sentence in
   it**, never an `allow` with an empty map, because the empty map is what the agent reads as
-  "ignored me". See ADR 0043.
+  "ignored me".
 - **A request nobody answers is a turn that never ends.** The control protocol blocks: the CLI waits
   for a `control_response` carrying the id it sent, for as long as that takes. So the two
   classifiers over one pipe must never both stand aside — `can_use_tool` asks *"would
@@ -290,15 +282,14 @@ per decision, and records the *reasoning*, not the choice.
   mode is an ordinary permission, asked even under `--dangerously-skip-permissions`, and full access
   says yes to it. The other half is that a line reaching the bottom of the reader is **refused out
   loud** by request id rather than dropped: a refusal ends a turn badly and in the transcript,
-  silence does not end it at all, and only one of the two is recoverable from the keyboard. See ADR
-  0057.
+  silence does not end it at all, and only one of the two is recoverable from the keyboard.
 - **Everything irreversible asks, and nothing reversible does.** No exceptions on either side: a
   dialog that appears for some deletes and not others is a key whose behaviour you cannot predict
   from the row it is pointed at, and one charged for an action you can undo is what teaches people
   to clear dialogs without reading them. The question says what is at stake — how much, where, and
   what the alternative is — the destructive answer wears `Diagnostic.Error`, and the cursor starts
   on the one that changes nothing. `ui.confirm_destructive = false` is the way out, and it is the
-  user's setting rather than the program's guess. See ADR 0039.
+  user's setting rather than the program's guess.
 - **A worktree lives inside its project, and a display string is not a grouping key.** The sidebar
   nests a worktree under the repository it is a tree of, named by its branch — four scratch trees
   of one repository are not four projects — and it groups on `SessionInfo::repo_root`, never by
@@ -307,7 +298,7 @@ per decision, and records the *reasoning*, not the choice.
   *relative* `worktree.root` puts trees inside the repository as `<repo>/<configured>/<branch>` —
   no `<repo>` level, nothing else's trees can land there — and `add_worktree` writes the directory
   into the repository's `.gitignore` (tracked, so every clone gets it; skipped when already
-  ignored), or every `git status` reads as one giant untracked directory. See ADR 0046.
+  ignored), or every `git status` reads as one giant untracked directory.
 - **A branch is named by what you asked for, once you have asked.** A worktree you did not name
   starts on `wily-nimbus`, because naming a branch before the work is a decision made at the worst
   possible moment — and the first message sent in it *is* that decision, arriving on its own, so
@@ -324,7 +315,7 @@ per decision, and records the *reasoning*, not the choice.
   And the host has to put *its own* label right — `ProjectFacts` is asked once per directory and
   read on every redraw, so `GitRenameBranch` is the one git write handled on the host loop, which
   is what makes the sidebar row follow instead of saying `wily-nimbus` until restart. The directory
-  keeps the old name on purpose: moving it would invalidate the conversation's `cwd`. See ADR 0051.
+  keeps the old name on purpose: moving it would invalidate the conversation's `cwd`.
 - **A project outlives the conversations in it.** The panel's list is written down (`sidebar.projects`,
   a workspace var) rather than worked out from where the conversations happen to be — derived, it
   deleted the directory you had worked in all month the moment you cleared out the last thread in
@@ -332,10 +323,10 @@ per decision, and records the *reasoning*, not the choice.
   conversation being started in it, keeps the name the host gave it (`sidebar.name`, so emptying a
   worktree does not rename it to `wt-fe3c0d93`), and leaves by `X` on its heading and nothing else.
   Empty, that asks nothing — `o` puts it back; with conversations still in it, it is a delete of
-  every one of them and asks like one. See ADR 0039.
+  every one of them and asks like one.
 - **What you have archived is not in the sidebar at all, and it is something you can empty.** The
   panel is the list you work in; a section of things you are finished with is the only part of that
-  column that is never the answer, and it grows forever. ADR 0039 left one dim row with a count
+  column that is never the answer, and it grows forever. The first cut left one dim row with a count
   behind — a door rather than a drawer — and that row is now **off by default** too, for the same
   argument one step further: a permanent line about what you are *not* doing is the line that
   column can least spare, and the way in was never the row. `^F` from anywhere, `a` from the panel
@@ -346,14 +337,14 @@ per decision, and records the *reasoning*, not the choice.
   minutes of dialogs for a workspace you have used since spring: so rows can be *ticked*
   (`<Space>`), every verb means what is ticked or the row under the cursor, and `^X` empties
   **what the panel is currently listing** — which is what the filter is for, since narrowing to one
-  project and pressing it is that project and nothing else. It asks, in numbers, by ADR 0039's
-  rule. What is on disk is in scope: `RESTORE_LIMIT` means a workspace loads the most recent two
+  project and pressing it is that project and nothing else. It asks, in numbers, like the delete
+  it is. What is on disk is in scope: `RESTORE_LIMIT` means a workspace loads the most recent two
   hundred conversations and the rest are files nothing could show, open or delete, so the panel
   reads `session.stored` as well as `session.list` and the host brings one in from its file the
   moment any verb names it — otherwise "empty the archive" reports success over a directory it
   never touched. **Nothing here deletes on a timer**: `archive.auto_days` *archives* what has gone
   idle, because archiving is reversible and free, and `archive.retention_days` only ever counts —
-  `archive.sweep` is the same number with a person behind it. See ADR 0061.
+  `archive.sweep` is the same number with a person behind it.
 - **A notification is for something you did not ask for and cannot see.** Both halves, and a
   message that fails either is not one. `MessageLevel` says how *bad* a thing is and never whether
   you need to know about it, which is how one channel ended up carrying a hundred and seventy call
@@ -373,7 +364,7 @@ per decision, and records the *reasoning*, not the choice.
   say, idleness — never "assume focused", which is the one wrong answer that means a whole class of
   terminal never notifies. A turn shorter than `notify.min_turn` finished while you were still
   looking at the key that started it. And `unread` stays the *record*: this points at it once and
-  gets out of the way. See ADR 0057.
+  gets out of the way.
 - **A turn that finished while you were elsewhere is news until you go and look.** The panel says
   what is *happening* and stops the moment it stops, so an answer that arrived while you were in
   another conversation looks exactly like an answer you read yesterday. `SessionInfo::unread` is set
@@ -381,7 +372,7 @@ per decision, and records the *reasoning*, not the choice.
   by hand is a second chore attached to the first. It lives on the conversation and is persisted, so
   every list agrees and a restart does not lose it; it wears `Status.Unread`, the amber the palette
   already uses for *act now*, and it never moves — motion means "something is happening you cannot
-  see", and this is the opposite. A folded project carries a dot for what it is hiding. See ADR 0042.
+  see", and this is the opposite. A folded project carries a dot for what it is hiding.
 - **A conversation that is asking you something is not a conversation that is working.** Its turn is
   still in flight — blocked on the hook — so `active_turn` is set and every list draws the spinner,
   which is the one row in the panel that most needs finding drawn as the nineteen that do not. Which
@@ -391,7 +382,7 @@ per decision, and records the *reasoning*, not the choice.
   `Status.Pending` and therefore *moves* — a block ends when you answer, which is exactly what
   `Status.Unread` must not do — and the queue behind it is in memory while the var is on disk, so it
   is announced once at startup, empty, and that is what clears the one left behind by a workspace
-  that stopped mid-question. See ADR 0043.
+  that stopped mid-question.
 - **A question is the last thing in the transcript until something answers it.** A turn's closing
   rows — its plan, what it left running, what it changed — are about the answer they close, so they
   splice in *above* a question steered in after that answer rather than at the end of the buffer,
@@ -404,7 +395,7 @@ per decision, and records the *reasoning*, not the choice.
   a *second* turn in one conversation, which the first turn's ending then dismantled. Steering never
   takes a message it cannot deliver: the tool-gap take is guarded on cancellation, and what stays in
   the queue becomes the next turn. Leaving the reader goes back to following the newest, and so does
-  sending — whether it starts a turn or joins one. See ADR 0052.
+  sending — whether it starts a turn or joins one.
 - **An orchestrator is a plugin, and it drives conversations by name.** `agent.command` carries the
   same `AgentCommand` vocabulary `swarm.command` does, at a conversation named by id and defaulting
   to the one on screen; `swarm.command` aimed at this node runs it here rather than dialling itself.
@@ -418,10 +409,10 @@ per decision, and records the *reasoning*, not the choice.
   and a raw-cell surface each need the word in `plugin.toml`, an observer needs nothing, and drawing
   and reading stay free. **A plugin arrives as a git clone**: `neosh plugin add <url>`, validated
   before it is moved into place, named by its manifest, and never able to delete what you put in
-  your own config directory by hand. See ADR 0053.
+  your own config directory by hand.
 - **A card is a row until you ask for more.** A call that only *looked* at something folds to its
   header with the size of what came back on the end of it; a command keeps its output — a stack of
-  them keeps the last one's — an edit keeps its diff, and a failure always shows. See ADR 0033.
+  them keeps the last one's — an edit keeps its diff, and a failure always shows.
 - **A run of calls of one kind is one row**, naming as many of them as fit and counting the rest —
   a turn that read six files reads as one, and so does a stretch of it spent on `git add`, `git
   commit`, `git push`. Reads with reads and commands with commands, never one of each, and never an
@@ -435,7 +426,7 @@ per decision, and records the *reasoning*, not the choice.
   the *end*: then it is a report of what is happening rather than an account of what happened, and
   the call being waited on is the one name that must never be the name that did not fit. Only a
   mark that is news gets drawn: `▸` while a call is out, `✗` if it failed, and nothing at all when
-  it worked. See ADR 0040 and ADR 0051.
+  it worked.
 - **A card says what happened, not which tool did it.** `Ran cargo test`, not `Bash cargo test` —
   read off the arguments, like the colour. A call nothing here classifies keeps the name its author
   gave it, so a plugin's tool is never renamed. **A command's output folds from the middle**: the
@@ -443,7 +434,7 @@ per decision, and records the *reasoning*, not the choice.
   for. **A card is attached to what it did**: no blank row above it, and its body under a corner
   (`└`) at a four-column indent rather than a rule down the whole left side. Air between every two
   actions and a wall beside every diff were both structure said twice — the header is at column
-  zero, the body is indented, and that is already a list. See ADR 0040 and ADR 0050.
+  zero, the body is indented, and that is already a list.
 - **A turn is something you can watch, not only something you read back.** A command is named by
   what it *does* and never by how it got there: a leading `cd /home/you/projects/thing &&` is the
   one part of that row you already knew — the conversation has a directory — and clipped to a
@@ -451,12 +442,12 @@ per decision, and records the *reasoning*, not the choice.
   six folds to what was run rather than to `cd, cd, cd`. Reading is a place, and a turn writes
   below it: parked on the **last row** you are carried along with what arrives, anywhere else you
   stay exactly where you are, and neither happens while a selection or a search is holding two
-  positions. And **the card the cursor is in is open** — ADR 0049's rule one surface along, bounded
+  positions. And **the card the cursor is in is open** — the list rule one surface along, bounded
   by `chat.preview_lines` because nine hundred rows appearing under `j` is what the fold exists to
   prevent, and never fewer rows than the folded card showed. `⇥` stops meaning "open this" and
   starts meaning "keep it", `c`/`C` step call to call because `[`/`]` is a whole turn and `{`/`}`
   is one block for a run of nine cards, and a preview never fires while the tail is carrying you:
-  following is watching, and a redraw settles the answer streaming above it. See ADR 0057.
+  following is watching, and a redraw settles the answer streaming above it.
 - **A terminal cannot paste a picture, so pasting one is a key.** Bracketed paste is a text
   protocol: a screenshot arrives as nothing, and a dragged file arrives as its path. `^V` asks the
   system clipboard through whichever of `wl-paste`/`xclip`/`pngpaste`/`osascript`/`powershell` is
@@ -468,12 +459,12 @@ per decision, and records the *reasoning*, not the choice.
   `from_clipboard` answers with bytes *or* a `Remote` to go and get. That fetch is spawned rather
   than awaited on the loop, carries the conversation it was asked in, and is the one attachment
   that says something on the way. A photograph too busy to fit as a PNG is sent as a JPEG rather
-  than refused over an encoding. See ADR 0051. An attachment is a **chip above the field**, never a
+  than refused over an encoding. An attachment is a **chip above the field**, never a
   token in it — the message you send is the message you typed. `ContentBlock::Image` carries a
   *path*, not bytes: a transcript that is mostly base64 is one nothing can read back, so the bytes
   live once in the state directory and a driver reads them when it builds its request. The media
-  type is read off the bytes, because a `.png` that is really a JPEG fails the turn. See ADR 0041.
-- **An agent that speaks when nobody asked is still speaking to you.** ADR 0054 stopped a turn
+  type is read off the bytes, because a `.png` that is really a JPEG fails the turn.
+- **An agent that speaks when nobody asked is still speaking to you.** An earlier fix stopped a turn
   `claude` starts for itself — a backgrounded command finishing, enqueued as a message to itself and
   answered — from being read as the answer to your next question, by draining the pipe before the
   prompt goes in and dropping what it found. This is the half it deferred: the same turn, *heard
@@ -485,16 +476,16 @@ per decision, and records the *reasoning*, not the choice.
   a turn opened to hold an answer has no question above it. **A turn still ends on its own
   `result`** — `init` opens one and `result` closes one for their turns as much as ours, so a prompt
   queued behind one has two endings to wait for, and ending on the first is how a message that had
-  not been read yet came back as `{"type":"thinking","text":""}`. See ADR 0056.
+  not been read yet came back as `{"type":"thinking","text":""}`.
 - **A vendor CLI outlives the turn, so an abandoned turn has to be *drained*.** `Live::lines` is
   per conversation. A turn that is walked away from — `<Esc>`, a switch — leaves the CLI mid-answer
   with the rest of it in the pipe, and the next turn reads it as its own: someone else's reply, and
   then nothing. Stop forwarding, interrupt, read to the `result` that ends it, and leave the process
-  at a turn boundary. See ADR 0041.
+  at a turn boundary.
 - **Everything queued into one gap is one message.** A delegating driver is handed the *newest* user
   message and nothing else, so N queued messages meant N-1 questions drawn as asked and never put to
   anybody — which reads exactly like being ignored. `take_steering_into` joins them, in the order
-  they were typed. See ADR 0041.
+  they were typed.
 - **A flash is one thing happening; a burst is a redraw.** `Animation::Flash` is the only motion
   here that fires once, so it needs a moment to count from — and a highlight group, shared by every
   row using it, cannot hold one. The *mark* does: an extmark is created once, so the frontend keys
@@ -505,12 +496,12 @@ per decision, and records the *reasoning*, not the choice.
   frames travel as a *name* because only the frontend knows what the terminal can draw, and it
   clips or pads every frame to the width of the run underneath, so a spinner can never move the
   column after it. The buffer keeps the glyph that was written — a frame is what a cell looks like,
-  not what the line says. See ADR 0045.
+  not what the line says.
 - **Compaction moves the meter, because compaction is what moved the context.** A driver that has
   once answered "how full is it" turns off the estimate derived from usage, so the next answer only
   arrives with the next request — and a `Compacted` whose `after` nobody applied left the footer
   reporting the pre-compaction number for the rest of the conversation, under a card that said
-  `180k → 12k`. See ADR 0050.
+  `180k → 12k`.
 - **What the plan has left cannot be counted, only reported and then kept.** A subscription's
   allowance is opaque and is not a function of anything on this machine — a turn run in `claude`
   directly spent it too. `claude` says so on a `rate_limit_event` line and `codex` on
@@ -522,8 +513,7 @@ per decision, and records the *reasoning*, not the choice.
   rest reads the vendor CLI's own login — `SecretString`, request-time, never on disk, structurally
   absent from `UiEvent` — and is `usage.poll`. **Quota and token history never share an axis**: a
   percentage of an opaque allowance does not convert into a token count. History comes from the
-  vendors' own transcripts, never from ours, and a bounded scan that hits its cap says so. See ADR
-  0044.
+  vendors' own transcripts, never from ours, and a bounded scan that hits its cap says so.
 - **Redrawing a row means clearing its marks first.** A mark clamps rather than dies when the line
   under it is replaced, and at equal priority the *narrower* one wins — so a row rewritten every
   tick accumulates marks and ends up painted by the shortest one from several seconds ago.
@@ -540,7 +530,7 @@ per decision, and records the *reasoning*, not the choice.
   it is — so `enter_session` believing "back at the end" is not the same as the window being there.
   Read a long answer, go up, come out, switch project, and the next conversation was drawn from a
   row of a transcript that no longer existed. Reading is a place *in* a conversation, so the switch
-  takes you out of it too. ADR 0036's rule, one more time: a value that is only forwarded is a value
+  takes you out of it too. The rule, one more time: a value that is only forwarded is a value
   that comes back wrong.
 - **Following the newest is not a row, and row zero is.** `top_line` is an `Option`: `None` is
   unscrolled — the frontend's own answer, the last screenful of a transcript and the first of
@@ -617,7 +607,7 @@ registry — this table is what ships.
 Every key here is one **every terminal sends on every platform**: Ctrl-with-a-letter, `⇧⇥`, `⏎`,
 `⌫`, `Esc`. Nothing needs `fn`, nothing needs Option-as-Alt, and nothing is reachable only by an
 arrow — arrows and `PgUp`/`Home`/`End` are bound wherever they mean something, and are never the
-only way to do anything. See ADR 0048.
+only way to do anything.
 
 ## Chat
 
@@ -666,7 +656,7 @@ arrives and is never the only way — `^K` or `/copy` here, `y` on any row of th
 
 ## Reading the transcript — `^S`
 
-The answer is the artefact; this is how you get a piece of it out. See ADR 0028.
+The answer is the artefact; this is how you get a piece of it out.
 
 **A mode's keys are the mode's keys.** `^S` puts the editor in `Normal`, so `chat`'s bindings —
 the ones that compose a message — stop firing and these get their keys back. Only four things are
@@ -686,7 +676,7 @@ Two corollaries, both of which were bugs:
 bar in the composer, why `$` is the last character rather than the space after it, why `h` at column
 zero stops rather than going to the row above, and why `v` then `y` copies the character you were
 looking at instead of saying there is nothing there. A screen is counted in the buffer rows actually
-on it, which after wrapping is not the window's height. See ADR 0051.
+on it, which after wrapping is not the window's height.
 
 | Key | Does |
 |---|---|
@@ -733,7 +723,7 @@ is an artefact you take pieces out of.
 as long as the cursor is in it — so `c c c` walks a turn's work one call at a time and the rows go
 back as you leave. `⇥` is how you keep one. And **reading the last row keeps reading it**: a turn
 still running writes below you, and if you are parked at the end you are carried along with it.
-Anywhere else you stay exactly where you are — `G` starts following again. See ADR 0057.
+Anywhere else you stay exactly where you are — `G` starts following again.
 
 ## Answering a question — the panel over the composer
 
@@ -785,7 +775,7 @@ What you have finished with, and the one place in the workspace where throwing t
 you came to do. **Nothing about it is on screen until you press the key**: no section, no row, no
 count — `archive.sidebar = true` if you want the count in the project panel. A popup, and a panel
 rather than a picker: it has marks, and every verb means what is marked or — with nothing marked —
-the row under the cursor. The strip at the foot says which. See ADR 0061.
+the row under the cursor. The strip at the foot says which.
 
 Conversations past `RESTORE_LIMIT` are in here too, and behave like any other row: the workspace
 brings one in from its file the first time a key names it. The header says how many are `on disk

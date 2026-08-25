@@ -446,7 +446,7 @@ happens on every cursor move — publish that as an event instead.
 
 ## Building on another plugin
 
-Neovim's `require("nvim-tree.api")`, in two spellings. See ADR 0061.
+Neovim's `require("nvim-tree.api")`, in two spellings.
 
 ```ts
 // Typed and free of round trips, for a plugin you `requires` in the manifest. Module-level state
@@ -491,8 +491,7 @@ over a verb the user had already decided to own.
 
 ## Putting something in somebody else's panel
 
-Four mechanisms, and between them you should not have to fork a bundled plugin to change it. See
-[ADR 0040](adr/0040-a-panel-is-a-surface-not-a-program.md) and ADR 0061.
+Four mechanisms, and between them you should not have to fork a bundled plugin to change it.
 
 ### Bind a key inside a panel you did not open
 
@@ -655,7 +654,7 @@ group with its owner. `plugins.list` in `^K` draws all of it: the `:checkhealth`
 
 Three different things, and they are three calls rather than three levels of one. `MessageLevel`
 says how bad something is; which of these you reach for says whether the user asked for it, which is
-what decides where it goes and how long it lives. See ADR 0057.
+what decides where it goes and how long it lives.
 
 ```ts
 neosh.notify("copied /home/me/proj");            // a reply to a key they just pressed
@@ -718,8 +717,7 @@ the frontend logs. Masking is a rendering decision; the leak is a transport one.
 
 The consequence to design around: this is the one modal you cannot re-skin. You can decide *when* to
 ask and what to do afterwards — the model switcher re-queries the endpoint and reopens its list —
-but not what the prompt looks like. [ADR 0022](adr/0022-credentials-never-cross-the-plugin-boundary.md)
-records why that trade was made.
+but not what the prompt looks like.
 
 ---
 

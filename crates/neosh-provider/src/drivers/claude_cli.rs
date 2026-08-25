@@ -47,7 +47,7 @@
 //! protocol in [`super::claude_control`], and is answered by the same person a built-in tool call
 //! would reach. `--permission-prompt-tool stdio` requires `--input-format stream-json`, which is
 //! the same input format a long-lived session needs, so the two fit together rather than trading
-//! off. See ADR 0032.
+//! off.
 //!
 //! # The useful discovery
 //!

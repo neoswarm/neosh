@@ -492,8 +492,8 @@ export type ApiCall =
     level: MessageLevel;
     message: string;
     /**
-     * Whether the user asked for this. See ADR 0057; `Reply` is the default and is what a
-     * bare `neosh.notify` has always meant.
+     * Whether the user asked for this. `Reply` is the default and is what a bare
+     * `neosh.notify` has always meant.
      */
     kind: NoticeKind;
     /**

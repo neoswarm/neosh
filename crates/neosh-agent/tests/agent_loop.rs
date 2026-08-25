@@ -554,7 +554,7 @@ async fn steering_is_taken_by_the_conversation_it_was_typed_in() {
 
 // ---- several views of one workspace ---------------------------------------
 //
-// The workspace is a process and the terminal is a viewer of it (ADR 0036), so there can be more
+// The workspace is a process and the terminal is a viewer of it, so there can be more
 // than one viewer. Each needs the *whole* stream: a view that missed one `ToolFinished` is a view
 // with a card that never stops spinning, and nothing later puts it right.
 

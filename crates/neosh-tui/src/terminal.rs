@@ -281,7 +281,7 @@ impl TerminalFrontend {
     /// than a clipboard library and it is the same reason: a library talks to the D-Bus or
     /// NSUserNotificationCenter of the machine the *process* is on, and a coding agent runs on the
     /// big machine while you sit at a laptop somewhere else. This travels back up the stream the UI
-    /// is drawn on, so it comes out where the person is. See ADR 0057.
+    /// is drawn on, so it comes out where the person is.
     ///
     /// Terminals that implement none of these ignore all of them silently, which is the honest
     /// failure: there is no capability query for this, and refusing to notify on the chance it will

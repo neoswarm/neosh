@@ -51,7 +51,7 @@ export type UiEvent =
     level: MessageLevel;
     text: string;
     /**
-     * Whether you asked for this, which is what decides how long it lives. See ADR 0057.
+     * Whether you asked for this, which is what decides how long it lives.
      *
      * Defaulted rather than required: `Reply` is what every existing sender meant, and a
      * frontend from before this existed folds the field away and draws what it always drew.

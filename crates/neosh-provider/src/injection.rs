@@ -9,7 +9,7 @@
 //! one, it changes the next turn, and it should be visible in the strip while it is on — and they
 //! are settings you cannot *send*.
 //!
-//! [`ProviderOptionDescriptor`] has carried `prompt_injected_values` since ADR 0011 and nothing has
+//! [`ProviderOptionDescriptor`] has carried `prompt_injected_values` from the start and nothing has
 //! ever acted on it, which meant choosing one sent the word as a parameter: `--effort ultrathink`,
 //! which is not a level, and the turn fails. This is the half that was missing.
 //!

@@ -5,7 +5,7 @@
 //! question the *agent* asks its client — ACP's `session/request_permission` — and until this
 //! existed, the only answers a driver could give were "yes, because the mode says full access" and
 //! "no". So `ask` mode, the default, meant every write and every command was refused without
-//! anybody being asked anything. See ADR 0032.
+//! anybody being asked anything.
 //!
 //! The shape here is deliberately thin: a request, a set of answers the asker itself worded, and a
 //! reply. Nothing about hooks, plugins or pickers, because a driver has no business knowing which
@@ -36,7 +36,7 @@ pub struct PermissionRequest {
     /// What [`crate::ask::QuestionRequest`] has always carried, and for the same reason: a
     /// workspace runs several turns at once, only one of them is on screen, and "somebody is
     /// waiting on you" is a fact about a conversation rather than about whichever panel drew the
-    /// prompt. `None` where a plugin asked outside any turn. See ADR 0057.
+    /// prompt. `None` where a plugin asked outside any turn.
     #[doc(alias = "session")]
     pub conversation: Option<neosh_proto::SessionId>,
 }

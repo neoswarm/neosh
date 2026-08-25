@@ -60,9 +60,9 @@ numeric_id!(
     /// not — what the agent produced is the workspace's, and a conversation shown in two terminals
     /// is one transcript with two cursors on it.
     ///
-    /// On the wire because a plugin has to be able to say which terminal it is drawing into. ADR
-    /// 0042 kept it out of the protocol deliberately, when every view saw the same frame and the
-    /// number bought nothing; a float that must land in *this* terminal is what changed.
+    /// On the wire because a plugin has to be able to say which terminal it is drawing into. It
+    /// was kept out of the protocol deliberately at first, when every view saw the same frame and
+    /// the number bought nothing; a float that must land in *this* terminal is what changed.
     ViewId
 );
 

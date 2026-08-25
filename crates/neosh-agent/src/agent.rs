@@ -1140,7 +1140,7 @@ struct HookApprover<'a> {
     /// outside a turn.
     turn: Option<TurnId>,
     /// And which conversation, so a prompt waiting in one you are not looking at can say which
-    /// one it is. See ADR 0057.
+    /// one it is.
     session: Option<neosh_proto::SessionId>,
 }
 
@@ -1194,7 +1194,7 @@ async fn ask_hooks(
 /// the person wants, and there is no mode, rule or allow-list that knows. Routing questions through
 /// the permission layer is what made `AskUserQuestion` fail silently — the configured default is
 /// full access, so the layer said yes to a question, the driver sent a yes with no answers in it,
-/// and the agent was told its user had ignored it. See ADR 0043.
+/// and the agent was told its user had ignored it.
 ///
 /// The other half of the difference is what "no" means. A permission hook that times out is a veto
 /// and the action is refused, because failing open on a permission is unsafe. A question hook that
@@ -1268,8 +1268,7 @@ impl neosh_provider::ask::QuestionAsker for DriverQuestioner {
 /// Sends an agent driver's permission request to the same prompt a tool call reaches.
 ///
 /// The driver has a question and no idea who answers it; this has the hook registry, the plugin
-/// bridge and the permission layer, and no idea what ACP is. That separation is the point — see
-/// ADR 0032.
+/// bridge and the permission layer, and no idea what ACP is. That separation is the point.
 ///
 /// Policy is consulted first, exactly as [`crate::tools::ToolCtx::permit`] does for a built-in
 /// tool. Without that, `full access` would still open a prompt, and a workspace read would open one

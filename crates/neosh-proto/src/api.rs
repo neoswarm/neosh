@@ -615,7 +615,7 @@ pub enum ApiCall {
     /// plugin owns the name or whether it is the host itself. A handler that returns nothing
     /// answers `null`, and one that throws fails the call with its message.
     ///
-    /// The other half of ADR 0040's "data, not callbacks": a *registration* stays data so it can be
+    /// The other half of "data, not callbacks": a *registration* stays data so it can be
     /// listed and disabled, and a *query* gets an answer, because faking one with an event, a
     /// correlation id and a reply command is a worse RPC written once per plugin.
     CmdCall {
@@ -1393,8 +1393,8 @@ pub enum ApiCall {
     Notify {
         level: MessageLevel,
         message: String,
-        /// Whether the user asked for this. See ADR 0057; `Reply` is the default and is what a
-        /// bare `neosh.notify` has always meant.
+        /// Whether the user asked for this. `Reply` is the default and is what a bare
+        /// `neosh.notify` has always meant.
         #[serde(default)]
         kind: NoticeKind,
         /// Which progress row to write, for [`NoticeKind::Progress`]. Ignored otherwise.

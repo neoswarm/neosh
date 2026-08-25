@@ -9,7 +9,7 @@
  * conversation* setting, saved with the conversation, so any one of them may be back in `ask` and
  * the footer is what says which.
  *
- * It is a **blocking** hook, so the rule from ADR 0009 applies — a blocking hook that does not
+ * It is a **blocking** hook, so the blocking-hook rule applies — a blocking hook that does not
  * answer in time is a veto. A permission prompt that failed open would be worse than no prompt at
  * all, so the timeout is generous enough for a human and the failure direction is "no".
  *
@@ -34,10 +34,10 @@ const ASK_TIMEOUT_MS = 120_000;
 /**
  * The conversations blocked on an approval, as a workspace var.
  *
- * The same shape and the same reasoning as `question.asking` (ADR 0043): being blocked on a person
+ * The same shape and the same reasoning as `question.asking`: being blocked on a person
  * is a fact about the *conversation*, not about whichever panel happened to draw the prompt, so it
  * goes somewhere everything can read it. The host reads it to decide whether the person is worth
- * interrupting for — see ADR 0057 — and a panel that wants to mark the row can read the same thing
+ * interrupting for, and a panel that wants to mark the row can read the same thing
  * without this plugin knowing it exists.
  */
 const VAR_ASKING = "permission.asking";
@@ -192,7 +192,7 @@ export async function activate({ neosh, subscriptions }: PluginContext) {
   // Once, empty, at startup. The queue is in memory and the var is on disk, so a workspace that
   // stopped with a prompt open left a conversation marked as waiting on an answer nothing is
   // going to ask for again — and this is what takes the mark off. Same reasoning as the questions
-  // plugin's own announcement; see ADR 0043.
+  // plugin's own announcement.
   await announce();
 
   subscriptions.push({

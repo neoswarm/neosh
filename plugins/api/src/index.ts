@@ -420,7 +420,7 @@ export interface Neosh {
    *
    * What it is *not* for is the thing the user can already see. `favourited ~/proj` next to a row
    * that just grew a pin is the same fact printed twice, and a corner that is usually saying
-   * something you did not need is a corner people stop reading. See ADR 0057, and
+   * something you did not need is a corner people stop reading. See
    * {@link Neosh.progress} and {@link Neosh.alert} for the two things that are not this.
    */
   notify(message: string, level?: MessageLevel): void;

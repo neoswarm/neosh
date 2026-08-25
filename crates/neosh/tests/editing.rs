@@ -694,7 +694,7 @@ fn a_paste_that_is_not_an_image_is_ordinary_text() {
 /// Taking one back off is a key everybody has. It used to be `⌥V`, which is `√` on a Mac whose
 /// terminal has not been told to send Option as Alt — and a key that never arrives is one no
 /// amount of rebinding fixes. Backspace on an *empty* composer is what a chip row does everywhere
-/// else, and it costs the field nothing: there is nothing left to erase. See ADR 0048.
+/// else, and it costs the field nothing: there is nothing left to erase.
 #[test]
 fn backspace_on_an_empty_composer_takes_the_attachment_off() {
     let sb = Sandbox::new("attachdrop");

@@ -19,7 +19,7 @@
 //!    could only fail closed, stopping at the first write. `app-server` sends
 //!    `item/commandExecution/requestApproval` and `item/fileChange/requestApproval` as JSON-RPC
 //!    requests and blocks on the reply, which is the same shape ACP uses and reaches the same
-//!    person. See ADR 0032, which planned exactly this.
+//!    person.
 //! 3. **Stop.** `turn/interrupt` asks the turn to end. Killing `exec` ends the process holding the
 //!    thread.
 //! 4. **Say what it is doing.** `turn/plan/updated` is a real checklist, `thread/tokenUsage/updated`
@@ -456,7 +456,7 @@ fn item_started(item: &Value, state: &mut CodexState) -> Vec<ProviderEvent> {
         }
         // The patch, as codex computed it before applying it — so the card has the diff from the
         // moment the call appears rather than after the fact. `cards::edits_of` reads the unified
-        // form; see ADR 0034.
+        // form.
         "fileChange" => {
             let input = json!({ "changes": item.get("changes").cloned().unwrap_or(json!([])) });
             call(id, "apply_patch", input, state)

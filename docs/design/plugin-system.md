@@ -1,8 +1,7 @@
 # Plugins on top of plugins
 
-**Status:** implemented, 2026-08-23 — see [ADR 0061](../adr/0061-a-plugin-can-build-on-a-plugin.md)
-for what was decided and why, and `docs/plugins.md` for how to use it. This document is the audit
-that preceded it, kept because the gap analysis is the reasoning. Of the proposal, A–I landed
+**Status:** implemented, 2026-08-23 — see `docs/plugins.md` for how to use it. This document is the
+audit that preceded the decision, kept because the gap analysis is the reasoning. Of the proposal, A–I landed
 except: per-buffer/window *options* (vars have the scopes), the transcript card / footer / composer
 as contribution *points* (they have kinds now, not points), and permission enforcement beyond
 `vcs_write` and `notify`.
@@ -24,7 +23,7 @@ another plugin usually uses three or four of them at once. Mapped onto what neos
 | Autocmds — `BufEnter`, `WinEnter`, `CursorMoved`, `ModeChanged`, `FocusGained`, `VimLeave`, `ColorScheme` | Hear that something happened in a plugin you do not import | **Mostly missing.** Eight fixed hooks, none about UI. `focus_changed`, `view_attached` and `shutdown` arrive on the wire and are **dropped** by `__dispatch` (`index.ts:2560-2562`). |
 | `User` autocmds, `nvim_exec_autocmds` | Plugin-defined events | **Have**, and better: `event.emit` with host-stamped `from`. |
 | `b:` / `w:` / `g:` / `t:` vars | Shared state about a *thing* | **Half.** `vars` is scoped to workspace, conversation, project — persisted, with change events. No buffer or window scope, and every write is a file write, so nothing per-cursor can live there. |
-| `setlocal` | Per-buffer / per-window options | **Missing.** Flat registry (`options.rs:31`); ADR 0014 says "a field on the declaration later". |
+| `setlocal` | Per-buffer / per-window options | **Missing.** Flat registry (`options.rs:31`); the recorded plan was "a field on the declaration later". |
 | Extmarks + `nvim_set_decoration_provider` | Draw on someone else's buffer at paint time | **Half.** Extmarks exist; no sign column, no per-window decoration, no range query, and a decorator has no stable row identity to key on. |
 | `:hi default link`, `nvim_win_set_hl_ns`, `winhighlight`, colorschemes as plugins | Theme a window without owning it; ship a theme | **Weak.** `hl.define` is last-write-wins with no owner, never cleaned on unload (`editor.rs:650-679`), no `default`, no read-back, no per-window remap, and `ui.theme` is a two-member enum (`host.rs:9255`). |
 | `vim.ui.select`, `vim.ui.input`, `vim.notify` as assignable functions | Replace *every* picker in one place (dressing.nvim, noice, nvim-notify) | **Missing.** `@neosh/api/ui` is a library each plugin calls; there is no slot to swap the implementation. |
@@ -125,8 +124,8 @@ And, because every plugin lives in one isolate (`runtime.rs:438`), a direct impo
 `api`. `neosh init` writes `api.d.ts` for every installed plugin alongside `@neosh/api`, so the
 import is typed against the plugin you actually have.
 
-**Why both.** ADR 0040 chose data over callbacks so that a contribution can be *listed, described
-and disabled*, and that reasoning is right for registrations — rows, verbs, keys. It was never
+**Why both.** The panel-is-a-surface rule chose data over callbacks so that a contribution can be
+*listed, described and disabled*, and that reasoning is right for registrations — rows, verbs, keys. It was never
 about queries. "What row is the sidebar on?" has no representation as data that is not also a
 cursor-move-per-keystroke file write; it is a function call, and faking it with `event.emit` plus a
 correlation id plus a reply command is how people end up writing a worse RPC in every plugin.
@@ -166,7 +165,7 @@ piece.
 
 ### C. `ListPanel`: the three mechanisms as a widget, not a convention
 
-ADR 0040 says a panel that lacks any of kind, points and vars "is not finished", and then the audit
+The rule says a panel that lacks any of kind, points and vars "is not finished", and then the audit
 finds `model`, `palette`, `approvals`, `slash` and all four shared widgets missing most of them.
 That is not five authors forgetting; it is the rule costing too much to follow by hand.
 
@@ -200,8 +199,8 @@ highlights have nothing (`highlight.rs:118`). Give them:
 the buffer or window, never written to `vars.json`. That is the answer to "a var write is a file
 write": the things that change per keystroke are about a buffer or a window, and those scopes are
 not persisted. `sidebar.cursor` lives there. `OptionSpec` gains `scope: "global" | "buffer" |
-"window"` per ADR 0014's own note, which is what lets a plugin say `wrap` for its panel and not
-for yours.
+"window"` — the long-planned field on the declaration — which is what lets a plugin say `wrap` for
+its panel and not for yours.
 
 ### F. UI events on the bus
 
@@ -210,7 +209,7 @@ rest on the existing event bus with `from: "neosh"`: `neosh.win.enter`, `neosh.w
 `neosh.buf.kind`, `neosh.cursor.moved`, `neosh.mode.changed`, `neosh.viewport`, `neosh.theme`.
 `event.on(name, cb, { kind })` filters on the buffer kind in the payload so a plugin interested in
 the sidebar does not parse every cursor move in the transcript. Not new wire types; `neosh.ready`
-set the precedent (ADR 0055).
+set the precedent.
 
 ### G. The manifest says what a plugin needs, provides and costs
 
@@ -306,5 +305,4 @@ Worth fixing regardless of the above:
 - Seven of nine `plugin.toml` permissions are never checked; `fs_*`/`network` gate APIs that do not
   exist.
 - Two plugins with one manifest `name` merge into one registry bucket (`bridge.rs:50-55`).
-- Docs drift: ADR 0016 ("single entry module") and ADR 0012 ("reload not implemented") are both
-  out of date; `docs/config.md:1296` says there is no plugin manager.
+- Docs drift: `docs/config.md:1296` says there is no plugin manager.

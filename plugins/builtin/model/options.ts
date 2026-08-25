@@ -15,7 +15,7 @@
  *
  * # Why it is a panel and not a private key handler
  *
- * Because ADR 0040 says so, and the sidebar proved why: every key here is an ordinary binding
+ * Because the surface rule says so, and the sidebar proved why: every key here is an ordinary binding
  * pointed at a named command, scoped to this buffer's **kind**. `^Z` lists them, `^K` runs them,
  * and `init.ts` can move any of them. A `switch` on the key inside this file is exactly the thing
  * that rule replaced.
@@ -253,7 +253,7 @@ async function draw(neosh: Neosh, s: Sheet, hints: string): Promise<void> {
   // carries the same rainbow the value does. Reconfigured only when the answer *changes*: this is
   // a round trip, and one per keystroke on a control that already makes several is how a panel
   // starts lagging behind the keys being pressed. Clock-driven rather than a one-shot, so it is
-  // safe against a redraw that mints every mark again (see ADR 0045).
+  // safe against a redraw that mints every mark again.
   const beyond = s.rows.some((r) => r.choices[r.at]?.spoken);
   if (beyond !== s.beyond) {
     s.beyond = beyond;

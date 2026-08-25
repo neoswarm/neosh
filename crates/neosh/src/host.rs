@@ -70,7 +70,7 @@ const READY_EVENT: &str = "neosh.ready";
 /// Written by whatever serves `ask_user` — the `questions` plugin, normally — and read by whatever
 /// draws conversations. The host reads it too, because "is anybody blocked on me" is exactly the
 /// question a notification exists to answer, and putting it on a var is what stops there being two
-/// answers. See ADR 0043 and ADR 0057.
+/// answers.
 const VAR_ASKING: &str = "question.asking";
 
 /// The same, for conversations blocked on an approval rather than on a question.
@@ -78,7 +78,7 @@ const VAR_ASKING: &str = "question.asking";
 /// Written by whatever serves `permission_pre` — the `approvals` plugin — and read here for the
 /// same reason `question.asking` is: being blocked on a person is a fact about the conversation.
 /// Two vars rather than one, because they are two different things to go and do and the panel that
-/// draws them may want to say which. See ADR 0057.
+/// draws them may want to say which.
 const VAR_PERMITTING: &str = "permission.asking";
 
 /// What the host is streaming into the chat buffer right now.
@@ -470,7 +470,7 @@ pub struct Host {
     /// replaced; a remembered one is.
     selection_pinned: bool,
     /// Drivers that run their own agent loop, kept so the permission mode can be mirrored into
-    /// them and a request they cannot answer alone can reach a person. See ADR 0032.
+    /// them and a request they cannot answer alone can reach a person.
     agent_drivers: Vec<Arc<dyn neosh_provider::drivers::AgentDriver>>,
     status_ns: neosh_proto::NamespaceId,
     /// Where the transcript's own highlights live.
@@ -520,7 +520,7 @@ pub struct Host {
     ///
     /// Zero views is an ordinary state — closing the last terminal leaves the turns running — but
     /// it must not mean losing where you were, so the last one is kept rather than taken down and
-    /// handed to the next terminal that attaches. What that buys is the case ADR 0036 was written
+    /// handed to the next terminal that attaches. What that buys is the case this design was written
     /// for: leave mid-answer, come back, and the answer is still arriving into the same transcript
     /// with the same scroll position, instead of a rebuild that is missing everything the turn has
     /// said and not yet committed.
@@ -664,7 +664,7 @@ pub struct Host {
     ///
     /// Out of band, like the quota poll and for the same reason: it is news from a driver that
     /// arrives when no turn is running, so there is no stream for it to come back on. See
-    /// [`neosh_provider::drivers::Unasked`] and ADR 0056.
+    /// [`neosh_provider::drivers::Unasked`].
     unasked_rx: Option<tokio::sync::mpsc::UnboundedReceiver<Unheard>>,
     unasked_tx: tokio::sync::mpsc::UnboundedSender<Unheard>,
     /// Set by a turn ending, cleared by the poll that follows it. See [`crate::quota::AFTER_TURN`].
@@ -674,14 +674,14 @@ pub struct Host {
     /// Kept so that the *newly* blocked ones can be told apart from the ones that already were:
     /// the var is rewritten whenever the set changes, so answering one of three questions
     /// re-announces the other two, and a notification per answer is a notification for something
-    /// you are in the middle of doing. See ADR 0057.
+    /// you are in the middle of doing.
     asking: Vec<neosh_proto::SessionId>,
     /// The same, for conversations blocked on an approval. See [`VAR_PERMITTING`].
     permitting: Vec<neosh_proto::SessionId>,
     /// What is worth interrupting somebody for, and what has already been said.
     ///
     /// Holds the gathered burst; the run loop is what delivers it, because only the run loop can
-    /// ask the frontend whether anybody is looking. See [`crate::notify`] and ADR 0057.
+    /// ask the frontend whether anybody is looking. See [`crate::notify`].
     notifier: crate::notify::Notifier,
     /// Where a picture that had to be fetched comes back to.
     ///
@@ -751,7 +751,7 @@ struct Round {
     /// tool coming back; a wait has no matching event and is cleared by being overtaken — the next
     /// token is the usual way. Without telling them apart, an agent driver that says something
     /// while a command is still running wipes `Running cargo test` off the line and puts the
-    /// generic verb back, which is the label flicker ADR 0033 chose a fixed verb to avoid.
+    /// generic verb back, which is the label flicker the fixed verb was chosen to avoid.
     note_is_wait: bool,
     /// Everything this turn has produced that the conversation does not hold yet.
     ///
@@ -1631,10 +1631,10 @@ impl Host {
             }
             ApiCall::VarSet { scope, key, value } => {
                 self.vars.set(&scope, key.clone(), value.clone());
-                // Which conversations are blocked on a person already travels this way — ADR 0043
-                // put it on a var precisely because it is a fact about them rather than about
+                // Which conversations are blocked on a person already travels this way — it was
+                // put on a var precisely because it is a fact about them rather than about
                 // whichever panel happened to learn it — so this is where the host learns it too,
-                // and no second channel has to be invented for the notification. See ADR 0057.
+                // and no second channel has to be invented for the notification.
                 match key.as_str() {
                     VAR_ASKING => self.alert_asking(&value, crate::notify::AlertReason::Question),
                     VAR_PERMITTING => {
@@ -2069,7 +2069,7 @@ impl Host {
             // `rev-parse` `remember_repo` already awaits here — and what follows it cannot be done
             // from a spawned task: the branch is half of what [`ProjectFacts`] cached the first
             // time this directory was seen, so a rename that did not reach the host would leave
-            // every project list drawing the old name until the workspace restarted. ADR 0036's
+            // every project list drawing the old name until the workspace restarted. The republish
             // rule, from the other end: a value the host *kept* has to be put right by whatever
             // changed it.
             ApiCall::GitRenameBranch { old, new, cwd } => {
@@ -2117,7 +2117,7 @@ impl Host {
                 Ok(ApiOk::PermissionMode { mode })
             }
             // News from a plugin. Declared, because it can interrupt somebody who is not looking
-            // at neosh — see `PluginPermission::Notify` and ADR 0057. Whether it *does* interrupt
+            // at neosh — see `PluginPermission::Notify`. Whether it *does* interrupt
             // them is still the host's decision and not the caller's: a plugin cannot know which
             // conversation is on screen or whether a terminal has focus.
             ApiCall::Alert { level, title, message, session } => {
@@ -2572,7 +2572,7 @@ impl Host {
                 // Progress, not a message: it stops being true the moment the picture lands, and
                 // pushing it onto a stack meant the row that superseded it sat *underneath* the
                 // one it superseded. Keyed by conversation, so two fetches at once are two rows
-                // and each is taken away by the one that finishes it. See ADR 0057.
+                // and each is taken away by the one that finishes it.
                 self.editor_progress(&format!("image:{session}"), format!("fetching {where_}\u{2026}"));
                 let tx = self.image_tx.clone();
                 tokio::spawn(async move {
@@ -2844,8 +2844,8 @@ impl Host {
     /// Say something in the corner, as a reply to a key that was just pressed.
     ///
     /// The default kind, and what all sixty-odd of the host's own call sites mean: this is
-    /// feedback for a keystroke, it is not news, and it never leaves the terminal. See ADR 0057
-    /// and, for the two things that are not this, [`Host::editor_progress`] and [`Host::alert`].
+    /// feedback for a keystroke, it is not news, and it never leaves the terminal. See, for the
+    /// two things that are not this, [`Host::editor_progress`] and [`Host::alert`].
     fn editor_message(&mut self, level: MessageLevel, text: impl Into<String>) {
         let _ = self.editor.apply(&PluginId::from(BUILTIN), ApiCall::Notify {
             level,
@@ -2879,7 +2879,7 @@ impl Host {
     ///
     /// Drawn in the corner *and*, if they turn out not to be looking, raised outside the terminal.
     /// Whether they are looking is settled later — in the run loop, which is the only place that
-    /// can ask the frontend — so this is the offer rather than the decision. See ADR 0057.
+    /// can ask the frontend — so this is the offer rather than the decision.
     fn alert(
         &mut self,
         reason: crate::notify::AlertReason,
@@ -2975,7 +2975,7 @@ impl Host {
     ///
     /// Three tests, and it is not a notification unless it passes all of them: it happened
     /// somewhere you are not looking, it took long enough that you had time to look away, and the
-    /// kind of ending is one you asked to hear about. See ADR 0057.
+    /// kind of ending is one you asked to hear about.
     fn alert_turn_ended(
         &mut self,
         session: &neosh_proto::SessionId,
@@ -2985,7 +2985,7 @@ impl Host {
     ) {
         use neosh_proto::StopReason;
 
-        // The screen in front of you. ADR 0042's rule, and the only one of the three that is
+        // The screen in front of you. The unread mark's rule, and the only one of the three that is
         // about where the person is rather than about the turn.
         if self.can_see(session) {
             return;
@@ -3058,8 +3058,6 @@ impl Host {
     ///   escape its own terminal speaks, which is the only way it comes out where the person is
     ///   rather than where the process is.
     /// - **Detached** — nothing attached, so there is no stream and no wrong machine to be on.
-    ///
-    /// See ADR 0057.
     async fn raise(&mut self, alert: crate::notify::Alert) -> anyhow::Result<()> {
         use crate::frontend::Presence;
         use crate::notify::DesktopPolicy;
@@ -3105,7 +3103,7 @@ impl Host {
     /// Whether the user can already see what is happening in this conversation.
     ///
     /// The whole test. A turn ending in the conversation on screen is the screen in front of you,
-    /// and ADR 0042's `unread` says the same thing — but it counts *detached* as on screen, on the
+    /// and the `unread` mark says the same thing — but it counts *detached* as on screen, on the
     /// reasoning that reattaching lands you in that conversation with the answer in it. True for
     /// the mark and false for the notification: with nothing attached, a finished turn is the most
     /// newsworthy thing a workspace can produce. Attachment is asked separately, in the run loop.
@@ -5352,7 +5350,7 @@ impl Host {
             (_, "o") if self.chat_anchored() => self.swap_ends(),
 
             // A folded card opens; an open one folds. `Tab` because it is the key that toggles a
-            // fold in every file tree and outliner; `za` for the Vim hands. See ADR 0033.
+            // fold in every file tree and outliner; `za` for the Vim hands.
             (KeyCode::Tab, _) => self.toggle_card_here(),
 
             (_, "/") => self.begin_search(false),
@@ -6003,7 +6001,7 @@ impl Host {
     /// you take out of a conversation: the path its shell, its editor and its next message want.
     /// Three keys every terminal sends, which is what lets the chat key be `⌥Y` — an Alt chord,
     /// `¥` on a Mac out of the box, and allowed as a default only because this route exists
-    /// beside it (ADR 0048). `session.copy.path` is the same verb by name, and the panel's `y`
+    /// beside it. `session.copy.path` is the same verb by name, and the panel's `y`
     /// does it for any row.
     fn yank_path(&mut self) {
         let path = self.root().display().to_string();
@@ -6676,7 +6674,7 @@ impl Host {
             // A run of reads: nothing until it is opened, and then a row per call. What the fold
             // exists to keep out of the transcript is the *contents* of the six files, so opening
             // a run gives back the six names in full and stops there. A run of *commands* keeps
-            // the last one's output, because what a command printed is the answer — see ADR 0051.
+            // the last one's output, because what a command printed is the answer.
             _ => cards::group_body(&g, &Self::card_heads(card), &root, limits, card.open, width),
         };
         // Anything else writing into the transcript ends the answer: its rows are addressed by
@@ -6767,8 +6765,8 @@ impl Host {
 
     /// Open the card the cursor is in, and fold the one it has left.
     ///
-    /// [ADR 0049](../../../docs/adr/0049-a-list-is-a-place-you-move-in.md)'s rule, on the
-    /// transcript: the row you are *in* stays unfolded, and only ever one row — the cursor is what
+    /// The rule that a list is a place you move in, on the transcript: the row you are *in* stays
+    /// unfolded, and only ever one row — the cursor is what
     /// asks, everywhere else. A turn that ran nine commands is nine rows you walk down, each one
     /// showing what it printed as you arrive and giving the rows back as you leave, and none of it
     /// is a key you have to know about.
@@ -6843,7 +6841,7 @@ impl Host {
     ///
     /// The transcript's own structure, which neither of the other two stepping keys can find.
     /// `[`/`]` is a whole turn — far too coarse to inspect what a turn *did* — and `{`/`}` is a
-    /// blank-line block, which since ADR 0050 took the blank row off the top of a card means a run
+    /// blank-line block, which since the blank row came off the top of a card means a run
     /// of nine cards is one block. So walking
     /// what happened, one call at a time, was nine presses of `j` per row of body and no way to
     /// skip a long one.
@@ -7950,7 +7948,7 @@ impl Host {
                     // conversation on screen has been seen by definition — including with nothing
                     // attached, because reattaching lands you in that conversation with the answer
                     // already in it. Anywhere else, the row is the only thing that will ever
-                    // mention it, so it has to say so until you go there. See ADR 0042.
+                    // mention it, so it has to say so until you go there.
                     s.unread = !seen;
                 }
                 if let Some((label, took)) = ended {
@@ -8022,7 +8020,7 @@ impl Host {
             }
             AgentEvent::Activity { session, turn, activity } => {
                 // A driver's account of its own loop, carried separately from `Token` here for the
-                // same reason it is locally: it is not a content block. See ADR 0034.
+                // same reason it is locally: it is not a content block.
                 if self.watched(&session) {
                     self.stream_out(&session, neosh_proto::StreamEvent::Activity {
                         turn: turn.0.clone(),
@@ -8737,7 +8735,7 @@ impl Host {
         });
         // Every terminal looking at this conversation, not the one that happens to be first: a
         // conversation can be on screen in several at once, and a footer redrawn in one of them is
-        // the other ones still saying it is working on something. See ADR 0042.
+        // the other ones still saying it is working on something.
         self.each_view_showing(&session, |me| {
             me.redraw_footer();
         });
@@ -8746,10 +8744,10 @@ impl Host {
     /// Open a turn to hold something the agent has already started saying.
     ///
     /// A backgrounded command finishing is a message `claude` enqueues to itself and answers, and
-    /// the answer is this conversation's. ADR 0054 stopped that turn being read as the reply to
+    /// the answer is this conversation's. The drain stopped that turn being read as the reply to
     /// whatever you typed next, by dropping it; this is where it gets somewhere to go instead. The
     /// agent said it would report back when the build landed, and it did — silence on the screen
-    /// until you happen to ask is indistinguishable from a hang. See ADR 0056.
+    /// until you happen to ask is indistinguishable from a hang.
     ///
     /// The turn says nothing: [`AgentDriver::listen_only`] is what tells the driver that, and it is
     /// set here rather than carried on the wire because it is true of exactly the turn about to
@@ -9138,7 +9136,7 @@ impl Host {
                 }
                 // The gathered burst is due. Not a per-alert timer: three conversations finishing
                 // while you are at lunch is one notification that says three, and the only way to
-                // know it was three is to wait a moment before speaking. See ADR 0057.
+                // know it was three is to wait a moment before speaking.
                 () = &mut burst, if bursting => {
                     bursting = false;
                     self.deliver_alerts().await?;
@@ -9788,7 +9786,7 @@ impl Host {
     /// and possibly other terminals looking at it, so the key that ends *this* terminal must not be
     /// able to end that. `^C^C` set `quitting` directly and took the workspace with it: every
     /// conversation, in every project, on a key whose first four meanings — copy, leave reading,
-    /// interrupt, clear the draft — are all local. ADR 0036's rule that `^Q` must never stop a
+    /// interrupt, clear the draft — are all local. The rule that `^Q` must never stop a
     /// workspace was never really about `^Q`; it is about every way out there is.
     fn leave(&mut self) {
         match self.on_quit {
@@ -10331,7 +10329,7 @@ impl Host {
             },
             // Notifications. Declared here rather than by a plugin for the same reason the display
             // settings above are: everything in the workspace reads them, and a setting that
-            // disappears when `plugins.disabled` names its owner is not a setting. See ADR 0057.
+            // disappears when `plugins.disabled` names its owner is not a setting.
             OptionSpec {
                 name: "notify.enabled".into(),
                 ty: OptionType::Bool,
@@ -11022,7 +11020,7 @@ impl neosh_provider::drivers::Unasked for UnaskedSink {
 ///
 /// Both arrive from a reader task on the driver's own thread, and the host is a single writer that
 /// owns everything either of them would have to touch — so they come down a channel rather than
-/// through a call. See [`neosh_provider::drivers::Unasked`] and ADR 0056.
+/// through a call. See [`neosh_provider::drivers::Unasked`].
 #[derive(Debug)]
 enum Unheard {
     /// The agent has started saying something nobody asked for, and needs a turn to say it in.

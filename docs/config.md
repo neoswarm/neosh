@@ -910,8 +910,7 @@ waiting on something outside the program.
 The **frontend** does this, on its own clock, over whatever the core last wrote — so a shimmer costs
 nothing above the terminal boundary and stops the moment the animated row scrolls out of sight.
 Without truecolor the same band renders as bold rather than as nothing. `ui.motion = false` removes
-the movement and keeps the colour; it never makes text disappear. See
-[ADR 0025](adr/0025-motion-belongs-to-the-frontend.md).
+the movement and keeps the colour; it never makes text disappear.
 
 The theme is a set of semantic groups — `Status.Working`, `Git.Added`, `Meter.Fill` — that plugins
 link to rather than choosing colours. Override any of them from `init.ts` and a theme switch will
@@ -922,7 +921,7 @@ await neosh.hl.define("Status.Working", { fg: "#ff00ff", bold: true });
 ```
 
 Motion is one shared 100 ms clock and costs about 1% of a core and under 1 KiB/s, which is why it
-stays on over SSH. See [ADR 0019](adr/0019-motion-and-the-visual-language.md) for the measurements.
+stays on over SSH.
 
 ### Approvals
 
@@ -1112,8 +1111,7 @@ you were asking.
 
 **The prompt is the host's, not a plugin's.** Nothing is echoed — you get one bullet per character —
 and no plugin ever sees what you typed. There is no API call that returns a key, only ones that
-report where it came from, so a plugin cannot leak what it cannot read. See
-[ADR 0022](adr/0022-credentials-never-cross-the-plugin-boundary.md).
+report where it came from, so a plugin cannot leak what it cannot read.
 
 Where it goes:
 

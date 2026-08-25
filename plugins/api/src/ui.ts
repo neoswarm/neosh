@@ -31,7 +31,7 @@ import type {
 /**
  * The buffer kinds the shared widgets publish.
  *
- * A picker used to have no kind, which by ADR 0040's own rule made it the one panel in the
+ * A picker used to have no kind, which by the surface rule made it the one panel in the
  * workspace you could only replace and never extend. With one, `keymap.set` at `buf_kind` scope
  * binds inside every picker at once, `win.ofKind` finds the open one, and `win.setHighlights`
  * restyles them all.
@@ -2983,7 +2983,7 @@ export interface ListPanelOptions<T> {
 export type CustomRow = { kind: "custom"; command: string; args: string[] };
 
 /**
- * A docked list panel that is a surface, not a program — ADR 0040's three mechanisms, and a
+ * A docked list panel that is a surface, not a program — the three panel mechanisms, and a
  * published cursor, for the price of a kind and a `rows` function.
  *
  * Given `kind: "acme.tasks"`, this creates the buffer with that kind, opens it in a dock, binds

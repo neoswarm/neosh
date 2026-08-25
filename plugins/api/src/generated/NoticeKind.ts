@@ -6,6 +6,6 @@
  * [`MessageLevel`] says how bad and therefore what colour; this says whether you asked for it,
  * and therefore where it goes and how long it lives. Every message used to be the same kind of
  * thing — a row in a six-second stack — so a pull's progress, the echo of a key you just pressed
- * and a node dropping off the swarm were one channel with one lifetime. See ADR 0057.
+ * and a node dropping off the swarm were one channel with one lifetime.
  */
 export type NoticeKind = "reply" | "progress" | "alert";

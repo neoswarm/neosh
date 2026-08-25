@@ -4,7 +4,7 @@
 //! not the moment you want to know. `claude` says so on a line in the middle of a turn; `codex`
 //! pushes a notification when the number moves. The question — *have I got enough left to start
 //! this* — is asked with nothing running at all. So the answers have to be **kept**, which is the
-//! same rule ADR 0036 states for anything a viewer needs on reattach: a value that is only
+//! same rule that holds for anything a viewer needs on reattach: a value that is only
 //! forwarded is a value that comes back wrong.
 //!
 //! # Patch or replace, decided by where it came from

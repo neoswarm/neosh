@@ -208,7 +208,7 @@ ACTS = [
     Act("edit", "Edited", "crates/neosh-core/src/palette.rs", 9.8, 10.5,
         diff=EDIT2_DIFF, added=1, removed=1),
     Act("bash", "Ran", "cargo test -p neosh-core", 10.9, 16.2, out=PASS_OUT, exit=0),
-    Act("write", "Wrote", "docs/adr/0042-a-card-folds-when-it-lands.md", 16.6, 17.3,
+    Act("write", "Wrote", "docs/design/a-card-folds-when-it-lands.md", 16.6, 17.3,
         diff=WRITE_DIFF, added=12),
 ]
 
@@ -221,7 +221,7 @@ LOOP = 24.0
 
 CHANGED = [("crates/neosh/src/cards.rs", 3, 3),
            ("crates/neosh-core/src/palette.rs", 1, 1),
-           ("docs/adr/0042-a-card-folds-when-it-lands.md", 12, 0)]
+           ("docs/design/a-card-folds-when-it-lands.md", 12, 0)]
 
 
 # ---------------------------------------------------------------------------

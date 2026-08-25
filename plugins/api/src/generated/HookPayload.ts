@@ -49,7 +49,7 @@ export type HookPayload =
      * What [`HookPayload::AskUser`] already carries, and for the same reason: a workspace
      * runs several turns at once, only one of them is on screen, and a prompt drawn over
      * whichever conversation you happen to be reading is a prompt about somebody else's work.
-     * `None` when a plugin asked outside any turn. See ADR 0057.
+     * `None` when a plugin asked outside any turn.
      */
     session?: SessionId;
     /**
