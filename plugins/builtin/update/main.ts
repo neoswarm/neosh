@@ -32,7 +32,7 @@ export async function activate({ neosh, subscriptions }: PluginContext) {
       return {
         text: `restart for ${s.latest ?? "the update"}`,
         hl: "Status.Pending",
-        right: { text: "r", hl: "Comment" },
+        right: { text: "↵", hl: "Comment" },
         command: `${NS}.restart`,
       };
     }
@@ -42,7 +42,7 @@ export async function activate({ neosh, subscriptions }: PluginContext) {
     return {
       text: `neosh ${s.latest} available`,
       hl: "Status.Unread",
-      right: { text: "u", hl: "Comment" },
+      right: { text: "↵", hl: "Comment" },
       command: `${NS}.apply`,
     };
   };
@@ -131,18 +131,13 @@ export async function activate({ neosh, subscriptions }: PluginContext) {
     }, { desc: "Restart the workspace to finish an update" }),
   );
 
-  // Keys on the rows this plugin contributed, and only those: `on: "custom"` rather than `any`, or
-  // `u` would be advertised over every conversation in somebody else's panel.
-  for (const [id, key, label, command] of [
-    ["update.apply", "u", "update", `${NS}.apply`],
-    ["update.restart", "r", "restart", `${NS}.restart`],
-  ] as const) {
-    await neosh.ext.contribute("sidebar.action", id, { key, label, command, on: "custom" })
-      .catch(() => {});
-    subscriptions.push({
-      dispose: () => void neosh.ext.remove("sidebar.action", id).catch(() => {}),
-    });
-  }
+  // No `sidebar.action` of its own, deliberately. A contributed row already runs its `command` on
+  // `↵`, and one row that means the one thing there is to do — update, or restart once it is
+  // downloaded — is better than two keys for two states that never coexist.
+  //
+  // It also sidesteps something worth fixing properly one day: `on: "custom"` matches *any*
+  // contributed row rather than the contributor's own, so a key added here is advertised on the
+  // plan strip too, and the strip's own `<Tab>` hint gets pushed off the end of the row.
 
   await refresh();
   const timer = await neosh.timer.every(EVERY_MS, () => void refresh(true));
