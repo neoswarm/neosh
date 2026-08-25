@@ -249,7 +249,7 @@ two-word scratch name it was created with.",
     }),
   );
   // And once the workspace is up: the project list is somebody else's, so it is read when they
-  // have had their say rather than when we have had ours. See ADR 0055.
+  // have had their say rather than when we have had ours.
   neosh.event.on("neosh.ready", () => void decorate());
   await decorate();
 
@@ -348,7 +348,7 @@ async function switchBranch(neosh: Neosh): Promise<void> {
  * Set by `activate`. Anything that moves `HEAD` calls it instead of announcing the move in the
  * corner: the branch already has a place on screen, and a toast saying what the footer says is the
  * same fact printed twice. Without this the footer is up to five seconds stale — which is why the
- * toast was there, and is the thing to fix rather than to caption. See ADR 0057.
+ * toast was there, and is the thing to fix rather than to caption.
  */
 let refreshFooter: () => void = () => {};
 
@@ -357,7 +357,7 @@ async function newBranch(neosh: Neosh): Promise<void> {
   if (!description || !description.trim()) return;
 
   // Progress rather than a message: it is a state that stops being true the moment the model
-  // answers, and pushed onto the stack it sat *above* the row that superseded it. See ADR 0057.
+  // answers, and pushed onto the stack it sat *above* the row that superseded it.
   neosh.progress("git.name", "naming the branch…");
   let unique: string;
   try {

@@ -27,7 +27,7 @@
 //! said "and don't ask again". That is what makes *"Yes, and don't ask again for `cargo test`"*
 //! possible — it is the CLI's own sentence, about its own rule, and no client-side yes/no can
 //! reproduce it. neosh offers them verbatim and hands the chosen one straight back as
-//! `updatedPermissions`. See ADR 0032.
+//! `updatedPermissions`.
 
 use std::collections::HashMap;
 use std::path::Path;

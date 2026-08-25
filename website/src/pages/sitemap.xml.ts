@@ -1,8 +1,14 @@
 import type { APIRoute } from "astro";
 
+import { flatDocs } from "../data/docs";
+
 const pages = [
   { path: "/", priority: "1.0" },
   { path: "/plugins/", priority: "0.8" },
+  ...flatDocs.map((d) => ({
+    path: d.href === "/docs" ? "/docs/" : `${d.href}/`,
+    priority: d.href === "/docs" ? "0.9" : "0.7",
+  })),
   { path: "/terms/", priority: "0.3" },
   { path: "/privacy/", priority: "0.3" },
 ];

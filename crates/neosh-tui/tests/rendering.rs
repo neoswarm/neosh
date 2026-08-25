@@ -770,7 +770,7 @@ fn only_the_most_recent_notifications_are_shown() {
 }
 
 /// Feedback for a key you pressed is about *that* key, so the previous one is about a key you have
-/// already moved on from. See ADR 0057.
+/// already moved on from.
 #[test]
 fn a_reply_does_not_stack_on_the_reply_before_it() {
     let mut m = main_window_with(vec!["hello"]);

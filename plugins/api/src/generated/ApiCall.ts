@@ -366,6 +366,8 @@ export type ApiCall =
   | { "call": "swarm_probe"; addr: string }
   | { "call": "swarm_pair"; node: NodeId; name: string; addr?: string | null }
   | { "call": "swarm_unpair"; node: NodeId }
+  | { "call": "swarm_reconnect"; node: NodeId }
+  | { "call": "swarm_disconnect"; node: NodeId }
   | { "call": "swarm_strangers" }
   | { "call": "quota_list" }
   | { "call": "quota_refresh"; instance?: InstanceId | null }
@@ -490,8 +492,8 @@ export type ApiCall =
     level: MessageLevel;
     message: string;
     /**
-     * Whether the user asked for this. See ADR 0057; `Reply` is the default and is what a
-     * bare `neosh.notify` has always meant.
+     * Whether the user asked for this. `Reply` is the default and is what a bare
+     * `neosh.notify` has always meant.
      */
     kind: NoticeKind;
     /**

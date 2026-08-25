@@ -802,7 +802,7 @@ async function installPanel({ neosh, subscriptions }: PluginContext) {
   };
 
   // Every key is a named command, so `^Z` lists them and `init.ts` can move them. A `switch` on the
-  // key inside a handler is the thing this replaced — see ADR 0040.
+  // key inside a handler is the thing this replaced.
   const cmd = async (name: string, desc: string, fn: () => void | Promise<void>) => {
     subscriptions.push(await neosh.cmd.register(`${NS}.${name}`, fn, { desc }));
   };

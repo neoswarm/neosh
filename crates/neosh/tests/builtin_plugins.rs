@@ -1118,7 +1118,7 @@ fn the_generated_name_is_editable_before_the_branch_is_created() {
     s.type_text("my-own-name");
     s.special("enter");
     // The footer, which is where the branch lives. It used to be a toast saying the same thing,
-    // and a message restating what is already on screen is exactly what ADR 0057 took away — so
+    // and a message restating what is already on screen is exactly what the notice rework took away — so
     // the branch segment is now refreshed on the spot instead, and this waits on that.
     s.wait_for("my-own-name  mock");
 
@@ -1506,8 +1506,8 @@ fn a_driver_can_invent_an_option_and_the_switcher_renders_it() {
 
 #[test]
 fn a_level_that_is_a_word_is_said_rather_than_sent() {
-    // The half of `prompt_injected_values` that never existed. The field has been on the wire since
-    // ADR 0011 and nothing acted on it, so choosing such a level put it where a parameter goes —
+    // The half of `prompt_injected_values` that never existed. The field has long been on the wire
+    // and nothing acted on it, so choosing such a level put it where a parameter goes —
     // `--effort abracadabra`, which is not a level, and the turn fails.
     let sb = Sandbox::new("spoken");
     let dir = sb.root.join("config/plugins/lab");
@@ -1546,7 +1546,7 @@ fn nothing_else_reaches_the_keyboard_while_the_option_sheet_is_open() {
     // Every global key used to fall straight through it. `^N` opened a new conversation *behind*
     // the panel, which stayed on screen; `^T` opened the project panel underneath and moved focus
     // into it. Shadowing the keys the panel wants could never have fixed this — a panel can name
-    // the keys it wants and never the ones it merely does not want to happen. See ADR 0047.
+    // the keys it wants and never the ones it merely does not want to happen.
     let sb = Sandbox::new("modalsheet");
     let dir = sb.root.join("config/plugins/lab");
     std::fs::create_dir_all(&dir).expect("mkdir");
@@ -1734,7 +1734,7 @@ fn a_model_answer_git_would_reject_is_made_into_a_legal_refname() {
     s.special("enter");
     s.wait_for("fix/the-login");
     s.special("enter");
-    // The footer rather than a toast — see ADR 0057.
+    // The footer rather than a toast.
     s.wait_for("fix/the-login  mock");
 
     // The real proof: git accepted it.
@@ -2238,7 +2238,7 @@ fn a_new_conversation_in_a_repository_offers_a_worktree() {
 /// A scratch branch you finished with in March is still a worktree on disk long after `X` took it
 /// off the panel, so this picker was handing back every project you had ever removed — twenty rows
 /// of finished work above the three you are in — and choosing one put it straight into the sidebar
-/// again. The list is the workspace's answer to *which places do I work in* (ADR 0039), and this
+/// again. The list is the workspace's answer to *which places do I work in*, and this
 /// question asks exactly that.
 ///
 /// Two worktrees, alike in every way git can see and differing only in whether anything was ever
@@ -3454,7 +3454,7 @@ fn the_key_list_opens_from_the_panel_and_any_key_dismisses_it() {
 
 /// The key list is reachable from the composer, and by a chord rather than by `F1`. Apple's top
 /// row is brightness until somebody finds the setting, so the key whose job is teaching every
-/// other key was the one key a new Mac could not press. See ADR 0048.
+/// other key was the one key a new Mac could not press.
 #[test]
 fn the_key_list_opens_on_a_chord_from_the_composer() {
     let sb = Sandbox::new("keylistchord");
@@ -3890,7 +3890,7 @@ fn install_waiter(sb: &Sandbox) {
 #[test]
 fn a_turn_that_is_waiting_says_what_it_is_waiting_for() {
     // "Working… 4m" and "Retrying after 529 · attempt 2 of 5 · in 5s … 4m" are the same turn. Only
-    // one of them is a reason to keep waiting rather than to interrupt. See ADR 0054.
+    // one of them is a reason to keep waiting rather than to interrupt.
     let sb = Sandbox::new("waiting");
     install_waiter(&sb);
     sb.write_config("[options]\n\"agent.model\" = \"waiter/waiter\"\n");
@@ -3952,7 +3952,7 @@ fn install_leaver(sb: &Sandbox) {
 fn a_finished_turn_says_what_it_walked_away_from() {
     // The turn ends and the footer listing what was out goes away with the working line. Without
     // this the one case people actually ask about — "it says it is done, is it?" — is the one that
-    // leaves no trace at all. See ADR 0054.
+    // leaves no trace at all.
     let sb = Sandbox::new("leftrunning");
     install_leaver(&sb);
     sb.write_config("[options]\n\"agent.model\" = \"leaver/leaver\"\n");
@@ -6047,7 +6047,7 @@ fn install_runner(sb: &Sandbox) {
     std::fs::write(dir.join("main.ts"), RUNNER).expect("plugin");
 }
 
-/// ADR 0051. A stretch of a turn spent running things is one row, and the answer is the last one's.
+/// A stretch of a turn spent running things is one row, and the answer is the last one's.
 #[test]
 fn a_run_of_commands_is_one_row_that_keeps_the_last_answer() {
     let sb = Sandbox::new("stack");
@@ -6134,7 +6134,7 @@ fn a_run_of_commands_is_one_row_that_keeps_the_last_answer() {
     );
 }
 
-/// The three states a card can be in, and the two things that move it between them. See ADR 0057.
+/// The three states a card can be in, and the two things that move it between them.
 ///
 /// Folded is what a card costs when nobody is looking at it. The card the *cursor* is in shows
 /// more — bounded, because nine hundred rows appearing under `j` is what the fold exists to
@@ -6500,7 +6500,7 @@ export async function activate({ neosh }: PluginContext) {
 /// The keys are Vim's because this is a cursor over a column in a terminal, and a list of thirty
 /// conversations reached one `j` at a time is a list nobody moves around in. Counted in rows the
 /// cursor can *land* on rather than lines, so the headings and rules it already skips do not
-/// silently eat two of the five. See ADR 0049.
+/// silently eat two of the five.
 #[test]
 fn a_count_before_a_motion_moves_that_many_rows() {
     let sb = Sandbox::new("counts");
@@ -6676,7 +6676,7 @@ impl Session {
 }
 
 /* -------------------------------------------------------------------------- */
-/* What the plan has left — ADR 0044                                          */
+/* What the plan has left                                                     */
 /* -------------------------------------------------------------------------- */
 
 /// A provider written as a plugin, reporting its own vendor's allowance two ways.
@@ -6790,7 +6790,7 @@ fn a_plugins_own_provider_appears_in_the_plan_strip() {
 /// Three bars, a name and a sentence is five rows of a column whose job is your conversations —
 /// and four of them answer a question you did not ask. The default is the limit that would refuse
 /// the next request, plus anything else already critical; `<Tab>` on the row steps up to every
-/// window and then to the whole block, and `^L` is all of it whichever is showing. See ADR 0049.
+/// window and then to the whole block, and `^L` is all of it whichever is showing.
 #[test]
 fn the_plan_strip_is_one_row_until_you_ask_for_more() {
     let sb = Sandbox::new("plandense");
@@ -7009,7 +7009,7 @@ fn the_usage_panel_opens_with_the_plan_above_the_history() {
 ///
 /// `t` and `c` are ordinary letters. Bound at buffer-kind scope they only fire here — and because
 /// they point at named commands rather than at a `switch` inside a handler, `^Z` lists them and an
-/// `init.ts` can move them. See ADR 0040.
+/// `init.ts` can move them.
 #[test]
 fn the_usage_panel_swaps_metric_on_its_own_key() {
     let sb = Sandbox::new("planmetric");

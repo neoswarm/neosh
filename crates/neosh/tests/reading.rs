@@ -306,7 +306,7 @@ impl Sandbox {
 ///
 /// `5j` is five lines and `3G` is the third one — the count is a repetition on a motion and a
 /// destination on `G`, which is the distinction the digits are for. `0` is the start of the line
-/// when nothing has been typed and part of the number when something has. See ADR 0049.
+/// when nothing has been typed and part of the number when something has.
 #[test]
 fn a_count_repeats_a_motion_and_places_a_jump() {
     let sb = Sandbox::new("counts");
@@ -444,7 +444,7 @@ fn yank_turn_takes_the_question_and_its_whole_answer() {
 /// `yp` takes the conversation's directory — in a worktree, the worktree's path — which is the
 /// other thing you take out of a conversation: what your shell wants to `cd` to. The one `y`
 /// target that is not a piece of the transcript, and the route a Mac takes — `⌥Y` in chat is `¥`
-/// there, and is allowed as a default only because this exists (ADR 0048).
+/// there, and is allowed as a default only because this exists.
 #[test]
 fn yank_path_takes_the_conversations_directory() {
     let sb = Sandbox::new("yankpath");
@@ -1471,14 +1471,14 @@ impl Session {
 
 
 // ---------------------------------------------------------------------------
-// Watching what a turn did — ADR 0057
+// Watching what a turn did
 // ---------------------------------------------------------------------------
 
 /// `c` steps to the next tool call, and the card you land on opens itself.
 ///
 /// The transcript's third structure, after the turn and the block: `[`/`]` is a whole turn and
 /// `{`/`}` is one block for a whole run of cards, so before this there was no way to walk what a
-/// turn *did* one call at a time. And a card the cursor is in shows what came back — ADR 0049's
+/// turn *did* one call at a time. And a card the cursor is in shows what came back — the list
 /// rule, one surface along — so `c c c` reads the work rather than the headers over it.
 #[test]
 fn c_steps_call_to_call_and_the_card_you_are_on_opens_itself() {
@@ -1585,7 +1585,6 @@ fn leaving_reading_folds_the_preview_and_keeps_the_pin() {
 /// Reading is a place *in* the transcript — the scroll offset is pinned by every motion — so
 /// before this an answer produced while `^S` was on landed off the bottom of the window with
 /// nothing saying so, and watching a turn meant leaving reading and coming back for every call.
-/// See ADR 0057.
 #[test]
 fn reading_the_last_row_keeps_reading_it() {
     let sb = Sandbox::new("cards-tail");

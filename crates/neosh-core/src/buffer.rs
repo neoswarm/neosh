@@ -21,7 +21,7 @@
 //! The cost is that finding a mark by id is a scan. That is the right trade for an agent UI: the
 //! renderer only ever asks "what marks are on the lines I am about to draw", which this layout
 //! makes trivial, while by-id lookup is a rare plugin operation. When buffers grow large enough for
-//! the scan to matter, the replacement is a marker tree — see `docs/adr/0007`.
+//! the scan to matter, the replacement is a marker tree.
 
 use neosh_proto::{
     ApiError, BufferId, ExtmarkId, ExtmarkInfo, ExtmarkOpts, ExtmarkRender, LineRender,

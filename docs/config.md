@@ -375,8 +375,40 @@ one you cannot fix from inside a program you can no longer type into.
 ### The other computers — `[swarm]`
 
 Several machines, one workspace: every one knows what the others are running, and can ask them to
-do something. Off unless you say otherwise — a workspace does not open a port because it was
-upgraded.
+do something. **On by default**: the identity exists, paired machines are dialled, and
+`0.0.0.0:7717` is listening, so adding this computer from another one works before anything is
+configured. What stays consent is *membership* — a machine not on the allow-list gets nowhere
+regardless of what it can reach, and joining still takes a yes on both machines.
+
+```toml
+[swarm]
+enabled = false        # the whole switch: no identity, no listener, no dialling
+listen  = ""           # or just dial-only: joins machines without being joinable
+```
+
+The default port being taken — a second workspace on the same machine — downgrades to dial-only
+with a line in the log, never a workspace that refuses to start. `This computer` in `^J` says
+which happened: `listening on 0.0.0.0:7717`, `not listening`, or `dial-only`.
+
+#### What a connection is doing
+
+Every paired machine is a row in `^J` from the first frame, and the row says where the link
+stands: `connecting…` for one being dialled that has never answered — with a `try 4` once it has
+failed a few times, because a spinner that has been spinning since Tuesday is not a state —
+`reconnecting` for one that was here and dropped, `disconnected` for one nothing is dialling, and
+the conversation count for one that is up. Reconnects back off from a second up to half a minute
+and reset the moment a dial lands, so a machine that reboots is back in seconds.
+
+Two verbs on any row, and the list updates live while it is open:
+
+| Key | Does |
+|---|---|
+| `^R` | Dial it again now, rather than waiting out the retry delay |
+| `^D` | Disconnect: close the link and stop dialling, keeping the pairing. `^R` takes it back |
+
+Disconnect holds in both directions — a peer that dials in is turned away until you say otherwise
+— and lasts until a reconnect or a restart. Unpairing (`^X`) is the stronger verb, for a machine
+you are done with rather than done with for now.
 
 #### Adding a computer
 
@@ -410,7 +442,7 @@ its public key, so joining two machines this way means each having the other's:
 ```toml
 [swarm]
 name = "mac-studio"           # what the others call you; the hostname if unset
-listen = "100.71.4.9:7717"    # omit to be dial-only
+listen = "100.71.4.9:7717"    # omit for 0.0.0.0:7717; "" to be dial-only
 
 [[swarm.peers]]
 addr = "linux-box:7717"
@@ -878,8 +910,7 @@ waiting on something outside the program.
 The **frontend** does this, on its own clock, over whatever the core last wrote — so a shimmer costs
 nothing above the terminal boundary and stops the moment the animated row scrolls out of sight.
 Without truecolor the same band renders as bold rather than as nothing. `ui.motion = false` removes
-the movement and keeps the colour; it never makes text disappear. See
-[ADR 0025](adr/0025-motion-belongs-to-the-frontend.md).
+the movement and keeps the colour; it never makes text disappear.
 
 The theme is a set of semantic groups — `Status.Working`, `Git.Added`, `Meter.Fill` — that plugins
 link to rather than choosing colours. Override any of them from `init.ts` and a theme switch will
@@ -890,7 +921,7 @@ await neosh.hl.define("Status.Working", { fg: "#ff00ff", bold: true });
 ```
 
 Motion is one shared 100 ms clock and costs about 1% of a core and under 1 KiB/s, which is why it
-stays on over SSH. See [ADR 0019](adr/0019-motion-and-the-visual-language.md) for the measurements.
+stays on over SSH.
 
 ### Approvals
 
@@ -1080,8 +1111,7 @@ you were asking.
 
 **The prompt is the host's, not a plugin's.** Nothing is echoed — you get one bullet per character —
 and no plugin ever sees what you typed. There is no API call that returns a key, only ones that
-report where it came from, so a plugin cannot leak what it cannot read. See
-[ADR 0022](adr/0022-credentials-never-cross-the-plugin-boundary.md).
+report where it came from, so a plugin cannot leak what it cannot read.
 
 Where it goes:
 

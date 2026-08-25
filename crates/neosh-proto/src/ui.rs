@@ -620,7 +620,7 @@ pub enum MessageLevel {
 /// [`MessageLevel`] says how bad and therefore what colour; this says whether you asked for it,
 /// and therefore where it goes and how long it lives. Every message used to be the same kind of
 /// thing — a row in a six-second stack — so a pull's progress, the echo of a key you just pressed
-/// and a node dropping off the swarm were one channel with one lifetime. See ADR 0057.
+/// and a node dropping off the swarm were one channel with one lifetime.
 #[derive(TS, Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug, Default)]
 #[serde(rename_all = "snake_case")]
 #[ts(export)]
@@ -756,7 +756,7 @@ pub enum UiEvent {
     Message {
         level: MessageLevel,
         text: String,
-        /// Whether you asked for this, which is what decides how long it lives. See ADR 0057.
+        /// Whether you asked for this, which is what decides how long it lives.
         ///
         /// Defaulted rather than required: `Reply` is what every existing sender meant, and a
         /// frontend from before this existed folds the field away and draws what it always drew.
@@ -787,7 +787,7 @@ pub enum UiEvent {
     /// anything the workspace raises by itself is raised on the wrong machine.
     ///
     /// Never sent for something on screen. By the time one of these exists, the host has already
-    /// established you cannot see the thing it is about. See ADR 0057.
+    /// established you cannot see the thing it is about.
     Alert {
         /// What this is about, in a few words — a conversation's name, usually.
         title: String,
@@ -1018,7 +1018,7 @@ pub enum InputEvent {
     /// supports mode 1004; the host treats a view that has never sent one as *unknown* rather than
     /// as focused, and falls back to how long it has been since a key arrived. Assuming focus would
     /// mean a terminal that cannot report is a terminal that never notifies, which is the wrong way
-    /// round to be wrong. See ADR 0057.
+    /// round to be wrong.
     Focus {
         on: bool,
     },

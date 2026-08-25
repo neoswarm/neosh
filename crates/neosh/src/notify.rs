@@ -19,13 +19,11 @@
 //! Nothing leaves the terminal about a thing you are looking at. Past that:
 //!
 //! - **Terminal not focused** — an escape sequence, written by the view. The workspace is a process
-//!   and the terminal is a viewer of it (ADR 0036), and the person is at the terminal. A
+//!   and the terminal is a viewer of it, and the person is at the terminal. A
 //!   `notify-send` from here would be the same bug OSC 52 exists to avoid: neosh is used over SSH,
 //!   and the machine the process is on is not the machine the eyes are at.
 //! - **Nothing attached** — then there is no view, no stream and no wrong machine to be on, so the
 //!   workspace shells out to whatever the platform has.
-//!
-//! See ADR 0057.
 
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
@@ -80,7 +78,7 @@ pub enum AwayPolicy {
     /// Whenever the thing is not the conversation on screen, focused or not. For someone who keeps
     /// neosh visible in a tiled layout and is not looking at it.
     Offscreen,
-    /// Never. Marks and the corner only, which is what the workspace did before ADR 0057.
+    /// Never. Marks and the corner only, which is what the workspace did before alerts existed.
     Never,
 }
 

@@ -696,7 +696,7 @@ fn run_plugin(paths: &Paths, cmd: &PluginCmd) -> anyhow::Result<()> {
             }
         }
         PluginCmd::Remove { name, yes } => {
-            // Irreversible, so it asks — and says what is at stake before it does. See ADR 0039.
+            // Irreversible, so it asks — and says what is at stake before it does.
             if !yes {
                 let dir = paths.installed_plugin_dir().join(name);
                 if !std::io::IsTerminal::is_terminal(&std::io::stdin()) {

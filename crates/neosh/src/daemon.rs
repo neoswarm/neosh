@@ -142,7 +142,7 @@ impl Frontend for Viewer {
     }
 
     /// Nothing attached is `Detached`, which is a different answer from `Away` and needs a
-    /// different channel: there is no stream to write an escape to. See ADR 0057.
+    /// different channel: there is no stream to write an escape to.
     async fn presence(&mut self, idle_after: std::time::Duration) -> crate::frontend::Presence {
         let clients = self.clients.lock().await;
         if clients.is_empty() {
@@ -353,7 +353,7 @@ impl Handle {
                     // Whether somebody is at *this* terminal, which the workspace is away only if
                     // every terminal says no to. Recorded here beside the other per-client facts,
                     // and not forwarded: the host asks the frontend the merged question rather
-                    // than tracking a set of terminals it cannot see. See ADR 0057.
+                    // than tracking a set of terminals it cannot see.
                     if let InputEvent::Key { .. } | InputEvent::Paste { .. } = event {
                         self.clients.lock().await.typed(id);
                     }

@@ -1,6 +1,6 @@
 //! However many terminals you open, you see everything.
 //!
-//! ADR 0036 made the workspace a process and the terminal a viewer of it, and then allowed exactly
+//! Making the workspace a process and the terminal a viewer of it at first allowed exactly
 //! one viewer: a second `neosh` took the workspace over and the first was told why. That was the
 //! honest thing to ship at the time and it is the wrong thing to keep — the reason to open a second
 //! window is that a turn is running in the first, and taking it over is precisely the moment you
@@ -14,7 +14,7 @@
 //! scroll position, the composer, the panels open over it.
 //!
 //! Every client looks at exactly one view. Several clients may look at the *same* view, which is
-//! what ADR 0042 shipped: mirrors, identical and live. What is being built on top of this is a view
+//! what shipped first: mirrors, identical and live. What is being built on top of this is a view
 //! per client, so that a second terminal is somewhere else rather than a copy — and keeping the two
 //! ids apart is what lets that arrive one piece at a time instead of all at once.
 //!
@@ -24,7 +24,7 @@
 //!
 //! # Every terminal is its own size again
 //!
-//! A client resolves its own layout (ADR 0006), so two terminals of different sizes each lay out
+//! A client resolves its own layout, so two terminals of different sizes each lay out
 //! the declarative geometry they are sent — that part was never the problem. What was, was the
 //! handful of places the *host* draws to a width because the thing being drawn is one row and must
 //! stay one row: a tool card, the welcome. Those were buffer contents, one copy shared by every
@@ -98,7 +98,7 @@ struct Client {
     ///
     /// `None` is *cannot say* rather than *no*: only a terminal implementing mode 1004 ever reports
     /// this, and treating silence as focused would mean everyone on a terminal that cannot report
-    /// gets no notifications at all. Unknown falls back to [`Client::last_input`]. See ADR 0057.
+    /// gets no notifications at all. Unknown falls back to [`Client::last_input`].
     focused: Option<bool>,
     /// When a key last arrived from this terminal, which is the fallback for one that cannot say
     /// whether it has focus. Stamped on attach so a terminal that has just opened is not instantly
@@ -222,7 +222,7 @@ impl Clients {
     /// A workspace is away only when *every* attached terminal is: two windows open and one of them
     /// in front means the thing is on a screen somebody can see. Nothing attached is not away — it
     /// is [`Clients::is_empty`], which is a different answer with a different channel, because
-    /// there is no terminal to write an escape to. See ADR 0057.
+    /// there is no terminal to write an escape to.
     pub fn away(&self, idle_after: std::time::Duration) -> bool {
         !self.clients.is_empty()
             && self.clients.iter().all(|(_, c)| match c.focused {

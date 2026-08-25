@@ -321,7 +321,7 @@ pub enum StreamEvent {
     Token { turn: String, text: String },
     Thinking { turn: String, text: String },
     /// A driver's account of its own loop — sub-agents, plans, compaction. Carried separately from
-    /// `Token` here for the same reason it is locally: it is not a content block. See ADR 0034.
+    /// `Token` here for the same reason it is locally: it is not a content block.
     Activity { turn: String, activity: Activity },
     TurnEnded { turn: String, stop_reason: StopReason, usage: Usage },
     /// The agent is waiting for a person. Carries what is being asked so a remote viewer can answer

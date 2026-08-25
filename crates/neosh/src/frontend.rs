@@ -23,7 +23,7 @@ use crate::clients::{ClientId, Frame};
 ///
 /// Three states rather than a boolean, because the two ways of not being seen need different
 /// channels: a terminal that exists but is behind another window can be written an escape
-/// sequence, and one that does not exist cannot. See ADR 0057.
+/// sequence, and one that does not exist cannot.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Presence {
     /// A terminal is attached and in front of somebody. Nothing needs to leave it.
@@ -90,7 +90,7 @@ pub trait Frontend: Send {
 #[derive(Debug, Default)]
 struct Watch {
     /// `1` focused, `0` not, `-1` never said — which is what a terminal without mode 1004 leaves
-    /// it at, and is why this is not a `bool`. See ADR 0057.
+    /// it at, and is why this is not a `bool`.
     focused: AtomicI8,
     /// Milliseconds since the process started, at the last keystroke.
     ///
@@ -229,7 +229,7 @@ impl Frontend for TerminalUi {
         }
         // The host only ever sends one of these once it has established nobody can see the thing
         // it is about, so there is nothing left to decide here — just which escape this terminal
-        // speaks, which is the one part of it the host cannot know. See ADR 0057.
+        // speaks, which is the one part of it the host cannot know.
         for (level, title, body) in std::mem::take(&mut self.mirror.alerts) {
             let _ = self.inner.alert(self.alert_osc, self.alert_bell, &title, &body);
             let _ = level;

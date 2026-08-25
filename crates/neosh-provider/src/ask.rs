@@ -16,7 +16,7 @@
 //! it silently broke: the configured default is full access, so the layer answered `Allow` before
 //! anybody was asked, the driver sent back a bare yes, and `claude` replied to its own model with
 //! *"The user did not answer the questions."* — a turn that asked you something, never showed it to
-//! you, and then told the agent you had ignored it. See ADR 0043.
+//! you, and then told the agent you had ignored it.
 //!
 //! # The shape
 //!

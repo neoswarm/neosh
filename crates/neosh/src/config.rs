@@ -54,20 +54,26 @@ pub struct Config {
 
 /// `[swarm]` — ASCP, the other machines in your workspace.
 ///
-/// Off unless `peers` names somebody or `listen` is set, so a workspace does not open a port
-/// because it was upgraded. Everything here is about *reachability and consent*; who is allowed is
-/// `peers`, and a machine not on that list gets nowhere regardless of what it can reach.
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+/// On by default: the identity exists, paired machines are dialled, and the default port is
+/// listening, so "add this computer" from another machine works before anything is configured.
+/// What stays consent is *membership* — who is allowed is `peers` and what pairing remembered, a
+/// machine not on that list gets nowhere regardless of what it can reach, and joining still takes
+/// a yes on both machines. `enabled = false` turns the whole thing off; `listen = ""` keeps a
+/// machine dial-only.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct SwarmConfig {
+    /// The whole switch. `false` means no identity, no listener, no dialling, and `^J` says so.
+    pub enabled: bool,
     /// What to call this machine on other people's screens. The hostname if unset.
     pub name: Option<String>,
     /// Where to accept connections — `"0.0.0.0:7717"`, or `"100.71.4.9:7717"` to bind only the
     /// overlay's address.
     ///
-    /// Unset means dial-only, which is the right setting for a laptop: it joins the machines it
-    /// knows about without being joinable from whatever café network it is on. There is no default
-    /// port here on purpose — a config that opens a socket has to say so in words.
+    /// Unset means the default, `0.0.0.0:7717`. `""` means dial-only, which is the right setting
+    /// for a laptop: it joins the machines it knows about without being joinable from whatever
+    /// café network it is on. A taken port is a warning and a dial-only workspace, never a
+    /// workspace that refuses to start.
     pub listen: Option<String>,
     /// The machines this one connects to, and the keys they must prove.
     pub peers: Vec<SwarmPeer>,
@@ -80,9 +86,26 @@ pub struct SwarmConfig {
     /// Separate from `accepts_commands`, and off by default, because it is a different kind of
     /// trust: steering an agent is a message, approving one is a write to this machine's disk.
     pub accepts_approvals: bool,
-    /// Seconds between heartbeats, and how long a reconnect waits.
+    /// Seconds between heartbeats, and the ceiling a reconnect backs off to.
     #[serde(default = "default_heartbeat")]
     pub heartbeat_secs: u64,
+}
+
+/// By hand rather than derived, because a derived `Default` answers `enabled` and
+/// `accepts_commands` with `false` — and this is the instance serde fills missing fields from, so
+/// a config with no `[swarm]` section at all must come out the same as one with an empty one.
+impl Default for SwarmConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            name: None,
+            listen: None,
+            peers: Vec::new(),
+            accepts_commands: true,
+            accepts_approvals: false,
+            heartbeat_secs: default_heartbeat(),
+        }
+    }
 }
 
 /// One machine in the swarm.

@@ -168,6 +168,26 @@ pub struct Contribution {
     pub priority: i32,
 }
 
+/// How the connection to a peer stands, beyond the fact of it being up or not.
+///
+/// `up` is the summary and this is the story, because "not connected" is three different rows on a
+/// board: a machine being dialled that has never answered, one that was here and is being dialled
+/// again, and one nothing is dialling at all — it reached us last time, or it was told to stop.
+/// `attempt` counts dials since the last success, so a panel can say `try 4` instead of drawing a
+/// spinner that has been spinning since Tuesday.
+#[derive(TS, Serialize, Deserialize, Clone, PartialEq, Debug)]
+#[ts(export)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum LinkState {
+    /// Being dialled, never yet answered.
+    Connecting { attempt: u32 },
+    Up,
+    /// Was up, lost, and being dialled again — with backoff, so the count moves slower over time.
+    Retrying { attempt: u32 },
+    /// Nobody is dialling it: it dialled us last time, or a disconnect said to stop.
+    Down,
+}
+
 /// A node, as a plugin sees it: what it is, and what it has.
 #[derive(TS, Serialize, Deserialize, Clone, PartialEq, Debug)]
 #[ts(export)]
@@ -177,6 +197,8 @@ pub struct SwarmNode {
     /// `false` for a machine we have lost touch with. Its agents are still described, because they
     /// were real a moment ago and probably still are — what changed is that we cannot see them.
     pub up: bool,
+    /// The story behind `up`: connecting, retrying with a count, or not being dialled at all.
+    pub link: LinkState,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
     pub agents: Vec<AgentSummary>,
@@ -593,7 +615,7 @@ pub enum ApiCall {
     /// plugin owns the name or whether it is the host itself. A handler that returns nothing
     /// answers `null`, and one that throws fails the call with its message.
     ///
-    /// The other half of ADR 0040's "data, not callbacks": a *registration* stays data so it can be
+    /// The other half of "data, not callbacks": a *registration* stays data so it can be
     /// listed and disabled, and a *query* gets an answer, because faking one with an event, a
     /// correlation id and a reply command is a worse RPC written once per plugin.
     CmdCall {
@@ -1110,6 +1132,18 @@ pub enum ApiCall {
     SwarmUnpair {
         node: NodeId,
     },
+    /// Dial a down peer again now, rather than waiting out the retry delay.
+    SwarmReconnect {
+        node: NodeId,
+    },
+    /// Close the connection to a peer and stop dialling it, without unpairing.
+    ///
+    /// [`ApiCall::SwarmReconnect`] is how you undo it. Pairing is untouched: the machine may still
+    /// dial back in, and a restart dials it again — this is "leave it alone for now", not "forget
+    /// it", which is what [`ApiCall::SwarmUnpair`] is for.
+    SwarmDisconnect {
+        node: NodeId,
+    },
     /// Machines that have asked to join, or that we found and have not added.
     SwarmStrangers,
 
@@ -1359,8 +1393,8 @@ pub enum ApiCall {
     Notify {
         level: MessageLevel,
         message: String,
-        /// Whether the user asked for this. See ADR 0057; `Reply` is the default and is what a
-        /// bare `neosh.notify` has always meant.
+        /// Whether the user asked for this. `Reply` is the default and is what a bare
+        /// `neosh.notify` has always meant.
         #[serde(default)]
         kind: NoticeKind,
         /// Which progress row to write, for [`NoticeKind::Progress`]. Ignored otherwise.

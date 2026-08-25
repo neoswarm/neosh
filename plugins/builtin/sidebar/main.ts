@@ -33,7 +33,7 @@
  *
  * What a project *is* — pinned, ordered, folded — lives in shared project vars rather than in this
  * plugin's private state, so a panel of your own, a status segment or a picker all read the same
- * favourites rather than each starting empty. See ADR 0040.
+ * favourites rather than each starting empty.
  */
 
 import { byteLength, projectScope } from "@neosh/api";
@@ -108,8 +108,8 @@ const POINT_ACTION = "sidebar.action";
  * Something to put *on* a row this panel already draws — a git badge on a project, a colour on a
  * conversation — keyed by what the row is about rather than where it is.
  *
- * The third kind of thing a plugin can do to a panel it did not write, and the one ADR 0040 left
- * out: a section is rows of your own, an action is a verb on ours, and this is a mark on ours. Pure
+ * The third kind of thing a plugin can do to a panel it did not write, and the one the original
+ * contribution vocabulary left out: a section is rows of your own, an action is a verb on ours, and this is a mark on ours. Pure
  * data, merged at draw time, so a decorator costs the panel nothing on the paint path and can be
  * listed and disabled like any contribution. It is nvim-tree's decorator API as a contribution.
  */
@@ -168,8 +168,8 @@ interface Project {
   /**
    * Linked worktrees of this checkout, nested rather than listed beside it.
    *
-   * A worktree used to be a top-level project — correct by ADR 0029's "a worktree is a project",
-   * and wrong as a *list*: four scratch trees of one repository read as four unrelated projects,
+   * A worktree used to be a top-level project — correct by the old rule that a worktree is a
+   * project, and wrong as a *list*: four scratch trees of one repository read as four unrelated projects,
    * and the thing they have in common is the thing the column no longer said. The name carried
    * the relationship (`neosh · brisk-otter`) precisely because the structure did not. Each entry
    * is an ordinary {@link Project} — its own cwd, its own fold and rank vars — whose `worktrees`
@@ -250,7 +250,7 @@ const VAR_NAME = "sidebar.name";
  * Which tree belongs to which repository is read off a conversation's `repo_root`, so a worktree
  * you have emptied has nobody to say it — and without this it stops being a worktree the moment it
  * stops having conversations, jumps out of the repository it belongs to and lands at the top level
- * as a project of its own. Which is the thing ADR 0046 is about, arrived at from the other
+ * as a project of its own. Which is the worktree-nesting rule, arrived at from the other
  * direction: a tree does not become a project by being idle.
  */
 const VAR_ROOT = "sidebar.root";
@@ -315,7 +315,7 @@ export async function activate({ neosh, subscriptions }: PluginContext) {
   // A workspace can have several and they are not copies of each other: which conversation is
   // open, which row the cursor is on, whether the column is showing at all. All of that is
   // navigation, and navigation is what a view *is* — so the buffer is per view too, since the
-  // cursor and the unfolded row are drawn into its text. See ADR 0057.
+  // cursor and the unfolded row are drawn into its text.
   const panels = new Map<ViewId, Panel>();
 
   const makePanel = async (view: ViewId): Promise<Panel> => {
@@ -1140,7 +1140,7 @@ async function registerCommands(w: Wiring): Promise<void> {
     if (inside?.repo_root) cwd = inside.repo_root;
     // No message. The row moves to the top of the column and gains a pin, in the panel the cursor
     // is already in — saying so in the corner as well is the same fact twice, and a corner that is
-    // usually restating something visible is one people stop reading. See ADR 0057.
+    // usually restating something visible is one people stop reading.
     await arrangement.toggleFavorite(cwd);
   });
 
@@ -1291,8 +1291,8 @@ async function registerCommands(w: Wiring): Promise<void> {
       neosh.notify(`copied ${current.cwd}`);
     }, { desc: "Copy this conversation's directory to the clipboard" }),
   );
-  // An Alt chord, which ADR 0048 keeps out of the defaults — on a Mac out of the box `⌥Y` is `¥`,
-  // a key neosh never receives — with the one exception the same ADR makes for arrows: bound where
+  // An Alt chord, which the default-binding rule keeps out of the defaults — on a Mac out of the
+  // box `⌥Y` is `¥`, a key neosh never receives — with the one exception it makes for arrows: bound where
   // it means something, and never the only way. Chat mode has no Ctrl chord left to give this, and
   // every terminal-sendable route exists beside it — `yp` in the reader, `y` on any row of this
   // panel, `^K` and `/copy` by name — so a terminal that sends Alt gets a key in the composer and
@@ -1541,7 +1541,7 @@ function argsFor(target: Target | undefined): string[] {
  * with in March is still a checkout on disk long after `X` took it off the list, so this picker
  * was offering back, under "an existing one", every project you had ever removed — twenty rows of
  * finished work above the three you are actually in, and choosing one put it straight back in the
- * sidebar. The list is the workspace's answer to *which places do I work in* (see ADR 0039), and
+ * sidebar. The list is the workspace's answer to *which places do I work in*, and
  * this question is asking exactly that. A worktree neosh has never heard of is not on it either,
  * which is correct rather than a casualty: `Another directory…` lists every tree git knows and is
  * how a directory joins the list in the first place.
@@ -1884,7 +1884,7 @@ async function deleteSession(neosh: Neosh, session: string): Promise<boolean> {
  * Removing the *last* project used to be the one case this could not finish: the store refused to
  * delete the very last conversation in the workspace. It no longer does — what you land in is a
  * placeholder, which is in no list and so in no project — so `X` here can leave the panel with
- * nothing but `+ Add project` on it. See ADR 0039.
+ * nothing but `+ Add project` on it.
  */
 async function removeProject(
   neosh: Neosh,
@@ -1954,9 +1954,20 @@ function atStake(inside: SessionInfo[]): string {
 async function showNodes(neosh: Neosh): Promise<void> {
   const me = await neosh.swarm.self().catch(() => null);
   if (!me) {
-    neosh.notify("the swarm is off — `[swarm]` in your config turns it on", "info");
+    // On by default, so off means somebody turned it off — or `--clean`, which has nowhere to
+    // keep the key that *is* this machine's identity.
+    neosh.notify(
+      "the swarm is off — remove `enabled = false` from `[swarm]`, or leave --clean",
+      "info",
+    );
     return;
   }
+  // What the listener managed, said on this machine's own row: an address a peer could dial, or
+  // why there is not one. Written by the host as a workspace var, because it is a fact about the
+  // workspace and not about whichever panel happened to ask.
+  const listening = await neosh.vars
+    .get<{ addr: string | null; error?: string }>({ scope: "global" }, "swarm.listen")
+    .catch(() => null);
 
   type Row =
     | { kind: "node"; node: SwarmNode }
@@ -1984,18 +1995,30 @@ async function showNodes(neosh: Neosh): Promise<void> {
 
     for (const n of nodes) {
       const running = n.agents.filter((a) => a.state === "running").length;
+      // One sentence per link state, because they are different answers to "why is it not
+      // here": being dialled for the first time, being dialled again, and not being dialled.
+      const state =
+        n.link.state === "up"
+          ? `${n.agents.length} ${n.agents.length === 1 ? "conversation" : "conversations"}`
+          : n.link.state === "connecting"
+            ? n.link.attempt > 0
+              ? `connecting — try ${n.link.attempt}, ${n.reason ?? "no answer"}`
+              : "connecting…"
+            : n.link.state === "retrying"
+              ? n.link.attempt > 0
+                ? `reconnecting — try ${n.link.attempt}`
+                : "reconnecting…"
+              : `disconnected — ${n.reason ?? "it dials in"}  ·  ^R reconnects`;
       rows.push({
         label: n.info.name,
         detail: [
-          n.up
-            ? `${n.agents.length} ${n.agents.length === 1 ? "conversation" : "conversations"}`
-            : `unreachable — ${n.reason ?? "no answer"}`,
+          state,
           running > 0 ? `${running} working` : "",
-          !n.capabilities.accepts_commands ? "read-only" : "",
+          n.up && !n.capabilities.accepts_commands ? "read-only" : "",
           n.info.os,
           fingerprint(n.info.id),
         ].filter(Boolean).join("  ·  "),
-        keywords: `${n.info.os} ${n.info.id}`,
+        keywords: `${n.info.os} ${n.info.id} ${n.link.state}`,
         value: { kind: "node", node: n },
       });
     }
@@ -2009,8 +2032,17 @@ async function showNodes(neosh: Neosh): Promise<void> {
     rows.push({
       label: `This computer  ·  ${me.name}`,
       // The fingerprint is what somebody at the other machine compares against. Shown here so
-      // "what is my id" never means leaving the program to run a command.
-      detail: `${fingerprint(me.id)}  ·  ^Y copies the full id`,
+      // "what is my id" never means leaving the program to run a command. Beside it, whether
+      // this machine can be dialled at all — the first question when adding it from over there.
+      detail: [
+        fingerprint(me.id),
+        listening?.addr
+          ? `listening on ${listening.addr}`
+          : listening?.error
+            ? `not listening — ${listening.error}`
+            : "dial-only",
+        "^Y copies the full id",
+      ].join("  ·  "),
       keywords: `self me ${me.id}`,
       value: { kind: "self" },
     });
@@ -2026,9 +2058,15 @@ async function showNodes(neosh: Neosh): Promise<void> {
     title: "Computers",
     width: 84,
     height: 14,
-    hints: "↵ choose   ^Y copy my id   ^X remove   esc close",
+    hints: "↵ choose   ^R reconnect   ^D disconnect   ^X remove   ^Y my id   esc close",
+    // The list keeps up while it is open: a machine connecting, dropping, or moving from
+    // "connecting" to a row of conversations changes under the cursor rather than on reopen.
+    subscribe: (reload) =>
+      neosh.swarm.onChange(() => {
+        void refill().then(reload);
+      }),
     // Chords, because every bare letter a picker takes is a letter its filter can never contain.
-    ownKeys: ["<C-y>", "<C-x>"],
+    ownKeys: ["<C-y>", "<C-x>", "<C-r>", "<C-d>"],
     async onKey(key, ctx) {
       if (key.key.code.kind !== "char" || !key.key.mods.ctrl) return;
       switch (key.key.code.c.toLowerCase()) {
@@ -2036,6 +2074,22 @@ async function showNodes(neosh: Neosh): Promise<void> {
           await neosh.edit.copy(me.id);
           neosh.notify("copied this computer's id");
           return "handled";
+        case "r": {
+          const row = ctx.item;
+          if (row?.kind !== "node" || row.node.link.state === "up") return "handled";
+          await neosh.swarm.reconnect(row.node.info.id).catch((e) => neosh.notify(String(e), "warn"));
+          neosh.notify(`dialling ${row.node.info.name}…`);
+          await refill();
+          return "reload";
+        }
+        case "d": {
+          const row = ctx.item;
+          if (row?.kind !== "node" || row.node.link.state === "down") return "handled";
+          await neosh.swarm.disconnect(row.node.info.id).catch((e) => neosh.notify(String(e), "warn"));
+          neosh.notify(`disconnected ${row.node.info.name} — ^R takes it back`);
+          await refill();
+          return "reload";
+        }
         case "x": {
           const row = ctx.item;
           if (row?.kind !== "node") return "handled";
@@ -2945,7 +2999,7 @@ function sessionRow(
   // Finished while you were somewhere else. The one row in this column that is asking for
   // something, so it is the one row that gets the attention colour — and it does not move, because
   // it is not going to stop being true on its own and a mark that pulses forever is a mark you
-  // learn to look past. It goes away by being opened. See ADR 0042.
+  // learn to look past. It goes away by being opened.
   const unread = !working && !asking && !s.interrupted && s.unread;
   // The turn that was running here never ended, because the workspace it was running in stopped:
   // the machine was shut down, the process was killed. It outranks `unread` — a turn that finished
@@ -3035,7 +3089,7 @@ function sessionRow(
           : running
             // The colour the panel already uses for work happening somewhere you are not, dimmed
             // and — the whole point — still. Motion here would be a promise that you have to do
-            // something, and you do not: it finishes whether or not you look. See ADR 0045.
+            // something, and you do not: it finishes whether or not you look.
             ? "Status.Monitoring"
             : s.is_active
               ? "Accent"

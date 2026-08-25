@@ -4,7 +4,7 @@
 //! registry never sees, so the only thing standing between them and the workspace is the answer to
 //! the question the *agent* asks — and until [`DriverAsker`] existed, that answer came from the
 //! permission mode alone. `ask`, the default, meant "no", silently, whatever the user would have
-//! said if anybody had put the question to them. See ADR 0032.
+//! said if anybody had put the question to them.
 
 use std::sync::{Arc, Mutex};
 

@@ -31,7 +31,7 @@ import type {
 /**
  * The buffer kinds the shared widgets publish.
  *
- * A picker used to have no kind, which by ADR 0040's own rule made it the one panel in the
+ * A picker used to have no kind, which by the surface rule made it the one panel in the
  * workspace you could only replace and never extend. With one, `keymap.set` at `buf_kind` scope
  * binds inside every picker at once, `win.ofKind` finds the open one, and `win.setHighlights`
  * restyles them all.
@@ -469,6 +469,19 @@ export interface PickerOptions<T> {
     key: KeyContext,
     ctx: { item: T | undefined; query: string },
   ): Promise<"handled" | "reload" | "close" | undefined> | "handled" | "reload" | "close" | undefined;
+  /**
+   * Watch something outside the picker, and reload the rows when it moves.
+   *
+   * Called once as the picker opens; the `Disposable` it returns is disposed with it. Calling
+   * `reload` does what `onKey`'s `"reload"` does — re-run `source`, or re-rank `items`, the very
+   * array you passed in — for a change no key caused: a peer connecting while the list of
+   * computers is open is a row that should change under you, not on the next press.
+   *
+   * ```ts
+   * subscribe: (reload) => neosh.swarm.onChange(reload)
+   * ```
+   */
+  subscribe?(reload: () => void): Disposable;
 }
 
 const NS = "neosh.ui.picker";
@@ -797,6 +810,18 @@ export async function picker<T>(
     await refetch();
     opts.onQuery?.(query);
   };
+
+  if (opts.subscribe) {
+    disposers.push(
+      opts.subscribe(() => {
+        if (closed) return;
+        void (async () => {
+          await refetch();
+          if (!closed) await render();
+        })().catch(() => {});
+      }),
+    );
+  }
 
   disposers.push(
     await neosh.cmd.register(command, async (_args, key) => {
@@ -2958,7 +2983,7 @@ export interface ListPanelOptions<T> {
 export type CustomRow = { kind: "custom"; command: string; args: string[] };
 
 /**
- * A docked list panel that is a surface, not a program — ADR 0040's three mechanisms, and a
+ * A docked list panel that is a surface, not a program — the three panel mechanisms, and a
  * published cursor, for the price of a kind and a `rows` function.
  *
  * Given `kind: "acme.tasks"`, this creates the buffer with that kind, opens it in a dock, binds

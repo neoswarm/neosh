@@ -963,8 +963,7 @@ const PROGRESS_ABANDONED: std::time::Duration = std::time::Duration::from_secs(6
 ///
 /// Two lists in one corner, because they are two different claims and only one of them is about to
 /// stop being true. Progress sits above — it is what the program is *doing*, and it will change on
-/// its own — and messages below it, nearest the composer, because they are answers to a key. See
-/// ADR 0057.
+/// its own — and messages below it, nearest the composer, because they are answers to a key.
 fn draw_notifications(frame: &mut Frame, area: Rect, mirror: &Mirror, theme: &Theme) {
     /// At most one reply and two alerts. The stack used to be three of anything, which meant a
     /// burst of replies could push the one piece of news off the top of it.

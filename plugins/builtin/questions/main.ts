@@ -14,7 +14,7 @@
  * badly. The configured default is full access, so the layer said yes before anybody was asked, the
  * driver sent back a bare yes carrying no answers, and `claude` reported to its own model: *"The
  * user did not answer the questions."* A turn asked you something, never showed it to you, and then
- * told the agent you had ignored it. See ADR 0043.
+ * told the agent you had ignored it.
  *
  * # The shape of it
  *
@@ -26,12 +26,12 @@
  * listed, which is the one people reach for most. It goes into the composer, where you can see it,
  * because that is the field on this screen and a second one drawn inside a float is a field you
  * have to notice. While there is something typed the numbered shortcuts go away, which is how the
- * panel says a digit is a character now. See ADR 0037.
+ * panel says a digit is a character now.
  *
  * **Every key is a named command.** `question.accept`, `question.next` — so `^Z` lists them and an
  * `init.ts` can move them, and a third party can bind their own against the `neosh.question` buffer
  * kind without forking this. Only the printable keys come through the raw capture, and only because
- * they are text rather than verbs. See ADR 0040.
+ * they are text rather than verbs.
  *
  * **A question belongs to its conversation.** Several turns run at once, and one of them asking is
  * not a reason to take the screen away from the one you are reading. A question for a conversation

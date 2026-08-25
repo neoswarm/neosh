@@ -454,7 +454,7 @@ impl PermissionOptionKind {
 /// with more than one answer each, sometimes with an answer nobody listed. Squeezing it into the
 /// permission family would mean a prompt whose "options" are not decisions about the thing being
 /// asked, and a policy layer that could answer `full access` to a question about which database to
-/// use. See ADR 0043.
+/// use.
 #[derive(TS, Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
 #[ts(export)]
 pub struct UserQuestion {
@@ -611,7 +611,7 @@ pub enum HookPayload {
         /// What [`HookPayload::AskUser`] already carries, and for the same reason: a workspace
         /// runs several turns at once, only one of them is on screen, and a prompt drawn over
         /// whichever conversation you happen to be reading is a prompt about somebody else's work.
-        /// `None` when a plugin asked outside any turn. See ADR 0057.
+        /// `None` when a plugin asked outside any turn.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         #[ts(optional)]
         session: Option<SessionId>,

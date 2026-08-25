@@ -196,8 +196,8 @@ pub struct Limits {
 /// is the cursor's question, it is asked about exactly one card, and the answer costs nothing that
 /// moving off the card does not give straight back.
 ///
-/// Which is [ADR 0049](../../../docs/adr/0049-a-list-is-a-place-you-move-in.md)'s rule, one surface
-/// along: the row you are *in* stays unfolded, and only ever one row. A transcript is a list you
+/// Which is the rule that a list is a place you move in, one surface along: the row you are *in*
+/// stays unfolded, and only ever one row. A transcript is a list you
 /// move in as much as the project panel is.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub enum Open {
@@ -463,7 +463,7 @@ pub struct Head<'a> {
 /// those *is* before it says anything; a column of `Ran`, `Searched`, `Read`, `Fetched` is a list
 /// of things that were done.
 ///
-/// `None` for a call this cannot classify, and then the tool's own name stands. That is ADR 0033's
+/// `None` for a call this cannot classify, and then the tool's own name stands. That is the card
 /// rule and the part of it that was load-bearing: nothing here invents a friendlier word for a
 /// tool it does not understand, and a plugin's `frobnicate` is called `frobnicate` for ever. What
 /// changed is only that a call whose arguments *do* say what it did gets to say it — read off
@@ -525,7 +525,7 @@ pub fn looks_at_something(input: &serde_json::Value) -> bool {
 /// The other half of [`looks_at_something`], and by the same rule — read off the arguments, so a
 /// shell a plugin registers tomorrow is a command because it was given one. A run of these shares
 /// a card the way a run of reads does, with the one difference that follows from what a command
-/// is: what it printed is the answer, so the run keeps the last one's output. See ADR 0051.
+/// is: what it printed is the answer, so the run keeps the last one's output.
 pub fn runs_a_command(input: &serde_json::Value) -> bool {
     Kind::of(input) == Kind::Run
 }
@@ -718,8 +718,7 @@ fn verb<'a>(heads: &'a [Head<'a>], live: bool) -> &'a str {
 ///
 /// Calls of one kind only, and never an edit: a diff is the answer and there is no summarising it
 /// into a list of names. A run of *commands* gets the same row, named by what each command is
-/// rather than how it was spelled, and keeps the last one's output under it — see [`run_body`] and
-/// ADR 0051.
+/// rather than how it was spelled, and keeps the last one's output under it — see [`run_body`].
 pub fn group_header(g: &Glyphs, heads: &[Head], root: &std::path::Path, width: usize) -> Row {
     let live = heads.iter().any(|h| h.state == ToolState::Running);
     let failed = heads.iter().any(|h| h.state == ToolState::Failed);
@@ -888,8 +887,7 @@ pub fn group_body(
 /// ```
 ///
 /// And a failure is never the output that folded away: a run does not continue past one, so a
-/// command that failed is the last call on its card and its output is the one showing. See ADR
-/// 0051.
+/// command that failed is the last call on its card and its output is the one showing.
 fn run_body(
     g: &Glyphs,
     heads: &[Head],
@@ -903,7 +901,7 @@ fn run_body(
     // drop a hundred and fifty rows under the cursor on the way past — which is exactly what the
     // bound exists to prevent. So the cursor buys more of the one output that was already showing,
     // and `\u{21e5}` is what buys the other eight. A run of reads is not this: a row per call is
-    // one row per call, and that is bounded by the card. See ADR 0057.
+    // one row per call, and that is bounded by the card.
     let opened = open == Open::Full;
     let margin = g.margin();
     let deeper = format!("{margin}    ");
@@ -1058,7 +1056,7 @@ pub fn tasks(g: &Glyphs, rows: &[TaskRow], width: usize) -> Vec<Row> {
 /// It wears `Status.Unread` rather than anything that moves. `Status.Pending` pulses because a
 /// question ends the moment you answer it and the motion is asking you to; this ends when it ends,
 /// and a transcript that throbs at you over work you were told to ignore is the version of this
-/// nobody wants. See ADR 0045 on why motion means "act now".
+/// nobody wants — motion means "act now", and this is not that.
 pub fn still_running(g: &Glyphs, n: usize) -> Vec<Row> {
     let what = if n == 1 { "1 thing".to_string() } else { format!("{n} things") };
     let text = format!("{} Still running in the background \u{b7} {what}", g.elbow);
@@ -2204,7 +2202,7 @@ mod tests {
     }
 
     /// The cursor's card shows more than a folded one and less than an opened one — and never
-    /// fewer rows than the folded card it replaced, whatever the settings say. See ADR 0057.
+    /// fewer rows than the folded card it replaced, whatever the settings say.
     #[test]
     fn the_card_the_cursor_is_in_is_worth_more_rows_than_the_ones_it_is_not() {
         let input = json!({ "file_path": "/work/a.rs" });
@@ -2270,7 +2268,7 @@ mod tests {
         assert!(groups_with(&read, &grep));
         assert!(
             groups_with(&ran, &json!({ "command": "git status" })),
-            "ADR 0051: what a command printed is the answer, and the stack keeps the last one's"
+            "what a command printed is the answer, and the stack keeps the last one's"
         );
         assert!(!groups_with(&read, &ran), "one verb over two activities is a verb that is not true");
         assert!(!groups_with(&read, &edit), "an edit's diff is the answer");
@@ -2295,7 +2293,7 @@ mod tests {
             assert!(text.starts_with(&format!("  {want}")), "{name}: {text}");
         }
         // And a call nothing here understands keeps the name its author gave it, for ever. That is
-        // the half of ADR 0033 that was load-bearing: neosh never invents a word for a tool.
+        // the half of the card rule that was load-bearing: neosh never invents a word for a tool.
         let opaque = json!({ "description": "look around", "thing": 3 });
         assert_eq!(did(&opaque), None);
         let text = header_text(&g(), &head("frobnicate", &opaque, ToolState::Done), &root(), 80);
@@ -2330,8 +2328,8 @@ mod tests {
     #[test]
     fn a_questions_argument_that_is_not_a_list_of_questions_is_somebody_elses() {
         // The key is a common enough word that a tool nothing here has heard of may use it for
-        // something else, and renaming that call `Asked` would be exactly the invention ADR 0033
-        // forbids.
+        // something else, and renaming that call `Asked` would be exactly the invention the card
+        // rule forbids.
         for input in [
             json!({ "questions": ["what", "why"] }),
             json!({ "questions": [] }),

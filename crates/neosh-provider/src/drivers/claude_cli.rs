@@ -47,7 +47,7 @@
 //! protocol in [`super::claude_control`], and is answered by the same person a built-in tool call
 //! would reach. `--permission-prompt-tool stdio` requires `--input-format stream-json`, which is
 //! the same input format a long-lived session needs, so the two fit together rather than trading
-//! off. See ADR 0032.
+//! off.
 //!
 //! # The useful discovery
 //!
@@ -1813,6 +1813,14 @@ mod tests {
         // and does not finish: `init`, and the rest of it only once the next prompt has been read.
         // That is the case the drain cannot cover, because the turn is still going when the prompt
         // goes in and the CLI queues it behind them.
+        //
+        // The unasked `init` goes out *before* the control response that closes turn one, and the
+        // order is what makes this test deterministic: turn one is blocked on that response, so it
+        // reads the init on the way to it and turn two starts already knowing a turn is open.
+        // Printed the other way round, whether turn two's drain sees the init depends on how fast
+        // a shell gets scheduled — on a loaded CI machine, sometimes not fast enough, and the
+        // unasked ending then closes the turn that was queued behind it, which is exactly the bug
+        // the driver fixes for real usage, where the window is microseconds instead of a fork.
         std::fs::write(
             &script,
             r#"#!/bin/sh
@@ -1823,12 +1831,12 @@ while IFS= read -r line; do
   case "$line" in
     *control_request*)
       id=`printf '%s' "$line" | sed 's/.*"request_id":"\([^"]*\)".*/\1/'`
-      printf '{"type":"control_response","response":{"subtype":"success","request_id":"%s","response":{"totalTokens":10,"maxTokens":100}}}\n' "$id"
       if [ "$n" = 1 ] && [ -z "$spoke" ]; then
         spoke=1
         pending=1
         printf '{"type":"system","subtype":"init","session_id":"s","slash_commands":[]}\n'
       fi
+      printf '{"type":"control_response","response":{"subtype":"success","request_id":"%s","response":{"totalTokens":10,"maxTokens":100}}}\n' "$id"
       continue
       ;;
   esac

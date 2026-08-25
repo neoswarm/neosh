@@ -1,28 +1,27 @@
 /**
  * The archive: what you have finished with, and how you finally get rid of it.
  *
- * ADR 0023 gave the workspace two verbs — `x` puts a conversation away, `X` destroys it — and ADR
- * 0039 took the archive out of the sidebar, because a list of things you are deliberately done with
- * is the one part of that column that is never the answer. Both of them then said the same thing
+ * The workspace has two verbs — `x` puts a conversation away, `X` destroys it — and the archive
+ * was taken out of the sidebar, because a list of things you are deliberately done with
+ * is the one part of that column that is never the answer. Both decisions then said the same thing
  * about the other end: nothing sweeps it, an archive is a place things accumulate, and deleting
- * somebody's history on a timer is the move neither ADR was willing to make.
+ * somebody's history on a timer is a move this workspace has never been willing to make.
  *
- * That is still true and this plugin does not change it. What it changes is the half those ADRs
- * left as a note: **emptying it by hand was one conversation at a time**. A picker with `^X` on a
+ * That is still true and this plugin does not change it. What it changes is the half those
+ * decisions left as a note: **emptying it by hand was one conversation at a time**. A picker with `^X` on a
  * row is a fine way to throw away the thing you just regretted and a terrible way to deal with two
  * hundred of them, which is what an archive of a workspace you have used for a year actually is.
  *
- * So the archive is a panel rather than a picker, and everything a panel is owed by ADR 0040 it
- * has:
+ * So the archive is a panel rather than a picker, and everything a panel is owed it has:
  *
  * - **Every key is an ordinary binding** on the buffer kind `neosh.archive`, pointed at a command
  *   with a name. `^Z` lists them, `^K` runs them, one line in `init.ts` moves any of them. There is
  *   no private switch on `KeyContext` here — the picker's `ownKeys`/`onKey` pair, which is what
- *   this replaced, is exactly the shape ADR 0040 exists to stop.
+ *   this replaced, is exactly the shape the surface rule exists to stop.
  * - **`archive.action` is a contribution point.** Say a key, a label and a command, and it is a
  *   verb on these rows — invoked with the marked conversations, or with the row under the cursor
  *   when nothing is marked, so a plugin never has to track the cursor itself.
- * - **The rows are a list you move in**, by ADR 0049: `j`/`k` take a count, `^D`/`^U` are half of
+ * - **The rows are a list you move in**: `j`/`k` take a count, `^D`/`^U` are half of
  *   the panel's real height, `12G` is a row, and a half-typed count is on screen.
  *
  * And it can be marked. `<Space>` ticks a row, `a` ticks everything showing, and every verb here —
@@ -30,7 +29,7 @@
  * cursor. `^X` empties the archive outright: everything *currently listed*, which is the filter's
  * whole point, so narrowing to one project and pressing it deletes that project's finished
  * conversations and nothing else. It asks, it says how many and how much is in them, and the
- * question is charged for the reason ADR 0039 gives — it cannot be undone.
+ * question is charged for the one reason that matters — it cannot be undone.
  *
  * Two things here are about conversations you have never seen. `RESTORE_LIMIT` means a workspace
  * loads the most recent few hundred conversations and leaves the rest on disk, in no list at all —
@@ -39,7 +38,7 @@
  * is the directory, and the host brings one in from disk the moment any verb names it.
  *
  * Nothing here deletes on a timer. `archive.auto_days` will *archive* an idle conversation, because
- * archiving is reversible and free and that is the ADR's own test; `archive.retention_days` only
+ * archiving is reversible and free and that is the test that matters; `archive.retention_days` only
  * ever says how much is old, and `archive.sweep` is the key you press when you agree. A reminder is
  * not a policy.
  *
@@ -490,7 +489,7 @@ class Panel {
       // itself the moment it was asked a question would answer it into an empty screen.
       closeOnBlur: false,
       // Nothing else reaches the keyboard while this is up. It is a panel you are in the middle of
-      // using, and `^N` over it opening a conversation behind it is ADR 0047's whole example.
+      // using, and `^N` over it opening a conversation behind it is exactly what modality exists to stop.
       // `^Q` and `^R` still resolve — see `ui.modal_escape_keys` — so this can never be a terminal
       // somebody has to kill, and `^F` closes it from inside because a modal that borrows a global
       // key to open itself owes a binding to shut itself.
@@ -848,10 +847,10 @@ async function bindKeys(
     }
   }, { redraw: false });
 
-  // `u`, and deliberately not `^U` as well. ADR 0039 gave the picker `^U` for this because a bare
+  // `u`, and deliberately not `^U` as well. The picker had `^U` for this because a bare
   // letter there is a letter the filter can never contain; in a panel whose filter is a prompt the
-  // letter is free, and `^U` has a job — half a screen — that ADR 0049 gives every list in the
-  // workspace. Binding both would have quietly taken the motion away, in the one panel most likely
+  // letter is free, and `^U` has a job — half a screen — that every list in the
+  // workspace gives it. Binding both would have quietly taken the motion away, in the one panel most likely
   // to be longer than a screen.
   await verb(`${NS}.restore`, "u", "Put these back, without going there", async () => {
     // Tidying and travelling are different intentions, and being thrown into a conversation per row
@@ -958,7 +957,7 @@ async function bindKeys(
     desc: "Swallow an unbound key in the archive",
   }));
 
-  // The way in, from anywhere. `^F` is the archive's key by ADR 0039 and it toggles, because a key
+  // The way in, from anywhere. `^F` has always been the archive's key and it toggles, because a key
   // that opens a modal and cannot shut it is a key you have to remember a second one for.
   await neosh.keymap.set("chat", "<C-f>", "archive.open", {
     desc: "Archived conversations",
@@ -1026,7 +1025,7 @@ async function bindContributed(
 /**
  * The question, with what is at stake in it.
  *
- * ADR 0039's rule: everything irreversible asks, unconditionally, and the value of the question is
+ * The rule: everything irreversible asks, unconditionally, and the value of the question is
  * that it is always there. So it says how many, how much is in them and where they came from —
  * "Are you sure?" is a speed bump you learn to clear without reading, and a number is not.
  */
@@ -1142,12 +1141,12 @@ function render(info: SessionInfo, messages: Message[]): string {
  * What the workspace does about the archive on its own, which is: archive, and mention.
  *
  * `archive.auto_days` puts an idle conversation away. That is allowed to happen without being asked
- * because archiving is reversible and free — it is the *test* ADR 0023 sets for a dialog, applied
+ * because archiving is reversible and free — it is the *test* for whether a dialog is owed, applied
  * from the other side — and the alert says how many so it is never something you find out about by
  * noticing a row has gone.
  *
  * `archive.retention_days` deletes nothing, ever. It says how much of the archive is old and points
- * at the key that empties it. ADR 0023 and ADR 0039 both refuse to delete history on a timer, and a
+ * at the key that empties it. The workspace refuses to delete history on a timer, and a
  * setting that quietly reversed that would be the program deciding something that is not its to
  * decide. `archive.sweep` is the same number with a person behind it.
  */
@@ -1245,18 +1244,18 @@ const POINT_SIDEBAR_ACTION = "sidebar.action";
 /**
  * `a` on every row of the project panel — and, only if you ask for it, a row saying how many.
  *
- * The row is **off**. ADR 0039 called it a door rather than a drawer left open, and it is still the
+ * The row is **off**. It used to be a door rather than a drawer left open, and it is still the
  * smallest possible version of one: a single dim line, and only while there is something behind it.
  * But the column it sits in is your conversations, the thing it announces is by definition the
  * thing you are finished with, and a permanent line about what you are *not* doing is a line the
- * panel cannot spare — which is the same argument 0039 used to take the section out, applied to
+ * panel cannot spare — which is the same argument that took the section out, applied to
  * what it left behind.
  *
  * What replaces it is what the archive was always reached by: `^F` from anywhere, `a` from the
  * panel — advertised in the panel's key strip, so it is not a key you have to have been told about
  * — and `^K`. `archive.sidebar = true` puts the row back for anybody who wants the count on screen.
  *
- * Both are contributed rather than drawn by the sidebar, which is ADR 0040's claim tested on
+ * Both are contributed rather than drawn by the sidebar, which is the surface claim tested on
  * ourselves: the panel that owns the archive is not the panel that says there is one. Turn this
  * plugin off and both go with it, rather than leaving a row pointing at a command that has gone.
  */

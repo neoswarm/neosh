@@ -69,7 +69,7 @@ pub struct Mirror {
     /// business and the wire stays clock-free.
     ///
     /// Only [`NoticeKind::Reply`] and [`NoticeKind::Alert`] are in here; progress lives in its own
-    /// map because it is replaced rather than appended. See ADR 0057.
+    /// map because it is replaced rather than appended.
     pub messages: Vec<Notice>,
     /// Progress rows, by the key that owns each one.
     ///
@@ -81,7 +81,7 @@ pub struct Mirror {
     ///
     /// Taken by the frontend when it next draws, exactly like [`Mirror::clipboard`] and for the
     /// same reason: the mirror owns no terminal, and writing an escape sequence is the one thing
-    /// this type must not do if it is to stay testable without a tty. See ADR 0057.
+    /// this type must not do if it is to stay testable without a tty.
     pub alerts: Vec<(neosh_proto::MessageLevel, String, String)>,
     /// Text the core asked us to put on the clipboard, taken by the renderer when it next draws.
     ///
@@ -475,7 +475,7 @@ mod tests {
     }
 
     /// Two keys pressed quickly are two keys, and the answer you want is the one for the second.
-    /// The three-high stack was the corner trying to be a log. See ADR 0057.
+    /// The three-high stack was the corner trying to be a log.
     #[test]
     fn a_reply_replaces_the_reply_before_it() {
         let mut m = Mirror::new();

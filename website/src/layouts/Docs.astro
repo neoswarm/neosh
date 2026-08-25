@@ -1,0 +1,775 @@
+---
+import Base from "./Base.astro";
+import { sections, flatDocs } from "../data/docs";
+
+interface Heading {
+  depth: number;
+  slug: string;
+  text: string;
+}
+
+interface Props {
+  frontmatter: { title: string; description?: string };
+  headings?: Heading[];
+}
+
+const { frontmatter, headings = [] } = Astro.props;
+const { title, description } = frontmatter;
+
+const path = Astro.url.pathname.replace(/\/+$/, "") || "/";
+const idx = flatDocs.findIndex((d) => d.href === path);
+const current = idx >= 0 ? flatDocs[idx] : null;
+const prev = idx > 0 ? flatDocs[idx - 1] : null;
+const next = idx >= 0 && idx < flatDocs.length - 1 ? flatDocs[idx + 1] : null;
+
+const toc = headings.filter((h) => h.depth === 2 || h.depth === 3);
+const mdHref = path === "/docs" ? "/docs/index.md" : `${path}.md`;
+---
+
+<Base title={`${title} · Docs`} description={description}>
+  <div class="docs">
+    <aside class="side" id="docs-side">
+      <div class="side-head">
+        <a href="/" class="mark" aria-label="neoswarm home">
+          <img src="/mark.svg" alt="" width="26" height="26" />
+        </a>
+        <a href="/docs" class="docs-label">Docs</a>
+      </div>
+
+      <nav class="side-nav" aria-label="Documentation">
+        {
+          sections.map((s) => (
+            <div class="group">
+              <p class="group-title">{s.title}</p>
+              {s.links.map((l) => (
+                <a
+                  href={l.href}
+                  class:list={["side-link", { active: l.href === path }]}
+                  aria-current={l.href === path ? "page" : undefined}
+                >
+                  {l.title}
+                </a>
+              ))}
+            </div>
+          ))
+        }
+      </nav>
+
+      <div class="side-foot">
+        <a href="https://github.com/neoswarm/neosh" target="_blank" rel="noopener">GitHub</a>
+        <a class="discord-link" href="https://discord.gg/cWdMAqcAn5" target="_blank" rel="noopener">
+          <svg width="15" height="15" viewBox="0 0 127.14 96.36" fill="currentColor" aria-hidden="true">
+            <path
+              d="M107.7,8.07A105.15,105.15,0,0,0,81.47,0a72.06,72.06,0,0,0-3.36,6.83A97.68,97.68,0,0,0,49,6.83,72.37,72.37,0,0,0,45.64,0,105.89,105.89,0,0,0,19.39,8.09C2.79,32.65-1.71,56.6.54,80.21h0A105.73,105.73,0,0,0,32.71,96.36,77.7,77.7,0,0,0,39.6,85.25a68.42,68.42,0,0,1-10.85-5.18c.91-.66,1.8-1.34,2.66-2a75.57,75.57,0,0,0,64.32,0c.87.71,1.76,1.39,2.66,2a68.68,68.68,0,0,1-10.87,5.19,77,77,0,0,0,6.89,11.1A105.25,105.25,0,0,0,126.6,80.22h0C129.24,52.84,122.09,29.11,107.7,8.07ZM42.45,65.69C36.18,65.69,31,60,31,53s5-12.74,11.43-12.74S54,46,53.89,53,48.84,65.69,42.45,65.69Zm42.24,0C78.41,65.69,73.25,60,73.25,53s5-12.74,11.44-12.74S96.23,46,96.12,53,91.08,65.69,84.69,65.69Z"
+            />
+          </svg>
+          Discord
+        </a>
+        <a href="/plugins">Plugins</a>
+      </div>
+    </aside>
+
+    <div class="scrim" id="docs-scrim" aria-hidden="true"></div>
+
+    <div class="main">
+      <div class="topbar">
+        <button class="menu-btn" id="docs-menu" aria-label="Open navigation" aria-controls="docs-side">
+          <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round">
+            <path d="M2 4h12M2 8h12M2 12h12" />
+          </svg>
+        </button>
+        <nav class="crumbs" aria-label="Breadcrumb">
+          {current && <span class="crumb-section">{current.section}</span>}
+          {current && <span class="crumb-sep">/</span>}
+          <span class="crumb-page">{title}</span>
+        </nav>
+        <button class="copy-page" id="copy-page" data-md={mdHref} type="button">
+          <svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" aria-hidden="true">
+            <rect x="5.5" y="5.5" width="8" height="8" rx="1.5" />
+            <path d="M10.5 5.5v-2a1.5 1.5 0 0 0-1.5-1.5H4A1.5 1.5 0 0 0 2.5 3.5V9A1.5 1.5 0 0 0 4 10.5h1.5" />
+          </svg>
+          <span>Copy page</span>
+        </button>
+        <a
+          class="open-gh"
+          href="https://github.com/neoswarm/neosh"
+          target="_blank"
+          rel="noopener"
+        >
+          Get neosh
+        </a>
+      </div>
+
+      <div class="cols">
+        <article class="doc">
+          <h1>{title}</h1>
+          {description && <p class="doc-lede">{description}</p>}
+          <slot />
+
+          {
+            (prev || next) && (
+              <nav class="pager" aria-label="Previous and next page">
+                {prev ? (
+                  <a href={prev.href} class="pager-link prev">
+                    <span class="pager-dir">Previous</span>
+                    <span class="pager-title">{prev.title}</span>
+                  </a>
+                ) : (
+                  <span />
+                )}
+                {next && (
+                  <a href={next.href} class="pager-link next">
+                    <span class="pager-dir">Next</span>
+                    <span class="pager-title">{next.title}</span>
+                  </a>
+                )}
+              </nav>
+            )
+          }
+        </article>
+
+        {
+          toc.length > 0 && (
+            <aside class="toc" aria-label="On this page">
+              <p class="toc-title">On this page</p>
+              <ul>
+                {toc.map((h) => (
+                  <li class:list={[{ sub: h.depth === 3 }]}>
+                    <a href={`#${h.slug}`}>{h.text}</a>
+                  </li>
+                ))}
+              </ul>
+            </aside>
+          )
+        }
+      </div>
+    </div>
+  </div>
+</Base>
+
+<style>
+  .docs {
+    display: flex;
+    min-height: 100vh;
+  }
+
+  /* ── Sidebar ─────────────────────────────────────────────── */
+
+  .side {
+    position: sticky;
+    top: 0;
+    align-self: flex-start;
+    display: flex;
+    flex-direction: column;
+    width: 276px;
+    flex-shrink: 0;
+    height: 100vh;
+    padding: 22px 20px;
+    border-right: 1px solid var(--line);
+    background: rgba(10, 10, 12, 0.7);
+    backdrop-filter: blur(12px);
+  }
+
+  .side-head {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding: 2px 8px 22px;
+  }
+
+  .mark {
+    display: inline-flex;
+  }
+
+  .mark img {
+    display: block;
+  }
+
+  .docs-label {
+    font-size: 17px;
+    font-weight: 600;
+    letter-spacing: -0.01em;
+  }
+
+  .side-nav {
+    flex: 1;
+    overflow-y: auto;
+    padding-bottom: 20px;
+  }
+
+  .group {
+    margin-bottom: 26px;
+  }
+
+  .group-title {
+    margin: 0 0 6px;
+    padding: 0 8px;
+    font-size: 14px;
+    font-weight: 600;
+    color: var(--fg);
+  }
+
+  .side-link {
+    display: block;
+    padding: 6px 8px;
+    border-radius: 7px;
+    font-size: 15px;
+    color: var(--muted);
+    transition: color 0.15s ease, background 0.15s ease;
+  }
+
+  .side-link:hover {
+    color: var(--fg);
+  }
+
+  .side-link.active {
+    color: var(--fg);
+    background: rgba(255, 255, 255, 0.06);
+  }
+
+  .side-foot {
+    display: flex;
+    gap: 18px;
+    padding: 16px 8px 0;
+    border-top: 1px solid var(--line);
+    font-size: 13px;
+    color: var(--muted);
+  }
+
+  .side-foot a:hover {
+    color: var(--fg);
+  }
+
+  .discord-link {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+  }
+
+  .discord-link:hover {
+    color: #5865f2;
+  }
+
+  .scrim {
+    display: none;
+  }
+
+  /* ── Main column ─────────────────────────────────────────── */
+
+  .main {
+    flex: 1;
+    min-width: 0;
+  }
+
+  .topbar {
+    position: sticky;
+    top: 0;
+    z-index: 5;
+    display: flex;
+    align-items: center;
+    gap: 14px;
+    height: 58px;
+    padding: 0 32px;
+    border-bottom: 1px solid var(--line);
+    background: rgba(10, 10, 12, 0.75);
+    backdrop-filter: blur(12px);
+  }
+
+  .menu-btn {
+    display: none;
+    align-items: center;
+    justify-content: center;
+    width: 32px;
+    height: 32px;
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    background: none;
+    color: var(--muted);
+    cursor: pointer;
+  }
+
+  .crumbs {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 15px;
+    min-width: 0;
+  }
+
+  .crumb-section {
+    color: var(--muted);
+    white-space: nowrap;
+  }
+
+  .crumb-sep {
+    color: var(--dim);
+  }
+
+  .crumb-page {
+    color: var(--fg);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
+  .copy-page {
+    margin-left: auto;
+    display: inline-flex;
+    align-items: center;
+    gap: 7px;
+    height: 32px;
+    padding: 0 12px;
+    border: 1px solid var(--line);
+    border-radius: 999px;
+    background: none;
+    color: var(--muted);
+    font-family: var(--sans);
+    font-size: 13px;
+    font-weight: 500;
+    white-space: nowrap;
+    cursor: pointer;
+    transition: color 0.15s ease, border-color 0.15s ease;
+  }
+
+  .copy-page:hover {
+    color: var(--fg);
+    border-color: var(--line-strong);
+  }
+
+  .open-gh {
+    display: inline-flex;
+    align-items: center;
+    height: 32px;
+    padding: 0 14px;
+    border-radius: 999px;
+    background: #e3e1dc;
+    color: #0b0b0d;
+    font-size: 13px;
+    font-weight: 600;
+    white-space: nowrap;
+    transition: background 0.2s ease;
+  }
+
+  .open-gh:hover {
+    background: #f0eeea;
+  }
+
+  .cols {
+    display: flex;
+    gap: 56px;
+    max-width: 1220px;
+    margin: 0 auto;
+    padding: 48px 32px 90px;
+  }
+
+  /* ── Article ─────────────────────────────────────────────── */
+
+  .doc {
+    flex: 1;
+    min-width: 0;
+    max-width: 810px;
+    font-size: 17.5px;
+  }
+
+  .doc h1 {
+    margin: 0 0 16px;
+    font-size: 46px;
+    font-weight: 600;
+    letter-spacing: -0.02em;
+    line-height: 1.15;
+  }
+
+  .doc-lede {
+    margin: 0 0 10px;
+    color: var(--muted);
+    font-size: 20px;
+    line-height: 1.6;
+  }
+
+  /* ── TOC ─────────────────────────────────────────────────── */
+
+  .toc {
+    position: sticky;
+    top: 106px;
+    align-self: flex-start;
+    width: 232px;
+    flex-shrink: 0;
+    font-size: 14px;
+    border-left: 1px solid var(--line);
+    padding-left: 18px;
+  }
+
+  .toc-title {
+    margin: 0 0 10px;
+    font-weight: 600;
+    color: var(--fg);
+  }
+
+  .toc ul {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+  }
+
+  .toc li {
+    margin: 0 0 8px;
+  }
+
+  .toc li.sub {
+    padding-left: 12px;
+  }
+
+  .toc a {
+    display: block;
+    color: var(--muted);
+    line-height: 1.45;
+    transition: color 0.15s ease;
+  }
+
+  .toc a:hover {
+    color: var(--fg);
+  }
+
+  .toc a.active {
+    color: var(--fg);
+  }
+
+  /* ── Pager ───────────────────────────────────────────────── */
+
+  .pager {
+    display: flex;
+    justify-content: space-between;
+    gap: 16px;
+    margin-top: 64px;
+    padding-top: 28px;
+    border-top: 1px solid var(--line);
+  }
+
+  .pager-link {
+    display: flex;
+    flex-direction: column;
+    gap: 3px;
+    padding: 14px 18px;
+    border: 1px solid var(--line);
+    border-radius: var(--radius);
+    min-width: 180px;
+    transition: border-color 0.2s ease, background 0.2s ease;
+  }
+
+  .pager-link:hover {
+    border-color: var(--line-strong);
+    background: var(--bg-raise);
+  }
+
+  .pager-link.next {
+    text-align: right;
+    margin-left: auto;
+  }
+
+  .pager-dir {
+    font-size: 12px;
+    color: var(--muted);
+  }
+
+  .pager-title {
+    font-size: 16px;
+    font-weight: 500;
+  }
+
+  /* ── Responsive ──────────────────────────────────────────── */
+
+  @media (max-width: 1120px) {
+    .toc {
+      display: none;
+    }
+  }
+
+  @media (max-width: 860px) {
+    .side {
+      position: fixed;
+      left: 0;
+      top: 0;
+      bottom: 0;
+      z-index: 30;
+      transform: translateX(-100%);
+      transition: transform 0.25s ease;
+      background: var(--bg-raise);
+    }
+
+    .side.open {
+      transform: none;
+    }
+
+    .scrim {
+      display: block;
+      position: fixed;
+      inset: 0;
+      z-index: 25;
+      background: rgba(0, 0, 0, 0.5);
+      opacity: 0;
+      pointer-events: none;
+      transition: opacity 0.25s ease;
+    }
+
+    .scrim.open {
+      opacity: 1;
+      pointer-events: auto;
+    }
+
+    .menu-btn {
+      display: inline-flex;
+    }
+
+    .topbar {
+      padding: 0 20px;
+    }
+
+    .copy-page span {
+      display: none;
+    }
+
+    .copy-page {
+      padding: 0 9px;
+    }
+
+    .cols {
+      padding: 36px 20px 70px;
+    }
+
+    .doc h1 {
+      font-size: 34px;
+    }
+  }
+</style>
+
+<style is:global>
+  /* Markdown body. Global, because the content comes out of the <slot />. */
+
+  .doc h2 {
+    margin: 52px 0 14px;
+    font-size: 29px;
+    font-weight: 600;
+    letter-spacing: -0.015em;
+    line-height: 1.25;
+    scroll-margin-top: 84px;
+  }
+
+  .doc h3 {
+    margin: 34px 0 12px;
+    font-size: 21px;
+    font-weight: 600;
+    scroll-margin-top: 84px;
+  }
+
+  .doc p {
+    margin: 0 0 18px;
+    line-height: 1.7;
+    color: #d6d6dd;
+  }
+
+  .doc a {
+    color: var(--accent);
+    text-decoration: underline;
+    text-decoration-color: rgba(165, 180, 252, 0.35);
+    text-underline-offset: 3px;
+    transition: text-decoration-color 0.15s ease;
+  }
+
+  .doc a:hover {
+    text-decoration-color: var(--accent);
+  }
+
+  .doc ul,
+  .doc ol {
+    margin: 0 0 16px;
+    padding-left: 24px;
+    color: #d6d6dd;
+  }
+
+  .doc li {
+    margin: 0 0 8px;
+    line-height: 1.65;
+  }
+
+  .doc li::marker {
+    color: var(--dim);
+  }
+
+  .doc code {
+    font-family: var(--mono);
+    font-size: 0.86em;
+  }
+
+  .doc :not(pre) > code {
+    background: rgba(255, 255, 255, 0.07);
+    border: 1px solid var(--line);
+    border-radius: 5px;
+    padding: 2px 5px;
+    white-space: nowrap;
+  }
+
+  .doc pre {
+    position: relative;
+    margin: 0 0 20px;
+    padding: 18px 20px;
+    background: var(--bg-raise) !important;
+    border: 1px solid var(--line);
+    border-radius: var(--radius);
+    font-size: 14.5px;
+    line-height: 1.6;
+    overflow-x: auto;
+  }
+
+  .doc pre code {
+    font-size: inherit;
+  }
+
+  .doc .copy-btn {
+    position: absolute;
+    top: 8px;
+    right: 8px;
+    display: inline-flex;
+    align-items: center;
+    height: 26px;
+    padding: 0 9px;
+    border: 1px solid var(--line);
+    border-radius: 7px;
+    background: rgba(10, 10, 12, 0.8);
+    color: var(--muted);
+    font-family: var(--sans);
+    font-size: 12px;
+    cursor: pointer;
+    opacity: 0;
+    transition: opacity 0.15s ease, color 0.15s ease;
+  }
+
+  .doc pre:hover .copy-btn,
+  .doc .copy-btn:focus-visible {
+    opacity: 1;
+  }
+
+  .doc .copy-btn:hover {
+    color: var(--fg);
+  }
+
+  .doc table {
+    width: 100%;
+    margin: 0 0 22px;
+    border-collapse: collapse;
+    font-size: 16px;
+  }
+
+  .doc th {
+    text-align: left;
+    font-weight: 600;
+    color: var(--muted);
+    padding: 10px 16px;
+    border-bottom: 1px solid var(--line-strong);
+    white-space: nowrap;
+  }
+
+  .doc td {
+    padding: 10px 16px;
+    border-bottom: 1px solid var(--line);
+    color: #d6d6dd;
+    line-height: 1.55;
+    vertical-align: top;
+  }
+
+  .doc td:first-child {
+    white-space: nowrap;
+  }
+
+  .doc blockquote {
+    margin: 0 0 16px;
+    padding: 12px 18px;
+    border-left: 2px solid var(--accent);
+    background: var(--bg-raise);
+    border-radius: 0 var(--radius) var(--radius) 0;
+  }
+
+  .doc blockquote p {
+    margin: 0;
+    color: var(--muted);
+  }
+
+  .doc hr {
+    margin: 36px 0;
+    border: 0;
+    border-top: 1px solid var(--line);
+  }
+</style>
+
+<script>
+  // Mobile sidebar.
+  const side = document.getElementById("docs-side");
+  const scrim = document.getElementById("docs-scrim");
+  const menu = document.getElementById("docs-menu");
+  if (side && scrim && menu) {
+    const toggle = (open: boolean) => {
+      side.classList.toggle("open", open);
+      scrim.classList.toggle("open", open);
+    };
+    menu.addEventListener("click", () => toggle(!side.classList.contains("open")));
+    scrim.addEventListener("click", () => toggle(false));
+  }
+
+  // Copy the whole page as markdown.
+  const copyPage = document.getElementById("copy-page");
+  if (copyPage) {
+    const label = copyPage.querySelector("span")!;
+    copyPage.addEventListener("click", async () => {
+      try {
+        const res = await fetch(copyPage.dataset.md!);
+        await navigator.clipboard.writeText(await res.text());
+        label.textContent = "Copied";
+      } catch {
+        label.textContent = "Failed";
+      }
+      setTimeout(() => (label.textContent = "Copy page"), 1400);
+    });
+  }
+
+  // Copy buttons on code blocks.
+  for (const pre of document.querySelectorAll(".doc pre")) {
+    const btn = document.createElement("button");
+    btn.className = "copy-btn";
+    btn.type = "button";
+    btn.textContent = "Copy";
+    btn.addEventListener("click", async () => {
+      const code = pre.querySelector("code");
+      await navigator.clipboard.writeText(code?.innerText ?? "");
+      btn.textContent = "Copied";
+      setTimeout(() => (btn.textContent = "Copy"), 1400);
+    });
+    pre.appendChild(btn);
+  }
+
+  // Scroll spy for the table of contents.
+  const tocLinks = new Map<string, HTMLAnchorElement>();
+  for (const a of document.querySelectorAll<HTMLAnchorElement>(".toc a[href^='#']")) {
+    tocLinks.set(decodeURIComponent(a.hash.slice(1)), a);
+  }
+  if (tocLinks.size > 0) {
+    let activeId = "";
+    const setActive = (id: string) => {
+      if (id === activeId) return;
+      tocLinks.get(activeId)?.classList.remove("active");
+      tocLinks.get(id)?.classList.add("active");
+      activeId = id;
+    };
+    const headings = [...tocLinks.keys()]
+      .map((id) => document.getElementById(id))
+      .filter((el): el is HTMLElement => el !== null);
+    const onScroll = () => {
+      const fromTop = window.scrollY + 100;
+      let current = headings[0]?.id ?? "";
+      for (const h of headings) {
+        if (h.offsetTop <= fromTop) current = h.id;
+      }
+      setActive(current);
+    };
+    window.addEventListener("scroll", onScroll, { passive: true });
+    onScroll();
+  }
+</script>
