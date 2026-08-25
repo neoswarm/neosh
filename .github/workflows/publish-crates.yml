@@ -1,0 +1,62 @@
+name: publish-crates
+
+# Ten crates, published in dependency order by cargo itself — `--workspace` resolves the graph, so
+# neosh-proto goes before neosh-core goes before neosh, and a version bump is one number in
+# [workspace.package].
+#
+# Tokenless. `crates-io-auth-action` exchanges this job's OIDC identity for a token that lasts
+# thirty minutes and is revoked when the job ends, so there is no CARGO_REGISTRY_TOKEN in the repo
+# secrets. Trusted publishing has to be configured per crate on crates.io and can only be added to
+# a crate that already exists — which is why the first version is published by hand, once, for all
+# ten. See docs/releasing.md.
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write # OIDC, exchanged for a short-lived crates.io token
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - uses: rust-lang/crates-io-auth-action@v1
+        id: auth
+
+      # Crate by crate, skipping whatever crates.io already has, so this is safe to run twice —
+      # which is not a hypothetical: the *first* release is published by hand (a trusted publisher
+      # cannot be attached to a crate that does not exist), and then the GitHub release fires this
+      # job over versions that are already up. `cargo publish --workspace` would fail the whole job
+      # on the first one it found. A network blip halfway through eleven crates is the other case,
+      # and re-running is the only way out of it.
+      #
+      # The order is the dependency order `--workspace` would have chosen, written down because
+      # publishing one at a time means choosing it ourselves. A new crate goes in the right place
+      # here, and gets its own first manual publish — see docs/releasing.md.
+      #
+      # `--no-verify`: CI has already built and tested this commit, and the verify step rebuilds
+      # every crate from scratch — deno_core included — for no new information.
+      - name: Publish what crates.io does not have yet
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+        run: |
+          set -euo pipefail
+          version=$(cargo metadata --format-version 1 --no-deps \
+            | jq -r '.packages[] | select(.name=="neosh") | .version')
+          echo "releasing $version"
+          for crate in neosh-plugins neosh-proto neosh-syntax neosh-core neosh-provider \
+                       neosh-script neosh-swarm neosh-vcs neosh-agent neosh-tui neosh; do
+            if curl -sf -A "neosh-release" "https://crates.io/api/v1/crates/$crate/$version" >/dev/null; then
+              echo "skip $crate@$version — crates.io already has it"
+              continue
+            fi
+            echo "publish $crate@$version"
+            cargo publish -p "$crate" --no-verify
+          done

@@ -1,7 +1,7 @@
 {
-  "name": "@neosh/titles",
+  "name": "@neosh/archive",
   "version": "0.1.0",
-  "description": "Names a conversation after what it turned out to be about.",
+  "description": "What you have finished with: a panel to find it in, and the verbs that empty it.",
   "license": "MIT",
   "type": "module",
   "keywords": [
@@ -11,7 +11,7 @@
   "repository": {
     "type": "git",
     "url": "git+https://github.com/neoswarm/neosh.git",
-    "directory": "plugins/builtin/titles"
+    "directory": "plugins/builtin/archive"
   },
   "files": [
     "*.ts",

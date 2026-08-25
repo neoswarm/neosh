@@ -1,7 +1,7 @@
 {
   "name": "@neosh/slash",
   "version": "0.1.0",
-  "description": "Type / to reach a command — neosh's own, and whatever the driver says it accepts.",
+  "description": "Type / to reach a command \u2014 neosh's own, and whatever the driver says it accepts.",
   "license": "MIT",
   "type": "module",
   "keywords": [
@@ -14,7 +14,8 @@
     "directory": "plugins/builtin/slash"
   },
   "files": [
-    "main.ts",
-    "plugin.toml"
+    "*.ts",
+    "plugin.toml",
+    "!._*"
   ]
 }

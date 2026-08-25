@@ -5,6 +5,10 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
+homepage.workspace = true
+description = "Syntax highlighting for neosh: what a token is, never what colour it is."
+keywords = ["neosh", "syntax", "highlighting", "syntect"]
+categories = ["text-processing"]
 
 [dependencies]
 # Used as a *parser* and nothing else: the scope stack it produces is mapped onto neosh's own

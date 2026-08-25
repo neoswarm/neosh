@@ -1,0 +1,18 @@
+{
+  "name": "neosh",
+  "version": "0.0.0",
+  "description": "Reserved for neosh, a terminal-first agent workspace. neosh is a Rust binary \u2014 install it from https://github.com/neoswarm/neosh/releases, `brew install neoswarm/tap/neosh`, or `cargo install neosh`. This package is a name reservation and installs nothing.",
+  "license": "MIT",
+  "keywords": [
+    "neosh"
+  ],
+  "homepage": "https://github.com/neoswarm/neosh",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/neoswarm/neosh.git",
+    "directory": "npm/neosh"
+  },
+  "files": [
+    "README.md"
+  ]
+}

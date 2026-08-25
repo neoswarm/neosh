@@ -5,6 +5,10 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
+homepage.workspace = true
+description = "Version control for neosh: the git operations the workspace and its plugins run."
+keywords = ["neosh", "git", "vcs", "worktree"]
+categories = ["development-tools"]
 
 [dependencies]
 neosh-proto = { workspace = true }

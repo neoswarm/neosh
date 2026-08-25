@@ -14,7 +14,8 @@
     "directory": "plugins/builtin/usage"
   },
   "files": [
-    "main.ts",
-    "plugin.toml"
+    "*.ts",
+    "plugin.toml",
+    "!._*"
   ]
 }

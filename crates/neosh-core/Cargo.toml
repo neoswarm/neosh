@@ -5,6 +5,10 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
+homepage.workspace = true
+description = "Buffers, windows, floats, extmarks, highlights and keymaps: the single-writer editor at the centre of neosh. No I/O."
+keywords = ["neosh", "editor", "buffer", "tui"]
+categories = ["development-tools", "text-editors"]
 
 [dependencies]
 neosh-proto = { workspace = true }

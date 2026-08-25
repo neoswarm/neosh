@@ -14,7 +14,8 @@
     "directory": "plugins/builtin/questions"
   },
   "files": [
-    "main.ts",
-    "plugin.toml"
+    "*.ts",
+    "plugin.toml",
+    "!._*"
   ]
 }

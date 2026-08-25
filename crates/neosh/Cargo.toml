@@ -5,6 +5,11 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
+homepage.workspace = true
+description = "A terminal-first agent workspace: the extensibility model of Neovim, the feature set of Cursor."
+readme = "README.md"
+keywords = ["neosh", "agent", "tui", "ai", "terminal"]
+categories = ["command-line-utilities", "development-tools"]
 
 [dependencies]
 neosh-proto = { workspace = true }
