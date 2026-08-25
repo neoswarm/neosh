@@ -10,6 +10,7 @@
   <p>
     <a href="https://discord.gg/cWdMAqcAn5"><img src="https://img.shields.io/badge/Discord-5865F2?logo=discord&logoColor=white&style=flat-square" alt="Discord" /></a>
     <a href="https://neoswarm.dev/docs"><img src="https://img.shields.io/badge/Docs-neoswarm.dev-1f6feb?style=flat-square" alt="Docs" /></a>
+    <a href="https://github.com/neoswarm/neosh/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/neoswarm/neosh/ci.yml?branch=main&style=flat-square&label=CI" alt="CI status" /></a>
     <a href="./LICENSE"><img src="https://img.shields.io/github/license/neoswarm/neosh?style=flat-square" alt="License" /></a>
   </p>
 
@@ -19,7 +20,8 @@
     <a href="#plugins">Plugins</a> ·
     <a href="#configuration">Configuration</a> ·
     <a href="https://neoswarm.dev/docs">Docs</a> ·
-    <a href="#community">Community</a>
+    <a href="#community">Community</a> ·
+    <a href="#contributing">Contributing</a>
   </p>
 
   <p><i>⭐ A star helps more people find it. Thank you.</i></p>
@@ -56,14 +58,18 @@ The workspace is a process. Terminals attach to it, and each one is somewhere in
 conversation, its own scroll, its own panels, while the work is shared, so every window shows
 every turn that is running and where. Close one, the turns keep running, and `neosh` puts you back.
 
-```
- plugins (TypeScript)          your init.ts is one too
-        │
-        ▼
- one core (Rust)               buffers, windows, agents, keys
-        │
-        ▼
- every terminal                attached, somewhere of its own, detachable
+```mermaid
+flowchart LR
+  T1["Your terminal"] --> WS
+  T2["The laptop, later"] --> WS
+  T3["A teammate's screen"] --> WS
+  subgraph WS["One workspace process"]
+    direction TB
+    PL["Plugins (TypeScript)<br/>sidebar · git · palette · your init.ts"] --> CORE["One core (Rust)<br/>buffers · windows · keys · turns"]
+  end
+  CORE --> A["Agents"]
+  A --> P["claude · codex · any OpenAI-shaped endpoint"]
+  WS -.->|"paired over ASCP"| M["Another machine's workspace"]
 ```
 
 Everything on screen came through the same API a third party plugin uses. The chat, the sidebar,
@@ -137,13 +143,25 @@ with the Neovim project, just built in its spirit.
   <a href="https://discord.gg/cWdMAqcAn5"><img src="https://img.shields.io/badge/Join%20the%20Discord-5865F2?logo=discord&logoColor=white&style=flat-square" alt="Join the Discord" /></a>
 </p>
 
-## Development
+## Star the repository ⭐
 
-```bash
-./scripts/check.sh    # everything CI runs
-```
+A star helps more people find neosh, and it is the one metric a non profit project has.
 
-More in [AGENTS.md](AGENTS.md) and [docs/](docs/).
+<!-- star gif goes here -->
+
+## Contributing
+
+Pull requests are welcome. Keep each one to a single logical change, and open an issue first for
+anything large. `./scripts/check.sh` runs everything CI runs, and for anything visual, attach a
+screenshot or a short recording: it is a terminal app, so what the screen looks like is the point.
+The full guide is in [CONTRIBUTING.md](CONTRIBUTING.md), and the design rules live in
+[AGENTS.md](AGENTS.md) and [docs/adr/](docs/adr/).
+
+## Security
+
+Found a vulnerability? Report it privately through
+[GitHub security advisories](https://github.com/neoswarm/neosh/security/advisories/new) instead of
+opening a public issue.
 
 ## License
 
