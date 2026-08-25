@@ -70,6 +70,17 @@ pub struct Session {
     pub context_tokens: u64,
     /// What the driver says the window is. See [`neosh_proto::SessionInfo::context_window`].
     pub context_window: Option<u64>,
+    /// Whether a driver has ever answered "how full is it" for this conversation.
+    ///
+    /// Not the same question as "is the window known", and spelling it as
+    /// `context_window.is_some()` was one field standing in for two facts. `Activity::Compacted`
+    /// carries `post_tokens` and no window — a driver answering the first question and saying
+    /// nothing about the second — so applying it on a conversation whose window nobody had
+    /// reported left this reading as *nobody has told us*, which turned the estimate in
+    /// [`Self::add_usage`] back on. The next `TurnEnded` then set the meter to the prompt size of
+    /// the request that did the compacting, which is the whole pre-compaction conversation:
+    /// `/compact` moved the meter and then, a moment later, moved it back.
+    pub context_counted: bool,
     pub active_turn: Option<TurnId>,
     /// Things said to *this* conversation while its turn was running, waiting for a gap to be
     /// taken in.
@@ -161,6 +172,7 @@ impl Session {
             usage: Usage::default(),
             context_tokens: 0,
             context_window: None,
+            context_counted: false,
             active_turn: None,
             steering: Vec::new(),
             turn_started_at: None,
@@ -268,9 +280,16 @@ impl Session {
     /// for itself what to keep and when to compact, and is the only thing that can answer "how
     /// full is it". Where it does answer, guessing alongside it would be inventing a second number
     /// for a question that already has one.
+    ///
+    /// `window` of zero is *not said*, never *gone*. A driver that reports a count without a
+    /// denominator — which is what a compaction boundary is — must not take the percentage off a
+    /// meter at the exact moment the number finally moved.
     pub fn set_context(&mut self, used: u64, window: u64) {
         self.context_tokens = used;
-        self.context_window = (window > 0).then_some(window);
+        self.context_counted = true;
+        if window > 0 {
+            self.context_window = Some(window);
+        }
     }
 
     pub fn add_usage(&mut self, u: &Usage) {
@@ -281,7 +300,7 @@ impl Session {
         // direction that matters — it counts one request rather than the conversation the agent is
         // holding, which for a CLI that compacts on its own is not the same thing at all.
         let prompt = u.input_tokens + u.cache_read_tokens + u.cache_write_tokens;
-        if prompt > 0 && self.context_window.is_none() {
+        if prompt > 0 && !self.context_counted {
             self.context_tokens = prompt;
         }
         self.usage.input_tokens += u.input_tokens;

@@ -3815,7 +3815,8 @@ impl Host {
         left.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
         right.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
 
-        // Drop what does not fit, least important first.
+        // Make it fit: shorten what can be shortened, then drop what still does not fit, least
+        // important first both times.
         //
         // Both sides at once, because the two halves are competing for one line and the loser is
         // whichever segment is worth least, not whichever side it happens to be on. Without this,
@@ -3824,7 +3825,17 @@ impl Host {
         // as a corrupted line rather than as a full one.
         //
         // Nothing is truncated. Half a token count is a wrong token count, and a bar cut short is
-        // a bar reading a level nothing is at.
+        // a bar reading a level nothing is at. But dropping was the *only* other answer, and it
+        // is too blunt on its own: a segment then costs its full width or nothing, so the widest
+        // one in the strip is the one most likely to vanish — and the widest one here is the
+        // context meter, which is also the number people are watching. Worse, a turn starting adds
+        // a segment, so the strip got a column narrower at exactly the moment there was something
+        // to watch, and on a terminal a few columns short of the whole line the meter disappeared
+        // for the length of the turn and came back when it ended.
+        //
+        // A short form is not a truncation and is not this code's to invent: the segment carries
+        // it, because only the thing that wrote `███░░░░░ 34% of 200k` knows that the denominator
+        // is the part it can do without. See [`neosh_proto::StatusSegment::short`].
         {
             let width = self.status_width();
             // The mode word, the space each side of the line, and the single column that keeps the
@@ -3842,7 +3853,6 @@ impl Host {
                 left.iter().chain(right.iter()).map(|(p, k, _)| (*p, k.clone())).collect();
             // Least important last in the strip, so least important first out of it.
             order.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| b.1.cmp(&a.1)));
-            let mut dropped: std::collections::HashSet<String> = Default::default();
             for (_, key) in &order {
                 let seg = left
                     .iter()
@@ -3852,6 +3862,58 @@ impl Host {
                     .expect("came from those lists");
                 used += cost(seg);
             }
+            // One at a time and stopping the moment it fits, so the strip gives up as little as
+            // will do rather than shrinking everything the first time anything is tight.
+            if width > 0 {
+                let mut given_up: Vec<(String, String)> = Vec::new();
+                for (_, key) in order.iter() {
+                    if used <= width {
+                        break;
+                    }
+                    let Some(seg) = left
+                        .iter_mut()
+                        .chain(right.iter_mut())
+                        .find(|(_, k, _)| k == key)
+                        .map(|(_, _, s)| s)
+                    else {
+                        continue;
+                    };
+                    // Taken rather than read, so a segment cannot be shortened twice — and an
+                    // empty short form is no short form, not a segment that says nothing.
+                    let Some(short) = seg.short.take().filter(|s| !s.is_empty()) else { continue };
+                    let before = cost(seg);
+                    let full = std::mem::replace(&mut seg.text, short);
+                    // `+` before `-`: a short form is shorter, but this must not depend on it.
+                    used = used + cost(seg) - before;
+                    given_up.push((key.clone(), full));
+                }
+                // And give back whatever still fits, most important first.
+                //
+                // Shortening is granular — the meter gives up eight columns to recover one — so
+                // stopping at the first arrangement that fits stops one step past the best one
+                // whenever it took more than a single segment to get there. Without this the
+                // strip has blank columns in the middle of it *and* something abbreviated, which
+                // is the one outcome nothing here wanted.
+                for (key, full) in given_up.iter().rev() {
+                    let Some(seg) = left
+                        .iter_mut()
+                        .chain(right.iter_mut())
+                        .find(|(_, k, _)| k == key)
+                        .map(|(_, _, s)| s)
+                    else {
+                        continue;
+                    };
+                    // The two forms differ only in their text — the key beside them is the same —
+                    // so the difference in what the line costs is the difference in their widths.
+                    // `used` already counts the short one, so this cannot go below zero.
+                    let want = used + display_width(full) - display_width(&seg.text);
+                    if want <= width {
+                        seg.text.clone_from(full);
+                        used = want;
+                    }
+                }
+            }
+            let mut dropped: std::collections::HashSet<String> = Default::default();
             for (_, key) in order.iter() {
                 if width == 0 || used <= width {
                     break;
@@ -8094,14 +8156,13 @@ impl Host {
                 // estimate in `add_usage` off, and the next answer only arrives with the next
                 // request. The driver said `post_tokens`; this is what it is for.
                 if let Some(used) = after {
-                    let window = self
-                        .agent
-                        .sessions()
-                        .get(&session)
-                        .and_then(|s| s.context_window)
-                        .unwrap_or(0);
+                    // No window with it, and none is wanted: a boundary is a count, and
+                    // `set_context` keeps whatever denominator is already known. Reading the old
+                    // one back out to hand it straight in again was this doing `set_context`'s job
+                    // — and doing it through the session lock, which is the one thing here that
+                    // must not be taken twice in a statement.
                     if let Some(s) = self.agent.sessions().get_mut(&session) {
-                        s.set_context(used, window);
+                        s.set_context(used, 0);
                     }
                     self.persist_sessions();
                 }
@@ -8488,6 +8549,20 @@ impl Host {
                         data: Some(serde_json::json!({ "win": win, "width": width, "height": height })),
                         from: BUILTIN.to_string(),
                     });
+                    // The strip is *fitted* to its own width — segments are shortened and then
+                    // dropped until the line fits — and this is the only place that width arrives.
+                    // Without this the fitting stands from whenever a plugin last wrote a segment,
+                    // which at rest is not again: nothing lays the strip out unless something in
+                    // it changed, and at rest nothing in it does. So a terminal made wider kept a
+                    // strip missing everything that had not fitted the old one, and a terminal
+                    // made narrower kept a strip too long for it, with the right-hand half drawn
+                    // over the end of the left — until a turn started or a conversation changed and
+                    // it silently put itself right, which is the version of this that is hardest to
+                    // report.
+                    let strip = self.editor.window(win).map(|w| w.buf) == Some(self.v().status);
+                    if strip {
+                        self.refresh_status();
+                    }
                 }
                 // What the frontend *drew*, which is not always what was asked for: a window whose
                 // scroll had to bend to keep its cursor on screen is showing a different first row.
@@ -8502,6 +8577,10 @@ impl Host {
                 // one's welcome until something unrelated happens to redraw it.
                 if win == self.v().chat_win && self.chat_width() != was {
                     self.draw_welcome();
+                    // And the block at the bottom of a running turn, for the same reason: the plan
+                    // and what is out are laid out against `chat_width`, so after a resize they are
+                    // wrapped to a width the window no longer has.
+                    self.redraw_footer();
                 }
             }
             InputEvent::Attached { .. } => {

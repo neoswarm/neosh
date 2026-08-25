@@ -7,6 +7,25 @@ import type { StatusAlign } from "./StatusAlign";
 export type StatusSegment = {
   text: string;
   /**
+   * The same thing, said in less room — used when the strip will not fit and before this
+   * segment is dropped for it.
+   *
+   * A narrow terminal is the case a status line has to survive, and the two answers it had were
+   * both wrong. Truncating is out: half a token count is a wrong token count, and a bar cut
+   * short is a bar reading a level nothing is at. Dropping is what happened instead, and it
+   * took the context meter out of exactly the terminal that most needed it — a turn running
+   * adds a segment, which is why the number people watch went missing precisely while there was
+   * something to watch.
+   *
+   * So the segment says its own short form, for the reason [`Hint`] splits its key from its
+   * label: what may be given up is a decision only the thing that wrote the text can make, and
+   * it cannot be made once the text is one string. `███░░░░░ 34%` is the same fact as
+   * `███░░░░░ 34% of 200k` with the denominator left out, and it is still true.
+   *
+   * Absent means there is no shorter true version, and the segment is dropped whole.
+   */
+  short?: string | null;
+  /**
    * The key that changes this, written the way the user would press it — `^P`, `^Z`.
    *
    * Beside what it acts on rather than in a list of its own, because a key is only memorable
@@ -19,6 +38,12 @@ export type StatusSegment = {
   /**
    * Lower sorts first within its side. Ties break by key, so the order is stable across redraws
    * rather than depending on which plugin happened to load first.
+   *
+   * It is also what a narrow strip gives up first, in reverse — so this is a statement about
+   * how much the segment is worth, not only about where it goes. Two segments on the same
+   * number are separated by the spelling of their keys, which is fine for an order and is no
+   * way to decide which of them survives: give anything you would mind losing a number of its
+   * own.
    */
   priority: number;
 };

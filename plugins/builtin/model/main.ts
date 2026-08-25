@@ -99,14 +99,29 @@ export async function activate({ neosh, subscriptions }: PluginContext) {
     // Whether the next turn can authenticate belongs beside the model name, not in the error it
     // would otherwise become. "opus · no key" is something you fix before you have typed the
     // question; a failure on send is something you fix after losing your train of thought.
-    const cred = (await neosh.agent.credentials().catch(() => []))
-      .find((c) => c.instance === selection.instance);
+    //
+    // Together with the catalogue, because both are wanted before the strip is written and
+    // neither depends on the other — asked one after the other, the model name appeared a round
+    // trip later than it had to for the sake of a shorter spelling of itself.
+    const [creds, entries] = await Promise.all([
+      neosh.agent.credentials().catch(() => []),
+      neosh.agent.listModels(selection.instance).catch(() => [] as ModelEntry[]),
+    ]);
+    const cred = creds.find((c) => c.instance === selection.instance);
     const unusable = cred?.source.kind === "missing";
+    const info = entries.find((e) => e.model.id === selection.model)?.model;
     // Right-hand end, where pi puts it: the left of the strip is what the conversation is
     // spending, which changes constantly, and the right is what it is spending it on, which does
     // not. Two things that move at different rates should not be interleaved.
+    //
+    // `short` is the id with the vendor's half of it off — `claude-opus-4-5` is `opus-4-5`, and
+    // `anthropic/claude-opus-5` is `opus-5`. This is the widest thing on the strip and it used to
+    // cost its full width or nothing, which on a narrow terminal meant the segments after it went
+    // instead. Which vendor you are on is the part of that string you already knew.
+    const brief = withoutVendor(selection.model, info?.family ?? undefined);
     await neosh.status.set("model", {
       text: `${selection.model}${unusable ? "  no key" : ""}`,
+      short: brief ? `${brief}${unusable ? "  no key" : ""}` : undefined,
       keys: "^P",
       hl: unusable ? "Diagnostic.Warn" : "Accent",
       align: "right",
@@ -115,10 +130,7 @@ export async function activate({ neosh, subscriptions }: PluginContext) {
 
     // Its own segment, with its own key. Glued onto the model name they read as one word, and the
     // one you want to change is whichever you are not looking at.
-    const entries = await neosh.agent.listModels(selection.instance).catch(() => [] as ModelEntry[]);
-    const descriptors =
-      entries.find((e) => e.model.id === selection.model)?.model.capabilities?.option_descriptors ??
-      [];
+    const descriptors = info?.capabilities?.option_descriptors ?? [];
     const options = summarise(selection.options ?? [], descriptors);
     if (options) {
       await neosh.status.set("effort", {
@@ -203,6 +215,28 @@ function beyond(
       ? value === true && typeof d.prompt_injected_word === "string"
       : typeof value === "string" && (d.prompt_injected_values ?? []).includes(value);
   });
+}
+
+/**
+ * The model id with the vendor's half of it taken off — `claude-opus-4-5` becomes `opus-4-5`.
+ *
+ * The strip's short form for the model segment. Cut at the *family*, which the catalogue already
+ * says (`"opus"`, `"sonnet"`, `"gpt-5"`), rather than at a prefix this file guesses at: a list of
+ * vendor spellings to strip is a list that is wrong about the next provider somebody registers,
+ * and the whole point of the catalogue is that a plugin's models arrive described.
+ *
+ * Nothing when there is no shorter honest version of the name — no family, a family that is not in
+ * the id, or an id that is already only its family. The segment is then dropped whole if it comes
+ * to that, which is the right answer: half a model id names a different model.
+ */
+function withoutVendor(id: string, family?: string): string | undefined {
+  // A namespaced id is a vendor and a name, and the vendor is the part being dropped either way.
+  const bare = id.slice(id.lastIndexOf("/") + 1);
+  if (!family) return bare === id ? undefined : bare;
+  const at = bare.indexOf(family);
+  if (at <= 0) return bare === id ? undefined : bare;
+  const cut = bare.slice(at);
+  return cut === id ? undefined : cut;
 }
 
 /**

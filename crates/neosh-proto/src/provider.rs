@@ -841,6 +841,18 @@ pub enum Activity {
     /// like everything else here `TurnAssembler` never reads it.
     Resume { token: String },
     /// How full the context window is, as of now.
+    ///
+    /// **As of now**, and that is the whole of the contract: a driver that asks its agent this
+    /// question and reads the answer later owes it to the receiver not to send one that has since
+    /// been overtaken. Nothing downstream can tell a stale count from a fresh one — they are the
+    /// same message — so the driver, which knows what it asked and when, is the only place the
+    /// distinction exists. `claude-cli` asks on a five-second clock and a compaction takes twenty:
+    /// every answer outstanding when the boundary lands measures a conversation that no longer
+    /// exists, and forwarding them put the meter back where [`Self::Compacted`] had just moved it
+    /// from.
+    ///
+    /// `total` of zero means *not said* rather than *gone*: a receiver keeps whatever denominator
+    /// it already had.
     Context {
         #[ts(type = "number")]
         used: u64,
