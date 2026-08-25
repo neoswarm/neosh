@@ -392,6 +392,8 @@ impl Editor {
                 | ApiCall::SwarmProbe { .. }
                 | ApiCall::SwarmPair { .. }
                 | ApiCall::SwarmUnpair { .. }
+                | ApiCall::SwarmReconnect { .. }
+                | ApiCall::SwarmDisconnect { .. }
                 | ApiCall::SwarmStrangers
                 // The plan's allowance: credentials, other programs' transcripts and a clock.
                 // Nothing here is UI state, and the store outlives every window that draws it.

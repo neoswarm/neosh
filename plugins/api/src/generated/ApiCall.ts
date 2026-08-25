@@ -366,6 +366,8 @@ export type ApiCall =
   | { "call": "swarm_probe"; addr: string }
   | { "call": "swarm_pair"; node: NodeId; name: string; addr?: string | null }
   | { "call": "swarm_unpair"; node: NodeId }
+  | { "call": "swarm_reconnect"; node: NodeId }
+  | { "call": "swarm_disconnect"; node: NodeId }
   | { "call": "swarm_strangers" }
   | { "call": "quota_list" }
   | { "call": "quota_refresh"; instance?: InstanceId | null }
