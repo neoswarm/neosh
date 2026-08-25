@@ -27,4 +27,11 @@ jobs:
 
       # The single source of truth: the same script contributors run locally,
       # so "works locally" and "passes CI" are the same sentence.
+      #
+      # Two test threads, because the integration suites each start a whole
+      # workspace — a real daemon, a real socket, plugins and all — and a
+      # 4-vCPU runner starting several at once is how a different test times
+      # out on every run. The repo's own testing docs recommend exactly this.
       - run: ./scripts/check.sh
+        env:
+          RUST_TEST_THREADS: "2"
