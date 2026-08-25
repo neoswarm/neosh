@@ -155,7 +155,7 @@ Pull requests are welcome. Keep each one to a single logical change, and open an
 anything large. `./scripts/check.sh` runs everything CI runs, and for anything visual, attach a
 screenshot or a short recording: it is a terminal app, so what the screen looks like is the point.
 The full guide is in [CONTRIBUTING.md](CONTRIBUTING.md), and the design rules live in
-[AGENTS.md](AGENTS.md) and [docs/adr/](docs/adr/).
+[AGENTS.md](AGENTS.md).
 
 ## Security
 
@@ -165,4 +165,6 @@ opening a public issue.
 
 ## License
 
-[MIT](LICENSE). Free forever.
+neosh is free, and it stays free. Everything in this repository is
+[MIT licensed](LICENSE): use it, change it, ship what you build on it. There is no paid tier and
+no open core, because there is no company to need one.
