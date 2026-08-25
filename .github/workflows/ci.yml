@@ -1,206 +1,30 @@
-# Everything `scripts/check.sh` runs, in the order that fails fastest.
-#
-# The steps are deliberately not folded into one `check.sh` call: a red X should
-# say *which* thing broke without anyone opening the log.
-#
-# Linting is a job of its own rather than a step, because `cargo clippy` and
-# `cargo test` cannot share a single artefact between them — one produces
-# clippy's metadata and the other produces real object code, so a job that does
-# both compiles the whole dependency graph twice in series. Split, they compile
-# it twice in parallel, and the run is as long as the slower half instead of the
-# sum. Clippy also never links, which is why it is the half that needs no V8.
-name: ci
+name: CI
 
 on:
   push:
     branches: [main]
   pull_request:
-  workflow_dispatch:
 
 concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
-env:
-  CARGO_TERM_COLOR: always
-  # A failing build should print the error, not a backtrace of rustc.
-  RUST_BACKTRACE: 1
-  # Nothing here is compiled twice in the same job, so incremental state is
-  # weight in the cache and nothing else.
-  CARGO_INCREMENTAL: 0
-  # Debug info is most of a debug build's link time and most of what the cache
-  # then has to carry, and nothing in this suite reads a symbolised frame.
-  CARGO_PROFILE_DEV_DEBUG: 0
-
 jobs:
-  rust:
+  check:
+    name: everything check.sh runs
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
 
       - uses: dtolnay/rust-toolchain@stable
 
-      # V8 dominates a clean build, so caching is the difference between a
-      # two-minute run and a twenty-minute one.
-      #
-      # `cache-on-failure` because the run that is failing is exactly the run
-      # somebody is iterating on, and making them pay for a cold graph on every
-      # attempt is how a ten-minute CI becomes a thirty-minute one.
-      - uses: Swatinem/rust-cache@v2
-        with:
-          cache-on-failure: true
-
-      # `rusty_v8` downloads a 150MB prebuilt static library into
-      # `target/debug/gn_out` — which is not one of the paths `rust-cache`
-      # recognises, so it prunes the archive while keeping the build script's
-      # "already ran" fingerprint. Cargo then has no reason to fetch it again,
-      # and the first thing that actually *links* V8 dies with "could not find
-      # native static library `rusty_v8`". Clippy survives because a check never
-      # links, which is why this only ever broke the test job.
-      #
-      # Keyed on the lockfile rather than on the asset's name: which archive the
-      # build script wants depends on the version *and* on the features it was
-      # compiled with, so a workflow that spells the filename out is a workflow
-      # that is silently wrong the first time either of them changes.
-      #
-      # Registered *after* `rust-cache` on purpose. Post steps run in reverse
-      # order, so this one saves the archive before `rust-cache` prunes it.
-      # Restore and save are separate because `actions/cache` does not save on a
-      # failed job — which is precisely the run that just paid to download it,
-      # and precisely the run somebody is iterating on. A red build should still
-      # leave the 150MB behind for the next attempt.
-      - name: Cache the V8 prebuilt
-        id: v8
-        uses: actions/cache/restore@v4
-        with:
-          path: target/debug/gn_out
-          key: v8-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
-
-      # The self-heal, for a cold cache or a lockfile that just moved. Dropping
-      # the fingerprint is what gives the build script permission to run again;
-      # it then finds its own checksum file next to the archive and re-downloads
-      # only if the URL it wants has actually changed.
-      - name: Let cargo fetch V8 again if the archive is missing
-        run: |
-          if [ ! -f target/debug/gn_out/obj/librusty_v8.a ]; then
-            echo "no prebuilt V8 in the cache — clearing the build fingerprint so cargo fetches it"
-            rm -rf target/debug/build/v8-*
-          fi
-
-      # Git is a dependency of the version-control tests, and its default
-      # branch name and identity are not configured on a fresh runner.
-      - name: Configure git for the vcs tests
-        run: |
-          git config --global user.email "ci@neosh.invalid"
-          git config --global user.name "neosh ci"
-          git config --global init.defaultBranch main
-
-      - name: Tests
-        run: cargo test --workspace --exclude neosh --locked
-
-      # The binary's own suites drive a real `neosh` under a pty, and each one
-      # is a whole workspace with a V8 runtime in it. Run at the runner's
-      # default parallelism they spend their budget waiting for each other's
-      # CPU rather than for the thing they are asserting on — sixteen of them
-      # timed out at once on a four-core runner, most in code this branch never
-      # touched. `--test-threads 2` is what AGENTS.md already prescribes for
-      # them locally, and a runner with fewer cores than a laptop needs it more
-      # rather than less.
-      - name: The binary's integration tests
-        run: cargo test -p neosh --locked -- --test-threads 2
-
-      # The plugin API's wire types are generated from Rust and committed. A
-      # Rust type that changed without its binding being regenerated means the
-      # ecosystem is compiling against a lie, so it is a build failure.
-      - name: TypeScript bindings are in sync with the Rust types
-        run: |
-          cargo test -p neosh-proto --quiet
-          if ! git diff --exit-code -- plugins/api/src/generated; then
-            echo "::error::generated TypeScript is out of date — run 'cargo test -p neosh-proto' and commit plugins/api/src/generated"
-            exit 1
-          fi
-
-      # Folded in here rather than kept as a job of its own: it needs the same
-      # dependency graph and the same linked binary the tests already built, and
-      # as a separate job it was compiling all of it a second time from a second
-      # cache to run one command.
       - uses: actions/setup-node@v4
         with:
           node-version: 22
-          cache: npm
-          cache-dependency-path: plugins/api/package-lock.json
-
-      - name: Install
-        working-directory: plugins/api
-        run: npm ci
-
-      # `neosh init` writes a starter config *and* the types it is checked
-      # against, both emitted from the binary. If the template drifts from the
-      # API, every new user's first experience is a type error.
-      - name: The scaffolded config type-checks against its own emitted types
-        run: |
-          scaffold="$(mktemp -d)"
-          cargo run --quiet --locked -p neosh -- --config-dir "$scaffold" init
-          ./plugins/api/node_modules/.bin/tsc --noEmit --project "$scaffold/tsconfig.json"
-
-      # Last, because the archive only exists once something has built V8, and
-      # `if: always()` because a run that failed its tests still downloaded it.
-      - name: Save the V8 prebuilt
-        if: always() && steps.v8.outputs.cache-hit != 'true'
-        uses: actions/cache/save@v4
-        with:
-          path: target/debug/gn_out
-          key: v8-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
-
-  lint:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy, rustfmt
 
       - uses: Swatinem/rust-cache@v2
-        with:
-          cache-on-failure: true
 
-      - name: Formatting
-        run: cargo fmt --all --check
-        continue-on-error: true
-
-      # Never links, so it needs no prebuilt V8 — see the note on the job above.
-      - name: Clippy
-        run: cargo clippy --workspace --all-targets --locked
-
-  typescript:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 22
-          cache: npm
-          cache-dependency-path: plugins/api/package-lock.json
-
-      - name: Install
-        working-directory: plugins/api
-        run: npm ci
-
-      # The generated types are the wire truth; the ergonomic layer sits on top.
-      - name: The plugin API type-checks against the generated types
-        working-directory: plugins/api
-        run: npx tsc --noEmit
-
-      - name: The example plugin type-checks against the published API
-        working-directory: examples/hello-plugin
-        run: ../../plugins/api/node_modules/.bin/tsc --noEmit
-
-      # The bundled plugins are the proof that the API is sufficient: they are
-      # written against exactly what a third party has. If one stops
-      # type-checking, either the API changed under it or it reached for
-      # something that is not public.
-      - name: The bundled plugins type-check against the published API
-        working-directory: plugins/builtin
-        run: ../api/node_modules/.bin/tsc --noEmit
+      # The single source of truth: the same script contributors run locally,
+      # so "works locally" and "passes CI" are the same sentence.
+      - run: ./scripts/check.sh
