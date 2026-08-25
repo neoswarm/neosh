@@ -1,0 +1,21 @@
+{
+  "name": "@neosh/update",
+  "version": "0.1.0",
+  "description": "Says when there is a newer neosh, and becomes it.",
+  "license": "MIT",
+  "type": "module",
+  "keywords": [
+    "neosh",
+    "neosh-plugin"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/neoswarm/neosh.git",
+    "directory": "plugins/builtin/update"
+  },
+  "files": [
+    "*.ts",
+    "plugin.toml",
+    "!._*"
+  ]
+}

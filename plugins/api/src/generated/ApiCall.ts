@@ -517,4 +517,20 @@ export type ApiCall =
      * conversation is about the workspace, and is never on screen by definition.
      */
     session?: SessionId | null;
+  }
+  | {
+    "call": "update_check";
+    /**
+     * Ask the network again rather than answering from the last check.
+     */
+    force: boolean;
+  }
+  | { "call": "update_apply" }
+  | {
+    "call": "update_restart";
+    /**
+     * Restart even with turns running. Never a default; a caller sets it only after saying
+     * out loud what would be lost.
+     */
+    force: boolean;
   };
