@@ -5,6 +5,16 @@ import Terminal from "./Terminal.astro";
 <section class="hero">
   <div class="wrap">
     <h1>An <span class="hl">agent swarm</span> for power users.</h1>
+    <button class="install" type="button" data-cmd="curl -fsSL https://neoswarm.dev/install.sh | sh" aria-label="Copy install command">
+      <span class="prompt" aria-hidden="true">$</span>
+      <code>curl -fsSL https://neoswarm.dev/install.sh | sh</code>
+      <svg class="ic copy" width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <rect x="9" y="9" width="13" height="13" rx="2" /><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1" />
+      </svg>
+      <svg class="ic done" width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="M20 6 9 17l-5-5" />
+      </svg>
+    </button>
     <div class="demo">
       <Terminal />
     </div>
@@ -37,7 +47,91 @@ import Terminal from "./Terminal.astro";
     color: transparent;
   }
 
+  .install {
+    display: inline-flex;
+    align-items: center;
+    gap: 16px;
+    margin-top: 34px;
+    padding: 16px 22px;
+    background: rgba(255, 255, 255, 0.03);
+    border: 1px solid var(--line);
+    font: 500 17px/1 var(--mono);
+    color: var(--muted);
+    cursor: pointer;
+    transition: border-color 0.25s ease, color 0.25s ease;
+  }
+
+  .install:hover {
+    border-color: rgba(255, 255, 255, 0.22);
+    color: var(--fg);
+  }
+
+  .install .prompt {
+    color: var(--dim);
+  }
+
+  .install code {
+    font: inherit;
+    letter-spacing: 0.01em;
+  }
+
+  .install .ic {
+    flex: none;
+    color: var(--dim);
+    transition: color 0.25s ease;
+  }
+
+  .install:hover .ic {
+    color: var(--fg);
+  }
+
+  .install .done {
+    display: none;
+    color: var(--accent);
+  }
+
+  .install.copied .copy {
+    display: none;
+  }
+
+  .install.copied .done {
+    display: block;
+  }
+
+  @media (max-width: 560px) {
+    .install {
+      max-width: 100%;
+      overflow: hidden;
+    }
+
+    .install code {
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+  }
+
   .demo {
     margin-top: 48px;
   }
+
+  @media (prefers-reduced-motion: reduce) {
+    .install,
+    .install .ic {
+      transition: none;
+    }
+  }
 </style>
+
+<script>
+  const btn = document.querySelector<HTMLButtonElement>(".hero .install");
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  btn?.addEventListener("click", async () => {
+    try {
+      await navigator.clipboard.writeText(btn.dataset.cmd!);
+      btn.classList.add("copied");
+      clearTimeout(timer);
+      timer = setTimeout(() => btn.classList.remove("copied"), 1600);
+    } catch {}
+  });
+</script>
