@@ -646,6 +646,10 @@ pub struct Host {
     swarm_allowed: neosh_swarm::Allowed,
     /// The node's events, held here between construction and the loop taking them.
     swarm_events: Option<tokio::sync::mpsc::UnboundedReceiver<neosh_swarm::SwarmEvent>>,
+    /// Whether `[swarm] listen` was written by hand — which decides how loud a failure to bind
+    /// is. The default port being taken is the ordinary case of a second workspace; an address
+    /// somebody chose failing to bind is a config problem they would want named.
+    swarm_listen_configured: bool,
     /// What each account has left on its plan, kept between the moments anything says so.
     ///
     /// In the host and not in a plugin for the reason every capability here is: it reads a
@@ -1061,6 +1065,7 @@ impl Host {
             swarm_strangers: Default::default(),
             swarm_allowed: neosh_swarm::Allowed::load(None),
             swarm_events: None,
+            swarm_listen_configured: false,
             quota: crate::quota::QuotaStore::new(None),
             quota_tx,
             quota_rx: Some(quota_rx),
@@ -1667,7 +1672,8 @@ impl Host {
                     .map(|p| neosh_proto::SwarmNode {
                         info: p.info.clone(),
                         capabilities: p.capabilities.clone(),
-                        up: p.up,
+                        up: p.up(),
+                        link: p.link.clone(),
                         reason: p.reason.clone(),
                         agents: p.agents.clone(),
                     })
@@ -1760,8 +1766,11 @@ impl Host {
                 h.send(neosh_swarm::SwarmRequest::Pair {
                     id: node.clone(),
                     name: name.clone(),
-                    addr,
+                    addr: addr.clone(),
                 });
+                // On the board immediately, as "connecting" when we are the one dialling — the
+                // moment after pairing is exactly when somebody is watching for it to appear.
+                self.swarm.seed(node.clone(), name.clone(), addr.is_some());
                 self.swarm_strangers.remove(&node);
                 self.editor_message(MessageLevel::Info, format!("paired with {name}"));
                 self.bridge.broadcast(PluginEvent::SwarmChanged);
@@ -1786,6 +1795,27 @@ impl Host {
                 }
                 h.send(neosh_swarm::SwarmRequest::Unpair { id: node });
                 self.bridge.broadcast(PluginEvent::SwarmChanged);
+                Ok(ApiOk::Unit)
+            }
+            ApiCall::SwarmReconnect { node } => {
+                let Some(h) = &self.swarm_node else {
+                    return Err(ApiError::NotFound { what: "the swarm is not running".into() });
+                };
+                h.send(neosh_swarm::SwarmRequest::Redial { id: node.clone() });
+                // The board says "connecting" from the keystroke, not from the first failure:
+                // the state changed the moment somebody asked, and the events catch up.
+                if let Some(name) = self.swarm.peer(&node).map(|p| p.info.name.clone()) {
+                    self.swarm.seed(node.clone(), name, true);
+                    self.swarm.dial_failed(&node, 0, "dialling…".into());
+                }
+                self.bridge.broadcast(PluginEvent::SwarmChanged);
+                Ok(ApiOk::Unit)
+            }
+            ApiCall::SwarmDisconnect { node } => {
+                let Some(h) = &self.swarm_node else {
+                    return Err(ApiError::NotFound { what: "the swarm is not running".into() });
+                };
+                h.send(neosh_swarm::SwarmRequest::Disconnect { id: node });
                 Ok(ApiOk::Unit)
             }
             // Answered off the loop: it opens a socket to somewhere that may not answer.
@@ -3134,14 +3164,20 @@ impl Host {
     /// upgraded. Every failure here is a warning rather than an error — a swarm that cannot start
     /// is a feature that is unavailable, not a reason the editor should refuse to run.
     fn start_swarm(&mut self, cfg: &crate::config::SwarmConfig) {
-        if cfg.peers.is_empty() && cfg.listen.is_none() {
+        if !cfg.enabled {
             return;
         }
+        // The swarm runs whether or not anything was configured — that is what makes "add this
+        // computer" from another machine work on a fresh install. The difference `configured`
+        // makes is only how loud to be when it cannot run.
+        let configured = !cfg.peers.is_empty() || cfg.listen.is_some();
         let Some(state) = self.state_dir.clone() else {
-            self.editor_message(
-                MessageLevel::Warn,
-                "the swarm needs somewhere to keep its key, and --clean has nowhere",
-            );
+            if configured {
+                self.editor_message(
+                    MessageLevel::Warn,
+                    "the swarm needs somewhere to keep its key, and --clean has nowhere",
+                );
+            }
             return;
         };
 
@@ -3160,6 +3196,9 @@ impl Host {
         let allowed = neosh_swarm::Allowed::load(Some(&state));
         let mut peers = Vec::new();
         for (id, p) in allowed.list() {
+            // A row on the board from the first frame, so a machine being dialled reads as
+            // "connecting" rather than as a silence to explain.
+            self.swarm.seed(id.clone(), p.name.clone(), p.addr.is_some());
             if let Some(addr) = p.addr {
                 peers.push(neosh_swarm::PeerAddress { addr, expect: Some(id) });
             }
@@ -3170,10 +3209,11 @@ impl Host {
                 Some(id) => {
                     let id = neosh_proto::NodeId(id.clone());
                     allowed.add(id.clone(), neosh_swarm::AllowedPeer {
-                        name,
+                        name: name.clone(),
                         addr: Some(p.addr.clone()),
                         source: neosh_swarm::Source::Config,
                     });
+                    self.swarm.seed(id.clone(), name, true);
                     peers.push(neosh_swarm::PeerAddress {
                         addr: p.addr.clone(),
                         expect: Some(id),
@@ -3193,21 +3233,30 @@ impl Host {
         }
         self.swarm_allowed = allowed.clone();
 
-        let listen = match cfg.listen.as_deref().map(str::parse::<std::net::SocketAddr>) {
-            Some(Ok(a)) => Some(a),
-            Some(Err(e)) => {
-                self.editor_message(
-                    MessageLevel::Warn,
-                    format!("swarm.listen is not an address: {e}"),
-                );
-                None
-            }
-            None => None,
+        let listen = match cfg.listen.as_deref() {
+            // The default: reachable, so adding this computer from another one works before
+            // anything is configured. Being reachable is not being joined — pairing still takes a
+            // yes on both machines — and a taken port downgrades to dial-only with a warning.
+            None => Some(std::net::SocketAddr::from(([0, 0, 0, 0], 7717))),
+            // Dial-only, by choice. The empty string is the off switch rather than a missing
+            // key, because missing now means the default.
+            Some("") => None,
+            Some(s) => match s.parse::<std::net::SocketAddr>() {
+                Ok(a) => Some(a),
+                Err(e) => {
+                    self.editor_message(
+                        MessageLevel::Warn,
+                        format!("swarm.listen is not an address: {e}"),
+                    );
+                    None
+                }
+            },
         };
 
         if let Some(name) = &cfg.name {
             self.swarm_name = name.clone();
         }
+        self.swarm_listen_configured = cfg.listen.as_deref().is_some_and(|s| !s.is_empty());
         let node_cfg = neosh_swarm::SwarmConfig {
             name: self.swarm_name.clone(),
             listen,
@@ -3222,12 +3271,30 @@ impl Host {
             node_cfg,
             env!("CARGO_PKG_VERSION").to_string(),
         );
-        self.editor_message(
-            MessageLevel::Info,
-            format!("swarm: this node is {}", handle.id().short()),
-        );
+        // Only when somebody wrote a `[swarm]` section. On by default means this would
+        // otherwise be a line every workspace prints at every start, about a feature the
+        // person may never have met — the id is in `^J`, where the question gets asked.
+        if configured {
+            self.editor_message(
+                MessageLevel::Info,
+                format!("swarm: this node is {}", handle.id().short()),
+            );
+        }
         self.swarm_node = Some(handle);
         self.swarm_events = Some(events);
+    }
+
+    /// A fact about this workspace, published where every plugin can read it and hear it change —
+    /// the same channel `question.asking` travels on, and for the same reason: it is about the
+    /// workspace, not about whichever panel happened to learn it.
+    fn set_global_var(&mut self, key: &str, value: serde_json::Value) {
+        let scope = neosh_proto::VarScope::Global;
+        self.vars.set(&scope, key.to_string(), value.clone());
+        self.bridge.broadcast(PluginEvent::VarChanged {
+            scope,
+            key: key.to_string(),
+            value: Some(value),
+        });
     }
 
     fn swarm_self(&self) -> Option<neosh_proto::NodeInfo> {
@@ -3429,8 +3496,26 @@ impl Host {
     pub fn on_swarm_event(&mut self, event: neosh_swarm::SwarmEvent) {
         use neosh_swarm::SwarmEvent as E;
         match event {
+            E::Listening { addr } => {
+                self.set_global_var("swarm.listen", serde_json::json!({ "addr": addr.to_string() }));
+            }
+            E::ListenFailed { addr, error } => {
+                self.set_global_var(
+                    "swarm.listen",
+                    serde_json::json!({ "addr": null, "error": error.clone() }),
+                );
+                // Loud only for a listen somebody asked for by name. The default port being held
+                // by another workspace on this machine is the ordinary case of running two, and
+                // everything else — dialling, pairing outward — still works.
+                if self.swarm_listen_configured {
+                    self.editor_message(
+                        MessageLevel::Warn,
+                        format!("swarm could not listen on {addr}: {error}"),
+                    );
+                }
+            }
             E::PeerUp { node, capabilities } => {
-                let first = self.swarm.peer(&node.id).is_none_or(|p| !p.up);
+                let first = self.swarm.peer(&node.id).is_none_or(|p| !p.up());
                 self.swarm.peer_up(node.clone(), capabilities);
                 if first {
                     self.editor_message(
@@ -3442,14 +3527,19 @@ impl Host {
                 }
                 self.bridge.broadcast(PluginEvent::SwarmChanged);
             }
-            E::PeerDown { node, reason } => {
+            E::PeerDown { node, reason, will_retry } => {
                 let name = self
                     .swarm
                     .peer(&node)
                     .map(|p| p.info.name.clone())
                     .unwrap_or_else(|| node.short().to_string());
-                self.swarm.peer_down(&node, reason);
-                self.editor_message(MessageLevel::Warn, format!("lost {name}"));
+                // "Lost" is news about a machine that was here. A retry failing, a disconnect of
+                // something already down — those move the board, not the corner.
+                let was_up = self.swarm.peer(&node).is_some_and(|p| p.up());
+                self.swarm.peer_down(&node, reason, will_retry);
+                if was_up {
+                    self.editor_message(MessageLevel::Warn, format!("lost {name}"));
+                }
                 // Anything still waiting on that machine will never be answered by it.
                 let orphaned: Vec<String> = self.swarm_pending.keys().cloned().collect();
                 for id in orphaned {
@@ -3460,6 +3550,15 @@ impl Host {
                     }
                 }
                 self.bridge.broadcast(PluginEvent::SwarmChanged);
+            }
+            E::DialFailed { node, attempt, error, .. } => {
+                // Only a machine we can name has a row to update. An address with no identity
+                // yet has nothing on the board — it will appear as a stranger the moment it
+                // answers, and as a peer the moment it is paired.
+                if let Some(id) = node {
+                    self.swarm.dial_failed(&id, attempt, error);
+                    self.bridge.broadcast(PluginEvent::SwarmChanged);
+                }
             }
             E::Inventory { node, full, agents, gone } => {
                 self.swarm.inventory(&node, full, agents, gone);

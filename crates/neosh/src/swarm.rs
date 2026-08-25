@@ -11,7 +11,8 @@
 use std::collections::HashMap;
 
 use neosh_proto::{
-    AgentState, AgentSummary, NodeCapabilities, NodeId, NodeInfo, ProjectKey, SessionId, SessionInfo,
+    AgentState, AgentSummary, LinkState, NodeCapabilities, NodeId, NodeInfo, ProjectKey, SessionId,
+    SessionInfo,
 };
 
 /// One peer and everything it has told us.
@@ -21,12 +22,30 @@ pub struct Remote {
     pub capabilities: NodeCapabilities,
     /// Its agents, most recently updated first.
     pub agents: Vec<AgentSummary>,
-    /// `false` once it has gone. The row stays rather than vanishing: a machine you were working
-    /// with going quiet is information, and a list that silently shortens is one you cannot tell
-    /// from a list that never had it.
-    pub up: bool,
-    /// Why it went, when it did.
+    /// Where the connection stands. When it is not [`LinkState::Up`] the row stays rather than
+    /// vanishing: a machine you were working with going quiet is information, and a list that
+    /// silently shortens is one you cannot tell from a list that never had it.
+    pub link: LinkState,
+    /// Whether it has ever been up this run — what tells `connecting` from `reconnecting`, which
+    /// are the same state to the dialler and different sentences to a person.
+    ever_up: bool,
+    /// Why it is not up, when it is not.
     pub reason: Option<String>,
+}
+
+impl Remote {
+    pub fn up(&self) -> bool {
+        matches!(self.link, LinkState::Up)
+    }
+
+    /// The state a dial that did not produce a connection leaves the row in.
+    fn not_up(&self, attempt: u32) -> LinkState {
+        if self.ever_up {
+            LinkState::Retrying { attempt }
+        } else {
+            LinkState::Connecting { attempt }
+        }
+    }
 }
 
 /// Every node this one knows about, and what it has.
@@ -38,28 +57,65 @@ pub struct Swarm {
 }
 
 impl Swarm {
+    /// A machine we know about before it has said anything: paired, and about to be dialled — or
+    /// waited for. Gives the board a row from the first frame, so "connecting…" is a state a
+    /// person can watch rather than a silence they have to explain.
+    ///
+    /// `dialled` is whether a dialler is working on it. A peer that only ever dials *us* is
+    /// [`LinkState::Down`] until it shows up — nothing on this machine is trying, and a row that
+    /// says "connecting" about nobody's work is a promise nothing is keeping.
+    pub fn seed(&mut self, id: NodeId, name: String, dialled: bool) {
+        self.peers.entry(id.clone()).or_insert_with(|| Remote {
+            info: NodeInfo { id, name, os: String::new(), version: String::new() },
+            capabilities: NodeCapabilities {
+                accepts_commands: false,
+                accepts_approvals: false,
+                streams: false,
+                projects: Vec::new(),
+            },
+            agents: Vec::new(),
+            link: if dialled { LinkState::Connecting { attempt: 0 } } else { LinkState::Down },
+            ever_up: false,
+            reason: None,
+        });
+    }
+
     pub fn peer_up(&mut self, info: NodeInfo, capabilities: NodeCapabilities) {
         let entry = self.peers.entry(info.id.clone()).or_insert_with(|| Remote {
             info: info.clone(),
             capabilities: capabilities.clone(),
             agents: Vec::new(),
-            up: true,
+            link: LinkState::Up,
+            ever_up: true,
             reason: None,
         });
         entry.info = info;
         entry.capabilities = capabilities;
-        entry.up = true;
+        entry.link = LinkState::Up;
+        entry.ever_up = true;
         entry.reason = None;
     }
 
-    pub fn peer_down(&mut self, node: &NodeId, reason: String) {
+    pub fn peer_down(&mut self, node: &NodeId, reason: String, will_retry: bool) {
         if let Some(p) = self.peers.get_mut(node) {
-            p.up = false;
+            p.link = if will_retry { p.not_up(0) } else { LinkState::Down };
             p.reason = Some(reason);
             // Its agents are *not* cleared. They were real a moment ago and are probably still
             // running; what changed is that we can no longer see them. A board that empties a
             // machine's rows the instant a wifi hiccup drops a connection is one that makes you
             // think work was lost.
+        }
+    }
+
+    /// A dial at a peer failed. Moves the count along and keeps the freshest reason; never
+    /// touches a row that is up, because the dialler saying "could not connect" about a
+    /// connection the listener holds is the losing half of a simultaneous open talking.
+    pub fn dial_failed(&mut self, node: &NodeId, attempt: u32, error: String) {
+        if let Some(p) = self.peers.get_mut(node)
+            && !p.up()
+        {
+            p.link = p.not_up(attempt);
+            p.reason = Some(error);
         }
     }
 
@@ -105,7 +161,10 @@ impl Swarm {
     /// visible next to them — but is left out here, because this is what a list of things you can
     /// act on is built from and you cannot act on those.
     pub fn agents(&self) -> impl Iterator<Item = (&NodeInfo, &AgentSummary)> {
-        self.peers.values().filter(|p| p.up).flat_map(|p| p.agents.iter().map(move |a| (&p.info, a)))
+        self.peers
+            .values()
+            .filter(|p| p.up())
+            .flat_map(|p| p.agents.iter().map(move |a| (&p.info, a)))
     }
 
     /// Tell the swarm which projects this machine has, so it can answer [`Self::hosts_of`].
@@ -123,7 +182,7 @@ impl Swarm {
         let mut names: Vec<&str> = self
             .peers
             .values()
-            .filter(|p| p.up && p.agents.iter().any(|a| &a.project == key))
+            .filter(|p| p.up() && p.agents.iter().any(|a| &a.project == key))
             .map(|p| p.info.name.as_str())
             .collect();
         names.sort_unstable();
@@ -252,10 +311,10 @@ mod tests {
     #[test]
     fn a_peer_that_goes_down_keeps_its_rows_but_leaves_the_actionable_list() {
         let mut s = with_two();
-        s.peer_down(&NodeId("bb".into()), "connection closed".into());
+        s.peer_down(&NodeId("bb".into()), "connection closed".into(), true);
 
         let bb = s.peer(&NodeId("bb".into())).expect("still listed");
-        assert!(!bb.up);
+        assert!(!bb.up());
         assert_eq!(bb.reason.as_deref(), Some("connection closed"));
         assert_eq!(bb.agents.len(), 1, "and its conversations are still described");
 
@@ -270,11 +329,75 @@ mod tests {
     #[test]
     fn a_peer_that_comes_back_is_the_same_row() {
         let mut s = with_two();
-        s.peer_down(&NodeId("bb".into()), "gone".into());
+        s.peer_down(&NodeId("bb".into()), "gone".into(), true);
         s.peer_up(node("bb", "linux-box"), caps());
         let bb = s.peer(&NodeId("bb".into())).expect("peer");
-        assert!(bb.up);
+        assert!(bb.up());
         assert_eq!(bb.reason, None, "and it is no longer explaining itself");
+    }
+
+    /// The difference a person reads: a peer that was here is `reconnecting`, one that never
+    /// answered is still `connecting`, and one nothing is dialling is `down` — three sentences
+    /// the dialler's single loop cannot tell apart on its own.
+    #[test]
+    fn a_lost_peer_retries_and_a_never_seen_peer_connects() {
+        let mut s = Swarm::default();
+        s.seed(NodeId("aa".into()), "mac-studio".into(), true);
+        assert_eq!(
+            s.peer(&NodeId("aa".into())).expect("seeded").link,
+            LinkState::Connecting { attempt: 0 },
+            "a seeded row is being dialled from the first frame"
+        );
+
+        s.dial_failed(&NodeId("aa".into()), 3, "connection refused".into());
+        let aa = s.peer(&NodeId("aa".into())).expect("peer");
+        assert_eq!(aa.link, LinkState::Connecting { attempt: 3 }, "never up, still connecting");
+        assert_eq!(aa.reason.as_deref(), Some("connection refused"));
+
+        s.peer_up(node("aa", "mac-studio"), caps());
+        s.peer_down(&NodeId("aa".into()), "connection closed".into(), true);
+        s.dial_failed(&NodeId("aa".into()), 1, "no route to host".into());
+        assert_eq!(
+            s.peer(&NodeId("aa".into())).expect("peer").link,
+            LinkState::Retrying { attempt: 1 },
+            "once it has been up, the same failure reads as reconnecting"
+        );
+
+        s.peer_down(&NodeId("aa".into()), "disconnected by you".into(), false);
+        assert_eq!(
+            s.peer(&NodeId("aa".into())).expect("peer").link,
+            LinkState::Down,
+            "and with no dialler behind it, it is simply down"
+        );
+    }
+
+    /// A peer that only dials us is not "connecting": nothing here is trying.
+    #[test]
+    fn a_seeded_peer_nobody_dials_is_down_not_connecting() {
+        let mut s = Swarm::default();
+        s.seed(NodeId("aa".into()), "laptop".into(), false);
+        assert_eq!(s.peer(&NodeId("aa".into())).expect("seeded").link, LinkState::Down);
+    }
+
+    /// The losing half of a simultaneous open reports a failure a moment after the winning half
+    /// connected. That report must not repaint an up row.
+    #[test]
+    fn a_dial_failure_never_downgrades_an_up_peer() {
+        let mut s = with_two();
+        s.dial_failed(&NodeId("aa".into()), 1, "connection reset".into());
+        let aa = s.peer(&NodeId("aa".into())).expect("peer");
+        assert!(aa.up(), "the connection the listener holds is the truth");
+        assert_eq!(aa.reason, None);
+    }
+
+    /// Seeding is idempotent and never clobbers a row that has learned anything.
+    #[test]
+    fn seeding_an_existing_row_changes_nothing() {
+        let mut s = with_two();
+        s.seed(NodeId("aa".into()), "renamed".into(), true);
+        let aa = s.peer(&NodeId("aa".into())).expect("peer");
+        assert_eq!(aa.info.name, "mac-studio");
+        assert!(aa.up());
     }
 
     /// Inventory from a node we have no record of is dropped rather than inventing a peer with no
