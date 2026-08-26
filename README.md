@@ -24,7 +24,7 @@
     <a href="#contributing">Contributing</a>
   </p>
 
-  <p><i>⭐ A star helps more people find it. Thank you.</i></p>
+  <p><i>⭐ Help us reach more terminal lovers. Star this repo!</i></p>
 
   <img src="docs/demo.gif" width="100%" alt="neosh running two conversations at once: a turn fixing a flaky test, switching sessions mid-turn, the finished turn going unread, and the transcript read in normal mode" />
 </div>
