@@ -22,7 +22,11 @@ repo="neoswarm/neosh"
 base="https://github.com/$repo/releases/download/$tag"
 
 sha_for() {
-  local target="$1" url="$base/neosh-$target.tar.gz.sha256"
+  # One name per `local`: bash creates every name in a `local` declaration before it assigns any of
+  # them, so `local a="$1" b="$a"` expands `$a` as the *new, unset* local — which under `set -u` is
+  # an error rather than the outer value somebody expected.
+  local target="$1"
+  local url="$base/neosh-$target.tar.gz.sha256"
   local line
   # The file is `<sha256>  <filename>`, which is what `shasum -a 256` writes.
   line=$(curl -fsSL "$url") || {
