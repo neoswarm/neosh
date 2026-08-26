@@ -89,4 +89,18 @@ for dir in plugins/builtin/*/; do
   fi
 done
 
+# A script a workflow invokes as `./script` has to be executable *in git*. This repository is
+# often checked out on a volume that cannot store the bit, so `chmod +x` here changes nothing that
+# gets committed — and the failure is a release job exiting 126 on a runner, an hour after anyone
+# could have noticed.
+step "the scripts a workflow runs are executable"
+for script in scripts/*.sh; do
+  mode=$(git ls-files -s "$script" | cut -d' ' -f1)
+  if [ "$mode" != "100755" ]; then
+    echo "error: $script is $mode in git, not 100755." >&2
+    echo "       fix with: git update-index --chmod=+x $script" >&2
+    exit 1
+  fi
+done
+
 printf '\n\033[32mall checks passed\033[0m\n'
