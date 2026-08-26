@@ -196,8 +196,18 @@ safe to re-run a half-failed release.
 Then regenerate the Homebrew formula, as in step 8 — a release nobody points Homebrew at is a
 release `brew upgrade` cannot see.
 
-A new crate or a new bundled plugin needs its own first manual publish and its own trusted
-publisher, exactly as above. Nothing else does.
+**A new crate or a new bundled plugin needs its own first manual publish and its own trusted
+publisher**, exactly as in steps 3–5. Nothing else does — and this is the one part of a release that
+bites, because the need for it only appears when the workflow fails:
+
+```sh
+(cd plugins/builtin/<name> && npm publish --access public)
+npm trust github "@neosh/<name>" --file publish-npm.yml --repo neoswarm/neosh --allow-publish
+```
+
+`publish-npm.yml` carries on past one that fails and reports the names at the end, so the rest of a
+release still goes out — a name npm has never seen used to stop every package alphabetically after
+it, which is how `@neosh/usage` sat a version behind `@neosh/update`.
 
 ---
 

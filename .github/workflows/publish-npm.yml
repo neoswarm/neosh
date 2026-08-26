@@ -34,7 +34,13 @@ jobs:
 
       - name: Publish what npm does not have yet
         run: |
-          set -euo pipefail
+          # Not `set -e`: one package failing must not take the rest with it. The loop is
+          # alphabetical, so when `@neosh/update` was added and could not be published — a name npm
+          # has never seen has no trusted publisher, and OIDC cannot do a first publish — it also
+          # stopped `@neosh/usage`, which had nothing wrong with it and sat a version behind.
+          # Failures are collected and reported at the end instead.
+          set -uo pipefail
+          failed=""
           # `npm/neosh` is not in this list on purpose: the launcher's optional dependencies are
           # the four binaries, so it goes up in release.yml after they do. Publishing it here would
           # put a launcher on npm before there was anything for it to launch.
@@ -47,5 +53,16 @@ jobs:
               continue
             fi
             echo "publish $name@$version"
-            (cd "$dir" && npm publish --access public --provenance)
+            if ! (cd "$dir" && npm publish --access public --provenance); then
+              # A name npm has never seen is the expected case here, and it is a person's job:
+              # publish it once by hand, then add its trusted publisher. Everything else carries on.
+              echo "::warning::$name@$version was not published"
+              failed="$failed $name"
+            fi
           done
+          if [ -n "$failed" ]; then
+            echo "::error::not published:$failed"
+            echo "A package npm has never seen cannot be published by OIDC. Publish it once by"
+            echo "hand, then: npm trust github <name> --file publish-npm.yml --repo neoswarm/neosh"
+            exit 1
+          fi
