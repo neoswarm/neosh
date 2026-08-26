@@ -51,6 +51,12 @@ a {
   padding: 0 40px;
 }
 
+@media (max-width: 640px) {
+  .wrap {
+    padding: 0 16px;
+  }
+}
+
 .grid-bg {
   position: fixed;
   inset: 0;
