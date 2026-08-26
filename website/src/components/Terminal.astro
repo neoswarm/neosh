@@ -3,6 +3,7 @@
     <source type="image/webp" srcset="/hero-bg-800.webp 800w, /hero-bg-1600.webp 1600w" sizes="(max-width: 900px) 100vw, 1520px" />
     <img class="stage-bg" src="/hero-bg-1600.jpg" alt="" width="1600" height="889" fetchpriority="high" decoding="async" />
   </picture>
+  <div class="term-scroll">
   <div class="term" id="neosh-demo" aria-hidden="true">
     <div class="term-bar">
       <span class="dot red"></span>
@@ -52,11 +53,12 @@
           <div class="row"><span class="prompt">› </span><span id="draft"></span><span class="caret" id="caret"></span><span class="ph" id="ph">Ask anything, or run a command</span></div>
         </div>
         <div class="term-status">
-          <span class="t"><span class="cmt"> <span id="st-mode">chat</span>  </span><span class="ok">full access</span><span class="cmt"> </span><span class="key">⇧⇥</span><span class="cmt">  </span><span class="warn">glad-sparrow ●2</span><span class="cmt">  ██░░░░░░ 22% of 1.0M  ↑12.4k ↓3.1k</span></span>
-          <span class="r"><span id="st-turn" class="hidden"><span class="spin blue" data-spin>⠋</span><span class="live-fg"> </span><span id="st-elapsed" class="live-fg elapsed">0s</span><span>  </span></span><span class="acc">claude-fable-5</span><span> </span><span class="key">^P</span><span class="cmt">  High 1M </span><span class="key">^E</span><span> </span></span>
+          <span class="t"><span class="cmt"> <span id="st-mode">chat</span>  </span><span class="ok">full access</span><span class="cmt"> </span><span class="key">⇧⇥</span><span class="st-wide"><span class="cmt">  </span><span class="warn">glad-sparrow ●2</span><span class="cmt">  ██░░░░░░ 22% of 1.0M  ↑12.4k ↓3.1k</span></span></span>
+          <span class="r"><span id="st-turn" class="hidden"><span class="spin blue" data-spin>⠋</span><span class="live-fg"> </span><span id="st-elapsed" class="live-fg elapsed">0s</span><span>  </span></span><span class="acc">claude-fable-5</span><span> </span><span class="key">^P</span><span class="st-wide"><span class="cmt">  High 1M </span><span class="key">^E</span></span><span> </span></span>
         </div>
       </div>
     </div>
+  </div>
   </div>
 
   <div class="mini" aria-hidden="true">
@@ -104,10 +106,11 @@
     --add-gut: #1d3d2a;
     --del-gut: #4c2426;
 
+    --stage-pad-x: clamp(24px, 5vw, 76px);
     position: relative;
     border-radius: 8px;
     overflow: hidden;
-    padding: clamp(24px, 5vw, 76px);
+    padding: clamp(24px, 5vw, 76px) var(--stage-pad-x);
     /* a 358-byte thumbnail of the backdrop, painted before any request: the
        real image swaps in over the same picture, never over a flat colour */
     background: #22211d url("data:image/jpeg;base64,/9j/2wBDABQUFBQVFBcZGRcfIh4iHy4rJycrLkYyNjI2MkZqQk5CQk5Cal5yXVZdcl6phXZ2hanDpJukw+zT0+z/////////2wBDARQUFBQVFBcZGRcfIh4iHy4rJycrLkYyNjI2MkZqQk5CQk5Cal5yXVZdcl6phXZ2hanDpJukw+zT0+z/////////wgARCAANABgDASIAAhEBAxEB/8QAGAAAAgMAAAAAAAAAAAAAAAAAAAQDBQb/xAAVAQEBAAAAAAAAAAAAAAAAAAAAAf/aAAwDAQACEAMQAAAAz06VgAuR/8QAGxAAAgIDAQAAAAAAAAAAAAAAAQIAEQMSITH/2gAIAQEAAT8AUbeRcRMONBdsLmPYHjERF2HWMdaJ7P/EABURAQEAAAAAAAAAAAAAAAAAAAEQ/9oACAECAQE/AGf/xAAUEQEAAAAAAAAAAAAAAAAAAAAQ/9oACAEDAQE/AD//2Q==") center / cover no-repeat;
@@ -443,10 +446,38 @@
   .stage .mhint { margin-top: 4px; }
 
   @media (max-width: 900px) {
-    .stage .side,
-    .stage .vrule { display: none; }
-    #neosh-demo { font-size: 12px; }
-    .stage .term-body { height: 480px; }
+    /* The sidebar is the product — the projects, the swarm, the plan — so it
+       stays, at full size, anchored to the left edge. The window keeps its
+       width and runs past the right edge instead: the scroller pans to the
+       chat, and the mid-character crop is what says there is more. */
+    #neosh-demo { font-size: 12px; min-width: 97ch; }
+    .stage .term-scroll {
+      overflow-x: auto;
+      margin: 0 calc(var(--stage-pad-x) * -1);
+      padding: 0 var(--stage-pad-x);
+      scrollbar-width: none;
+    }
+    .stage .term-scroll::-webkit-scrollbar { display: none; }
+    /* em, not px: the height has to follow the font size down so a scaled
+       terminal keeps the same number of rows instead of gaining empty ones */
+    .stage .term-body { height: 42em; }
+    /* the context meter, the option summary, a benchmark's second tail and
+       the last two welcome hints are the only rows wider than the 62ch the
+       main column has at 97ch; everything else fits without hunting */
+    .stage .st-wide { display: none; }
+    /* the keycaps anchor to the edge that is actually on screen */
+    .stage .hud { left: 12px; right: auto; }
+  }
+
+  @media (max-width: 640px) {
+    .stage { --stage-pad-x: 10px; padding: 14px var(--stage-pad-x); }
+    #neosh-demo { font-size: 11px; }
+    .stage .term-bar { padding: 9px 11px; }
+    .stage .dot { width: 9px; height: 9px; }
+    .stage .term-title { font-size: 11px; }
+    .stage .hud { bottom: 44px; }
+    .stage .keycap { font-size: 10px; padding: 4px 7px; border-radius: 6px; }
+    .stage .keycap .what { font-size: 9.5px; }
   }
 
   @media (max-width: 1250px) {
@@ -542,7 +573,7 @@
     add('<span class="cmt">  model      </span>anthropic/claude-fable-5<span class="cmt">  ·  max</span>');
     add('<span class="cmt">  directory  </span>~/projects/neosh/.worktrees/glad-sparrow');
     blank();
-    add('<span class="key">  ⏎</span><span class="cmt"> send   </span><span class="key">^S</span><span class="cmt"> browse &amp; copy   </span><span class="key">^P</span><span class="cmt"> model   </span><span class="key">^T</span><span class="cmt"> projects   </span><span class="key">^Z</span><span class="cmt"> every key</span>');
+    add('<span class="key">  ⏎</span><span class="cmt"> send   </span><span class="key">^S</span><span class="cmt"> browse &amp; copy   </span><span class="key">^P</span><span class="cmt"> model</span><span class="st-wide"><span class="cmt">   </span><span class="key">^T</span><span class="cmt"> projects   </span><span class="key">^Z</span><span class="cmt"> every key</span></span>');
   }
 
   function showWorking(label: string) {
@@ -866,7 +897,7 @@
     await sleep(1700);
 
     // this conversation is mid-turn too, on its own clock
-    bench.done(['<span class="cmt">14 runs</span>', '<span class="cmt">6.1 ms ± 0.2 ms</span>']);
+    bench.done(['<span class="cmt">14 runs</span>', '<span class="st-wide cmt">6.1 ms ± 0.2 ms</span>']);
     await sleep(900);
 
     // meanwhile the first conversation finishes, off screen

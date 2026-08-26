@@ -70,7 +70,7 @@ const faqs = [
 
   .two {
     display: grid;
-    grid-template-columns: minmax(0, 0.72fr) minmax(0, 1.28fr);
+    grid-template-columns: minmax(0, 0.85fr) minmax(0, 1.15fr);
     gap: 24px 72px;
     align-items: start;
   }
@@ -88,7 +88,10 @@ const faqs = [
 
   .headline {
     font-family: "Geist", var(--sans);
-    font-size: clamp(29px, 3vw, 42px);
+    /* "what people want to know." is ~12.75em of Geist 600, so this is the
+       size at which it exactly fills the rail — any larger and it breaks
+       into a third line with "know." alone on it */
+    font-size: clamp(27px, calc(3.2vw - 5px), 48px);
     font-weight: 600;
     letter-spacing: normal;
     line-height: 1.25;
@@ -234,6 +237,11 @@ const faqs = [
 
     .rail {
       position: static;
+    }
+
+    .headline {
+      /* single column now: the same fit, against the page width */
+      font-size: clamp(25px, calc((100vw - 84px) / 13), 48px);
     }
 
     .lede {
