@@ -1,8 +1,20 @@
 ---
 layout: ../../layouts/Docs.astro
 title: Docs for agents
-description: Give your coding agent one file and it knows how to build neosh plugins. Install the skill, or paste one prompt.
+description: Give your coding agent one file and it knows how to build neosh plugins, or how to run neosh itself. Install a skill, or paste one prompt.
 ---
+
+## Two skills, for two different jobs
+
+**Writing plugins** — everything below. The agent learns the API, the sandbox and how to verify its work.
+
+**Driving neosh** — running conversations in it, fanning work out across worktrees, collecting the results. That one ships in the binary:
+
+```sh
+neosh skill install
+```
+
+It writes into `.claude/skills/`, `.agents/skills/` (Codex and the shared Agent Skills location), `.cursor/skills/` and `.gemini/skills/`; `--project` scopes it to a repository, `--agent` picks one. [Scripting](/docs/scripting) is the human version. Installing both is normal — they never overlap.
 
 ## The fastest path
 

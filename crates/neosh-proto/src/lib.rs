@@ -38,4 +38,8 @@ pub use vcs::*;
 
 /// Protocol version. Bumped on any breaking change to the types in this crate; the host refuses to
 /// load a plugin whose `@neosh/api` was built against a different major.
-pub const PROTOCOL_VERSION: u32 = 1;
+///
+/// 2 added [`ClientMessage::Call`] and [`ClientMessage::Subscribe`]. Additive on the wire, and
+/// bumped anyway: a workspace from before them answers a control call by ignoring the line, which
+/// is a client waiting forever rather than a client being told to run `neosh stop`.
+pub const PROTOCOL_VERSION: u32 = 2;

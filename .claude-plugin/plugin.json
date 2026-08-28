@@ -1,0 +1,13 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-plugin-manifest.json",
+  "name": "neosh",
+  "displayName": "neosh",
+  "description": "Run and manage long-lived coding agents in a neosh workspace: start conversations in any directory or worktree, fan work out across many at once, watch and steer them, collect what they produced.",
+  "version": "0.2.0",
+  "author": { "name": "neoswarm", "url": "https://github.com/neoswarm" },
+  "homepage": "https://github.com/neoswarm/neosh",
+  "repository": "https://github.com/neoswarm/neosh",
+  "license": "MIT",
+  "keywords": ["neosh", "agent", "orchestration", "terminal", "parallel"],
+  "skills": ["./crates/neosh/skills/"]
+}

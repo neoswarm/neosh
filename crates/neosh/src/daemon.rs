@@ -36,14 +36,32 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use neosh_proto::{
-    ClientMessage, DetachReason, InputEvent, RunningTurn, ServerMessage, WorkspaceStatus,
+    ApiCall, ApiError, ApiResponse, ClientMessage, DetachReason, InputEvent, PluginEvent,
+    RunningTurn, ServerMessage, WorkspaceStatus,
 };
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
-use tokio::sync::{Mutex, mpsc};
+use tokio::sync::{Mutex, mpsc, oneshot};
 
 use crate::clients::{ClientId, Clients, Frame, Source};
 use crate::frontend::Frontend;
+
+/// What a connection with no screen wants, on its way to the host.
+///
+/// The other channel out of here carries [`InputEvent`]s, which are what a *view* does — a key, a
+/// resize, a command pressed somewhere. This one is for a caller that has no view at all: a
+/// script, `neosh agent`, a web service. Kept apart on purpose, because folding them together
+/// would mean every consumer of the input stream growing a case for events that name no terminal.
+pub enum Control {
+    /// One [`ApiCall`], answered exactly once.
+    ///
+    /// The reply travels on a `oneshot` rather than back through this channel so the host can hand
+    /// it to a task and forget about it: a `git status` is a subprocess and `session.messages` is
+    /// a map lookup, and making the fast one wait behind the slow one is a queue nobody asked for.
+    Call { call: ApiCall, reply: oneshot::Sender<ApiResponse> },
+    /// Everything the workspace broadcasts, until the far end stops reading.
+    Subscribe { events: mpsc::UnboundedSender<PluginEvent> },
+}
 
 /// What the workspace is doing, for anyone who asks without attaching.
 ///
@@ -160,6 +178,7 @@ pub struct Daemon {
     listener: UnixListener,
     clients: Arc<Mutex<Clients>>,
     to_host: mpsc::UnboundedSender<(Source, InputEvent)>,
+    to_control: mpsc::UnboundedSender<Control>,
     live: Arc<Live>,
 }
 
@@ -198,10 +217,12 @@ impl Daemon {
             let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
         }
         let (to_host, _) = mpsc::unbounded_channel();
+        let (to_control, _) = mpsc::unbounded_channel();
         Ok(Self {
             listener,
             clients: Arc::new(Mutex::new(Clients::default())),
             to_host,
+            to_control,
             live: Live::new(),
         })
     }
@@ -215,10 +236,18 @@ impl Daemon {
     /// Called once, before [`Self::serve`]. The host then runs forever, with clients coming and
     /// going underneath it — which is the whole point: the run loop never learns that anybody
     /// attached, beyond one [`InputEvent::Attached`] telling it to say everything again.
-    pub fn wire(&mut self) -> (Box<dyn Frontend>, mpsc::UnboundedReceiver<(Source, InputEvent)>) {
+    pub fn wire(
+        &mut self,
+    ) -> (
+        Box<dyn Frontend>,
+        mpsc::UnboundedReceiver<(Source, InputEvent)>,
+        mpsc::UnboundedReceiver<Control>,
+    ) {
         let (tx, rx) = mpsc::unbounded_channel();
         self.to_host = tx;
-        (Box::new(Viewer::new(self.clients.clone())), rx)
+        let (ctx, crx) = mpsc::unbounded_channel();
+        self.to_control = ctx;
+        (Box::new(Viewer::new(self.clients.clone())), rx, crx)
     }
 
     /// Accept clients until the process ends. Runs alongside the host, not instead of it.
@@ -228,6 +257,7 @@ impl Daemon {
             let this = Handle {
                 clients: self.clients.clone(),
                 to_host: self.to_host.clone(),
+                to_control: self.to_control.clone(),
                 live: self.live.clone(),
             };
             tokio::spawn(async move { this.client(stream).await });
@@ -245,6 +275,7 @@ impl Daemon {
 struct Handle {
     clients: Arc<Mutex<Clients>>,
     to_host: mpsc::UnboundedSender<(Source, InputEvent)>,
+    to_control: mpsc::UnboundedSender<Control>,
     live: Arc<Live>,
 }
 
@@ -269,6 +300,18 @@ impl Handle {
         });
 
         let mut source: Option<Source> = None;
+        // Two lists, and the difference is whether the task will ever finish by itself.
+        //
+        // An answer will: the host replies to every call exactly once, or drops the sender, and
+        // either settles the `oneshot`. So it is *awaited* — a caller that writes a request and
+        // then closes its write half is still waiting to read the reply, and dropping it there
+        // would be a hang rather than an error.
+        //
+        // A watcher will not: it is parked on `recv()` for as long as the workspace runs, holding
+        // a clone of `out`. Awaiting one would mean the wait for the writer below never finishes —
+        // a leaked task and a leaked socket for every script that ever watched a quiet workspace.
+        let mut answers: Vec<tokio::task::JoinHandle<()>> = Vec::new();
+        let mut watchers: Vec<tokio::task::JoinHandle<()>> = Vec::new();
         while let Ok(Some(line)) = lines.next_line().await {
             if line.trim().is_empty() {
                 continue;
@@ -306,7 +349,7 @@ impl Handle {
                     self.to_host.closed().await;
                     break;
                 }
-                ClientMessage::Attach { protocol_version, width, height, build } => {
+                ClientMessage::Attach { protocol_version, width, height, build, session } => {
                     if protocol_version != neosh_proto::PROTOCOL_VERSION {
                         let _ = out.send(ServerMessage::Refused {
                             reason: format!(
@@ -342,7 +385,8 @@ impl Handle {
                     // Its own size. It used to be the smallest attached terminal's, because every
                     // view shared one transcript; a view has its own now, so a wide window is
                     // furnished wide and nobody else's screen is involved.
-                    let _ = self.to_host.send((from, InputEvent::Attached { width, height }));
+                    let _ =
+                        self.to_host.send((from, InputEvent::Attached { width, height, session }));
                 }
                 ClientMessage::Input { event } => {
                     let Some(from) = source else {
@@ -388,7 +432,50 @@ impl Handle {
                     let _ = out.send(ServerMessage::Detached { reason: DetachReason::Asked });
                     break;
                 }
+                // Neither of the two below attaches anything. A control connection has no screen,
+                // so it is not in `Clients`, is never sent a frame, never takes a terminal over,
+                // and `neosh status` does not count it as somebody watching — which matters,
+                // because "nobody is watching" is what decides whether a notification leaves the
+                // terminal.
+                ClientMessage::Call { id, call } => {
+                    let (tx, rx) = oneshot::channel();
+                    if self.to_control.send(Control::Call { call, reply: tx }).is_err() {
+                        break;
+                    }
+                    // Off the read loop, so a caller may have several in flight and a slow one
+                    // does not stop the next line being read. Answers therefore arrive in
+                    // whatever order they finish in, which is what the id is for.
+                    let out = out.clone();
+                    answers.push(tokio::spawn(async move {
+                        let response = rx.await.unwrap_or_else(|_| ApiResponse::Err {
+                            error: ApiError::Internal {
+                                message: "the workspace stopped before it answered".into(),
+                            },
+                        });
+                        let _ = out.send(ServerMessage::Called { id, response });
+                    }));
+                }
+                ClientMessage::Subscribe => {
+                    let (tx, mut rx) = mpsc::unbounded_channel();
+                    if self.to_control.send(Control::Subscribe { events: tx }).is_err() {
+                        break;
+                    }
+                    let out = out.clone();
+                    watchers.push(tokio::spawn(async move {
+                        while let Some(event) = rx.recv().await {
+                            if out.send(ServerMessage::Event { event }).is_err() {
+                                break;
+                            }
+                        }
+                    }));
+                }
             }
+        }
+        for h in watchers {
+            h.abort();
+        }
+        for h in answers {
+            let _ = h.await;
         }
 
         // However this connection ended — asked to leave, took a signal, or the terminal it was in

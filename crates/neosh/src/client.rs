@@ -153,9 +153,16 @@ fn line(msg: &ClientMessage) -> anyhow::Result<Vec<u8>> {
 }
 
 /// Attach this terminal to `stream` and draw until something ends it.
-pub async fn attach(stream: UnixStream) -> anyhow::Result<Ended> {
+///
+/// `session` is the conversation to open in, which is `None` for every attach but the one
+/// `neosh "a prompt"` makes: it has just started a conversation and this terminal is the reason
+/// it did. See [`neosh_proto::InputEvent::Attached`].
+pub async fn attach(
+    stream: UnixStream,
+    session: Option<neosh_proto::SessionId>,
+) -> anyhow::Result<Ended> {
     let (mut ui, mut input_rx) = TerminalUi::enter()?;
-    let result = run(stream, &mut ui, &mut input_rx).await;
+    let result = run(stream, session, &mut ui, &mut input_rx).await;
     // The terminal comes back whatever happened, including a failure: leaving somebody in the
     // alternate screen with no program running is worse than any error message.
     let _ = ui.shutdown().await;
@@ -164,6 +171,7 @@ pub async fn attach(stream: UnixStream) -> anyhow::Result<Ended> {
 
 async fn run(
     stream: UnixStream,
+    session: Option<neosh_proto::SessionId>,
     ui: &mut TerminalUi,
     input_rx: &mut tokio::sync::mpsc::UnboundedReceiver<InputEvent>,
 ) -> anyhow::Result<Ended> {
@@ -187,6 +195,7 @@ async fn run(
             width,
             height,
             build: crate::build::capture().clone(),
+            session,
         })?)
         .await?;
     write.flush().await?;
@@ -257,7 +266,12 @@ async fn run(
                             .await?;
                         }
                     }
-                    Ok(ServerMessage::Status { .. }) => {}
+                    // A terminal asks nothing over the control surface, so anything arriving on
+                    // these is a workspace answering somebody else's question on our socket —
+                    // which cannot happen, and is not a reason to stop drawing if it ever does.
+                    Ok(ServerMessage::Status { .. })
+                    | Ok(ServerMessage::Called { .. })
+                    | Ok(ServerMessage::Event { .. }) => {}
                     Err(e) => tracing::warn!("ignoring unparseable workspace message: {e}"),
                 }
             }

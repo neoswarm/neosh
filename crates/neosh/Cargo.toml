@@ -33,6 +33,9 @@ tokio-util = { workspace = true }
 futures = { workspace = true }
 clap = { workspace = true }
 directories = { workspace = true }
+# Embeds the skill so `neosh skill install` works from a released binary rather than only in a
+# checkout. See `src/skill.rs` for why the tree lives under this crate.
+include_dir = { workspace = true }
 shellexpand = { workspace = true }
 sha2 = { workspace = true }
 secrecy = { workspace = true }

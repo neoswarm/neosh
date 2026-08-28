@@ -147,6 +147,9 @@ struct Startup {
     /// Held and retried, then reported only if it still does not resolve once everything has loaded
     /// — the same shape as a held option value.
     pending_model: Option<String>,
+    /// A prompt from the command line, said once everything that could answer it has loaded.
+    /// See [`Bootstrap::first_prompt`].
+    first_prompt: Option<String>,
     /// Commands a frontend asked for before anything had registered them.
     ///
     /// Held for the same reason `deferred` and `reload_pending` are: a command belongs to a plugin,
@@ -179,6 +182,15 @@ pub struct Bootstrap {
     pub reload: Box<dyn Fn() -> anyhow::Result<Resolved>>,
     pub cli_model: Option<String>,
     pub cli_plugin_dirs: Vec<std::path::PathBuf>,
+    /// Say this as soon as there is something that can answer it.
+    ///
+    /// `neosh "a prompt"` in a process that *is* its own workspace — `--no-daemon`, the stdio
+    /// protocol, the tests. The attaching client cannot do it there, because there is nothing to
+    /// attach to: this process is both ends. It waits for the end of startup rather than firing at
+    /// launch, because until plugins have loaded there may be no provider that can serve the model
+    /// the config asked for, and a turn started against nothing is an error message where an
+    /// answer should be.
+    pub first_prompt: Option<String>,
 }
 
 /// What the transcript reader is waiting for, after a key that cannot act on its own.
@@ -686,6 +698,18 @@ pub struct Host {
     /// Holds the gathered burst; the run loop is what delivers it, because only the run loop can
     /// ask the frontend whether anybody is looking. See [`crate::notify`].
     notifier: crate::notify::Notifier,
+    /// Calls arriving from connections that have no screen. `None` when nothing is serving.
+    ///
+    /// See [`crate::daemon::Control`]. It is a channel of its own rather than a shape of
+    /// `InputEvent` because an `InputEvent` is something a *view* did, and none of these were done
+    /// by a view.
+    control_rx: Option<tokio::sync::mpsc::UnboundedReceiver<crate::daemon::Control>>,
+    /// Connections listening to everything the workspace broadcasts.
+    ///
+    /// Behind a lock rather than plain, because [`Host::broadcast`] is called from `&self` in a
+    /// dozen places and the alternative — never pruning — is a workspace that accumulates one dead
+    /// sender per script that has ever watched it, and clones every token into all of them.
+    subscribers: std::sync::Mutex<Vec<tokio::sync::mpsc::UnboundedSender<PluginEvent>>>,
     /// Where a picture that had to be fetched comes back to.
     ///
     /// Same reason as the quota channel above: what is on the clipboard is sometimes only the
@@ -1084,6 +1108,8 @@ impl Host {
             asking: Vec::new(),
             permitting: Vec::new(),
             notifier: crate::notify::Notifier::new(Default::default()),
+            control_rx: None,
+            subscribers: Default::default(),
             image_tx,
             image_rx: Some(image_rx),
             repos: Default::default(),
@@ -1154,16 +1180,12 @@ impl Host {
         true
     }
 
-    /// Run a slow call off the host loop, answering the plugin when it finishes.
+    /// Whether this call has to run off the host loop, whoever asked for it.
     ///
-    /// The host loop is the single writer for the editor. Awaiting `git status` inside it freezes
-    /// typing for the length of a subprocess; awaiting a model round-trip freezes it for seconds.
-    /// Returning `true` means this call has been taken over and must not also be dispatched.
-    fn spawn_slow(&mut self, plugin: &PluginId, id: Option<RequestId>, call: &ApiCall) -> bool {
-        let svc = self.services(plugin);
-        let plugin = plugin.clone();
-        let call = call.clone();
-        if !matches!(
+    /// One list, read by the plugin path and by the control socket, so the two cannot come to
+    /// disagree about which calls are allowed to block every terminal in the workspace.
+    fn is_slow(call: &ApiCall) -> bool {
+        matches!(
             call,
             ApiCall::GitStatus { .. }
                 | ApiCall::GitBranches { .. }
@@ -1191,9 +1213,21 @@ impl Host {
                 // request to somebody else's server.
                 | ApiCall::UpdateCheck { .. }
                 | ApiCall::UpdateApply
-        ) {
+        )
+    }
+
+    /// Run a slow call off the host loop, answering the plugin when it finishes.
+    ///
+    /// The host loop is the single writer for the editor. Awaiting `git status` inside it freezes
+    /// typing for the length of a subprocess; awaiting a model round-trip freezes it for seconds.
+    /// Returning `true` means this call has been taken over and must not also be dispatched.
+    fn spawn_slow(&mut self, plugin: &PluginId, id: Option<RequestId>, call: &ApiCall) -> bool {
+        if !Self::is_slow(call) {
             return false;
         }
+        let svc = self.services(plugin);
+        let plugin = plugin.clone();
+        let call = call.clone();
         let bridge = self.bridge.clone();
         tokio::spawn(async move {
             let result = run_slow(svc, call).await;
@@ -1688,7 +1722,7 @@ impl Host {
                     }
                     _ => {}
                 }
-                self.bridge.broadcast(PluginEvent::VarChanged {
+                self.broadcast(PluginEvent::VarChanged {
                     scope,
                     key,
                     value: Some(value),
@@ -1705,7 +1739,7 @@ impl Host {
                     VAR_PERMITTING => self.permitting.clear(),
                     _ => {}
                 }
-                self.bridge.broadcast(PluginEvent::VarChanged { scope, key, value: None });
+                self.broadcast(PluginEvent::VarChanged { scope, key, value: None });
                 Ok(ApiOk::Unit)
             }
             ApiCall::VarAll { scope } => Ok(ApiOk::Vars { vars: self.vars.all(&scope) }),
@@ -1819,7 +1853,7 @@ impl Host {
                 self.swarm.seed(node.clone(), name.clone(), addr.is_some());
                 self.swarm_strangers.remove(&node);
                 self.editor_message(MessageLevel::Info, format!("paired with {name}"));
-                self.bridge.broadcast(PluginEvent::SwarmChanged);
+                self.broadcast(PluginEvent::SwarmChanged);
                 Ok(ApiOk::Unit)
             }
             ApiCall::SwarmUnpair { node } => {
@@ -1840,7 +1874,7 @@ impl Host {
                     });
                 }
                 h.send(neosh_swarm::SwarmRequest::Unpair { id: node });
-                self.bridge.broadcast(PluginEvent::SwarmChanged);
+                self.broadcast(PluginEvent::SwarmChanged);
                 Ok(ApiOk::Unit)
             }
             ApiCall::SwarmReconnect { node } => {
@@ -1854,7 +1888,7 @@ impl Host {
                     self.swarm.seed(node.clone(), name, true);
                     self.swarm.dial_failed(&node, 0, "dialling…".into());
                 }
-                self.bridge.broadcast(PluginEvent::SwarmChanged);
+                self.broadcast(PluginEvent::SwarmChanged);
                 Ok(ApiOk::Unit)
             }
             ApiCall::SwarmDisconnect { node } => {
@@ -1865,19 +1899,19 @@ impl Host {
                 Ok(ApiOk::Unit)
             }
             // Answered off the loop: it opens a socket to somewhere that may not answer.
-            ApiCall::SwarmProbe { .. } => Err(ApiError::Internal {
-                message: "swarm.probe is answered asynchronously".into(),
-            }),
-            // Taken over before dispatch, because its answer comes from another machine.
-            ApiCall::SwarmCommand { .. } => {
-                Err(ApiError::Internal { message: "swarm.command is answered asynchronously".into() })
+            ApiCall::SwarmProbe { .. } => {
+                Err(ApiError::Internal { message: "swarm.probe is answered asynchronously".into() })
             }
+            // Taken over before dispatch, because its answer comes from another machine.
+            ApiCall::SwarmCommand { .. } => Err(ApiError::Internal {
+                message: "swarm.command is answered asynchronously".into(),
+            }),
             // ---- events -------------------------------------------------
             // `from` is stamped here rather than taken from the call, so "who said this" is one of
             // the few things in a plugin message that cannot be forged.
             ApiCall::EventEmit { name, data } => {
                 self.wake_on_event(&name);
-                self.bridge.broadcast(PluginEvent::Event {
+                self.broadcast(PluginEvent::Event {
                     name,
                     data,
                     from: plugin.0.clone(),
@@ -2404,7 +2438,13 @@ impl Host {
     /// of the thing you were trying to get away from. When every conversation is already on
     /// somebody's screen — or there is only one — it lands in the most recent, and two views of
     /// one conversation is a perfectly good thing to be: same transcript, own scroll, own draft.
-    fn open_view(&mut self, view: neosh_proto::ViewId) {
+    ///
+    /// `want` overrides all of that, and is how `neosh "a prompt"` lands you in the conversation
+    /// it just started rather than wherever the rule above would have put you.
+    fn open_view(&mut self, view: neosh_proto::ViewId, want: Option<neosh_proto::SessionId>) {
+        // Only one this workspace actually has. A conversation deleted between the client asking
+        // and the client arriving is not an error worth refusing an attach over.
+        let want = want.filter(|id| self.agent.sessions().get(id).is_some());
         // A workspace nobody was watching kept the screen of whoever left last, mid-answer and
         // all. This is the terminal coming back to it: it gets that screen rather than a
         // rebuilt-from-messages copy, which would be missing everything the running turn has said
@@ -2414,10 +2454,19 @@ impl Host {
             if let Some(state) = self.views.remove(&old) {
                 self.views.insert(view, state);
             }
+            // The kept screen is somebody else's conversation, and this terminal asked for one of
+            // its own. Moved rather than left, or `neosh "a prompt"` against a workspace that has
+            // been sitting detached shows you last week's transcript with a turn running out of
+            // sight.
+            if let Some(want) = want
+                && self.in_view(view, |me| me.arrive_in(&want).is_ok())
+            {
+                self.in_view(view, |me| me.enter_session());
+            }
             return;
         }
         let taken: Vec<_> = self.views.values().map(|v| v.session.clone()).collect();
-        let session = {
+        let session = want.unwrap_or_else(|| {
             let store = self.agent.sessions();
             store
                 .list()
@@ -2426,7 +2475,7 @@ impl Host {
                 .find(|id| !taken.contains(id))
                 .or_else(|| taken.first().cloned())
                 .unwrap_or_else(|| store.current_id().clone())
-        };
+        });
         let screen = ViewState::furnish(&mut self.editor, view, session.clone());
         self.views.insert(view, screen);
         // Drawn as an arrival rather than left empty: the transcript is rebuilt from the
@@ -2470,7 +2519,7 @@ impl Host {
             self.orphan = self.orphan.filter(|o| *o != view);
         }
         // So a plugin can let go of whatever it was keeping about that panel.
-        self.bridge.broadcast(neosh_proto::PluginEvent::ViewClosed { view });
+        self.broadcast(neosh_proto::PluginEvent::ViewClosed { view });
     }
 
     /// Do something as though the key had been pressed in `view`.
@@ -3180,7 +3229,7 @@ impl Host {
                     self.apply_option(&name, &value);
                     // Broadcast, not just to the owner: a setting is shared state, and the plugin
                     // that declared `ui.theme` is rarely the one that changes it.
-                    self.bridge.broadcast(PluginEvent::OptionChanged { name, value });
+                    self.broadcast(PluginEvent::OptionChanged { name, value });
                 }
                 CoreEffect::ContributionsChanged { point } => {
                     // A theme came or went: the option that lists them has to say so, and a
@@ -3190,10 +3239,10 @@ impl Host {
                     }
                     // Broadcast for the same reason: the plugin that *renders* a point is never the
                     // one that just contributed to it, and it is the one that has to redraw.
-                    self.bridge.broadcast(PluginEvent::ContributionsChanged { point });
+                    self.broadcast(PluginEvent::ContributionsChanged { point });
                 }
                 CoreEffect::HighlightsChanged { names } => {
-                    self.bridge.broadcast(PluginEvent::HighlightChanged { names });
+                    self.broadcast(PluginEvent::HighlightChanged { names });
                 }
                 CoreEffect::KindSeen { kind } => self.wake_on_kind(&kind),
             }
@@ -3334,7 +3383,7 @@ impl Host {
     fn set_global_var(&mut self, key: &str, value: serde_json::Value) {
         let scope = neosh_proto::VarScope::Global;
         self.vars.set(&scope, key.to_string(), value.clone());
-        self.bridge.broadcast(PluginEvent::VarChanged {
+        self.broadcast(PluginEvent::VarChanged {
             scope,
             key: key.to_string(),
             value: Some(value),
@@ -3569,7 +3618,7 @@ impl Host {
                     // It has just connected and knows nothing about us until we say so.
                     self.publish_inventory();
                 }
-                self.bridge.broadcast(PluginEvent::SwarmChanged);
+                self.broadcast(PluginEvent::SwarmChanged);
             }
             E::PeerDown { node, reason, will_retry } => {
                 let name = self
@@ -3593,7 +3642,7 @@ impl Host {
                         }));
                     }
                 }
-                self.bridge.broadcast(PluginEvent::SwarmChanged);
+                self.broadcast(PluginEvent::SwarmChanged);
             }
             E::DialFailed { node, attempt, error, .. } => {
                 // Only a machine we can name has a row to update. An address with no identity
@@ -3601,15 +3650,15 @@ impl Host {
                 // answers, and as a peer the moment it is paired.
                 if let Some(id) = node {
                     self.swarm.dial_failed(&id, attempt, error);
-                    self.bridge.broadcast(PluginEvent::SwarmChanged);
+                    self.broadcast(PluginEvent::SwarmChanged);
                 }
             }
             E::Inventory { node, full, agents, gone } => {
                 self.swarm.inventory(&node, full, agents, gone);
-                self.bridge.broadcast(PluginEvent::SwarmChanged);
+                self.broadcast(PluginEvent::SwarmChanged);
             }
             E::Stream { node, session, event } => {
-                self.bridge.broadcast(PluginEvent::SwarmStream { node, session, event });
+                self.broadcast(PluginEvent::SwarmStream { node, session, event });
             }
             E::Stranger { node, dialled } => {
                 let first = !self.swarm_strangers.contains_key(&node.id);
@@ -3632,7 +3681,7 @@ impl Host {
                         format!("{name} wants to join this workspace — ^J to allow it"),
                     );
                 }
-                self.bridge.broadcast(PluginEvent::SwarmChanged);
+                self.broadcast(PluginEvent::SwarmChanged);
             }
             E::Answer { id, result, .. } => {
                 let (ok, message) = match result {
@@ -4185,7 +4234,7 @@ impl Host {
         let borrowed = self.v().secret.is_some() || self.v().search.is_some();
         if self.v().draft != text && !borrowed {
             self.vm().draft.clone_from(&text);
-            self.bridge.broadcast(PluginEvent::ComposerChanged { text: text.clone() });
+            self.broadcast(PluginEvent::ComposerChanged { text: text.clone() });
         }
         let lines = self.editor.buffer(self.v().composer).map(|b| b.line_count()).unwrap_or(1).max(1);
         let width = self
@@ -4656,9 +4705,116 @@ impl Host {
 
     /// Serve a terminal rather than be one: `quit` sends the viewer away, and what this workspace
     /// is holding is reported to `live` for `neosh status` to read.
-    pub fn serve(&mut self, live: std::sync::Arc<crate::daemon::Live>) {
+    pub fn serve(
+        &mut self,
+        live: std::sync::Arc<crate::daemon::Live>,
+        control: tokio::sync::mpsc::UnboundedReceiver<crate::daemon::Control>,
+    ) {
         self.on_quit = OnQuit::Detach;
         self.live = Some(live);
+        self.control_rx = Some(control);
+    }
+
+    /// Tell every plugin, and every connection that asked to hear it.
+    ///
+    /// One method rather than two call sites everywhere, so a new event cannot arrive for plugins
+    /// and be invisible to `neosh agent watch` — which is the same argument as the socket carrying
+    /// [`ApiCall`] rather than a vocabulary of its own: one surface, two ways in.
+    fn broadcast(&self, event: PluginEvent) {
+        self.bridge.broadcast(event.clone());
+        let Ok(mut subs) = self.subscribers.lock() else { return };
+        if subs.is_empty() {
+            return;
+        }
+        // Dropped rather than queued for a subscriber that has gone: the send fails, the sender
+        // leaves the list, and nothing about a script walking away can cost this workspace memory.
+        subs.retain(|s| s.send(event.clone()).is_ok());
+    }
+
+    /// One thing asked over the control socket.
+    async fn on_control(&mut self, control: crate::daemon::Control) {
+        match control {
+            crate::daemon::Control::Subscribe { events } => {
+                if let Ok(mut subs) = self.subscribers.lock() {
+                    subs.push(events);
+                }
+            }
+            crate::daemon::Control::Call { call, reply } => self.control_call(call, reply).await,
+        }
+    }
+
+    /// Answer one [`ApiCall`] that arrived over the socket instead of from a plugin.
+    ///
+    /// The body is [`Host::dispatch`], under the host's own id — the socket is the keyboard, and
+    /// the keyboard has never had a manifest to declare capabilities in. What is here rather than
+    /// there is the handful of calls whose answer does not arrive now: they are settled through
+    /// the script bridge for a plugin, and a caller with no plugin id has to be settled on its own
+    /// `oneshot`.
+    async fn control_call(
+        &mut self,
+        call: ApiCall,
+        reply: tokio::sync::oneshot::Sender<neosh_proto::ApiResponse>,
+    ) {
+        // Refused by name rather than half-answered. Each of these finishes when a person does
+        // something at a terminal — types a key into a hidden field, has an image on a clipboard —
+        // or when a machine on the far side of a network answers, and none of those is a thing a
+        // caller with no screen can be waiting for. A clear refusal beats a call that returns
+        // successfully having done nothing.
+        let unreachable = match &call {
+            ApiCall::ProviderSetCredential { .. } => Some(
+                "a key is typed into a terminal. Set it in config.toml, in the environment, or \
+                 with `provider.key` at a keyboard",
+            ),
+            ApiCall::ChatAttach { path: None } => {
+                Some("there is no clipboard here — name a file: chat.attach with a path")
+            }
+            ApiCall::SwarmProbe { .. } | ApiCall::SwarmCommand { .. } => Some(
+                "the swarm is answered by the machine at the other end, which this connection has \
+                 no way to wait for. Use `agent.command` for a conversation on this machine",
+            ),
+            _ => None,
+        };
+        if let Some(why) = unreachable {
+            let _ = reply.send(Err(ApiError::Internal { message: why.into() }).into());
+            return;
+        }
+        // Answered when the command's owner answers, which for a handler that opens a picker is
+        // when somebody closes it. Never on this loop: waiting here would freeze every terminal
+        // attached to this workspace for the length of somebody else's function.
+        if let ApiCall::CmdCall { name, args } = call {
+            match self.editor.command_owner(&name) {
+                None => {
+                    let _ = reply
+                        .send(Err(ApiError::NotFound { what: format!("command {name}") }).into());
+                }
+                Some(owner) if owner.0 == BUILTIN => {
+                    self.run_builtin(&name, args);
+                    let _ = reply.send(Ok(ApiOk::Json { value: serde_json::Value::Null }).into());
+                }
+                Some(owner) => {
+                    let bridge = self.bridge.clone();
+                    tokio::spawn(async move {
+                        let result = bridge.call_command(&owner, &name, args).await;
+                        let _ = reply.send(
+                            result
+                                .map(|value| ApiOk::Json { value })
+                                .map_err(|message| ApiError::Internal { message })
+                                .into(),
+                        );
+                    });
+                }
+            }
+            return;
+        }
+        if Self::is_slow(&call) {
+            let svc = self.services(&PluginId::from(BUILTIN));
+            tokio::spawn(async move {
+                let _ = reply.send(run_slow(svc, call).await.into());
+            });
+            return;
+        }
+        let response = self.dispatch(&PluginId::from(BUILTIN), call).await;
+        let _ = reply.send(response.into());
     }
 
     /// Tell whoever is asking what is running here.
@@ -4825,7 +4981,7 @@ impl Host {
         for d in &self.agent_drivers {
             d.set_model(&here, &selection);
         }
-        self.bridge.broadcast(PluginEvent::SelectionChanged { selection });
+        self.broadcast(PluginEvent::SelectionChanged { selection });
     }
 
     /// Whether a turn sent with this selection could authenticate.
@@ -6538,7 +6694,7 @@ impl Host {
         self.replay_round();
         self.set_composer("");
         self.refresh_status();
-        self.bridge.broadcast(PluginEvent::SessionChanged {
+        self.broadcast(PluginEvent::SessionChanged {
             session: self.active_session(),
             view: self.from.view,
         });
@@ -7911,7 +8067,7 @@ impl Host {
                         neosh_proto::StreamEvent::TurnStarted { turn: turn.0.clone() },
                     );
                 }
-                self.bridge.broadcast(PluginEvent::TurnStarted { session, turn });
+                self.broadcast(PluginEvent::TurnStarted { session, turn });
             }
             AgentEvent::Token { session, turn, text } => {
                 if let Some(r) = self.rounds.get_mut(&session) {
@@ -7936,7 +8092,7 @@ impl Host {
                         text: text.clone(),
                     });
                 }
-                self.bridge.broadcast(PluginEvent::Token { session, turn, text });
+                self.broadcast(PluginEvent::Token { session, turn, text });
             }
             AgentEvent::Thinking { session, turn, text } => {
                 // Not accumulated, for the same reason `transcript` does not replay it: reasoning
@@ -7953,7 +8109,7 @@ impl Host {
                         text: text.clone(),
                     });
                 }
-                self.bridge.broadcast(PluginEvent::ThinkingToken { session, turn, text });
+                self.broadcast(PluginEvent::ThinkingToken { session, turn, text });
             }
             AgentEvent::ToolStarted { session, turn, call } => {
                 if let Some(r) = self.rounds.get_mut(&session) {
@@ -7967,7 +8123,7 @@ impl Host {
                     // rather than keep claiming the model is thinking.
                     me.draw_working();
                 });
-                self.bridge.broadcast(PluginEvent::ToolStarted { session, turn, call });
+                self.broadcast(PluginEvent::ToolStarted { session, turn, call });
             }
             AgentEvent::ToolFinished { session, turn, call, result } => {
                 if let Some(r) = self.rounds.get_mut(&session) {
@@ -7995,7 +8151,7 @@ impl Host {
                     me.finish_card(&call.id, &result);
                     me.draw_working();
                 });
-                self.bridge.broadcast(PluginEvent::ToolFinished { session, turn, call, result });
+                self.broadcast(PluginEvent::ToolFinished { session, turn, call, result });
             }
             AgentEvent::TurnEnded { session, turn, stop_reason, usage } => {
                 self.each_view_showing(&session, |me| {
@@ -8070,7 +8226,7 @@ impl Host {
                         usage: usage.clone(),
                     });
                 }
-                self.bridge.broadcast(PluginEvent::TurnEnded {
+                self.broadcast(PluginEvent::TurnEnded {
                     session: session.clone(),
                     turn,
                     stop_reason,
@@ -8160,7 +8316,7 @@ impl Host {
         // Out to plugins before it is drawn, and whatever it is. A meter, a plan view and a status
         // line all want this and none of them caused it — and it is the only thing that moves
         // *during* a turn, which for an agent driver can be twenty minutes long.
-        self.bridge.broadcast(PluginEvent::Activity {
+        self.broadcast(PluginEvent::Activity {
             session: session.clone(),
             turn,
             activity: activity.clone(),
@@ -8389,7 +8545,7 @@ impl Host {
         quota: neosh_provider::quota::Quota,
     ) {
         let Some(snapshot) = self.quota.apply(instance, source, quota, now_secs()) else { return };
-        self.bridge.broadcast(PluginEvent::Quota { snapshot });
+        self.broadcast(PluginEvent::Quota { snapshot });
     }
 
     /// Whether a plugin registered the driver serving this instance.
@@ -8682,14 +8838,21 @@ impl Host {
             }
             InputEvent::ViewportChanged { win, width, height, top_line, rows } => {
                 let was = self.chat_width();
-                let before = self.editor.window(win).and_then(|w| w.viewport.as_ref()).map(|v| (v.width, v.height));
-                self.editor.set_viewport(win, neosh_core::Viewport { width, height, top_line, rows });
+                let before = self
+                    .editor
+                    .window(win)
+                    .and_then(|w| w.viewport.as_ref())
+                    .map(|v| (v.width, v.height));
+                self.editor
+                    .set_viewport(win, neosh_core::Viewport { width, height, top_line, rows });
                 // A size is the one thing only the frontend knows; a plugin that sized a meter to
                 // it hears here that it has to size it again.
                 if before != Some((width, height)) {
-                    self.bridge.broadcast(PluginEvent::Event {
+                    self.broadcast(PluginEvent::Event {
                         name: "neosh.viewport".to_string(),
-                        data: Some(serde_json::json!({ "win": win, "width": width, "height": height })),
+                        data: Some(
+                            serde_json::json!({ "win": win, "width": width, "height": height }),
+                        ),
                         from: BUILTIN.to_string(),
                     });
                     // The strip is *fitted* to its own width — segments are shortened and then
@@ -8726,14 +8889,14 @@ impl Host {
                     self.redraw_footer();
                 }
             }
-            InputEvent::Attached { .. } => {
+            InputEvent::Attached { session, .. } => {
                 let arriving = self.from.view;
                 // A terminal we have never met gets a screen of its own, in a conversation nobody
                 // else is reading. That is the whole of what a second window is for: you opened it
                 // because something is running in the first one, so landing you in the same place
                 // would be the one thing guaranteed not to help.
                 if !self.views.contains_key(&arriving) {
-                    self.open_view(arriving);
+                    self.open_view(arriving, session);
                 }
                 // A client that has never seen any of this. Whatever was queued for *this view*
                 // was queued for whoever was looking before — and nobody may have been — so it is
@@ -8754,7 +8917,7 @@ impl Host {
                 self.draw_welcome();
                 // Every plugin holding a surface has to paint it again: the editor forwards cells
                 // and does not keep them, so a claim is all that could be republished.
-                self.bridge.broadcast(neosh_proto::PluginEvent::ViewAttached { view: arriving });
+                self.broadcast(neosh_proto::PluginEvent::ViewAttached { view: arriving });
                 // Certainly changed, and not subject to the once-a-second rule: "is anyone
                 // watching" is the one field of the report a viewer arriving is entirely about.
                 self.report_live_now();
@@ -8765,8 +8928,7 @@ impl Host {
             // furnish no panel into it.
             InputEvent::Ready { .. } if self.orphan == Some(self.from.view) => {
                 self.orphan = None;
-                self.bridge
-                    .broadcast(neosh_proto::PluginEvent::ViewAttached { view: self.from.view });
+                self.broadcast(neosh_proto::PluginEvent::ViewAttached { view: self.from.view });
                 self.draw_welcome();
             }
             // A notch, turned into rows here because only the host knows what is under the
@@ -8869,7 +9031,7 @@ impl Host {
         // The same event a turn would have carried, to the same listeners. A plugin drawing a row
         // about this has no way to tell — and no reason to care — whether a turn happened to be
         // running when the set moved.
-        self.bridge.broadcast(PluginEvent::Activity {
+        self.broadcast(PluginEvent::Activity {
             session: session.clone(),
             turn: neosh_proto::TurnId::default(),
             activity: neosh_proto::Activity::Background { tasks },
@@ -8962,7 +9124,7 @@ impl Host {
                     // Its vars go with it, and whoever was watching them is told.
                     let scope = neosh_proto::VarScope::Window { win: *win };
                     for key in self.vars.forget_window(*win) {
-                        self.bridge.broadcast(PluginEvent::VarChanged {
+                        self.broadcast(PluginEvent::VarChanged {
                             scope: scope.clone(),
                             key,
                             value: None,
@@ -8989,7 +9151,7 @@ impl Host {
         self.last_mode.retain(|v, _| self.views.contains_key(v));
         for (name, data) in said {
             self.wake_on_event(name);
-            self.bridge.broadcast(PluginEvent::Event {
+            self.broadcast(PluginEvent::Event {
                 name: name.to_string(),
                 data: Some(data),
                 from: BUILTIN.to_string(),
@@ -9145,6 +9307,9 @@ impl Host {
         let mut quota_rx = self.quota_rx.take();
         let mut unasked_rx = self.unasked_rx.take();
         let mut image_rx = self.image_rx.take();
+        // `None` unless something is serving, in which case a `recv` on it is never ready — the
+        // same shape as the swarm channel above, and for the same reason.
+        let mut control_rx = self.control_rx.take();
         let plan = tokio::time::sleep(crate::quota::AFTER_TURN);
         tokio::pin!(plan);
         // How many times in a row a poll has come back with nothing. Doubles the wait each time.
@@ -9168,6 +9333,12 @@ impl Host {
                     }
                 } => self.on_swarm_event(ev),
                 Some(ev) = agent_rx.recv() => self.handle_agent_event(ev),
+                Some(c) = async {
+                    match control_rx.as_mut() {
+                        Some(rx) => rx.recv().await,
+                        None => std::future::pending().await,
+                    }
+                } => self.on_control(c).await,
                 Some((from, input)) = input_rx.recv() => {
                     // A repaint changes nothing, so it must not go through the input path: the
                     // frontend is asking to draw the same state again while something on it moves.
@@ -9335,7 +9506,7 @@ impl Host {
         // Plugins first: `deactivate` runs while the host is still here to answer a last call —
         // flushing state, saying goodbye to a server — and nothing can wedge it, because the
         // runtime is dropped a moment later whether or not anybody has finished.
-        self.bridge.broadcast(PluginEvent::Shutdown);
+        self.broadcast(PluginEvent::Shutdown);
         for plugin in self.bridge.loaded() {
             let _ = self.bridge.script().send(ScriptInbound::Unload { plugin });
         }
@@ -9608,7 +9779,7 @@ impl Host {
         // Every list that draws a conversation is drawing a name that just changed, and the panel
         // redraws on this. Not the same event as switching — nothing moved — but it is the one
         // signal a thread list already listens to for "the conversations are not what you drew".
-        self.bridge.broadcast(PluginEvent::SessionChanged {
+        self.broadcast(PluginEvent::SessionChanged {
             session: self.active_session(),
             view: self.from.view,
         });
@@ -9635,6 +9806,9 @@ impl Host {
         self.refresh_status();
         self.refresh_composer();
         self.startup.reload = Some(boot.reload);
+        // Set here and not in `apply_config`, which `config.reload` also runs: a `^R` must not
+        // re-ask the question this process was started with.
+        self.startup.first_prompt = boot.first_prompt;
         self.startup.base_instances =
             self.agent.providers().instances().cloned().collect();
         // Started once, at boot, and never on reload: the allow-list and the listening socket are
@@ -10750,11 +10924,16 @@ impl Host {
     /// same workspace being true a second time.
     fn announce_ready(&mut self) {
         self.report_unread_points();
-        self.bridge.broadcast(PluginEvent::Event {
+        self.broadcast(PluginEvent::Event {
             name: READY_EVENT.to_string(),
             data: None,
             from: BUILTIN.to_string(),
         });
+        // Taken rather than read: this fires again when a late plugin settles, and asking the same
+        // question twice would be two turns for one command line.
+        if let Some(text) = self.startup.first_prompt.take() {
+            self.start_turn(text);
+        }
     }
 
     /// Apply a held `agent.model` the moment something can serve it.
