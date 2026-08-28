@@ -60,6 +60,29 @@ No API key needed. An existing `claude` login works as is, and 423 models are re
 configure anything. `neosh init` writes a starter config you can edit. Every install option is in
 the [installation guide](https://neoswarm.dev/docs/installation).
 
+Start a conversation with the question already in it:
+
+```bash
+neosh "why is the composer eating my paste"
+```
+
+## From a script, or from another agent
+
+`neosh agent` is the workspace without a screen — the same API a plugin uses, over the same socket
+a terminal attaches to. A shell loop, a CI job or a coding agent can run ten conversations at once
+while you carry on working in the terminal.
+
+```bash
+neosh agent start -C ../wt-login "fix the redirect loop"   # prints an id
+neosh agent ls                                             # what is running
+neosh agent watch                                          # follow, live
+neosh agent wait 3f2a1b0c --timeout 900 && ./deploy.sh     # the exit status is the answer
+```
+
+Nothing there takes a screen, and what it starts is an ordinary conversation you can open with `^T`.
+`neosh skill install` teaches Claude Code, Codex, Cursor and Gemini to drive it. Full reference:
+[scripting](https://neoswarm.dev/docs/scripting).
+
 ## How it works
 
 The workspace is a process. Terminals attach to it, and each one is somewhere in it: its own
@@ -136,6 +159,7 @@ The full docs live at **[neoswarm.dev/docs](https://neoswarm.dev/docs)**.
 | [Models](https://neoswarm.dev/docs/models) | Drivers, endpoints, and per-model options |
 | [Machines](https://neoswarm.dev/docs/machines) | Pairing computers and steering remote agents |
 | [Writing a plugin](https://neoswarm.dev/docs/plugins) | From empty folder to something on screen |
+| [Scripting](https://neoswarm.dev/docs/scripting) | `neosh agent`, running many at once, and the skill for coding agents |
 | [Docs for agents](https://neoswarm.dev/docs/agents) | llms.txt, the plugin skill, and what to tell your agent |
 
 ## Community

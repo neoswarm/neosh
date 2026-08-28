@@ -18,6 +18,7 @@ export const sections: DocSection[] = [
       { title: "Start Guide", href: "/docs" },
       { title: "Installation", href: "/docs/installation" },
       { title: "Concepts", href: "/docs/concepts" },
+      { title: "Scripting", href: "/docs/scripting" },
     ],
   },
   {

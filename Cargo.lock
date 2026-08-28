@@ -2369,6 +2369,7 @@ dependencies = [
  "directories",
  "futures",
  "image",
+ "include_dir",
  "insta",
  "neosh-agent",
  "neosh-core",

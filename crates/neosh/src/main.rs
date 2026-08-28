@@ -11,10 +11,12 @@ use neosh_script::ScriptRuntime;
 
 mod markdown;
 mod notify;
+mod agentcli;
 mod bridge;
 mod build;
 mod client;
 mod clients;
+mod control;
 mod daemon;
 mod cards;
 mod diff;
@@ -29,6 +31,7 @@ mod pstate;
 mod scaffold;
 mod services;
 mod sessions;
+mod skill;
 mod update;
 mod quota;
 mod swarm;
@@ -58,6 +61,18 @@ enum UiProtocol {
 struct Cli {
     #[command(subcommand)]
     command: Option<Cmd>,
+
+    /// Say this in a new conversation here, and open a terminal on it.
+    ///
+    /// The shortest way in: `neosh "why is the composer eating my paste"` starts a conversation in
+    /// this directory, sends that, and draws the answer arriving. It is the terminal — bare
+    /// `neosh` with a sentence in front of it — and not a headless run; that is `neosh agent
+    /// start`, which prints an id instead of taking the screen.
+    ///
+    /// Everything after the flags, joined with spaces, so quoting is optional for anything a shell
+    /// would not eat.
+    #[arg(trailing_var_arg = true)]
+    prompt: Vec<String>,
 
     #[arg(long, value_enum, default_value_t = UiProtocol::Terminal)]
     ui_protocol: UiProtocol,
@@ -132,6 +147,24 @@ enum Cmd {
     /// plugins are listed too — what loads is one question, and it should have one answer.
     #[command(subcommand)]
     Plugin(PluginCmd),
+    /// Drive this workspace from a script: start conversations, watch them, read them, stop them.
+    ///
+    /// Everything here is the same call a plugin would make, over the same socket a terminal
+    /// attaches to — so what a script can do is exactly what a plugin can do, and a conversation
+    /// started this way is an ordinary conversation that `^T` lists and you can go and read.
+    ///
+    /// Nothing here takes a screen. A control connection is not a terminal: it does not attach, it
+    /// does not take an attached one over, and `neosh status` does not count it as somebody
+    /// watching.
+    #[command(subcommand)]
+    Agent(agentcli::AgentCmd),
+    /// Put the neosh skill where your coding agent will find it.
+    ///
+    /// A skill is how Claude Code, Codex, Cursor, Gemini and anything else reading the shared
+    /// Agent Skills format learn what `neosh agent` is and when to reach for it. The copy that
+    /// ships in this binary is the copy that matches this binary, which for a document about a CLI
+    /// is the entire point of shipping it here.
+    Skill(skill::SkillArgs),
     /// Print this machine's swarm identity, and the line to paste on the other computers.
     ///
     /// A node is named by its public key, so joining two machines means each one having the
@@ -256,6 +289,17 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
     let cwd = std::fs::canonicalize(&cwd).unwrap_or(cwd);
 
     match &cli.command {
+        Some(Cmd::Agent(cmd)) => {
+            let outcome = agentcli::run(&paths, &cwd, &cli.config_dir, cmd).await?;
+            // Set rather than returned, so the socket closes and stdout flushes on the ordinary
+            // path out. `neosh agent wait` is meant to be used with `&&`, and a status code that
+            // is only ever zero would make that a lie.
+            if outcome.0 != 0 {
+                std::process::exit(outcome.0);
+            }
+            return Ok(());
+        }
+        Some(Cmd::Skill(args)) => return skill::run(&cwd, args),
         Some(Cmd::Init(args)) => return run_init(&paths, &cwd, args),
         Some(Cmd::Trust(args)) => return run_trust(&paths, &cwd, args),
         Some(Cmd::Paths) => return run_paths(&paths, &cwd),
@@ -339,8 +383,13 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
         false => None,
     };
 
+    let mut control_rx = None;
     let (frontend, input_rx): (Box<dyn Frontend>, _) = match (&mut serving, cli.ui_protocol) {
-        (Some(d), _) => d.wire(),
+        (Some(d), _) => {
+            let (f, rx, control) = d.wire();
+            control_rx = Some(control);
+            (f, rx)
+        }
         (None, UiProtocol::Terminal) => {
             let (f, rx) = TerminalUi::enter().map_err(|e| {
                 anyhow::anyhow!(
@@ -362,8 +411,8 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
     let input_rx = with_signals(input_rx);
 
     let mut host = Host::new(agent.clone(), bridge.clone(), frontend);
-    if let Some(d) = &serving {
-        host.serve(d.live());
+    if let (Some(d), Some(control)) = (&serving, control_rx) {
+        host.serve(d.live(), control);
     }
     host.adopt_agent_drivers(agent_drivers);
     host.discover_repo(&cwd).await;
@@ -383,6 +432,10 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
         }),
         cli_model: cli.model.clone(),
         cli_plugin_dirs: cli.plugin_dirs.clone(),
+        // Only ever reached by a process that is its own workspace: `--no-daemon`, the stdio
+        // protocol, a test. Everything else went through `run_client` above, which starts a
+        // conversation of its own rather than talking into whichever one this process began with.
+        first_prompt: sentence(&cli.prompt),
     });
 
     // Accepting terminals runs alongside the host, not instead of it: clients come and go while
@@ -503,8 +556,44 @@ async fn run_client(cli: &Cli, paths: &Paths, cwd: &std::path::Path) -> anyhow::
         &cli.plugin_dirs,
         &cli.mock_script,
     );
+
+    // `neosh "a prompt"`. Done over the control socket, before the screen is taken, so that a
+    // failure — an unreadable directory, a workspace that is too old — is a sentence in the
+    // terminal you typed in rather than an error drawn on the alternate screen and then wiped by
+    // the restore on the way out.
+    //
+    // The conversation is created *without* activating it and the terminal then asks to attach
+    // into it. Activating would move whichever terminal the workspace happened to be serving,
+    // which is somebody else's screen; and simply trusting "the newest conversation is where an
+    // arriving terminal lands" is wrong in the one case that matters, a workspace that has been
+    // sitting detached and is keeping a screen for whoever comes back. See `Host::open_view`.
+    let opening = match sentence(&cli.prompt) {
+        None => None,
+        Some(text) => {
+            let mut control = control::Control::connect(&socket, &args).await?;
+            let info = match control
+                .call(neosh_proto::ApiCall::SessionNew {
+                    cwd: Some(cwd.display().to_string()),
+                    title: None,
+                    activate: false,
+                })
+                .await?
+            {
+                neosh_proto::ApiOk::Session { session } => session,
+                other => anyhow::bail!("the workspace answered {other:?} to a new conversation"),
+            };
+            control
+                .call(neosh_proto::ApiCall::AgentCommand {
+                    session: Some(info.id.clone()),
+                    command: neosh_proto::AgentCommand::Send { text },
+                })
+                .await?;
+            Some(info.id)
+        }
+    };
+
     let stream = client::connect_or_start(&socket, &args).await?;
-    match client::attach(stream).await? {
+    match client::attach(stream, opening).await? {
         // Nothing to say. The terminal is back and the work carries on without it, which is what
         // was asked for — announcing it every time would be a program congratulating itself.
         client::Ended::Detached(neosh_proto::DetachReason::Asked) => {}
@@ -555,6 +644,15 @@ async fn run_status(paths: &Paths) -> anyhow::Result<()> {
         say!("  {:>8}  {}  ({})", friendly(t.elapsed_secs), t.label, t.cwd);
     }
     Ok(())
+}
+
+/// The words after the flags, as one message, or `None` when there were none.
+///
+/// Joined with spaces rather than requiring quotes: `neosh why is this slow` is what people type,
+/// and a shell has already thrown away whatever whitespace was between the words.
+fn sentence(words: &[String]) -> Option<String> {
+    let joined = words.join(" ");
+    (!joined.trim().is_empty()).then_some(joined)
 }
 
 /// A duration a person would say out loud.
@@ -612,7 +710,6 @@ fn machine_name() -> String {
         .filter(|h| !h.is_empty())
         .unwrap_or_else(|| "this-machine".to_string())
 }
-
 
 fn run_init(paths: &Paths, cwd: &std::path::Path, args: &InitArgs) -> anyhow::Result<()> {
     let report = if args.project {

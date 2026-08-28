@@ -186,6 +186,27 @@ is `docs/releasing.md`.
   until the workspace stops, and then reopening a conversation starts an agent that has never heard
   of it — full transcript, empty model, and nothing on either side that reports it. It travels as
   `Activity::Resume`, is kept in `Session::resume`, and comes back as `TurnRequest::resume`.
+- **A caller with no screen gets the API, not a vocabulary of its own.** `neosh agent` sends
+  `ApiCall` over the socket a terminal attaches to and reads `ApiResponse` back
+  (`ClientMessage::Call`), and subscribes to the very `PluginEvent` stream a plugin observes
+  (`ClientMessage::Subscribe`) — so what a script can do is what a plugin can do, and a capability
+  added for one arrives in the other with nobody writing glue. A `ControlRequest` enum listing the
+  verbs a script may use is a second list to keep in step, which means a surface that is one release
+  behind the one it mirrors; `CmdCall` and `CmdList` are why a *plugin's* verbs are scriptable
+  without a subcommand each. **A control connection is not a view**: not in `Clients`, never sent a
+  frame, never takes a terminal over, and never "somebody is watching" — which decides where a
+  notification goes, so ten scripts polling must not make a workspace think a person is at it. It is
+  not gated either: the socket is `0600` in the user's own runtime directory and does not leave the
+  machine, so reaching it is already being the person at the keyboard, and the permissions that
+  matter — the agent's — are unchanged. What is refused is what finishes only when a person does
+  something (`ProviderSetCredential`, a clipboard paste) or when another machine answers
+  (`SwarmProbe`, `SwarmCommand`), by name and with the fix, because a call that returns `ok` having
+  done nothing is the worst answer available. Fanning out is `SessionNew { activate: false }` —
+  creating a conversation from a script must not move the transcript out from under somebody
+  reading one — and `neosh "a prompt"` therefore asks to attach *into* a named conversation
+  (`Attach { session }`) rather than trusting that the newest one is where an arriving terminal
+  lands: a workspace that has been sitting detached keeps a screen for whoever comes back, and that
+  screen is somebody else's.
 - **The workspace is a process; the terminal is a viewer of it.** `neosh` attaches to the workspace
   for your config directory, starting one if there is none. Closing a terminal detaches — turns keep
   running. `neosh stop` is what ends a workspace, and `^Q` must never be able to. `UiEvent` is a
@@ -600,6 +621,30 @@ fired — were invisible to the test suite and obvious on screen.
 
 After editing anything under `plugins/`, `touch plugins/lib.rs` before building: the plugin tree is
 embedded with `include_dir!` and cargo will not notice otherwise.
+
+---
+
+# The command line
+
+`neosh` is the terminal; `neosh "a prompt"` is the terminal with the first question already asked,
+in a new conversation in this directory. Quote it when the first word is also a subcommand name —
+`neosh status of the build` runs `neosh status` and then complains about `of`, which is an error
+rather than a surprise, but an error all the same.
+
+Everything else the workspace can be asked for a person is under `neosh agent`, which takes no
+screen and answers `--json` for every verb: `start`, `ls`, `send`, `read`, `watch`, `wait`,
+`interrupt`, `rename`, `archive`, `rm`, `models`, `model`, `commands`, `run`, `call`. `wait` exits
+`0`/`1`/`2`/`124` — finished, failed, interrupted, timed out — so `&&` means what it looks like.
+`run` and `call` are the two escape hatches: a plugin's command by name, and any `ApiCall` at all.
+Ids are uuids and every verb takes an unambiguous prefix of one, or `.` for what a terminal is
+looking at. `website/src/pages/docs/scripting.md` is the long version.
+
+`neosh skill install` writes `crates/neosh/skills/neosh/SKILL.md` into `.claude/skills/`,
+`.agents/skills/`, `.cursor/skills/` and `.gemini/skills/`, for the user or for a project. The
+skill lives under the crate rather than at the repository root for the reason `plugins/` is its own
+crate — `include_dir!` embeds what is under the package root and nothing else, so a tree at the
+root would work in a checkout and publish empty — and `.claude-plugin/plugin.json` points at it
+from the root rather than the other way round.
 
 ---
 

@@ -208,6 +208,9 @@ impl Client {
             // real `neosh` under test. Left as the default so the two compare equal and no test
             // here has to care: an unknown stamp is not a difference. See `BuildId::same_as`.
             build: Default::default(),
+            // Wherever the workspace would have put us. Asking for a conversation by name is what
+            // `neosh "a prompt"` does, and no test here is that.
+            session: None,
         });
         c
     }
@@ -1154,5 +1157,329 @@ fn one_conversation_runs_one_agent_across_an_interrupt() {
         vec![first],
         "one conversation, one agent — spawned {:?}",
         spawns(&log)
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The control surface — a caller with no screen
+// ---------------------------------------------------------------------------
+
+/// A script, driven over the same socket a terminal attaches to.
+///
+/// Deliberately not `crate::control::Control`: this is an integration test of a *protocol*, and a
+/// client that shared its implementation with the thing under test would pass just as happily if
+/// both were wrong about the wire. So it speaks `ClientMessage` and reads `ServerMessage` by hand,
+/// exactly as the terminal client above does.
+struct Script {
+    write: UnixStream,
+    lines: std::sync::mpsc::Receiver<String>,
+    held: std::collections::VecDeque<neosh_proto::PluginEvent>,
+    next: u64,
+}
+
+impl Drop for Script {
+    fn drop(&mut self) {
+        let _ = self.write.shutdown(std::net::Shutdown::Both);
+    }
+}
+
+impl Script {
+    fn open(socket: &Path) -> Self {
+        let stream = UnixStream::connect(socket).expect("connect");
+        let read = stream.try_clone().expect("clone");
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            for line in BufReader::new(read).lines() {
+                let Ok(line) = line else { break };
+                if tx.send(line).is_err() {
+                    break;
+                }
+            }
+        });
+        Self { write: stream, lines: rx, held: Default::default(), next: 0 }
+    }
+
+    fn send(&mut self, msg: ClientMessage) {
+        let mut line = serde_json::to_vec(&msg).expect("encode");
+        line.push(b'\n');
+        self.write.write_all(&line).expect("write");
+        self.write.flush().expect("flush");
+    }
+
+    fn subscribe(&mut self) {
+        self.send(ClientMessage::Subscribe);
+    }
+
+    /// One call, and the answer to it. Panics on an API error, which in these tests is always a
+    /// failure of the thing being tested rather than something to assert about.
+    fn call(&mut self, call: neosh_proto::ApiCall) -> neosh_proto::ApiOk {
+        match self.try_call(call) {
+            neosh_proto::ApiResponse::Ok { value } => value,
+            neosh_proto::ApiResponse::Err { error } => panic!("the workspace refused: {error}"),
+        }
+    }
+
+    fn try_call(&mut self, call: neosh_proto::ApiCall) -> neosh_proto::ApiResponse {
+        self.next += 1;
+        let id = self.next.to_string();
+        self.send(ClientMessage::Call { id: id.clone(), call });
+        let deadline = Instant::now() + PATIENCE;
+        while Instant::now() < deadline {
+            let Ok(line) = self.lines.recv_timeout(Duration::from_millis(200)) else { continue };
+            match serde_json::from_str::<ServerMessage>(&line) {
+                Ok(ServerMessage::Called { id: got, response }) if got == id => return response,
+                Ok(ServerMessage::Event { event }) => self.held.push_back(event),
+                _ => {}
+            }
+        }
+        panic!("no answer to {id}");
+    }
+
+    /// Read events until `f` is happy with one.
+    fn until_event(
+        &mut self,
+        what: &str,
+        f: impl Fn(&neosh_proto::PluginEvent) -> bool,
+    ) -> neosh_proto::PluginEvent {
+        let deadline = Instant::now() + PATIENCE;
+        loop {
+            while let Some(e) = self.held.pop_front() {
+                if f(&e) {
+                    return e;
+                }
+            }
+            if Instant::now() > deadline {
+                panic!("timed out waiting for {what}");
+            }
+            let Ok(line) = self.lines.recv_timeout(Duration::from_millis(200)) else { continue };
+            if let Ok(ServerMessage::Event { event }) = serde_json::from_str::<ServerMessage>(&line)
+            {
+                self.held.push_back(event);
+            }
+        }
+    }
+}
+
+fn sessions(s: &mut Script) -> Vec<neosh_proto::SessionInfo> {
+    match s.call(neosh_proto::ApiCall::SessionList { include_archived: true }) {
+        neosh_proto::ApiOk::Sessions { sessions } => sessions,
+        other => panic!("expected a conversation list, got {other:?}"),
+    }
+}
+
+/// A script starts a conversation, runs a turn in it, and reads back what was said — with nobody
+/// at a terminal at any point.
+///
+/// This is the whole of `neosh agent`, minus the argument parsing: start, send, hear it end, read
+/// it. It runs against a workspace that has never had a client attached, because that is how a
+/// fan-out actually runs — the person who launched it has gone.
+#[test]
+fn a_script_can_run_a_turn_with_nobody_watching() {
+    let sb = Sandbox::new("control");
+    let ws = sb.serve("hello_turn.jsonl");
+
+    let mut s = Script::open(&ws.socket);
+    // Subscribed *before* the turn is started. The other order is a race a short turn wins, and
+    // the mock provider is about as short as a turn gets.
+    s.subscribe();
+
+    let made = match s.call(neosh_proto::ApiCall::SessionNew {
+        cwd: Some(sb.root.join("work").display().to_string()),
+        title: Some("from a script".into()),
+        activate: false,
+    }) {
+        neosh_proto::ApiOk::Session { session } => session,
+        other => panic!("expected the conversation it made, got {other:?}"),
+    };
+    assert_eq!(made.title.as_deref(), Some("from a script"));
+
+    s.call(neosh_proto::ApiCall::AgentCommand {
+        session: Some(made.id.clone()),
+        command: neosh_proto::AgentCommand::Send { text: "say something".into() },
+    });
+
+    let want = made.id.clone();
+    s.until_event("the turn to end", move |e| {
+        matches!(e, neosh_proto::PluginEvent::TurnEnded { session, .. } if *session == want)
+    });
+
+    let messages =
+        match s.call(neosh_proto::ApiCall::SessionMessages { session: Some(made.id.clone()) }) {
+            neosh_proto::ApiOk::Messages { messages } => messages,
+            other => panic!("expected a transcript, got {other:?}"),
+        };
+    let said: String = messages
+        .iter()
+        .filter(|m| m.role == neosh_proto::Role::Assistant)
+        .flat_map(|m| m.content.iter())
+        .filter_map(|b| match b {
+            neosh_proto::ContentBlock::Text { text } => Some(text.clone()),
+            _ => None,
+        })
+        .collect();
+    assert!(said.contains("All done."), "the script never saw the answer: {said:?}");
+}
+
+/// A control connection is not a terminal.
+///
+/// The thing this protects: "is anybody watching" decides whether a notification leaves the
+/// terminal and whether the workspace counts as idle. A script polling every ten seconds must not
+/// make a workspace believe somebody is sitting at it — and must not take an actual terminal's
+/// place, which is what attaching does.
+#[test]
+fn a_script_is_not_somebody_watching() {
+    let sb = Sandbox::new("controlnotaview");
+    let ws = sb.serve("hello_turn.jsonl");
+
+    let mut c = Client::attach(&ws.socket, neosh_proto::PROTOCOL_VERSION);
+    c.ready();
+
+    let mut s = Script::open(&ws.socket);
+    // Enough calls that a bug counting connections would have counted these.
+    for _ in 0..3 {
+        sessions(&mut s);
+    }
+    c.pump_once();
+    assert!(c.ended.is_none(), "a script took the terminal's place: {:?}", c.ended);
+
+    let out = sb.neosh(&["status"]).output().expect("status");
+    let said = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        said.contains("a terminal is attached"),
+        "the terminal should still be the one watching: {said}"
+    );
+
+    drop(c);
+    // The terminal has gone and only the script is left, so nobody is watching — even though a
+    // connection is open and answering.
+    let deadline = Instant::now() + PATIENCE;
+    let mut said = String::new();
+    while Instant::now() < deadline {
+        let out = sb.neosh(&["status"]).output().expect("status");
+        said = String::from_utf8_lossy(&out.stdout).into_owned();
+        if said.contains("nobody watching") {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(said.contains("nobody watching"), "a script counted as a viewer: {said}");
+    // And it is still answering, which is the other half: not being a terminal is not the same as
+    // having been disconnected.
+    assert!(!sessions(&mut s).is_empty());
+}
+
+/// Deleting a conversation over the socket deletes it, and a call that cannot be answered says so
+/// rather than reporting success.
+#[test]
+fn a_script_can_throw_a_conversation_away_and_is_refused_what_needs_a_person() {
+    let sb = Sandbox::new("controldelete");
+    let ws = sb.serve("hello_turn.jsonl");
+    let mut s = Script::open(&ws.socket);
+
+    let made = match s.call(neosh_proto::ApiCall::SessionNew {
+        cwd: Some(sb.root.join("work").display().to_string()),
+        title: Some("temporary".into()),
+        activate: false,
+    }) {
+        neosh_proto::ApiOk::Session { session } => session,
+        other => panic!("expected a conversation, got {other:?}"),
+    };
+    assert!(sessions(&mut s).iter().any(|x| x.id == made.id));
+
+    s.call(neosh_proto::ApiCall::SessionClose { session: made.id.clone() });
+    assert!(
+        !sessions(&mut s).iter().any(|x| x.id == made.id),
+        "the conversation is still here after being closed"
+    );
+
+    // A key is typed into a terminal, and there is no terminal on this connection. The refusal
+    // says what to do instead — a call that returned `ok` having done nothing is the failure mode
+    // worth a test of its own.
+    let answer = s.try_call(neosh_proto::ApiCall::ProviderSetCredential {
+        instance: neosh_proto::InstanceId("mock".into()),
+        replace: false,
+    });
+    match answer {
+        neosh_proto::ApiResponse::Err { error } => {
+            let said = error.to_string();
+            assert!(said.contains("config.toml"), "the refusal says no fix: {said}");
+        }
+        neosh_proto::ApiResponse::Ok { value } => {
+            panic!("a key prompt with nobody to type into it answered {value:?}")
+        }
+    }
+}
+
+/// `neosh "a prompt"` lands the terminal in the conversation it just started.
+///
+/// The case this is really about is a workspace that has been sitting with nobody attached: it
+/// keeps the last screen for whoever comes back, so a terminal that trusted "the newest
+/// conversation is where an arriving terminal lands" would be handed the old one instead, with its
+/// own turn running out of sight. See `Host::open_view`.
+#[test]
+fn attaching_into_a_named_conversation_beats_the_screen_that_was_left_behind() {
+    let sb = Sandbox::new("controlopen");
+    let ws = sb.serve("hello_turn.jsonl");
+
+    // Somebody was here, in a conversation of their own, and left. The workspace keeps their
+    // screen.
+    let mut first = Client::attach(&ws.socket, neosh_proto::PROTOCOL_VERSION);
+    first.ready();
+    first.leave();
+    first.until("the first terminal to go", |c| c.ended.is_some());
+    drop(first);
+
+    // A script starts a conversation with a name nothing else would have.
+    let mut s = Script::open(&ws.socket);
+    let made = match s.call(neosh_proto::ApiCall::SessionNew {
+        cwd: Some(sb.root.join("work").display().to_string()),
+        title: Some("zzz-the-one-we-asked-for".into()),
+        activate: false,
+    }) {
+        neosh_proto::ApiOk::Session { session } => session,
+        other => panic!("expected a conversation, got {other:?}"),
+    };
+
+    // And the terminal asks for it by name, exactly as `neosh "a prompt"` does.
+    let stream = UnixStream::connect(&ws.socket).expect("connect");
+    let read = stream.try_clone().expect("clone");
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        for line in BufReader::new(read).lines() {
+            let Ok(line) = line else { break };
+            if tx.send(line).is_err() {
+                break;
+            }
+        }
+    });
+    let mut asked = Client {
+        write: stream,
+        lines: rx,
+        mirror: neosh_tui::Mirror::new(),
+        ended: None,
+        refusal: None,
+        stopped: false,
+        size: (100, 34),
+    };
+    asked.send(ClientMessage::Attach {
+        protocol_version: neosh_proto::PROTOCOL_VERSION,
+        width: 100,
+        height: 34,
+        build: Default::default(),
+        session: Some(made.id.clone()),
+    });
+    asked.ready();
+
+    // Asked of the workspace rather than read off the screen: which conversation a terminal is in
+    // is a fact the host holds, and a title only reaches the screen if some panel happens to draw
+    // it.
+    let here = sessions(&mut s)
+        .into_iter()
+        .find(|x| x.on_screen)
+        .expect("some conversation is on a screen");
+    assert_eq!(
+        here.id, made.id,
+        "the terminal landed in {:?} rather than the conversation it asked for",
+        here.title
     );
 }

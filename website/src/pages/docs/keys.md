@@ -1,69 +1,179 @@
 ---
 layout: ../../layouts/Docs.astro
 title: Keys
-description: The short version of every binding that ships. ^Z lists the live registry, and every key here is an ordinary binding your init.ts can move.
+description: Every default binding that ships. All of them are ordinary entries in one table — set the same key in your init.ts and yours replaces ours.
 ---
 
-Every default is a key your terminal already sends: Ctrl with a letter, `⇧⇥`, `⏎`, `⌫`, `Esc`. Arrows and `PgUp`/`PgDn` work wherever they mean something and are never the only way to do anything.
+**Nothing here is fixed.** Every key below is an ordinary binding to a *command name*, in the same table your `init.ts` writes to. Setting the same key replaces it; `neosh.keymap.del` removes it; a capability whose key you delete still runs from `^K` by name. `^Z` lists the live registry, which is the truth — this page is what ships. See [keymaps](/docs/keymaps) for how to change any of it.
+
+Every default is a key your terminal already sends: Ctrl with a letter, `⇧⇥`, `⏎`, `⌫`, `Esc`. Nothing needs `fn` or Option-as-Alt. Arrows, `PgUp`/`PgDn`, `Home` and `End` are bound wherever they mean something and are **never the only way** to do anything.
 
 ## Chat
 
 | Key | Does |
 | --- | --- |
-| `⏎` | Send. While a turn runs, steer it |
+| `⏎` | Send. While a turn is running, **steer** it: the message is taken in at the next gap |
 | `⇧⏎` | Newline, so a pasted snippet stays one message |
-| `Esc` | Interrupt the turn. The conversation survives it |
-| `^P` | Pick a model, mid turn too |
-| `^E` | Every option this model has, applied as you move |
-| `⇧⇥` | Permission mode for this conversation |
-| `^N` | New conversation, with a choice of where |
+| `Esc` | Interrupt the turn in this conversation. The conversation survives it |
+| `^Y` | Take the last thing you queued back into the composer, to change it or drop it |
+| `^V` | Attach the image on the clipboard — the picture, or the one it only names |
+| `⌫` | On an empty composer, take the last attached image back off |
+| `^P` | Pick a model. Mid-turn too — the running agent is told |
+| `^E` | Every option this model has, on one panel, applied as you move |
+| `⇧⇥` | Permission mode. Belongs to this conversation and is saved with it |
 | `^T` | Projects and conversations |
+| `^J` | The computers in this workspace |
+| `^F` | The archive |
+| `^N` | New conversation. In a repository it asks where |
+| `^O` | Add a project |
+| `^B` | Toggle the sidebar |
 | `^K` | Command palette |
-| `^S` | Read the transcript in normal mode |
-| `^V` | Attach the image on the clipboard |
+| `/` | Complete a command by name — neosh's, and whatever the agent accepts |
+| `^L` | What the plan has left, and where the week went |
 | `^G` | Git status |
 | `^D` | Show what changed |
-| `^L` | What the plan has left |
-| `^B` | Toggle the sidebar |
-| `^F` | The archive |
-| `^J` | The computers in this workspace |
+| `^S` | Read the transcript |
+| `⌥Y` | Copy this conversation's directory |
+| `^A` `^X` | Select everything, cut the selection |
+| `^C` | Copy the selection, or clear the draft, or (twice) quit |
+| `PgUp` `PgDn` `^End` | Scroll, and back to the newest message |
 | `^R` | Reload configuration |
-| `^Q` | Close this terminal. Everything keeps running |
+| `^Q` | Close this terminal. Whatever is running keeps running |
 | `^Z` | Every binding, live |
 
-`/` completes a command by name. Dragging an image onto the terminal attaches it.
+Dragging an image onto the terminal pastes its path, and a pasted path to an image is attached rather than typed out.
 
-## Reading the transcript
+**Composer editing** is a text field: `←`/`→` by character and `^←`/`^→` by word, `Home`/`End` and `^Home`/`^End` for the ends, shift with any of them to select, `^W` and `^U` to delete a word or back to the start of the line.
 
-`^S` puts the transcript in normal mode. The motions are Vim's and take counts: `5j`, `12G`, `^D`, `w`, `f`, `/` and `n`, `v` to select, text objects like `iw` and `i(`. Nothing edits; the transcript is an artefact you take pieces out of.
+`model.upgrade` and `model.downgrade` ship with **no key** — they had `⌥↑`/`⌥↓`, which is not a key every terminal sends. `^K` runs both by name, and `init.ts` can bind them.
 
-The copies specific to a transcript:
+## Reading the transcript — `^S`
 
-| Key | Copies |
+`^S` puts the editor in `Normal`, so chat's bindings stop firing and these get their keys back. Only `^C`, `^Q`, `^R` and `^S` are bound in every mode.
+
+| Key | Does |
 | --- | --- |
-| `y` | The selection |
-| `yc` | The code block the cursor is in, without its indent |
-| `ym` | The whole turn, question and answer |
-| `yp` | This conversation's directory |
-| `ya` | The entire transcript |
+| `hjkl`, arrows | Move. A count first does it that many times: `5j` |
+| `w` `b` `e` `ge` | By word. `W` `B` `E` by WORD — everything that is not a space |
+| `0` `^` `$` `g_` | Line start, first non-blank, last character, last non-blank |
+| `f` `F` `t` `T` then `;` `,` | To a character on this line, or just before it |
+| `%` | The bracket matching the one under the cursor |
+| `gg` `G` | Ends of the transcript. With a count it is a row: `12G` |
+| `^D` `^U` | Half a screen |
+| `^F` `^B`, `PgUp` `PgDn` | A screen |
+| `^E` `^Y` | Scroll a line without moving the cursor |
+| `H` `M` `L` | The top, middle and bottom row of the window |
+| `zz` `zt` `zb` | Put the cursor's line in the middle, at the top, at the bottom |
+| `[` `]` | Previous / next **turn** |
+| `c` `C` | Next / previous **tool call**. The card you land on opens itself |
+| `{` `}` | Previous / next **block** |
+| `⇥` `za` | *Keep* the tool card under the cursor open |
+| `/` `?` then `n` `N` | Search, and step through the matches |
+| `*` `#` | Search for the word under the cursor |
+| `v` `V` | Start a selection; `V` by whole lines |
+| `o` | While selecting: the other end of what you have |
+| `gv` | The selection you last gave up, back where it was |
+| `iw` `aw` `ip` `ap` `i"` `i(` … | Text objects, while selecting. `a` takes the delimiters |
+| `y` | Copy the selection, and leave |
+| `yy` `Y` | Copy the line |
+| `y` + a motion | Copy what it covers: `yw`, `y$`, `y5j`, `yG` |
+| `yi` + an object | Copy one without selecting it first — `yiw`, `yi"` |
+| `yc` | Copy the **code block** the cursor is in, without its indent or language line |
+| `ym` | Copy the whole **turn** — the question and everything it produced |
+| `yp` | Copy this conversation's **directory** |
+| `ya` | Copy the entire transcript |
+| `i` `a` `o` `⏎` | Back to the composer |
+| `^S` | And back out, the way you came in |
+| `Esc` | One thing per press: the selection, then the search highlight, then the mode |
 
-`[` and `]` jump by turn, `c` and `C` by tool call, and the card the cursor is in opens itself. `^S` again, or `i`, goes back to the composer.
+There is no `^V`: a blockwise selection is a rectangle rather than a range. Nothing here edits — no `d`, `x` or `p` — because the transcript is an artefact you take pieces out of.
 
-## The project panel
-
-`^T`, then Vim motions with counts. `↵` opens, `n` starts a conversation in the project under the cursor, `r` renames, `f` pins, `x` archives, `X` deletes, `y` copies the row's directory. `?` shows the keys for the row you are on.
+The card you are standing on is open, up to `chat.preview_lines`. Reading the last row keeps reading it: a turn still running writes below you and carries you along. Anywhere else you stay put, and `G` starts following again.
 
 ## Answering a question
 
-When an agent asks you something, a panel opens over the composer. `↵` takes the option under the cursor, `1` to `9` jump to one, `⇥` ticks on a multi-select, and typing is answering: your text goes into the composer and is sent instead. `Esc` tells the agent nobody answered, which it can act on.
+What an agent gets when it asks *you* something. Every key here is bound against the `neosh.question` buffer kind, so `^Z` lists it and `init.ts` can move it.
+
+| Key | Does |
+| --- | --- |
+| `↵` | Take the option under the cursor. With something typed, send that instead |
+| `1`–`9` | Take that option, while nothing has been typed |
+| `⇥` | Tick or untick, on a question that takes more than one |
+| `^P` `^N`, `↑` `↓` | Move |
+| `⇧⇥` | Back to the previous question |
+| type | Your own answer. `⌫` back to the options, `^W` a word, `^U` all of it |
+| `Esc` | Dismiss. The agent is told nobody answered, which it can act on |
+
+## The project panel — `^T`
+
+| Key | Does |
+| --- | --- |
+| `↵` | Open a conversation, fold a project, or add one from the `+` row |
+| `j` `k` | Move. With a count, that many rows: `5j` |
+| `^D` `^U` | Half a screen; `PgUp`/`PgDn` for a whole one |
+| `gg` `G` | The ends of the list, and `5gg` / `5G` for the fifth row |
+| `>` `<` `=` | Wider, narrower, back to the default — it is the `sidebar.width` setting |
+| `n` | New conversation in the project under the cursor |
+| `o` | Add a project |
+| `f` | Pin a project to the top |
+| `J` `K` | Reorder within a group |
+| `r` | Rename a conversation |
+| `y` | Copy the row's directory |
+| `p` | Pull that repository (a git-plugin contribution) |
+| `d` | Remove a worktree from disk. It asks first (a git-plugin contribution) |
+| `x` `X` | Archive, delete. On a project heading, `X` takes the project off the list |
+| `a` | The archive |
+| `⇥` | On the plan rows: how much of it to show |
+| `?` | The keys for whatever row you are on |
+| `Esc` | Back to the composer |
+
+## The archive — `^F`, or `a` in the project panel
+
+Rows can be ticked, and every verb means what is ticked or — with nothing ticked — the row under the cursor.
+
+| Key | Does |
+| --- | --- |
+| `↵` | Put this one back and go to it |
+| `u` | Put these back, and stay here |
+| `X` | Delete these, for good. It asks, and says how many |
+| `^X` | Empty what the panel is **currently showing**, so a filter first narrows it |
+| `<Space>` `⇥` | Tick this row, and step down |
+| `a` | Tick everything showing, or untick it |
+| `e` | Copy these conversations to the clipboard, as markdown |
+| `y` | Copy this conversation's directory |
+| `/` | Filter — on the title, the project and the path |
+| `s` `S` | The next ordering along; the next grouping along |
+| `j` `k`, `^D` `^U`, `gg` `G` | Move, with counts |
+| `?` | The keys |
+| `Esc` | One thing per press: the marks, then the filter, then the panel |
+| `^F` `q` `^C` | Close it |
+
+## Pickers
+
+| Key | Does |
+| --- | --- |
+| `↵` | Choose |
+| `^N`/`^P`, `^J`/`^K`, `↑`/`↓` | Move |
+| type | Filter |
+| `⇥` `⇧⇥`, `→` `←` | Between the two panes of the model picker |
+| `Esc`, `^C` | Close |
+
+In the model picker, chords — because every bare letter a picker takes is a letter its filter can never contain:
+
+| Key | Does |
+| --- | --- |
+| `^S` | Sign in to the provider the rail is on |
+| `^R` | Ask that endpoint what it serves again |
+| `^A` | Add a model by id |
+| `^D` | Remove one you added |
+
+These are settings (`ui.keys.next`, `ui.keys.accept`, …), so rebinding them changes what the pickers say they do.
 
 ## Rebinding
-
-Every key is a binding to a command name in one table:
 
 ```ts
 await neosh.keymap.set("chat", "<C-l>", "chat.clear");
 await neosh.keymap.del("chat", "<C-o>");
 ```
 
-The full table lives in [AGENTS.md](https://github.com/neoswarm/neosh/blob/main/AGENTS.md) in the repository.
+Keys bind to command names, never to callbacks — which is what makes every binding listable with `^Z`, runnable by name from `^K`, and replaceable by you or by another plugin. [Keymaps](/docs/keymaps) covers modes, scopes, `<leader>` and sequences.

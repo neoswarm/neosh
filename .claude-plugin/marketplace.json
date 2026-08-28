@@ -1,0 +1,15 @@
+{
+  "name": "neosh",
+  "owner": { "name": "neoswarm", "url": "https://github.com/neoswarm" },
+  "plugins": [
+    {
+      "name": "neosh",
+      "source": "./",
+      "description": "Drive a neosh workspace from a coding agent: start, watch, steer and collect many agent conversations at once.",
+      "category": "agents",
+      "keywords": ["neosh", "agent", "orchestration", "parallel"],
+      "license": "MIT",
+      "homepage": "https://github.com/neoswarm/neosh"
+    }
+  ]
+}

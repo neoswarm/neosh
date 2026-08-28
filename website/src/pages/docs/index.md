@@ -50,6 +50,7 @@ A worktree you did not name gets its branch named from your first message, so `f
 ## Next steps
 
 - [Concepts](/docs/concepts) explains the workspace model in five minutes.
-- [Keys](/docs/keys) is the short version of every binding that ships.
+- [Keys](/docs/keys) is every binding that ships — all of them defaults you can move.
+- [Scripting](/docs/scripting) is `neosh agent`: running many conversations at once, from a shell or another coding agent.
 - [Configuration](/docs/configuration) covers `init.ts` and `config.toml`.
 - [Plugins](/docs/plugins) shows how to write and install one.

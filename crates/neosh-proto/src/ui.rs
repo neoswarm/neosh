@@ -25,6 +25,7 @@
 use serde::{Deserialize, Serialize};
 use ts_rs::TS;
 
+use crate::api::ApiResponse;
 use crate::ids::{BufferId, ExtmarkId, NamespaceId, SessionId, SurfaceId, WindowId};
 
 // ---------------------------------------------------------------------------
@@ -959,7 +960,23 @@ pub enum InputEvent {
     /// to be said again from the beginning ([`crate::UiEvent`] is a delta stream, and a delta into
     /// nothing is nothing). Folding the two together and always re-announcing would mean the
     /// in-process case sends its whole state twice at startup, into a mirror that already has it.
-    Attached { width: u16, height: u16 },
+    Attached {
+        width: u16,
+        height: u16,
+        /// Which conversation this terminal would like to open in.
+        ///
+        /// `None` — every attach until `neosh "a prompt"` existed — is the ordinary placement: the
+        /// most recent conversation nobody else is reading, or the screen a workspace nobody was
+        /// watching kept for whoever came back. That second case is why this cannot be left to
+        /// "the newest conversation wins": a terminal starting one and then attaching would be
+        /// handed the abandoned screen instead, and the conversation it had just started would be
+        /// running somewhere nothing on that screen mentions.
+        ///
+        /// A request rather than an instruction: a conversation deleted between the ask and the
+        /// arrival gets the ordinary placement rather than an error nobody can act on.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session: Option<SessionId>,
+    },
     /// The last terminal looking at a view has gone.
     ///
     /// Not something a client sends — it cannot know whether it was the last, and a client whose
@@ -1069,6 +1086,9 @@ pub enum ClientMessage {
         /// from the workspace anyway, and refusing it would be a worse answer than saying nothing.
         #[serde(default)]
         build: BuildId,
+        /// Open in this conversation. See [`InputEvent::Attached::session`].
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session: Option<SessionId>,
     },
     Input {
         #[serde(flatten)]
@@ -1080,6 +1100,49 @@ pub enum ClientMessage {
     Stop,
     /// What is running, for a client that only wants to ask.
     Status,
+
+    /// Make an ordinary [`crate::ApiCall`] — the very one a plugin would make — over the socket.
+    ///
+    /// # Why this is not a second vocabulary
+    ///
+    /// The alternative was a `ControlRequest` enum listing the things a script is allowed to do:
+    /// start a conversation, send to one, list them, interrupt. Every one of those verbs already
+    /// exists, in [`crate::ApiCall`], because a plugin needed it first — and a second enum saying
+    /// the same things is a second enum to keep in step, which means a surface that is a release
+    /// behind the one it mirrors. So the socket carries the public API and nothing else: whatever
+    /// a plugin can do, `neosh agent` can do, and a capability added for one arrives in the other
+    /// without anybody writing a line.
+    ///
+    /// # What a caller is
+    ///
+    /// Not a view. A control connection has no terminal, no screen and no keyboard, so it is never
+    /// counted as attached, never sent a frame, and never takes the workspace over. Calls that
+    /// name a window act on the terminal being served, exactly as a plugin's do.
+    ///
+    /// # What it may do
+    ///
+    /// Everything. The socket lives in the user's own runtime directory at `0600` and a Unix
+    /// socket does not leave the machine, so reaching it means already being the person at the
+    /// keyboard — and a permission layer between someone and their own workspace would be
+    /// ceremony rather than security. The permissions that matter are the *agent's*, and those
+    /// are unchanged: a tool call from a conversation started this way is asked about exactly as
+    /// one started by typing.
+    Call {
+        /// Echoed on [`ServerMessage::Called`]. Any string the caller likes — several may be in
+        /// flight at once, which is the point of it being here rather than implied by order.
+        id: String,
+        call: crate::ApiCall,
+    },
+    /// Send every [`crate::PluginEvent`] this workspace broadcasts down this connection.
+    ///
+    /// The same stream a plugin observes, for the same reason [`Self::Call`] is the same call: a
+    /// script following ten conversations wants `Token`, `ToolStarted`, `TurnEnded` and
+    /// `SessionChanged`, and those already exist and already name the conversation they came from.
+    ///
+    /// Subscribing does not attach. It is legal alongside [`Self::Call`] on one connection, which
+    /// is what lets a caller subscribe *first* and then start a turn — the other order is a race
+    /// where a short turn ends before anybody was listening.
+    Subscribe,
 }
 
 /// What the workspace says back.
@@ -1105,6 +1168,21 @@ pub enum ServerMessage {
     /// This client is no longer the one attached.
     Detached { reason: DetachReason },
     Status { status: WorkspaceStatus },
+    /// The answer to one [`ClientMessage::Call`], carrying the id that asked.
+    ///
+    /// Answers can arrive in any order — a `git status` is a subprocess and a `session.list` is a
+    /// map lookup — so the id is how a caller with several in flight tells them apart.
+    Called {
+        id: String,
+        response: ApiResponse,
+    },
+    /// One event, for a connection that asked to [`ClientMessage::Subscribe`].
+    ///
+    /// Dropped rather than queued for a subscriber that has stopped reading: a script that walked
+    /// away must cost a closed socket, never a workspace holding tokens for it forever.
+    Event {
+        event: crate::PluginEvent,
+    },
 }
 
 #[derive(TS, Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
