@@ -1,6 +1,6 @@
 {
   "name": "@neosh/titles",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Names a conversation after what it turned out to be about.",
   "license": "MIT",
   "type": "module",

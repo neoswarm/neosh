@@ -1,6 +1,6 @@
 {
   "name": "@neosh/approvals",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Asks before the agent does something the policy says to ask about.",
   "license": "MIT",
   "type": "module",

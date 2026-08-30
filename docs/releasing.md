@@ -175,17 +175,38 @@ checksum somebody typed is a formula that installs whatever is at that URL now.
 ## Every release after that
 
 ```sh
-# 1. Bump the one version.
+# 1. Bump the version — in both halves of the root manifest.
 $EDITOR Cargo.toml                       # [workspace.package] version
+                                         # AND the ten internal pins in [workspace.dependencies]
 $EDITOR npm/neosh/package.json          # version AND the four optionalDependencies
 $EDITOR plugins/api/package.json plugins/builtin/*/package.json
+cargo update -w                          # so Cargo.lock agrees before anything is committed
 
 # 2. Prove it.
 ./scripts/check.sh
 
 # 3. Tag it.
-git commit -am "release: v0.2.0" && git tag v0.2.0 && git push --follow-tags
+git commit -am "release: v0.3.0" && git tag v0.3.0 && git push --follow-tags
 ```
+
+**Both halves of the root manifest**, and this is the one that bites. Every internal dependency in
+`[workspace.dependencies]` carries a `version` beside its `path` — it has to, or `cargo package`
+refuses — so bumping `[workspace.package]` alone leaves ten pins asking for the version that no
+longer exists, and the workspace stops resolving at all:
+
+```
+error: failed to select a version for the requirement `neosh-proto = "^0.2.0"`
+candidate versions found which didn't match: 0.3.0
+```
+
+It fails loudly and on the first command, which is the good case. It is in step 1 rather than in a
+troubleshooting section because reading it after `check.sh` has already died is reading it too late.
+
+**Which number.** `0.x` is breaking at the *minor*, and Cargo means it: a new variant on a public
+`enum` or a new field on a public `struct` breaks an exhaustive `match` or a struct literal
+downstream, and both are ordinary things to add. `0.2.0` → `0.3.0` was exactly that — `LinkState`
+gained `Waiting`, `SwarmEvent` gained `Unapproved`, `allow::Peer` gained `alias`. Ship those as a
+patch and the version number has stopped telling anybody anything.
 
 Then publish the GitHub release for that tag. Publishing it is the trigger: `release.yml` builds
 the four binaries and attaches them, `publish-crates.yml` pushes the eleven crates,
