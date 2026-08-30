@@ -351,7 +351,7 @@ fn open(name: &str) -> Session {
 
 #[test]
 fn a_question_is_drawn_with_its_options_and_what_each_one_means() {
-    let mut s = open("draws");
+    let s = open("draws");
     assert!(s.saw("Database"), "the header names what it is about\n{}", s.transcript());
     assert!(s.saw("Postgres"), "{}", s.transcript());
     assert!(
