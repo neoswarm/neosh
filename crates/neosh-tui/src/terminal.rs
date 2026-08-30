@@ -93,7 +93,6 @@ pub fn to_input_event(ev: Event) -> Option<InputEvent> {
         // see `InputEvent::Focus`.
         Event::FocusGained => Some(InputEvent::Focus { on: true }),
         Event::FocusLost => Some(InputEvent::Focus { on: false }),
-        _ => None,
     }
 }
 

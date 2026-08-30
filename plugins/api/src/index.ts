@@ -1642,6 +1642,17 @@ export interface SwarmApi {
   /** Withdraw authorisation and stop connecting. Refuses for a machine your config declared. */
   unpair(node: NodeId): Promise<void>;
   /**
+   * Call a machine something else — an SSH `Host` alias, and for the same reasons.
+   *
+   * A hostname is chosen by whoever set the machine up, is often `Mac` or `ubuntu` on every box
+   * somebody owns, and is not what its owner calls it. This wins over the announced name
+   * everywhere a `SwarmNode` is read, so every panel agrees; `null` gives the announced name back.
+   *
+   * Refuses for a machine your `config.toml` declared, naming the `name` field to change instead —
+   * an alias stored beside a config peer would be reverted by the next reload.
+   */
+  rename(node: NodeId, name: string | null): Promise<void>;
+  /**
    * Dial a down peer again now, rather than waiting out its retry delay.
    *
    * Also what lifts a {@link disconnect}: for a peer that dials *this* machine, being willing to
@@ -2052,6 +2063,9 @@ function build(
       },
       async unpair(node) {
         await c({ call: "swarm_unpair", node });
+      },
+      async rename(node, name) {
+        await c({ call: "swarm_rename", node, name });
       },
       async reconnect(node) {
         await c({ call: "swarm_reconnect", node });

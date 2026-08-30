@@ -128,12 +128,6 @@ impl Session {
         stdin.flush().expect("flush");
     }
 
-    fn key(&mut self, c: &str) {
-        self.send(&format!(
-            r#"{{"type":"key","key":{{"code":{{"kind":"char","c":"{c}"}},"mods":{{}}}}}}"#
-        ));
-    }
-
     fn special(&mut self, kind: &str) {
         self.send(&format!(r#"{{"type":"key","key":{{"code":{{"kind":"{kind}"}},"mods":{{}}}}}}"#));
     }

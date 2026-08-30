@@ -154,7 +154,18 @@ is `docs/releasing.md`.
   `config.toml`, and a `[[swarm.peers]]` entry written by hand is not the UI's to remove. A dialler
   does not announce a connection until the peer has sent it something: it sends the last message of
   the handshake and cannot tell whether the far end approved, so announcing there says "joined" and
-  then "lost" every time pairing is half done.
+  then "lost" every time pairing is half done. **And half done is a state with a name on it**, not
+  a dial that failed: `LinkState::Waiting`, out of `SwarmEvent::Unapproved`, carrying the
+  `NodeInfo` the handshake did get. Reported as a `DialFailed` with attempt 0 it rendered as
+  `connecting…` — the one row with something actionable in it drawn as the one row with nothing to
+  say — so adding a computer looked like a wrong address for as long as anybody watched. It does
+  not spin, either: a spinner means *this* machine is working on it, and what this is waiting for
+  is a person at the other end. **What a machine is called is a decision too.** A hostname is
+  chosen by whoever set the box up and is `Mac` on both of them; `swarm.rename` is an SSH `Host`
+  alias, kept beside the pairing in `$STATE`, substituted once where `SwarmNode` is built so every
+  panel agrees, and never overwritten by the handshake that refreshes everything else. And the
+  hostname it falls back to is asked of the *OS*: `HOSTNAME` is unexported under bash and unset
+  under zsh, so reading only the environment named every machine in the swarm `neosh`.
 - **An agent belongs to the machine it was started on.** ASCP moves *descriptions* of agents and
   *requests* to their owners, never the agent: its files, shell and credentials are there, and a
   conversation that could migrate is one whose `cwd` means something else afterwards. The owner may
@@ -672,7 +683,7 @@ only way to do anything.
 | `^E` | Everything this model can be told, on one panel: effort, thinking, fast mode, context, and whatever a driver invented. `h`/`l` along a row, `j`/`k` between them, arrows too, and it applies as you move. Nothing else reaches the keyboard while it is open; `^E` again closes it |
 | `⇧⇥` | Permission mode — full access to start with, then ask, allow-listed, deny. Belongs to this conversation, saved with it, and takes effect on the turn that is running |
 | `^T` | Projects and conversations. Switching is never refused — turns keep running where they are |
-| `^J` | The computers in this workspace. Add one by its address, allow one that is asking, or open what it is running |
+| `^J` | The computers in this workspace. Add one by its address, allow one that is asking, rename one (`^E`), or open what it is running. A machine this one has reached that has not allowed it back says so, and says which key to press over there |
 | `^F` | What you have archived — see below. Filter it, put some back, or finally empty it |
 | `^N` | New conversation. In a repository it asks where: here, a worktree you need not name, one kept inside the project, one you do name, an existing one, another machine, elsewhere. A worktree you did not name is named by your first message — `fix/composer-paste-truncation`, not `wily-nimbus` |
 | `^O` | Add a project |

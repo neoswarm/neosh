@@ -49,6 +49,7 @@ base64 = { workspace = true }
 image = { workspace = true }
 uuid = { workspace = true }
 tokio-stream = { workspace = true }
+hostname = "0.4"
 
 [dev-dependencies]
 insta = { workspace = true }

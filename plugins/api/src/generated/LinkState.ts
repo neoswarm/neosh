@@ -3,14 +3,15 @@
 /**
  * How the connection to a peer stands, beyond the fact of it being up or not.
  *
- * `up` is the summary and this is the story, because "not connected" is three different rows on a
+ * `up` is the summary and this is the story, because "not connected" is four different rows on a
  * board: a machine being dialled that has never answered, one that was here and is being dialled
- * again, and one nothing is dialling at all — it reached us last time, or it was told to stop.
- * `attempt` counts dials since the last success, so a panel can say `try 4` instead of drawing a
- * spinner that has been spinning since Tuesday.
+ * again, one nothing is dialling at all — it reached us last time, or it was told to stop — and
+ * one that answered and is waiting on a person. `attempt` counts dials since the last success, so
+ * a panel can say `try 4` instead of drawing a spinner that has been spinning since Tuesday.
  */
 export type LinkState =
   | { "state": "connecting"; attempt: number }
   | { "state": "up" }
+  | { "state": "waiting" }
   | { "state": "retrying"; attempt: number }
   | { "state": "down" };

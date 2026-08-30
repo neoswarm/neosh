@@ -26,7 +26,7 @@ fn caps() -> NodeCapabilities {
 /// Run one handshake between two identities and give back both sides' verdicts.
 fn allow(who: &Identity, name: &str) -> AllowedPeer {
     let _ = who;
-    AllowedPeer { name: name.into(), addr: None, source: Source::Paired }
+    AllowedPeer { name: name.into(), alias: None, addr: None, source: Source::Paired }
 }
 
 async fn introduce(

@@ -170,11 +170,11 @@ pub struct Contribution {
 
 /// How the connection to a peer stands, beyond the fact of it being up or not.
 ///
-/// `up` is the summary and this is the story, because "not connected" is three different rows on a
+/// `up` is the summary and this is the story, because "not connected" is four different rows on a
 /// board: a machine being dialled that has never answered, one that was here and is being dialled
-/// again, and one nothing is dialling at all — it reached us last time, or it was told to stop.
-/// `attempt` counts dials since the last success, so a panel can say `try 4` instead of drawing a
-/// spinner that has been spinning since Tuesday.
+/// again, one nothing is dialling at all — it reached us last time, or it was told to stop — and
+/// one that answered and is waiting on a person. `attempt` counts dials since the last success, so
+/// a panel can say `try 4` instead of drawing a spinner that has been spinning since Tuesday.
 #[derive(TS, Serialize, Deserialize, Clone, PartialEq, Debug)]
 #[ts(export)]
 #[serde(tag = "state", rename_all = "snake_case")]
@@ -182,6 +182,19 @@ pub enum LinkState {
     /// Being dialled, never yet answered.
     Connecting { attempt: u32 },
     Up,
+    /// Reached, proved who we are, and that machine has not allowed this one yet.
+    ///
+    /// The far half of pairing, and its own state rather than a flavour of `Connecting`, because
+    /// the two are answered by different people. `Connecting` is the network's problem and gets a
+    /// spinner; this is a key somebody has to press on the *other* machine, and a spinner over it
+    /// is a promise nothing on this one is keeping. It is also the state pairing spends most of
+    /// its life in — you add a computer here, then walk over there — so a board that draws it as
+    /// "connecting…" is a board that never explains the only step left.
+    ///
+    /// Reached by the *dialler* only: the handshake sends this machine's proof last and the far
+    /// end simply stops talking to a machine it has not been told about, so "it went quiet after
+    /// the handshake" and "it has not allowed me" are the same observation.
+    Waiting,
     /// Was up, lost, and being dialled again — with backoff, so the count moves slower over time.
     Retrying { attempt: u32 },
     /// Nobody is dialling it: it dialled us last time, or a disconnect said to stop.
@@ -1131,6 +1144,21 @@ pub enum ApiCall {
     /// Withdraw authorisation, and stop dialling.
     SwarmUnpair {
         node: NodeId,
+    },
+    /// What *you* call a machine, overriding the name it announces.
+    ///
+    /// An SSH `Host` alias, and it exists for the same reason: a hostname is chosen by whoever set
+    /// the machine up, is often the same on every machine somebody owns, and is not what its owner
+    /// calls it. The announced name is a fallback rather than the truth — this is the truth.
+    ///
+    /// `None` gives the announced name back, so a rename is undoable without remembering what the
+    /// machine was called. Refused for a peer declared in `config.toml`, whose name is that file's
+    /// to change: an alias stored here would be shadowed by the config on the next reload, and a
+    /// rename that silently reverts is worse than one that says where to make it.
+    SwarmRename {
+        node: NodeId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
     },
     /// Dial a down peer again now, rather than waiting out the retry delay.
     SwarmReconnect {

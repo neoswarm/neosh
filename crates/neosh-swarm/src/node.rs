@@ -117,6 +117,19 @@ pub enum SwarmEvent {
     /// A dial did not produce a connection. `attempt` counts since the last success, so a board
     /// can say `try 4`; `node` is absent for an address whose machine we have never identified.
     DialFailed { node: Option<NodeId>, addr: String, attempt: u32, error: String },
+    /// Reached a machine we have authorised, and it has not authorised us back.
+    ///
+    /// Pairing is a decision each machine makes, so this is the ordinary state between the two
+    /// halves rather than an error — and it is the one a board most needs to name, because the
+    /// only thing that ends it is somebody pressing a key on the *other* machine. Reported as its
+    /// own event rather than as a [`SwarmEvent::DialFailed`] with a distinctive sentence in it: a
+    /// board that has to match on an error string to draw the right row is one sentence rewrite
+    /// away from drawing the wrong one.
+    ///
+    /// Carries the full [`NodeInfo`] because the handshake got that far. A row that has only ever
+    /// been half-paired can therefore still say what the machine is actually called, what it is
+    /// running and what it offers — all of which arrived before it stopped talking to us.
+    Unapproved { node: NodeInfo, capabilities: NodeCapabilities, addr: String },
     Inventory { node: NodeId, full: bool, agents: Vec<AgentSummary>, gone: Vec<SessionId> },
     Stream { node: NodeId, session: SessionId, event: StreamEvent },
     /// A peer asked us to do something. The host must answer with [`SwarmRequest::Answer`].
@@ -326,8 +339,14 @@ async fn run(
                     SwarmRequest::Projects { projects } => caps.projects = projects,
                     SwarmRequest::Pair { id, name, addr } => {
                         paused.remove(&id);
+                        // Re-pairing keeps whatever this user decided to call it. Unpair is how
+                        // you forget a machine; adding one back after a network moved is not, and
+                        // having it revert to its hostname would make the rename feel unreliable
+                        // in exactly the case somebody renamed it for.
+                        let alias = allowed.get(&id).and_then(|p| p.alias);
                         allowed.add(id.clone(), crate::allow::Peer {
                             name,
+                            alias,
                             addr: addr.clone(),
                             source: crate::allow::Source::Paired,
                         });
@@ -687,8 +706,10 @@ async fn keep_dialled(
     enum Outcome {
         /// Connected, accepted, and served until it ended.
         Served,
-        /// Reached the machine, and it has not allowed this one (yet).
-        Refused,
+        /// Reached the machine, and it has not allowed this one (yet). Carries what the handshake
+        /// learned, because that is everything a board needs to draw the row properly and it is
+        /// about to be the only thing we ever hear from this machine.
+        Refused(Box<(NodeInfo, NodeCapabilities)>),
         /// Reached a machine we have not paired with. What "add a computer" is waiting for.
         Stranger,
         Failed(String),
@@ -717,11 +738,16 @@ async fn keep_dialled(
                             "another machine answered ({})",
                             found.node.id.short()
                         ))
-                    } else if serve(stream, found, wire.clone(), true, Some(peer.addr.clone())).await
-                    {
-                        Outcome::Served
                     } else {
-                        Outcome::Refused
+                        // Kept before `serve` takes it: whether this connection was ever announced
+                        // is only known afterwards, and by then the one thing that would let a
+                        // board explain the answer is gone.
+                        let seen = (found.node.clone(), found.capabilities.clone());
+                        if serve(stream, found, wire.clone(), true, Some(peer.addr.clone())).await {
+                            Outcome::Served
+                        } else {
+                            Outcome::Refused(Box::new(seen))
+                        }
                     }
                 }
                 Err(crate::SwarmError::Stranger(s)) => {
@@ -747,16 +773,17 @@ async fn keep_dialled(
                 Duration::from_secs(1)
             }
             // The machine is *there*, so backing off would only slow down the pairing it is
-            // probably in the middle of; the flat heartbeat is the pace. Refused is still worth a
-            // row on the board — "it has not allowed this machine" names the key to press, over
-            // there, where a person is presumably sitting.
-            Outcome::Refused => {
+            // probably in the middle of; the flat heartbeat is the pace. That also means the row
+            // flips to connected within one heartbeat of somebody saying yes over there, which is
+            // what makes the second half of pairing feel like it worked rather than like it needs
+            // a restart.
+            Outcome::Refused(seen) => {
                 attempt = 0;
-                let _ = events.send(SwarmEvent::DialFailed {
-                    node: peer.expect.clone(),
+                let (node, capabilities) = *seen;
+                let _ = events.send(SwarmEvent::Unapproved {
+                    node,
+                    capabilities,
                     addr: peer.addr.clone(),
-                    attempt: 0,
-                    error: "reached it — it has not allowed this machine yet".into(),
                 });
                 every
             }
