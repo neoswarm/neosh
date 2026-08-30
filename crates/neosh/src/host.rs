@@ -1716,7 +1716,14 @@ impl Host {
                     .swarm
                     .peers()
                     .map(|p| neosh_proto::SwarmNode {
-                        info: p.info.clone(),
+                        // The name a plugin sees is the name the *user* gave it, with the
+                        // announced one behind it. Substituted here, once, rather than left for
+                        // every panel to remember: a rename that only the computers panel honoured
+                        // would be a machine with two names on one screen.
+                        info: neosh_proto::NodeInfo {
+                            name: p.display_name(),
+                            ..p.info.clone()
+                        },
                         capabilities: p.capabilities.clone(),
                         up: p.up(),
                         link: p.link.clone(),
@@ -1841,6 +1848,25 @@ impl Host {
                 }
                 h.send(neosh_swarm::SwarmRequest::Unpair { id: node });
                 self.bridge.broadcast(PluginEvent::SwarmChanged);
+                Ok(ApiOk::Unit)
+            }
+            ApiCall::SwarmRename { node, name } => {
+                if self.swarm_node.is_none() {
+                    return Err(ApiError::NotFound { what: "the swarm is not running".into() });
+                }
+                // The store is the record and the board is the picture. Written first, so a rename
+                // that the config refuses never reaches the screen at all.
+                let renamed = self
+                    .swarm_allowed
+                    .rename(&node, name.clone())
+                    .map_err(|e| ApiError::Denied { reason: e.to_string() })?;
+                if !renamed {
+                    return Err(ApiError::NotFound { what: format!("no such machine: {}", node.short()) });
+                }
+                self.swarm.set_alias(&node, name);
+                let now = self.swarm.peer(&node).map(|p| p.display_name()).unwrap_or_default();
+                self.bridge.broadcast(PluginEvent::SwarmChanged);
+                self.editor_message(MessageLevel::Info, format!("that computer is now {now}"));
                 Ok(ApiOk::Unit)
             }
             ApiCall::SwarmReconnect { node } => {
@@ -3243,6 +3269,9 @@ impl Host {
             // A row on the board from the first frame, so a machine being dialled reads as
             // "connecting" rather than as a silence to explain.
             self.swarm.seed(id.clone(), p.name.clone(), p.addr.is_some());
+            // And under the name this user gave it, from that same first frame: a rename that only
+            // takes effect once the machine has answered is one that looks lost across a restart.
+            self.swarm.set_alias(&id, p.alias.clone());
             if let Some(addr) = p.addr {
                 peers.push(neosh_swarm::PeerAddress { addr, expect: Some(id) });
             }
@@ -3254,6 +3283,10 @@ impl Host {
                     let id = neosh_proto::NodeId(id.clone());
                     allowed.add(id.clone(), neosh_swarm::AllowedPeer {
                         name: name.clone(),
+                        // A config peer's name is the config's to set, which is also why
+                        // `swarm.rename` refuses one: this file is reloaded and an alias stored
+                        // beside it would be a rename that lasts until `^R`.
+                        alias: None,
                         addr: Some(p.addr.clone()),
                         source: neosh_swarm::Source::Config,
                     });
@@ -3603,6 +3636,30 @@ impl Host {
                     self.swarm.dial_failed(&id, attempt, error);
                     self.bridge.broadcast(PluginEvent::SwarmChanged);
                 }
+            }
+            E::Unapproved { node, capabilities, .. } => {
+                // Said once per machine, not once per dial. The dialler retries at the heartbeat
+                // for as long as pairing stays half-done — which can be the whole time somebody
+                // walks to the other computer — and a notification every ten seconds about a state
+                // that has not changed is the definition of noise. The panel row is the standing
+                // record; this is the nudge that sends you to it.
+                let first = !matches!(
+                    self.swarm.peer(&node.id).map(|p| p.link.clone()),
+                    Some(neosh_proto::LinkState::Waiting)
+                );
+                self.swarm.unapproved(node.clone(), capabilities);
+                if first {
+                    let name = self
+                        .swarm
+                        .peer(&node.id)
+                        .map(|p| p.display_name())
+                        .unwrap_or_else(|| node.name.clone());
+                    self.editor_message(
+                        MessageLevel::Info,
+                        format!("{name} has not allowed this computer yet — press ^J over there"),
+                    );
+                }
+                self.bridge.broadcast(PluginEvent::SwarmChanged);
             }
             E::Inventory { node, full, agents, gone } => {
                 self.swarm.inventory(&node, full, agents, gone);
@@ -11287,13 +11344,25 @@ fn refusal_text(r: &neosh_proto::Refusal) -> String {
 
 /// What to call this machine when nobody has said.
 ///
-/// The hostname, which is what a person would answer if asked which computer they were at. Read
-/// from the environment rather than a syscall: `HOSTNAME` and `COMPUTERNAME` cover unix shells and
-/// Windows, and "neosh" is a name rather than a failure for the case where neither is set.
+/// The hostname, which is what a person would answer if asked which computer they were at — and it
+/// is asked *of the operating system* rather than of the environment, which is the whole point of
+/// this function existing in this shape.
+///
+/// `HOSTNAME` is not an exported variable on any platform worth relying on. bash sets it and does
+/// not export it, zsh does not set it at all (it has `HOST`), and the workspace is a daemon that
+/// gets a thinner environment than any of them. So the environment answered "no" on every Mac and
+/// most Linux boxes, every node fell through to the literal fallback, and every machine in the
+/// swarm was called `neosh` — in a panel whose entire job is telling machines apart.
+///
+/// The environment is still consulted *first*, because a container that sets `HOSTNAME` to
+/// something meaningful is deliberately overriding a kernel hostname that is a random hex string.
 fn machine_name() -> String {
     std::env::var("HOSTNAME")
         .or_else(|_| std::env::var("COMPUTERNAME"))
         .ok()
+        .or_else(|| hostname::get().ok().map(|h| h.to_string_lossy().into_owned()))
+        // `mini.local`, `build.tail1234.ts.net` — the first label is the name, and the rest is the
+        // network's business. A row in a list has one line for this.
         .map(|h| h.split('.').next().unwrap_or(&h).to_string())
         .filter(|h| !h.is_empty())
         .unwrap_or_else(|| "neosh".to_string())

@@ -78,6 +78,7 @@ import {
   type PickerItem,
   prompt,
   pulseBright,
+  pulseHl,
   spinnerFrame,
 } from "@neosh/api/ui";
 
@@ -1968,6 +1969,7 @@ async function showNodes(neosh: Neosh): Promise<void> {
   const listening = await neosh.vars
     .get<{ addr: string | null; error?: string }>({ scope: "global" }, "swarm.listen")
     .catch(() => null);
+  const ascii = (await neosh.opt.get<boolean>("ui.ascii_only").catch(() => false)) ?? false;
 
   type Row =
     | { kind: "node"; node: SwarmNode }
@@ -1975,11 +1977,17 @@ async function showNodes(neosh: Neosh): Promise<void> {
     | { kind: "add" }
     | { kind: "self" };
 
-  const build = async (): Promise<PickerItem<Row>[]> => {
-    const [nodes, strangers] = await Promise.all([
-      neosh.swarm.nodes().catch(() => []),
-      neosh.swarm.strangers().catch(() => []),
-    ]);
+  // The last answer from the host, so a spinner frame costs a redraw rather than two round trips.
+  // At 80ms a tick, rebuilding these over the API would be the most talkative thing in the
+  // workspace, to animate one glyph.
+  let nodes: SwarmNode[] = [];
+  let strangers: SwarmStranger[] = [];
+
+  /** Whether anything on screen is mid-dial, and therefore whether the tick has any work. */
+  const spinning = () =>
+    nodes.some((n) => n.link.state === "connecting" || n.link.state === "retrying");
+
+  const build = (): PickerItem<Row>[] => {
     const rows: PickerItem<Row>[] = [];
 
     for (const s of strangers) {
@@ -1989,17 +1997,30 @@ async function showNodes(neosh: Neosh): Promise<void> {
           ? `found at ${s.addr ?? "an address you gave"}  ·  ${fingerprint(s.info.id)}  ·  ↵ to add`
           : `wants to join  ·  ${fingerprint(s.info.id)}  ·  ↵ to allow`,
         keywords: `${s.info.id} pending join pair new`,
+        // A machine asking to join is the one row here that wants answering, so it wears the
+        // colour the workspace already uses for *act now* and pulses on the same 1 Hz duty cycle
+        // as every other waiting indicator. Nothing else in this list moves unless it is working.
+        icon: "?",
+        hl: pulseHl("Status.Pending"),
         value: { kind: "stranger", stranger: s },
       });
     }
 
     for (const n of nodes) {
       const running = n.agents.filter((a) => a.state === "running").length;
-      // One sentence per link state, because they are different answers to "why is it not
-      // here": being dialled for the first time, being dialled again, and not being dialled.
-      const state =
-        n.link.state === "up"
-          ? `${n.agents.length} ${n.agents.length === 1 ? "conversation" : "conversations"}`
+      // One sentence per link state, because they are different answers to "why is it not here" —
+      // and the fourth of them is the reason this reads the way it does. `waiting` is the far half
+      // of pairing: reached, proven, and not yet allowed over there. It used to arrive as
+      // `connecting` with attempt 0, which printed a bare `connecting…` and threw the only useful
+      // sentence away, so adding a computer looked like a network fault for as long as anybody
+      // was willing to watch it.
+      const state = n.link.state === "up"
+        ? `${n.agents.length} ${n.agents.length === 1 ? "conversation" : "conversations"}`
+        : n.link.state === "waiting"
+          // Reads on from the label, which is the machine's name — naming it again here gave
+          // `linux-box  allow this computer on linux-box`. What the sentence has to carry is the
+          // key and the fact that it is pressed somewhere else.
+          ? "has not allowed this computer yet — ^J there"
           : n.link.state === "connecting"
             ? n.link.attempt > 0
               ? `connecting — try ${n.link.attempt}, ${n.reason ?? "no answer"}`
@@ -2009,6 +2030,16 @@ async function showNodes(neosh: Neosh): Promise<void> {
                 ? `reconnecting — try ${n.link.attempt}`
                 : "reconnecting…"
               : `disconnected — ${n.reason ?? "it dials in"}  ·  ^R reconnects`;
+      // The glyph says what the row is doing; the sentence says what to do about it. A spinner
+      // only ever means "this machine is working on it" — never over `waiting`, where nothing on
+      // this computer is trying and the motion would be a promise nobody is keeping.
+      const [icon, hl] = n.link.state === "up"
+        ? [ascii ? "*" : "●", "Diagnostic.Ok"]
+        : n.link.state === "waiting"
+          ? [ascii ? "!" : "◍", pulseHl("Status.Pending")]
+          : n.link.state === "down"
+            ? [ascii ? "-" : "○", "Sidebar.Dim"]
+            : [spinnerFrame(), "Status.Streaming"];
       rows.push({
         label: n.info.name,
         detail: [
@@ -2019,14 +2050,20 @@ async function showNodes(neosh: Neosh): Promise<void> {
           fingerprint(n.info.id),
         ].filter(Boolean).join("  ·  "),
         keywords: `${n.info.os} ${n.info.id} ${n.link.state}`,
+        icon,
+        hl,
         value: { kind: "node", node: n },
       });
     }
 
     rows.push({
-      label: "+ Add a computer…",
+      // The `+` is the icon now that this list has a gutter, not the first character of the label:
+      // with both it read `+ + Add a computer…`.
+      label: "Add a computer…",
       detail: "its address on your network, or through Tailscale",
       keywords: "pair join new machine host",
+      icon: "+",
+      hl: "Sidebar.Dim",
       value: { kind: "add" },
     });
     rows.push({
@@ -2049,24 +2086,55 @@ async function showNodes(neosh: Neosh): Promise<void> {
     return rows;
   };
 
-  const items = await build();
-  const refill = async () => {
-    items.splice(0, items.length, ...(await build()));
+  /** Ask the host again. Everything else here draws from what this last brought back. */
+  const fetch = async () => {
+    [nodes, strangers] = await Promise.all([
+      neosh.swarm.nodes().catch(() => []),
+      neosh.swarm.strangers().catch(() => []),
+    ]);
   };
+
+  const redraw = () => {
+    items.splice(0, items.length, ...build());
+  };
+  const refill = async () => {
+    await fetch();
+    redraw();
+  };
+
+  await fetch();
+  const items: PickerItem<Row>[] = build();
 
   const chosen = await picker(neosh, items, {
     title: "Computers",
     width: 84,
     height: 14,
-    hints: "↵ choose   ^R reconnect   ^D disconnect   ^X remove   ^Y my id   esc close",
+    hints: "↵ open   ^E rename   ^R reconnect   ^D disconnect   ^X remove   ^Y my id",
     // The list keeps up while it is open: a machine connecting, dropping, or moving from
     // "connecting" to a row of conversations changes under the cursor rather than on reopen.
-    subscribe: (reload) =>
-      neosh.swarm.onChange(() => {
+    subscribe: (reload) => {
+      const changed = neosh.swarm.onChange(() => {
         void refill().then(reload);
-      }),
+      });
+      // And the spinner turns on the shared clock, off what the last change brought back rather
+      // than off a fresh pair of API calls: a dial takes seconds, the clock ticks twelve times a
+      // second, and asking the host what it knows on every frame to move one glyph would make
+      // this panel the noisiest thing in the workspace. Nothing ticks while nothing is dialling,
+      // so a list of connected machines costs exactly as much as it did before.
+      const ticked = onTick(() => {
+        if (!spinning()) return;
+        redraw();
+        reload();
+      });
+      return {
+        dispose() {
+          changed.dispose();
+          ticked.dispose();
+        },
+      };
+    },
     // Chords, because every bare letter a picker takes is a letter its filter can never contain.
-    ownKeys: ["<C-y>", "<C-x>", "<C-r>", "<C-d>"],
+    ownKeys: ["<C-y>", "<C-x>", "<C-r>", "<C-d>", "<C-e>"],
     async onKey(key, ctx) {
       if (key.key.code.kind !== "char" || !key.key.mods.ctrl) return;
       switch (key.key.code.c.toLowerCase()) {
@@ -2089,6 +2157,27 @@ async function showNodes(neosh: Neosh): Promise<void> {
           neosh.notify(`disconnected ${row.node.info.name} — ^R takes it back`);
           await refill();
           return "reload";
+        }
+        case "e": {
+          const row = ctx.item;
+          if (row?.kind !== "node") return "handled";
+          // Prefilled with what the row says, so this is an edit rather than a blank field you
+          // have to remember the old name to fill in. Clearing it is how you go back to the
+          // hostname, which is why an empty answer is not the same as `Esc`.
+          const next = await prompt(neosh, `Call ${row.node.info.name}`, {
+            initial: row.node.info.name,
+            width: 60,
+          });
+          if (next === null) return "handled";
+          try {
+            await neosh.swarm.rename(row.node.info.id, next.trim() === "" ? null : next.trim());
+            await refill();
+            return "reload";
+          } catch (e) {
+            // Almost always "that one is in your config file", which names the field to change.
+            neosh.notify(String(e), "warn");
+            return "handled";
+          }
         }
         case "x": {
           const row = ctx.item;
@@ -2137,6 +2226,23 @@ async function showNodes(neosh: Neosh): Promise<void> {
       return;
     }
     case "node": {
+      // A row you cannot open should say why in the terms the row is in. "Nothing running" is true
+      // of a machine that has not allowed this one yet, and is not what is wrong with it.
+      if (chosen.node.link.state === "waiting") {
+        neosh.notify(
+          `${chosen.node.info.name} has not allowed this computer yet — press ^J there and add `
+            + `${me.name}`,
+          "info",
+        );
+        return;
+      }
+      if (!chosen.node.up) {
+        neosh.notify(
+          `${chosen.node.info.name} is not connected — ${chosen.node.reason ?? "still dialling"}`,
+          "info",
+        );
+        return;
+      }
       const newest = [...chosen.node.agents].sort((a, b) => b.updated_at - a.updated_at)[0];
       if (!newest) {
         neosh.notify(`${chosen.node.info.name} has nothing running`, "info");
@@ -2384,9 +2490,16 @@ async function addComputer(neosh: Neosh): Promise<void> {
   const target = addr.includes(":") ? addr.trim() : `${addr.trim()}:7717`;
 
   let found;
+  // A dial across a network somebody just typed the address of is the one thing here that can take
+  // long enough to look broken — a wrong hostname sits on a TCP timeout — so it turns while it
+  // waits. Progress is keyed and replaced in place, which is what makes this one line rather than
+  // a column of `asking…`.
+  const turning = onTick(() => {
+    neosh.progress("swarm.probe", `${spinnerFrame()} asking ${target}…`);
+  });
   try {
     // A state that stops being true the moment the far end answers or does not.
-    neosh.progress("swarm.probe", `asking ${target}…`);
+    neosh.progress("swarm.probe", `${spinnerFrame()} asking ${target}…`);
     found = await neosh.swarm.probe(target);
   } catch (e) {
     // `String(e)` here would read `NeoshError: not found: …: swarm i/o: Connection refused (os
@@ -2401,6 +2514,7 @@ async function addComputer(neosh: Neosh): Promise<void> {
     neosh.log.warn(`swarm probe of ${target} failed: ${String(e)}`);
     return;
   } finally {
+    turning.dispose();
     neosh.done("swarm.probe");
   }
 
@@ -2419,6 +2533,12 @@ async function addComputer(neosh: Neosh): Promise<void> {
   // Both halves have to happen, and only one of them is ours. Saying so now saves the ten minutes
   // otherwise spent wondering why the machine is listed and permanently unreachable.
   neosh.notify(`${found.name} added — now allow this computer over there, with ^J`);
+  // And back to the panel, which is where that second half becomes visible: the new row sits on
+  // `allow this computer on <name>` until somebody does it and then turns over to its
+  // conversations, live, without a key being pressed here. Dropping the user back at the composer
+  // instead is what made pairing feel like it had silently failed — the one thing worth watching
+  // was on a panel they had just been taken out of.
+  await showNodes(neosh);
 }
 
 /**

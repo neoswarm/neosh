@@ -397,6 +397,7 @@ impl Editor {
                 | ApiCall::SwarmProbe { .. }
                 | ApiCall::SwarmPair { .. }
                 | ApiCall::SwarmUnpair { .. }
+                | ApiCall::SwarmRename { .. }
                 | ApiCall::SwarmReconnect { .. }
                 | ApiCall::SwarmDisconnect { .. }
                 | ApiCall::SwarmStrangers

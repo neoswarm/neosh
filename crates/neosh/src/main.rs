@@ -604,10 +604,16 @@ fn run_swarm_id(paths: &Paths) -> anyhow::Result<()> {
 }
 
 /// What this computer is called, for the sample config above.
+///
+/// Asked of the OS rather than of the environment, for the reason spelled out on the host's copy:
+/// `HOSTNAME` is unexported on macOS and unset under zsh, so the environment alone answers "no"
+/// on most machines — and this one prints an `addr` somebody is about to paste into a config file
+/// on another computer.
 fn machine_name() -> String {
     std::env::var("HOSTNAME")
         .or_else(|_| std::env::var("COMPUTERNAME"))
         .ok()
+        .or_else(|| hostname::get().ok().map(|h| h.to_string_lossy().into_owned()))
         .map(|h| h.split('.').next().unwrap_or(&h).to_string())
         .filter(|h| !h.is_empty())
         .unwrap_or_else(|| "this-machine".to_string())

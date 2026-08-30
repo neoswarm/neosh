@@ -393,18 +393,39 @@ which happened: `listening on 0.0.0.0:7717`, `not listening`, or `dial-only`.
 #### What a connection is doing
 
 Every paired machine is a row in `^J` from the first frame, and the row says where the link
-stands: `connecting…` for one being dialled that has never answered — with a `try 4` once it has
-failed a few times, because a spinner that has been spinning since Tuesday is not a state —
-`reconnecting` for one that was here and dropped, `disconnected` for one nothing is dialling, and
-the conversation count for one that is up. Reconnects back off from a second up to half a minute
-and reset the moment a dial lands, so a machine that reboots is back in seconds.
+stands. The glyph is the state and the sentence is what to do about it:
 
-Two verbs on any row, and the list updates live while it is open:
+| Row | Means |
+|---|---|
+| `●` and a conversation count | Up |
+| a spinner, `connecting…` | Being dialled, never yet answered. `try 4` once it has failed a few times, because a spinner that has been spinning since Tuesday is not a state |
+| a spinner, `reconnecting` | Was here, dropped, being dialled again |
+| `◍ allow this computer on linux-box — ^J there` | Reached it, and **it has not allowed this machine yet**. The second half of pairing, waiting on a person at the other end |
+| `○ disconnected` | Nothing is dialling it — it dials in, or you pressed `^D` |
+
+The spinner only ever means *this* machine is working on it. A row waiting on somebody at the other
+end does not move, because nothing here is trying: it pulses, like every other thing in the
+workspace that is waiting for you.
+
+Reconnects back off from a second up to half a minute and reset the moment a dial lands, so a
+machine that reboots is back in seconds. A half-paired row retries at the flat heartbeat instead,
+which is what makes it turn over into a connection within seconds of somebody saying yes over there
+— no key, no restart.
+
+The verbs on a row, and the list updates live while it is open:
 
 | Key | Does |
 |---|---|
+| `^E` | Call it something else. An SSH `Host` alias: it wins over the name the machine announces, everywhere, and clearing the field gives the hostname back. Refused for a machine your `config.toml` declared, whose `name` is one line away |
 | `^R` | Dial it again now, rather than waiting out the retry delay |
 | `^D` | Disconnect: close the link and stop dialling, keeping the pairing. `^R` takes it back |
+| `^X` | Unpair: forget it altogether |
+| `^Y` | Copy this computer's own id |
+
+Renaming earns its key because a hostname is chosen by whoever set the machine up: two Macs out of
+the box are both `Mac`, and a list of machines that are all called the same thing is a list you
+cannot use. What you call one is written to the state directory beside the pairing, so it survives
+a restart and every panel agrees about it.
 
 Disconnect holds in both directions — a peer that dials in is turned away until you say otherwise
 — and lasts until a reconnect or a restart. Unpairing (`^X`) is the stronger verb, for a machine
@@ -430,6 +451,10 @@ showing if it came from the other end.
 Then the other machine says `mac-studio wants to join this workspace — ^J to allow it`, and somebody
 there says yes. Two confirmations, one per machine, because authorising a computer to steer your
 agents is a decision each side gets to make.
+
+Between the two, you are put back in `^J` with the new machine sitting on `allow this computer on
+linux-box — ^J there`. That is the panel to leave open while you walk over: the row turns into its
+conversation count on its own, within a heartbeat of the yes, with nothing to press here.
 
 Nothing is restarted and nothing is written to your `config.toml` — paired machines live in the
 state directory. `^X` in that list removes one.

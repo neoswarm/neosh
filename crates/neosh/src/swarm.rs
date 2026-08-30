@@ -31,6 +31,10 @@ pub struct Remote {
     ever_up: bool,
     /// Why it is not up, when it is not.
     pub reason: Option<String>,
+    /// What this user calls it, if they have said. Held beside `info` rather than written into it
+    /// because every handshake replaces `info` wholesale, and a name a person chose must not be
+    /// something a reconnect can undo.
+    pub alias: Option<String>,
 }
 
 impl Remote {
@@ -38,7 +42,25 @@ impl Remote {
         matches!(self.link, LinkState::Up)
     }
 
+    /// What to call this machine: the name its owner here gave it, else the one it announces.
+    ///
+    /// Falls back through to the id when a machine has neither, which happens for exactly one row
+    /// — a config peer with no `name`, before its first handshake — and is still better than a
+    /// blank label in a list you pick from.
+    pub fn display_name(&self) -> String {
+        self.alias
+            .clone()
+            .filter(|a| !a.is_empty())
+            .or_else(|| Some(self.info.name.clone()).filter(|n| !n.is_empty()))
+            .unwrap_or_else(|| self.info.id.short().to_string())
+    }
+
     /// The state a dial that did not produce a connection leaves the row in.
+    ///
+    /// Deliberately *not* sticky against [`LinkState::Waiting`]: this is only reached when a dial
+    /// actually failed, and a machine that was waiting on a person and has now stopped answering
+    /// its port has genuinely changed state. Being told to press a key on a computer that is
+    /// switched off is worse than being told nothing.
     fn not_up(&self, attempt: u32) -> LinkState {
         if self.ever_up {
             LinkState::Retrying { attempt }
@@ -77,7 +99,37 @@ impl Swarm {
             link: if dialled { LinkState::Connecting { attempt: 0 } } else { LinkState::Down },
             ever_up: false,
             reason: None,
+            alias: None,
         });
+    }
+
+    /// What this user calls a machine, applied to a row that may already exist.
+    ///
+    /// Separate from [`Swarm::seed`] because it is called for both — a peer being seeded at boot
+    /// and one renamed while the panel is open — and because `seed` deliberately does nothing to a
+    /// row that is already there, which is right for a link state and wrong for a name.
+    pub fn set_alias(&mut self, id: &NodeId, alias: Option<String>) {
+        if let Some(p) = self.peers.get_mut(id) {
+            p.alias = alias.filter(|a| !a.trim().is_empty()).map(|a| a.trim().to_string());
+        }
+    }
+
+    /// A machine we authorised, reached, and that has not authorised us back.
+    ///
+    /// Fills the row in from the handshake even though the connection went no further: name, OS,
+    /// version and what it offers all arrived, and a half-paired row that can say `mini · macOS ·
+    /// neosh 0.2.0` is one you can tell you dialled the right computer.
+    pub fn unapproved(&mut self, info: NodeInfo, capabilities: NodeCapabilities) {
+        let id = info.id.clone();
+        self.seed(id.clone(), info.name.clone(), true);
+        if let Some(p) = self.peers.get_mut(&id) {
+            p.info = info;
+            p.capabilities = capabilities;
+            p.link = LinkState::Waiting;
+            // The state is the whole story here, and a sentence beside it would be the same
+            // sentence twice. `reason` is for the things a state cannot say.
+            p.reason = None;
+        }
     }
 
     pub fn peer_up(&mut self, info: NodeInfo, capabilities: NodeCapabilities) {
@@ -88,7 +140,10 @@ impl Swarm {
             link: LinkState::Up,
             ever_up: true,
             reason: None,
+            alias: None,
         });
+        // `alias` is untouched on purpose: a handshake refreshes everything the machine says about
+        // itself, and what it is called here is not one of those things.
         entry.info = info;
         entry.capabilities = capabilities;
         entry.link = LinkState::Up;
@@ -388,6 +443,72 @@ mod tests {
         let aa = s.peer(&NodeId("aa".into())).expect("peer");
         assert!(aa.up(), "the connection the listener holds is the truth");
         assert_eq!(aa.reason, None);
+    }
+
+    /// The far half of pairing is its own row, and it says what it is waiting for.
+    ///
+    /// This is what "connecting…" for ever was: the dialler reached the machine, proved who it
+    /// was, and the far end — which has not been told about this one — simply stopped talking.
+    /// Reported as `DialFailed` with attempt 0, it landed on `Connecting { attempt: 0 }`, and the
+    /// panel's `attempt > 0` branch was the only one that printed the reason. So the single state
+    /// with something actionable in it was the single state that said nothing.
+    #[test]
+    fn a_machine_that_has_not_allowed_this_one_says_so_rather_than_connecting_for_ever() {
+        let mut s = Swarm::default();
+        s.seed(NodeId("aa".into()), "the address you typed".into(), true);
+
+        s.unapproved(node("aa", "mini"), caps());
+        let aa = s.peer(&NodeId("aa".into())).expect("peer");
+        assert_eq!(aa.link, LinkState::Waiting, "reached, and waiting on a person over there");
+        assert!(!aa.up(), "a handshake that got no further is not a connection");
+        assert_eq!(
+            aa.info.name, "mini",
+            "the handshake got far enough to learn the real name, so the row stops saying the \
+             address somebody typed"
+        );
+        assert_eq!(aa.reason, None, "the state is the whole story; a sentence would repeat it");
+
+        // Somebody presses the key over there. The dialler is still retrying at the heartbeat, so
+        // this arrives without anything happening on this machine.
+        s.peer_up(node("aa", "mini"), caps());
+        assert!(s.peer(&NodeId("aa".into())).expect("peer").up());
+    }
+
+    /// Waiting is not sticky: a machine that stops answering its port has genuinely changed state,
+    /// and telling somebody to go and press a key on a computer that is off is worse than silence.
+    #[test]
+    fn a_waiting_peer_that_goes_away_stops_saying_go_and_press_a_key() {
+        let mut s = Swarm::default();
+        s.seed(NodeId("aa".into()), "mini".into(), true);
+        s.unapproved(node("aa", "mini"), caps());
+        s.dial_failed(&NodeId("aa".into()), 2, "connection refused".into());
+        let aa = s.peer(&NodeId("aa".into())).expect("peer");
+        assert_eq!(aa.link, LinkState::Connecting { attempt: 2 });
+        assert_eq!(aa.reason.as_deref(), Some("connection refused"));
+    }
+
+    /// A name somebody chose outlives everything the machine says about itself.
+    #[test]
+    fn an_alias_wins_over_the_announced_name_and_survives_a_reconnect() {
+        let mut s = Swarm::default();
+        s.seed(NodeId("aa".into()), "Mac".into(), true);
+        assert_eq!(s.peer(&NodeId("aa".into())).expect("peer").display_name(), "Mac");
+
+        s.set_alias(&NodeId("aa".into()), Some("  the loud one  ".into()));
+        assert_eq!(
+            s.peer(&NodeId("aa".into())).expect("peer").display_name(),
+            "the loud one",
+            "trimmed, because a name with an accidental space is a name that sorts oddly"
+        );
+
+        // A handshake replaces everything the machine announces. It must not replace this.
+        s.peer_up(node("aa", "Mac"), caps());
+        assert_eq!(s.peer(&NodeId("aa".into())).expect("peer").display_name(), "the loud one");
+
+        // And clearing it gives the announced name back, so a rename is undoable without anybody
+        // having to remember what the machine used to be called.
+        s.set_alias(&NodeId("aa".into()), None);
+        assert_eq!(s.peer(&NodeId("aa".into())).expect("peer").display_name(), "Mac");
     }
 
     /// Seeding is idempotent and never clobbers a row that has learned anything.

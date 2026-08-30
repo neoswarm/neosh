@@ -21,7 +21,7 @@ use tokio::sync::mpsc::UnboundedReceiver;
 const PATIENCE: Duration = Duration::from_secs(10);
 
 fn known(name: &str) -> AllowedPeer {
-    AllowedPeer { name: name.into(), addr: None, source: Source::Paired }
+    AllowedPeer { name: name.into(), alias: None, addr: None, source: Source::Paired }
 }
 
 fn summary(id: &str, project: &str) -> AgentSummary {
@@ -607,6 +607,83 @@ async fn two_strangers_can_be_introduced_while_they_are_running() {
     })
     .await;
     assert_eq!(seen, 1);
+}
+
+/// Half a pairing says which half is missing, rather than dialling in silence for ever.
+///
+/// This is the state a person is actually in for the minute between adding a computer here and
+/// walking over to allow this one there — and it used to be indistinguishable from a wrong
+/// address. The dialler completes the handshake, sends its proof last, and the far end simply
+/// stops talking to a machine it has not been told about; reported as a dial *failure*, that
+/// became `connecting…` with no reason attached, for as long as anybody was willing to watch.
+#[tokio::test]
+async fn a_machine_that_has_not_allowed_us_back_says_so_rather_than_dialling_in_silence() {
+    let probe = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("probe");
+    let addr: SocketAddr = probe.local_addr().expect("addr");
+    drop(probe);
+
+    let a_id = Identity::ephemeral();
+    let b_id = Identity::ephemeral();
+    let (a_key, b_key) = (a_id.id().clone(), b_id.id().clone());
+
+    // A has added B — the first half of pairing, done. B has never heard of A.
+    let (aa, ba) = (Allowed::load(None), Allowed::load(None));
+    aa.add(b_key.clone(), known("the address you typed"));
+
+    let (b, mut b_rx) = neosh_swarm::node::spawn(
+        Arc::new(b_id),
+        ba,
+        SwarmConfig {
+            name: "linux-box".into(),
+            listen: Some(addr),
+            heartbeat: Duration::from_millis(150),
+            ..Default::default()
+        },
+        "0.1.0".into(),
+    );
+    let (_a, mut a_rx) = neosh_swarm::node::spawn(
+        Arc::new(a_id),
+        aa,
+        SwarmConfig {
+            name: "mac-studio".into(),
+            peers: vec![PeerAddress { addr: addr.to_string(), expect: Some(b_key.clone()) }],
+            heartbeat: Duration::from_millis(150),
+            ..Default::default()
+        },
+        "0.1.0".into(),
+    );
+
+    // Not `DialFailed`: nothing failed. The machine is there, it is the right machine, and it has
+    // said its name — all of which the row can now show while it waits on a person.
+    let waiting = wait_for(&mut a_rx, |e| match e {
+        SwarmEvent::Unapproved { node, .. } => Some(node.clone()),
+        _ => None,
+    })
+    .await;
+    assert_eq!(waiting.id, b_key, "and it is the machine we meant to reach");
+    assert_eq!(
+        waiting.name, "linux-box",
+        "the handshake got far enough to learn what it is really called, so the row stops \
+         repeating the address somebody typed"
+    );
+
+    // Over there, the other half of the same moment: somebody is asking.
+    let asking = wait_for(&mut b_rx, |e| match e {
+        SwarmEvent::Stranger { node, dialled: false } => Some(node.id.clone()),
+        _ => None,
+    })
+    .await;
+    assert_eq!(asking, a_key);
+
+    // The person walks over and presses the key. Nothing happens on A — the dialler is already
+    // retrying at the heartbeat, which is what makes the row turn over on its own.
+    b.send(SwarmRequest::Pair { id: a_key, name: "mac-studio".into(), addr: None });
+    let up = wait_for(&mut a_rx, |e| match e {
+        SwarmEvent::PeerUp { node, .. } => Some(node.name.clone()),
+        _ => None,
+    })
+    .await;
+    assert_eq!(up, "linux-box");
 }
 
 /// Unpairing stops the reconnecting, which is the half that is easy to forget.
