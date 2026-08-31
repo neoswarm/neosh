@@ -396,22 +396,45 @@ export async function activate({ neosh, subscriptions }: PluginContext) {
       }
     };
 
-    const open = async () => {
-      if (win === null) {
-        // Read defensively: a reload takes every declared option away and puts it back, and this
-        // can be called from a view arriving in the gap. A panel that throws there used to take
-        // the whole plugin runtime with it.
-        const width = (await neosh.opt.get<number>("sidebar.width").catch(() => null)) ?? 34;
-        win = await here.win.open(buf, "left", { size: width });
-      }
-      await draw();
-      // And again once the frontend has said how tall the panel turned out to be. The foot is held
-      // against the bottom edge, which is a measurement — and on the first frame there is nothing
-      // to measure yet, so without this the strip sits under the last project until something else
-      // happens to redraw.
-      // Not held in `subscriptions`: the panel is opened and closed as often as `^B` is pressed,
-      // and the runtime cancels a plugin's timers when it unloads anyway.
-      neosh.timer.after(120, () => void draw());
+    /**
+     * The open in flight, so two callers cannot each make a window.
+     *
+     * `win` is assigned two `await`s after it is tested — a host round trip for the width, then
+     * the window itself — so `if (win === null)` is a check whose answer is stale by the time it
+     * is acted on. Two calls in that gap both saw `null`, both opened a column, and `win` kept
+     * only the second: the first stayed on screen and could never be closed again, because
+     * `close` closes `win`. Two sidebars, from pressing `^B` or `^T` twice quickly, or from a key
+     * arriving while `view.onOpen` was still building the panel.
+     *
+     * Concurrent callers await the same open rather than starting another. They all wanted the
+     * same end state and now they all get it — which is why this returns the promise instead of
+     * dropping the second call, whose caller is about to `focus` something.
+     */
+    let opening: Promise<void> | null = null;
+
+    const open = (): Promise<void> => {
+      if (opening) return opening;
+      const run = (async () => {
+        if (win === null) {
+          // Read defensively: a reload takes every declared option away and puts it back, and this
+          // can be called from a view arriving in the gap. A panel that throws there used to take
+          // the whole plugin runtime with it.
+          const width = (await neosh.opt.get<number>("sidebar.width").catch(() => null)) ?? 34;
+          win = await here.win.open(buf, "left", { size: width });
+        }
+        await draw();
+        // And again once the frontend has said how tall the panel turned out to be. The foot is
+        // held against the bottom edge, which is a measurement — and on the first frame there is
+        // nothing to measure yet, so without this the strip sits under the last project until
+        // something else happens to redraw.
+        // Not held in `subscriptions`: the panel is opened and closed as often as `^B` is pressed,
+        // and the runtime cancels a plugin's timers when it unloads anyway.
+        neosh.timer.after(120, () => void draw());
+      })();
+      opening = run.finally(() => {
+        opening = null;
+      });
+      return opening;
     };
 
     const leave = async () => {
@@ -424,6 +447,11 @@ export async function activate({ neosh, subscriptions }: PluginContext) {
     };
 
     const close = async () => {
+      // Let an open that is still in flight finish first. `^B` twice quickly is open-then-close,
+      // and a close that reads `win` while the open has not assigned it yet sees `null`, returns
+      // having done nothing, and leaves the column that arrives a moment later on screen — with
+      // the panel now believing it is shut. The next `^B` opens a second one.
+      if (opening) await opening.catch(() => {});
       if (win === null) return;
       const w = win;
       win = null;
@@ -586,11 +614,24 @@ export async function activate({ neosh, subscriptions }: PluginContext) {
   // loaded. `sidebar.open` decides whether it starts showing, per view rather than once for the
   // workspace: `^B` in one window is `^B` in that window.
   const startOpen = (await neosh.opt.get<boolean>("sidebar.open")) ?? true;
+  // Panels being built, keyed by the terminal they are for. The same check-then-act as `open`, one
+  // level up and worse: `panels.set` lands after `makePanel` resolves, so two events for one view
+  // in that gap built two complete panels — two buffers, two windows — and the map kept the
+  // second. Reserved *synchronously*, before the first `await`, which is what makes the test and
+  // the claim one step.
+  const making = new Map<ViewId, Promise<Panel>>();
   subscriptions.push(
     neosh.view.onOpen((view) => {
       void (async () => {
-        if (panels.has(view)) return;
-        const made = await makePanel(view);
+        if (panels.has(view) || making.has(view)) return;
+        const building = makePanel(view);
+        making.set(view, building);
+        let made: Panel;
+        try {
+          made = await building;
+        } finally {
+          making.delete(view);
+        }
         panels.set(view, made);
         if (startOpen) await made.open();
       })().catch((e: unknown) => {
@@ -610,6 +651,26 @@ export async function activate({ neosh, subscriptions }: PluginContext) {
       panels.delete(view);
     }),
   );
+  // And when *we* are the ones going away, which is not the same thing and is the one this panel
+  // got wrong. `dispose` deliberately does not close a window, because its only caller was a
+  // terminal that had already gone and taken its windows with it. A reload is the opposite: every
+  // terminal is still there, still showing a column that nothing is going to take off the screen,
+  // and nothing disposed the panels on this path at all. So `^R` left the old sidebar standing,
+  // the reloaded plugin's `view.onOpen` built a second one beside it, and the workspace had two —
+  // one of them drawn by code that no longer existed and answering no keys.
+  //
+  // Closed rather than merely forgotten, and fire-and-forget because a `Disposable` is
+  // synchronous: the op is in flight before the runtime tears down, and a failure here means the
+  // window was going anyway.
+  subscriptions.push({
+    dispose: () => {
+      for (const p of panels.values()) {
+        void p.close().catch(() => {});
+        p.dispose();
+      }
+      panels.clear();
+    },
+  });
 }
 
 function same(a: Target, b: Target): boolean {

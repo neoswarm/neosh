@@ -461,6 +461,47 @@ fn the_sidebar_toggles_and_the_second_toggle_puts_it_back() {
     assert!(s.pump(|s| !s.windows_for(buf).is_empty()), "reopens\n{}", s.transcript());
 }
 
+/// Reloading the configuration must leave one sidebar, not two.
+///
+/// `^R` unloads the plugin and loads it again. The reloaded copy asks for a panel per terminal —
+/// `view.onOpen` fires for the ones already here — but nothing took the old copy's column off the
+/// screen: the panel's `dispose` deliberately does not close a window, because its only caller was
+/// a terminal that had already gone and taken its windows with it, and on this path nothing called
+/// `dispose` at all. So the workspace got a second sidebar beside the first, and the first was
+/// drawn by code that no longer existed and answered no keys.
+///
+/// Counted across *every* `[sidebar]` buffer rather than the first one, because the whole symptom
+/// is a second buffer with a second window on it — a test that looked at one buffer would have
+/// been perfectly happy.
+#[test]
+fn reloading_the_config_leaves_one_sidebar_rather_than_two() {
+    let sb = Sandbox::new("reload-dup");
+    let mut s = sb.start();
+    s.wait_for("PROJECTS");
+    let before: usize =
+        s.buffers_named("[sidebar]").iter().map(|b| s.windows_for(*b).len()).sum();
+    assert_eq!(before, 1, "one to start with\n{}", s.transcript());
+
+    s.send(&command("config.reload"));
+    // The panel has to come back — a reload that closed the old column and never opened a new one
+    // would pass a naive "not two" assertion while leaving somebody with no sidebar at all.
+    assert!(
+        s.pump(|s| {
+            let open: usize =
+                s.buffers_named("[sidebar]").iter().map(|b| s.windows_for(*b).len()).sum();
+            open == 1 && s.buffers_named("[sidebar]").len() > 1
+        }),
+        "one sidebar after the reload, on a freshly built panel\n{}",
+        s.transcript()
+    );
+
+    // And it settles there: the old window is closed rather than merely drawn over, so nothing
+    // arrives a moment later to make it two again.
+    s.drain_for(Duration::from_secs(2));
+    let after: usize = s.buffers_named("[sidebar]").iter().map(|b| s.windows_for(*b).len()).sum();
+    assert_eq!(after, 1, "still one\n{}", s.transcript());
+}
+
 #[test]
 fn the_sidebar_stays_shut_when_config_says_so() {
     let sb = Sandbox::new("closed");
