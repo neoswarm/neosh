@@ -214,10 +214,12 @@ two-word scratch name it was created with.",
   await neosh.keymap.set("chat", "<C-g>", "git.status", { desc: "Git status" });
   await neosh.keymap.set("chat", "<C-d>", "git.diff", { desc: "Show what changed" });
 
-  // What changed, on the project's own row. A decoration rather than a section of our own: the
-  // row already exists, the sidebar already knows how to draw a mark on it, and the whole point of
-  // the point is that this plugin never imports the panel. Keyed by the project's directory, and
-  // withdrawn when the tree is clean — a `0` on every row is a column of noise.
+  // Where this checkout stands, on the project's own row. A decoration rather than a section of
+  // our own: the row already exists, the sidebar already knows how to draw a mark on it, and the
+  // whole point of the point is that this plugin never imports the panel. Keyed by the project's
+  // directory — which is a worktree's directory too, so a nested tree reports its own branch's
+  // divergence rather than its repository's — and withdrawn when there is nothing to say, because
+  // a `0` on every row is a column of noise.
   const decorate = async () => {
     const projects = await neosh.vars
       .get<unknown>({ scope: "global" }, "sidebar.projects")
@@ -225,16 +227,20 @@ two-word scratch name it was created with.",
     const cwds = Array.isArray(projects)
       ? projects.filter((p): p is string => typeof p === "string")
       : [];
+    const ascii = (await neosh.opt.get<boolean>("ui.ascii_only").catch(() => false)) ?? false;
     for (const cwd of cwds) {
       const status = await neosh.git.status({ cwd }).catch(() => null);
-      const dirty = status?.changes.length ?? 0;
-      if (dirty === 0) {
+      const parts = status ? statParts(status, ascii) : [];
+      if (parts.length === 0) {
         await neosh.ext.remove("sidebar.decoration", `dirty:${cwd}`).catch(() => {});
         continue;
       }
       await neosh.ext.contribute("sidebar.decoration", `dirty:${cwd}`, {
         target: { project: cwd },
-        badge: { text: `${dirty === 1 ? "●" : `●${dirty}`}`, hl: "Git.Modified" },
+        // The strip is ordered worst-first, so what to give up on a narrow row is already decided:
+        // everything but the head of it. A project name the panel had to clip to make room for
+        // `?7` is a row that gave up what it is to say something you did not ask for.
+        badge: { parts, short: parts.slice(0, 1) },
       }).catch(() => {});
     }
   };
@@ -254,19 +260,30 @@ two-word scratch name it was created with.",
   await decorate();
 
   // Which branch you are on belongs beside the model: both answer "where is what I type going".
+  // The same vocabulary as the panel's badge, in one colour rather than several — a status segment
+  // is one span, and the strip is short enough that the worst thing true of it is the right answer
+  // to what colour it should be.
   const footer = async () => {
     const status = await neosh.git.status().catch(() => null);
     if (!status) {
       await neosh.status.clear("branch");
       return;
     }
+    const ascii = (await neosh.opt.get<boolean>("ui.ascii_only").catch(() => false)) ?? false;
     const head = status.repo.detached
       ? `detached ${status.repo.head ?? ""}`.trim()
       : (status.repo.branch ?? "no branch");
-    const dirty = status.changes.length;
+    const parts = statParts(status, ascii);
+    const stats = parts.map((p) => p.text).join("");
+    // The strip is ordered worst-first, so its head is both the colour the segment should be and
+    // the one stat worth keeping when the terminal is too narrow for all of them. A segment with
+    // no short form is dropped whole — which is how the branch name itself disappeared off a
+    // 110-column footer the moment this said four things instead of one.
+    const worst = parts[0];
     await neosh.status.set("branch", {
-      text: `${head}${dirty ? ` ●${dirty}` : ""}`,
-      hl: dirty ? "Git.Modified" : "Git.Branch",
+      text: `${head}${stats === "" ? "" : ` ${stats}`}`,
+      short: worst ? `${head} ${worst.text}` : head,
+      hl: worst?.hl ?? "Git.Branch",
       priority: 20,
     });
   };
@@ -280,6 +297,50 @@ two-word scratch name it was created with.",
   );
   // The working tree changes whenever anything writes a file, including the agent.
   subscriptions.push(neosh.timer.every(5000, () => void footer()));
+}
+
+// ---------------------------------------------------------------------------
+// Where a checkout stands, in five columns or fewer per fact
+// ---------------------------------------------------------------------------
+
+/**
+ * A repository's state as a run of coloured stats, worst first, nothing said about zero.
+ *
+ * It replaced a single amber `●3`. A dot with a number on it is one fact — *something* here has
+ * been touched — drawn in the one colour the panel uses for "act now", on the rows you look at
+ * most; and the thing it did not say is the thing you actually want off a project row, which is
+ * whether this checkout has drifted from the remote. Ahead and behind are already in `RepoStatus`,
+ * from the branch header `git status --porcelain=v2 --branch` prints, so this costs no extra call.
+ *
+ * The order is what would stop you: a conflict is a tree you cannot commit from, behind is work
+ * you have not got yet, ahead is work nobody else has, and the two dirty counts are yours and
+ * undecided. Each fact keeps its own colour — a strip drawn in one colour is a string you read
+ * rather than a row you glance at — and every one of them is a glyph and a number, so the whole
+ * strip is at most a handful of columns even when all five are true.
+ *
+ * `↑` and `↓` are the direction the *commits* would travel, which is the way every git prompt in
+ * the world draws it: `↓2` is two waiting for you.
+ */
+function statParts(status: RepoStatus, ascii: boolean): Array<{ text: string; hl?: string }> {
+  const parts: Array<{ text: string; hl?: string }> = [];
+  const say = (text: string, hl: string) => {
+    // The separator is a part of its own with no highlight: it belongs to neither side, and giving
+    // it to the run before it would colour a column that has nothing in it.
+    if (parts.length > 0) parts.push({ text: " " });
+    parts.push({ text, hl });
+  };
+  const is = (c: (typeof status.changes)[number], state: string) =>
+    c.staged === state || c.unstaged === state;
+  const conflicted = status.changes.filter((c) => is(c, "conflicted")).length;
+  const untracked = status.changes.filter((c) => !is(c, "conflicted") && is(c, "untracked")).length;
+  const dirty = status.changes.length - conflicted - untracked;
+
+  if (conflicted > 0) say(`${ascii ? "!" : "✗"}${conflicted}`, "Git.Conflict");
+  if (status.repo.behind > 0) say(`${ascii ? "v" : "↓"}${status.repo.behind}`, "Git.Behind");
+  if (status.repo.ahead > 0) say(`${ascii ? "^" : "↑"}${status.repo.ahead}`, "Git.Ahead");
+  if (dirty > 0) say(`~${dirty}`, "Git.Modified");
+  if (untracked > 0) say(`?${untracked}`, "Git.Untracked");
+  return parts;
 }
 
 // ---------------------------------------------------------------------------

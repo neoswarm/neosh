@@ -7651,8 +7651,12 @@ fn a_third_party_plugin_can_be_switched_off_from_config() {
     assert!(!s.saw("imports sidebar"), "the plugin should not have run\n{}", s.transcript());
 }
 
-/// A plugin puts a mark on a row the sidebar drew — the git plugin's dirty count on the project
+/// A plugin puts a mark on a row the sidebar drew — the git plugin's stat strip on the project
 /// row — without the sidebar knowing git exists. The badge sits after the name, in the row.
+///
+/// Two changes of two different kinds, because the strip counts them separately: a tracked file
+/// somebody edited is `~1` and a file git has never seen is `?1`. A single count could not tell
+/// them apart, which is the whole reason the badge is a run of parts rather than one.
 #[test]
 fn a_decoration_lands_on_the_project_row() {
     if !have_git() {
@@ -7663,7 +7667,38 @@ fn a_decoration_lands_on_the_project_row() {
     std::fs::write(sb.work().join("new.txt"), "x\n").expect("write");
     std::fs::write(sb.work().join("README.md"), "changed\n").expect("write");
     let mut s = sb.start();
-    s.wait_for("work ●2");
+    s.wait_for("work ~1 ?1");
+}
+
+/// The badge gives way before the name does.
+///
+/// A project name is what the row *is*; the strip is news about it. So in a column too narrow for
+/// both, the git plugin's `short` form — the worst single stat — is what gets drawn, and the name
+/// is left whole. Before this the badge took its columns first and the row read
+/// `neosh-websit… ↓3 ↑12 ~5 ?7`: four facts nobody asked for, bought with the one thing the panel
+/// exists to show.
+///
+/// At the narrowest the panel goes, which is where the rule has to hold if it holds anywhere.
+#[test]
+fn a_badge_gives_up_its_columns_before_the_name_is_clipped() {
+    if !have_git() {
+        return;
+    }
+    let sb = Sandbox::new("badge-yields");
+    sb.write_config("[options]\n\"sidebar.width\" = 16\n");
+    sb.git_init();
+    for i in 0..4 {
+        std::fs::write(sb.work().join(format!("u{i}.txt")), "x\n").expect("write");
+    }
+    std::fs::write(sb.work().join("README.md"), "changed\n").expect("write");
+    let mut s = sb.start();
+    // One tracked file edited and four git has never seen: `~1 ?4` in full, `~1` short. The row
+    // keeps its name and the head of the strip.
+    s.wait_for("work ~1");
+    s.drain_for(Duration::from_secs(2));
+    // The footer says the whole of it — it has the room — so this has to name the row rather than
+    // the count, or it asserts against the status bar instead of the panel.
+    assert!(!s.saw("work ~1 ?4"), "the row should not carry the full strip\n{}", s.transcript());
 }
 
 /// A third-party decoration: a badge on a conversation and a section anchored by name between

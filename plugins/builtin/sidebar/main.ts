@@ -66,6 +66,7 @@ import {
   badgeWidth as badgeColumns,
   decorateRow,
   elapsed,
+  fitBadge,
   fuzzy,
   type ListRow,
   type Match,
@@ -3160,7 +3161,13 @@ async function collect(
   // any of them by name, and the foot is whatever lands after the last one.
   const blocks: Record<Slot, () => void> = {
     projects: () => {
-      rows.push(...heading("PROJECTS", opts.width));
+      // How to make the column wider, on the heading of the column it makes wider — the idiom the
+      // plan block already uses for `^L`, and it costs no row of a panel whose rows are its whole
+      // job. It has to be *somewhere*: a project name clipped to `neosh-websit…` is a row asking
+      // to be widened, and `>` was bound, documented and invisible — advertised on contributed
+      // rows only, which is the one kind of row most people never stand on. Only while the panel
+      // has the keyboard, because that is when the key does anything.
+      rows.push(...heading("PROJECTS", opts.width, opts.focused ? "<> width" : undefined));
       for (const p of projects) {
         rows.push(projectRow(p, arrangement, opts, now));
         if (arrangement.isFolded(p.cwd)) continue;
@@ -3348,14 +3355,16 @@ function projectRow(
   // project under it still end in the same place — clipping the name is what a panel this narrow
   // does, and letting the mark run two columns past everything else is not.
   const target: Target = { kind: "project", cwd: p.cwd };
-  const name = clip(
-    p.name,
-    Math.max(
-      6,
-      opts.width - 8 - byteLength(mark) - byteLength(star) - (elsewhere.length ? 8 : 0) -
-        badgeColumns(opts.decorations.get(targetKey(target) ?? "")),
-    ),
+  // Everything the name and the badge have to share. The badge gives up its least important parts
+  // before a single character comes off the name — a project you cannot read the name of is not a
+  // row you can use, and how far behind the remote it is keeps until you widen the panel with `>`.
+  const room = opts.width - 8 - byteLength(mark) - byteLength(star) - (elsewhere.length ? 8 : 0);
+  const decoration = fitBadge(
+    opts.decorations.get(targetKey(target) ?? ""),
+    room,
+    Array.from(p.name).length,
   );
+  const name = clip(p.name, Math.max(6, room - badgeColumns(decoration)));
   const spans: Array<{ from: number; to: number; hl: string }> = [];
   if (star !== "") {
     const from = byteLength(` ${arrow} ${name}`);
@@ -3374,7 +3383,7 @@ function projectRow(
     full: ` ${arrow} ${p.name}`,
     indent: 3,
     // `here` is this panel's opinion; everything else is a decorator's to colour.
-    hl: here ? "Directory" : opts.decorations.get(targetKey(target) ?? "")?.hl ?? "Sidebar.Dim",
+    hl: here ? "Directory" : decoration?.hl ?? "Sidebar.Dim",
     spans: spans.length > 0 ? spans : undefined,
     right: elsewhere.length > 0
       // The machines take the column the count would have used. A project that is in two places is
@@ -3382,7 +3391,7 @@ function projectRow(
       ? { text: `${clip(elsewhere.join(" "), 14)} `, hl: "Sidebar.Remote" }
       : right,
     value: target,
-  }, opts.decorations.get(targetKey(target) ?? ""), Boolean(busy) || elsewhere.length > 0);
+  }, decoration, Boolean(busy) || elsewhere.length > 0);
 }
 
 /**
@@ -3427,10 +3436,15 @@ function worktreeRow(
   // nesting read as two levels where there is one.
   const pad = "   ";
   const target: Target = { kind: "project", cwd: p.cwd };
-  const name = clip(
-    p.name,
-    Math.max(6, opts.width - 8 - byteLength(glyph) - byteLength(mark) - badgeColumns(opts.decorations.get(targetKey(target) ?? ""))),
+  // As on a project row, and two columns tighter: the branch name is what this row is, so the
+  // badge is what gives way. See `projectRow`.
+  const room = opts.width - 8 - byteLength(glyph) - byteLength(mark);
+  const decoration = fitBadge(
+    opts.decorations.get(targetKey(target) ?? ""),
+    room,
+    Array.from(p.name).length,
   );
+  const name = clip(p.name, Math.max(6, room - badgeColumns(decoration)));
   const spans: Array<{ from: number; to: number; hl: string }> = [];
   if (glyph !== "") {
     const at = byteLength(`${pad}${arrow} `);
@@ -3451,11 +3465,11 @@ function worktreeRow(
     // already on the row.
     full: `${pad}${arrow} ${glyph}${p.name}`,
     indent: byteLength(`${pad}${arrow} `),
-    hl: here ? "Directory" : opts.decorations.get(targetKey(target) ?? "")?.hl ?? "Sidebar.Dim",
+    hl: here ? "Directory" : decoration?.hl ?? "Sidebar.Dim",
     spans: spans.length > 0 ? spans : undefined,
     right,
     value: target,
-  }, opts.decorations.get(targetKey(target) ?? ""), Boolean(busy));
+  }, decoration, Boolean(busy));
 }
 
 /**
@@ -3639,19 +3653,23 @@ function turnFor(s: SessionInfo, now: number): string {
  */
 function hints(opts: DrawOptions): ListRow<Target>[] {
   const kind = opts.selected?.kind;
-  const lines = !opts.focused
-    // `^O` is not here and `+ Add project` is a row you can see: a key strip has two lines, and the
-    // verb with a row of its own is the one that can afford to give up its place on them.
-    ? ["^T projects  ^N new   ^F archive", "^K palette   ^B hide  ^Z keys"]
-    : kind === "custom"
-      ? ["↵ open it     <> width", "esc back      ? keys"]
-    : kind === "project"
-      // `X` is on the strip because a list you cannot shorten is a list that grows forever, and a
-      // project that outlives its conversations — which is the point of it — has to have a way off.
-      ? ["↵ fold   f ★       JK move", "n new    y path     X remove  ? keys"]
-      : kind === "session"
-        ? ["↵ open   r rename   x archive", "X delete y path     ? keys"]
-        : ["↵ add project", "esc back         ? keys"];
+  const lines = strip(
+    !opts.focused
+      // `^O` is not here and `+ Add project` is a row you can see: a key strip has two lines, and
+      // the verb with a row of its own is the one that can afford to give up its place on them.
+      ? ["^T projects", "^N new", "^F archive", "^K palette", "^B hide", "^Z keys"]
+      : kind === "custom"
+        ? ["↵ open it", "esc back", "? keys"]
+      : kind === "project"
+        // `X` is on the strip because a list you cannot shorten is a list that grows forever, and
+        // a project that outlives its conversations — which is the point of it — has to have a way
+        // off.
+        ? ["↵ fold", "f ★", "JK move", "n new", "y path", "X remove", "? keys"]
+        : kind === "session"
+          ? ["↵ open", "r rename", "x archive", "X delete", "y path", "? keys"]
+          : ["↵ add project", "esc back", "? keys"],
+    opts.width,
+  );
 
   // Contributed verbs get their own line rather than being squeezed onto ours, because ours are
   // laid out in columns that a third party's label of unknown length would break — and because a
@@ -3673,6 +3691,52 @@ function hints(opts: DrawOptions): ListRow<Target>[] {
     })),
     ...(mine === "" ? [] : [{ text: ` ${mine}`, hl: "Sidebar.Dim", inert: true }]),
   ];
+}
+
+/**
+ * A key strip packed into the column it is actually drawn in.
+ *
+ * These lines used to be written out by hand with their columns lined up by eye, which is a layout
+ * that is right at exactly one width: the project row's second line came to thirty-six columns in
+ * a panel that is thirty-four wide by default, and what fell off the end was `? keys` — clipped to
+ * `? k`. A strip that truncates its own escape hatch is worse than one that never mentioned it.
+ *
+ * So: verbs in order of how much you need them, packed greedily onto two lines, and whatever does
+ * not fit is dropped. The **last** cell is the way to everything dropped — `? keys`, or `^Z keys`
+ * when the panel does not have the keyboard — so if anything was dropped it takes the final slot.
+ * Greedy rather than even columns because these cells are three columns wide (`f ★`) and eight
+ * (`X remove`), and a grid sized for the widest fits four fewer verbs than the panel has room for.
+ */
+function strip(cells: string[], width: number): string[] {
+  const cols = (s: string) => Array.from(s).length;
+  const room = Math.max(1, width - 1);
+  const last = cells[cells.length - 1] ?? "";
+  const lines: string[] = [];
+  let placed = 0;
+  for (const cell of cells) {
+    const open = lines.length === 0 ? "" : lines[lines.length - 1] ?? "";
+    if (open !== "" && cols(`${open}  ${cell}`) <= room) {
+      lines[lines.length - 1] = `${open}  ${cell}`;
+    } else if (lines.length < 2 && cols(cell) <= room) {
+      lines.push(cell);
+    } else {
+      break;
+    }
+    placed++;
+  }
+  // Anything left unplaced means the strip is incomplete, so its last line has to end at the way in
+  // to the rest. Verbs come off the tail to make room for it rather than it being appended, because
+  // appending is exactly what overflowed — this is counting the same columns the loop above did.
+  if (placed < cells.length && lines.length > 0) {
+    const at = lines.length - 1;
+    let tail = lines[at] ?? "";
+    while (tail !== "" && cols(`${tail}  ${last}`) > room) {
+      const cut = tail.lastIndexOf("  ");
+      tail = cut < 0 ? "" : tail.slice(0, cut);
+    }
+    lines[at] = tail === "" ? last : `${tail}  ${last}`;
+  }
+  return lines;
 }
 
 /** The contributed verbs that apply to the row under the cursor, clipped to the column. */
