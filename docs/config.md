@@ -254,8 +254,10 @@ In the panel (`<C-t>`): `↑`/`↓`, `j`/`k` or `^N`/`^P` move, `Enter` opens or
 `f` pins, `J`/`K` reorder, `n` new conversation here, `x` archive, `X` delete, `a` the archive,
 `r` rename, `?` every binding, `Esc` leaves. `J`/`K` work from a conversation row too — they move
 the project it is in, because you are looking at the project when you are looking at what is inside
-it. The foot of the panel lists the keys for whatever the cursor is on; set `sidebar.hints = false`
-once they are in your fingers.
+it. `>` and `<` make the column wider and narrower and `=` puts it back — they are the
+`sidebar.width` setting, so this key and `config.toml` say the same number, and the panel's own
+heading says `<> width` while it has the keyboard. The foot of the panel lists the keys for
+whatever the cursor is on; set `sidebar.hints = false` once they are in your fingers.
 
 ### Archiving, and the one verb that deletes
 
