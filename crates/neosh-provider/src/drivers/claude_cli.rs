@@ -115,8 +115,12 @@ pub fn control_mode(mode: PermissionMode) -> &'static str {
 /// today.
 const MIN_VERSION: &[(&str, (u32, u32, u32))] = &[
     ("claude-opus-5", (2, 1, 219)),
-    ("claude-fable-5", (2, 1, 169)),
-    ("claude-sonnet-5", (2, 1, 219)),
+    ("claude-fable-5-1", (2, 1, 255)),
+    ("claude-fable-5", (2, 1, 170)),
+    // 197, not 219. Read off the vendor's own table rather than assumed equal to Opus 5's, which
+    // is what it was — and a floor twenty-two releases too high is a model missing from the picker
+    // on every CLI in that range, with nothing on screen to say it was ever there.
+    ("claude-sonnet-5", (2, 1, 197)),
     ("claude-opus-4-8", (2, 1, 154)),
     ("claude-opus-4-7", (2, 1, 111)),
 ];
@@ -1713,6 +1717,26 @@ mod tests {
     #[test]
     fn an_unknown_version_is_offered_everything() {
         assert!(serves("claude-opus-5", None));
+    }
+
+    /// Every floor here is a number read off the vendor's release notes, and the failure it causes
+    /// is silent in both directions: too high and the model is missing from `^P` with nothing
+    /// saying why, too low and picking it fails the turn after you have typed the question. Pinned
+    /// per model rather than as one "is it recent" check, because they genuinely differ — Sonnet 5
+    /// landed twenty-two releases before Opus 5 and was hidden for all of them by a floor copied
+    /// from its neighbour.
+    #[test]
+    fn each_model_carries_the_release_it_actually_shipped_in() {
+        for (model, floor, before) in [
+            ("claude-fable-5-1", (2, 1, 255), (2, 1, 254)),
+            ("claude-fable-5", (2, 1, 170), (2, 1, 169)),
+            ("claude-sonnet-5", (2, 1, 197), (2, 1, 196)),
+            ("claude-opus-5", (2, 1, 219), (2, 1, 218)),
+            ("claude-opus-4-8", (2, 1, 154), (2, 1, 153)),
+        ] {
+            assert!(serves(model, Some(floor)), "{model} is offered on the release that added it");
+            assert!(!serves(model, Some(before)), "{model} is hidden on the one before");
+        }
     }
 
     #[test]

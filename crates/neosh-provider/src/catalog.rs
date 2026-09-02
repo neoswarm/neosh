@@ -254,10 +254,15 @@ pub fn anthropic_models() -> Vec<ModelInfo> {
     use ModelTier::{Balanced, Fast, Frontier};
     const OPUS: &str = "Most capable for complex work";
     const SONNET: &str = "Best for everyday tasks";
+    // What the vendor says Fable is for. It read "Long-form writing and voice" here, which is a
+    // guess from the name — the line is the top of the ladder for reasoning and long-horizon
+    // agentic work, and it is the one row whose price says so.
+    const FABLE: &str = "Deepest reasoning and long-running work";
     vec![
         claude("claude-opus-5", "Claude Opus 5", "opus", Frontier, OPUS, 1_000_000, 128_000, (5.0, 25.0), Some(EFFORT_5), true, false),
-        claude("claude-fable-5", "Claude Fable 5", "fable", Frontier, "Long-form writing and voice", 1_000_000, 128_000, (10.0, 50.0), Some(EFFORT_5), false, false),
-        claude("claude-sonnet-5", "Claude Sonnet 5", "sonnet", Balanced, SONNET, 1_000_000, 128_000, (3.0, 15.0), Some(EFFORT_5), false, false),
+        claude("claude-fable-5-1", "Claude Fable 5.1", "fable", Frontier, FABLE, 1_000_000, 128_000, (10.0, 50.0), Some(EFFORT_5), false, false),
+        claude("claude-fable-5", "Claude Fable 5", "fable", Frontier, FABLE, 1_000_000, 128_000, (10.0, 50.0), Some(EFFORT_5), false, true),
+        claude("claude-sonnet-5", "Claude Sonnet 5", "sonnet", Balanced, SONNET, 1_000_000, 128_000, (2.0, 10.0), Some(EFFORT_5), false, false),
         claude("claude-opus-4-8", "Claude Opus 4.8", "opus", Frontier, OPUS, 1_000_000, 128_000, (5.0, 25.0), Some(EFFORT_5), true, true),
         claude("claude-opus-4-7", "Claude Opus 4.7", "opus", Frontier, OPUS, 1_000_000, 128_000, (5.0, 25.0), Some(EFFORT_5), false, true),
         claude("claude-opus-4-6", "Claude Opus 4.6", "opus", Frontier, OPUS, 1_000_000, 128_000, (5.0, 25.0), Some(EFFORT_46), false, true),
@@ -332,9 +337,11 @@ pub fn claude_cli_models() -> Vec<ModelInfo> {
     use ModelTier::{Balanced, Fast, Frontier};
     const OPUS: &str = "Most capable for complex work";
     const SONNET: &str = "Best for everyday tasks";
+    const FABLE: &str = "Deepest reasoning and long-running work";
     const ENTRIES: &[ClaudeCliEntry] = &[
         ("claude-opus-5", "Claude Opus 5", "opus", Frontier, OPUS, 1_000_000, Some(EFFORT_5), true, Some(true), false),
-        ("claude-fable-5", "Claude Fable 5", "fable", Frontier, "Long-form writing and voice", 1_000_000, Some(EFFORT_5), false, Some(true), false),
+        ("claude-fable-5-1", "Claude Fable 5.1", "fable", Frontier, FABLE, 1_000_000, Some(EFFORT_5), false, Some(true), false),
+        ("claude-fable-5", "Claude Fable 5", "fable", Frontier, FABLE, 1_000_000, Some(EFFORT_5), false, Some(true), true),
         ("claude-sonnet-5", "Claude Sonnet 5", "sonnet", Balanced, SONNET, 1_000_000, Some(EFFORT_5), false, Some(false), false),
         ("claude-haiku-4-5", "Claude Haiku 4.5", "haiku", Fast, "Fastest, for quick answers", 200_000, None, false, None, false),
         ("claude-opus-4-8", "Claude Opus 4.8", "opus", Frontier, OPUS, 1_000_000, Some(EFFORT_5), true, None, true),
@@ -531,10 +538,14 @@ fn seed_models(instance: &str) -> Vec<ModelInfo> {
             ("gpt-5.4", "GPT-5.4", "gpt", Balanced, "Strong for everyday coding", true),
             ("gpt-5.4-mini", "GPT-5.4 Mini", "gpt", Fast, "Small, quick, cheap", true),
         ],
+        // The Flash line moves fastest of anything seeded here — three releases in three months —
+        // which is the argument for seeds being a floor rather than the list: the moment a key is
+        // present, `/v1/models` decides, and a row here only has to be reachable and readable.
         "google" => &[
             ("gemini-3.1-pro-preview", "Gemini 3.1 Pro", "gemini-pro", Frontier, "Most capable Gemini", false),
-            ("gemini-3.7-flash", "Gemini 3.7 Flash", "gemini-flash", Balanced, "Quick, for everyday work", false),
+            ("gemini-3.8-flash", "Gemini 3.8 Flash", "gemini-flash", Balanced, "Quick, for everyday work", false),
             ("gemini-3.1-flash-lite", "Gemini 3.1 Flash Lite", "gemini-flash-lite", Fast, "Cheapest and fastest", false),
+            ("gemini-3.7-flash", "Gemini 3.7 Flash", "gemini-flash", Balanced, "Previous generation", true),
             ("gemini-2.5-pro", "Gemini 2.5 Pro", "gemini-pro", Frontier, "Previous generation", true),
             ("gemini-2.5-flash", "Gemini 2.5 Flash", "gemini-flash", Balanced, "Previous generation", true),
         ],
@@ -764,7 +775,7 @@ pub fn builtin_instances() -> Vec<InstanceConfig> {
         ])),
         instance("gemini-cli", "gemini-cli", "Gemini", None, cli("gemini", "gemini auth login"), acp_models(&[
             ("gemini-3.1-pro-preview", "Gemini 3.1 Pro", ModelTier::Frontier, "Most capable Gemini"),
-            ("gemini-3.7-flash", "Gemini 3.7 Flash", ModelTier::Balanced, "Quick, for everyday work"),
+            ("gemini-3.8-flash", "Gemini 3.8 Flash", ModelTier::Balanced, "Quick, for everyday work"),
             ("gemini-3.1-flash-lite", "Gemini 3.1 Flash Lite", ModelTier::Fast, "Cheapest and fastest"),
         ])),
         // --- API keys: billed per token --------------------------------
