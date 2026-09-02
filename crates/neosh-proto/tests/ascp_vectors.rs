@@ -76,11 +76,14 @@ fn caps() -> NodeCapabilities {
         accepts_commands: true,
         accepts_approvals: false,
         streams: true,
+        browse: true,
         projects: vec![RemoteProject {
             key: ProjectKey("git:github.com/neoswarm/neosh".into()),
             name: "neosh".into(),
             cwd: "/home/me/src/neosh".into(),
             active: true,
+            sessions: 2,
+            running: 1,
         }],
     }
 }
@@ -180,6 +183,20 @@ fn every_message_has_a_canonical_encoding() {
         }),
     );
     check("12-goodbye.json", canonical(&AscpMessage::Goodbye { message: None }));
+    check(
+        "13-browse.json",
+        canonical(&AscpMessage::Browse { id: "b1".into(), prefix: "/home/me/src/".into() }),
+    );
+    check(
+        "14-browsed.json",
+        canonical(&AscpMessage::Browsed {
+            id: "b1".into(),
+            // Each one as the asker would have typed it, trailing separator and all — which is the
+            // part an implementation in another language gets wrong, because a `read_dir` gives you
+            // bare names and a field needs a path.
+            paths: vec!["/home/me/src/neosh/".into(), "/home/me/src/dotfiles/".into()],
+        }),
+    );
 }
 
 /// The exact bytes a peer has to sign.

@@ -1174,6 +1174,24 @@ pub enum ApiCall {
     },
     /// Machines that have asked to join, or that we found and have not added.
     SwarmStrangers,
+    /// Which directories on another machine start with `prefix` — [`ApiCall::PathComplete`], asked
+    /// over there.
+    ///
+    /// What makes "start a conversation on that computer" a place you can *go* rather than a menu
+    /// of the three checkouts it happens to have open. Without it the only way to reach a fourth is
+    /// to type its path from memory, which is a path typed wrong, and the way you find out is a
+    /// conversation that refuses to start.
+    ///
+    /// Answers with the same shape [`ApiCall::PathComplete`] does — each entry as you would have
+    /// typed it, trailing separator and all — so one field can complete against either machine and
+    /// the only thing that changes is which one is asked. Rejects when the peer is not connected,
+    /// when it does not accept commands, and when it is too old to have heard of the question; the
+    /// message says which.
+    SwarmBrowse {
+        node: NodeId,
+        #[serde(default)]
+        prefix: String,
+    },
 
     // ---- the plan ------------------------------------------------------
     // What the account has left, and what it has already spent. The capability is in the host
@@ -1579,6 +1597,16 @@ pub enum ApiOk {
     SwarmNodes { nodes: Vec<SwarmNode> },
     SwarmAgents { agents: Vec<SwarmAgent> },
     SwarmStrangers { strangers: Vec<SwarmStranger> },
+    /// A command a peer carried out, and the conversation it made if it made one.
+    ///
+    /// Only [`AgentCommand::NewSession`] fills it in, and dropping it was what made "start
+    /// something over there" a dead end: the far end knew the id, said it in its `Ack`, and the
+    /// host threw it away — so a plugin could start a conversation on another machine and then had
+    /// no way to open the thing it had just started.
+    SwarmCommanded {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session: Option<SessionId>,
+    },
     // ---- the plan ----
     Quotas { quotas: Vec<QuotaSnapshot> },
     QuotaHistory { samples: Vec<QuotaSample> },

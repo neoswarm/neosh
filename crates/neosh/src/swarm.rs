@@ -93,6 +93,7 @@ impl Swarm {
                 accepts_commands: false,
                 accepts_approvals: false,
                 streams: false,
+                browse: true,
                 projects: Vec::new(),
             },
             agents: Vec::new(),
@@ -295,6 +296,7 @@ mod tests {
             accepts_commands: true,
             accepts_approvals: false,
             streams: true,
+            browse: true,
             projects: Vec::new(),
         }
     }

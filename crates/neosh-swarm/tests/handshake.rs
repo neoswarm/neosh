@@ -19,6 +19,7 @@ fn caps() -> NodeCapabilities {
         accepts_commands: true,
         accepts_approvals: false,
         streams: true,
+        browse: true,
         projects: Vec::new(),
     }
 }

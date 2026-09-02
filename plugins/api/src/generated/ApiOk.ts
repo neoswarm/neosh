@@ -107,6 +107,7 @@ export type ApiOk =
   | { "ok": "swarm_nodes"; nodes: Array<SwarmNode> }
   | { "ok": "swarm_agents"; agents: Array<SwarmAgent> }
   | { "ok": "swarm_strangers"; strangers: Array<SwarmStranger> }
+  | { "ok": "swarm_commanded"; session?: SessionId | null }
   | { "ok": "quotas"; quotas: Array<QuotaSnapshot> }
   | { "ok": "quota_history"; samples: Array<QuotaSample> }
   | { "ok": "usage_history"; history: UsageHistory }

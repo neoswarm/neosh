@@ -401,6 +401,7 @@ impl Editor {
                 | ApiCall::SwarmReconnect { .. }
                 | ApiCall::SwarmDisconnect { .. }
                 | ApiCall::SwarmStrangers
+                | ApiCall::SwarmBrowse { .. }
                 // The plan's allowance: credentials, other programs' transcripts and a clock.
                 // Nothing here is UI state, and the store outlives every window that draws it.
                 | ApiCall::QuotaList

@@ -70,4 +70,6 @@ export type AscpMessage =
     session?: SessionId | null;
   }
   | { "type": "refused"; id: string; refusal: Refusal }
+  | { "type": "browse"; id: string; prefix: string }
+  | { "type": "browsed"; id: string; paths: Array<string> }
   | { "type": "goodbye"; message?: string | null };
