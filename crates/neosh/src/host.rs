@@ -39,6 +39,15 @@ use crate::vim;
 /// How long mutations accumulate before a frame is emitted.
 const COALESCE: Duration = Duration::from_millis(16);
 
+/// How often to check whether the other machines have been told something out of date.
+///
+/// Slow on purpose. What it carries is "which projects and conversations exist here", which moves
+/// when a person does something rather than when a token arrives, and two seconds of lag on
+/// somebody else's screen is not a thing anybody could notice. It also bounds the cost: the check
+/// is a recompute-and-compare, and doing it on the host loop's every iteration would put it on the
+/// token path.
+const ROSTER_INTERVAL: Duration = Duration::from_secs(2);
+
 /// The plugin id the host registers its own things under.
 ///
 /// Not a special case in the core: the built-in UI, commands, keymaps and options are all owned by
@@ -642,6 +651,16 @@ pub struct Host {
     swarm_node: Option<neosh_swarm::SwarmHandle>,
     /// Commands sent to peers that have not been answered yet, and who to settle when they are.
     swarm_pending: std::collections::HashMap<String, (PluginId, RequestId)>,
+    /// The last thing said to the peers about what is here, so a poll can say nothing when nothing
+    /// has changed. `None` until the first publish.
+    published: Option<(Vec<neosh_proto::AgentSummary>, Vec<neosh_proto::RemoteProject>)>,
+    /// Which of those are directory listings rather than commands.
+    ///
+    /// One waiting map for both, because a peer that goes away has to fail everything outstanding
+    /// and a second map would be a second place to remember to do it. This set is only consulted on
+    /// the way *back*: a refusal arrives as `Refused { id }` with nothing on it to say what it is
+    /// refusing, so the id is what says whether the answer is `Paths` or a started conversation.
+    swarm_browsing: std::collections::HashSet<String>,
     swarm_next_command: u64,
     /// Local conversations somebody on another machine is watching.
     ///
@@ -1093,6 +1112,8 @@ impl Host {
             swarm: Default::default(),
             swarm_node: None,
             swarm_pending: Default::default(),
+            published: None,
+            swarm_browsing: Default::default(),
             swarm_next_command: 0,
             swarm_watched: Default::default(),
             swarm_strangers: Default::default(),
@@ -1928,9 +1949,12 @@ impl Host {
             ApiCall::SwarmProbe { .. } => {
                 Err(ApiError::Internal { message: "swarm.probe is answered asynchronously".into() })
             }
-            // Taken over before dispatch, because its answer comes from another machine.
+            // Taken over before dispatch, because their answers come from another machine.
             ApiCall::SwarmCommand { .. } => Err(ApiError::Internal {
                 message: "swarm.command is answered asynchronously".into(),
+            }),
+            ApiCall::SwarmBrowse { .. } => Err(ApiError::Internal {
+                message: "swarm.browse is answered asynchronously".into(),
             }),
             // ---- events -------------------------------------------------
             // `from` is stamped here rather than taken from the call, so "who said this" is one of
@@ -3467,6 +3491,69 @@ impl Host {
         handle.send(neosh_swarm::SwarmRequest::Command { node, id, session, command });
     }
 
+    /// Ask a peer which of its directories start with `prefix`, and remember who is waiting.
+    ///
+    /// Shares [`Self::swarm_next_command`] with the command path so the two id spaces cannot
+    /// collide — which matters because a refusal comes back as a bare `Refused { id }` with nothing
+    /// on it to say which question it is refusing, and the id is the only thing that tells them
+    /// apart.
+    fn begin_swarm_browse(
+        &mut self,
+        node: neosh_proto::NodeId,
+        prefix: String,
+        waiting: (PluginId, RequestId),
+    ) {
+        // This machine, reached the way any other is. A picker walking `swarm.nodes()` finds its
+        // own node in the list, and asking ourselves over a socket would make a local directory
+        // listing depend on the swarm being up — and fail outright with `--clean`, which has
+        // nowhere to keep the key that is this machine's identity.
+        if self.swarm_self().is_some_and(|me| me.id == node) {
+            let svc = self.services(&PluginId::from(BUILTIN));
+            let bridge = self.bridge.clone();
+            let (plugin, id) = waiting;
+            tokio::spawn(async move {
+                let result = svc.path_complete(prefix).await;
+                let response: ApiResponse = result.into();
+                let _ = bridge.script().send(ScriptInbound::Plugin {
+                    plugin,
+                    msg: PluginInbound::Response { id, response },
+                });
+            });
+            return;
+        }
+        let Some(handle) = &self.swarm_node else {
+            self.answer_swarm(waiting, Err(ApiError::NotFound {
+                what: "the swarm is not running".into(),
+            }));
+            return;
+        };
+        self.swarm_next_command += 1;
+        let id = format!("b{}", self.swarm_next_command);
+        self.swarm_pending.insert(id.clone(), waiting);
+        self.swarm_browsing.insert(id.clone());
+        handle.send(neosh_swarm::SwarmRequest::Browse { node, id, prefix });
+    }
+
+    /// A peer asked which of our directories start with `prefix`. Answer exactly once, whatever
+    /// happens.
+    ///
+    /// Off the loop, because it is a `read_dir` and the loop is what draws. Directory names only —
+    /// the same listing the local completer produces, which never opens a file and never says
+    /// whether one is there.
+    fn run_swarm_browse(&mut self, node: neosh_proto::NodeId, id: String, prefix: String) {
+        let Some(handle) = self.swarm_node.as_ref() else { return };
+        let handle = handle.clone();
+        let svc = self.services(&PluginId::from(BUILTIN));
+        tokio::spawn(async move {
+            let result = match svc.path_complete(prefix).await {
+                Ok(ApiOk::Paths { paths }) => Ok(paths),
+                Ok(_) => Ok(Vec::new()),
+                Err(e) => Err(neosh_proto::Refusal::Failed { message: format!("{e:?}") }),
+            };
+            handle.send(neosh_swarm::SwarmRequest::Browsed { node, id, result });
+        });
+    }
+
     /// Find out what machine is at an address, off the loop.
     ///
     /// Given a short deadline of its own: the address came from somebody typing, and a wrong one is
@@ -3483,10 +3570,14 @@ impl Host {
             self.answer_swarm(waiting, Err(ApiError::NotFound { what: "no state directory".into() }));
             return;
         };
+        // A probe says hello and hangs up, so everything here is `false`: it is not offering to do
+        // anything for the machine it is asking about, and a capability it advertised would be one
+        // it is about to stop being able to honour.
         let caps = neosh_proto::NodeCapabilities {
             accepts_commands: false,
             accepts_approvals: false,
             streams: false,
+            browse: false,
             projects: Vec::new(),
         };
         let bridge = self.bridge.clone();
@@ -3580,23 +3671,85 @@ impl Host {
     /// The checkouts this machine can start something in, for a peer's "new conversation over
     /// there" menu.
     ///
-    /// Derived from where conversations already are rather than from a scan of the disk: a list of
-    /// every git repository on somebody's laptop is both slow to produce and more than a peer needs
-    /// to know.
-    fn local_projects(&self, agents: &[neosh_proto::AgentSummary]) -> Vec<neosh_proto::RemoteProject> {
+    /// Never a scan of the disk: a list of every git repository on somebody's laptop is slow to
+    /// produce and far more than a peer needs to know. It is the list this machine's own panel
+    /// shows — the places you work — which is two sources rather than one.
+    ///
+    /// The live conversations are the obvious half and were once the whole of it, which made the
+    /// answer wrong in a way that only showed up from the other machine: a project is a place you
+    /// work rather than a property of the work in it, so a repository you cleared out this morning
+    /// vanished from every other computer's "start something over there", and the checkout you have
+    /// had open for a month but are not mid-turn in was never on it at all. It also made
+    /// [`neosh_proto::RemoteProject::active`] a constant — everything on the list had a
+    /// conversation, so everything said `true`.
+    ///
+    /// So the other half is `sidebar.projects`, the workspace var that *is* the panel's list. Read
+    /// here for the same reason `question.asking` is: it is a fact about this workspace rather than
+    /// about whichever panel happened to write it down, which is what a var is for. A workspace
+    /// whose panel is switched off simply falls back to the conversations, which is what this
+    /// answered before.
+    fn local_projects(
+        &mut self,
+        agents: &[neosh_proto::AgentSummary],
+    ) -> Vec<neosh_proto::RemoteProject> {
         let mut out: Vec<neosh_proto::RemoteProject> = Vec::new();
         for a in agents {
-            if out.iter().any(|p| p.cwd == a.cwd) {
+            match out.iter_mut().find(|p| p.cwd == a.cwd) {
+                Some(p) => {
+                    p.sessions += 1;
+                    p.running += u32::from(a.state == neosh_proto::AgentState::Running);
+                }
+                None => out.push(neosh_proto::RemoteProject {
+                    key: a.project.clone(),
+                    name: a.project_name.clone(),
+                    cwd: a.cwd.clone(),
+                    active: true,
+                    sessions: 1,
+                    running: u32::from(a.state == neosh_proto::AgentState::Running),
+                }),
+            }
+        }
+
+        // And the quiet ones. `sidebar.name` is what the host called each directory when it last
+        // had something in it — a worktree's `neosh (fix/thing)` rather than its `wt-fe3c0d93` —
+        // so an emptied project keeps the name the other machine already knows it by.
+        let known: Vec<String> = serde_json::from_value(
+            self.vars.get(&neosh_proto::VarScope::Global, "sidebar.projects"),
+        )
+        .unwrap_or_default();
+        for cwd in known {
+            if out.iter().any(|p| p.cwd == cwd) {
                 continue;
             }
+            let path = std::path::Path::new(&cwd);
+            // Only somewhere that is still there. A project on the list whose directory has been
+            // deleted is a row on another machine that can only ever fail to open.
+            if !path.is_dir() {
+                continue;
+            }
+            let name = self
+                .vars
+                .get(&neosh_proto::VarScope::Project { cwd: cwd.clone() }, "sidebar.name")
+                .as_str()
+                .map(str::to_string)
+                .filter(|n| !n.is_empty())
+                .unwrap_or_else(|| {
+                    path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()
+                });
             out.push(neosh_proto::RemoteProject {
-                key: a.project.clone(),
-                name: a.project_name.clone(),
-                cwd: a.cwd.clone(),
-                active: true,
+                key: self.project_key(path),
+                name,
+                cwd,
+                active: false,
+                sessions: 0,
+                running: 0,
             });
         }
-        out.sort_by(|a, b| a.name.cmp(&b.name));
+
+        // Somewhere being worked in first, and alphabetical inside that: the list is read by
+        // somebody looking for where to start something, and "there is already an agent in here"
+        // is the most useful thing a row can say about itself.
+        out.sort_by(|a, b| b.active.cmp(&a.active).then_with(|| a.name.cmp(&b.name)));
         out
     }
 
@@ -3612,10 +3765,30 @@ impl Host {
         }
         self.swarm.set_local_projects(keys);
         let projects = self.local_projects(&agents);
+        self.published = Some((agents.clone(), projects.clone()));
         if let Some(h) = &self.swarm_node {
             h.send(neosh_swarm::SwarmRequest::Publish { full: true, agents, gone: Vec::new() });
             h.send(neosh_swarm::SwarmRequest::Projects { projects });
         }
+    }
+
+    /// The same, but only when the answer has moved since the last time it was said.
+    ///
+    /// Called on a timer, so this is the comparison that keeps an idle workspace silent: two
+    /// vectors of small structs against the two that were last sent, and nothing on the wire when
+    /// they match. `AgentSummary` carries `updated_at` and `usage`, so a turn producing tokens
+    /// moves it and peers watching a board see the count climb — which is the point of a roster
+    /// rather than a snapshot.
+    fn publish_inventory_if_changed(&mut self) {
+        if self.swarm_node.is_none() {
+            return;
+        }
+        let agents = self.local_inventory();
+        let projects = self.local_projects(&agents);
+        if self.published.as_ref().is_some_and(|(a, p)| a == &agents && p == &projects) {
+            return;
+        }
+        self.publish_inventory();
     }
 
     /// One event from the swarm.
@@ -3669,6 +3842,7 @@ impl Host {
                 // Anything still waiting on that machine will never be answered by it.
                 let orphaned: Vec<String> = self.swarm_pending.keys().cloned().collect();
                 for id in orphaned {
+                    self.swarm_browsing.remove(&id);
                     if let Some(waiting) = self.swarm_pending.remove(&id) {
                         self.answer_swarm(waiting, Err(ApiError::NotFound {
                             what: format!("{name} went away before answering"),
@@ -3741,11 +3915,15 @@ impl Host {
                 self.broadcast(PluginEvent::SwarmChanged);
             }
             E::Answer { id, result, .. } => {
-                let (ok, message) = match result {
-                    Ok(_) => (true, String::new()),
-                    Err(r) => (false, refusal_text(&r)),
+                let (ok, message, session) = match result {
+                    Ok(session) => (true, String::new(), session),
+                    Err(r) => (false, refusal_text(&r), None),
                 };
-                self.on_swarm_reply(&id, ok, message);
+                self.on_swarm_reply(&id, ok, message, session);
+            }
+            E::Browse { node, id, prefix } => self.run_swarm_browse(node, id, prefix),
+            E::Browsed { id, result, .. } => {
+                self.on_swarm_browsed(&id, result.map_err(|r| refusal_text(&r)));
             }
             E::Subscribed { session, .. } => {
                 let fresh = self.swarm_watched.insert(session.clone());
@@ -3901,14 +4079,40 @@ impl Host {
     }
 
     /// Settle a command we sent, when the far end answers.
-    pub fn on_swarm_reply(&mut self, id: &str, ok: bool, message: String) {
+    ///
+    /// `session` is what a [`neosh_proto::AgentCommand::NewSession`] made, and is the whole of what
+    /// makes starting something on another machine reversible into looking at it: the far end knows
+    /// the id and says it, and until this carried it the caller could start a conversation over
+    /// there and then had nothing to open.
+    pub fn on_swarm_reply(
+        &mut self,
+        id: &str,
+        ok: bool,
+        message: String,
+        session: Option<neosh_proto::SessionId>,
+    ) {
         let Some(waiting) = self.swarm_pending.remove(id) else { return };
-        let result = if ok {
-            Ok(ApiOk::Unit)
-        } else {
+        let browsing = self.swarm_browsing.remove(id);
+        let result = if !ok {
             Err(ApiError::Denied { reason: message })
+        } else if browsing {
+            // A `Browsed` settles through `on_swarm_browsed`; reaching here with `ok` means the
+            // peer answered a directory listing with a bare `Ack`, which no version of it does.
+            Ok(ApiOk::Paths { paths: Vec::new() })
+        } else {
+            Ok(ApiOk::SwarmCommanded { session })
         };
         self.answer_swarm(waiting, result);
+    }
+
+    /// Settle a directory listing we asked a peer for.
+    pub fn on_swarm_browsed(&mut self, id: &str, result: Result<Vec<String>, String>) {
+        let Some(waiting) = self.swarm_pending.remove(id) else { return };
+        self.swarm_browsing.remove(id);
+        self.answer_swarm(waiting, match result {
+            Ok(paths) => Ok(ApiOk::Paths { paths }),
+            Err(reason) => Err(ApiError::Denied { reason }),
+        });
     }
 
     /// Act on an option the host itself owns. Everything else is a plugin's business.
@@ -4825,9 +5029,12 @@ impl Host {
             ApiCall::ChatAttach { path: None } => {
                 Some("there is no clipboard here — name a file: chat.attach with a path")
             }
-            ApiCall::SwarmProbe { .. } | ApiCall::SwarmCommand { .. } => Some(
+            ApiCall::SwarmProbe { .. }
+            | ApiCall::SwarmCommand { .. }
+            | ApiCall::SwarmBrowse { .. } => Some(
                 "the swarm is answered by the machine at the other end, which this connection has \
-                 no way to wait for. Use `agent.command` for a conversation on this machine",
+                 no way to wait for. Use `agent.command` for a conversation on this machine, and \
+                 `path.complete` for a directory on it",
             ),
             _ => None,
         };
@@ -8783,6 +8990,10 @@ impl Host {
             );
             return;
         }
+        if let ApiCall::SwarmBrowse { node, prefix } = &call {
+            self.begin_swarm_browse(node.clone(), prefix.clone(), (plugin.clone(), id.clone()));
+            return;
+        }
         if self.spawn_slow(&plugin, Some(id.clone()), &call) {
             return;
         }
@@ -9379,6 +9590,24 @@ impl Host {
         tokio::pin!(burst);
         let mut bursting = false;
 
+        // What the other machines are told this one has. A day away when there is no swarm, which
+        // is the shape every optional timer above has.
+        //
+        // A *timer* rather than a call at each of the places a conversation can change, because
+        // that list is long and was already wrong: the inventory was published when a peer
+        // connected and when a peer drove something here, and never once because somebody sitting
+        // at this machine started, renamed, archived or deleted a conversation. Every other
+        // computer's picture of this one was therefore a snapshot from whenever it last dialled —
+        // a project added an hour ago was invisible over there, with nothing to say why. Nothing
+        // goes on the wire unless the answer actually changed, so an idle workspace with peers is
+        // one comparison every two seconds and no traffic at all.
+        let roster = tokio::time::sleep(if self.swarm_node.is_some() {
+            ROSTER_INTERVAL
+        } else {
+            Duration::from_secs(86_400)
+        });
+        tokio::pin!(roster);
+
         loop {
             tokio::select! {
                 Some(out) = script_rx.recv() => self.handle_script_out(out).await,
@@ -9509,6 +9738,10 @@ impl Host {
                 () = &mut burst, if bursting => {
                     bursting = false;
                     self.deliver_alerts().await?;
+                }
+                () = &mut roster, if self.swarm_node.is_some() => {
+                    self.publish_inventory_if_changed();
+                    roster.as_mut().reset(Instant::now() + ROSTER_INTERVAL);
                 }
                 () = &mut plan => {
                     self.refresh_quota(None);

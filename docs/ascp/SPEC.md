@@ -144,6 +144,7 @@ is an accident of who booted first.
 | `Presence` | one per node per heartbeat | always |
 | `Inventory` | one per change | always |
 | `Command` / `Ack` / `Refused` | one per meaningful keystroke | on demand |
+| `Browse` / `Browsed` / `Refused` | one per keystroke in a directory field | on demand |
 | `Subscribe` / `Stream` | **one per token** | only while subscribed |
 
 That last row is the whole performance argument. Twenty machines streaming every token to everyone
@@ -193,6 +194,28 @@ must be able to say no to — hence `NodeCapabilities::accepts_approvals`, separ
 Capabilities are advisory **to the caller** — they let a board grey out a verb rather than offering
 one that will be refused. The owner enforces regardless, because a capability list is something the
 other side could have lied about.
+
+### Browse
+
+`Browse { id, prefix }` asks which directories on that node start with `prefix`; `Browsed { id,
+paths }` answers, or `Refused` does. Exactly once, like every request here. Each path comes back as
+the asker would have typed it — trailing separator and all — so it can go straight into a field.
+**Directory names only**: never files, never contents, never anything a `read_dir` cannot answer.
+
+`NodeCapabilities::projects` is what a node *offers* and is a short list of places it already works
+in. This is the other half, and without it the only way to reach a fourth directory over there is to
+type its path from memory and find out it was wrong when the conversation fails to start.
+
+Gated on `accepts_commands`, and deliberately **not** on a permission of its own. A node that
+accepts commands already accepts `NewSession` with an arbitrary `cwd` — it will start an agent
+anywhere on its disk you name — so declining to say which directories exist would withhold strictly
+less than it has already given away, at the cost of a third permission for people to reason about.
+
+`NodeCapabilities::browse` is a *compatibility* flag rather than a permission, and it is the reason
+this could be added without a version bump. An unknown message tag fails the frame and fails the
+connection with it, so a node built before `Browse` existed cannot simply ignore one — a caller must
+therefore check the flag before sending. It defaults to `false`, which is exactly what an older
+node's handshake decodes to, so "does not say" and "cannot" are the same answer.
 
 ### Stream
 
@@ -247,9 +270,13 @@ An implementation is ASCP-0 conformant if it:
 6. Never acts on a command it did not authorise, whatever it advertised in `NodeCapabilities`.
 7. Sends a full `Inventory` on connect.
 8. Sends `Stream` only for sessions the peer has subscribed to.
+9. Answers every `Browse` exactly once with `Browsed` or `Refused`, and answers none at all unless
+   it accepts commands.
+10. Sends `Browse` only to a peer whose handshake said `browse: true`.
 
-Points 1, 2 and 6 are the security-relevant ones. An implementation failing any of them is not a
-degraded ASCP node; it is an open door.
+Points 1, 2, 6 and 9 are the security-relevant ones. An implementation failing any of them is not a
+degraded ASCP node; it is an open door. Point 10 is the compatibility one: a peer that has never
+heard of the message will drop the connection rather than skip the frame.
 
 ---
 

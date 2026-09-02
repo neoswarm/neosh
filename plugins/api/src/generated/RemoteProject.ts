@@ -14,6 +14,24 @@ export type RemoteProject = {
   cwd: string;
   /**
    * Whether this node has a conversation open in it now.
+   *
+   * Meant something for exactly as long as this list was derived from live conversations: every
+   * project on it had one, so every one of them said `true` and a board drawing the flag drew
+   * one colour. A node now advertises the places it *works in* — which is the list its own panel
+   * shows, and includes the project you cleared out this morning — so the two states exist and
+   * the flag is worth reading.
    */
   active: boolean;
+  /**
+   * How many conversations are open in it there.
+   */
+  sessions: number;
+  /**
+   * How many of those are mid-turn.
+   *
+   * Separate from `sessions` because they are different questions and a board answers both in
+   * one row: `3 conversations · 1 working` is what the sidebar says about a local project, and a
+   * remote one should not have to say less.
+   */
+  running: number;
 };

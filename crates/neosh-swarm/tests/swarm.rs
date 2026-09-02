@@ -284,6 +284,74 @@ async fn a_read_only_node_refuses_without_asking_its_host() {
     assert!(heard.is_err(), "a read-only node's host is not asked to enforce it");
 }
 
+/// A directory listing reaches the owner and comes back under the id it was asked with.
+#[tokio::test]
+async fn browsing_a_peer_answers_with_that_machines_directories() {
+    let mut p = pair(true).await;
+    let b_id = wait_for(&mut p.a_rx, |e| match e {
+        SwarmEvent::PeerUp { node, .. } => Some(node.id.clone()),
+        _ => None,
+    })
+    .await;
+
+    p.a.send(SwarmRequest::Browse { node: b_id.clone(), id: "b1".into(), prefix: "/src/".into() });
+
+    let (id, prefix) = wait_for(&mut p.b_rx, |e| match e {
+        SwarmEvent::Browse { id, prefix, .. } => Some((id.clone(), prefix.clone())),
+        _ => None,
+    })
+    .await;
+    assert_eq!((id.as_str(), prefix.as_str()), ("b1", "/src/"), "asked, verbatim");
+
+    let a_id = wait_for(&mut p.b_rx, |e| match e {
+        SwarmEvent::PeerUp { node, .. } => Some(node.id.clone()),
+        _ => None,
+    })
+    .await;
+    p.b.send(SwarmRequest::Browsed {
+        node: a_id,
+        id: "b1".into(),
+        result: Ok(vec!["/src/neosh/".into()]),
+    });
+
+    let answer = wait_for(&mut p.a_rx, |e| match e {
+        SwarmEvent::Browsed { id, result, .. } if id == "b1" => Some(result.clone()),
+        _ => None,
+    })
+    .await;
+    assert_eq!(answer.expect("answered"), vec!["/src/neosh/".to_string()]);
+}
+
+/// A read-only node is not asked to list its directories either.
+///
+/// Browsing follows `accepts_commands` rather than a permission of its own — a node that will start
+/// an agent at any path you name has already given away more than the names of its directories —
+/// which means the gate has to be the same gate, applied in the same place, and not a second one
+/// somebody remembered to write.
+#[tokio::test]
+async fn a_read_only_node_will_not_be_browsed() {
+    let mut p = pair(false).await;
+    let b_id = wait_for(&mut p.a_rx, |e| match e {
+        SwarmEvent::PeerUp { node, .. } => Some(node.id.clone()),
+        _ => None,
+    })
+    .await;
+
+    p.a.send(SwarmRequest::Browse { node: b_id, id: "b1".into(), prefix: "/".into() });
+
+    let heard = tokio::time::timeout(Duration::from_millis(700), async {
+        loop {
+            match p.b_rx.recv().await {
+                Some(SwarmEvent::Browse { .. }) => return true,
+                Some(_) => continue,
+                None => return false,
+            }
+        }
+    })
+    .await;
+    assert!(heard.is_err(), "its host is not asked to enforce what it already declared");
+}
+
 /// Streams go to subscribers and to nobody else.
 #[tokio::test]
 async fn a_stream_arrives_only_after_subscribing() {

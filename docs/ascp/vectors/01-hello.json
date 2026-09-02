@@ -2,12 +2,15 @@
   "capabilities": {
     "accepts_approvals": false,
     "accepts_commands": true,
+    "browse": true,
     "projects": [
       {
         "active": true,
         "cwd": "/home/me/src/neosh",
         "key": "git:github.com/neoswarm/neosh",
-        "name": "neosh"
+        "name": "neosh",
+        "running": 1,
+        "sessions": 2
       }
     ],
     "streams": true

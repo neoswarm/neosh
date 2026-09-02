@@ -2273,6 +2273,63 @@ fn a_new_conversation_in_a_repository_offers_a_worktree() {
     );
 }
 
+/// Somewhere else sits above the worktrees, and says the field completes paths.
+///
+/// The list of trees is unbounded and the verb under it was therefore at a distance that grew with
+/// how long you had used the program: "I can't go down in the sidebar for it" is the same complaint
+/// one panel along. It is also the row that tells you the filter line *is* a path field, and a
+/// sentence about how to type is no use once you have scrolled past it looking for somewhere to
+/// type.
+#[test]
+fn somewhere_else_is_above_the_worktrees_rather_than_under_them() {
+    if !have_git() {
+        return;
+    }
+    let sb = Sandbox::new("newwhereorder");
+    sb.git_init();
+    let mut s = sb.start();
+    s.wait_for("PROJECTS");
+    s.ctrl("n");
+    assert!(s.pump(|s| !s.picker_named("[New conversation]").is_empty()), "the picker opened");
+
+    let rows = s.picker_named("[New conversation]");
+    let elsewhere = rows.iter().position(|l| l.contains("Another directory"));
+    let trees = rows.iter().position(|l| l.contains("worktree  ·  "));
+    assert!(elsewhere.is_some(), "somewhere else is offered\n{rows:?}");
+    // Only meaningful when there is a tree to be above; without one the row's position is not in
+    // question and asserting on it would be asserting on nothing.
+    if let (Some(e), Some(t)) = (elsewhere, trees) {
+        assert!(e < t, "somewhere else comes first\n{rows:?}");
+    }
+    assert!(
+        rows.iter().any(|l| l.contains("type a path")),
+        "and it says the field takes one\n{rows:?}"
+    );
+}
+
+/// `^O` lands in the path field, rather than in a menu with the path field at the bottom of it.
+///
+/// This used to be the current repository's worktrees with `Type a path…` under them — a list of
+/// the one place you were already in, which you had to read to the end of every time to reach the
+/// thing you almost always wanted. The row is first now, and it is a fallback rather than the
+/// route: typing a path is what the field does from the first keystroke.
+#[test]
+fn add_project_puts_the_path_first() {
+    let sb = Sandbox::new("addfirst");
+    let mut s = sb.start();
+    s.wait_for("PROJECTS");
+
+    s.send(&command("project.open"));
+    // The float, not the sidebar's `+ Add project` row — which is on screen from the start and
+    // would let this assert before anything opened.
+    assert!(s.pump(|s| !s.float_named("[Add project").is_empty()), "the field opened");
+
+    let rows = s.float_named("[Add project");
+    // The title, then the filter line, then the rows — so the first row is the third line.
+    let first = rows.iter().skip(2).find(|l| !l.trim().is_empty()).cloned().unwrap_or_default();
+    assert!(first.contains("Type a path"), "the path is the first row\n{rows:?}");
+}
+
 /// The trees it offers under "an existing one" are the ones on the panel's list, not every
 /// checkout `git worktree list` can see.
 ///

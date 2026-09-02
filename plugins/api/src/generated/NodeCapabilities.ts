@@ -24,6 +24,17 @@ export type NodeCapabilities = {
    */
   streams: boolean;
   /**
+   * Whether [`AscpMessage::Browse`] will be answered.
+   *
+   * Not a permission — it follows `accepts_commands`, for the reason written on `Browse` — but a
+   * *compatibility* flag, and that is why it is here rather than derived. A node built before
+   * `Browse` existed cannot skip a message it has never heard of: the frame parses or the
+   * connection fails, so a new node that sent one on spec would drop an old peer's link every
+   * time somebody opened a directory picker. It defaults to `false`, which is exactly what an
+   * older node's handshake decodes to, so "does not say" and "cannot" are the same answer.
+   */
+  browse: boolean;
+  /**
    * The checkouts this node has, for starting something on it.
    */
   projects: Array<RemoteProject>;

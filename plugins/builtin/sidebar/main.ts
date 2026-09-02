@@ -66,7 +66,9 @@ import {
   badgeWidth as badgeColumns,
   decorateRow,
   elapsed,
+  fuzzy,
   type ListRow,
+  type Match,
   mergeDecorations,
   placeSections,
   type SectionItem,
@@ -1635,15 +1637,6 @@ async function newConversation(
     return;
   }
 
-  type Where =
-    | { kind: "here" }
-    | { kind: "scratch" }
-    | { kind: "inside" }
-    | { kind: "new" }
-    | { kind: "elsewhere" }
-    | { kind: "tree"; path: string; label: string }
-    /** On another computer, in a checkout that machine told us it has. */
-    | { kind: "host"; node: string; cwd: string; label: string };
   const rows: Array<PickerItem<Where>> = [
     {
       label: "Here",
@@ -1694,6 +1687,12 @@ async function newConversation(
       value: { kind: "new" },
     });
   }
+  // Somewhere else, before the list of trees rather than after it. Not because it is the commonest
+  // answer — it is not — but because the list above it is unbounded, and a verb that sits under an
+  // unbounded list is a verb whose distance from the cursor depends on how long you have used the
+  // program. It is also the row that says the field completes paths, and a sentence about how to
+  // type is no use once you have already scrolled past it looking for somewhere to type.
+  rows.push(elsewhereRow("Another directory…"));
   for (const t of others) {
     const label = t.branch ?? t.head ?? t.path;
     rows.push({
@@ -1705,38 +1704,8 @@ async function newConversation(
       value: { kind: "tree", path: t.path, label },
     });
   }
-  // The other computers, and the checkouts each of them offered in its handshake. A machine that
-  // does not accept commands is left out rather than shown and refused — a row that cannot work is
-  // worse than no row.
-  for (const n of await neosh.swarm.nodes().catch(() => [])) {
-    if (!n.up || !n.capabilities.accepts_commands) continue;
-    for (const project of n.capabilities.projects) {
-      rows.push({
-        label: `${project.name}`,
-        detail: `on ${n.info.name}  ·  ${project.cwd}`,
-        keywords: `${n.info.name} ${project.cwd} remote host computer`,
-        icon: "→",
-        hl: "Sidebar.Remote",
-        value: {
-          kind: "host",
-          node: n.info.id,
-          cwd: project.cwd,
-          label: `${project.name} on ${n.info.name}`,
-        },
-      });
-    }
-  }
 
-  rows.push({
-    label: "Another directory…",
-    detail: "somewhere else entirely",
-    keywords: "project folder",
-    icon: "…",
-    hl: "Sidebar.Dim",
-    value: { kind: "elsewhere" },
-  });
-
-  const chosen = await picker(neosh, rows, { title: "New conversation", width: 76 });
+  const chosen = await whereTo(neosh, rows, { title: "New conversation" });
   if (chosen === null) return;
   // Every row below that reaches for git names the repository it is about. `^N` from a
   // conversation and `n` from a row on a different project are the same code path, and the only
@@ -1766,21 +1735,361 @@ async function newConversation(
       await neosh.session.create({ cwd: chosen.path });
       return;
     case "host":
-      // Started *there*. The agent will run on that machine, against that machine's files, which
-      // is the point — this is not a way to work on a remote directory from here.
+      await startThere(neosh, chosen);
+      return;
+    case "elsewhere": {
+      const path = chosen.path ?? (await pathPicker(neosh, "New conversation"));
+      if (path === null || path.trim() === "") return;
       try {
-        await neosh.swarm.command(chosen.node, "", {
-          command: "new_session",
-          cwd: chosen.cwd,
-          title: null,
-        });
-        neosh.notify(`started ${chosen.label}`);
+        await neosh.session.create({ cwd: path.trim() });
       } catch (e) {
         neosh.notify(String(e), "warn");
       }
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Where — one field for every answer to "which directory, on which computer"
+// ---------------------------------------------------------------------------
+
+/**
+ * Every answer `^N` and `^O` accept.
+ *
+ * `elsewhere` carries its path when the field already produced one, and leaves it off when the row
+ * was chosen from the menu — the difference between "you typed a directory" and "you asked to be
+ * asked for one".
+ */
+type Where =
+  | { kind: "here" }
+  | { kind: "scratch" }
+  | { kind: "inside" }
+  | { kind: "new" }
+  | { kind: "elsewhere"; path?: string }
+  | { kind: "tree"; path: string; label: string }
+  /** On another computer, in one of its directories. */
+  | { kind: "host"; node: string; cwd: string; label: string }
+  /** Look at one machine's directories rather than every machine's projects. */
+  | { kind: "machine"; node: string; name: string }
+  /** A machine that is on the list and cannot be used yet. `↵` says which of those it is. */
+  | { kind: "unreachable"; name: string; why: string };
+
+/** The row that drops through to a path, wherever a caller wants it in the order. */
+function elsewhereRow(label: string): PickerItem<Where> {
+  return {
+    label,
+    // What the field does, said on the row that is about the field. The alternative was a hint
+    // strip nobody reads until they already know what they are looking for.
+    detail: "or type a path — `/`, `~` and `./` complete as you go",
+    keywords: "path folder directory type browse elsewhere",
+    icon: "…",
+    hl: "Sidebar.Dim",
+    value: { kind: "elsewhere" },
+  };
+}
+
+/**
+ * What the field is completing against, read off what has been typed.
+ *
+ * Three states and one field, because the alternative is a mode — and a mode is a thing you have to
+ * be in before you can type, which is the entire complaint this replaced. A path is a path the
+ * moment it starts like one; `<machine>:` is scp's syntax and means there what it means here, which
+ * is the only reason it is worth having a syntax at all.
+ */
+type Field =
+  | { kind: "rows" }
+  | { kind: "local"; path: string }
+  | { kind: "remote"; node: SwarmNode; path: string };
+
+/** Whether a query has started to look like a path rather than a search. */
+function looksLikePath(q: string): boolean {
+  return q.startsWith("/") || q.startsWith("~") || q.startsWith("./") || q.startsWith("../");
+}
+
+/**
+ * Split `linux-box:/home/me/src` into the machine and the path.
+ *
+ * Matched on what the machine is *called here* — the alias if you set one, since that is the name
+ * every panel shows and therefore the only one you could have read off the screen — and on the
+ * start of its id, which is what you have when two machines share a name. A colon in a query that
+ * names no machine is not a host prefix: it is a directory with a colon in it, which is legal on
+ * every filesystem this runs on.
+ */
+function readField(query: string, nodes: SwarmNode[]): Field {
+  const at = query.indexOf(":");
+  if (at > 0) {
+    const who = query.slice(0, at).toLowerCase();
+    const node = nodes.find((n) =>
+      n.info.name.toLowerCase() === who || n.info.id.toLowerCase().startsWith(who)
+    );
+    if (node) return { kind: "remote", node, path: query.slice(at + 1) };
+  }
+  return looksLikePath(query) ? { kind: "local", path: query } : { kind: "rows" };
+}
+
+/** How a machine's rows are prefixed, and what `<Tab>` puts back in the field. */
+function hostPrefix(node: SwarmNode): string {
+  // The name, unless it has a colon or a space in it — in which case the id is the only thing that
+  // round-trips through a field whose separator is a colon.
+  return /[:\s]/.test(node.info.name) ? node.info.id.slice(0, 8) : node.info.name;
+}
+
+/**
+ * The machines, as rows you can go into.
+ *
+ * Every paired machine, including the ones that cannot be used — greyed, with the reason on them.
+ * The list used to skip anything not `up` and not accepting commands, which is right about what can
+ * be *done* and wrong about what should be *said*: somebody who has just paired a computer and is
+ * looking for it finds an empty list and nothing anywhere to explain it, which reads as the feature
+ * not existing rather than as the machine not being ready.
+ */
+function machineRows(nodes: SwarmNode[], ascii: boolean): PickerItem<Where>[] {
+  const out: PickerItem<Where>[] = [];
+  for (const n of nodes) {
+    const usable = n.up && n.capabilities.accepts_commands;
+    const projects = n.capabilities.projects;
+    const conversations = projects.reduce((sum, p) => sum + p.sessions, 0);
+    const working = projects.reduce((sum, p) => sum + p.running, 0);
+    const state = n.link.state === "up"
+      ? [
+        `${projects.length} ${projects.length === 1 ? "project" : "projects"}`,
+        conversations > 0 ? `${conversations} open` : "",
+        working > 0 ? `${working} working` : "",
+        n.capabilities.accepts_commands ? "" : "read-only — nothing can be started there",
+      ].filter(Boolean).join("  ·  ")
+      : n.link.state === "waiting"
+        ? "has not allowed this computer yet — ^J there"
+        : n.link.state === "down"
+          ? "disconnected — ^J to reconnect"
+          : "connecting…";
+    const [icon, hl] = n.link.state === "up"
+      ? usable ? [ascii ? "*" : "●", "Diagnostic.Ok"] : [ascii ? "-" : "◐", "Sidebar.Dim"]
+      : n.link.state === "waiting"
+        ? [ascii ? "!" : "◍", pulseHl("Status.Pending")]
+        : n.link.state === "down"
+          ? [ascii ? "-" : "○", "Sidebar.Dim"]
+          : [spinnerFrame(), "Status.Streaming"];
+    out.push({
+      label: n.info.name,
+      // The prefix on every row, so the syntax is learned by reading rather than by being told.
+      detail: `${state}   ${hostPrefix(n)}:`,
+      keywords: `${n.info.id} ${n.info.os} computer machine remote host ${hostPrefix(n)}`,
+      icon,
+      hl,
+      value: usable
+        ? { kind: "machine", node: n.info.id, name: hostPrefix(n) }
+        // Nothing to go into, so `↵` says why rather than opening an empty list — and stays here,
+        // because being told a machine is not ready is not a reason to lose the list you were in.
+        : { kind: "unreachable", name: n.info.name, why: state },
+    });
+  }
+  return out;
+}
+
+/** One machine's directories, once you are inside it. */
+function projectRows(node: SwarmNode, ascii: boolean): PickerItem<Where>[] {
+  const prefix = hostPrefix(node);
+  return node.capabilities.projects.map((p) => ({
+    // The prefixed path, because `<Tab>` puts a row's *label* back in the field and a bare name
+    // would take the field somewhere that is not a directory on any machine.
+    label: `${prefix}:${p.cwd}`,
+    detail: [
+      p.name,
+      p.sessions > 0
+        ? `${p.sessions} ${p.sessions === 1 ? "conversation" : "conversations"}`
+        : "nothing open",
+      p.running > 0 ? `${p.running} working` : "",
+    ].filter(Boolean).join("  ·  "),
+    keywords: `${p.name} ${p.key} remote`,
+    // Filled when somebody is working in it, hollow when nobody is. The one thing the flag could
+    // not say while every project on the list was one with a conversation in it.
+    icon: p.active ? (ascii ? "*" : "●") : (ascii ? "-" : "○"),
+    hl: p.active ? "Diagnostic.Ok" : "Sidebar.Dim",
+    value: {
+      kind: "host" as const,
+      node: node.info.id,
+      cwd: p.cwd,
+      label: `${p.name} on ${node.info.name}`,
+    },
+  }));
+}
+
+/**
+ * The one question both `^N` and `^O` ask: which directory, on which computer.
+ *
+ * A picker whose filter line **is** the field. Type nothing and it is the menu the caller passed;
+ * type `/`, `~` or `./` and it is a directory completer; type `linux-box:` and it is a directory
+ * completer pointed at that machine. Nothing has to be navigated to first, which was the whole
+ * complaint: the path was a row at the bottom of a list, under an unbounded number of worktrees,
+ * and reaching it meant arrowing past everything the program had ever been told about.
+ *
+ * `<Tab>` walks into the highlighted directory and `↵` takes it, which is `pathPicker`'s bargain
+ * and is why a completion row's label has to be the whole path.
+ *
+ * Choosing a machine reopens this seeded with `<machine>:` rather than descending in place: the
+ * picker owns its own filter line, and a second level whose rows lie about what is in the field is
+ * a `<Tab>` that jumps somewhere nobody asked for.
+ */
+async function whereTo(
+  neosh: Neosh,
+  base: PickerItem<Where>[],
+  opts: { title: string; seed?: string },
+): Promise<Where | null> {
+  const ascii = (await neosh.opt.get<boolean>("ui.ascii_only").catch(() => false)) ?? false;
+  let seed = opts.seed ?? "";
+
+  /**
+   * The machines, and the rows built from them. Reread rather than captured, because the list is
+   * live: a peer connecting, or gaining a project, while this is open has to change the rows under
+   * the cursor. Captured once, `subscribe` would re-rank the same stale array for ever and the
+   * subscription would be a promise the picker was not keeping.
+   */
+  let nodes: SwarmNode[] = [];
+  // Mutated in place, never reassigned: `reload` re-ranks the very array the picker was handed,
+  // so a fresh array here would be a list that never caught up with anything.
+  const rows: PickerItem<Where>[] = [];
+  const refill = async () => {
+    const me = (await neosh.swarm.self().catch(() => null))?.id ?? null;
+    // This machine is in `nodes()` like any other — a fleet plugin walking the list reaches its
+    // own node, which is deliberate — and it is the one row that must not be here: every other row
+    // in this picker already means "on this computer", and `mymac:/tmp` would otherwise start a
+    // local conversation by the remote path and then try to *watch* it over a socket to ourselves.
+    nodes = (await neosh.swarm.nodes().catch(() => [] as SwarmNode[]))
+      .filter((n) => n.info.id !== me);
+    // No `Add a computer…` row, deliberately. The swarm is on by default, so on every
+    // single-machine workspace — which is most of them — that row would be a permanent line in a
+    // menu pressed many times a day, about a thing its reader is not doing. It is the archive-count
+    // argument one panel along. This picker lists the computers you *have*; getting one is `^J`,
+    // which has a key of its own and a line in the legend.
+    const machines = machineRows(nodes, ascii);
+    rows.splice(0, rows.length, ...base, ...machines);
+    return machines.length > 0;
+  };
+
+  for (;;) {
+    const anyMachines = await refill();
+
+    const chosen = await picker<Where>(neosh, rows, {
+      title: opts.title,
+      width: 84,
+      height: 14,
+      query: seed,
+      placeholder: "nothing matches — <CR> takes the path you typed",
+      hints: anyMachines
+        ? "↵ choose   ⇥ into a directory   / a path   name: another computer"
+        : "↵ choose   ⇥ into a directory   / or ~ for a path",
+      source: async (query) => {
+        const field = readField(query, nodes);
+        if (field.kind === "rows") {
+          // Our own ranking, because a `source` replaces the picker's filtering wholesale. Same
+          // fuzzy scorer the picker uses, over the same label-and-keywords, so a query that is not
+          // a path behaves exactly as it would with no source at all.
+          if (query.trim() === "") return rows;
+          return rows
+            .map((item) => ({ item, m: fuzzy(`${item.label} ${item.keywords ?? ""}`, query) }))
+            .filter((r): r is { item: PickerItem<Where>; m: Match } => r.m !== null)
+            .sort((a, b) => b.m.score - a.m.score)
+            .map((r) => r.item);
+        }
+        if (field.kind === "local") {
+          const paths = await neosh.path.complete(field.path).catch(() => []);
+          return paths.map((path) => ({
+            label: path,
+            icon: ascii ? ">" : "▸",
+            hl: "Sidebar.Dim",
+            value: { kind: "elsewhere" as const, path },
+          }));
+        }
+        const prefix = hostPrefix(field.node);
+        // Nothing typed after the colon: what that machine offers, which is a short list of real
+        // places rather than the contents of `/`. Typing on turns it into a directory listing.
+        //
+        // A machine with nothing on that list falls through to its home directory rather than
+        // showing an empty one — a computer you have just paired has never had a project on it,
+        // and "no rows" is the answer least likely to be read as "and here is where to start".
+        const offered = field.path === "" ? projectRows(field.node, ascii) : [];
+        if (offered.length > 0) return offered;
+        const paths = await neosh.swarm
+          .browse(field.node.info.id, field.path === "" ? "~/" : field.path)
+          .catch((e) => {
+            // A peer that went away mid-keystroke, or one too old to answer. Said out loud rather
+            // than drawn as an empty directory, which is the one reading that is never true.
+            neosh.notify(String(e), "warn");
+            return [] as string[];
+          });
+        return paths.map((path) => ({
+          label: `${prefix}:${path}`,
+          detail: field.node.info.name,
+          icon: ascii ? ">" : "▸",
+          hl: "Sidebar.Remote",
+          value: {
+            kind: "host" as const,
+            node: field.node.info.id,
+            cwd: path,
+            label: `${path} on ${field.node.info.name}`,
+          },
+        }));
+      },
+      // What `↵` means when the field holds something no row offered — which for a directory you
+      // know the name of is the ordinary case, not the exception.
+      freeform: (query) => {
+        const field = readField(query, nodes);
+        if (field.kind === "local") return { kind: "elsewhere", path: query.trim() };
+        if (field.kind === "remote" && field.path.trim() !== "") {
+          return {
+            kind: "host",
+            node: field.node.info.id,
+            cwd: field.path.trim(),
+            label: `${field.path.trim()} on ${field.node.info.name}`,
+          };
+        }
+        return null;
+      },
+      // A machine connecting, or gaining a project, while the list is open. Same reason the
+      // computers panel subscribes: a row that only changes on the next press is a row that was
+      // wrong when it was read. `refill` first, or the reload re-ranks the same stale array.
+      subscribe: (reload) => neosh.swarm.onChange(() => void refill().then(reload)),
+    });
+
+    if (chosen === null) return null;
+    if (chosen.kind === "machine") {
+      // Back into the same picker with the machine's prefix already typed, which is exactly the
+      // state somebody would have reached by typing it — so the two routes cannot diverge.
+      seed = `${chosen.name}:`;
+      continue;
+    }
+    if (chosen.kind === "unreachable") {
+      neosh.notify(`${chosen.name}: ${chosen.why}`, "info");
+      seed = "";
+      continue;
+    }
+    return chosen;
+  }
+}
+
+/** Start a conversation on another machine, and go and look at it. */
+async function startThere(
+  neosh: Neosh,
+  chosen: { node: string; cwd: string; label: string },
+): Promise<void> {
+  // Started *there*. The agent runs on that machine, against that machine's files, which is the
+  // point — this is not a way to work on a remote directory from here.
+  try {
+    const session = await neosh.swarm.command(chosen.node, "", {
+      command: "new_session",
+      cwd: chosen.cwd,
+      title: null,
+    });
+    // Opened, not merely reported. Starting a conversation here switches to it, and one started
+    // over there that only produced a toast was the same key doing visibly less for the same
+    // intention — you had to go and find, in `^J`, the thing you had just made.
+    if (session) {
+      await neosh.cmd.exec("swarm.open", [chosen.node, session]).catch(() => {});
       return;
-    case "elsewhere":
-      await neosh.cmd.exec("project.open").catch(() => {});
+    }
+    neosh.notify(`started ${chosen.label}`);
+  } catch (e) {
+    neosh.notify(String(e), "warn");
   }
 }
 
@@ -1844,12 +2153,22 @@ function owningProject(target: Target | undefined): string | null {
 }
 
 /**
- * Which directory to add.
+ * Which directory to add — here, or on another computer.
  *
- * Offers the worktrees of the repository you are in before asking you to type, because that is
- * where the next project usually is and a path typed from memory is a path typed wrong. The
- * runtime has no filesystem, so there is no directory browser to offer — the last entry drops
- * through to a text field, which the host validates.
+ * **The path is the first thing now, not the last.** This was a list of the current repository's
+ * worktrees with `Type a path…` under it, and a path is what somebody pressing this key almost
+ * always has: the row they wanted sat at the bottom of a list they had to read to the end of every
+ * time, and the list was of the one place they were already in. So the filter line *is* the path
+ * field from the first keystroke — `/`, `~` and `./` complete directories as you go — and the
+ * worktrees are suggestions under it rather than a menu in front of it.
+ *
+ * And the machines are on it, because "add a project" never had a reason to mean "on this
+ * computer". `linux-box:` completes over there and `↵` starts the conversation there; the row for
+ * it arrives in the panel the way every other remote conversation's does.
+ *
+ * Answers `null` for anything that was not a local directory — including a remote one, which has
+ * been acted on by then. The caller's job is to open a path here, and a path on somebody else's
+ * disk is not one.
  */
 async function chooseDirectory(neosh: Neosh): Promise<string | null> {
   const [worktrees, sessions] = await Promise.all([
@@ -1857,25 +2176,30 @@ async function chooseDirectory(neosh: Neosh): Promise<string | null> {
     neosh.session.list().catch(() => [] as SessionInfo[]),
   ]);
   const open = new Set(sessions.map((s) => s.cwd));
-  const candidates = worktrees.filter((t) => !open.has(t.path));
-  if (candidates.length === 0) return pathPicker(neosh, "Add project");
 
-  const TYPE = "\u0000type";
-  const chosen = await picker(
-    neosh,
-    [
-      ...candidates.map((t) => ({
-        label: basename(t.path),
-        detail: [t.branch ?? "", t.path].filter(Boolean).join("  ·  "),
-        keywords: t.path,
-        value: t.path,
-      })),
-      { label: "Type a path…", value: TYPE },
-    ],
-    { title: "Add project", width: 76 },
-  );
+  const rows: PickerItem<Where>[] = [elsewhereRow("Type a path…")];
+  for (const t of worktrees.filter((w) => !open.has(w.path))) {
+    rows.push({
+      // The path, not the basename: `<Tab>` puts a row's label back in the field, and a bare
+      // directory name there is a path relative to somewhere nobody chose.
+      label: t.path,
+      detail: [basename(t.path), t.branch ?? ""].filter(Boolean).join("  ·  "),
+      keywords: `${basename(t.path)} worktree`,
+      icon: "⎇",
+      hl: "Git.Branch",
+      value: { kind: "elsewhere", path: t.path },
+    });
+  }
+
+  const chosen = await whereTo(neosh, rows, { title: "Add project" });
   if (chosen === null) return null;
-  return chosen === TYPE ? pathPicker(neosh, "Add project") : chosen;
+  if (chosen.kind === "host") {
+    await startThere(neosh, chosen);
+    return null;
+  }
+  if (chosen.kind !== "elsewhere") return null;
+  // Chosen from the menu rather than typed: that row means "ask me", and this is the asking.
+  return chosen.path ?? (await pathPicker(neosh, "Add project"));
 }
 
 /**
