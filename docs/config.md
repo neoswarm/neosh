@@ -996,10 +996,10 @@ right.
 Model                                                              ⇧⇥ providers
 > 
  PLANS                  │ ❯ Claude Opus 5         Frontier  Most capable for complex work
-  ✳ Claude            ✓ │   Claude Fable 5        Frontier  Long-form writing and voice
+  ✳ Claude            ✓ │   Claude Fable 5.1      Frontier  Deepest reasoning and long-running work
   ⬢ Codex             ✓ │   Claude Sonnet 5       Balanced  Best for everyday tasks
  API KEYS               │   Claude Haiku 4.5      Fast      Fastest, for quick answers
-  ✳ Anthropic         ! │   ▸ 5 superseded
+  ✳ Anthropic         ! │   ▸ 6 superseded
  LOCAL                  │
   ▲ Ollama              │
 ────────────────────────┴──────────────────────────────────────────────────────────
