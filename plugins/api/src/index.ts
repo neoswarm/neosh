@@ -1727,8 +1727,15 @@ export interface PathApi {
    *
    * `~` expands against the home directory. A prefix with no `/` completes against the active
    * conversation's directory, which is what someone typing `src` means.
+   *
+   * `denied` is set when the list is empty *because the operating system refused*, rather than
+   * because nothing matched. The two are the same empty array and they are not the same answer:
+   * macOS grants folder access to the **terminal**, so `~/Documents` full of projects reads as
+   * empty until somebody ticks a box, and a field that draws "no directory matches" over that
+   * sends people to go and check a path that was right all along. When it is set it says which
+   * folder, which application and which System Settings pane, and it is meant to be shown.
    */
-  complete(prefix: string): Promise<string[]>;
+  complete(prefix: string): Promise<{ paths: string[]; denied?: string }>;
 }
 
 export interface TimerApi {
@@ -2000,7 +2007,8 @@ function build(
     },
     path: {
       async complete(prefix) {
-        return expect(await c({ call: "path_complete", prefix }), "paths").paths;
+        const answer = expect(await c({ call: "path_complete", prefix }), "paths");
+        return { paths: answer.paths, denied: answer.denied ?? undefined };
       },
     },
     state: {

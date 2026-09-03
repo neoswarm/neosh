@@ -3463,6 +3463,44 @@ fn typing_a_path_offers_the_directories_that_match_it() {
 }
 
 #[test]
+fn a_directory_the_system_refuses_says_so_rather_than_reading_as_empty() {
+    use std::os::unix::fs::PermissionsExt;
+
+    // Nothing there and not allowed to look are the same empty list, and they are not the same
+    // answer. macOS is where this bites hardest — the privacy layer grants folder access to the
+    // *terminal*, so `~/Documents` full of projects reads as empty until somebody ticks a box, and
+    // a field drawing "no directory matches" over that sends people off to check a path that was
+    // right all along. TCC is not something a test can arrange; mode bits reach the same code by
+    // the same route, and which of the two sentences comes out is `access.rs`'s own unit tests.
+    let sb = Sandbox::new("pathdenied");
+    let shut = sb.work().join("shut");
+    std::fs::create_dir_all(&shut).expect("mkdir");
+    std::fs::set_permissions(&shut, std::fs::Permissions::from_mode(0o000)).expect("chmod");
+
+    // As root the mode bits are advisory, so there would be nothing here to refuse.
+    if std::fs::read_dir(&shut).is_ok() {
+        let _ = std::fs::set_permissions(&shut, std::fs::Permissions::from_mode(0o755));
+        return;
+    }
+
+    let mut s = sb.start();
+    s.wait_for("PROJECTS");
+    s.send(&command("project.open"));
+    assert!(s.pump(|s| !s.float_named("[Add project").is_empty()), "the field opened");
+
+    for c in shut.display().to_string().chars() {
+        s.key(&c.to_string());
+    }
+    s.key("/");
+
+    let said = s.pump(|s| s.saw("no permission to read"));
+    // Put the bits back before asserting: a failure must not leave the sandbox holding a directory
+    // its own cleanup cannot remove.
+    let _ = std::fs::set_permissions(&shut, std::fs::Permissions::from_mode(0o755));
+    assert!(said, "the refusal is on screen rather than an empty list");
+}
+
+#[test]
 fn tab_takes_the_highlighted_completion_into_the_field() {
     let sb = Sandbox::new("pathtab");
     std::fs::create_dir_all(sb.work().join("alpha")).expect("mkdir");

@@ -2375,6 +2375,7 @@ impl Host {
                     .iter()
                     .map(|p| p.display().to_string())
                     .collect(),
+                denied: None,
             }),
             other => Err(ApiError::Internal {
                 message: format!("unroutable call: {other:?}"),
@@ -3546,7 +3547,14 @@ impl Host {
         let svc = self.services(&PluginId::from(BUILTIN));
         tokio::spawn(async move {
             let result = match svc.path_complete(prefix).await {
-                Ok(ApiOk::Paths { paths }) => Ok(paths),
+                // A directory the *far* machine was not allowed to read comes back as a refusal
+                // rather than as an empty listing, so browsing somebody else's Mac says what went
+                // wrong instead of drawing a home directory with nothing in it. `Refusal::Failed`
+                // already travels, so this costs no wire change and no version bump.
+                Ok(ApiOk::Paths { denied: Some(message), .. }) => {
+                    Err(neosh_proto::Refusal::Failed { message })
+                }
+                Ok(ApiOk::Paths { paths, .. }) => Ok(paths),
                 Ok(_) => Ok(Vec::new()),
                 Err(e) => Err(neosh_proto::Refusal::Failed { message: format!("{e:?}") }),
             };
@@ -4098,7 +4106,7 @@ impl Host {
         } else if browsing {
             // A `Browsed` settles through `on_swarm_browsed`; reaching here with `ok` means the
             // peer answered a directory listing with a bare `Ack`, which no version of it does.
-            Ok(ApiOk::Paths { paths: Vec::new() })
+            Ok(ApiOk::Paths { paths: Vec::new(), denied: None })
         } else {
             Ok(ApiOk::SwarmCommanded { session })
         };
@@ -4110,7 +4118,7 @@ impl Host {
         let Some(waiting) = self.swarm_pending.remove(id) else { return };
         self.swarm_browsing.remove(id);
         self.answer_swarm(waiting, match result {
-            Ok(paths) => Ok(ApiOk::Paths { paths }),
+            Ok(paths) => Ok(ApiOk::Paths { paths, denied: None }),
             Err(reason) => Err(ApiError::Denied { reason }),
         });
     }
