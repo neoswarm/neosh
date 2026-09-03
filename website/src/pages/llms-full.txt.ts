@@ -1,6 +1,4 @@
 import type { APIRoute } from "astro";
-import { readFileSync } from "node:fs";
-import { fileURLToPath } from "node:url";
 import { flatDocs } from "../data/docs";
 
 // The whole corpus in one file, regenerated on every build from the same
@@ -12,9 +10,32 @@ const websitePages = import.meta.glob("./docs/*.md", {
   eager: true,
 }) as Record<string, string>;
 
-// This file lives at website/src/pages/, so the repository root is three up.
-const repo = (p: string) =>
-  readFileSync(fileURLToPath(new URL(`../../../${p}`, import.meta.url)), "utf-8");
+// Read through `import.meta.glob` rather than `readFileSync` off
+// `import.meta.url`. A glob is resolved by the bundler against *this source
+// file* and inlined, so it means the same thing wherever the compiled chunk
+// ends up; `import.meta.url` means the chunk, which since Astro 7 prerenders
+// from `dist/.prerender/chunks/` — three levels up from there is
+// `website/docs/`, a directory that does not exist, and the build died on it.
+const repoFiles = {
+  ...import.meta.glob("../../../docs/*.md", {
+    query: "?raw",
+    import: "default",
+    eager: true,
+  }),
+  ...import.meta.glob("../../../plugins/api/src/*.ts", {
+    query: "?raw",
+    import: "default",
+    eager: true,
+  }),
+} as Record<string, string>;
+
+const repo = (p: string) => {
+  const text = repoFiles[`../../../${p}`];
+  // A missing key is a path that was renamed, and silently dropping it would
+  // leave the corpus quietly short of a whole guide.
+  if (text === undefined) throw new Error(`llms-full.txt: no such repository file: ${p}`);
+  return text;
+};
 
 const stripFrontmatter = (md: string) =>
   md.replace(/^---\n[\s\S]*?\n---\n/, "");
