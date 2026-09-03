@@ -1705,8 +1705,29 @@ export interface SwarmApi {
    * with the owner's reason when it says no. A node may refuse anything; `NodeCapabilities` on its
    * {@link SwarmNode} says in advance what it is likely to accept, so a menu can grey out a verb
    * rather than offering one that will bounce.
+   *
+   * Answers with the conversation a `new_session` created, and `null` for everything else — which
+   * is what makes starting something over there a place you can then go: pass it to
+   * {@link subscribe}, or to `swarm.open`, without waiting for the next inventory to notice it.
    */
-  command(node: NodeId, session: string, command: AgentCommand): Promise<void>;
+  command(node: NodeId, session: string, command: AgentCommand): Promise<string | null>;
+  /**
+   * Which directories on another machine start with `prefix` — `path.complete`, asked over there.
+   *
+   * The same answers in the same shape as the local one: each entry as you would have typed it,
+   * trailing separator and all, so a single field can complete against either machine and the only
+   * thing that changes is which one is asked. Directory names only.
+   *
+   * {@link NodeCapabilities.projects} is what a machine *offers*, and it is the short list of
+   * places it already works in; this is how you reach the directory over there that neither machine
+   * has ever opened. Rejects when the peer is not connected, when it does not accept commands, and
+   * when it is running a neosh too old to have heard of the question — the message says which, and
+   * an empty list is a directory with nothing in it rather than a failure.
+   *
+   * Passing this machine's own node id answers locally, so a picker that walks `nodes()` needs no
+   * special case for the row that is itself.
+   */
+  browse(node: NodeId, prefix?: string): Promise<string[]>;
   /**
    * Watch a remote conversation: its history now, then everything as it happens, delivered to
    * {@link onStream}.
@@ -1799,8 +1820,15 @@ export interface PathApi {
    *
    * `~` expands against the home directory. A prefix with no `/` completes against the active
    * conversation's directory, which is what someone typing `src` means.
+   *
+   * `denied` is set when the list is empty *because the operating system refused*, rather than
+   * because nothing matched. The two are the same empty array and they are not the same answer:
+   * macOS grants folder access to the **terminal**, so `~/Documents` full of projects reads as
+   * empty until somebody ticks a box, and a field that draws "no directory matches" over that
+   * sends people to go and check a path that was right all along. When it is set it says which
+   * folder, which application and which System Settings pane, and it is meant to be shown.
    */
-  complete(prefix: string): Promise<string[]>;
+  complete(prefix: string): Promise<{ paths: string[]; denied?: string }>;
 }
 
 export interface TimerApi {
@@ -2072,7 +2100,8 @@ function build(
     },
     path: {
       async complete(prefix) {
-        return expect(await c({ call: "path_complete", prefix }), "paths").paths;
+        const answer = expect(await c({ call: "path_complete", prefix }), "paths");
+        return { paths: answer.paths, denied: answer.denied ?? undefined };
       },
     },
     state: {
@@ -2173,7 +2202,13 @@ function build(
         return expect(await c({ call: "swarm_hosts_of", project }), "names").names;
       },
       async command(node, session, command) {
-        await c({ call: "swarm_command", node, session, command });
+        const done = await c({ call: "swarm_command", node, session, command });
+        // Only `new_session` says anything, so an `ok` of any other shape is an older peer
+        // answering a command that had nothing to report — which is a success, not a mismatch.
+        return done.ok === "swarm_commanded" ? done.session ?? null : null;
+      },
+      async browse(node, prefix) {
+        return expect(await c({ call: "swarm_browse", node, prefix: prefix ?? "" }), "paths").paths;
       },
       async subscribe(node, session) {
         await c({ call: "swarm_subscribe", node, session });

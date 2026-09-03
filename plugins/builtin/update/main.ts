@@ -26,14 +26,24 @@ export async function activate({ neosh, subscriptions }: PluginContext) {
   /** What is drawn, so a tick that changes nothing is not a round trip. */
   let drawn: string | null = null;
 
-  /** What the row says, given what the host worked out. `null` when there is nothing to say. */
+  /**
+   * What the row says, given what the host worked out. `null` when there is nothing to say.
+   *
+   * The right-hand hint is the *command*, not `↵`. `↵` is true — the cursor can land here and open
+   * it — but it is true the way every row in the panel is true, and it was the only thing the row
+   * ever said about how to update. Reaching it means knowing the sidebar has to be focused before
+   * `j` does anything (`^T`), then that `G` skips a workspace's worth of conversations to get to a
+   * strip pinned at the bottom. Three facts, none of them on screen, to press a key that is already
+   * two characters from the composer somebody is sitting in. So the row advertises the way in that
+   * needs no navigation at all, and stays openable for anybody who is passing.
+   */
   const rowFor = (s: UpdateStatus) => {
     if (s.restart_pending) {
       return {
         text: `restart for ${s.latest ?? "the update"}`,
         hl: "Status.Pending",
-        right: { text: "↵", hl: "Comment" },
-        command: `${NS}.restart`,
+        right: { text: "/update", hl: "Comment" },
+        command: NS,
       };
     }
     if (!s.behind || !s.latest) return null;
@@ -42,8 +52,8 @@ export async function activate({ neosh, subscriptions }: PluginContext) {
     return {
       text: `neosh ${s.latest} available`,
       hl: "Status.Unread",
-      right: { text: "↵", hl: "Comment" },
-      command: `${NS}.apply`,
+      right: { text: "/update", hl: "Comment" },
+      command: NS,
     };
   };
 
@@ -73,12 +83,40 @@ export async function activate({ neosh, subscriptions }: PluginContext) {
       await neosh.alert(
         `neosh ${status.latest}`,
         status.self_updatable
-          ? "A new version is out. Update from the sidebar, or run update.apply."
+          // The thing to type, in a notification that may well be read on a phone. "Update from the
+          // sidebar" is an instruction to go and find something; this is the instruction.
+          ? "A new version is out. Type /update in the chat."
           : `A new version is out. Update with: ${status.upgrade_command ?? "your package manager"}`,
         { level: "info" },
       ).catch(() => {});
     }
   };
+
+  // `/update` — the whole verb, and the one to tell people about.
+  //
+  // The three below are the *pieces*: check, apply, restart. Naming them was right and advertising
+  // them was not, because "update neosh" is one intention and a menu of three is a question about
+  // internal state — which of them applies depends on whether a check has run, whether a download
+  // has happened, and whether a restart is owed, none of which anybody tracks. Typing `/update`
+  // used to match all three and pick none, so the answer to "how do I update" was a list.
+  //
+  // Registered under the bare namespace so the slash menu, which matches on name and scores an
+  // exact prefix by length, puts it above the three it is made of.
+  subscriptions.push(
+    await neosh.cmd.register(NS, async () => {
+      // Forced, because this is somebody asking *now*: the six-hourly poll may be five hours stale
+      // and "you are on the newest" from a cache is the one answer this must not give wrongly.
+      const s = await neosh.update.check(true).catch(() => null);
+      if (!s) return neosh.notify("Could not check for updates", "warn");
+      if (s.error) return neosh.notify(`Update check failed: ${s.error}`, "warn");
+      // Finish what is already half done before starting anything new. A downloaded update that is
+      // waiting on a restart is not a workspace that needs another download.
+      if (s.restart_pending) return neosh.cmd.exec(`${NS}.restart`);
+      if (s.behind) return neosh.cmd.exec(`${NS}.apply`);
+      await refresh(true);
+      return neosh.notify(`neosh ${s.current} is the newest`, "info");
+    }, { desc: "Update neosh" }),
+  );
 
   subscriptions.push(
     await neosh.cmd.register(`${NS}.check`, async () => {

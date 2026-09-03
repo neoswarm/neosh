@@ -82,7 +82,7 @@ export type ApiOk =
   | { "ok": "focused_win"; win: WindowId | null }
   | { "ok": "option"; entry: OptionEntry | null }
   | { "ok": "options"; options: Array<OptionEntry> }
-  | { "ok": "paths"; paths: Array<string> }
+  | { "ok": "paths"; paths: Array<string>; denied?: string | null }
   | { "ok": "viewport"; viewport: Viewport | null }
   | { "ok": "sessions"; sessions: Array<SessionInfo> }
   | { "ok": "credentials"; credentials: Array<CredentialInfo> }
@@ -113,6 +113,7 @@ export type ApiOk =
   | { "ok": "swarm_nodes"; nodes: Array<SwarmNode> }
   | { "ok": "swarm_agents"; agents: Array<SwarmAgent> }
   | { "ok": "swarm_strangers"; strangers: Array<SwarmStranger> }
+  | { "ok": "swarm_commanded"; session?: SessionId | null }
   | { "ok": "quotas"; quotas: Array<QuotaSnapshot> }
   | { "ok": "quota_history"; samples: Array<QuotaSample> }
   | { "ok": "usage_history"; history: UsageHistory }

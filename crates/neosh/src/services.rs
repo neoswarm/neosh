@@ -144,7 +144,18 @@ impl Services {
             let partial = partial.to_string();
             move || {
                 let mut out: Vec<String> = Vec::new();
-                let Ok(entries) = std::fs::read_dir(&base) else { return out };
+                // The failure is classified rather than swallowed. A `read_dir` that comes back
+                // `EPERM` on macOS is the privacy layer refusing the *terminal*, and reporting it
+                // as an empty directory is how a path field ends up saying "no directory matches"
+                // about a folder that is full of them. See `crate::access`.
+                let entries = match std::fs::read_dir(&base) {
+                    Ok(entries) => entries,
+                    Err(e) => {
+                        let why = crate::access::refused(&e, &base)
+                            .map(|r| r.sentence(&base.display().to_string()));
+                        return (out, why);
+                    }
+                };
                 for entry in entries.flatten() {
                     let name = entry.file_name().to_string_lossy().to_string();
                     // A leading dot is only offered once you have typed one — otherwise every
@@ -165,11 +176,12 @@ impl Services {
                 }
                 out.sort();
                 out.truncate(LIMIT);
-                out
+                (out, None)
             }
         })
         .await
         .unwrap_or_default();
+        let (read, denied) = read;
 
         // Returned as what you would have typed, so a caller can put the answer straight back in
         // the field. The trailing slash is what makes pressing Tab twice descend.
@@ -183,7 +195,7 @@ impl Services {
                 }
             })
             .collect();
-        Ok(ApiOk::Paths { paths })
+        Ok(ApiOk::Paths { paths, denied })
     }
 
     pub async fn git_status(&self, cwd: Option<String>) -> ApiResult {

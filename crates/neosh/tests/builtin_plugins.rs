@@ -461,6 +461,47 @@ fn the_sidebar_toggles_and_the_second_toggle_puts_it_back() {
     assert!(s.pump(|s| !s.windows_for(buf).is_empty()), "reopens\n{}", s.transcript());
 }
 
+/// Reloading the configuration must leave one sidebar, not two.
+///
+/// `^R` unloads the plugin and loads it again. The reloaded copy asks for a panel per terminal —
+/// `view.onOpen` fires for the ones already here — but nothing took the old copy's column off the
+/// screen: the panel's `dispose` deliberately does not close a window, because its only caller was
+/// a terminal that had already gone and taken its windows with it, and on this path nothing called
+/// `dispose` at all. So the workspace got a second sidebar beside the first, and the first was
+/// drawn by code that no longer existed and answered no keys.
+///
+/// Counted across *every* `[sidebar]` buffer rather than the first one, because the whole symptom
+/// is a second buffer with a second window on it — a test that looked at one buffer would have
+/// been perfectly happy.
+#[test]
+fn reloading_the_config_leaves_one_sidebar_rather_than_two() {
+    let sb = Sandbox::new("reload-dup");
+    let mut s = sb.start();
+    s.wait_for("PROJECTS");
+    let before: usize =
+        s.buffers_named("[sidebar]").iter().map(|b| s.windows_for(*b).len()).sum();
+    assert_eq!(before, 1, "one to start with\n{}", s.transcript());
+
+    s.send(&command("config.reload"));
+    // The panel has to come back — a reload that closed the old column and never opened a new one
+    // would pass a naive "not two" assertion while leaving somebody with no sidebar at all.
+    assert!(
+        s.pump(|s| {
+            let open: usize =
+                s.buffers_named("[sidebar]").iter().map(|b| s.windows_for(*b).len()).sum();
+            open == 1 && s.buffers_named("[sidebar]").len() > 1
+        }),
+        "one sidebar after the reload, on a freshly built panel\n{}",
+        s.transcript()
+    );
+
+    // And it settles there: the old window is closed rather than merely drawn over, so nothing
+    // arrives a moment later to make it two again.
+    s.drain_for(Duration::from_secs(2));
+    let after: usize = s.buffers_named("[sidebar]").iter().map(|b| s.windows_for(*b).len()).sum();
+    assert_eq!(after, 1, "still one\n{}", s.transcript());
+}
+
 #[test]
 fn the_sidebar_stays_shut_when_config_says_so() {
     let sb = Sandbox::new("closed");
@@ -2232,6 +2273,63 @@ fn a_new_conversation_in_a_repository_offers_a_worktree() {
     );
 }
 
+/// Somewhere else sits above the worktrees, and says the field completes paths.
+///
+/// The list of trees is unbounded and the verb under it was therefore at a distance that grew with
+/// how long you had used the program: "I can't go down in the sidebar for it" is the same complaint
+/// one panel along. It is also the row that tells you the filter line *is* a path field, and a
+/// sentence about how to type is no use once you have scrolled past it looking for somewhere to
+/// type.
+#[test]
+fn somewhere_else_is_above_the_worktrees_rather_than_under_them() {
+    if !have_git() {
+        return;
+    }
+    let sb = Sandbox::new("newwhereorder");
+    sb.git_init();
+    let mut s = sb.start();
+    s.wait_for("PROJECTS");
+    s.ctrl("n");
+    assert!(s.pump(|s| !s.picker_named("[New conversation]").is_empty()), "the picker opened");
+
+    let rows = s.picker_named("[New conversation]");
+    let elsewhere = rows.iter().position(|l| l.contains("Another directory"));
+    let trees = rows.iter().position(|l| l.contains("worktree  ·  "));
+    assert!(elsewhere.is_some(), "somewhere else is offered\n{rows:?}");
+    // Only meaningful when there is a tree to be above; without one the row's position is not in
+    // question and asserting on it would be asserting on nothing.
+    if let (Some(e), Some(t)) = (elsewhere, trees) {
+        assert!(e < t, "somewhere else comes first\n{rows:?}");
+    }
+    assert!(
+        rows.iter().any(|l| l.contains("type a path")),
+        "and it says the field takes one\n{rows:?}"
+    );
+}
+
+/// `^O` lands in the path field, rather than in a menu with the path field at the bottom of it.
+///
+/// This used to be the current repository's worktrees with `Type a path…` under them — a list of
+/// the one place you were already in, which you had to read to the end of every time to reach the
+/// thing you almost always wanted. The row is first now, and it is a fallback rather than the
+/// route: typing a path is what the field does from the first keystroke.
+#[test]
+fn add_project_puts_the_path_first() {
+    let sb = Sandbox::new("addfirst");
+    let mut s = sb.start();
+    s.wait_for("PROJECTS");
+
+    s.send(&command("project.open"));
+    // The float, not the sidebar's `+ Add project` row — which is on screen from the start and
+    // would let this assert before anything opened.
+    assert!(s.pump(|s| !s.float_named("[Add project").is_empty()), "the field opened");
+
+    let rows = s.float_named("[Add project");
+    // The title, then the filter line, then the rows — so the first row is the third line.
+    let first = rows.iter().skip(2).find(|l| !l.trim().is_empty()).cloned().unwrap_or_default();
+    assert!(first.contains("Type a path"), "the path is the first row\n{rows:?}");
+}
+
 /// The trees it offers under "an existing one" are the ones on the panel's list, not every
 /// checkout `git worktree list` can see.
 ///
@@ -3362,6 +3460,44 @@ fn typing_a_path_offers_the_directories_that_match_it() {
         "both directories are offered\n{:?}",
         s.float_named("[Add project")
     );
+}
+
+#[test]
+fn a_directory_the_system_refuses_says_so_rather_than_reading_as_empty() {
+    use std::os::unix::fs::PermissionsExt;
+
+    // Nothing there and not allowed to look are the same empty list, and they are not the same
+    // answer. macOS is where this bites hardest — the privacy layer grants folder access to the
+    // *terminal*, so `~/Documents` full of projects reads as empty until somebody ticks a box, and
+    // a field drawing "no directory matches" over that sends people off to check a path that was
+    // right all along. TCC is not something a test can arrange; mode bits reach the same code by
+    // the same route, and which of the two sentences comes out is `access.rs`'s own unit tests.
+    let sb = Sandbox::new("pathdenied");
+    let shut = sb.work().join("shut");
+    std::fs::create_dir_all(&shut).expect("mkdir");
+    std::fs::set_permissions(&shut, std::fs::Permissions::from_mode(0o000)).expect("chmod");
+
+    // As root the mode bits are advisory, so there would be nothing here to refuse.
+    if std::fs::read_dir(&shut).is_ok() {
+        let _ = std::fs::set_permissions(&shut, std::fs::Permissions::from_mode(0o755));
+        return;
+    }
+
+    let mut s = sb.start();
+    s.wait_for("PROJECTS");
+    s.send(&command("project.open"));
+    assert!(s.pump(|s| !s.float_named("[Add project").is_empty()), "the field opened");
+
+    for c in shut.display().to_string().chars() {
+        s.key(&c.to_string());
+    }
+    s.key("/");
+
+    let said = s.pump(|s| s.saw("no permission to read"));
+    // Put the bits back before asserting: a failure must not leave the sandbox holding a directory
+    // its own cleanup cannot remove.
+    let _ = std::fs::set_permissions(&shut, std::fs::Permissions::from_mode(0o755));
+    assert!(said, "the refusal is on screen rather than an empty list");
 }
 
 #[test]
@@ -7553,8 +7689,12 @@ fn a_third_party_plugin_can_be_switched_off_from_config() {
     assert!(!s.saw("imports sidebar"), "the plugin should not have run\n{}", s.transcript());
 }
 
-/// A plugin puts a mark on a row the sidebar drew — the git plugin's dirty count on the project
+/// A plugin puts a mark on a row the sidebar drew — the git plugin's stat strip on the project
 /// row — without the sidebar knowing git exists. The badge sits after the name, in the row.
+///
+/// Two changes of two different kinds, because the strip counts them separately: a tracked file
+/// somebody edited is `~1` and a file git has never seen is `?1`. A single count could not tell
+/// them apart, which is the whole reason the badge is a run of parts rather than one.
 #[test]
 fn a_decoration_lands_on_the_project_row() {
     if !have_git() {
@@ -7565,7 +7705,38 @@ fn a_decoration_lands_on_the_project_row() {
     std::fs::write(sb.work().join("new.txt"), "x\n").expect("write");
     std::fs::write(sb.work().join("README.md"), "changed\n").expect("write");
     let mut s = sb.start();
-    s.wait_for("work ●2");
+    s.wait_for("work ~1 ?1");
+}
+
+/// The badge gives way before the name does.
+///
+/// A project name is what the row *is*; the strip is news about it. So in a column too narrow for
+/// both, the git plugin's `short` form — the worst single stat — is what gets drawn, and the name
+/// is left whole. Before this the badge took its columns first and the row read
+/// `neosh-websit… ↓3 ↑12 ~5 ?7`: four facts nobody asked for, bought with the one thing the panel
+/// exists to show.
+///
+/// At the narrowest the panel goes, which is where the rule has to hold if it holds anywhere.
+#[test]
+fn a_badge_gives_up_its_columns_before_the_name_is_clipped() {
+    if !have_git() {
+        return;
+    }
+    let sb = Sandbox::new("badge-yields");
+    sb.write_config("[options]\n\"sidebar.width\" = 16\n");
+    sb.git_init();
+    for i in 0..4 {
+        std::fs::write(sb.work().join(format!("u{i}.txt")), "x\n").expect("write");
+    }
+    std::fs::write(sb.work().join("README.md"), "changed\n").expect("write");
+    let mut s = sb.start();
+    // One tracked file edited and four git has never seen: `~1 ?4` in full, `~1` short. The row
+    // keeps its name and the head of the strip.
+    s.wait_for("work ~1");
+    s.drain_for(Duration::from_secs(2));
+    // The footer says the whole of it — it has the room — so this has to name the row rather than
+    // the count, or it asserts against the status bar instead of the panel.
+    assert!(!s.saw("work ~1 ?4"), "the row should not carry the full strip\n{}", s.transcript());
 }
 
 /// A third-party decoration: a badge on a conversation and a section anchored by name between

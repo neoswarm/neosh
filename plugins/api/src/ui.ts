@@ -1352,6 +1352,10 @@ export async function pathPicker(
   title: string,
   opts: { initial?: string; width?: number; height?: number } = {},
 ): Promise<string | null> {
+  // The last refusal said out loud, so a folder the OS is hiding is reported once rather than on
+  // every keystroke into it. `source` runs per character typed, and a notice per character is the
+  // same message forty times for one cause.
+  let saidDenied: string | null = null;
   return picker<string>(neosh, [], {
     title,
     width: Math.max(40, opts.width ?? 72),
@@ -1359,8 +1363,19 @@ export async function pathPicker(
     query: opts.initial ?? "",
     placeholder: "no directory matches — <CR> takes what you typed",
     source: async (query) => {
-      const paths = await neosh.path.complete(query).catch(() => []);
-      return paths.map((path) => ({ label: path, value: path }));
+      const answer = await neosh.path
+        .complete(query)
+        .catch(() => ({ paths: [] as string[], denied: undefined }));
+      // An empty list because nobody was allowed to look is not an empty directory, and the
+      // placeholder under this field can only say the second one. Said the way the remote branch
+      // of the same question says it — a notice, because it is feedback for a key you pressed.
+      if (answer.denied && answer.denied !== saidDenied) {
+        saidDenied = answer.denied;
+        neosh.notify(answer.denied, "warn");
+      } else if (!answer.denied) {
+        saidDenied = null;
+      }
+      return answer.paths.map((path) => ({ label: path, value: path }));
     },
     // What you typed, when it is not one of the offered rows. A completion list that refuses a path
     // it did not think of is a list that gets in the way.
@@ -2755,12 +2770,34 @@ export interface ActionItem {
   on?: string;
 }
 
+/** One coloured run of a badge. A part with no `hl` is the panel's own colour — a separator. */
+export interface BadgePart {
+  text: string;
+  hl?: string;
+}
+
+/**
+ * A mark after a row's name: one coloured run, or several.
+ *
+ * Several, because a badge is often several facts rather than one — `↓2` is not the same news as
+ * `~7`, and a strip of git stats drawn in one colour is a string you have to read rather than a
+ * row you can glance at. The single form stays because most badges *are* one fact.
+ *
+ * `short` is the same badge with less in it, for a row too narrow to carry all of it — the fewest
+ * parts still worth drawing, not a truncation. A panel is what knows how many columns there are;
+ * which fact to give up is the badge's to say, exactly as it is for a status segment. Absent means
+ * there is no shorter true version, and the full badge stands.
+ */
+export type BadgeSpec =
+  | { text: string; hl?: string }
+  | { parts: BadgePart[]; short?: BadgePart[] };
+
 /** A mark on a row a panel already draws, keyed by what the row is about. */
 export interface DecorationItem {
   /** The row it is about, in the panel's own terms: `{ project: cwd }`, `{ task: id }`. */
   target: Record<string, string>;
-  /** A short mark after the name, in `hl`. The name is clipped to make room. */
-  badge?: { text: string; hl?: string };
+  /** A short mark after the name. The name is clipped to make room. */
+  badge?: BadgeSpec;
   /** The row's highlight, when the panel has no opinion of its own. */
   hl?: string;
   /** The right-hand column, on a row that is not busy. */
@@ -2769,9 +2806,41 @@ export interface DecorationItem {
 
 /** Every decoration on one target, merged. */
 export interface Decoration {
-  badge?: { text: string; hl?: string };
+  /** `text` is every part run together — what a caller measuring the badge reads. */
+  badge?: { text: string; hl?: string; parts: BadgePart[]; short: BadgePart[] };
   hl?: string;
   right?: { text: string; hl?: string };
+}
+
+/** A badge in either form, as the run of parts the rest of this file works in. */
+function badgeParts(badge: BadgeSpec | undefined): BadgePart[] {
+  if (!badge || typeof badge !== "object") return [];
+  const many = (badge as { parts?: unknown }).parts;
+  if (Array.isArray(many)) {
+    return many.filter((p): p is BadgePart =>
+      Boolean(p) && typeof p === "object" && typeof (p as BadgePart).text === "string" &&
+      (p as BadgePart).text !== ""
+    );
+  }
+  const one = badge as { text?: unknown; hl?: unknown };
+  if (typeof one.text !== "string" || one.text === "") return [];
+  return [{ text: one.text, hl: typeof one.hl === "string" ? one.hl : undefined }];
+}
+
+/**
+ * A badge's short form, falling back to the whole of it.
+ *
+ * The fallback is what lets several decorations merge without anybody declaring one: a plugin with
+ * nothing to give up keeps all of its parts in both forms, and {@link fitBadge} notices that the
+ * two are the same width and leaves the badge alone.
+ */
+function badgeShort(badge: BadgeSpec | undefined): BadgePart[] {
+  const declared = (badge as { short?: unknown } | undefined)?.short;
+  if (!Array.isArray(declared)) return badgeParts(badge);
+  return declared.filter((p): p is BadgePart =>
+    Boolean(p) && typeof p === "object" && typeof (p as BadgePart).text === "string" &&
+    (p as BadgePart).text !== ""
+  );
 }
 
 /** The key a decoration's `target` files under: `project:/w/x`, `task:17`. */
@@ -2797,11 +2866,16 @@ export function mergeDecorations(
     const key = decorationKey(c.item?.target);
     if (key === null) continue;
     const d = out.get(key) ?? {};
-    const badge = c.item.badge;
-    if (typeof badge?.text === "string" && badge.text !== "") {
-      d.badge = d.badge
-        ? { text: `${d.badge.text} ${badge.text}`, hl: d.badge.hl }
-        : { text: badge.text, hl: badge.hl };
+    const parts = badgeParts(c.item.badge);
+    if (parts.length > 0) {
+      const short = badgeShort(c.item.badge);
+      const merged = d.badge ? [...d.badge.parts, { text: " " }, ...parts] : parts;
+      d.badge = {
+        text: merged.map((p) => p.text).join(""),
+        hl: d.badge?.hl ?? parts[0]?.hl,
+        parts: merged,
+        short: d.badge ? [...d.badge.short, { text: " " }, ...short] : short,
+      };
     }
     if (d.hl === undefined && typeof c.item.hl === "string") d.hl = c.item.hl;
     if (d.right === undefined && typeof c.item.right?.text === "string") {
@@ -2812,9 +2886,41 @@ export function mergeDecorations(
   return out;
 }
 
-/** How many columns a decoration's badge will take, for a row builder to leave free. */
+/**
+ * How many columns a decoration's badge will take, for a row builder to leave free.
+ *
+ * Columns rather than bytes, which is what a row builder is subtracting this from: `●3` is four
+ * bytes and two columns, and a strip of arrows is three bytes each — measured in bytes, a badge
+ * that says `↓2 ↑5 ~7` takes eleven columns off a name to occupy nine.
+ */
 export function badgeWidth(d: Decoration | undefined): number {
-  return d?.badge ? byteLength(` ${d.badge.text}`) : 0;
+  return d?.badge ? width(` ${d.badge.text}`) : 0;
+}
+
+/**
+ * The badge as this row can actually afford it: the whole of it, or its short form.
+ *
+ * **The badge yields before the name does.** A row's name is what the row *is* — a project you
+ * cannot read the name of is not a row you can use — and a badge is news about it. So the full
+ * strip is drawn whenever the name fits beside it, and a name that would be clipped by the badge
+ * gets the short form instead. Only if it still does not fit is the name clipped, which is the
+ * panel's own business and unchanged.
+ *
+ * `room` is every column the name and the badge have between them, `name` the columns the name
+ * wants. A badge whose short form saves nothing is left alone, which is what makes the fallback in
+ * {@link badgeShort} safe: a plugin that declared no short form never has one chosen for it.
+ */
+export function fitBadge(
+  d: Decoration | undefined,
+  room: number,
+  name: number,
+): Decoration | undefined {
+  if (!d?.badge) return d;
+  const full = badgeWidth(d);
+  if (name + full <= room) return d;
+  const short = { ...d.badge, text: d.badge.short.map((p) => p.text).join("") };
+  if (width(` ${short.text}`) >= full) return d;
+  return { ...d, badge: { ...short, parts: d.badge.short } };
 }
 
 /**
@@ -2833,12 +2939,18 @@ export function decorateRow<T>(
   if (!d) return row;
   if (d.badge) {
     const mark = ` ${d.badge.text}`;
-    const from = byteLength(row.text);
+    // Past the space this puts between the name and the badge: it is the panel's colour, not the
+    // badge's, and a span over it would be one colour claiming a column it does not fill.
+    let at = byteLength(row.text) + 1;
     row.text = `${row.text}${mark}`;
     if (row.full !== undefined) row.full = `${row.full}${mark}`;
-    if (d.badge.hl) {
-      row.spans = [...(row.spans ?? []), { from, to: from + byteLength(mark), hl: d.badge.hl }];
+    const spans = [...(row.spans ?? [])];
+    for (const part of d.badge.parts) {
+      const to = at + byteLength(part.text);
+      if (part.hl) spans.push({ from: at, to, hl: part.hl });
+      at = to;
     }
+    if (spans.length > 0) row.spans = spans;
   }
   if (d.hl && row.hl === undefined) row.hl = d.hl;
   if (d.right && !busy) row.right = { text: `${d.right.text} `, hl: d.right.hl };

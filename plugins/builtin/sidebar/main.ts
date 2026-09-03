@@ -66,7 +66,10 @@ import {
   badgeWidth as badgeColumns,
   decorateRow,
   elapsed,
+  fitBadge,
+  fuzzy,
   type ListRow,
+  type Match,
   mergeDecorations,
   placeSections,
   type SectionItem,
@@ -396,22 +399,45 @@ export async function activate({ neosh, subscriptions }: PluginContext) {
       }
     };
 
-    const open = async () => {
-      if (win === null) {
-        // Read defensively: a reload takes every declared option away and puts it back, and this
-        // can be called from a view arriving in the gap. A panel that throws there used to take
-        // the whole plugin runtime with it.
-        const width = (await neosh.opt.get<number>("sidebar.width").catch(() => null)) ?? 34;
-        win = await here.win.open(buf, "left", { size: width });
-      }
-      await draw();
-      // And again once the frontend has said how tall the panel turned out to be. The foot is held
-      // against the bottom edge, which is a measurement — and on the first frame there is nothing
-      // to measure yet, so without this the strip sits under the last project until something else
-      // happens to redraw.
-      // Not held in `subscriptions`: the panel is opened and closed as often as `^B` is pressed,
-      // and the runtime cancels a plugin's timers when it unloads anyway.
-      neosh.timer.after(120, () => void draw());
+    /**
+     * The open in flight, so two callers cannot each make a window.
+     *
+     * `win` is assigned two `await`s after it is tested — a host round trip for the width, then
+     * the window itself — so `if (win === null)` is a check whose answer is stale by the time it
+     * is acted on. Two calls in that gap both saw `null`, both opened a column, and `win` kept
+     * only the second: the first stayed on screen and could never be closed again, because
+     * `close` closes `win`. Two sidebars, from pressing `^B` or `^T` twice quickly, or from a key
+     * arriving while `view.onOpen` was still building the panel.
+     *
+     * Concurrent callers await the same open rather than starting another. They all wanted the
+     * same end state and now they all get it — which is why this returns the promise instead of
+     * dropping the second call, whose caller is about to `focus` something.
+     */
+    let opening: Promise<void> | null = null;
+
+    const open = (): Promise<void> => {
+      if (opening) return opening;
+      const run = (async () => {
+        if (win === null) {
+          // Read defensively: a reload takes every declared option away and puts it back, and this
+          // can be called from a view arriving in the gap. A panel that throws there used to take
+          // the whole plugin runtime with it.
+          const width = (await neosh.opt.get<number>("sidebar.width").catch(() => null)) ?? 34;
+          win = await here.win.open(buf, "left", { size: width });
+        }
+        await draw();
+        // And again once the frontend has said how tall the panel turned out to be. The foot is
+        // held against the bottom edge, which is a measurement — and on the first frame there is
+        // nothing to measure yet, so without this the strip sits under the last project until
+        // something else happens to redraw.
+        // Not held in `subscriptions`: the panel is opened and closed as often as `^B` is pressed,
+        // and the runtime cancels a plugin's timers when it unloads anyway.
+        neosh.timer.after(120, () => void draw());
+      })();
+      opening = run.finally(() => {
+        opening = null;
+      });
+      return opening;
     };
 
     const leave = async () => {
@@ -424,6 +450,11 @@ export async function activate({ neosh, subscriptions }: PluginContext) {
     };
 
     const close = async () => {
+      // Let an open that is still in flight finish first. `^B` twice quickly is open-then-close,
+      // and a close that reads `win` while the open has not assigned it yet sees `null`, returns
+      // having done nothing, and leaves the column that arrives a moment later on screen — with
+      // the panel now believing it is shut. The next `^B` opens a second one.
+      if (opening) await opening.catch(() => {});
       if (win === null) return;
       const w = win;
       win = null;
@@ -586,11 +617,24 @@ export async function activate({ neosh, subscriptions }: PluginContext) {
   // loaded. `sidebar.open` decides whether it starts showing, per view rather than once for the
   // workspace: `^B` in one window is `^B` in that window.
   const startOpen = (await neosh.opt.get<boolean>("sidebar.open")) ?? true;
+  // Panels being built, keyed by the terminal they are for. The same check-then-act as `open`, one
+  // level up and worse: `panels.set` lands after `makePanel` resolves, so two events for one view
+  // in that gap built two complete panels — two buffers, two windows — and the map kept the
+  // second. Reserved *synchronously*, before the first `await`, which is what makes the test and
+  // the claim one step.
+  const making = new Map<ViewId, Promise<Panel>>();
   subscriptions.push(
     neosh.view.onOpen((view) => {
       void (async () => {
-        if (panels.has(view)) return;
-        const made = await makePanel(view);
+        if (panels.has(view) || making.has(view)) return;
+        const building = makePanel(view);
+        making.set(view, building);
+        let made: Panel;
+        try {
+          made = await building;
+        } finally {
+          making.delete(view);
+        }
         panels.set(view, made);
         if (startOpen) await made.open();
       })().catch((e: unknown) => {
@@ -610,6 +654,26 @@ export async function activate({ neosh, subscriptions }: PluginContext) {
       panels.delete(view);
     }),
   );
+  // And when *we* are the ones going away, which is not the same thing and is the one this panel
+  // got wrong. `dispose` deliberately does not close a window, because its only caller was a
+  // terminal that had already gone and taken its windows with it. A reload is the opposite: every
+  // terminal is still there, still showing a column that nothing is going to take off the screen,
+  // and nothing disposed the panels on this path at all. So `^R` left the old sidebar standing,
+  // the reloaded plugin's `view.onOpen` built a second one beside it, and the workspace had two —
+  // one of them drawn by code that no longer existed and answering no keys.
+  //
+  // Closed rather than merely forgotten, and fire-and-forget because a `Disposable` is
+  // synchronous: the op is in flight before the runtime tears down, and a failure here means the
+  // window was going anyway.
+  subscriptions.push({
+    dispose: () => {
+      for (const p of panels.values()) {
+        void p.close().catch(() => {});
+        p.dispose();
+      }
+      panels.clear();
+    },
+  });
 }
 
 function same(a: Target, b: Target): boolean {
@@ -1574,15 +1638,6 @@ async function newConversation(
     return;
   }
 
-  type Where =
-    | { kind: "here" }
-    | { kind: "scratch" }
-    | { kind: "inside" }
-    | { kind: "new" }
-    | { kind: "elsewhere" }
-    | { kind: "tree"; path: string; label: string }
-    /** On another computer, in a checkout that machine told us it has. */
-    | { kind: "host"; node: string; cwd: string; label: string };
   const rows: Array<PickerItem<Where>> = [
     {
       label: "Here",
@@ -1633,6 +1688,12 @@ async function newConversation(
       value: { kind: "new" },
     });
   }
+  // Somewhere else, before the list of trees rather than after it. Not because it is the commonest
+  // answer — it is not — but because the list above it is unbounded, and a verb that sits under an
+  // unbounded list is a verb whose distance from the cursor depends on how long you have used the
+  // program. It is also the row that says the field completes paths, and a sentence about how to
+  // type is no use once you have already scrolled past it looking for somewhere to type.
+  rows.push(elsewhereRow("Another directory…"));
   for (const t of others) {
     const label = t.branch ?? t.head ?? t.path;
     rows.push({
@@ -1644,38 +1705,8 @@ async function newConversation(
       value: { kind: "tree", path: t.path, label },
     });
   }
-  // The other computers, and the checkouts each of them offered in its handshake. A machine that
-  // does not accept commands is left out rather than shown and refused — a row that cannot work is
-  // worse than no row.
-  for (const n of await neosh.swarm.nodes().catch(() => [])) {
-    if (!n.up || !n.capabilities.accepts_commands) continue;
-    for (const project of n.capabilities.projects) {
-      rows.push({
-        label: `${project.name}`,
-        detail: `on ${n.info.name}  ·  ${project.cwd}`,
-        keywords: `${n.info.name} ${project.cwd} remote host computer`,
-        icon: "→",
-        hl: "Sidebar.Remote",
-        value: {
-          kind: "host",
-          node: n.info.id,
-          cwd: project.cwd,
-          label: `${project.name} on ${n.info.name}`,
-        },
-      });
-    }
-  }
 
-  rows.push({
-    label: "Another directory…",
-    detail: "somewhere else entirely",
-    keywords: "project folder",
-    icon: "…",
-    hl: "Sidebar.Dim",
-    value: { kind: "elsewhere" },
-  });
-
-  const chosen = await picker(neosh, rows, { title: "New conversation", width: 76 });
+  const chosen = await whereTo(neosh, rows, { title: "New conversation" });
   if (chosen === null) return;
   // Every row below that reaches for git names the repository it is about. `^N` from a
   // conversation and `n` from a row on a different project are the same code path, and the only
@@ -1705,21 +1736,375 @@ async function newConversation(
       await neosh.session.create({ cwd: chosen.path });
       return;
     case "host":
-      // Started *there*. The agent will run on that machine, against that machine's files, which
-      // is the point — this is not a way to work on a remote directory from here.
+      await startThere(neosh, chosen);
+      return;
+    case "elsewhere": {
+      const path = chosen.path ?? (await pathPicker(neosh, "New conversation"));
+      if (path === null || path.trim() === "") return;
       try {
-        await neosh.swarm.command(chosen.node, "", {
-          command: "new_session",
-          cwd: chosen.cwd,
-          title: null,
-        });
-        neosh.notify(`started ${chosen.label}`);
+        await neosh.session.create({ cwd: path.trim() });
       } catch (e) {
         neosh.notify(String(e), "warn");
       }
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Where — one field for every answer to "which directory, on which computer"
+// ---------------------------------------------------------------------------
+
+/**
+ * Every answer `^N` and `^O` accept.
+ *
+ * `elsewhere` carries its path when the field already produced one, and leaves it off when the row
+ * was chosen from the menu — the difference between "you typed a directory" and "you asked to be
+ * asked for one".
+ */
+type Where =
+  | { kind: "here" }
+  | { kind: "scratch" }
+  | { kind: "inside" }
+  | { kind: "new" }
+  | { kind: "elsewhere"; path?: string }
+  | { kind: "tree"; path: string; label: string }
+  /** On another computer, in one of its directories. */
+  | { kind: "host"; node: string; cwd: string; label: string }
+  /** Look at one machine's directories rather than every machine's projects. */
+  | { kind: "machine"; node: string; name: string }
+  /** A machine that is on the list and cannot be used yet. `↵` says which of those it is. */
+  | { kind: "unreachable"; name: string; why: string };
+
+/** The row that drops through to a path, wherever a caller wants it in the order. */
+function elsewhereRow(label: string): PickerItem<Where> {
+  return {
+    label,
+    // What the field does, said on the row that is about the field. The alternative was a hint
+    // strip nobody reads until they already know what they are looking for.
+    detail: "or type a path — `/`, `~` and `./` complete as you go",
+    keywords: "path folder directory type browse elsewhere",
+    icon: "…",
+    hl: "Sidebar.Dim",
+    value: { kind: "elsewhere" },
+  };
+}
+
+/**
+ * What the field is completing against, read off what has been typed.
+ *
+ * Three states and one field, because the alternative is a mode — and a mode is a thing you have to
+ * be in before you can type, which is the entire complaint this replaced. A path is a path the
+ * moment it starts like one; `<machine>:` is scp's syntax and means there what it means here, which
+ * is the only reason it is worth having a syntax at all.
+ */
+type Field =
+  | { kind: "rows" }
+  | { kind: "local"; path: string }
+  | { kind: "remote"; node: SwarmNode; path: string };
+
+/** Whether a query has started to look like a path rather than a search. */
+function looksLikePath(q: string): boolean {
+  return q.startsWith("/") || q.startsWith("~") || q.startsWith("./") || q.startsWith("../");
+}
+
+/**
+ * Split `linux-box:/home/me/src` into the machine and the path.
+ *
+ * Matched on what the machine is *called here* — the alias if you set one, since that is the name
+ * every panel shows and therefore the only one you could have read off the screen — and on the
+ * start of its id, which is what you have when two machines share a name. A colon in a query that
+ * names no machine is not a host prefix: it is a directory with a colon in it, which is legal on
+ * every filesystem this runs on.
+ */
+function readField(query: string, nodes: SwarmNode[]): Field {
+  const at = query.indexOf(":");
+  if (at > 0) {
+    const who = query.slice(0, at).toLowerCase();
+    const node = nodes.find((n) =>
+      n.info.name.toLowerCase() === who || n.info.id.toLowerCase().startsWith(who)
+    );
+    if (node) return { kind: "remote", node, path: query.slice(at + 1) };
+  }
+  return looksLikePath(query) ? { kind: "local", path: query } : { kind: "rows" };
+}
+
+/** How a machine's rows are prefixed, and what `<Tab>` puts back in the field. */
+function hostPrefix(node: SwarmNode): string {
+  // The name, unless it has a colon or a space in it — in which case the id is the only thing that
+  // round-trips through a field whose separator is a colon.
+  return /[:\s]/.test(node.info.name) ? node.info.id.slice(0, 8) : node.info.name;
+}
+
+/**
+ * The machines, as rows you can go into.
+ *
+ * Every paired machine, including the ones that cannot be used — greyed, with the reason on them.
+ * The list used to skip anything not `up` and not accepting commands, which is right about what can
+ * be *done* and wrong about what should be *said*: somebody who has just paired a computer and is
+ * looking for it finds an empty list and nothing anywhere to explain it, which reads as the feature
+ * not existing rather than as the machine not being ready.
+ */
+function machineRows(nodes: SwarmNode[], ascii: boolean): PickerItem<Where>[] {
+  const out: PickerItem<Where>[] = [];
+  for (const n of nodes) {
+    const usable = n.up && n.capabilities.accepts_commands;
+    const projects = n.capabilities.projects;
+    const conversations = projects.reduce((sum, p) => sum + p.sessions, 0);
+    const working = projects.reduce((sum, p) => sum + p.running, 0);
+    const state = n.link.state === "up"
+      ? [
+        `${projects.length} ${projects.length === 1 ? "project" : "projects"}`,
+        conversations > 0 ? `${conversations} open` : "",
+        working > 0 ? `${working} working` : "",
+        n.capabilities.accepts_commands ? "" : "read-only — nothing can be started there",
+      ].filter(Boolean).join("  ·  ")
+      : n.link.state === "waiting"
+        ? "has not allowed this computer yet — ^J there"
+        : n.link.state === "down"
+          ? "disconnected — ^J to reconnect"
+          : "connecting…";
+    const [icon, hl] = n.link.state === "up"
+      ? usable ? [ascii ? "*" : "●", "Diagnostic.Ok"] : [ascii ? "-" : "◐", "Sidebar.Dim"]
+      : n.link.state === "waiting"
+        ? [ascii ? "!" : "◍", pulseHl("Status.Pending")]
+        : n.link.state === "down"
+          ? [ascii ? "-" : "○", "Sidebar.Dim"]
+          : [spinnerFrame(), "Status.Streaming"];
+    out.push({
+      label: n.info.name,
+      // The prefix on every row, so the syntax is learned by reading rather than by being told.
+      detail: `${state}   ${hostPrefix(n)}:`,
+      keywords: `${n.info.id} ${n.info.os} computer machine remote host ${hostPrefix(n)}`,
+      icon,
+      hl,
+      value: usable
+        ? { kind: "machine", node: n.info.id, name: hostPrefix(n) }
+        // Nothing to go into, so `↵` says why rather than opening an empty list — and stays here,
+        // because being told a machine is not ready is not a reason to lose the list you were in.
+        : { kind: "unreachable", name: n.info.name, why: state },
+    });
+  }
+  return out;
+}
+
+/** One machine's directories, once you are inside it. */
+function projectRows(node: SwarmNode, ascii: boolean): PickerItem<Where>[] {
+  const prefix = hostPrefix(node);
+  return node.capabilities.projects.map((p) => ({
+    // The prefixed path, because `<Tab>` puts a row's *label* back in the field and a bare name
+    // would take the field somewhere that is not a directory on any machine.
+    label: `${prefix}:${p.cwd}`,
+    detail: [
+      p.name,
+      p.sessions > 0
+        ? `${p.sessions} ${p.sessions === 1 ? "conversation" : "conversations"}`
+        : "nothing open",
+      p.running > 0 ? `${p.running} working` : "",
+    ].filter(Boolean).join("  ·  "),
+    keywords: `${p.name} ${p.key} remote`,
+    // Filled when somebody is working in it, hollow when nobody is. The one thing the flag could
+    // not say while every project on the list was one with a conversation in it.
+    icon: p.active ? (ascii ? "*" : "●") : (ascii ? "-" : "○"),
+    hl: p.active ? "Diagnostic.Ok" : "Sidebar.Dim",
+    value: {
+      kind: "host" as const,
+      node: node.info.id,
+      cwd: p.cwd,
+      label: `${p.name} on ${node.info.name}`,
+    },
+  }));
+}
+
+/**
+ * The one question both `^N` and `^O` ask: which directory, on which computer.
+ *
+ * A picker whose filter line **is** the field. Type nothing and it is the menu the caller passed;
+ * type `/`, `~` or `./` and it is a directory completer; type `linux-box:` and it is a directory
+ * completer pointed at that machine. Nothing has to be navigated to first, which was the whole
+ * complaint: the path was a row at the bottom of a list, under an unbounded number of worktrees,
+ * and reaching it meant arrowing past everything the program had ever been told about.
+ *
+ * `<Tab>` walks into the highlighted directory and `↵` takes it, which is `pathPicker`'s bargain
+ * and is why a completion row's label has to be the whole path.
+ *
+ * Choosing a machine reopens this seeded with `<machine>:` rather than descending in place: the
+ * picker owns its own filter line, and a second level whose rows lie about what is in the field is
+ * a `<Tab>` that jumps somewhere nobody asked for.
+ */
+async function whereTo(
+  neosh: Neosh,
+  base: PickerItem<Where>[],
+  opts: { title: string; seed?: string },
+): Promise<Where | null> {
+  const ascii = (await neosh.opt.get<boolean>("ui.ascii_only").catch(() => false)) ?? false;
+  let seed = opts.seed ?? "";
+
+  /**
+   * The machines, and the rows built from them. Reread rather than captured, because the list is
+   * live: a peer connecting, or gaining a project, while this is open has to change the rows under
+   * the cursor. Captured once, `subscribe` would re-rank the same stale array for ever and the
+   * subscription would be a promise the picker was not keeping.
+   */
+  let nodes: SwarmNode[] = [];
+  // Mutated in place, never reassigned: `reload` re-ranks the very array the picker was handed,
+  // so a fresh array here would be a list that never caught up with anything.
+  const rows: PickerItem<Where>[] = [];
+  const refill = async () => {
+    const me = (await neosh.swarm.self().catch(() => null))?.id ?? null;
+    // This machine is in `nodes()` like any other — a fleet plugin walking the list reaches its
+    // own node, which is deliberate — and it is the one row that must not be here: every other row
+    // in this picker already means "on this computer", and `mymac:/tmp` would otherwise start a
+    // local conversation by the remote path and then try to *watch* it over a socket to ourselves.
+    nodes = (await neosh.swarm.nodes().catch(() => [] as SwarmNode[]))
+      .filter((n) => n.info.id !== me);
+    // No `Add a computer…` row, deliberately. The swarm is on by default, so on every
+    // single-machine workspace — which is most of them — that row would be a permanent line in a
+    // menu pressed many times a day, about a thing its reader is not doing. It is the archive-count
+    // argument one panel along. This picker lists the computers you *have*; getting one is `^J`,
+    // which has a key of its own and a line in the legend.
+    const machines = machineRows(nodes, ascii);
+    rows.splice(0, rows.length, ...base, ...machines);
+    return machines.length > 0;
+  };
+
+  // The last refusal reported, so a folder macOS is hiding is said once and not once per keystroke.
+  let saidDenied: string | null = null;
+
+  for (;;) {
+    const anyMachines = await refill();
+
+    const chosen = await picker<Where>(neosh, rows, {
+      title: opts.title,
+      width: 84,
+      height: 14,
+      query: seed,
+      placeholder: "nothing matches — <CR> takes the path you typed",
+      hints: anyMachines
+        ? "↵ choose   ⇥ into a directory   / a path   name: another computer"
+        : "↵ choose   ⇥ into a directory   / or ~ for a path",
+      source: async (query) => {
+        const field = readField(query, nodes);
+        if (field.kind === "rows") {
+          // Our own ranking, because a `source` replaces the picker's filtering wholesale. Same
+          // fuzzy scorer the picker uses, over the same label-and-keywords, so a query that is not
+          // a path behaves exactly as it would with no source at all.
+          if (query.trim() === "") return rows;
+          return rows
+            .map((item) => ({ item, m: fuzzy(`${item.label} ${item.keywords ?? ""}`, query) }))
+            .filter((r): r is { item: PickerItem<Where>; m: Match } => r.m !== null)
+            .sort((a, b) => b.m.score - a.m.score)
+            .map((r) => r.item);
+        }
+        if (field.kind === "local") {
+          const answer = await neosh.path
+            .complete(field.path)
+            .catch(() => ({ paths: [] as string[], denied: undefined }));
+          // Same rule the remote branch below follows: a directory the OS refused is said out
+          // loud, never drawn as a directory with nothing in it. Once per reason — this runs on
+          // every keystroke.
+          if (answer.denied && answer.denied !== saidDenied) {
+            saidDenied = answer.denied;
+            neosh.notify(answer.denied, "warn");
+          } else if (!answer.denied) {
+            saidDenied = null;
+          }
+          return answer.paths.map((path) => ({
+            label: path,
+            icon: ascii ? ">" : "▸",
+            hl: "Sidebar.Dim",
+            value: { kind: "elsewhere" as const, path },
+          }));
+        }
+        const prefix = hostPrefix(field.node);
+        // Nothing typed after the colon: what that machine offers, which is a short list of real
+        // places rather than the contents of `/`. Typing on turns it into a directory listing.
+        //
+        // A machine with nothing on that list falls through to its home directory rather than
+        // showing an empty one — a computer you have just paired has never had a project on it,
+        // and "no rows" is the answer least likely to be read as "and here is where to start".
+        const offered = field.path === "" ? projectRows(field.node, ascii) : [];
+        if (offered.length > 0) return offered;
+        const paths = await neosh.swarm
+          .browse(field.node.info.id, field.path === "" ? "~/" : field.path)
+          .catch((e) => {
+            // A peer that went away mid-keystroke, or one too old to answer. Said out loud rather
+            // than drawn as an empty directory, which is the one reading that is never true.
+            neosh.notify(String(e), "warn");
+            return [] as string[];
+          });
+        return paths.map((path) => ({
+          label: `${prefix}:${path}`,
+          detail: field.node.info.name,
+          icon: ascii ? ">" : "▸",
+          hl: "Sidebar.Remote",
+          value: {
+            kind: "host" as const,
+            node: field.node.info.id,
+            cwd: path,
+            label: `${path} on ${field.node.info.name}`,
+          },
+        }));
+      },
+      // What `↵` means when the field holds something no row offered — which for a directory you
+      // know the name of is the ordinary case, not the exception.
+      freeform: (query) => {
+        const field = readField(query, nodes);
+        if (field.kind === "local") return { kind: "elsewhere", path: query.trim() };
+        if (field.kind === "remote" && field.path.trim() !== "") {
+          return {
+            kind: "host",
+            node: field.node.info.id,
+            cwd: field.path.trim(),
+            label: `${field.path.trim()} on ${field.node.info.name}`,
+          };
+        }
+        return null;
+      },
+      // A machine connecting, or gaining a project, while the list is open. Same reason the
+      // computers panel subscribes: a row that only changes on the next press is a row that was
+      // wrong when it was read. `refill` first, or the reload re-ranks the same stale array.
+      subscribe: (reload) => neosh.swarm.onChange(() => void refill().then(reload)),
+    });
+
+    if (chosen === null) return null;
+    if (chosen.kind === "machine") {
+      // Back into the same picker with the machine's prefix already typed, which is exactly the
+      // state somebody would have reached by typing it — so the two routes cannot diverge.
+      seed = `${chosen.name}:`;
+      continue;
+    }
+    if (chosen.kind === "unreachable") {
+      neosh.notify(`${chosen.name}: ${chosen.why}`, "info");
+      seed = "";
+      continue;
+    }
+    return chosen;
+  }
+}
+
+/** Start a conversation on another machine, and go and look at it. */
+async function startThere(
+  neosh: Neosh,
+  chosen: { node: string; cwd: string; label: string },
+): Promise<void> {
+  // Started *there*. The agent runs on that machine, against that machine's files, which is the
+  // point — this is not a way to work on a remote directory from here.
+  try {
+    const session = await neosh.swarm.command(chosen.node, "", {
+      command: "new_session",
+      cwd: chosen.cwd,
+      title: null,
+    });
+    // Opened, not merely reported. Starting a conversation here switches to it, and one started
+    // over there that only produced a toast was the same key doing visibly less for the same
+    // intention — you had to go and find, in `^J`, the thing you had just made.
+    if (session) {
+      await neosh.cmd.exec("swarm.open", [chosen.node, session]).catch(() => {});
       return;
-    case "elsewhere":
-      await neosh.cmd.exec("project.open").catch(() => {});
+    }
+    neosh.notify(`started ${chosen.label}`);
+  } catch (e) {
+    neosh.notify(String(e), "warn");
   }
 }
 
@@ -1783,12 +2168,22 @@ function owningProject(target: Target | undefined): string | null {
 }
 
 /**
- * Which directory to add.
+ * Which directory to add — here, or on another computer.
  *
- * Offers the worktrees of the repository you are in before asking you to type, because that is
- * where the next project usually is and a path typed from memory is a path typed wrong. The
- * runtime has no filesystem, so there is no directory browser to offer — the last entry drops
- * through to a text field, which the host validates.
+ * **The path is the first thing now, not the last.** This was a list of the current repository's
+ * worktrees with `Type a path…` under it, and a path is what somebody pressing this key almost
+ * always has: the row they wanted sat at the bottom of a list they had to read to the end of every
+ * time, and the list was of the one place they were already in. So the filter line *is* the path
+ * field from the first keystroke — `/`, `~` and `./` complete directories as you go — and the
+ * worktrees are suggestions under it rather than a menu in front of it.
+ *
+ * And the machines are on it, because "add a project" never had a reason to mean "on this
+ * computer". `linux-box:` completes over there and `↵` starts the conversation there; the row for
+ * it arrives in the panel the way every other remote conversation's does.
+ *
+ * Answers `null` for anything that was not a local directory — including a remote one, which has
+ * been acted on by then. The caller's job is to open a path here, and a path on somebody else's
+ * disk is not one.
  */
 async function chooseDirectory(neosh: Neosh): Promise<string | null> {
   const [worktrees, sessions] = await Promise.all([
@@ -1796,25 +2191,30 @@ async function chooseDirectory(neosh: Neosh): Promise<string | null> {
     neosh.session.list().catch(() => [] as SessionInfo[]),
   ]);
   const open = new Set(sessions.map((s) => s.cwd));
-  const candidates = worktrees.filter((t) => !open.has(t.path));
-  if (candidates.length === 0) return pathPicker(neosh, "Add project");
 
-  const TYPE = "\u0000type";
-  const chosen = await picker(
-    neosh,
-    [
-      ...candidates.map((t) => ({
-        label: basename(t.path),
-        detail: [t.branch ?? "", t.path].filter(Boolean).join("  ·  "),
-        keywords: t.path,
-        value: t.path,
-      })),
-      { label: "Type a path…", value: TYPE },
-    ],
-    { title: "Add project", width: 76 },
-  );
+  const rows: PickerItem<Where>[] = [elsewhereRow("Type a path…")];
+  for (const t of worktrees.filter((w) => !open.has(w.path))) {
+    rows.push({
+      // The path, not the basename: `<Tab>` puts a row's label back in the field, and a bare
+      // directory name there is a path relative to somewhere nobody chose.
+      label: t.path,
+      detail: [basename(t.path), t.branch ?? ""].filter(Boolean).join("  ·  "),
+      keywords: `${basename(t.path)} worktree`,
+      icon: "⎇",
+      hl: "Git.Branch",
+      value: { kind: "elsewhere", path: t.path },
+    });
+  }
+
+  const chosen = await whereTo(neosh, rows, { title: "Add project" });
   if (chosen === null) return null;
-  return chosen === TYPE ? pathPicker(neosh, "Add project") : chosen;
+  if (chosen.kind === "host") {
+    await startThere(neosh, chosen);
+    return null;
+  }
+  if (chosen.kind !== "elsewhere") return null;
+  // Chosen from the menu rather than typed: that row means "ask me", and this is the asking.
+  return chosen.path ?? (await pathPicker(neosh, "Add project"));
 }
 
 /**
@@ -2775,7 +3175,13 @@ async function collect(
   // any of them by name, and the foot is whatever lands after the last one.
   const blocks: Record<Slot, () => void> = {
     projects: () => {
-      rows.push(...heading("PROJECTS", opts.width));
+      // How to make the column wider, on the heading of the column it makes wider — the idiom the
+      // plan block already uses for `^L`, and it costs no row of a panel whose rows are its whole
+      // job. It has to be *somewhere*: a project name clipped to `neosh-websit…` is a row asking
+      // to be widened, and `>` was bound, documented and invisible — advertised on contributed
+      // rows only, which is the one kind of row most people never stand on. Only while the panel
+      // has the keyboard, because that is when the key does anything.
+      rows.push(...heading("PROJECTS", opts.width, opts.focused ? "<> width" : undefined));
       for (const p of projects) {
         rows.push(projectRow(p, arrangement, opts, now));
         if (arrangement.isFolded(p.cwd)) continue;
@@ -2963,14 +3369,16 @@ function projectRow(
   // project under it still end in the same place — clipping the name is what a panel this narrow
   // does, and letting the mark run two columns past everything else is not.
   const target: Target = { kind: "project", cwd: p.cwd };
-  const name = clip(
-    p.name,
-    Math.max(
-      6,
-      opts.width - 8 - byteLength(mark) - byteLength(star) - (elsewhere.length ? 8 : 0) -
-        badgeColumns(opts.decorations.get(targetKey(target) ?? "")),
-    ),
+  // Everything the name and the badge have to share. The badge gives up its least important parts
+  // before a single character comes off the name — a project you cannot read the name of is not a
+  // row you can use, and how far behind the remote it is keeps until you widen the panel with `>`.
+  const room = opts.width - 8 - byteLength(mark) - byteLength(star) - (elsewhere.length ? 8 : 0);
+  const decoration = fitBadge(
+    opts.decorations.get(targetKey(target) ?? ""),
+    room,
+    Array.from(p.name).length,
   );
+  const name = clip(p.name, Math.max(6, room - badgeColumns(decoration)));
   const spans: Array<{ from: number; to: number; hl: string }> = [];
   if (star !== "") {
     const from = byteLength(` ${arrow} ${name}`);
@@ -2989,7 +3397,7 @@ function projectRow(
     full: ` ${arrow} ${p.name}`,
     indent: 3,
     // `here` is this panel's opinion; everything else is a decorator's to colour.
-    hl: here ? "Directory" : opts.decorations.get(targetKey(target) ?? "")?.hl ?? "Sidebar.Dim",
+    hl: here ? "Directory" : decoration?.hl ?? "Sidebar.Dim",
     spans: spans.length > 0 ? spans : undefined,
     right: elsewhere.length > 0
       // The machines take the column the count would have used. A project that is in two places is
@@ -2997,7 +3405,7 @@ function projectRow(
       ? { text: `${clip(elsewhere.join(" "), 14)} `, hl: "Sidebar.Remote" }
       : right,
     value: target,
-  }, opts.decorations.get(targetKey(target) ?? ""), Boolean(busy) || elsewhere.length > 0);
+  }, decoration, Boolean(busy) || elsewhere.length > 0);
 }
 
 /**
@@ -3042,10 +3450,15 @@ function worktreeRow(
   // nesting read as two levels where there is one.
   const pad = "   ";
   const target: Target = { kind: "project", cwd: p.cwd };
-  const name = clip(
-    p.name,
-    Math.max(6, opts.width - 8 - byteLength(glyph) - byteLength(mark) - badgeColumns(opts.decorations.get(targetKey(target) ?? ""))),
+  // As on a project row, and two columns tighter: the branch name is what this row is, so the
+  // badge is what gives way. See `projectRow`.
+  const room = opts.width - 8 - byteLength(glyph) - byteLength(mark);
+  const decoration = fitBadge(
+    opts.decorations.get(targetKey(target) ?? ""),
+    room,
+    Array.from(p.name).length,
   );
+  const name = clip(p.name, Math.max(6, room - badgeColumns(decoration)));
   const spans: Array<{ from: number; to: number; hl: string }> = [];
   if (glyph !== "") {
     const at = byteLength(`${pad}${arrow} `);
@@ -3066,11 +3479,11 @@ function worktreeRow(
     // already on the row.
     full: `${pad}${arrow} ${glyph}${p.name}`,
     indent: byteLength(`${pad}${arrow} `),
-    hl: here ? "Directory" : opts.decorations.get(targetKey(target) ?? "")?.hl ?? "Sidebar.Dim",
+    hl: here ? "Directory" : decoration?.hl ?? "Sidebar.Dim",
     spans: spans.length > 0 ? spans : undefined,
     right,
     value: target,
-  }, opts.decorations.get(targetKey(target) ?? ""), Boolean(busy));
+  }, decoration, Boolean(busy));
 }
 
 /**
@@ -3254,19 +3667,23 @@ function turnFor(s: SessionInfo, now: number): string {
  */
 function hints(opts: DrawOptions): ListRow<Target>[] {
   const kind = opts.selected?.kind;
-  const lines = !opts.focused
-    // `^O` is not here and `+ Add project` is a row you can see: a key strip has two lines, and the
-    // verb with a row of its own is the one that can afford to give up its place on them.
-    ? ["^T projects  ^N new   ^F archive", "^K palette   ^B hide  ^Z keys"]
-    : kind === "custom"
-      ? ["↵ open it     <> width", "esc back      ? keys"]
-    : kind === "project"
-      // `X` is on the strip because a list you cannot shorten is a list that grows forever, and a
-      // project that outlives its conversations — which is the point of it — has to have a way off.
-      ? ["↵ fold   f ★       JK move", "n new    y path     X remove  ? keys"]
-      : kind === "session"
-        ? ["↵ open   r rename   x archive", "X delete y path     ? keys"]
-        : ["↵ add project", "esc back         ? keys"];
+  const lines = strip(
+    !opts.focused
+      // `^O` is not here and `+ Add project` is a row you can see: a key strip has two lines, and
+      // the verb with a row of its own is the one that can afford to give up its place on them.
+      ? ["^T projects", "^N new", "^F archive", "^K palette", "^B hide", "^Z keys"]
+      : kind === "custom"
+        ? ["↵ open it", "esc back", "? keys"]
+      : kind === "project"
+        // `X` is on the strip because a list you cannot shorten is a list that grows forever, and
+        // a project that outlives its conversations — which is the point of it — has to have a way
+        // off.
+        ? ["↵ fold", "f ★", "JK move", "n new", "y path", "X remove", "? keys"]
+        : kind === "session"
+          ? ["↵ open", "r rename", "x archive", "X delete", "y path", "? keys"]
+          : ["↵ add project", "esc back", "? keys"],
+    opts.width,
+  );
 
   // Contributed verbs get their own line rather than being squeezed onto ours, because ours are
   // laid out in columns that a third party's label of unknown length would break — and because a
@@ -3288,6 +3705,52 @@ function hints(opts: DrawOptions): ListRow<Target>[] {
     })),
     ...(mine === "" ? [] : [{ text: ` ${mine}`, hl: "Sidebar.Dim", inert: true }]),
   ];
+}
+
+/**
+ * A key strip packed into the column it is actually drawn in.
+ *
+ * These lines used to be written out by hand with their columns lined up by eye, which is a layout
+ * that is right at exactly one width: the project row's second line came to thirty-six columns in
+ * a panel that is thirty-four wide by default, and what fell off the end was `? keys` — clipped to
+ * `? k`. A strip that truncates its own escape hatch is worse than one that never mentioned it.
+ *
+ * So: verbs in order of how much you need them, packed greedily onto two lines, and whatever does
+ * not fit is dropped. The **last** cell is the way to everything dropped — `? keys`, or `^Z keys`
+ * when the panel does not have the keyboard — so if anything was dropped it takes the final slot.
+ * Greedy rather than even columns because these cells are three columns wide (`f ★`) and eight
+ * (`X remove`), and a grid sized for the widest fits four fewer verbs than the panel has room for.
+ */
+function strip(cells: string[], width: number): string[] {
+  const cols = (s: string) => Array.from(s).length;
+  const room = Math.max(1, width - 1);
+  const last = cells[cells.length - 1] ?? "";
+  const lines: string[] = [];
+  let placed = 0;
+  for (const cell of cells) {
+    const open = lines.length === 0 ? "" : lines[lines.length - 1] ?? "";
+    if (open !== "" && cols(`${open}  ${cell}`) <= room) {
+      lines[lines.length - 1] = `${open}  ${cell}`;
+    } else if (lines.length < 2 && cols(cell) <= room) {
+      lines.push(cell);
+    } else {
+      break;
+    }
+    placed++;
+  }
+  // Anything left unplaced means the strip is incomplete, so its last line has to end at the way in
+  // to the rest. Verbs come off the tail to make room for it rather than it being appended, because
+  // appending is exactly what overflowed — this is counting the same columns the loop above did.
+  if (placed < cells.length && lines.length > 0) {
+    const at = lines.length - 1;
+    let tail = lines[at] ?? "";
+    while (tail !== "" && cols(`${tail}  ${last}`) > room) {
+      const cut = tail.lastIndexOf("  ");
+      tail = cut < 0 ? "" : tail.slice(0, cut);
+    }
+    lines[at] = tail === "" ? last : `${tail}  ${last}`;
+  }
+  return lines;
 }
 
 /** The contributed verbs that apply to the row under the cursor, clipped to the column. */

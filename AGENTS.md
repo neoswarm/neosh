@@ -225,7 +225,26 @@ is `docs/releasing.md`.
   NAT traversal — plain TCP, with Tailscale or the like underneath — and does not trust the network
   to say who may steer an agent: a node is its ed25519 public key, and authorisation is a list you
   wrote. `accepts_approvals` is separate from `accepts_commands` and off by default, because
-  steering is a message and approving is a write to that machine's disk.
+  steering is a message and approving is a write to that machine's disk. **`Browse` is not a third
+  permission**, though: a node that accepts commands already accepts `NewSession` with any `cwd` on
+  its disk, so naming the directories that exist withholds strictly less than it has given away, and
+  a knob for it would be a question nobody has the information to answer. `NodeCapabilities::browse`
+  is therefore a *compatibility* flag — an unknown message tag fails the frame and takes the
+  connection with it, so a directory picker aimed at an older peer would knock it off the board
+  rather than come back empty. It defaults to `false`, which is what an older handshake decodes to,
+  so "does not say" and "cannot" are one answer and a version bump was never needed.
+- **What another machine knows about this one is a roster, not a snapshot.** `publish_inventory` was
+  called when a peer connected and when a peer drove something here, and never once because somebody
+  *sitting at this machine* started, renamed, archived or deleted a conversation — so every other
+  computer's picture of this one was frozen at whenever it last dialled, and a project added an hour
+  ago was invisible over there with nothing on screen to say why. A timer rather than a call at each
+  of the places a conversation can change, because that list is long and was already wrong; it
+  recomputes and compares, so an idle workspace with peers puts nothing on the wire. And what it
+  advertises is the list its **own panel** shows — `sidebar.projects`, read the way
+  `question.asking` is, because which places you work in is a fact about the workspace rather than
+  about the panel that wrote it down. Derived from live conversations alone it was also a constant:
+  every project on the list had one, so `RemoteProject::active` said `true` for all of them and a
+  board drawing the flag drew one colour.
 - `Editor::handles` is a **deny-list**. A new API call that is not added to it silently routes to
   the core.
 - **A driver's account of its own loop is not a content block.** Sub-agents, plans, compaction and
@@ -413,6 +432,43 @@ is `docs/releasing.md`.
   worktree does not rename it to `wt-fe3c0d93`), and leaves by `X` on its heading and nothing else.
   Empty, that asks nothing — `o` puts it back; with conversations still in it, it is a delete of
   every one of them and asks like one.
+- **"Where?" is one field, and the field is the path field.** `^N` and `^O` ask the same question and
+  ask it the same way: type nothing and it is a menu, type `/`, `~` or `./` and it completes
+  directories, type `linux-box:` and it completes directories **on that computer**. `<Tab>` walks
+  into the highlighted one and `↵` takes it — `pathPicker`'s bargain, which is why a completion row's
+  label has to be the whole path and why a remote one is prefixed rather than bare. The scp spelling
+  is not decoration: `host:path` means there what it means here, it is what makes one field able to
+  point at two machines, and it is learned by reading a machine's row rather than by being told. What
+  this replaced was a path sitting at the bottom of a list of every worktree the program had ever
+  heard of — a verb whose distance from the cursor grew with how long you had used it — so
+  `Another directory…` is above that list now and `Type a path…` is the first row of `^O`. Choosing a
+  machine reopens the picker seeded with `<machine>:` rather than descending in place, because a
+  second level whose rows lie about what is in the field is a `<Tab>` that jumps somewhere nobody
+  asked for. **Every paired machine is a row, including the ones that cannot be used**, greyed with
+  the reason on them: skipping them is right about what can be *done* and wrong about what should be
+  *said*, and somebody who has just paired a computer and finds an empty list reads it as the feature
+  not existing. A machine with no projects yet falls through to its home directory rather than
+  showing none. And starting one over there **opens it** — `swarm.command` answers with the
+  conversation `NewSession` made, which until it did meant the same key did visibly less for the same
+  intention: you had to go and find, in `^J`, the thing you had just made.
+- **Nothing there and not allowed to look are different answers.** They are the same empty list, and
+  only one of them is fixed by typing a different path — so a path field drawing `no directory
+  matches` over a refusal sends somebody off to check a path that was right all along. macOS is
+  where this bites: TCC grants folder access to the **terminal**, so `~/Documents` with a year of
+  work in it completes to nothing until a box is ticked in System Settings, and `chmod` does not
+  help, the file's owner does not help, and `sudo` — which is what everybody reaches for — does not
+  help either. The kernel hands over the one bit that separates the two and Rust throws it away:
+  `EACCES` is the mode bits, `EPERM` is the privacy layer, and `ErrorKind::PermissionDenied` is
+  both, so `crate::access` reads the raw errno and nothing else can. What it answers with names the
+  folder, the application the grant actually belongs to and the pane it is granted in, because
+  "permission denied" is true and unactionable; the application is a guess from `TERM_PROGRAM` and
+  becomes "your terminal" when it cannot be one, since a workspace outlives the terminal that
+  started it and a confidently wrong name is what somebody then hunts for in a list of thirty. It
+  travels as `denied` on `ApiOk::Paths` and is drawn as a **notice** rather than a row — a row is a
+  thing you can put the cursor on, and this one would do nothing — and over ASCP it is an ordinary
+  `Refusal::Failed`, so a peer's protected folder reports itself without a wire change. **And what
+  cannot be detected is not guessed at**: a denied `display notification` on macOS exits `0`, so
+  nothing here claims to know whether a notification was ever seen.
 - **What you have archived is not in the sidebar at all, and it is something you can empty.** The
   panel is the list you work in; a section of things you are finished with is the only part of that
   column that is never the answer, and it grows forever. The first cut left one dim row with a count
@@ -738,7 +794,7 @@ only way to do anything.
 | `^J` | The computers in this workspace. Add one by its address, allow one that is asking, rename one (`^E`), or open what it is running. A machine this one has reached that has not allowed it back says so, and says which key to press over there |
 | `^F` | What you have archived — see below. Filter it, put some back, or finally empty it |
 | `^N` | New conversation. In a repository it asks where: here, a worktree you need not name, one kept inside the project, one you do name, an existing one, another machine, elsewhere. A worktree you did not name is named by your first message — `fix/composer-paste-truncation`, not `wily-nimbus` |
-| `^O` | Add a project |
+| `^O` | Add a project. The filter line **is** the path field: `/`, `~` and `./` complete directories from the first keystroke, `⇥` walks into the highlighted one, `↵` takes what you typed. `linux-box:` completes on that computer instead |
 | `^B` | Toggle the sidebar |
 | `^K` | Command palette |
 | `/` | Completes a command by name — neosh's, and whatever the agent says it accepts. Keep typing; the composer is still the field, and `↵` sends what you typed when nothing matches |

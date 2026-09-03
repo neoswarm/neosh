@@ -254,8 +254,10 @@ In the panel (`<C-t>`): `↑`/`↓`, `j`/`k` or `^N`/`^P` move, `Enter` opens or
 `f` pins, `J`/`K` reorder, `n` new conversation here, `x` archive, `X` delete, `a` the archive,
 `r` rename, `?` every binding, `Esc` leaves. `J`/`K` work from a conversation row too — they move
 the project it is in, because you are looking at the project when you are looking at what is inside
-it. The foot of the panel lists the keys for whatever the cursor is on; set `sidebar.hints = false`
-once they are in your fingers.
+it. `>` and `<` make the column wider and narrower and `=` puts it back — they are the
+`sidebar.width` setting, so this key and `config.toml` say the same number, and the panel's own
+heading says `<> width` while it has the keyboard. The foot of the panel lists the keys for
+whatever the cursor is on; set `sidebar.hints = false` once they are in your fingers.
 
 ### Archiving, and the one verb that deletes
 
@@ -514,8 +516,13 @@ Projects are matched by normalised git remote, not by path — `/Users/me/dev/ne
 the other over HTTPS. A directory with no remote falls back to its name, which is a guess and shown
 as one.
 
-`^N` offers the other machines' checkouts alongside your worktrees, so "start something over there"
-is one key.
+`^N` and `^O` offer the other machines alongside your own worktrees, so "start something over there"
+is one key — and the field completes paths on whichever machine you point it at. See
+[Adding a project](#adding-a-project).
+
+What a machine advertises is the list *its* panel shows, refreshed as it changes rather than fixed
+at the moment you connected — so a project added over there appears here within a couple of seconds,
+and one you cleared out but did not remove is still somewhere you can start something.
 
 `↵` on a remote conversation **opens it**: its history, then everything as it happens. `i` says
 something to it and `^C` asks its turn to stop — because "it feels like it is on this computer" is a
@@ -527,15 +534,39 @@ The protocol is specified in [ascp/SPEC.md](ascp/SPEC.md).
 
 ### Adding a project
 
-`^O` anywhere, `o` in the project panel, or `Enter` on the `+ Add project` row. It offers the
-worktrees of the repository you are in that are not open yet, and drops through to a path field for
-anything else. It is the `project.open` command, so `^K` finds it and `<leader>pa` can be it.
+`^O` anywhere, `o` in the project panel, or `Enter` on the `+ Add project` row. It is the
+`project.open` command, so `^K` finds it and `<leader>pa` can be it.
 
-The path field completes as you type: the list under it is the directories matching what you have
-so far. `<Tab>` takes the highlighted one into the field so you can keep descending, `<C-BS>` goes
-back up a whole segment rather than a character, and `<CR>` accepts either the highlighted row or
-exactly what you typed — because the directory you want may not be one it offered. `~` expands, and
-a path with no `/` completes against the conversation's own directory.
+**The filter line is the path field.** There is no row to reach first and no mode to enter: start
+typing `/`, `~` or `./` and the list under it becomes the directories that match. `<Tab>` takes the
+highlighted one into the field so you can keep descending, `<C-BS>` goes back up a whole segment
+rather than a character, and `<CR>` accepts either the highlighted row or exactly what you typed —
+because the directory you want may not be one it offered. `~` expands, and a path with no `/`
+completes against the conversation's own directory.
+
+Underneath, as suggestions rather than a menu: `Type a path…` first, then the worktrees of the
+repository you are in that are not open yet, then every computer you have paired.
+
+#### On another computer
+
+Type `linux-box:` and the same field completes directories **over there** — scp's spelling, meaning
+what it means there. With nothing after the colon it lists what that machine offers: the projects it
+works in, filled where somebody has a conversation open and hollow where nobody has, with the counts
+beside them. Keep typing and it is an ordinary directory listing of that machine's disk, one segment
+at a time, `<Tab>` and all.
+
+`<CR>` starts the conversation **there** — the agent runs on that machine, against that machine's
+files — and opens a window onto it here.
+
+Every paired machine is a row whether or not it can be used. One that has not allowed this computer
+yet, or that is disconnected, or that is read-only, says which; `<CR>` on it repeats the reason
+rather than opening an empty list. `^N` asks the same question with the same field, alongside
+`Here` and the worktree options.
+
+Listing a machine's directories follows `accepts_commands`: a machine that will start an agent
+anywhere you name has already given away more than the names of its directories, so there is no
+separate setting. Directory names only — never files, never contents. A machine running a neosh
+older than this says so rather than dropping the connection.
 
 ### Confirmations
 
@@ -969,10 +1000,10 @@ right.
 Model                                                              ⇧⇥ providers
 > 
  PLANS                  │ ❯ Claude Opus 5         Frontier  Most capable for complex work
-  ✳ Claude            ✓ │   Claude Fable 5        Frontier  Long-form writing and voice
+  ✳ Claude            ✓ │   Claude Fable 5.1      Frontier  Deepest reasoning and long-running work
   ⬢ Codex             ✓ │   Claude Sonnet 5       Balanced  Best for everyday tasks
  API KEYS               │   Claude Haiku 4.5      Fast      Fastest, for quick answers
-  ✳ Anthropic         ! │   ▸ 5 superseded
+  ✳ Anthropic         ! │   ▸ 6 superseded
  LOCAL                  │
   ▲ Ollama              │
 ────────────────────────┴──────────────────────────────────────────────────────────

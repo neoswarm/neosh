@@ -275,8 +275,24 @@ pub struct RemoteProject {
     /// [`AgentCommand::NewSession`], not something to look at locally.
     pub cwd: String,
     /// Whether this node has a conversation open in it now.
+    ///
+    /// Meant something for exactly as long as this list was derived from live conversations: every
+    /// project on it had one, so every one of them said `true` and a board drawing the flag drew
+    /// one colour. A node now advertises the places it *works in* — which is the list its own panel
+    /// shows, and includes the project you cleared out this morning — so the two states exist and
+    /// the flag is worth reading.
     #[serde(default)]
     pub active: bool,
+    /// How many conversations are open in it there.
+    #[serde(default)]
+    pub sessions: u32,
+    /// How many of those are mid-turn.
+    ///
+    /// Separate from `sessions` because they are different questions and a board answers both in
+    /// one row: `3 conversations · 1 working` is what the sidebar says about a local project, and a
+    /// remote one should not have to say less.
+    #[serde(default)]
+    pub running: u32,
 }
 
 /// What a node is willing to have done to it.
@@ -298,6 +314,16 @@ pub struct NodeCapabilities {
     /// Whether [`AscpMessage::Subscribe`] will produce anything.
     #[serde(default)]
     pub streams: bool,
+    /// Whether [`AscpMessage::Browse`] will be answered.
+    ///
+    /// Not a permission — it follows `accepts_commands`, for the reason written on `Browse` — but a
+    /// *compatibility* flag, and that is why it is here rather than derived. A node built before
+    /// `Browse` existed cannot skip a message it has never heard of: the frame parses or the
+    /// connection fails, so a new node that sent one on spec would drop an old peer's link every
+    /// time somebody opened a directory picker. It defaults to `false`, which is exactly what an
+    /// older node's handshake decodes to, so "does not say" and "cannot" are the same answer.
+    #[serde(default)]
+    pub browse: bool,
     /// The checkouts this node has, for starting something on it.
     #[serde(default)]
     pub projects: Vec<RemoteProject>,
@@ -417,6 +443,26 @@ pub enum AscpMessage {
         session: Option<SessionId>,
     },
     Refused { id: String, refusal: Refusal },
+    /// Which directories on that machine start with `prefix`.
+    ///
+    /// [`NodeCapabilities::projects`] is what a node *offers*, and it is a short list of places it
+    /// already works in. This is the other half: the directory over there that neither machine has
+    /// ever opened, which without this can only be reached by typing a path from memory and finding
+    /// out it was wrong when the conversation fails to start.
+    ///
+    /// Gated on [`NodeCapabilities::accepts_commands`], and deliberately not on a knob of its own.
+    /// A node that accepts commands already accepts [`AgentCommand::NewSession`] with an arbitrary
+    /// `cwd` — it will *start an agent* anywhere on its disk you name — so declining to say which
+    /// directories exist would withhold strictly less than it has already given away, at the cost
+    /// of a third permission for people to reason about. Directory names only: never files, never
+    /// contents, never anything a `read_dir` cannot answer.
+    ///
+    /// Answered with [`Self::Browsed`] or [`Self::Refused`], exactly once, like every other
+    /// request here.
+    Browse { id: String, prefix: String },
+    /// The answer to [`Self::Browse`] — each entry as the asker would have typed it, trailing
+    /// separator and all, so it can go straight back into a field.
+    Browsed { id: String, paths: Vec<String> },
     /// Closing cleanly, so a peer can say "went away" rather than waiting out a timeout.
     Goodbye {
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -478,5 +524,56 @@ mod tests {
         assert_eq!(NodeId("0123456789abcdef".into()).short(), "01234567");
         assert_eq!(NodeId("abc".into()).short(), "abc");
         assert_eq!(NodeId(String::new()).short(), "");
+    }
+
+    /// A machine that predates [`AscpMessage::Browse`] has to decode as one that cannot answer it.
+    ///
+    /// This is the whole of what keeps a directory picker from knocking an older peer off the
+    /// board. An unknown message tag fails the frame and fails the connection with it, so
+    /// [`NodeCapabilities::browse`] is what a new node checks before ever sending one — and the
+    /// handshake of a node that has never heard of the field says nothing about it. "Did not say"
+    /// and "cannot" must therefore be the same answer, which is what `#[serde(default)]` on a
+    /// `bool` buys and what this pins down.
+    #[test]
+    fn a_handshake_from_before_browse_existed_says_it_cannot_browse() {
+        let older = r#"{
+            "accepts_commands": true,
+            "accepts_approvals": false,
+            "streams": true,
+            "projects": [
+                {"key":"git:example.com/me/thing","name":"thing","cwd":"/home/me/thing","active":true}
+            ]
+        }"#;
+        let caps: NodeCapabilities = serde_json::from_str(older).expect("an older handshake parses");
+        assert!(!caps.browse, "and it is not asked to browse");
+        assert!(caps.accepts_commands, "while everything it did say survives");
+        // The counts are the same bargain one type down: absent is zero, not a parse failure.
+        let p = &caps.projects[0];
+        assert_eq!((p.sessions, p.running), (0, 0));
+        assert!(p.active, "and the flag it did send is believed");
+    }
+
+    /// And the other direction: an older node is handed fields it has never heard of.
+    ///
+    /// Serde ignores unknown keys on a struct by default, which is the half of the bargain that
+    /// lets a new node advertise `browse` at all — but "by default" is a setting somebody could
+    /// change to `deny_unknown_fields` on a tidying pass, and that would break every mixed-version
+    /// swarm at the handshake. Pinned here so the tidying pass fails a test instead.
+    #[test]
+    fn a_handshake_carrying_fields_an_older_node_lacks_still_parses() {
+        let newer = r#"{
+            "accepts_commands": true,
+            "accepts_approvals": false,
+            "streams": true,
+            "browse": true,
+            "something_from_next_year": 7,
+            "projects": [
+                {"key":"git:example.com/me/thing","name":"thing","cwd":"/t","active":false,
+                 "sessions":3,"running":1,"another_new_one":"x"}
+            ]
+        }"#;
+        let caps: NodeCapabilities = serde_json::from_str(newer).expect("a newer handshake parses");
+        assert!(caps.browse);
+        assert_eq!((caps.projects[0].sessions, caps.projects[0].running), (3, 1));
     }
 }

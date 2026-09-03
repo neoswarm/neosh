@@ -79,6 +79,10 @@ pub enum SwarmRequest {
     Command { node: NodeId, id: String, session: SessionId, command: AgentCommand },
     /// Answer a request that came in.
     Answer { node: NodeId, id: String, result: Result<Option<SessionId>, Refusal> },
+    /// Ask a peer which of its directories start with `prefix`.
+    Browse { node: NodeId, id: String, prefix: String },
+    /// Answer a [`SwarmEvent::Browse`] that came in.
+    Browsed { node: NodeId, id: String, result: Result<Vec<String>, Refusal> },
     Subscribe { node: NodeId, session: SessionId },
     Unsubscribe { node: NodeId, session: SessionId },
     /// Something happened in a local session. Sent only to peers that subscribed to it.
@@ -136,6 +140,11 @@ pub enum SwarmEvent {
     Command { node: NodeId, id: String, session: SessionId, command: AgentCommand },
     /// A command we sent has been answered. Exactly one of these per command, ever.
     Answer { node: NodeId, id: String, result: Result<Option<SessionId>, Refusal> },
+    /// A peer wants to know which of our directories start with `prefix`. The host must answer with
+    /// [`SwarmRequest::Browsed`].
+    Browse { node: NodeId, id: String, prefix: String },
+    /// A browse we sent has been answered. Exactly one of these per browse, ever.
+    Browsed { node: NodeId, id: String, result: Result<Vec<String>, Refusal> },
     /// A machine proved who it is and is not one we have paired with.
     ///
     /// The beginning of pairing rather than the end of a connection. Reported for both directions:
@@ -148,6 +157,10 @@ pub enum SwarmEvent {
 }
 
 /// What the host holds.
+///
+/// Clonable so a spawned task can answer a peer without the host loop having to wait for it: the
+/// only thing in here is a sender and an id, and every request on it is fire-and-forget.
+#[derive(Clone)]
 pub struct SwarmHandle {
     tx: mpsc::UnboundedSender<SwarmRequest>,
     id: NodeId,
@@ -237,6 +250,10 @@ async fn run(
         accepts_commands: config.accepts_commands,
         accepts_approvals: config.accepts_approvals,
         streams: true,
+        // A build fact rather than a setting: it says this binary understands the message, and what
+        // decides whether the message is *answered* is `accepts_commands`, checked when one
+        // arrives. A knob here would be a second permission for something already permitted.
+        browse: true,
         projects: Vec::new(),
     };
 
@@ -450,6 +467,51 @@ async fn run(
                             });
                         }
                     }
+                    SwarmRequest::Browse { node, id, prefix } => {
+                        match peers.get(&node) {
+                            // Never sent to a peer that has not said it understands the question:
+                            // an unknown message tag fails the frame and takes the connection with
+                            // it, so a directory picker aimed at an older machine would knock it
+                            // off the board rather than come back empty. See
+                            // `NodeCapabilities::browse`.
+                            Some(p) if p.capabilities.browse => {
+                                let _ = p.out.send(AscpMessage::Browse { id, prefix });
+                            }
+                            Some(p) => {
+                                let _ = events.send(SwarmEvent::Browsed {
+                                    node,
+                                    id,
+                                    result: Err(Refusal::NotPermitted {
+                                        what: format!(
+                                            "{} is running neosh {}, which cannot list directories \
+                                             for another machine",
+                                            p.info.name, p.info.version
+                                        ),
+                                    }),
+                                });
+                            }
+                            // Answered locally rather than dropped, for the reason `Command` is:
+                            // a request with no reply is indistinguishable from a slow network,
+                            // and the caller is a field somebody is typing into.
+                            None => {
+                                let _ = events.send(SwarmEvent::Browsed {
+                                    node,
+                                    id,
+                                    result: Err(Refusal::Busy {
+                                        message: "not connected".into(),
+                                    }),
+                                });
+                            }
+                        }
+                    }
+                    SwarmRequest::Browsed { node, id, result } => {
+                        if let Some(p) = peers.get(&node) {
+                            let _ = p.out.send(match result {
+                                Ok(paths) => AscpMessage::Browsed { id, paths },
+                                Err(refusal) => AscpMessage::Refused { id, refusal },
+                            });
+                        }
+                    }
                     SwarmRequest::Subscribe { node, session } => {
                         if let Some(p) = peers.get(&node) {
                             let _ = p.out.send(AscpMessage::Subscribe { session });
@@ -593,6 +655,25 @@ async fn run(
                         } else {
                             let _ = events.send(SwarmEvent::Command { node, id, session, command });
                         }
+                    }
+                    AscpMessage::Browse { id, prefix } => {
+                        // The same gate the command path applies, and deliberately the same one:
+                        // a node that accepts commands already accepts `NewSession` with any path
+                        // on its disk, so naming the directories that exist is strictly less than
+                        // it has given away. A node that does not is not asked to list anything.
+                        if caps.accepts_commands {
+                            let _ = events.send(SwarmEvent::Browse { node, id, prefix });
+                        } else if let Some(p) = peers.get(&node) {
+                            let _ = p.out.send(AscpMessage::Refused {
+                                id,
+                                refusal: Refusal::NotPermitted {
+                                    what: "this node does not accept commands".into(),
+                                },
+                            });
+                        }
+                    }
+                    AscpMessage::Browsed { id, paths } => {
+                        let _ = events.send(SwarmEvent::Browsed { node, id, result: Ok(paths) });
                     }
                     AscpMessage::Ack { id, session } => {
                         let _ = events.send(SwarmEvent::Answer {

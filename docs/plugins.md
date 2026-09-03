@@ -531,12 +531,20 @@ await neosh.ext.contribute("sidebar.section", "todo", {
   rows: [{ text: "Ship the thing", command: "acme.open", args: ["thing"] }],
 });
 
-// A mark on a row the panel already draws, keyed by what the row is about. The git plugin's
-// dirty count is exactly this. The name is clipped to make room for the badge; `hl` colours a
+// A mark on a row the panel already draws, keyed by what the row is about. The git plugin's stat
+// strip is exactly this. The name is clipped to make room for the badge; `hl` colours a
 // row the panel left plain; `right` replaces the count or the age on a row that is not busy.
 await neosh.ext.contribute("sidebar.decoration", `prs:${cwd}`, {
   target: { project: cwd },                       // or { session: id }
   badge: { text: "2 PRs", hl: "Accent" },
+});
+
+// A badge is often several facts rather than one, and a strip drawn in a single colour is a string
+// you read rather than a row you glance at. `parts` is the same badge in as many colours as it has
+// things to say — what `↓2 ↑5 ~7` on a project row is — and a part with no `hl` is a separator.
+await neosh.ext.contribute("sidebar.decoration", `ci:${cwd}`, {
+  target: { project: cwd },
+  badge: { parts: [{ text: "✓12", hl: "Git.Added" }, { text: " " }, { text: "✗1", hl: "Git.Conflict" }] },
 });
 
 // A verb on a row. The panel binds the key and invokes your command with the row under the cursor:

@@ -11,6 +11,7 @@ use neosh_script::ScriptRuntime;
 
 mod markdown;
 mod notify;
+mod access;
 mod agentcli;
 mod bridge;
 mod build;
