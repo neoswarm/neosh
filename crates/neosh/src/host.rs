@@ -666,6 +666,14 @@ struct ViewState {
     /// where you learn tabs exist.
     tabline: BufferId,
     tabline_win: WindowId,
+    /// The conversation this terminal last *arrived* in.
+    ///
+    /// What `rehome` compares against to decide whether moving the keyboard is also an arrival.
+    /// The obvious guard — "does the store's current differ" — is wrong, because `current_id()` is
+    /// the front of the recency order rather than a pointer: unarchiving a conversation moves it
+    /// there, so the guard fired and the arrival shoved the pane's own conversation back to the
+    /// front, undoing the ordering the unarchive had just established.
+    entered: Option<neosh_proto::SessionId>,
     /// When `<C-c>` was last pressed with nothing left to cancel.
     ///
     /// Per terminal, not per pane: the second press is about this keyboard, and having to press it
@@ -703,6 +711,7 @@ impl ViewState {
         });
 
         let pane = editor.active_pane(view);
+        let session_id = session.clone();
         let first = PaneState::furnish(editor, view, pane, session);
         editor.set_mode(view, Mode::Chat);
         // The field you type in is where unpushed focus lands, so a key bound against
@@ -714,6 +723,7 @@ impl ViewState {
             status,
             tabline,
             tabline_win,
+            entered: Some(session_id),
             quit_armed: None,
         }
     }
@@ -3995,7 +4005,10 @@ impl Host {
         // Guarded, because `sync_panes` runs after every apply and `enter` is a history: moving to
         // the front of the recency order on every redraw would make the sidebar's ordering mean
         // "most recently drawn" rather than "most recently arrived in".
-        if self.agent.sessions().current_id() != &session {
+        if self.views.get(&view).and_then(|v| v.entered.as_ref()) != Some(&session) {
+            if let Some(v) = self.views.get_mut(&view) {
+                v.entered = Some(session.clone());
+            }
             let _ = self.in_pane(view, pane, |me| me.arrive_in(&session));
         }
 
