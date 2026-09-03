@@ -235,13 +235,31 @@ fn claude(
         pricing: Some(Pricing {
             input_per_mtok: price.0,
             output_per_mtok: price.1,
-            cache_read_per_mtok: price.0 * 0.1,
+            cache_read_per_mtok: price.0 * cache_read_multiple(id),
             cache_write_per_mtok: price.0 * 1.25,
         }),
         family: Some(family.into()),
         tier: Some(tier),
         legacy,
         tagline: Some(tagline.into()),
+    }
+}
+
+/// What a cache hit costs, as a multiple of the base input price.
+///
+/// A rule with two exceptions, and the exceptions are the vendor's rather than ours: the pricing
+/// table's own footnote reads *"cache hits and refreshes on Claude Fable 5.1 and Claude Mythos 5.1
+/// are priced at 0.025x the base input price. All other models use the standard 0.1x multiplier."*
+///
+/// Written as an exception list rather than folded into every call site, because that is the shape
+/// of the fact — and because a flat `0.1` was wrong by **four times** on the most expensive model
+/// in the catalogue. This number is not decoration: `neosh::usage` and the sidebar both multiply a
+/// real `cache_read_tokens` count by it, so a stale multiplier is money reported wrongly on the one
+/// screen people check to find out what they are spending.
+fn cache_read_multiple(id: &str) -> f64 {
+    match id {
+        "claude-fable-5-1" | "claude-mythos-5-1" => 0.025,
+        _ => 0.1,
     }
 }
 
@@ -1018,6 +1036,27 @@ mod tests {
         for i in &compat {
             assert!(i.base_url.is_some(), "{} needs a base URL", i.id);
         }
+    }
+
+    #[test]
+    fn a_cache_hit_costs_what_the_vendor_says_it_costs() {
+        // Not a formula. Anthropic's pricing table carries a footnote — "cache hits and refreshes
+        // on Claude Fable 5.1 and Claude Mythos 5.1 are priced at 0.025x the base input price. All
+        // other models use the standard 0.1x multiplier" — and a flat 0.1 made the most expensive
+        // model in the catalogue read four times its real cache cost in `^L` and in the sidebar.
+        let by_id = |want: &str| {
+            anthropic_models().into_iter().find(|m| m.id.as_ref() == want).expect("in the catalogue")
+        };
+        let fable = by_id("claude-fable-5-1").pricing.expect("priced");
+        assert_eq!(fable.input_per_mtok, 10.0);
+        assert_eq!(fable.cache_read_per_mtok, 0.25, "Fable 5.1 reads from cache at 0.025x");
+
+        // The rule the exception is an exception to, checked on both sides so a future edit cannot
+        // quietly apply the discount everywhere.
+        let opus = by_id("claude-opus-5").pricing.expect("priced");
+        assert_eq!(opus.cache_read_per_mtok, 0.50, "Opus 5 is still the standard 0.1x");
+        let fable_5 = by_id("claude-fable-5").pricing.expect("priced");
+        assert_eq!(fable_5.cache_read_per_mtok, 1.0, "Fable 5 did not get 5.1's cache price");
     }
 
     #[test]
