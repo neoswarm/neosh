@@ -28,6 +28,7 @@ Every default is a key your terminal already sends: Ctrl with a letter, `⇧⇥`
 | `^O` | Add a project |
 | `^B` | Toggle the sidebar |
 | `^K` | Command palette |
+| `^W` | Windows, panes and tabs — hold it to see what follows. See below |
 | `/` | Complete a command by name — neosh's, and whatever the agent accepts |
 | `^L` | What the plan has left, and where the week went |
 | `^G` | Git status |
@@ -43,9 +44,44 @@ Every default is a key your terminal already sends: Ctrl with a letter, `⇧⇥`
 
 Dragging an image onto the terminal pastes its path, and a pasted path to an image is attached rather than typed out.
 
-**Composer editing** is a text field: `←`/`→` by character and `^←`/`^→` by word, `Home`/`End` and `^Home`/`^End` for the ends, shift with any of them to select, `^W` and `^U` to delete a word or back to the start of the line.
+**Composer editing** is a text field: `←`/`→` by character and `^←`/`^→` by word, `Home`/`End` and `^Home`/`^End` for the ends, shift with any of them to select, `^⌫` and `^U` to delete a word or back to the start of the line. `^W` was the word-delete and is now the window prefix — a key cannot both delete a word and wait to see whether a window verb follows it, because the waiting is what makes every word-delete feel late. `ui.keys.delete_word` and `ui.keys.window_prefix` swap them back if you would rather.
 
 `model.upgrade` and `model.downgrade` ship with **no key** — they had `⌥↑`/`⌥↓`, which is not a key every terminal sends. `^K` runs both by name, and `init.ts` can bind them.
+
+## Windows, panes and tabs — `^W`
+
+The one prefix that ships. It earns it: twenty-four verbs, and no Ctrl-with-a-letter left to give them — so most would otherwise arrive with no key at all.
+
+**Hold `^W` and wait.** A panel lists everything that follows it, read out of your own keymap rather than out of this page — so a rebinding shows *your* letter, and a plugin that adds a verb under the prefix appears in it with nobody writing glue. `ui.keys.hint_delay` is how long the pause is (300 ms; `0` shows it at once), and `ui.keys.window_prefix` moves the prefix.
+
+| Key | Does |
+| --- | --- |
+| `v` `s` | Split: the new pane on the right, or below. Focus follows |
+| `c` | Split to the right **on a new conversation** — splitting and `^N` in one key |
+| `q` | Close this pane. The last one is refused — `^Q` closes the terminal |
+| `o` | Close every pane but this one |
+| `h` `j` `k` `l` | Go to the pane that way. No wrap-around: the edge is where it stops |
+| `w` | The next pane, or the next **tab** when there is only one pane — so it always goes somewhere |
+| `<` `>` | Narrower, wider — Vim's, and the same keys the project panel resizes with |
+| `-` `+` | Shorter, taller. At an edge the other boundary moves rather than nothing happening |
+| `H` `J` `K` `L` | **Move this pane** to that edge — Vim's, and the counterpart to `hjkl` moving *you* |
+| `x` | Swap this pane with the next, keeping their places |
+| `=` | Give every pane an equal share |
+| `t` | A tab. **Asks what goes in it**: a new conversation, a shell, or this conversation again |
+| `T` | A tab with a **shell**, skipping the question |
+| `S` | Split into a **shell** |
+| `X` | Close this tab and everything in it |
+| `n` `p` | The next / previous tab, wrapping |
+| `1`–`9` | That tab, counting from the left as the bar numbers them |
+| `r` | Name this tab. `↵` on an empty name gives it back to being named by what is in it |
+| `,` `.` | Move this tab along the bar |
+| `?` | The list, now rather than after the pause |
+
+**Every pane is a whole conversation surface** — its own transcript, its own message field, its own draft, scroll, search and reading position. Two chats side by side are two of all of that; typing in one does nothing to the other. A split starts on what you were already reading, which is what `:split` means in Vim and is the only version that needs no dialog; `^T` and `^N` then change what is in the pane you are in.
+
+**A pane can be a shell.** `^WT` for a tab with one, `^WS` to split into one. Every key goes to the program inside — `^C` interrupts *it* — except the window prefix, which is always your way out. It runs `$SHELL -l` in the conversation's directory.
+
+**The strip along the top is always there.** Tabs on the left, numbered as `^W1`…`^W9` counts them, and the keys for wherever you are on the right. The pane with the keyboard is the one whose **edges are lit**.
 
 ## Reading the transcript — `^S`
 

@@ -15,10 +15,10 @@ use std::collections::{HashMap, HashSet};
 use std::collections::BTreeMap;
 
 use neosh_proto::{
-    ApiCall, ApiError, ApiOk, ApiResult, BufferId, Contribution, ExtmarkId, ExtmarkOpts,
+    ApiCall, ApiError, ApiOk, ApiResult, BufferId, Contribution, Direction, ExtmarkId, ExtmarkOpts,
     FloatConfig, HlTarget, KeyContext, KeyPress, KeymapEntry, KeymapScope, MessageLevel, Mode,
-    NamespaceId, NoticeKind, OnDelete, OptionValue, PluginId, Rect, SelectShape, SurfaceId,
-    TextEdit, UiEvent, ViewId, VirtTextPos, WindowId, WindowLayout,
+    NamespaceId, NoticeKind, OnDelete, OptionValue, PaneId, PaneNode, PluginId, Rect, SelectShape,
+    SurfaceId, TabId, TabInfo, TextEdit, UiEvent, ViewId, VirtTextPos, WindowId, WindowLayout,
 };
 
 use crate::buffer::{Buffer, LineEdit};
@@ -34,6 +34,19 @@ use crate::window::{Viewport, Window};
 /// Quit and reload configuration: the two things you need when a panel is wrong. `ui.modal_escape_keys`
 /// replaces this, including with an empty list — see [`Editor::is_modal_escape`].
 const MODAL_ESCAPES: &[&str] = &["<C-q>", "<C-r>"];
+
+/// A pane id nothing in the workspace knows about.
+///
+/// Named rather than reported as a bare failure, because the two ways to get here are a plugin
+/// holding an id from before a close and a plugin that has muddled a pane with a window — and the
+/// number in the message is what tells them apart at a glance.
+fn no_pane(pane: PaneId) -> ApiError {
+    ApiError::NotFound { what: format!("pane {pane}") }
+}
+
+fn no_tab(tab: TabId) -> ApiError {
+    ApiError::NotFound { what: format!("tab {tab}") }
+}
 
 /// Work the core cannot do itself, drained by the host after every apply.
 #[derive(Debug, Clone, PartialEq)]
@@ -93,11 +106,68 @@ struct ViewState {
     /// The window that has this view's keys when nothing has pushed focus — its composer. What
     /// lets a binding on the `neosh.composer` kind resolve at rest. See [`Editor::set_home`].
     home: Option<WindowId>,
+    /// How this terminal's main region is divided, and which tab is on it.
+    ///
+    /// An `Option` because a view is made on demand — `views.entry(view).or_default()` runs from
+    /// half a dozen places, including ones with nothing to draw yet — and a tab needs an id, which
+    /// only the editor can allocate. `None` is "nobody has asked about the layout of this terminal
+    /// yet", which is different from a terminal with one empty tab in it and would be a lie to
+    /// report as such: the first ask is what fixes the ids, and everything downstream keys off
+    /// them.
+    tabs: Option<Tabs>,
 }
 
 impl Default for ViewState {
     fn default() -> Self {
-        Self { focus: FocusStack::new(), mode: Mode::Normal, pending_keys: Vec::new(), home: None }
+        Self {
+            focus: FocusStack::new(),
+            mode: Mode::Normal,
+            pending_keys: Vec::new(),
+            home: None,
+            tabs: None,
+        }
+    }
+}
+
+/// One terminal's tabs.
+#[derive(Debug, Clone)]
+struct Tabs {
+    tabs: Vec<TabInfo>,
+    active: TabId,
+    /// The panes this terminal has had the keyboard in, newest first.
+    ///
+    /// Not derivable from the tree, and needed by two things that would otherwise both guess:
+    /// arriving in a split from the side lands where you were rather than on whichever child is
+    /// first, and closing a pane hands the keyboard to the one you came from rather than to the
+    /// next one in draw order. Trimmed to the panes that still exist on every write, because a
+    /// remembered pane that has been closed is an id that will eventually be handed back out.
+    mru: Vec<PaneId>,
+}
+
+impl Tabs {
+    fn tab(&self, id: TabId) -> Option<&TabInfo> {
+        self.tabs.iter().find(|t| t.id == id)
+    }
+
+    fn tab_mut(&mut self, id: TabId) -> Option<&mut TabInfo> {
+        self.tabs.iter_mut().find(|t| t.id == id)
+    }
+
+    /// Which tab a pane is in.
+    fn owner(&self, pane: PaneId) -> Option<TabId> {
+        self.tabs.iter().find(|t| t.root.contains(pane)).map(|t| t.id)
+    }
+
+    fn active_tab(&self) -> Option<&TabInfo> {
+        self.tab(self.active)
+    }
+
+    /// Remember that a pane has the keyboard.
+    fn touch(&mut self, pane: PaneId) {
+        self.mru.retain(|p| *p != pane);
+        self.mru.insert(0, pane);
+        let live: Vec<PaneId> = self.tabs.iter().flat_map(|t| t.root.panes()).collect();
+        self.mru.retain(|p| live.contains(p));
     }
 }
 
@@ -160,6 +230,8 @@ pub struct Editor {
     next_win: u32,
     next_ns: u32,
     next_surface: u32,
+    next_pane: u32,
+    next_tab: u32,
 }
 
 impl Editor {
@@ -171,6 +243,8 @@ impl Editor {
             // 1 is taken by the selection namespace below.
             next_ns: 2,
             next_surface: 1,
+            next_pane: 1,
+            next_tab: 1,
             selection_ns: NamespaceId(1),
             ..Default::default()
         };
@@ -193,6 +267,430 @@ impl Editor {
     /// same answer as one about a terminal that has done nothing yet.
     fn peek(&self, view: ViewId) -> Option<&ViewState> {
         self.views.get(&view)
+    }
+
+    // ---- tabs and panes --------------------------------------------------
+    //
+    // The tree arithmetic is `crate::panes`, which knows nothing about windows or events. What is
+    // here is the three things it deliberately does not do: hand out ids, close the windows that
+    // were docked in a pane that has gone, and say what changed.
+
+    /// This view's tabs, making the first one if the view has never been laid out.
+    ///
+    /// Every read goes through here rather than through `Option`-handling at each call site,
+    /// because "a terminal with no tabs" is not a state anything downstream can draw and the
+    /// alternative is thirty places each deciding what to do about it.
+    fn tabs(&mut self, view: ViewId) -> &mut Tabs {
+        if self.peek(view).is_none_or(|v| v.tabs.is_none()) {
+            let (tab, pane) = (TabId(self.next_tab), PaneId(self.next_pane));
+            self.next_tab += 1;
+            self.next_pane += 1;
+            let first = TabInfo {
+                id: tab,
+                title: None,
+                root: PaneNode::Leaf { pane },
+                active_pane: pane,
+            };
+            self.view(view).tabs =
+                Some(Tabs { tabs: vec![first], active: tab, mru: vec![pane] });
+            // Said as soon as it exists, not only when something changes it.
+            //
+            // Every *later* mutation announces itself, so this looked like a formality — and it is
+            // the frame the whole main region is on. A window docked in a pane the frontend has
+            // never heard of gets no rectangle and is not drawn, which is correct and is why the
+            // first tab has to be announced by the thing that creates it. Left to the first
+            // mutation, a terminal that opens and is simply *used* — no split, no second tab — has
+            // a transcript and a composer that exist, hold the right text, and are never on screen.
+            self.publish_panes(view);
+        }
+        self.view(view).tabs.as_mut().expect("just made")
+    }
+
+    fn peek_tabs(&self, view: ViewId) -> Option<&Tabs> {
+        self.peek(view).and_then(|v| v.tabs.as_ref())
+    }
+
+    /// Every tab of a view, and which one is on screen.
+    pub fn tab_list(&mut self, view: ViewId) -> (Vec<TabInfo>, TabId) {
+        let t = self.tabs(view);
+        (t.tabs.clone(), t.active)
+    }
+
+    /// The pane this view's keys belong to: the active pane of the active tab.
+    pub fn active_pane(&mut self, view: ViewId) -> PaneId {
+        let t = self.tabs(view);
+        let active = t.active;
+        t.tab(active).map(|t| t.active_pane).unwrap_or_else(|| {
+            // A tab list whose `active` names nothing is a bug one level up, but the honest
+            // recovery is the first pane there is rather than a panic in a draw path.
+            t.tabs.first().map(|t| t.active_pane).unwrap_or(PaneId(0))
+        })
+    }
+
+    /// The pane this view's keys belong to, without settling a view that has never been laid out.
+    ///
+    /// The read-only half of [`Editor::active_pane`]. Both exist because the read path is on every
+    /// frame and half of it holds a `&self` it cannot give up — and a getter that quietly allocates
+    /// the first tab is one that turns "which pane is this?" into a state change.
+    pub fn active_pane_of(&self, view: ViewId) -> Option<PaneId> {
+        let t = self.peek_tabs(view)?;
+        t.active_tab().map(|t| t.active_pane)
+    }
+
+    /// Every pane of every tab of a view, in tab order.
+    pub fn panes_of(&self, view: ViewId) -> Vec<PaneId> {
+        self.peek_tabs(view)
+            .map(|t| t.tabs.iter().flat_map(|t| t.root.panes()).collect())
+            .unwrap_or_default()
+    }
+
+    /// The panes of one tab, left to right and top to bottom.
+    pub fn panes_in_tab(&self, view: ViewId, tab: TabId) -> Vec<PaneId> {
+        self.peek_tabs(view).and_then(|t| t.tab(tab)).map(|t| t.root.panes()).unwrap_or_default()
+    }
+
+    /// Which tab is on screen in a view.
+    pub fn active_tab_of(&self, view: ViewId) -> Option<TabId> {
+        self.peek_tabs(view).map(|t| t.active)
+    }
+
+    /// How many tabs a view has. One for a view nothing has laid out yet, which is what it will
+    /// have the moment anything asks.
+    pub fn tab_count_of(&self, view: ViewId) -> usize {
+        self.peek_tabs(view).map(|t| t.tabs.len()).unwrap_or(1)
+    }
+
+    /// Every tab of a view, without settling one that has never been laid out.
+    pub fn tabs_of(&self, view: ViewId) -> Vec<TabInfo> {
+        self.peek_tabs(view).map(|t| t.tabs.clone()).unwrap_or_default()
+    }
+
+    /// Every binding in a mode, as [`ApiCall::KeymapList`] would report them.
+    ///
+    /// For the host drawing a legend, which has to say what is *bound* rather than what it once
+    /// bound: a rebinding in `init.ts` and a plugin adding a verb both have to show up, and a hint
+    /// row built from a hard-coded table is a promise about a keyboard nobody has.
+    pub fn keymaps_for(&self, mode: Mode) -> Vec<KeymapEntry> {
+        self.keymaps
+            .list(Some(mode))
+            .into_iter()
+            .map(|(mode, scope, seq, b)| KeymapEntry {
+                mode,
+                lhs: format_keys(&seq),
+                command: b.command,
+                scope,
+                desc: b.desc,
+            })
+            .collect()
+    }
+
+    /// What a command says it does, for a legend that would otherwise print its name.
+    pub fn command_desc(&self, name: &str) -> Option<String> {
+        self.commands.get(name).and_then(|c| c.desc.clone())
+    }
+
+    /// The surface claimed on a window, if one is.
+    ///
+    /// For the host painting a terminal: it claims once and then pushes cells on every frame, and
+    /// keeping the id itself would mean a second place that has to notice a window closing.
+    pub fn surface_on(&self, win: WindowId) -> Option<SurfaceId> {
+        self.surfaces.iter().find(|(_, (w, _))| *w == win).map(|(s, _)| *s)
+    }
+
+    /// The keys held while a multi-key sequence is still ambiguous.
+    ///
+    /// For a frontend that wants to *show* a half-typed chord — which is what makes a prefix layer
+    /// teachable rather than a thing you have to have been told. Read-only and a copy: the
+    /// resolution of a sequence is this type's business, and a caller that could edit the buffer
+    /// could make a chord resolve to something nobody pressed.
+    pub fn pending_keys(&self, view: ViewId) -> Vec<KeyPress> {
+        self.peek(view).map(|v| v.pending_keys.clone()).unwrap_or_default()
+    }
+
+    /// Which view a pane belongs to, for a call that named one without saying where.
+    pub fn view_of_pane(&self, pane: PaneId) -> Option<ViewId> {
+        self.views
+            .iter()
+            .find(|(_, v)| v.tabs.as_ref().is_some_and(|t| t.owner(pane).is_some()))
+            .map(|(id, _)| *id)
+    }
+
+    /// Which view a tab belongs to.
+    pub fn view_of_tab(&self, tab: TabId) -> Option<ViewId> {
+        self.views
+            .iter()
+            .find(|(_, v)| v.tabs.as_ref().is_some_and(|t| t.tab(tab).is_some()))
+            .map(|(id, _)| *id)
+    }
+
+    /// Divide a pane, and answer with the new one.
+    pub fn pane_split(&mut self, view: ViewId, pane: PaneId, dir: Direction) -> Option<PaneId> {
+        // As in `tab_new`: settle the view before reserving, or the first tab's pane and this one
+        // are handed the same id.
+        self.tabs(view);
+        let new = PaneId(self.next_pane);
+        let t = self.tabs(view);
+        let tab = t.owner(pane)?;
+        let root = &mut t.tab_mut(tab)?.root;
+        if !crate::panes::split(root, pane, dir, new) {
+            return None;
+        }
+        self.next_pane += 1;
+        self.publish_panes(view);
+        Some(new)
+    }
+
+    /// Take a pane out, closing every window docked in it.
+    ///
+    /// Answers whether it went. The last pane of the last tab is refused: a terminal with nowhere
+    /// to draw has no key that would bring a pane back, so this is one of the few places where
+    /// saying no is the only safe answer.
+    pub fn pane_close(&mut self, view: ViewId, pane: PaneId) -> bool {
+        let Some(t) = self.peek_tabs(view) else { return false };
+        let Some(tab) = t.owner(pane) else { return false };
+        let last_pane_of_tab = t.tab(tab).is_some_and(|t| t.root.panes().len() == 1);
+        if last_pane_of_tab {
+            // Closing a tab's only pane is closing the tab, which has its own last-one rule.
+            return self.tab_close(view, tab);
+        }
+
+        self.close_windows_in_pane(view, pane);
+
+        let t = self.tabs(view);
+        let Some(info) = t.tab_mut(tab) else { return false };
+        if !crate::panes::close(&mut info.root, pane) {
+            return false;
+        }
+        // The keyboard goes where you came from, not to whichever pane draws first.
+        let root_panes = info.root.panes();
+        let t = self.tabs(view);
+        t.mru.retain(|p| *p != pane);
+        let next = t.mru.iter().find(|p| root_panes.contains(p)).copied();
+        if let Some(info) = t.tab_mut(tab) {
+            if info.active_pane == pane {
+                info.active_pane = next.or_else(|| root_panes.first().copied()).unwrap_or(pane);
+            }
+        }
+        self.publish_panes(view);
+        true
+    }
+
+    /// Give a pane the keyboard, switching tabs if it is in another one.
+    pub fn pane_focus(&mut self, view: ViewId, pane: PaneId) -> bool {
+        let t = self.tabs(view);
+        let Some(tab) = t.owner(pane) else { return false };
+        t.active = tab;
+        if let Some(info) = t.tab_mut(tab) {
+            info.active_pane = pane;
+        }
+        t.touch(pane);
+        self.publish_panes(view);
+        true
+    }
+
+    /// Move the keyboard one pane in a direction, and answer with where it went.
+    pub fn pane_focus_dir(&mut self, view: ViewId, dir: Direction) -> Option<PaneId> {
+        let t = self.tabs(view);
+        let from = t.active_tab()?.active_pane;
+        let mru = t.mru.clone();
+        let root = &t.active_tab()?.root;
+        let to = crate::panes::neighbour(root, from, dir, &mru)?;
+        self.pane_focus(view, to).then_some(to)
+    }
+
+    pub fn pane_resize(&mut self, view: ViewId, pane: PaneId, dir: Direction, delta: i16) -> bool {
+        let t = self.tabs(view);
+        let Some(tab) = t.owner(pane) else { return false };
+        let Some(info) = t.tab_mut(tab) else { return false };
+        if !crate::panes::resize(&mut info.root, pane, dir, delta) {
+            return false;
+        }
+        self.publish_panes(view);
+        true
+    }
+
+    pub fn pane_swap(&mut self, view: ViewId, a: PaneId, b: PaneId) -> bool {
+        let t = self.tabs(view);
+        // Only within one tab: swapping across tabs would move the *windows* too, and a window
+        // belongs to a view rather than to a tab — so the honest version of "move this pane to that
+        // tab" is a different call, and pretending this is it would half-do it.
+        let (Some(ta), Some(tb)) = (t.owner(a), t.owner(b)) else { return false };
+        if ta != tb {
+            return false;
+        }
+        let Some(info) = t.tab_mut(ta) else { return false };
+        if !crate::panes::swap(&mut info.root, a, b) {
+            return false;
+        }
+        self.publish_panes(view);
+        true
+    }
+
+    /// Move a pane to the far edge of its tab. Vim's `<C-w>H`/`J`/`K`/`L`.
+    pub fn pane_move_edge(&mut self, view: ViewId, pane: PaneId, dir: Direction) -> bool {
+        let t = self.tabs(view);
+        let Some(tab) = t.owner(pane) else { return false };
+        let Some(info) = t.tab_mut(tab) else { return false };
+        if !crate::panes::move_to_edge(&mut info.root, pane, dir) {
+            return false;
+        }
+        self.publish_panes(view);
+        true
+    }
+
+    pub fn pane_equalize(&mut self, view: ViewId) {
+        let t = self.tabs(view);
+        let active = t.active;
+        if let Some(info) = t.tab_mut(active) {
+            crate::panes::equalize(&mut info.root);
+        }
+        self.publish_panes(view);
+    }
+
+    /// Open a tab with one empty pane, and answer with both ids.
+    pub fn tab_new(
+        &mut self,
+        view: ViewId,
+        title: Option<String>,
+        activate: bool,
+    ) -> (TabId, PaneId) {
+        // Settle the view's first tab *before* reserving ids for this one. Reserved first, the two
+        // would collide: making the first tab allocates from the same counters, so a view whose
+        // very first call was `tab_new` would get two tabs with one id between them.
+        self.tabs(view);
+        let (tab, pane) = (TabId(self.next_tab), PaneId(self.next_pane));
+        self.next_tab += 1;
+        self.next_pane += 1;
+        let t = self.tabs(view);
+        t.tabs.push(TabInfo {
+            id: tab,
+            title,
+            root: PaneNode::Leaf { pane },
+            active_pane: pane,
+        });
+        if activate {
+            t.active = tab;
+            t.touch(pane);
+        }
+        self.publish_panes(view);
+        (tab, pane)
+    }
+
+    /// Close a tab and every window in it. The view's last tab is refused.
+    pub fn tab_close(&mut self, view: ViewId, tab: TabId) -> bool {
+        let t = self.tabs(view);
+        if t.tabs.len() <= 1 || t.tab(tab).is_none() {
+            return false;
+        }
+        let panes = t.tab(tab).map(|t| t.root.panes()).unwrap_or_default();
+        for pane in &panes {
+            self.close_windows_in_pane(view, *pane);
+        }
+
+        let t = self.tabs(view);
+        let at = t.tabs.iter().position(|t| t.id == tab).unwrap_or(0);
+        t.tabs.retain(|t| t.id != tab);
+        t.mru.retain(|p| !panes.contains(p));
+        if t.active == tab {
+            // The tab to its left, or the first one — never "the one that is now at this index",
+            // which for the last tab is nothing at all.
+            let next = at.min(t.tabs.len().saturating_sub(1));
+            t.active = t.tabs[next].id;
+            let pane = t.tabs[next].active_pane;
+            t.touch(pane);
+        }
+        self.publish_panes(view);
+        true
+    }
+
+    pub fn tab_select(&mut self, view: ViewId, tab: TabId) -> bool {
+        let t = self.tabs(view);
+        if t.tab(tab).is_none() {
+            return false;
+        }
+        t.active = tab;
+        let pane = t.tab(tab).map(|t| t.active_pane);
+        if let Some(p) = pane {
+            t.touch(p);
+        }
+        self.publish_panes(view);
+        true
+    }
+
+    /// Go `delta` tabs along the bar, wrapping.
+    pub fn tab_step(&mut self, view: ViewId, delta: i32) -> Option<TabId> {
+        let t = self.tabs(view);
+        let n = t.tabs.len() as i32;
+        if n == 0 {
+            return None;
+        }
+        let at = t.tabs.iter().position(|x| x.id == t.active)? as i32;
+        let to = (at + delta).rem_euclid(n) as usize;
+        let id = t.tabs[to].id;
+        self.tab_select(view, id).then_some(id)
+    }
+
+    /// Move a tab along the bar, clamped at the ends.
+    pub fn tab_move(&mut self, view: ViewId, tab: TabId, to: u32) -> bool {
+        let t = self.tabs(view);
+        let Some(from) = t.tabs.iter().position(|x| x.id == tab) else { return false };
+        let to = (to as usize).min(t.tabs.len().saturating_sub(1));
+        if from == to {
+            return false;
+        }
+        let info = t.tabs.remove(from);
+        t.tabs.insert(to, info);
+        self.publish_panes(view);
+        true
+    }
+
+    pub fn tab_rename(&mut self, view: ViewId, tab: TabId, title: Option<String>) -> bool {
+        let t = self.tabs(view);
+        let Some(info) = t.tab_mut(tab) else { return false };
+        info.title = title;
+        self.publish_panes(view);
+        true
+    }
+
+    /// Close every window docked in a pane that is going away.
+    ///
+    /// Windows rather than buffers: the transcript in a closed pane is a conversation that still
+    /// exists and may be on screen in the terminal next door. What goes is the viewport onto it.
+    fn close_windows_in_pane(&mut self, view: ViewId, pane: PaneId) {
+        let doomed: Vec<WindowId> = self
+            .windows
+            .values()
+            .filter(|w| w.view == view)
+            .filter(|w| matches!(&w.layout, WindowLayout::Docked { pane: Some(p), .. } if *p == pane))
+            .map(|w| w.id)
+            .collect();
+        for win in doomed {
+            self.windows.remove(&win);
+            self.captures.remove(&win);
+            self.keymaps.remove_window(win);
+            self.win_hl.remove(&win);
+            self.surfaces.retain(|_, (w, _)| *w != win);
+            if let Some(v) = self.views.get_mut(&view) {
+                v.focus.remove(win);
+                if v.home == Some(win) {
+                    // The home window is where keys go at rest. Left pointing at a closed window,
+                    // every binding on the composer's kind stops resolving and the keyboard has
+                    // nowhere to be — which looks exactly like the workspace having hung.
+                    v.home = None;
+                }
+            }
+            self.push_ui_in(view, UiEvent::WindowClosed { win });
+        }
+    }
+
+    fn publish_panes(&mut self, view: ViewId) {
+        let Some(t) = self.peek_tabs(view) else { return };
+        let (tabs, active) = (t.tabs.clone(), t.active);
+        debug_assert!(
+            tabs.iter().all(|t| crate::panes::well_formed(&t.root)),
+            "a malformed pane tree reached the frontend: {tabs:?}"
+        );
+        self.push_ui_in(view, UiEvent::PanesChanged { tabs, active });
     }
 
     /// Hand one view's windows to another id.
@@ -605,6 +1103,14 @@ impl Editor {
             self.push_ui_in(view, UiEvent::BufferLines { buf, start: 0, old_end: u32::MAX, lines });
         }
 
+        // Before the windows, because a window docked in a pane cannot be placed until the mirror
+        // knows the pane is there. Said the other way round, every window in the main region is
+        // dropped on the frame the terminal attaches on — which is the whole screen, blank, for as
+        // long as it takes something else to change and force a redraw.
+        if self.peek_tabs(view).is_some() {
+            self.publish_panes(view);
+        }
+
         // This view's windows and no others. A terminal has no use for the geometry of a panel
         // open in the terminal next door, and telling it would put a window on its screen that
         // nothing there can close.
@@ -643,6 +1149,8 @@ impl Editor {
 
         let focus = self.peek(view).and_then(|v| v.focus.current());
         self.push_ui_in(view, UiEvent::FocusChanged { win: focus });
+        let home = self.home(view);
+        self.push_ui_in(view, UiEvent::HomeChanged { win: home });
     }
 
     fn republish_highlights(&mut self) {
@@ -814,7 +1322,13 @@ impl Editor {
     /// key bound against `neosh.composer` has to resolve at rest, which means resolution needs a
     /// window to read the kind off. Window- and buffer-scoped bindings on it resolve too.
     pub fn set_home(&mut self, view: ViewId, win: Option<WindowId>) {
+        if self.view(view).home == win {
+            return;
+        }
         self.view(view).home = win;
+        // The frontend needs this to place the caret at rest. It used to work it out — "the
+        // bottom-most docked window" — which was exact until a terminal could have two of them.
+        self.push_ui_in(view, UiEvent::HomeChanged { win });
     }
 
     fn home(&self, view: ViewId) -> Option<WindowId> {
@@ -1017,9 +1531,7 @@ impl Editor {
                 // Dropping the prefix instead would mean that with `gd` bound, typing `gx` produces
                 // `x` — the composer eats characters and there is no way to tell why.
                 let held = std::mem::take(&mut self.view(view).pending_keys);
-                for k in held {
-                    self.unclaimed(view, k);
-                }
+                self.replay(view, held);
             }
         }
         res
@@ -1035,10 +1547,39 @@ impl Editor {
         if held.is_empty() {
             return false;
         }
-        for k in held {
-            self.unclaimed(view, k);
-        }
+        self.replay(view, held);
         true
+    }
+
+    /// Give back the keys an abandoned sequence was holding, each one on its own terms.
+    ///
+    /// **Each is re-resolved as a single key first**, and only reaches [`Self::unclaimed`] if
+    /// nothing is bound to it alone. Dumping the whole run as unbound input is what this used to do,
+    /// and it meant that a prefix in flight *disabled every other binding on the keyboard*: with
+    /// `<C-w>` held, `<C-w><C-v>` matches nothing, so `<C-v>` was replayed as raw input and the
+    /// thing it is actually bound to — attach the image on the clipboard — never ran. A key the
+    /// abandoned sequence merely *contained* is still a key somebody pressed, and if something is
+    /// bound to it by itself then that is what they meant.
+    ///
+    /// The `gd`/`gx` case the replay exists for is unchanged: neither `g` nor `x` is bound alone, so
+    /// both still arrive in the field as characters.
+    ///
+    /// Resolved directly rather than by feeding each key back in, which would be a loop — `<C-w>` is
+    /// a prefix, so re-feeding it would start the same pending sequence over again and the key after
+    /// it would join that one. A lone key that is *only* a prefix resolves to `Pending` here and is
+    /// treated as unclaimed, which for a chord means it does nothing at all.
+    fn replay(&mut self, view: ViewId, held: Vec<KeyPress>) {
+        let scopes = self.active_scopes(view);
+        let mode = self.mode(view);
+        for k in held {
+            match self.keymaps.resolve(mode, &scopes, std::slice::from_ref(&k)) {
+                KeyResolution::Matched { command, .. } => {
+                    let ctx = KeyContext { key: k, mode, view, win: self.focused(view) };
+                    self.invoke_command(&command.clone(), Vec::new(), Some(ctx));
+                }
+                _ => self.unclaimed(view, k),
+            }
+        }
     }
 
     /// A key no binding wanted.
@@ -1232,6 +1773,35 @@ impl Editor {
             ApiCall::BufGetKind { buf } => {
                 Ok(ApiOk::MaybeText { text: self.buf(buf)?.kind.clone() })
             }
+            ApiCall::BufDelete { buf } => {
+                if !self.buffers.contains_key(&buf) {
+                    return Err(ApiError::NotFound { what: format!("buffer {buf}") });
+                }
+                // The windows first, and each told to the terminal it was in — a window belongs to
+                // exactly one view, and a `WindowClosed` sent to everybody is a window vanishing
+                // from a mirror that never had it.
+                let showing: Vec<(WindowId, ViewId)> =
+                    self.windows.values().filter(|w| w.buf == buf).map(|w| (w.id, w.view)).collect();
+                for (win, at) in showing {
+                    self.windows.remove(&win);
+                    self.captures.remove(&win);
+                    self.keymaps.remove_window(win);
+                    self.win_hl.remove(&win);
+                    self.surfaces.retain(|_, (w, _)| *w != win);
+                    if let Some(v) = self.views.get_mut(&at) {
+                        v.focus.remove(win);
+                        if v.home == Some(win) {
+                            v.home = None;
+                        }
+                    }
+                    self.push_ui_in(at, UiEvent::WindowClosed { win });
+                }
+                self.buffers.remove(&buf);
+                self.attached.remove(&buf);
+                // To everybody: a buffer is the workspace's, so every mirror may be holding it.
+                self.push_ui(UiEvent::BufferClosed { buf });
+                Ok(ApiOk::Unit)
+            }
             ApiCall::BufLineCount { buf } => {
                 Ok(ApiOk::Count { n: self.buf(buf)?.line_count() })
             }
@@ -1326,12 +1896,15 @@ impl Editor {
             }
             ApiCall::WinResize { win, size } => {
                 let layout = match &self.win(win)?.layout {
-                    WindowLayout::Docked { dock, gravity, wrap, .. } => WindowLayout::Docked {
-                        dock: *dock,
-                        size,
-                        gravity: *gravity,
-                        wrap: *wrap,
-                    },
+                    WindowLayout::Docked { pane, dock, gravity, wrap, .. } => {
+                        WindowLayout::Docked {
+                            pane: *pane,
+                            dock: *dock,
+                            size,
+                            gravity: *gravity,
+                            wrap: *wrap,
+                        }
+                    }
                     WindowLayout::Float { .. } => {
                         return Err(ApiError::InvalidArgument {
                             message: "win_resize is for docked windows; a float is configured with float_configure".into(),
@@ -1502,6 +2075,99 @@ impl Editor {
                 // different window each time there are two.
                 windows.sort_by_key(|w| w.win.0);
                 Ok(ApiOk::Windows { windows })
+            }
+
+            // ---- tabs and panes --------------------------------------
+            //
+            // A call naming a pane or a tab does not also say which terminal it is in, and does not
+            // have to: an id is unique across the workspace, so the view is *looked up* from it
+            // rather than taken from whoever asked. Which is the difference between a plugin
+            // splitting the pane it was given and a plugin splitting whatever happens to be under
+            // the terminal it is being served from — the second is right almost always and wrong
+            // exactly when an orchestrator is putting work on somebody else's screen.
+            ApiCall::PaneSplit { pane, dir } => {
+                let at = self.view_of_pane(pane).ok_or_else(|| no_pane(pane))?;
+                let new = self.pane_split(at, pane, dir).ok_or_else(|| no_pane(pane))?;
+                Ok(ApiOk::Pane { pane: Some(new) })
+            }
+            ApiCall::PaneClose { pane } => {
+                let at = self.view_of_pane(pane).ok_or_else(|| no_pane(pane))?;
+                if !self.pane_close(at, pane) {
+                    return Err(ApiError::InvalidArgument {
+                        message: "the last pane of the last tab cannot be closed — a terminal with nowhere to draw has no key that would bring one back".into(),
+                    });
+                }
+                Ok(ApiOk::Unit)
+            }
+            ApiCall::PaneFocus { pane } => {
+                let at = self.view_of_pane(pane).ok_or_else(|| no_pane(pane))?;
+                self.pane_focus(at, pane);
+                Ok(ApiOk::Unit)
+            }
+            ApiCall::PaneFocusDir { view: named, dir } => {
+                let at = named.unwrap_or(view);
+                Ok(ApiOk::Pane { pane: self.pane_focus_dir(at, dir) })
+            }
+            ApiCall::PaneResize { pane, dir, delta } => {
+                let at = self.view_of_pane(pane).ok_or_else(|| no_pane(pane))?;
+                // Not an error at the edge: this is a held key, and a refusal per press after the
+                // last one that fit is a stream of messages where nothing has gone wrong.
+                self.pane_resize(at, pane, dir, delta);
+                Ok(ApiOk::Unit)
+            }
+            ApiCall::PaneSwap { pane, with } => {
+                let at = self.view_of_pane(pane).ok_or_else(|| no_pane(pane))?;
+                if !self.pane_swap(at, pane, with) {
+                    return Err(ApiError::InvalidArgument {
+                        message: "two panes of one tab can be swapped; two panes of different tabs cannot — the windows in them belong to the terminal, not to the tab".into(),
+                    });
+                }
+                Ok(ApiOk::Unit)
+            }
+            ApiCall::PaneMoveEdge { pane, dir } => {
+                let at = self.view_of_pane(pane).ok_or_else(|| no_pane(pane))?;
+                self.pane_move_edge(at, pane, dir);
+                Ok(ApiOk::Unit)
+            }
+            ApiCall::PaneEqualize { view: named } => {
+                self.pane_equalize(named.unwrap_or(view));
+                Ok(ApiOk::Unit)
+            }
+            ApiCall::TabNew { view: named, title, activate } => {
+                let (tab, _) = self.tab_new(named.unwrap_or(view), title, activate);
+                Ok(ApiOk::Tab { tab })
+            }
+            ApiCall::TabClose { tab } => {
+                let at = self.view_of_tab(tab).ok_or_else(|| no_tab(tab))?;
+                if !self.tab_close(at, tab) {
+                    return Err(ApiError::InvalidArgument {
+                        message: "a terminal's last tab cannot be closed".into(),
+                    });
+                }
+                Ok(ApiOk::Unit)
+            }
+            ApiCall::TabSelect { tab } => {
+                let at = self.view_of_tab(tab).ok_or_else(|| no_tab(tab))?;
+                self.tab_select(at, tab);
+                Ok(ApiOk::Unit)
+            }
+            ApiCall::TabStep { view: named, delta } => {
+                self.tab_step(named.unwrap_or(view), delta);
+                Ok(ApiOk::Unit)
+            }
+            ApiCall::TabMove { tab, to } => {
+                let at = self.view_of_tab(tab).ok_or_else(|| no_tab(tab))?;
+                self.tab_move(at, tab, to);
+                Ok(ApiOk::Unit)
+            }
+            ApiCall::TabRename { tab, title } => {
+                let at = self.view_of_tab(tab).ok_or_else(|| no_tab(tab))?;
+                self.tab_rename(at, tab, title);
+                Ok(ApiOk::Unit)
+            }
+            ApiCall::TabList { view: named } => {
+                let (tabs, active) = self.tab_list(named.unwrap_or(view));
+                Ok(ApiOk::Tabs { tabs, active })
             }
 
             // ---- extmarks --------------------------------------------

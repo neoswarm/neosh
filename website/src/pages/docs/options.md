@@ -67,10 +67,14 @@ Every picker, prompt and completion list reads the `ui.keys.*` family, in Neovim
 "ui.keys.dismiss" = "<Esc> <C-c>"
 "ui.keys.complete" = "<Tab> <Right>"
 "ui.keys.clear" = "<C-u>"
-"ui.keys.delete_word" = "<C-w>"
+"ui.keys.delete_word" = "<C-BS>"
+"ui.keys.window_prefix" = "<C-w>"
+"ui.keys.hint_delay" = 300
 ```
 
 A widget claims these window-scoped while it is open, so they outrank global bindings and are released the moment it closes. That is what makes `^N` move in a picker even though `^N` is otherwise "new conversation".
+
+The last two are the window prefix and how long you have to hold it before it lists what follows. `ui.keys.hint_delay = 0` shows the list at once; a bigger number keeps it out of the way of anyone who already knows the letters. `ui.keys.delete_word` moved off `<C-w>` when the prefix took it — a key cannot both delete a word and wait to see whether a window verb follows, because the waiting is what makes every word-delete feel late. Set them to each other's values if you would rather have it the old way round.
 
 ## Sidebar
 

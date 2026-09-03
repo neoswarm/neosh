@@ -5,6 +5,7 @@ import type { Capability } from "./Capability";
 import type { CursorMotion } from "./CursorMotion";
 import type { CursorShape } from "./CursorShape";
 import type { DiffTarget } from "./DiffTarget";
+import type { Direction } from "./Direction";
 import type { DriverKind } from "./DriverKind";
 import type { ExtmarkId } from "./ExtmarkId";
 import type { ExtmarkOpts } from "./ExtmarkOpts";
@@ -25,6 +26,7 @@ import type { NodeId } from "./NodeId";
 import type { NoticeKind } from "./NoticeKind";
 import type { OptionSpec } from "./OptionSpec";
 import type { OptionValue } from "./OptionValue";
+import type { PaneId } from "./PaneId";
 import type { PermissionMode } from "./PermissionMode";
 import type { ProjectKey } from "./ProjectKey";
 import type { ProviderEvent } from "./ProviderEvent";
@@ -36,6 +38,7 @@ import type { StatusSegment } from "./StatusSegment";
 import type { StreamId } from "./StreamId";
 import type { SurfaceCell } from "./SurfaceCell";
 import type { SurfaceId } from "./SurfaceId";
+import type { TabId } from "./TabId";
 import type { TextEdit } from "./TextEdit";
 import type { ToolDef } from "./ToolDef";
 import type { UsageResolution } from "./UsageResolution";
@@ -55,6 +58,7 @@ export type ApiCall =
      */
     kind?: string | null;
   }
+  | { "call": "buf_delete"; buf: BufferId }
   | { "call": "buf_line_count"; buf: BufferId }
   | {
     "call": "buf_get_lines";
@@ -110,6 +114,38 @@ export type ApiCall =
   | { "call": "win_get_viewport"; win: WindowId }
   | { "call": "win_scroll_to"; win: WindowId; top_line: number | null }
   | { "call": "win_list" }
+  | {
+    "call": "pane_split";
+    pane: PaneId;
+    /**
+     * Which side of `pane` the new one takes. `Right` and `Down` put it after `pane` in the
+     * split; `Left` and `Up` put it before.
+     */
+    dir: Direction;
+  }
+  | { "call": "pane_close"; pane: PaneId }
+  | { "call": "pane_focus"; pane: PaneId }
+  | { "call": "pane_focus_dir"; view?: ViewId | null; dir: Direction }
+  | { "call": "pane_resize"; pane: PaneId; dir: Direction; delta: number }
+  | { "call": "pane_swap"; pane: PaneId; with: PaneId }
+  | { "call": "pane_move_edge"; pane: PaneId; dir: Direction }
+  | { "call": "pane_equalize"; view?: ViewId | null }
+  | {
+    "call": "tab_new";
+    view?: ViewId | null;
+    title?: string | null;
+    /**
+     * Whether to go to it. A tab opened by a key is; a tab opened by an orchestrator putting
+     * work somewhere is not, for the same reason `SessionNew { activate: false }` exists.
+     */
+    activate: boolean;
+  }
+  | { "call": "tab_close"; tab: TabId }
+  | { "call": "tab_select"; tab: TabId }
+  | { "call": "tab_step"; view?: ViewId | null; delta: number }
+  | { "call": "tab_move"; tab: TabId; to: number }
+  | { "call": "tab_rename"; tab: TabId; title: string | null }
+  | { "call": "tab_list"; view?: ViewId | null }
   | {
     "call": "win_motion";
     win: WindowId;

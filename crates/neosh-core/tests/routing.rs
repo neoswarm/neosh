@@ -175,7 +175,7 @@ fn a_kind_scoped_binding_reaches_a_panel_it_does_not_own() {
     let win = match e
         .apply(&panel, ApiCall::WinOpen {
             buf,
-            layout: neosh_proto::WindowLayout::Docked {
+            layout: neosh_proto::WindowLayout::Docked { pane: None,
                 dock: neosh_proto::Dock::Left,
                 size: Some(30),
                 gravity: neosh_proto::Gravity::Start,
@@ -242,7 +242,7 @@ fn windows_are_listed_with_what_is_in_them() {
     };
     e.apply(&panel, ApiCall::WinOpen {
         buf,
-        layout: neosh_proto::WindowLayout::Docked {
+        layout: neosh_proto::WindowLayout::Docked { pane: None,
             dock: neosh_proto::Dock::Left,
             size: Some(30),
             gravity: neosh_proto::Gravity::Start,

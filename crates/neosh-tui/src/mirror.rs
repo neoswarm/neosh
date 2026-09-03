@@ -61,7 +61,19 @@ pub struct Mirror {
     pub window_order: Vec<WindowId>,
     pub surfaces: BTreeMap<SurfaceId, MirrorSurface>,
     pub highlights: BTreeMap<String, HighlightDef>,
+    /// How this terminal's main region is divided, as the core last said it.
+    ///
+    /// Empty until the first `PanesChanged`, which is not the same as "one pane covering
+    /// everything": a window docked in a pane the mirror has never heard of is not drawn, and
+    /// drawing it somewhere plausible instead would put the transcript on screen one frame before
+    /// the layout that says where it goes, in the wrong place, and then move it.
+    pub tabs: Vec<neosh_proto::TabInfo>,
+    pub active_tab: Option<neosh_proto::TabId>,
     pub focus: Option<WindowId>,
+    /// Where the keyboard rests when nothing has taken it — the active pane's composer.
+    ///
+    /// Said by the core rather than worked out here. See [`neosh_proto::UiEvent::HomeChanged`].
+    pub home: Option<WindowId>,
     /// Notifications, with when each arrived.
     ///
     /// The protocol carries no timestamp — a message is a message, and a frontend that never shows
@@ -198,8 +210,15 @@ impl Mirror {
             UiEvent::SurfaceReleased { surface } => {
                 self.surfaces.remove(&surface);
             }
+            UiEvent::PanesChanged { tabs, active } => {
+                self.tabs = tabs;
+                self.active_tab = Some(active);
+            }
             UiEvent::FocusChanged { win } => {
                 self.focus = win;
+            }
+            UiEvent::HomeChanged { win } => {
+                self.home = win;
             }
             UiEvent::Message { level, text, kind, key } => {
                 let now = std::time::Instant::now();
@@ -383,7 +402,7 @@ mod tests {
         m.apply(UiEvent::WindowOpened {
             win: WindowId(1),
             buf: BufferId(1),
-            layout: WindowLayout::Docked { dock: Dock::Main, size: None, gravity: Gravity::Start, wrap: None },
+            layout: WindowLayout::Docked { pane: None, dock: Dock::Main, size: None, gravity: Gravity::Start, wrap: None },
         });
         let float = |z: i32| WindowLayout::Float {
             config: FloatConfig {
@@ -405,7 +424,7 @@ mod tests {
         m.apply(UiEvent::WindowOpened {
             win: WindowId(1),
             buf: BufferId(1),
-            layout: WindowLayout::Docked { dock: Dock::Main, size: None, gravity: Gravity::Start, wrap: None },
+            layout: WindowLayout::Docked { pane: None, dock: Dock::Main, size: None, gravity: Gravity::Start, wrap: None },
         });
         m.apply(UiEvent::SurfaceClaimed {
             surface: SurfaceId(1),

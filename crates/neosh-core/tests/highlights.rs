@@ -116,7 +116,7 @@ fn a_kind_remap_reaches_every_window_of_the_kind_including_later_ones() {
         ApiOk::Buf { buf } => buf,
         other => panic!("{other:?}"),
     };
-    let win = e.open_window(buf, WindowLayout::Docked {
+    let win = e.open_window(buf, WindowLayout::Docked { pane: None,
         dock: neosh_proto::Dock::Left,
         size: Some(30),
         gravity: Default::default(),

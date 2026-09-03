@@ -26,25 +26,191 @@ use serde::{Deserialize, Serialize};
 use ts_rs::TS;
 
 use crate::api::ApiResponse;
-use crate::ids::{BufferId, ExtmarkId, NamespaceId, SessionId, SurfaceId, WindowId};
+use crate::ids::{
+    BufferId, ExtmarkId, NamespaceId, PaneId, SessionId, SurfaceId, TabId, WindowId,
+};
 
 // ---------------------------------------------------------------------------
 // Geometry
 // ---------------------------------------------------------------------------
 
-/// Where a non-floating window sits.
+/// Which edge of a rectangle a non-floating window sits against.
 ///
-/// Deliberately *not* an arbitrary split tree: agent UIs do not need one, and a split tree creates
-/// layout ambiguity that every plugin then has to reason about.
+/// The rectangle is the screen, or — when the window names a [`PaneId`] — one pane of the main
+/// region. That is the only difference between the two, and it is what let splitting arrive without
+/// a second geometry vocabulary: a composer docked `Bottom` in a pane is the same call as a
+/// composer docked `Bottom` on the screen, asked about a smaller rectangle.
+///
+/// Still not an arbitrary split tree *here*: a window says which edge of which rectangle it wants,
+/// and the tree that makes those rectangles is [`PaneNode`], one level up. Keeping the two apart is
+/// what stops every plugin from having to reason about nesting to place a status line.
 #[derive(TS, Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
 #[serde(rename_all = "snake_case")]
 #[ts(export)]
 pub enum Dock {
     Left,
     Right,
+    /// The strip above the main region, inside it — to the right of a left dock, not over it.
+    ///
+    /// Which is what a tab bar needs and could not otherwise have: carved from the screen it would
+    /// span the sidebar too, and a tab bar that runs across the project panel is a tab bar that
+    /// looks like it belongs to the workspace rather than to the region it names.
+    Top,
     Bottom,
-    /// The primary region. Exactly one window occupies it at a time.
+    /// The primary region. Exactly one window occupies it at a time — per rectangle, so one per
+    /// pane rather than one per screen.
     Main,
+}
+
+/// Which way a split lays its children out.
+///
+/// Named for what it does to the screen rather than for the key that made it, because those two
+/// disagree in every editor that has ever shipped one: Vim's `:vsplit` produces panes side by side,
+/// and a `Vertical` that means "stacked" to the layout code and "side by side" to the user is a
+/// bug waiting for its first off-by-one. `Row` is a row of panes; `Column` is a column of them.
+/// The *commands* say `right` and `down`, which is the one description nobody can misread.
+#[derive(TS, Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
+#[serde(rename_all = "snake_case")]
+#[ts(export)]
+pub enum SplitDir {
+    /// Children side by side, dividing the width.
+    Row,
+    /// Children stacked, dividing the height.
+    Column,
+}
+
+impl SplitDir {
+    /// The direction a split of this kind is crossed by, going from one child to the next.
+    pub fn axis(self) -> (Direction, Direction) {
+        match self {
+            SplitDir::Row => (Direction::Left, Direction::Right),
+            SplitDir::Column => (Direction::Up, Direction::Down),
+        }
+    }
+}
+
+/// Which way to go, for moving between panes and for growing one.
+#[derive(TS, Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
+#[serde(rename_all = "snake_case")]
+#[ts(export)]
+pub enum Direction {
+    Left,
+    Right,
+    Up,
+    Down,
+}
+
+impl Direction {
+    /// The split that divides space along this direction's axis.
+    pub fn split(self) -> SplitDir {
+        match self {
+            Direction::Left | Direction::Right => SplitDir::Row,
+            Direction::Up | Direction::Down => SplitDir::Column,
+        }
+    }
+
+    /// Whether this direction runs towards later children of its split.
+    pub fn forward(self) -> bool {
+        matches!(self, Direction::Right | Direction::Down)
+    }
+}
+
+/// How the main region of one tab is divided.
+///
+/// A tree rather than a list because a split of a split is the thing people actually build — a chat
+/// on the left, and on the right a chat above a terminal — and a flat list of rectangles cannot say
+/// that without every consumer re-deriving the nesting from coordinates.
+#[derive(TS, Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+#[ts(export)]
+pub enum PaneNode {
+    /// One rectangle. Whatever is docked in this pane is drawn in it.
+    Leaf { pane: PaneId },
+    /// Several, sharing one axis in the order given.
+    ///
+    /// Never fewer than two: a split with one child is that child, and collapsing it on removal is
+    /// what keeps `<C-w>h` from stepping through invisible levels of nothing. Never nested inside a
+    /// split of the same `dir` either — three panes in a row are one `Row` of three, not a `Row` of
+    /// two whose second child is a `Row` — so that resizing divides the space a user can see.
+    Split { dir: SplitDir, children: Vec<PaneChild> },
+}
+
+/// One child of a split, and how much of the axis it gets.
+#[derive(TS, Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
+#[ts(export)]
+pub struct PaneChild {
+    pub node: PaneNode,
+    /// Share of the parent's axis, relative to its siblings.
+    ///
+    /// A weight rather than cells, because the terminal is resized by somebody dragging its corner
+    /// and a layout stored in cells has to be recomputed — badly, and with rounding that
+    /// accumulates — every time that happens. Weights survive a resize by meaning the same thing at
+    /// every size. [`WEIGHT`] is what an even split is made of.
+    pub weight: u16,
+}
+
+impl PaneChild {
+    /// An evenly-weighted child.
+    pub fn new(node: PaneNode) -> Self {
+        Self { node, weight: WEIGHT }
+    }
+}
+
+/// The weight every child starts with, and the unit resizing moves in.
+///
+/// Large enough that a pane can be shrunk many times and still divide sensibly: at 100, a pane
+/// resized down five times is still 50 rather than 0, and a weight that reaches zero is a pane you
+/// cannot see and cannot get back to.
+pub const WEIGHT: u16 = 100;
+
+impl PaneNode {
+    /// Every pane in this subtree, left to right and top to bottom.
+    ///
+    /// Which is also the order `<C-w>w` cycles in, so "the next pane" and "the next one along the
+    /// screen" are the same thing rather than two orders that agree until the first nested split.
+    pub fn panes(&self) -> Vec<PaneId> {
+        let mut out = Vec::new();
+        self.collect(&mut out);
+        out
+    }
+
+    fn collect(&self, out: &mut Vec<PaneId>) {
+        match self {
+            PaneNode::Leaf { pane } => out.push(*pane),
+            PaneNode::Split { children, .. } => {
+                for c in children {
+                    c.node.collect(out);
+                }
+            }
+        }
+    }
+
+    pub fn contains(&self, pane: PaneId) -> bool {
+        match self {
+            PaneNode::Leaf { pane: p } => *p == pane,
+            PaneNode::Split { children, .. } => children.iter().any(|c| c.node.contains(pane)),
+        }
+    }
+}
+
+/// One tab of one view.
+#[derive(TS, Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
+#[ts(export)]
+pub struct TabInfo {
+    pub id: TabId,
+    /// What the tab bar calls it.
+    ///
+    /// `None` is "name it after what is in it" — the conversation's title, the terminal's command —
+    /// which is what a tab nobody has renamed should say, and it has to stay `None` to keep saying
+    /// it: a title resolved once and stored is a tab still called `main` three conversations later.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    pub root: PaneNode,
+    /// Which pane in this tab has the keyboard when the tab does.
+    ///
+    /// Per tab rather than per view, so that leaving a tab and coming back puts you where you were
+    /// rather than in whichever pane happens to be first.
+    pub active_pane: PaneId,
 }
 
 /// What a float is positioned relative to.
@@ -203,6 +369,15 @@ impl Default for FloatConfig {
 #[ts(export)]
 pub enum WindowLayout {
     Docked {
+        /// Which pane's rectangle `dock` is measured against, or the screen's when absent.
+        ///
+        /// An `Option` rather than a pane that happens to mean "the whole screen", because the two
+        /// are different things and one of them outlives the other: a pane is closed when its split
+        /// is, and a window docked to the screen — the sidebar, the status line — must not go with
+        /// it. A window naming a pane that has gone is not drawn at all, which is the honest answer
+        /// and the one the frontend can give without inventing a rectangle.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pane: Option<PaneId>,
         dock: Dock,
         /// Preferred extent along the dock's variable axis.
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -749,7 +924,37 @@ pub enum UiEvent {
         surface: SurfaceId,
     },
 
+    /// How this view's main region is divided, and which tab is on it.
+    ///
+    /// The whole set of tabs every time, not a delta. A pane tree is a few dozen bytes and it
+    /// changes only when somebody presses a key — whereas a delta over a tree needs paths, and a
+    /// path into a tree that has been rebalanced by a close is the one kind of stale reference that
+    /// silently addresses the wrong pane rather than none. Retained by the editor and said again by
+    /// `republish`, because a terminal reattaching to a workspace with four tabs open has to be
+    /// told about all four.
+    PanesChanged {
+        tabs: Vec<TabInfo>,
+        active: TabId,
+    },
+
     FocusChanged {
+        win: Option<WindowId>,
+    },
+
+    /// Which window has this view's keys when nothing has *taken* them — its composer.
+    ///
+    /// The resting place of the keyboard, and therefore where the caret is drawn whenever no float
+    /// or panel has pushed focus. The core has always known this; it was not on the wire because
+    /// the frontend could work it out — "the bottom-most docked window" was exactly right while a
+    /// terminal had one of those.
+    ///
+    /// A split gives it two, and the guess then picks one of them by geometry: after `<C-w>v` the
+    /// caret stayed in the pane you left, so the field you were typing into and the field with the
+    /// cursor in it were different fields. There is no rule over rectangles that recovers this —
+    /// which pane the keyboard is in is a decision, not a position — so the decision is sent.
+    ///
+    /// Retained and said again by `republish`, like focus.
+    HomeChanged {
         win: Option<WindowId>,
     },
 

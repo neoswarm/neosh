@@ -2,12 +2,23 @@
 import type { Dock } from "./Dock";
 import type { FloatConfig } from "./FloatConfig";
 import type { Gravity } from "./Gravity";
+import type { PaneId } from "./PaneId";
 
 /**
  * Declarative placement for a window. The frontend turns this into a rectangle.
  */
 export type WindowLayout = {
   "kind": "docked";
+  /**
+   * Which pane's rectangle `dock` is measured against, or the screen's when absent.
+   *
+   * An `Option` rather than a pane that happens to mean "the whole screen", because the two
+   * are different things and one of them outlives the other: a pane is closed when its split
+   * is, and a window docked to the screen — the sidebar, the status line — must not go with
+   * it. A window naming a pane that has gone is not drawn at all, which is the honest answer
+   * and the one the frontend can give without inventing a rectangle.
+   */
+  pane?: PaneId | null;
   dock: Dock;
   /**
    * Preferred extent along the dock's variable axis.

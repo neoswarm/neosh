@@ -89,6 +89,58 @@ is `docs/releasing.md`.
   kind asks for it, `[provides]` is how `ext.points()` knows who reads what and how a typo'd point
   gets reported, and `ListPanel` gives a third party's panel all of this for a kind and a `rows`
   function.
+- **A pane is a rectangle, and a dock is measured against one.** Splitting arrived without a
+  second geometry vocabulary: `WindowLayout::Docked` gained an optional `PaneId`, and a composer
+  docked `Bottom` *in a pane* is the same call as one docked `Bottom` on the screen asked about a
+  smaller rectangle. The tree that makes those rectangles is `PaneNode`, one level up, so nothing
+  placing a status line has to reason about nesting. Two invariants, held by construction in
+  `neosh_core::panes` rather than checked afterwards: **a split has at least two children**, and
+  **a split is never directly inside a split of the same axis** — three panes in a row are one
+  `Row` of three, or the second boundary moves a different amount from the first for the same
+  keypress. Weights, never cells: a layout stored in cells has to be recomputed, badly, every time
+  somebody drags the terminal's corner. The editor owns the shape and the host owns the contents,
+  and `sync_panes` makes the difference true after every apply — so a pane a plugin created is
+  furnished exactly like one a key created. **What was one per terminal is now one per pane**:
+  `PaneState` is the transcript, the composer, the draft, the scroll, the search and the reading
+  state, because every one of those was always about *one conversation being read in one place*.
+  What is genuinely per terminal turned out to be two things — the status strip and `<C-c>` arming.
+  `views_showing` became `panes_showing`, and `in_pane` is `in_view` one level down: a turn's
+  output belongs to the pane reading that conversation, which is very often not the pane the
+  keyboard is in. **Which pane has the keyboard is a decision, not a position** — so it is *sent*
+  (`UiEvent::HomeChanged`) rather than derived. The frontend used to work it out as "the bottom-most
+  docked window", which was exact until a terminal had two of them, and then the caret stayed in
+  the pane you had just left. **And moving the keyboard into a pane is arriving in the conversation
+  it is reading**: which model answers, how hard it thinks, what the context meter measures and what
+  `⇧⇥` sets all resolve through the one conversation the store calls current, so a keyboard that
+  moved without saying so left `^P` showing the model of the pane you had left and `^E` opening its
+  options. Guarded on the store's current actually differing, because `enter` is a *history* and
+  moving to the front of it on every redraw would make the sidebar's order mean "most recently
+  drawn". `abandoning` counts panes for the same reason: asked per terminal, moving from one half of
+  a split to the other reported the half you left as abandoned while it was still on screen a column
+  away.
+- **A prefix layer is affordable only if it teaches itself.** This workspace's rule is that
+  inventing a prefix for one verb costs every user a concept to save one of them a keystroke —
+  and panes and tabs are twenty-four verbs on a keyboard where every Ctrl-with-a-letter is already
+  spoken for. `<C-w>` is Vim's, `ui.keys.window_prefix` moves it, and `ui.keys.delete_word` moved
+  off it to `<C-BS>` because one key cannot both delete a word and wait to see whether a window
+  verb follows: waiting is what makes every word-delete feel late. What pays for it is that
+  **holding the prefix draws the list** — after `ui.keys.hint_delay` (300 ms), so typing `<C-w>v`
+  fluently never flashes a panel and hesitating is answered — and the panel is built from the
+  *live keymap*, so a rebinding in `init.ts` shows your letter and a plugin's verb appears with
+  nobody writing glue. The tab strip carries the prefix permanently, which is where you find out
+  it exists. A legend is a promise about a keyboard, so every key it prints is read back out of
+  the registry rather than spelled in the renderer.
+- **The tab strip is always there, and the tabs outrank the legend on it.** One row across the top
+  of the main region — inside it, which is what `Dock::Top` is for: carved from the screen it would
+  run across the project panel and read as the workspace's rather than as the region's. Always
+  drawn, even with one tab, because a bar that appears when you make a second tab is a bar whose
+  arrival moves every other row down and which nothing had ever mentioned. Numbered from one,
+  because the key is `<C-w>1`. When the row is short the **legend** is what gives way, never the
+  tab names: crowded out by three key names the bar said `+1` where a conversation's title belongs,
+  on the one row whose job is telling you which conversations are open. The first hint is reserved
+  for, since everything else is behind it. And **which pane has the keyboard is said with its
+  edges** — `Pane.Active` on the borders that belong to it, tmux's answer, because four panes of
+  one conversation look identical and the caret is one cell.
 - **A panel you are in the middle of using has the keyboard.** `FloatConfig::modal` takes
   `KeymapScope::Global` out of the chain, and a key nothing claimed is swallowed rather than reaching
   the composer behind the float. Shadowing the keys a widget wants is the other half and not a
@@ -707,13 +759,76 @@ Dragging an image onto the terminal pastes its path, and a pasted path to an ima
 rather than typed out. What is attached sits above the field until the message goes.
 
 Composer editing is a text field: `←`/`→` by character and `^←`/`^→` by word, `Home`/`End` and
-`^Home`/`^End` for the ends, shift with any of them to select, `^W` and `^U` to delete a word or
-back to the start of the line. The capability ladder — `model.upgrade`, `model.downgrade` — has no
+`^Home`/`^End` for the ends, shift with any of them to select, `^⌫` and `^U` to delete a word or
+back to the start of the line — `^W` used to be the word-delete and is now the window prefix, which
+is `ui.keys.delete_word` and `ui.keys.window_prefix` if you want them the other way round. The capability ladder — `model.upgrade`, `model.downgrade` — has no
 default key: it had `⌥↑`/`⌥↓`, which is not a key every terminal sends, and `^K` runs both by
 name. Copying this conversation's directory — `session.copy.path`, which in a worktree is the
 worktree's path — keeps `⌥Y` on the terms arrows are bound on: a key that means something where it
 arrives and is never the only way — `^K` or `/copy` here, `y` on any row of the project panel, and
 `yp` in the reader.
+
+## Windows, panes and tabs — `<C-w>`
+
+The one prefix in the workspace, and it earns it: twenty-four verbs, no Ctrl-letter left to give
+them, and a list that draws itself when you hold the key. `ui.keys.window_prefix` moves it;
+`^Z` lists every one of these as an ordinary binding, and `^K` runs any of them by name.
+
+**Hold `<C-w>` and wait** — the panel below appears, read out of your keymap rather than out of this
+table. `ui.keys.hint_delay = 0` shows it at once; a larger number keeps it out of the way.
+
+| Key | Does |
+|---|---|
+| `v` `s` | Split: the new pane on the right, or below. Focus follows |
+| `c` | Split to the right **on a new conversation** — the one-key version of splitting and then `^N` |
+| `q` | Close this pane. The last one is refused: `^Q` closes the terminal |
+| `o` | Close every pane but this one |
+| `h` `j` `k` `l` | Go to the pane that way. No wrap-around — the edge is where it stops |
+| `w` | The next pane, or the next **tab** when this one has a single pane, so it always goes somewhere |
+| `<` `>` | Narrower, wider — Vim's, and the same keys the project panel resizes with |
+| `-` `+` | Shorter, taller. At an edge the other boundary moves rather than nothing happening |
+| `H` `J` `K` `L` | **Move this pane** to that edge — Vim's, and the counterpart to `hjkl` moving *you* |
+| `x` | Swap this pane with the next, keeping their places — how the one you care about gets the wide half |
+| `=` | Give every pane an equal share |
+| `t` | A tab. **Asks what goes in it**: a new conversation, a shell, or this conversation again |
+| `T` | A tab with a **shell**, skipping the question |
+| `S` | Split into a **shell** |
+| `X` | Close this tab and everything in it |
+| `n` `p` | The next / previous tab, wrapping |
+| `1`–`9` | That tab, counting from the left as the bar numbers them |
+| `r` | Name this tab. `↵` on an empty name gives it back to being named by what is in it |
+| `,` `.` | Move this tab along the bar |
+| `?` | The list, now rather than after the delay |
+
+A split shows what you were reading — Vim's answer for `:split`, and the only one that needs no
+dialog — and each pane then has **its own transcript, composer, draft, scroll and search**. `^T` and
+`^N` change what is in the pane you are in.
+
+## A shell in a pane
+
+`<C-w>t` **asks** what a new tab is for — a new conversation, a shell, or this conversation again —
+and makes nothing until you have answered, because a tab that flickers into the bar and out again on
+a key you cancelled is worse than the question taking a moment. `1`/`2`/`3` answer it directly, `jk`
+move, `Esc` gives up. Every row says *what you get*: the first cut called the third one
+`Conversation`, meaning the one you are in, which reads as *a* conversation and so was
+indistinguishable from `New conversation` on the row below — and the likeliest intent is first,
+because that is where the cursor starts and `⏎` is what people press. The three verbs behind it (`tab.new`, `tab.new.chat`, `tab.new.term`) stay separate
+commands, so a script or a key can skip the question — which is what `<C-w>T` does.
+
+
+`<C-w>T` opens a tab with one, `<C-w>S` splits into one. A terminal pane is one window and no
+composer, because a terminal *is* the field you type into; every key goes to the child — `^C`
+interrupts *it*, `^D` ends *its* input — and the one key that does not is the window prefix, which
+is how you get out of a full-screen program. Paste arrives bracketed, so an editor in there knows it
+was pasted rather than typed.
+
+It is `$SHELL -l`, in the conversation's directory, with `TERM=xterm-256color` and `NEOSH=1` set.
+It draws through the raw-cell surface API a plugin already has — which turned out to carry exactly a
+terminal cell — rather than through a buffer: a buffer is lines with marks on them, and rebuilding a
+mark table sixty times a second for a program repainting arbitrary cells is not the same problem.
+The caret is placed from the *child's* cursor, and the buffer under the surface is a scaffold of
+spaces so there are rows for it to land on. A shell that exits says so and leaves its last frame up,
+because what it printed before it went is usually why you were looking.
 
 ## Reading the transcript — `^S`
 

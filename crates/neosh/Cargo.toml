@@ -50,6 +50,8 @@ image = { workspace = true }
 uuid = { workspace = true }
 tokio-stream = { workspace = true }
 hostname = "0.4"
+portable-pty = "0.9.0"
+vt100 = "0.16.2"
 
 [dev-dependencies]
 insta = { workspace = true }
