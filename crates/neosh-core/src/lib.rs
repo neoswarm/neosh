@@ -13,6 +13,7 @@ pub mod highlight;
 pub mod keymap;
 pub mod options;
 pub mod palette;
+pub mod panes;
 pub mod text;
 pub mod window;
 

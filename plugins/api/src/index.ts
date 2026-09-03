@@ -17,6 +17,10 @@ import type { ApiError } from "./generated/ApiError";
 import type { ApiOk } from "./generated/ApiOk";
 import type { ApiResponse } from "./generated/ApiResponse";
 import type { BranchInfo } from "./generated/BranchInfo";
+import type { Direction } from "./generated/Direction";
+import type { PaneId } from "./generated/PaneId";
+import type { TabId } from "./generated/TabId";
+import type { TabInfo } from "./generated/TabInfo";
 import type { BufferId } from "./generated/BufferId";
 import type { Capability } from "./generated/Capability";
 import type { CommitInfo } from "./generated/CommitInfo";
@@ -137,7 +141,8 @@ import type { WorktreeInfo } from "./generated/WorktreeInfo";
 export type {
   AccountKind, Activity, ApiError, BranchInfo, Brand, BufferId, Capability, CommandEntry, CommitInfo,
   AgentCommand, AgentState, AgentSummary,
-  Contribution, CredentialInfo, CredentialSource, CursorShape, DiffTarget, Dock, CursorMotion, ExtmarkId, ExtmarkInfo, ExtmarkOpts, FileChange, FileState, FloatConfig,
+  Contribution, CredentialInfo, CredentialSource, CursorShape, DiffTarget, Direction, Dock, CursorMotion, ExtmarkId, ExtmarkInfo, ExtmarkOpts, FileChange, FileState, FloatConfig,
+  PaneId, TabId, TabInfo,
   Gravity, HighlightDef, HighlightEntry, HighlightSpec, Hint, HlTarget, HookName, HookOutcome, HookPayload, InstanceConfig, KeyContext,
   AttachmentInfo,
   KeymapEntry, KeymapScope, MessageLevel, Mode, ModelEntry, ModelInfo, ModelSelection, ModelTier, NamespaceId,
@@ -385,6 +390,10 @@ export interface Neosh {
   readonly version: number;
   readonly buf: BufferApi;
   readonly win: WindowApi;
+  /** The panes of the main region. See {@link PaneApi}. */
+  readonly pane: PaneApi;
+  /** The tabs each terminal has. See {@link TabApi}. */
+  readonly tab: TabApi;
   readonly float: FloatApi;
   readonly edit: EditApi;
   readonly ns: NamespaceApi;
@@ -558,6 +567,84 @@ export interface BufferApi {
   ): Promise<Disposable>;
 }
 
+/**
+ * The panes of the main region, and the tabs they live in.
+ *
+ * A pane is *where*, not *what*: it owns no buffer and draws nothing. You split one, then dock
+ * windows into it with {@link WindowApi.open} — which is why splitting a chat and splitting a
+ * terminal are the same two calls.
+ *
+ * Everything here is what the workspace's own `<C-w>` keys are built from. There is no private
+ * path: `<C-w>v` is `pane.split(await pane.active(), "right")` and nothing else, so a plugin that
+ * wants a different window manager can have one without forking anything.
+ */
+export interface PaneApi {
+  /** The pane this terminal's keys belong to. */
+  active(view?: ViewId): Promise<PaneId>;
+  /**
+   * Divide a pane in two, and answer with the new one.
+   *
+   * The new pane is *empty* — nothing is drawn in it until something is docked into it. Focus does
+   * not move either: a plugin splitting to show you something and a person pressing a key to go
+   * and work there are different intentions, and only the second one wants the keyboard.
+   */
+  split(pane: PaneId, dir: Direction): Promise<PaneId>;
+  /**
+   * Close a pane and every window docked in it.
+   *
+   * Rejects on the last pane of the last tab: a terminal with nowhere to draw has no key that
+   * would bring a pane back.
+   */
+  close(pane: PaneId): Promise<void>;
+  focus(pane: PaneId): Promise<void>;
+  /**
+   * Move the keyboard to the nearest pane in a direction, and answer with it — or `null` at the
+   * edge of the layout, which is an ordinary outcome of holding a key down rather than an error.
+   * There is deliberately no wrap-around.
+   */
+  focusDir(dir: Direction, view?: ViewId): Promise<PaneId | null>;
+  /**
+   * Move the boundary on a pane's `dir` side. `delta` is in weight units — an even split is
+   * {@link WEIGHT} each — so a resize means the same thing at every terminal size and survives the
+   * terminal being resized under it. A pane with no boundary on that side is a no-op.
+   */
+  resize(pane: PaneId, dir: Direction, delta: number): Promise<void>;
+  /**
+   * Exchange two panes' places, keeping what is in each. The weights belong to the slots, so
+   * swapping into the wide one is how you make a pane wide.
+   */
+  swap(pane: PaneId, withPane: PaneId): Promise<void>;
+  /**
+   * Send a pane to the far edge of its tab — the counterpart to {@link PaneApi.focusDir}, which
+   * moves the keyboard rather than the pane. It arrives with an even share rather than the size it
+   * had: it is among different neighbours now, and carrying the old number over would make it the
+   * odd one out for a reason nobody could see.
+   */
+  moveToEdge(pane: PaneId, dir: Direction): Promise<void>;
+  /** Give every pane of the active tab an equal share, at every level. */
+  equalize(view?: ViewId): Promise<void>;
+}
+
+/** The tabs of one terminal. Each is a title and a tree of panes. */
+export interface TabApi {
+  /** Every tab of a terminal, its panes, and which one is on screen. */
+  list(view?: ViewId): Promise<{ tabs: TabInfo[]; active: TabId }>;
+  /**
+   * Open a tab with one empty pane. `activate` goes to it — `false` is for putting work somewhere
+   * without moving the screen out from under whoever is reading it.
+   */
+  create(opts?: { title?: string; activate?: boolean; view?: ViewId }): Promise<TabId>;
+  /** Close a tab and every pane in it. Rejects on a terminal's last tab. */
+  close(tab: TabId): Promise<void>;
+  select(tab: TabId): Promise<void>;
+  /** Go `delta` tabs along, wrapping — a tab bar is a list you can see all of. */
+  step(delta: number, view?: ViewId): Promise<void>;
+  /** Move a tab along the bar, clamped at the ends. This is a drag; a drag that teleports is a bug. */
+  move(tab: TabId, to: number): Promise<void>;
+  /** Name a tab, or pass `null` to give it back its derived name. */
+  rename(tab: TabId, title: string | null): Promise<void>;
+}
+
 export interface WindowApi {
   /**
    * `gravity` is which end short content settles against: `"start"` (the default) pins it to the
@@ -568,11 +655,17 @@ export interface WindowApi {
    * wrapped a long path would reflow every row below it — but a text field is prose and wants
    * this on. A bottom dock that wraps also grows to show the folded rows, `size` acting as its
    * floor.
+   *
+   * `pane` docks the window inside one pane of the main region rather than against the screen.
+   * The same four edges either way — a composer at the foot of a pane is this call with a `pane`,
+   * and a status line along the foot of the terminal is this call without one. Omit it for
+   * anything that belongs to the whole terminal: a sidebar docked into a pane would be a sidebar
+   * that disappears when you close that split.
    */
   open(
     buf: BufferId,
     dock: Dock,
-    opts?: { size?: number; gravity?: Gravity; wrap?: boolean },
+    opts?: { size?: number; gravity?: Gravity; wrap?: boolean; pane?: PaneId },
   ): Promise<WindowId>;
   close(win: WindowId): Promise<void>;
   /**
@@ -2307,10 +2400,79 @@ function build(
         return listener(list, cb);
       },
     },
+    pane: {
+      async active(view) {
+        const { tabs, active } = expect(await c({ call: "tab_list", view }), "tabs");
+        // The active tab, or the first — a terminal always has at least one, and a `tabs` that
+        // came back empty is a workspace that has gone wrong in a way this cannot paper over.
+        const tab = tabs.find((t) => t.id === active) ?? tabs[0];
+        if (!tab) throw new Error("this terminal has no tabs");
+        return tab.active_pane;
+      },
+      async split(pane, dir) {
+        const p = expect(await c({ call: "pane_split", pane, dir }), "pane").pane;
+        if (p === null) throw new Error(`pane ${pane} could not be split`);
+        return p;
+      },
+      async close(pane) {
+        await c({ call: "pane_close", pane });
+      },
+      async focus(pane) {
+        await c({ call: "pane_focus", pane });
+      },
+      async focusDir(dir, view) {
+        return expect(await c({ call: "pane_focus_dir", dir, view }), "pane").pane;
+      },
+      async resize(pane, dir, delta) {
+        await c({ call: "pane_resize", pane, dir, delta });
+      },
+      async swap(pane, withPane) {
+        await c({ call: "pane_swap", pane, with: withPane });
+      },
+      async moveToEdge(pane, dir) {
+        await c({ call: "pane_move_edge", pane, dir });
+      },
+      async equalize(view) {
+        await c({ call: "pane_equalize", view });
+      },
+    },
+    tab: {
+      async list(view) {
+        const r = expect(await c({ call: "tab_list", view }), "tabs");
+        return { tabs: r.tabs, active: r.active };
+      },
+      async create(opts) {
+        return expect(
+          await c({
+            call: "tab_new",
+            view: opts?.view,
+            title: opts?.title,
+            activate: opts?.activate ?? true,
+          }),
+          "tab",
+        ).tab;
+      },
+      async close(tab) {
+        await c({ call: "tab_close", tab });
+      },
+      async select(tab) {
+        await c({ call: "tab_select", tab });
+      },
+      async step(delta, view) {
+        await c({ call: "tab_step", delta, view });
+      },
+      async move(tab, to) {
+        await c({ call: "tab_move", tab, to });
+      },
+      async rename(tab, title) {
+        await c({ call: "tab_rename", tab, title });
+      },
+    },
     win: {
       async open(buf, dock, opts) {
         const layout: WindowLayout = {
           kind: "docked",
+          pane: opts?.pane ?? null,
           dock,
           size: opts?.size ?? null,
           gravity: opts?.gravity ?? "start",

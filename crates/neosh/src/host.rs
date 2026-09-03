@@ -15,7 +15,8 @@ use std::time::Duration;
 use neosh_agent::{Agent, AgentEvent, PluginBridge, Prompt};
 use neosh_core::{CoreEffect, Editor};
 use neosh_proto::{
-    ApiCall, ApiError, ApiOk, ApiResponse, ApiResult, BufferId, ContentBlock, CursorMotion, Dock,
+    ApiCall, ApiError, ApiOk, ApiResponse, ApiResult, BufferId, ContentBlock, CursorMotion,
+    Direction, Dock,
     Gravity,
     InputEvent,
     KeyCode, MessageLevel, Mode, OptionSpec, OptionType, OptionValue, PluginEvent, PluginId,
@@ -72,6 +73,109 @@ struct Lazy {
 pub const KIND_TRANSCRIPT: &str = "neosh.transcript";
 pub const KIND_COMPOSER: &str = "neosh.composer";
 pub const KIND_STATUS: &str = "neosh.status";
+/// The strip across the top of the main region.
+///
+/// A kind like every other, which is what makes the bar replaceable: a plugin binds keys against
+/// it, finds its window with `win.ofKind`, recolours it with `win.setHighlights`, or disables ours
+/// entirely and docks its own `Top` window in its place. The host draws a default; a default is
+/// something you turn off.
+pub const KIND_TABLINE: &str = "neosh.tabline";
+/// The panel that lists what the window prefix can do. A kind, like everything else here, so a
+/// plugin can restyle it or bind against it.
+pub const KIND_WINDOW_HINT: &str = "neosh.window_keys";
+/// A pane running a shell. Bind against it to give a terminal pane a key of your own.
+pub const KIND_TERMINAL: &str = "neosh.terminal";
+/// The panel that asks what a new tab should hold.
+pub const KIND_TAB_CHOICE: &str = "neosh.tab_choice";
+
+/// What a new tab can be, in the order the panel offers them.
+///
+/// Three, and no more. A chooser is a thing you read every time you open a tab, so it earns its
+/// place only by being shorter than the decision it saves — and "which of my forty conversations"
+/// is a question `^T` already answers better than a list bolted onto this one would.
+///
+/// **Every label says what you get, not what it is.** The first cut called the third one
+/// `Conversation`, meaning "the one you are already in" — which reads as *a* conversation, so it
+/// was indistinguishable from `New conversation` on the row below it, and the first person to see
+/// the panel asked what the difference was. A label you have to be told the meaning of has failed;
+/// two labels one word apart describing opposite things is worse than either alone.
+///
+/// **The likeliest intent is first**, because the cursor starts there and Enter is what people
+/// press. Opening a tab almost always means starting something. The third option is the one a
+/// split already covers — it is offered because a *tab* of it is a whole screen where a split is
+/// half of one, and it is last because that is a thing you want occasionally rather than by
+/// default.
+const TAB_CHOICES: &[(&str, &str)] = &[
+    ("New conversation", "a fresh one, here in this directory"),
+    ("Terminal", "a shell, here in this directory"),
+    ("This conversation again", "a second place to read it, with its own scroll"),
+];
+
+/// What follows the window prefix, and the command each runs.
+///
+/// Vim's letters wherever Vim has one, because the whole reason to have a prefix is that the
+/// fingers of everyone who would want it already know these. `v`/`s` split, `hjkl` move, `HJKL`
+/// resize — capitals for resizing rather than Vim's `<>+-`, which are punctuation a plain terminal
+/// cannot reliably tell apart under Ctrl and which have no mnemonic anyway. `c` is a *chat* split,
+/// which is the one verb here Vim has no opinion about.
+///
+/// Order matters: it is the order the hint panel lists them in, and the list is grouped by what you
+/// are trying to do rather than alphabetically, because somebody reading it has a goal and not a
+/// letter.
+const WINDOW_KEYS: &[(&str, &str)] = &[
+    ("v", "window.split.right"),
+    ("s", "window.split.down"),
+    ("c", "window.split.chat"),
+    ("q", "window.close"),
+    ("o", "window.only"),
+    ("h", "window.left"),
+    ("j", "window.down"),
+    ("k", "window.up"),
+    ("l", "window.right"),
+    ("w", "window.next"),
+    // Vim's resize keys, which are also the sidebar's — `<` and `>` narrow and widen a panel
+    // everywhere else in this workspace, so they had better do it here. They were on tab-move,
+    // which was wrong on both counts: against Vim, where `<C-w><` is narrower, and against the
+    // program they are in, where the first thing anybody tries for "make this smaller" is `<`.
+    // `<lt>`, not `<`. A bare `<` starts a special-key name in the notation this parses, so the
+    // binding was rejected as an unterminated `<` and never registered — the key simply did
+    // nothing, while `>` beside it worked. Vim spells the literal the same way and for the same
+    // reason.
+    ("<lt>", "window.narrower"),
+    (">", "window.wider"),
+    ("-", "window.shorter"),
+    ("+", "window.taller"),
+    // Shift-and-a-direction *moves the pane* that way, which is Vim's meaning and the one thing
+    // that was missing: you could move between panes and not move a pane, so a layout that came
+    // out the wrong way round had to be closed and rebuilt. These were a second set of resize keys
+    // until `<`/`>`/`-`/`+` took that job back — a redundant alias was standing on the only
+    // mnemonic the missing verb had.
+    ("H", "window.move.left"),
+    ("J", "window.move.down"),
+    ("K", "window.move.up"),
+    ("L", "window.move.right"),
+    // Vim's exchange. `x` was tab-close, which is not a Vim key at all and had taken this one.
+    ("x", "window.exchange"),
+    ("=", "window.equalize"),
+    ("t", "tab.open"),
+    // Shift for the shell versions of the two keys next to them, which is the one mnemonic that
+    // needs no explaining once you know `t` and `s`.
+    ("T", "tab.new.term"),
+    ("S", "window.split.term"),
+    ("X", "tab.close"),
+    ("n", "tab.next"),
+    ("p", "tab.prev"),
+    ("r", "tab.rename"),
+    // Tab-move, off `<`/`>` now that resizing has them back. Rare enough to live on a key with no
+    // mnemonic, and adjacent to the ones it used to have.
+    (",", "tab.move.left"),
+    (".", "tab.move.right"),
+    ("?", "window.keys"),
+];
+
+/// How much weight one resize keypress moves. A tenth of an even share, so a pane crosses the
+/// screen in about ten presses — few enough to be quick, many enough to stop where you meant.
+const RESIZE_STEP: i16 = 10;
 const READY_EVENT: &str = "neosh.ready";
 
 /// The workspace var naming every conversation blocked on an answer.
@@ -239,7 +343,7 @@ fn object_for(ch: &str) -> Option<vim::Object> {
     })
 }
 
-/// One terminal's place in the workspace.
+/// One *pane's* place in the workspace.
 ///
 /// Everything in here answers "where am I" rather than "what happened": which conversation is on
 /// screen, how far up it you have read, what is half-typed in the composer, which card you have
@@ -252,12 +356,34 @@ fn object_for(ch: &str) -> Option<vim::Object> {
 /// that matters: folding a card open is *navigation*, so `⇥` on a diff must not move the rows
 /// under somebody else who happens to be in the same conversation. The rows are the same; where
 /// you are in them is yours.
-struct ViewState {
+///
+/// **This used to be one per terminal, and splitting is what made it one per pane.** Every field
+/// here was already about a single conversation being read in a single place — a scroll offset, a
+/// draft, a half-typed count, a search. Two chats side by side are two of all of that, which is
+/// why the split is where it is: nothing had to be divided up, the struct simply stopped being
+/// unique. What is genuinely one per terminal — the status line, the quit arming — moved out to
+/// [`ViewState`], and there turned out to be two such things.
+struct PaneState {
+    /// Which rectangle of the main region this is. See [`neosh_proto::PaneId`].
+    ///
+    /// Held rather than looked up, because every window this pane opens has to be docked *in* it
+    /// and the id is what says so. A `PaneState` whose id is not in the editor's tree is a pane
+    /// that has been closed and not yet cleaned up, which is a state that exists for exactly as
+    /// long as one call takes to return.
+    pane: neosh_proto::PaneId,
+    /// Whether this pane is a shell rather than a conversation.
+    ///
+    /// A flag rather than two kinds of `PaneState`, because almost everything about *where you
+    /// are* is the same either way — which pane, which window, whether it has the keyboard — and
+    /// the handful of places that differ are the ones that write into a transcript. The terminal
+    /// itself is not in here: it lives in [`Host::terminals`], keyed by pane, because it owns a
+    /// thread and a child process and this struct is cloned and rebuilt freely.
+    term: bool,
     /// The conversation on screen here.
     ///
-    /// On the view rather than in the store, which is the whole of what "two terminals in two
-    /// conversations" means. The store holds every conversation and the order they were last
-    /// arrived in; who is looking at which one is this.
+    /// On the pane rather than in the store, which is the whole of what "two conversations at
+    /// once" means. The store holds every conversation and the order they were last arrived in;
+    /// who is looking at which one is this.
     session: neosh_proto::SessionId,
     chat: BufferId,
     chat_win: WindowId,
@@ -274,7 +400,6 @@ struct ViewState {
     chat_top: Option<u32>,
     composer: BufferId,
     composer_win: WindowId,
-    status: BufferId,
     /// Every tool card in the transcript on screen, in row order.
     ///
     /// A body goes *under its own header*, not at the end of the transcript: an agent driver runs
@@ -373,32 +498,32 @@ struct ViewState {
     reading_last_select: Option<((u32, u32), (u32, u32), SelectShape)>,
     /// The search being typed in the transcript, if one is.
     search: Option<SearchPrompt>,
+    /// A tab being named, if one is. Per pane rather than per view for the same reason the search
+    /// is: it borrows *this* pane's composer, and giving it back has to put this pane's draft back.
+    rename: Option<RenamePrompt>,
     /// The last thing searched for, so `n` still works after the prompt has closed.
     searched: String,
     /// Which way it was going, because `n` means "onwards" rather than "forwards": after `?foo`,
     /// `n` is up the transcript and `N` is down it.
     searched_back: bool,
-    /// When `<C-c>` was last pressed with nothing left to cancel.
-    ///
-    /// Quitting on the first press would be wrong: `<C-c>` is muscle memory, and in a workspace
-    /// holding an unsent draft the cost of getting it wrong is losing that draft. Quitting only on
-    /// a *second* press within a couple of seconds is the pattern people already know.
-    quit_armed: Option<std::time::Instant>,
 }
 
-impl ViewState {
-    /// Give a terminal a screen: a transcript, a status line and a field to type in.
+impl PaneState {
+    /// Furnish one pane: a transcript and a field to type in, both docked inside it.
     ///
-    /// One set per view, which is what makes two terminals two places. The buffers are per view
-    /// rather than shared for the reason on [`ViewState`] itself — folding a card open is
-    /// navigation — and the windows have to be, because a window belongs to exactly one view.
+    /// The two windows name the pane, which is the whole mechanism — the frontend resolves the
+    /// pane's rectangle from the tree and then carves these off *it*, so a composer at the foot of
+    /// a pane and a composer at the foot of the screen are the same call asked about different
+    /// rectangles. Nothing here knows how many panes there are or where this one is.
     fn furnish(
         editor: &mut Editor,
         view: neosh_proto::ViewId,
+        pane: neosh_proto::PaneId,
         session: neosh_proto::SessionId,
     ) -> Self {
         let chat = editor.create_buffer_of_kind("[chat]", KIND_TRANSCRIPT);
         let chat_win = editor.open_window_in(view, chat, WindowLayout::Docked {
+            pane: Some(pane),
             dock: Dock::Main,
             size: None,
             // A conversation settles against the field you answer it in. Anchored to the top, a
@@ -409,17 +534,6 @@ impl ViewState {
             wrap: None,
         });
 
-        // Docked before the composer, so it takes the bottom-most row and the composer sits above
-        // it. Without a status line the startup screen renders literally nothing — two empty
-        // buffers — and "it opened an empty terminal" is indistinguishable from "it crashed".
-        let status = editor.create_buffer_of_kind("[status]", KIND_STATUS);
-        editor.open_window_in(view, status, WindowLayout::Docked {
-            dock: Dock::Bottom,
-            size: Some(1),
-            gravity: Gravity::Start,
-            wrap: None,
-        });
-
         let composer = editor.create_buffer_of_kind("[composer]", KIND_COMPOSER);
         // Four rows at rest: a rule, up to three lines of what you are writing, and the shortcut
         // row that lives on the last of them as a virtual line. The rule is what makes the
@@ -427,24 +541,22 @@ impl ViewState {
         // what makes a long prompt fold and the window grow to show it, instead of running off the
         // right edge.
         let composer_win = editor.open_window_in(view, composer, WindowLayout::Docked {
+            pane: Some(pane),
             dock: Dock::Bottom,
             size: Some(4),
             gravity: Gravity::Start,
             wrap: Some(true),
         });
-        editor.set_mode(view, Mode::Chat);
-        // The field you type in is where unpushed focus lands, so a key bound against
-        // `neosh.composer` resolves at rest. See [`Editor::set_home`].
-        editor.set_home(view, Some(composer_win));
 
         Self {
+            pane,
+            term: false,
             session,
             chat,
             chat_win,
             chat_top: None,
             composer,
             composer_win,
-            status,
             cards: Vec::new(),
             welcome_rows: 0,
             working: false,
@@ -463,15 +575,162 @@ impl ViewState {
             reading_find: None,
             reading_last_select: None,
             search: None,
+            rename: None,
             searched: String::new(),
             searched_back: false,
+        }
+    }
+
+    /// Furnish a pane as a shell instead of a conversation.
+    ///
+    /// One window and no composer: a terminal *is* the field you type into, so a second one below
+    /// it would be a box you type in that sends nothing anywhere. `chat_win` and `composer_win` are
+    /// deliberately the same window — every path that asks "where does the keyboard rest here"
+    /// gets the terminal, which is the true answer, and the couple of places that would write a
+    /// transcript into it are guarded on [`PaneState::term`] instead.
+    fn furnish_term(
+        editor: &mut Editor,
+        view: neosh_proto::ViewId,
+        pane: neosh_proto::PaneId,
+        session: neosh_proto::SessionId,
+    ) -> Self {
+        let buf = editor.create_buffer_of_kind("[terminal]", KIND_TERMINAL);
+        let win = editor.open_window_in(view, buf, WindowLayout::Docked {
+            pane: Some(pane),
+            dock: Dock::Main,
+            size: None,
+            gravity: Gravity::Start,
+            wrap: None,
+        });
+        Self {
+            pane,
+            term: true,
+            session,
+            chat: buf,
+            chat_win: win,
+            chat_top: None,
+            composer: buf,
+            composer_win: win,
+            cards: Vec::new(),
+            welcome_rows: 0,
+            working: false,
+            plan_rows: 0,
+            unanswered: None,
+            streaming: None,
+            answer: None,
+            draft: String::new(),
+            secret: None,
+            mode_before_reading: Mode::Chat,
+            reading: false,
+            reading_pending: None,
+            reading_count: String::new(),
+            reading_shape: SelectShape::Exclusive,
+            reading_goal: None,
+            reading_find: None,
+            reading_last_select: None,
+            search: None,
+            rename: None,
+            searched: String::new(),
+            searched_back: false,
+        }
+    }
+}
+
+/// One terminal's screen: its panes, and the two things that are its rather than any pane's.
+///
+/// The list is short on purpose. Everything that turned out to be about *a conversation being read
+/// somewhere* stayed on [`PaneState`] when splitting arrived; what is left here is what a terminal
+/// has exactly one of however many panes are open in it — the status strip along the bottom, and
+/// whether `<C-c>` has been pressed once. The tab and pane *tree* is not here either: the editor
+/// owns it, because a plugin can reshape it through the public API and a second copy in the host
+/// would be a second copy to keep in step.
+struct ViewState {
+    /// What is in each pane, keyed by the editor's ids.
+    ///
+    /// A map rather than a tree: the shape is the editor's business and this only has to answer
+    /// "what is in that rectangle". Which also means the two cannot disagree about the shape —
+    /// there is only one shape — and a pane in here that the editor has closed is garbage this
+    /// collects rather than a layout that renders wrong.
+    panes: std::collections::BTreeMap<neosh_proto::PaneId, PaneState>,
+    /// The strip along the bottom of the terminal.
+    ///
+    /// Docked to the *screen* rather than to a pane: it says what is true of this workspace — the
+    /// model, the branch, what a plugin has put there — and four copies of it, one per pane, would
+    /// be four rows saying the same sentence.
+    status: BufferId,
+    /// The tab strip across the top of the main region.
+    ///
+    /// One row, always drawn, even with a single tab open. A bar that appears when you make a
+    /// second tab is a bar whose arrival moves every other row down by one — and, worse, one that
+    /// nothing on screen has ever mentioned until the moment you happened to find the key. It is
+    /// where you learn tabs exist.
+    tabline: BufferId,
+    tabline_win: WindowId,
+    /// The conversation this terminal last *arrived* in.
+    ///
+    /// What `rehome` compares against to decide whether moving the keyboard is also an arrival.
+    /// The obvious guard — "does the store's current differ" — is wrong, because `current_id()` is
+    /// the front of the recency order rather than a pointer: unarchiving a conversation moves it
+    /// there, so the guard fired and the arrival shoved the pane's own conversation back to the
+    /// front, undoing the ordering the unarchive had just established.
+    entered: Option<neosh_proto::SessionId>,
+    /// When `<C-c>` was last pressed with nothing left to cancel.
+    ///
+    /// Per terminal, not per pane: the second press is about this keyboard, and having to press it
+    /// twice *in the same pane* would make a key that already needs explaining need it twice.
+    quit_armed: Option<std::time::Instant>,
+}
+
+impl ViewState {
+    /// Give a terminal a screen: a status line, and one pane with a conversation in it.
+    fn furnish(
+        editor: &mut Editor,
+        view: neosh_proto::ViewId,
+        session: neosh_proto::SessionId,
+    ) -> Self {
+        // Docked before anything else at the bottom, so it takes the bottom-most row and every
+        // pane's composer sits above it. Without a status line the startup screen renders literally
+        // nothing — two empty buffers — and "it opened an empty terminal" is indistinguishable from
+        // "it crashed".
+        let status = editor.create_buffer_of_kind("[status]", KIND_STATUS);
+        editor.open_window_in(view, status, WindowLayout::Docked {
+            pane: None,
+            dock: Dock::Bottom,
+            size: Some(1),
+            gravity: Gravity::Start,
+            wrap: None,
+        });
+
+        let tabline = editor.create_buffer_of_kind("[tabs]", KIND_TABLINE);
+        let tabline_win = editor.open_window_in(view, tabline, WindowLayout::Docked {
+            pane: None,
+            dock: Dock::Top,
+            size: Some(1),
+            gravity: Gravity::Start,
+            wrap: None,
+        });
+
+        let pane = editor.active_pane(view);
+        let session_id = session.clone();
+        let first = PaneState::furnish(editor, view, pane, session);
+        editor.set_mode(view, Mode::Chat);
+        // The field you type in is where unpushed focus lands, so a key bound against
+        // `neosh.composer` resolves at rest. See [`Editor::set_home`].
+        editor.set_home(view, Some(first.composer_win));
+
+        Self {
+            panes: [(pane, first)].into_iter().collect(),
+            status,
+            tabline,
+            tabline_win,
+            entered: Some(session_id),
             quit_armed: None,
         }
     }
 }
 
 pub struct Host {
-    /// Where each terminal is. See [`ViewState`].
+    /// Where each terminal is. See [`PaneState`].
     ///
     /// One entry per view somebody is attached to, made when a terminal arrives and taken down
     /// with its last terminal. Never empty: a workspace nobody is looking at keeps the view of
@@ -494,6 +753,9 @@ pub struct Host {
     /// them and a request they cannot answer alone can reach a person.
     agent_drivers: Vec<Arc<dyn neosh_provider::drivers::AgentDriver>>,
     status_ns: neosh_proto::NamespaceId,
+    /// Where the tab strip's own marks live. Its own namespace, so redrawing the bar several times
+    /// a second cannot disturb anything else.
+    tabline_ns: neosh_proto::NamespaceId,
     /// Where the transcript's own highlights live.
     ///
     /// Separate from the status line's so that redrawing the working line — which happens several
@@ -546,6 +808,35 @@ pub struct Host {
     /// with the same scroll position, instead of a rebuild that is missing everything the turn has
     /// said and not yet committed.
     orphan: Option<neosh_proto::ViewId>,
+    /// The pane being written into, when that is not the pane with the keyboard.
+    ///
+    /// Set only for the duration of [`Host::in_pane`], which is how a turn's output reaches the
+    /// transcript reading its conversation while somebody types in the pane next door. `None` — the
+    /// state it is in for every key press — means `v()` answers with wherever the person is.
+    ///
+    /// An override rather than a focus move, because those are different facts: focus is where keys
+    /// go, and an answer arriving must never take the keyboard out of the field you are mid-sentence
+    /// in. It is cleared by [`Host::in_view`] too, since a pane id from the terminal you have just
+    /// left names nothing on the one you have arrived at.
+    acting_pane: Option<neosh_proto::PaneId>,
+    /// The window and buffer of the prefix panel, while it is up.
+    ///
+    /// On the host rather than on a pane: it is a hint about the keyboard, and there is one
+    /// keyboard. Two of them on screen at once would be two answers to the same half-typed chord.
+    window_hint: Option<(WindowId, BufferId)>,
+    /// The "what goes in this tab" panel, while it is up.
+    ///
+    /// On the host rather than on a pane, like the prefix hint: it is a question about the keyboard
+    /// and there is one keyboard.
+    tab_choice: Option<TabChooser>,
+    /// Every shell running in a pane, by pane. See [`crate::term`].
+    terminals: crate::term::Terminals,
+    /// A pane that has just been made and is to be furnished as a shell rather than a conversation.
+    ///
+    /// `sync_panes` is what furnishes a pane, and it runs after the fact — it sees a pane the tree
+    /// has and this does not, with nothing to say which kind it should be. Set by the command that
+    /// created it and taken by the furnishing, which is one turn of the loop later at most.
+    pending_term: Option<neosh_proto::PaneId>,
     /// The last terminal to send anything.
     ///
     /// The fallback for work that is nobody's key press and names no window — a plugin drawing on
@@ -999,6 +1290,22 @@ struct SearchPrompt {
     draft: String,
 }
 
+/// The panel asking what a new tab should hold — see [`Host::begin_tab_choice`].
+struct TabChooser {
+    win: WindowId,
+    buf: BufferId,
+    /// Which row the cursor is on.
+    at: usize,
+}
+
+/// Naming a tab, borrowing the composer to type in — see [`Host::begin_tab_rename`].
+struct RenamePrompt {
+    tab: neosh_proto::TabId,
+    value: String,
+    /// The draft that was in the composer, put back afterwards.
+    draft: String,
+}
+
 struct SecretPrompt {
     instance: neosh_proto::InstanceId,
     label: String,
@@ -1055,6 +1362,7 @@ impl Host {
         let chat_ns = namespace("neosh.chat");
         let composer_ns = namespace("neosh.composer");
         let search_ns = namespace("neosh.search");
+        let tabline_ns = namespace("neosh.tabline");
 
         let mut host = Self {
             editor,
@@ -1066,6 +1374,7 @@ impl Host {
             chat_ns,
             composer_ns,
             search_ns,
+            tabline_ns,
             status_segments: Default::default(),
             hints: Default::default(),
             selection_pinned: false,
@@ -1087,6 +1396,11 @@ impl Host {
             // one beside it. In a process that is its own terminal nothing ever adopts it, which
             // is correct: there is one view and it is this.
             orphan: Some(neosh_proto::ViewId::LOCAL),
+            acting_pane: None,
+            window_hint: None,
+            tab_choice: None,
+            terminals: Default::default(),
+            pending_term: None,
             live: None,
             live_at: None,
             live_turns: 0,
@@ -1426,7 +1740,7 @@ impl Host {
         let response: ApiResponse = match self.editor.command_owner(&name) {
             None => Err(ApiError::NotFound { what: format!("command {name}") }).into(),
             Some(owner) if owner.0 == BUILTIN => {
-                self.run_builtin(&name, args);
+                self.run_builtin(&name, args, None);
                 Ok(ApiOk::Json { value: serde_json::Value::Null }).into()
             }
             Some(owner) => {
@@ -1976,7 +2290,10 @@ impl Host {
                 // marked in the wrong panel now: `▸` in this column means "the conversation this
                 // window is reading" and every window has its own answer.
                 let here = self.active_session();
-                let seen: Vec<_> = self.views.values().map(|v| v.session.clone()).collect();
+                // Every pane, not every terminal: `on_screen` means somebody can see it, and a
+                // conversation in the right-hand half of a split is as visible as one in a
+                // terminal of its own.
+                let seen: Vec<_> = self.panes().map(|p| p.session.clone()).collect();
                 for info in &mut list {
                     info.is_active = info.id == here;
                     info.on_screen = seen.contains(&info.id);
@@ -2030,7 +2347,7 @@ impl Host {
                         .map(|s| s.info())
                         .ok_or_else(|| ApiError::Internal { message: "session vanished".into() })?;
                     i.is_active = self.v().session == id;
-                    i.on_screen = self.views.values().any(|v| v.session == id);
+                    i.on_screen = self.panes().any(|p| p.session == id);
                     i
                 };
                 let info = self.named(info);
@@ -2079,7 +2396,17 @@ impl Host {
                         .filter(|(id, _)| Some(**id) != self.orphan)
                         .map(|(id, v)| neosh_proto::ViewInfo {
                             view: *id,
-                            session: v.session.clone(),
+                            // The conversation this terminal's keyboard is in. A split shows
+                            // several at once and this field can name one, so it names the one a
+                            // key pressed here would go to — which is what every caller of it
+                            // means by "the conversation in that terminal".
+                            session: self
+                                .editor
+                                .active_pane_of(*id)
+                                .and_then(|p| v.panes.get(&p))
+                                .or_else(|| v.panes.values().next())
+                                .map(|p| p.session.clone())
+                                .unwrap_or_default(),
                             current: *id == here,
                         })
                         .collect(),
@@ -2402,19 +2729,83 @@ impl Host {
     /// what [`Self::in_view`] is for. The fallback exists because a view can go away between an
     /// event being queued and being handled, and a panic in the run loop takes the workspace with
     /// it.
-    fn v(&self) -> &ViewState {
+    /// The pane the keyboard is in, in the terminal being served.
+    ///
+    /// Still spelled `v()` at close to two hundred call sites, and deliberately so: every one of
+    /// them means *where the person is*, which was the view when a terminal had one conversation
+    /// and is the pane now that it can have four. Renaming them all to `p()` would have been two
+    /// hundred lines of diff saying nothing, and the one that got missed would be a call that
+    /// silently read the wrong pane.
+    fn v(&self) -> &PaneState {
+        let view = self.view_now();
+        let pane = self.pane_now(view);
         self.views
-            .get(&self.from.view)
-            .or_else(|| self.views.values().next())
-            .expect("a workspace always keeps at least one view")
+            .get(&view)
+            .and_then(|v| v.panes.get(&pane).or_else(|| v.panes.values().next()))
+            .expect("a workspace always keeps at least one pane")
     }
 
-    fn vm(&mut self) -> &mut ViewState {
-        let id = match self.views.contains_key(&self.from.view) {
+    fn vm(&mut self) -> &mut PaneState {
+        let view = self.view_now();
+        let pane = self.pane_now(view);
+        let pane = match self.views.get(&view).is_some_and(|v| v.panes.contains_key(&pane)) {
+            true => pane,
+            false => self
+                .views
+                .get(&view)
+                .and_then(|v| v.panes.keys().next().copied())
+                .expect("a workspace always keeps at least one pane"),
+        };
+        self.views
+            .get_mut(&view)
+            .and_then(|v| v.panes.get_mut(&pane))
+            .expect("just looked it up")
+    }
+
+    /// Which pane `v()` means: the one being written into if something said so, otherwise the one
+    /// with the keyboard.
+    ///
+    /// The override exists because writing and typing are different questions — see
+    /// [`Self::in_pane`]. Only honoured when the pane is actually in this terminal, so a stale
+    /// override cannot make `v()` answer with a transcript from another screen.
+    fn pane_now(&self, view: neosh_proto::ViewId) -> neosh_proto::PaneId {
+        self.acting_pane
+            .filter(|p| self.views.get(&view).is_some_and(|v| v.panes.contains_key(p)))
+            .or_else(|| self.editor.active_pane_of(view))
+            .or_else(|| self.views.get(&view).and_then(|v| v.panes.keys().next().copied()))
+            // A pane the editor knows about that this has no state for cannot happen from the
+            // keyboard — panes and their state are made together — but it can from a plugin
+            // splitting, in the frame between the tree changing and the host furnishing it.
+            .unwrap_or_default()
+    }
+
+    /// The terminal being served, or any terminal if that one has gone.
+    fn view_now(&self) -> neosh_proto::ViewId {
+        match self.views.contains_key(&self.from.view) {
             true => self.from.view,
             false => *self.views.keys().next().expect("a workspace always keeps at least one view"),
-        };
-        self.views.get_mut(&id).expect("just looked it up")
+        }
+    }
+
+    /// The screen the keyboard is on — its status line, its panes, its quit arming.
+    fn vs(&self) -> &ViewState {
+        let view = self.view_now();
+        self.views.get(&view).expect("a workspace always keeps at least one view")
+    }
+
+    fn vsm(&mut self) -> &mut ViewState {
+        let view = self.view_now();
+        self.views.get_mut(&view).expect("a workspace always keeps at least one view")
+    }
+
+    /// Every pane of every terminal, which is what "on screen anywhere" now means.
+    ///
+    /// The counterpart to `views.values()` before splitting. A conversation is being looked at if
+    /// *a pane* is showing it, and a terminal with a chat in each half is two answers rather than
+    /// one — which decides unread marks, where a question opens, and whether a notification leaves
+    /// the terminal at all.
+    fn panes(&self) -> impl Iterator<Item = &PaneState> {
+        self.views.values().flat_map(|v| v.panes.values())
     }
 
     /// Which terminal a plugin's call is about.
@@ -2516,7 +2907,7 @@ impl Host {
             }
             return;
         }
-        let taken: Vec<_> = self.views.values().map(|v| v.session.clone()).collect();
+        let taken: Vec<_> = self.panes().map(|p| p.session.clone()).collect();
         let session = want.unwrap_or_else(|| {
             let store = self.agent.sessions();
             store
@@ -2561,7 +2952,7 @@ impl Host {
             // everything a plugin put there is closed now rather than left for the plugin to close
             // when it hears about this. A panel closed asynchronously is a panel still on screen
             // when the next terminal arrives and its replacement opens beside it.
-            let chrome = [self.v().chat, self.v().composer, self.v().status];
+            let chrome = [self.v().chat, self.v().composer, self.vs().status];
             self.editor.close_others_in(view, &chrome);
             self.orphan = Some(view);
         } else {
@@ -2582,9 +2973,13 @@ impl Host {
     /// drawn.
     fn in_view<R>(&mut self, view: neosh_proto::ViewId, f: impl FnOnce(&mut Self) -> R) -> R {
         let was = self.from;
+        // A view switch is not a pane switch: an override left standing would name a pane in the
+        // terminal we have just left, and `v()` would answer with a transcript from another screen.
+        let pane = self.acting_pane.take();
         self.from.view = view;
         let out = f(self);
         self.from = was;
+        self.acting_pane = pane;
         out
     }
 
@@ -2603,7 +2998,13 @@ impl Host {
         Ok(())
     }
 
-    /// The conversation this terminal is leaving, if no other terminal is in it.
+    /// The conversation this pane is leaving, if nothing else is showing it.
+    ///
+    /// Counted in **panes**, not terminals. A scratch conversation is dropped when the last thing
+    /// looking at it stops — and with two panes side by side, "another window has it" and "another
+    /// terminal has it" stopped being the same question. Asked per terminal, moving from the left
+    /// half to the right half reported the left half's conversation as abandoned while it was still
+    /// on screen a column away.
     fn abandoning(
         &self,
         going_to: &neosh_proto::SessionId,
@@ -2612,10 +3013,11 @@ impl Host {
         if leaving == *going_to {
             return None;
         }
+        let here = self.pane_now(self.view_now());
         let elsewhere = self
-            .views_showing(&leaving)
+            .panes_showing(&leaving)
             .into_iter()
-            .any(|v| v != self.from.view);
+            .any(|(v, p)| v != self.from.view || p != here);
         (!elsewhere).then_some(leaving)
     }
 
@@ -2625,26 +3027,86 @@ impl Host {
         store.get(session).map(|s| s.cwd.clone()).unwrap_or_else(|| self.cwd.clone())
     }
 
-    /// Every terminal showing this conversation.
+    /// Do something as though the key had been pressed in a particular pane.
     ///
-    /// The question that replaced "is this the one on screen". A turn's output goes to whoever is
-    /// looking at it, which may be nobody and may be two people.
-    fn views_showing(&self, session: &neosh_proto::SessionId) -> Vec<neosh_proto::ViewId> {
+    /// [`Self::in_view`] one level down, and for exactly the same reason: a turn's output belongs
+    /// to the pane reading that conversation, which is very often not the pane the keyboard is in.
+    /// Two chats side by side means the answer arriving in the right-hand one must be written into
+    /// the right-hand one's transcript while you are typing into the left.
+    ///
+    /// Overriding rather than *moving* focus is the whole point. Focus is where the person is;
+    /// this is where the writing goes, and a turn finishing must not take the keyboard away from
+    /// the pane somebody is mid-sentence in.
+    fn in_pane<R>(
+        &mut self,
+        view: neosh_proto::ViewId,
+        pane: neosh_proto::PaneId,
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        let was = self.from;
+        let prev = self.acting_pane.replace(pane);
+        self.from.view = view;
+        let out = f(self);
+        self.from = was;
+        self.acting_pane = prev;
+        out
+    }
+
+    /// Which pane a window belongs to, for an event that names a window and nothing else.
+    ///
+    /// The frontend reports geometry per window and knows nothing about panes, so every one of
+    /// those has to be turned back into "which half of the screen is this about" before it can be
+    /// acted on.
+    fn pane_of_window(
+        &self,
+        win: WindowId,
+    ) -> Option<(neosh_proto::ViewId, neosh_proto::PaneId)> {
+        self.views.iter().find_map(|(view, v)| {
+            v.panes
+                .values()
+                .find(|p| p.chat_win == win || p.composer_win == win)
+                .map(|p| (*view, p.pane))
+        })
+    }
+
+    /// Every pane showing this conversation, and which terminal each is in.
+    ///
+    /// The question that replaced "is this the one on screen", and then replaced "which terminals
+    /// are showing it" when a terminal stopped being able to show only one. A turn's output goes
+    /// to whoever is looking at it, which may be nobody, may be two people, and may be twice on one
+    /// screen — a conversation open in both halves of a split is two transcripts, and an answer
+    /// that arrives in one of them is a redraw the other never gets.
+    fn panes_showing(
+        &self,
+        session: &neosh_proto::SessionId,
+    ) -> Vec<(neosh_proto::ViewId, neosh_proto::PaneId)> {
         self.views
             .iter()
-            .filter(|(_, v)| v.session == *session)
-            .map(|(id, _)| *id)
+            .flat_map(|(id, v)| {
+                v.panes
+                    .values()
+                    .filter(|p| p.session == *session)
+                    .map(move |p| (*id, p.pane))
+            })
             .collect()
     }
 
-    /// Do something in every terminal showing this conversation, which may be none.
+    /// Every terminal with a pane showing this conversation, each named once.
+    fn views_showing(&self, session: &neosh_proto::SessionId) -> Vec<neosh_proto::ViewId> {
+        let mut out: Vec<neosh_proto::ViewId> =
+            self.panes_showing(session).into_iter().map(|(v, _)| v).collect();
+        out.dedup();
+        out
+    }
+
+    /// Do something in every pane showing this conversation, which may be none.
     fn each_view_showing(
         &mut self,
         session: &neosh_proto::SessionId,
         f: impl Fn(&mut Self),
     ) {
-        for view in self.views_showing(session) {
-            self.in_view(view, |me| f(me));
+        for (view, pane) in self.panes_showing(session) {
+            self.in_pane(view, pane, |me| f(me));
         }
     }
 
@@ -3265,7 +3727,10 @@ impl Host {
                     // so they are listable and rebindable like any other. It just answers them
                     // itself rather than sending them to a JS plugin that does not exist.
                     if plugin.0 == BUILTIN {
-                        self.run_builtin(&name, args);
+                        // The key is carried through, because two of these read it: `<C-w>3` is
+                        // `tab.select` with the digit in the press rather than in an argument, and
+                        // a command invoked from `^K` has no key at all and says so.
+                        self.run_builtin(&name, args, key.as_ref());
                     } else if plugin.0 == LAZY {
                         // A key for a plugin that is not up yet: load it, and press again for it.
                         self.wake_on_command(&name, args);
@@ -3297,6 +3762,271 @@ impl Host {
                 }
                 CoreEffect::KindSeen { kind } => self.wake_on_kind(&kind),
             }
+        }
+        self.sync_panes();
+    }
+
+    /// Bring what is *in* each pane back into step with the tree that says where the panes are.
+    ///
+    /// The editor owns the shape and the host owns the contents, and the two are changed by
+    /// different things: a `<C-w>v` and a plugin's `pane.split` both reshape the tree, and neither
+    /// knows how to build a transcript. Rather than every one of those paths remembering to furnish
+    /// and tear down, this runs after every apply and makes the difference true — which is the same
+    /// bargain `drain_effects` itself is, and it means a pane created by a plugin nobody has heard
+    /// of is furnished exactly like one created by a key.
+    ///
+    /// Cheap enough to run unconditionally: it is a couple of `BTreeMap` scans over single digits
+    /// of panes, and it does nothing at all in the overwhelmingly common case where nothing moved.
+    fn sync_panes(&mut self) {
+        let views: Vec<neosh_proto::ViewId> = self.views.keys().copied().collect();
+        for view in views {
+            let live = self.editor.panes_of(view);
+            let Some(state) = self.views.get(&view) else { continue };
+
+            // A pane the tree no longer has. Its windows went with it — the editor closes those —
+            // and its buffers go here, because a transcript nothing can open is memory that grows
+            // every time somebody closes a split.
+            let gone: Vec<neosh_proto::PaneId> =
+                state.panes.keys().copied().filter(|p| !live.contains(p)).collect();
+            for pane in gone {
+                let Some(dead) = self.views.get_mut(&view).and_then(|v| v.panes.remove(&pane))
+                else {
+                    continue;
+                };
+                let plugin = PluginId::from(BUILTIN);
+                for buf in [dead.chat, dead.composer] {
+                    let _ = self.editor.apply(&plugin, ApiCall::BufDelete { buf });
+                }
+            }
+
+            // A pane the tree has that nothing has furnished — a plugin's split, or the far side of
+            // a key's. It shows what the pane with the keyboard is showing, which is Vim's answer
+            // for `:split` and the only one that needs no dialog: a split that stopped to ask which
+            // conversation would be a split you cannot bind to a key.
+            let Some(state) = self.views.get(&view) else { continue };
+            let fresh: Vec<neosh_proto::PaneId> =
+                live.iter().copied().filter(|p| !state.panes.contains_key(p)).collect();
+            if !fresh.is_empty() {
+                let inherit = self
+                    .editor
+                    .active_pane_of(view)
+                    .and_then(|p| state.panes.get(&p))
+                    .or_else(|| state.panes.values().next())
+                    .map(|p| p.session.clone())
+                    .unwrap_or_else(|| self.agent.sessions().current_id().clone());
+                for pane in fresh {
+                    let as_term = self.pending_term == Some(pane);
+                    if as_term {
+                        self.pending_term = None;
+                    }
+                    let furnished = match as_term {
+                        true => PaneState::furnish_term(&mut self.editor, view, pane, inherit.clone()),
+                        false => PaneState::furnish(&mut self.editor, view, pane, inherit.clone()),
+                    };
+                    if let Some(v) = self.views.get_mut(&view) {
+                        v.panes.insert(pane, furnished);
+                    }
+                    if as_term {
+                        self.start_terminal(view, pane);
+                        continue;
+                    }
+                    // Drawn as an arrival, exactly as a terminal attaching is: the transcript is
+                    // rebuilt from the conversation's messages and the composer says what `⏎` does.
+                    // Left to the next redraw it would be a pane of nothing until you typed.
+                    self.in_pane(view, pane, |me| {
+                        me.enter_session();
+                        me.refresh_composer();
+                    });
+                }
+            }
+
+            self.rehome(view);
+        }
+        self.refresh_tabline();
+    }
+
+    /// Start a shell in a pane, and claim the surface it draws on.
+    ///
+    /// Sized from the window's viewport when the frontend has reported one, and from a sane default
+    /// when it has not — the first `ViewportChanged` resizes it, which is one frame later and is
+    /// exactly the same path a person dragging the terminal's corner takes.
+    fn start_terminal(&mut self, view: neosh_proto::ViewId, pane: neosh_proto::PaneId) {
+        let Some(state) = self.views.get(&view).and_then(|v| v.panes.get(&pane)) else { return };
+        let (win, session) = (state.chat_win, state.session.clone());
+        let (cols, rows) = self
+            .editor
+            .window(win)
+            .and_then(|w| w.viewport)
+            .map(|v| (v.width, v.height))
+            .unwrap_or((80, 24));
+        let cwd = self.session_cwd(&session);
+
+        match crate::term::Term::spawn(&cwd, rows, cols) {
+            Ok(t) => {
+                self.terminals.insert(pane, t);
+                let plugin = PluginId::from(BUILTIN);
+                let _ = self.editor.apply_in(view, &plugin, ApiCall::SurfaceClaim {
+                    win,
+                    rect: neosh_proto::Rect { row: 0, col: 0, width: cols, height: rows },
+                });
+                self.scaffold_terminal(view, pane, rows, cols);
+                self.draw_terminal(view, pane);
+            }
+            // Said out loud and the pane left empty rather than silently blank: a shell that would
+            // not start is a thing about the machine — no pty, a `$SHELL` that is not there — and
+            // the person has to be told which.
+            Err(e) => {
+                self.editor_message(MessageLevel::Error, format!("could not start a shell: {e}"));
+            }
+        }
+    }
+
+    /// Paint whatever the shell has drawn, if it has drawn anything since last time.
+    fn draw_terminal(&mut self, view: neosh_proto::ViewId, pane: neosh_proto::PaneId) {
+        let Some(t) = self.terminals.get(pane) else { return };
+        let cells = t.cells();
+        let at = t.cursor();
+        let win = self.pane_window(view, pane);
+        let Some(surface) = self.editor.surface_on(win) else { return };
+        let plugin = PluginId::from(BUILTIN);
+        let _ = self.editor.apply_in(view, &plugin, ApiCall::SurfacePut { surface, cells });
+        // The caret goes where the *shell* put it. The frontend draws it from the window's cursor,
+        // and a terminal window's buffer is empty — so without this the caret sits at the top-left
+        // of the pane while you type at a prompt further down, which reads as a terminal that is
+        // not receiving anything.
+        if let Some((row, col)) = at {
+            let _ = self.editor.apply_in(view, &plugin, ApiCall::WinSetCursor {
+                win,
+                row: row as u32,
+                col: col as u32,
+            });
+        }
+    }
+
+    /// Give a terminal's buffer somewhere for the caret to be.
+    ///
+    /// A surface paints cells and a *caret* is placed from the buffer underneath — the frontend
+    /// resolves it against the rows a window actually rendered, so an empty buffer is a window with
+    /// nowhere to put one, and the caret sat wherever the fallback left it while you typed at a
+    /// prompt further down. Spaces rather than empty lines, because the column is clamped to the
+    /// length of the row it lands on and every row of an empty buffer is zero long.
+    ///
+    /// Rewritten on claim and on resize only. It is a scaffold, not content: the surface is drawn
+    /// over every cell of it, and nothing reads it back.
+    fn scaffold_terminal(
+        &mut self,
+        view: neosh_proto::ViewId,
+        pane: neosh_proto::PaneId,
+        rows: u16,
+        cols: u16,
+    ) {
+        let Some(buf) = self.views.get(&view).and_then(|v| v.panes.get(&pane)).map(|p| p.chat)
+        else {
+            return;
+        };
+        let plugin = PluginId::from(BUILTIN);
+        let line = " ".repeat(cols as usize);
+        let _ = self.editor.apply_in(view, &plugin, ApiCall::BufSetLines {
+            buf,
+            start: 0,
+            end: -1,
+            lines: vec![line; rows.max(1) as usize],
+        });
+    }
+
+    fn pane_window(
+        &self,
+        view: neosh_proto::ViewId,
+        pane: neosh_proto::PaneId,
+    ) -> WindowId {
+        self.views
+            .get(&view)
+            .and_then(|v| v.panes.get(&pane))
+            .map(|p| p.chat_win)
+            .unwrap_or_default()
+    }
+
+    /// Push every shell that has drawn something since the last frame, and reap the dead.
+    ///
+    /// Polled rather than pushed: the reader threads set a flag, and this is the one place that
+    /// turns flags into frames. A channel per terminal waking the loop would be the same work with
+    /// a wake-up per byte of output, which for a build log is thousands a second.
+    fn tick_terminals(&mut self) -> bool {
+        let mut drew = false;
+        let live: Vec<(neosh_proto::ViewId, neosh_proto::PaneId)> = self
+            .views
+            .iter()
+            .flat_map(|(v, s)| s.panes.values().filter(|p| p.term).map(move |p| (*v, p.pane)))
+            .collect();
+        for (view, pane) in live {
+            let dirty = self.terminals.get(pane).is_some_and(|t| t.take_dirty());
+            if !dirty {
+                continue;
+            }
+            self.draw_terminal(view, pane);
+            drew = true;
+            // A shell that has exited leaves a pane showing its last frame forever. Said once, in
+            // the pane, rather than closing it: what it printed before it went is often the reason
+            // you would want to look.
+            if self.terminals.get_mut(pane).is_some_and(|t| t.finished()) {
+                self.terminals.remove(pane);
+                self.in_pane(view, pane, |me| {
+                    me.editor_message(MessageLevel::Info, "the shell exited — <C-w>q closes the pane");
+                });
+            }
+        }
+        drew
+    }
+
+    /// Point the keyboard at the active pane, and put the mode back to what that pane was in.
+    ///
+    /// Two facts that are per pane meeting one that is per view. `home` is the window keys go to at
+    /// rest, so it has to follow the active pane or every binding on `neosh.composer` resolves
+    /// against a field in the half of the screen you are not in. The *mode* is the editor's and
+    /// there is one per terminal — so a pane you left while reading has to put `Normal` back when
+    /// you return to it, or `j` types a letter into a transcript.
+    fn rehome(&mut self, view: neosh_proto::ViewId) {
+        let Some(pane) = self.editor.active_pane_of(view) else { return };
+        let Some(state) = self.views.get(&view).and_then(|v| v.panes.get(&pane)) else { return };
+        let (composer_win, chat_win) = (state.composer_win, state.chat_win);
+        let (reading, was) = (state.reading, state.mode_before_reading);
+        let session = state.session.clone();
+
+        // **Moving the keyboard into a pane is arriving in the conversation it is reading.**
+        //
+        // Which model answers, how hard it thinks, what the context meter is measuring and what
+        // `⇧⇥` sets are all facts about a *conversation*, and the store keeps one "current" that
+        // every one of them reads. Nothing told it the keyboard had moved — so with two chats side
+        // by side, `^P` showed the model of whichever pane you last *entered a conversation in*,
+        // `^E` opened that one's options, and the footer named its model while you typed into the
+        // other. The pane you are in is the conversation you are in; there is no third thing for
+        // these to be about.
+        //
+        // Guarded, because `sync_panes` runs after every apply and `enter` is a history: moving to
+        // the front of the recency order on every redraw would make the sidebar's ordering mean
+        // "most recently drawn" rather than "most recently arrived in".
+        if self.views.get(&view).and_then(|v| v.entered.as_ref()) != Some(&session) {
+            if let Some(v) = self.views.get_mut(&view) {
+                v.entered = Some(session.clone());
+            }
+            let _ = self.in_pane(view, pane, |me| me.arrive_in(&session));
+        }
+
+        self.editor.set_home(view, Some(composer_win));
+        let want = if reading { Mode::Normal } else { was };
+        if self.editor.mode(view) != want {
+            self.editor.set_mode(view, want);
+        }
+        // Reading is a place *in* a pane, and the focus stack is per view — so arriving in a pane
+        // that was left mid-read has to put the transcript back on top of it, and arriving in one
+        // that was not has to take it off. Without this, moving from a reading pane to a composing
+        // one left the keys going to a transcript in the other half of the screen.
+        let plugin = PluginId::from(BUILTIN);
+        let focused = self.editor.focused(view);
+        if reading && focused != Some(chat_win) {
+            let _ = self.editor.apply_in(view, &plugin, ApiCall::FocusPush { win: chat_win });
+        } else if !reading && focused == Some(chat_win) {
+            let _ = self.editor.apply_in(view, &plugin, ApiCall::FocusPop);
         }
     }
 
@@ -4216,11 +4946,240 @@ impl Host {
         }
     }
 
+    /// Redraw the tab strip.
+    ///
+    /// Two things on one row, and the second is why the row is always there. On the left, the tabs:
+    /// numbered, so `<C-w>1` is readable straight off the bar rather than being a fact you have to
+    /// have been told. On the right, the keys — which is the whole of "you can tell what to do by
+    /// looking at it", and the reason this is not hidden behind a single-tab check.
+    ///
+    /// A tab with no name is named by what is in it: the conversation in its active pane, or how
+    /// many panes it has when they disagree. Resolved on every redraw rather than stored, because a
+    /// name worked out once is a tab still called by the conversation you closed an hour ago.
+    fn refresh_tabline(&mut self) {
+        let views: Vec<neosh_proto::ViewId> = self.views.keys().copied().collect();
+        for view in views {
+            self.in_view(view, |me| me.draw_tabline());
+        }
+    }
+
+    fn draw_tabline(&mut self) {
+        let view = self.view_now();
+        let Some(buf) = self.views.get(&view).map(|v| v.tabline) else { return };
+        let width = self
+            .views
+            .get(&view)
+            .map(|v| v.tabline_win)
+            .and_then(|w| self.editor.window(w))
+            .and_then(|w| w.viewport.map(|v| v.width as usize))
+            .unwrap_or(0);
+        // A width of zero is *unknown*, not narrow — the frontend has not reported one yet, or is
+        // one that never does. The tabs are written anyway and the legend is what waits: which tabs
+        // are open does not depend on how wide the row is, and returning early here left the bar
+        // empty until something happened to resize it, which for a client that reports no
+        // viewports at all is never.
+        let known = width > 0;
+
+        let (tabs, active) = (self.editor.tab_list(view).0, self.editor.active_tab_of(view));
+        // Text and its colours, built together and written as one line plus range marks — the way
+        // the status strip does it, and for the same reason: virtual text on an empty line cannot
+        // be selected, searched or read back, and this is a row people will want to screenshot.
+        let mut text = String::new();
+        let mut marks: Vec<(usize, usize, String)> = Vec::new();
+        // The tabs get the room first and the legend takes what is left. A hint is worth a lot and
+        // is worth less than the thing it is a hint about: crowded out by three key names, the bar
+        // said `+1` where a conversation's title belongs, which is the one row on screen whose job
+        // is telling you which conversations are open.
+        //
+        // The first hint is the exception and is reserved for: it is `<C-w>`, and everything else
+        // here — including the way back to a tab whose name did not fit — is behind it.
+        let keys = self.tabline_keys();
+        let cost = |(k, l): &(String, String)| display_width(k) + display_width(l) + 2;
+        // Two spaces between the keys and the last tab, so the bar never reads as one long run.
+        let reserved = keys.first().map(cost).unwrap_or(0) + 2;
+        let room = match known {
+            true => width.saturating_sub(reserved),
+            false => usize::MAX,
+        };
+
+        for (n, tab) in tabs.iter().enumerate() {
+            let name = self.tab_title(view, tab);
+            // `1` rather than `0`: the key is `<C-w>1`, and a bar counting from zero is a bar whose
+            // numbers are not the numbers you type.
+            let label = format!(" {} {} ", n + 1, name);
+            // Nothing is half-drawn. A tab label cut in the middle reads as a conversation with a
+            // different name, so the ones that do not fit are dropped and counted instead.
+            if display_width(&text) + display_width(&label) > room {
+                let more = format!(" +{} ", tabs.len() - n);
+                if display_width(&text) + display_width(&more) <= room {
+                    let from = text.len();
+                    text.push_str(&more);
+                    marks.push((from, text.len(), "Tabline.Tab".into()));
+                }
+                break;
+            }
+            let from = text.len();
+            text.push_str(&label);
+            let group = match Some(tab.id) == active {
+                true => "Tabline.Active",
+                false => "Tabline.Tab",
+            };
+            marks.push((from, text.len(), group.into()));
+        }
+
+        // The legend, hard against the right edge. What it says depends on where you are, because a
+        // strip listing keys that do nothing here is worse than no strip: it is a promise about a
+        // keyboard that is not being kept.
+        //
+        // As many as fit, in the order they are worth knowing — and whole ones, never half of one:
+        // `<C-w>v spl` is a key that appears to exist and do something else.
+        let used = display_width(&text);
+        let mut shown: Vec<(String, String)> = Vec::new();
+        let mut spent = 0usize;
+        for (n, k) in keys.iter().enumerate() {
+            // At an unknown width, the prefix and nothing else. There is no right-hand edge to
+            // place a legend against yet — but *that this bar leads somewhere* is the one thing it
+            // has to say from the first frame, and making that contingent on a frontend having
+            // reported geometry would mean a client that reports none never learns the prefix
+            // exists. The rest arrives with the first viewport report, which redraws this.
+            let fits = match known {
+                true => used + spent + cost(k) + 1 <= width,
+                false => n == 0,
+            };
+            if !fits {
+                break;
+            }
+            spent += cost(k);
+            shown.push(k.clone());
+        }
+        let pad = width.saturating_sub(used + spent);
+        if known && pad > 0 {
+            text.push_str(&" ".repeat(pad));
+        }
+        for (k, label) in shown {
+            let from = text.len();
+            text.push_str(&format!(" {k}"));
+            marks.push((from, text.len(), "Tabline.Key".into()));
+            let from = text.len();
+            text.push_str(&format!(" {label}"));
+            marks.push((from, text.len(), "Tabline.Hint".into()));
+        }
+
+        let plugin = PluginId::from(BUILTIN);
+        let _ = self.editor.apply_in(view, &plugin, ApiCall::BufSetLines {
+            buf,
+            start: 0,
+            end: -1,
+            lines: vec![text],
+        });
+        // Cleared first. A row rewritten several times a second accumulates marks otherwise, and at
+        // equal priority the *narrower* one wins — so the bar ends up painted by the shortest label
+        // it had a few seconds ago.
+        let _ = self.editor.apply_in(view, &plugin, ApiCall::MarkClear {
+            ns: self.tabline_ns,
+            buf,
+            start: None,
+            end: None,
+        });
+        for (from, to, hl) in marks {
+            let _ = self.editor.apply_in(view, &plugin, ApiCall::MarkSet {
+                ns: self.tabline_ns,
+                buf,
+                row: 0,
+                col: from as u32,
+                opts: neosh_proto::ExtmarkOpts {
+                    end_col: Some(to as u32),
+                    hl_group: Some(hl),
+                    line_hl_group: None,
+                    virt_text: vec![],
+                    virt_text_pos: neosh_proto::VirtTextPos::Eol,
+                    on_delete: neosh_proto::OnDelete::Clamp,
+                    priority: 0,
+                },
+            });
+        }
+    }
+
+    /// What a tab is called: its own name, or the conversation in it.
+    fn tab_title(&self, view: neosh_proto::ViewId, tab: &neosh_proto::TabInfo) -> String {
+        if let Some(name) = &tab.title {
+            return name.clone();
+        }
+        let panes = self.editor.panes_in_tab(view, tab.id);
+        // Several panes and no name of its own: the count is the honest label. Naming a tab after
+        // one of four conversations picks a winner nobody asked it to pick, and the pane you are in
+        // is already the one with the keyboard — the bar is for the tabs you are *not* in.
+        if panes.len() > 1 {
+            return format!("{} panes", panes.len());
+        }
+        let pane = self.views.get(&view).and_then(|v| v.panes.get(&tab.active_pane));
+        // A shell is not in a conversation, so naming it after one would be naming it after
+        // whatever it happened to inherit. The command it is running is the true answer and is
+        // short, which the bar also wants.
+        if pane.is_some_and(|p| p.term) {
+            let shell = self.terminals.get(tab.active_pane).map(|t| t.command.clone());
+            let name = shell
+                .as_deref()
+                .and_then(|c| c.rsplit('/').next())
+                .unwrap_or("shell")
+                .to_string();
+            return name;
+        }
+        let title = pane
+            .map(|p| p.session.clone())
+            .and_then(|s| self.agent.sessions().get(&s).and_then(|s| s.title.clone()));
+        match title {
+            Some(t) if !t.trim().is_empty() => t,
+            _ => "new".to_string(),
+        }
+    }
+
+    /// The keys the tab strip advertises, for wherever the keyboard is.
+    ///
+    /// Short, and different per place. The full list is `<C-w>` — which is on this strip, and is
+    /// the thing that makes the rest discoverable without any of them being printed.
+    fn tabline_keys(&self) -> Vec<(String, String)> {
+        let view = self.view_now();
+        let panes = self
+            .editor
+            .active_tab_of(view)
+            .map(|t| self.editor.panes_in_tab(view, t).len())
+            .unwrap_or(1);
+        let tabs = self.editor.tab_count_of(view);
+
+        let mut out = vec![(self.chord("<C-w>"), "windows".to_string())];
+        // Only once there is somewhere to go. A "next tab" key on a workspace with one tab is a
+        // key that does nothing, printed where you are most likely to read it.
+        if tabs > 1 {
+            out.push((self.chord("<C-w>w"), "next tab".to_string()));
+        }
+        if panes > 1 {
+            out.push((self.chord("<C-w>hjkl"), "move".to_string()));
+        } else {
+            out.push((self.chord("<C-w>v"), "split".to_string()));
+        }
+        out
+    }
+
+    /// How a chord should be *printed*, which is whatever it is currently bound to.
+    ///
+    /// Read out of the live keymap rather than spelled here, so a legend is a promise about the
+    /// keyboard somebody actually has. `init.ts` moving the window prefix moves what the strip
+    /// says, and a hint row that still advertises the default after a rebinding is worse than no
+    /// hint row at all.
+    fn chord(&self, default: &str) -> String {
+        let prefix = self.window_prefix();
+        match default.strip_prefix("<C-w>") {
+            Some(rest) => format!("{prefix}{rest}"),
+            None => default.to_string(),
+        }
+    }
+
     /// How wide the status strip is, or zero if the frontend has not said yet.
     fn status_width(&self) -> usize {
         self.editor
             .windows()
-            .find(|w| w.buf == self.v().status)
+            .find(|w| w.buf == self.vs().status)
             .and_then(|w| w.viewport.map(|v| v.width as usize))
             .unwrap_or(0)
     }
@@ -4445,21 +5404,21 @@ impl Host {
 
         let plugin = PluginId::from(BUILTIN);
         let _ = self.editor.apply(&plugin, ApiCall::BufSetLines {
-            buf: self.v().status,
+            buf: self.vs().status,
             start: 0,
             end: -1,
             lines: vec![text.clone()],
         });
         let _ = self.editor.apply(&plugin, ApiCall::MarkClear {
             ns: self.status_ns,
-            buf: self.v().status,
+            buf: self.vs().status,
             start: None,
             end: None,
         });
         for (from, to, hl) in marks {
             let _ = self.editor.apply(&plugin, ApiCall::MarkSet {
                 ns: self.status_ns,
-                buf: self.v().status,
+                buf: self.vs().status,
                 row: 0,
                 col: from as u32,
                 opts: neosh_proto::ExtmarkOpts {
@@ -4482,6 +5441,11 @@ impl Host {
     /// be sent to the model, and a placeholder written into it would be sent the moment someone
     /// pressed Enter without looking. Virtual text is drawn and never read back.
     fn refresh_composer(&mut self) {
+        // A terminal pane has no composer — its window *is* the field — and the chrome this draws
+        // would be written straight over the shell's own output.
+        if self.v().term {
+            return;
+        }
         let plugin = PluginId::from(BUILTIN);
         let _ = self.editor.apply(&plugin, ApiCall::MarkClear {
             ns: self.composer_ns,
@@ -5060,7 +6024,7 @@ impl Host {
                         .send(Err(ApiError::NotFound { what: format!("command {name}") }).into());
                 }
                 Some(owner) if owner.0 == BUILTIN => {
-                    self.run_builtin(&name, args);
+                    self.run_builtin(&name, args, None);
                     let _ = reply.send(Ok(ApiOk::Json { value: serde_json::Value::Null }).into());
                 }
                 Some(owner) => {
@@ -6867,6 +7831,11 @@ impl Host {
     }
 
     fn enter_session(&mut self) {
+        // A shell is not in a conversation, and rebuilding a transcript into its buffer would paint
+        // over the screen the child is drawing.
+        if self.v().term {
+            return;
+        }
         // First, and while the transcript being read is still the one on screen. Reading is a place
         // *in* a conversation — a cursor at a row, a selection between two of them, a search
         // highlight — and every one of those addresses text that is about to be replaced by
@@ -9035,6 +10004,47 @@ impl Host {
     }
 
     fn handle_input(&mut self, input: InputEvent) -> bool {
+        // The prefix panel describes one half-typed chord, so the press after it appeared ends it
+        // whatever that press is — including the one that completes the chord, which is about to
+        // do the thing the panel was describing. Taken down *before* the key is handled: a hint
+        // still on screen over the split it just told you how to make is a panel you would then
+        // have to dismiss.
+        if self.window_hint.is_some() && matches!(input, InputEvent::Key { .. }) {
+            self.drop_window_hint();
+        }
+        // A shell takes the keyboard whole. Everything a terminal can receive belongs to the
+        // program inside it — `^C` interrupts *that*, `^D` ends *its* input — so the workspace's own
+        // bindings step aside, and the one way back out is the window prefix.
+        //
+        // Two exceptions, and both are about not stealing a chord: a sequence already in flight
+        // belongs to the keymap that started it, and the key that *starts* the prefix has to reach
+        // the keymap or there would be no way to leave a full-screen program.
+        if self.v().term {
+            let pane = self.v().pane;
+            let view = self.view_now();
+            match input {
+                InputEvent::Key { key }
+                    if self.editor.pending_keys(view).is_empty() && !self.starts_prefix(&key) =>
+                {
+                    let bytes = crate::term::encode(&key);
+                    if let Some(t) = self.terminals.get_mut(pane) {
+                        t.write(&bytes);
+                    }
+                    return true;
+                }
+                InputEvent::Paste { text } => {
+                    // Bracketed, so a program that understands it knows this was pasted rather than
+                    // typed — which is what stops an editor auto-indenting every line of it.
+                    if let Some(t) = self.terminals.get_mut(pane) {
+                        t.write(b"\x1b[200~");
+                        t.write(text.as_bytes());
+                        t.write(b"\x1b[201~");
+                    }
+                    return true;
+                }
+                _ => {}
+            }
+        }
         // A key being typed in takes the keyboard whole, bindings included. Routing it through the
         // keymaps first would mean a key containing `n` — every base64 key does — firing whatever
         // `n` is bound to, halfway through the paste.
@@ -9042,6 +10052,32 @@ impl Host {
             match input {
                 InputEvent::Key { key } => self.secret_key(key),
                 InputEvent::Paste { text } => self.secret_paste(&text),
+                other => return self.handle_input_uncaptured(other),
+            }
+            return true;
+        }
+        // The new-tab panel takes the keyboard whole: `j`, `k` and the digits are answers to the
+        // question on screen, and every one of them is also bound to something else.
+        if self.tab_choice.is_some() {
+            match input {
+                InputEvent::Key { key } => self.tab_choice_key(key),
+                other => return self.handle_input_uncaptured(other),
+            }
+            return true;
+        }
+        // Naming a tab takes it the same way, and for the same reason a search does: every letter
+        // of the name you are typing is also somebody's binding.
+        if self.v().rename.is_some() {
+            match input {
+                InputEvent::Key { key } => self.rename_key(key),
+                InputEvent::Paste { text } => {
+                    if let Some(p) = self.vm().rename.as_mut() {
+                        // One line. A pasted paragraph is not a tab name, and the newlines in it
+                        // would be drawn as a strip several rows tall.
+                        p.value.push_str(text.replace('\n', " ").trim());
+                    }
+                    self.render_rename();
+                }
                 other => return self.handle_input_uncaptured(other),
             }
             return true;
@@ -9141,28 +10177,70 @@ impl Host {
                     // over the end of the left — until a turn started or a conversation changed and
                     // it silently put itself right, which is the version of this that is hardest to
                     // report.
-                    let strip = self.editor.window(win).map(|w| w.buf) == Some(self.v().status);
+                    let strip = self.editor.window(win).map(|w| w.buf) == Some(self.vs().status);
                     if strip {
                         self.refresh_status();
                     }
+                    // The tab strip is fitted to its own width for the same reason the status line
+                    // is — labels are dropped and counted until the row fits — and this is the only
+                    // place that width arrives.
+                    if self.views.values().any(|v| v.tabline_win == win) {
+                        self.refresh_tabline();
+                    }
                 }
-                // What the frontend *drew*, which is not always what was asked for: a window whose
-                // scroll had to bend to keep its cursor on screen is showing a different first row.
-                // Taking it back means the next page starts from where the screen is rather than
-                // from where the core last guessed, which with wrapped rows are different places.
-                if win == self.v().chat_win && self.v().chat_top.is_some() {
-                    self.vm().chat_top = Some(top_line);
-                }
-                // This is where the host *learns* a width — `Resize` is the terminal's outer size
-                // and the transcript is some part of it. So anything drawn to a width has to be
-                // drawn again here, or a narrow terminal joining a wide workspace keeps the wide
-                // one's welcome until something unrelated happens to redraw it.
-                if win == self.v().chat_win && self.chat_width() != was {
-                    self.draw_welcome();
-                    // And the block at the bottom of a running turn, for the same reason: the plan
-                    // and what is out are laid out against `chat_width`, so after a resize they are
-                    // wrapped to a width the window no longer has.
-                    self.redraw_footer();
+                // Which pane this window is in — *not* whichever pane happens to have the keyboard.
+                // A split resizes two panes at once and the frontend reports each window
+                // separately, so half of these events are about the pane you are not in. Tested
+                // against `self.v()` they were answered by the active pane's state, which meant a
+                // scroll position taken from the wrong transcript and a redraw that never happened
+                // for the other half of the screen.
+                let owner = self.pane_of_window(win);
+                if let Some((at, pane)) = owner {
+                    self.in_pane(at, pane, |me| {
+                        // What the frontend *drew*, which is not always what was asked for: a
+                        // window whose scroll had to bend to keep its cursor on screen is showing a
+                        // different first row. Taking it back means the next page starts from where
+                        // the screen is rather than from where the core last guessed, which with
+                        // wrapped rows are different places.
+                        if win == me.v().chat_win && me.v().chat_top.is_some() {
+                            me.vm().chat_top = Some(top_line);
+                        }
+                        // This is where the host *learns* a width — `Resize` is the terminal's
+                        // outer size and a transcript is some part of it, which since splitting is
+                        // a part that changes without the terminal changing at all. So anything
+                        // drawn to a width has to be drawn again here, or a pane halved by a split
+                        // keeps the whole region's layout until something unrelated redraws it.
+                        if win == me.v().chat_win && me.chat_width() != was {
+                            me.draw_welcome();
+                            // And the block at the bottom of a running turn, for the same reason:
+                            // the plan and what is out are laid out against `chat_width`, so after
+                            // a resize they are wrapped to a width the window no longer has.
+                            me.redraw_footer();
+                        }
+                        // The composer too, which nothing used to have to redraw: its rule is a run
+                        // of `─` as wide as the field, and until a pane could be narrowed on its
+                        // own the only thing that changed that width was the terminal itself. A
+                        // split halves it, and a rule drawn for the old width wraps onto a second
+                        // row — a composer that grows a line every time you split.
+                        if win == me.v().composer_win {
+                            me.refresh_composer();
+                        }
+                        // And a shell is told how big it is, which is what sends it `SIGWINCH` —
+                        // without it a program redraws to the size the pane used to be.
+                        if me.v().term && win == me.v().chat_win {
+                            let pane = me.v().pane;
+                            if let Some(t) = me.terminals.get_mut(pane) {
+                                t.resize(height, width);
+                            }
+                            let plugin = PluginId::from(BUILTIN);
+                            let _ = me.editor.apply_in(at, &plugin, ApiCall::SurfaceClaim {
+                                win,
+                                rect: neosh_proto::Rect { row: 0, col: 0, width, height },
+                            });
+                            me.scaffold_terminal(at, pane, height, width);
+                            me.draw_terminal(at, pane);
+                        }
+                    });
                 }
             }
             InputEvent::Attached { session, .. } => {
@@ -9561,6 +10639,19 @@ impl Host {
         // the redraw window because the two answer different questions and share no timing.
         let keys = tokio::time::sleep(Duration::from_secs(86_400));
         tokio::pin!(keys);
+        // The shorter of the two chord timers. `keys` gives up on a half-typed sequence; this one
+        // *explains* it, and fires well before it so that hesitating over the prefix teaches you
+        // what follows rather than silently timing out. Two timers rather than one with two
+        // deadlines, because they mean opposite things: one is "you have stopped typing", and this
+        // is "you have paused, so here is the list".
+        let hint = tokio::time::sleep(Duration::from_secs(86_400));
+        tokio::pin!(hint);
+        let mut hinting = false;
+        // How often a shell's output reaches the screen. Fast enough that typing feels immediate,
+        // slow enough that a build log scrolling past is a few dozen frames a second rather than
+        // one per write. Armed only while a terminal exists, so a workspace with none does no work.
+        let shells = tokio::time::sleep(Duration::from_millis(16));
+        tokio::pin!(shells);
         let mut waiting = false;
 
         // The elapsed clock on the working line. A third deadline rather than a share of the redraw
@@ -9683,6 +10774,20 @@ impl Host {
                         self.drain_effects();
                     }
                 }
+                () = &mut shells, if !self.terminals.is_empty() => {
+                    // The cells are queued like any other mutation; the loop's own flush at the
+                    // bottom sends them. Nothing special about a terminal's frame.
+                    self.tick_terminals();
+                    shells.as_mut().reset(Instant::now() + Duration::from_millis(16));
+                }
+                () = &mut hint, if hinting => {
+                    hinting = false;
+                    // Asked again rather than assumed: the chord may have been completed, given up
+                    // on, or replaced by a different one in the time this was armed for.
+                    if self.holding_window_prefix() {
+                        self.show_window_keys();
+                    }
+                }
                 Some(unheard) = async {
                     match unasked_rx.as_mut() {
                         Some(rx) => rx.recv().await,
@@ -9774,10 +10879,39 @@ impl Host {
                 self.report_live_now();
             }
             if std::mem::take(&mut self.keys_touched) {
-                waiting = self.keys_pending;
+                // The window prefix does not expire, and every other half-typed sequence does.
+                //
+                // `timeoutlen` is what keeps a prefix from making a printable character untypeable:
+                // with `gd` bound, `g` has to appear in the field eventually or the composer eats
+                // it with no way to tell why. Nothing is waiting to be typed behind `<C-w>` — it is
+                // a chord, not a character — so the deadline protects nothing here and costs the
+                // one thing that matters: the panel appears at 300 ms and the chord died at 500,
+                // so reading the list it had just drawn was enough to lose the chord it described,
+                // and the verb you then pressed went into the message field. A panel that says
+                // "pick one" is a promise to wait for you to pick one.
+                //
+                // Nothing hangs. A second key either completes the chord or is unmatched, and
+                // unmatched replays the whole held sequence as ordinary input on the press itself.
+                let prefix = self.holding_window_prefix();
+                waiting = self.keys_pending && !prefix;
                 if waiting {
                     let ms = self.editor.options().int("timeoutlen").unwrap_or(500).max(0) as u64;
                     keys.as_mut().reset(Instant::now() + Duration::from_millis(ms));
+                }
+                // A delay rather than drawing at once, so somebody typing `<C-w>v` fluently never
+                // sees a flash — and somebody who pauses gets told. Zero means "at once", for
+                // anyone who would rather have it that way.
+                hinting = self.keys_pending
+                    && prefix
+                    && self.window_hint.is_none();
+                if hinting {
+                    let ms = self
+                        .editor
+                        .options()
+                        .int("ui.keys.hint_delay")
+                        .unwrap_or(300)
+                        .max(0) as u64;
+                    hint.as_mut().reset(Instant::now() + Duration::from_millis(ms));
                 }
             }
             if self.v().working && !ticking {
@@ -10206,6 +11340,47 @@ impl Host {
                 "provider.key",
                 "Enter an API key — for the named instance, or the one this model belongs to",
             ),
+            // Windows, panes and tabs. Every one of these is an ordinary named command before it
+            // is a key, which is what makes the prefix rebindable, `^K` able to run any of them by
+            // name, and a plugin able to build a different window manager out of the same verbs.
+            ("window.split.right", "Split this pane, and put the new one on the right"),
+            ("window.split.left", "Split this pane, and put the new one on the left"),
+            ("window.split.down", "Split this pane, and put the new one below"),
+            ("window.split.up", "Split this pane, and put the new one above"),
+            ("window.split.chat", "Split to the right, on a new conversation"),
+            ("window.close", "Close this pane"),
+            ("window.only", "Close every pane but this one"),
+            ("window.left", "Go to the pane on the left"),
+            ("window.right", "Go to the pane on the right"),
+            ("window.up", "Go to the pane above"),
+            ("window.down", "Go to the pane below"),
+            ("window.next", "Go to the next pane, or the next tab when there is one pane"),
+            ("window.wider", "Widen this pane"),
+            ("window.narrower", "Narrow this pane"),
+            ("window.taller", "Make this pane taller"),
+            ("window.shorter", "Make this pane shorter"),
+            ("window.equalize", "Give every pane an equal share"),
+            ("window.move.left", "Move this pane to the far left"),
+            ("window.move.down", "Move this pane to the bottom"),
+            ("window.move.up", "Move this pane to the top"),
+            ("window.move.right", "Move this pane to the far right"),
+            ("window.exchange", "Swap this pane with the next one, keeping their places"),
+            ("tab.open", "Open a tab, choosing what goes in it"),
+            ("tab.new", "Open a tab showing what you are reading"),
+            ("tab.new.chat", "Open a tab on a new conversation in this directory"),
+            ("tab.close", "Close this tab and everything in it"),
+            // Registered as well as bound. A command that is bound to a key and owned by nobody
+            // resolves to "no such command" on every press — which is what `<C-w>1` did, silently
+            // enough that the key simply looked dead.
+            ("tab.select", "Go to the tab with this number, counting from the left"),
+            ("tab.next", "Go to the next tab"),
+            ("tab.prev", "Go to the previous tab"),
+            ("tab.rename", "Name this tab"),
+            ("tab.move.left", "Move this tab left along the bar"),
+            ("tab.move.right", "Move this tab right along the bar"),
+            ("window.split.term", "Split this pane, and run a shell in the new one"),
+            ("tab.new.term", "Open a tab with a shell in it"),
+            ("window.keys", "Show what the window prefix can do"),
         ];
         for (name, desc) in commands {
             let _ = self.editor.apply(&plugin, ApiCall::CmdRegister {
@@ -10280,6 +11455,65 @@ impl Host {
                 scope: None,
                 desc: Some(desc.to_string()),
             });
+        }
+        self.bind_window_keys();
+    }
+
+    /// The window prefix, out of `ui.keys.window_prefix`.
+    ///
+    /// Read on every use rather than cached, for the reason `ui.modal_escape_keys` is: it is a
+    /// setting, `^R` reloads settings, and a cached copy of the key that reaches every other key is
+    /// the one that cannot be corrected without restarting.
+    fn window_prefix(&self) -> String {
+        self.editor
+            .options()
+            .get("ui.keys.window_prefix")
+            .and_then(|v| v.as_str().map(str::to_string))
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "<C-w>".to_string())
+    }
+
+    /// Bind everything under the window prefix.
+    ///
+    /// A prefix layer, which the rest of this workspace deliberately does not have — and the
+    /// argument against one is on the record: *"inventing a prefix layer for one verb costs every
+    /// user a concept to save one of them a keystroke."* This is not one verb. It is twenty-four,
+    /// on a keyboard where every Ctrl-letter is already spoken for, and where the alternative is
+    /// that most of them ship with no key at all. Vim and tmux both landed here from the same
+    /// place.
+    ///
+    /// What makes it affordable is that it is *self-teaching*: holding the prefix draws the list —
+    /// see [`Self::window_hint`] — so nobody has to have been told, which was the real cost of a
+    /// prefix and not the keystroke. The prefix itself is on the tab bar, permanently.
+    ///
+    /// Rebound rather than added to on reload, so moving the prefix in `init.ts` does not leave the
+    /// old one working as well: two prefixes, one of which you did not choose, is worse than either.
+    fn bind_window_keys(&mut self) {
+        let plugin = PluginId::from(BUILTIN);
+        let prefix = self.window_prefix();
+        for (suffix, command) in WINDOW_KEYS {
+            for mode in [Mode::Normal, Mode::Insert, Mode::Visual, Mode::Chat] {
+                let _ = self.editor.apply(&plugin, ApiCall::KeymapSet {
+                    mode,
+                    lhs: format!("{prefix}{suffix}"),
+                    command: command.to_string(),
+                    scope: None,
+                    desc: None,
+                });
+            }
+        }
+        // A tab by number. Nine of them, which is as many as the bar can usefully print and as
+        // many as a single keypress can name.
+        for n in 1..=9u32 {
+            for mode in [Mode::Normal, Mode::Insert, Mode::Visual, Mode::Chat] {
+                let _ = self.editor.apply(&plugin, ApiCall::KeymapSet {
+                    mode,
+                    lhs: format!("{prefix}{n}"),
+                    command: "tab.select".to_string(),
+                    scope: None,
+                    desc: None,
+                });
+            }
         }
     }
 
@@ -10361,16 +11595,16 @@ impl Host {
         // because the two cases cannot both be true. Without this the key that means "copy"
         // everywhere else in your day means "throw away what you were writing" here.
         if self.copy_selection(false) {
-            self.vm().quit_armed = None;
+            self.vsm().quit_armed = None;
             return;
         }
         if self.v().reading {
             self.leave_reading();
-            self.vm().quit_armed = None;
+            self.vsm().quit_armed = None;
             return;
         }
         if let Some(stopped) = self.cancel_turn_here() {
-            self.vm().quit_armed = None;
+            self.vsm().quit_armed = None;
             if stopped {
                 self.editor_message(MessageLevel::Info, "interrupted");
             }
@@ -10378,15 +11612,15 @@ impl Host {
         }
         if !self.composer_text().is_empty() {
             self.set_composer("");
-            self.vm().quit_armed = None;
+            self.vsm().quit_armed = None;
             return;
         }
-        let armed = self.v().quit_armed.is_some_and(|at| at.elapsed() < ARM_WINDOW);
+        let armed = self.vs().quit_armed.is_some_and(|at| at.elapsed() < ARM_WINDOW);
         if armed {
             self.leave();
             return;
         }
-        self.vm().quit_armed = Some(std::time::Instant::now());
+        self.vsm().quit_armed = Some(std::time::Instant::now());
         self.editor_message(MessageLevel::Info, match self.on_quit {
             OnQuit::Stop => "press ^C again to quit, or ^Q",
             OnQuit::Detach => "press ^C again to close this terminal, or ^Q",
@@ -10475,7 +11709,12 @@ impl Host {
         let _ = self.editor.apply(&plugin, ApiCall::WinScrollTo { win, top_line: top });
     }
 
-    fn run_builtin(&mut self, name: &str, args: Vec<String>) {
+    fn run_builtin(
+        &mut self,
+        name: &str,
+        args: Vec<String>,
+        key: Option<&neosh_proto::KeyContext>,
+    ) {
         match name {
             "config.reload" => self.reload_config(),
             "quit" => self.leave(),
@@ -10591,8 +11830,710 @@ impl Host {
                     None => self.editor_message(MessageLevel::Warn, "no model is selected"),
                 }
             }
+
+            // ---- windows, panes and tabs ---------------------------------
+            "window.split.right" => self.split_pane(Direction::Right, false),
+            "window.split.left" => self.split_pane(Direction::Left, false),
+            "window.split.down" => self.split_pane(Direction::Down, false),
+            "window.split.up" => self.split_pane(Direction::Up, false),
+            "window.split.chat" => self.split_pane(Direction::Right, true),
+            "window.close" => self.close_pane(),
+            "window.only" => self.only_pane(),
+            "window.left" => self.go_pane(Direction::Left),
+            "window.right" => self.go_pane(Direction::Right),
+            "window.up" => self.go_pane(Direction::Up),
+            "window.down" => self.go_pane(Direction::Down),
+            "window.next" => self.next_pane(),
+            "window.wider" => self.resize_pane(Direction::Right, RESIZE_STEP),
+            "window.narrower" => self.resize_pane(Direction::Right, -RESIZE_STEP),
+            "window.taller" => self.resize_pane(Direction::Down, RESIZE_STEP),
+            "window.shorter" => self.resize_pane(Direction::Down, -RESIZE_STEP),
+            "window.equalize" => {
+                let view = self.view_now();
+                self.editor.pane_equalize(view);
+            }
+            "window.move.left" => self.move_pane(Direction::Left),
+            "window.move.down" => self.move_pane(Direction::Down),
+            "window.move.up" => self.move_pane(Direction::Up),
+            "window.move.right" => self.move_pane(Direction::Right),
+            "window.exchange" => self.exchange_pane(),
+            "window.keys" => self.show_window_keys(),
+            "tab.open" => self.begin_tab_choice(),
+            "tab.new" => self.new_tab(),
+            "tab.new.chat" => {
+                let cwd = self.session_cwd(&self.v().session.clone());
+                self.new_tab();
+                self.start_conversation_here(cwd);
+            }
+            "tab.new.term" => {
+                let view = self.view_now();
+                self.editor.tab_new(view, None, true);
+                // Marked *before* the sync that furnishes it: `sync_panes` is what turns a pane the
+                // tree has into a pane with something in it, and it has nothing else to go on.
+                self.pending_term = self.editor.active_pane_of(view);
+                self.sync_panes();
+                self.refresh_status();
+            }
+            "window.split.term" => {
+                let view = self.view_now();
+                let from = self.editor.active_pane(view);
+                if let Some(new) = self.editor.pane_split(view, from, Direction::Right) {
+                    self.pending_term = Some(new);
+                    self.sync_panes();
+                    self.editor.pane_focus(view, new);
+                    self.sync_panes();
+                    self.refresh_status();
+                }
+            }
+            "tab.close" => self.close_tab(),
+            "tab.next" => self.step_tab(1),
+            "tab.prev" => self.step_tab(-1),
+            "tab.rename" => self.begin_tab_rename(),
+            "tab.move.left" => self.shift_tab(-1),
+            "tab.move.right" => self.shift_tab(1),
+            "tab.select" => {
+                // The digit is in the key rather than in an argument: `<C-w>3` is one binding per
+                // number and no way to carry a parameter through a keymap. Run from `^K` with no
+                // key at all, an argument is how it is said instead.
+                let n = key
+                    .and_then(|k| match &k.key.code {
+                        KeyCode::Char { c } => c.chars().next(),
+                        _ => None,
+                    })
+                    .and_then(|c| c.to_digit(10))
+                    .or_else(|| args.first().and_then(|a| a.parse::<u32>().ok()));
+                if let Some(n) = n.filter(|n| *n >= 1) {
+                    let view = self.view_now();
+                    let tabs = self.editor.tab_list(view).0;
+                    match tabs.get(n as usize - 1) {
+                        Some(t) => {
+                            let id = t.id;
+                            self.editor.tab_select(view, id);
+                        }
+                        // Silently, because `<C-w>4` with three tabs open is a miscount rather than
+                        // a mistake, and a warning per press is noise on a key you are holding.
+                        None => {}
+                    }
+                }
+            }
             other => tracing::warn!("no built-in command {other}"),
         }
+    }
+
+    // ---- windows, panes and tabs ---------------------------------------------
+    //
+    // Each of these is a thin wrapper over the editor's public API — the same calls a plugin makes
+    // — plus the two things a *key* wants that a plugin call should not assume: focus following the
+    // split, and a message when there is nowhere to go. `sync_panes` furnishes whatever appears, so
+    // none of these knows how to build a transcript.
+
+    /// Divide this pane, and go into the new one.
+    ///
+    /// Focus follows, which the API call deliberately does not do: a plugin splitting to show you
+    /// something and a person pressing a key to go and work there are different intentions, and
+    /// only the second one wants the keyboard to move.
+    fn split_pane(&mut self, dir: Direction, fresh: bool) {
+        let view = self.view_now();
+        let from = self.editor.active_pane(view);
+        let Some(new) = self.editor.pane_split(view, from, dir) else {
+            self.editor_message(MessageLevel::Warn, "this pane cannot be split");
+            return;
+        };
+        // Before focusing: the new pane inherits the session of whichever pane is active when it is
+        // furnished, and that has to still be the one it was split from.
+        self.sync_panes();
+        self.editor.pane_focus(view, new);
+        self.sync_panes();
+        if fresh {
+            // A split you asked to put something *else* in — the one-key version of splitting and
+            // then reaching for `^N`. Same directory, no dialog: `^N` is the key that asks where,
+            // and this is not a second place to be asked it.
+            let cwd = self.session_cwd(&self.v().session.clone());
+            self.start_conversation_here(cwd);
+            return;
+        }
+        self.refresh_status();
+        self.refresh_composer();
+    }
+
+    fn close_pane(&mut self) {
+        let view = self.view_now();
+        let pane = self.editor.active_pane(view);
+        if !self.editor.pane_close(view, pane) {
+            self.editor_message(
+                MessageLevel::Warn,
+                "this is the last pane — ^Q closes the terminal, and the turns keep running",
+            );
+            return;
+        }
+        self.sync_panes();
+        self.refresh_status();
+        self.refresh_composer();
+    }
+
+    /// Close every pane in this tab except the one you are in.
+    fn only_pane(&mut self) {
+        let view = self.view_now();
+        let keep = self.editor.active_pane(view);
+        let Some(tab) = self.editor.active_tab_of(view) else { return };
+        for pane in self.editor.panes_in_tab(view, tab) {
+            if pane != keep {
+                self.editor.pane_close(view, pane);
+            }
+        }
+        self.sync_panes();
+        self.refresh_status();
+        self.refresh_composer();
+    }
+
+    fn go_pane(&mut self, dir: Direction) {
+        let view = self.view_now();
+        if self.editor.pane_focus_dir(view, dir).is_none() {
+            // Nothing said out loud. Running out of panes in a direction is the ordinary outcome of
+            // holding a key down, and a message per press would be a warning for something that has
+            // not gone wrong. The cursor simply does not move, which is what Vim does too.
+            return;
+        }
+        self.sync_panes();
+        self.refresh_status();
+        self.refresh_composer();
+    }
+
+    /// The next pane, or the next tab when this one has only the pane you are in.
+    ///
+    /// One key that always goes *somewhere*. `<C-w>w` on a single-pane tab doing nothing at all is
+    /// the most common way a prefix layer teaches somebody it is broken.
+    fn next_pane(&mut self) {
+        let view = self.view_now();
+        let Some(tab) = self.editor.active_tab_of(view) else { return };
+        let panes = self.editor.panes_in_tab(view, tab);
+        if panes.len() <= 1 {
+            self.step_tab(1);
+            return;
+        }
+        let at = self.editor.active_pane(view);
+        let next = panes.iter().position(|p| *p == at).map(|i| (i + 1) % panes.len()).unwrap_or(0);
+        let to = panes[next];
+        self.editor.pane_focus(view, to);
+        self.sync_panes();
+        self.refresh_status();
+        self.refresh_composer();
+    }
+
+    fn resize_pane(&mut self, dir: Direction, delta: i16) {
+        let view = self.view_now();
+        let pane = self.editor.active_pane(view);
+        // Growing rightwards at the right-hand edge has no boundary to move, and the thing a person
+        // means by "wider" there is the boundary on the *other* side. Tried in order rather than
+        // reported as a failure: `<C-w>L` doing nothing in the last pane of a split is the key
+        // working exactly half the time.
+        if !self.editor.pane_resize(view, pane, dir, delta) {
+            let back = match dir {
+                Direction::Right => Direction::Left,
+                Direction::Left => Direction::Right,
+                Direction::Down => Direction::Up,
+                Direction::Up => Direction::Down,
+            };
+            self.editor.pane_resize(view, pane, back, delta);
+        }
+    }
+
+    /// Open a tab on the conversation you are already in.
+    ///
+    /// **A tab is a place, not a conversation.** It inherits, exactly as a split does and for the
+    /// same reason: `:tabnew` in every editor gives you another view of your work, and what you do
+    /// next decides what goes in it. Starting a conversation here instead put a row in the project
+    /// panel every time somebody opened a tab — a list of half-used "New conversation" entries in
+    /// the one panel whose job is the conversations you are actually working in, and none of them
+    /// asked for.
+    ///
+    /// Getting a *new* conversation in it is `^N`, which is the key that asks where — a worktree,
+    /// elsewhere, another machine. A tab is not a second place to be asked that, and it is not a
+    /// way to be handed a conversation you did not ask for either.
+    /// Send this pane to an edge of the tab, and go with it.
+    ///
+    /// The keyboard follows, because you moved the thing you were in — a move that left you behind
+    /// would be a move you then have to chase.
+    fn move_pane(&mut self, dir: Direction) {
+        let view = self.view_now();
+        let pane = self.editor.active_pane(view);
+        if self.editor.pane_move_edge(view, pane, dir) {
+            self.editor.pane_focus(view, pane);
+            self.sync_panes();
+            self.refresh_status();
+        }
+    }
+
+    /// Swap this pane with the next one along, keeping the shape.
+    ///
+    /// The weights belong to the slots, so this is how you put the pane you care about in the wide
+    /// half without resizing anything. Wraps, because two panes are the common case and "next" with
+    /// no wrap would do nothing in one of them.
+    fn exchange_pane(&mut self) {
+        let view = self.view_now();
+        let Some(tab) = self.editor.active_tab_of(view) else { return };
+        let panes = self.editor.panes_in_tab(view, tab);
+        if panes.len() < 2 {
+            return;
+        }
+        let at = self.editor.active_pane(view);
+        let Some(i) = panes.iter().position(|p| *p == at) else { return };
+        let with = panes[(i + 1) % panes.len()];
+        self.editor.pane_swap(view, at, with);
+        // Focus follows the *pane*, which after a swap is in the other slot — so the keyboard stays
+        // with the conversation you were reading rather than with the rectangle it used to be in.
+        self.editor.pane_focus(view, at);
+        self.sync_panes();
+        self.refresh_status();
+    }
+
+    fn new_tab(&mut self) {
+        let view = self.view_now();
+        self.editor.tab_new(view, None, true);
+        self.sync_panes();
+        self.refresh_status();
+        self.refresh_composer();
+    }
+
+    /// Start a conversation in this directory and go to it, in whichever pane is active.
+    ///
+    /// Made here rather than through `ApiCall::SessionNew`, which is `async` for one reason — it
+    /// remembers the directory as a project — and the directory is one the workspace is already in,
+    /// since it came off a conversation that is on screen. Everything else that call does is these
+    /// four lines, and they are the four that matter: a conversation inherits the model you are
+    /// using and the system prompt you set, because starting it on whatever the catalogue lists
+    /// first would silently change what you are talking to.
+    fn start_conversation_here(&mut self, cwd: std::path::PathBuf) {
+        let mut session = neosh_agent::Session::new(cwd);
+        session.created_at = now_secs();
+        session.updated_at = session.created_at;
+        session.selection = self.agent.selection();
+        session.system = self.agent.session().system.clone();
+        let id = session.id.clone();
+        self.agent.sessions().insert(session);
+        if self.arrive_in(&id).is_ok() {
+            // `arrive_in` says *which* conversation this pane is in; this is what draws it. Without
+            // it the pane keeps the rows of whatever it was showing — a transcript from another
+            // conversation under a footer that has already moved on, which reads as the new
+            // conversation having inherited somebody else's messages.
+            self.enter_session();
+        }
+        self.refresh_status();
+        self.refresh_composer();
+    }
+
+    fn close_tab(&mut self) {
+        let view = self.view_now();
+        let Some(tab) = self.editor.active_tab_of(view) else { return };
+        if !self.editor.tab_close(view, tab) {
+            self.editor_message(
+                MessageLevel::Warn,
+                "this is the last tab — ^Q closes the terminal, and the turns keep running",
+            );
+            return;
+        }
+        self.sync_panes();
+        self.refresh_status();
+        self.refresh_composer();
+    }
+
+    fn step_tab(&mut self, delta: i32) {
+        let view = self.view_now();
+        self.editor.tab_step(view, delta);
+        self.sync_panes();
+        self.refresh_status();
+        self.refresh_composer();
+    }
+
+    /// Show what the window prefix can do.
+    ///
+    /// The thing that makes a prefix layer affordable at all. Vim's `<C-w>` is undiscoverable —
+    /// you either know it or you never find out — and a workspace whose rule is *"a default binding
+    /// is a key every terminal sends"* cannot then hide two dozen verbs behind a letter nobody has
+    /// been told about. So the letter tells you.
+    ///
+    /// Built from the *live* keymap rather than from [`WINDOW_KEYS`], so it lists the keys somebody
+    /// actually has: a rebinding in `init.ts` shows the new letter, and a plugin that adds a verb
+    /// under the prefix appears here without anyone writing glue for it. A legend is a promise
+    /// about a keyboard.
+    ///
+    /// Not modal, not focusable: it is a hint over whatever you were doing, and the next key goes
+    /// to the chord it is describing rather than to the panel. Which is also why it closes itself
+    /// on the next press — see [`Self::drop_window_hint`].
+    fn show_window_keys(&mut self) {
+        if self.window_hint.is_some() {
+            return;
+        }
+        let prefix = self.window_prefix();
+        let view = self.view_now();
+
+        // The live registry, narrowed to what starts with the prefix. Sorted by the order
+        // `WINDOW_KEYS` lists them in — grouped by intent rather than alphabetically, because
+        // somebody reading this has a goal and not a letter — with anything a plugin added after.
+        let mut rows: Vec<(String, String, String)> = Vec::new();
+        for entry in self.editor.keymaps_for(self.editor.mode(view)) {
+            let Some(suffix) = entry.lhs.strip_prefix(&prefix) else { continue };
+            if suffix.is_empty() {
+                continue;
+            }
+            let rank = WINDOW_KEYS
+                .iter()
+                .position(|(k, _)| *k == suffix)
+                .unwrap_or(WINDOW_KEYS.len());
+            // The panel says which key to *press*, so it prints the character rather than the
+            // notation you would write in `init.ts`. `^Z` still lists the notation, which is what
+            // you would copy.
+            let shown = suffix.replace("<lt>", "<");
+            let desc = entry
+                .desc
+                .clone()
+                .or_else(|| self.editor.command_desc(&entry.command))
+                .unwrap_or_else(|| entry.command.clone());
+            rows.push((format!("{rank:04}{suffix}"), shown, desc));
+        }
+        rows.sort();
+        // The nine numbered tabs are one idea, not nine rows: listing `1`…`9` separately would be
+        // a third of the panel spent on a thing the tab bar already numbers for you.
+        rows.retain(|(_, k, _)| k.parse::<u32>().is_err());
+        if self.editor.tab_count_of(view) > 1 {
+            rows.push((String::new(), "1-9".into(), "Go to that tab".into()));
+        }
+        if rows.is_empty() {
+            return;
+        }
+
+        let key_col = rows.iter().map(|(_, k, _)| display_width(k)).max().unwrap_or(1);
+        let lines: Vec<String> = rows
+            .iter()
+            .map(|(_, k, d)| format!("  {k:<key_col$}  {d}"))
+            .collect();
+        let width = lines.iter().map(|l| display_width(l)).max().unwrap_or(20) + 2;
+
+        let plugin = PluginId::from(BUILTIN);
+        let buf = self.editor.create_buffer_of_kind("[window keys]", KIND_WINDOW_HINT);
+        let _ = self.editor.apply_in(view, &plugin, ApiCall::BufSetLines {
+            buf,
+            start: 0,
+            end: -1,
+            lines,
+        });
+        for (row, (_, k, _)) in rows.iter().enumerate() {
+            let _ = self.editor.apply_in(view, &plugin, ApiCall::MarkSet {
+                ns: self.tabline_ns,
+                buf,
+                row: row as u32,
+                col: 2,
+                opts: neosh_proto::ExtmarkOpts {
+                    end_col: Some(2 + k.len() as u32),
+                    hl_group: Some("Tabline.Key".into()),
+                    line_hl_group: None,
+                    virt_text: vec![],
+                    virt_text_pos: VirtTextPos::Eol,
+                    on_delete: neosh_proto::OnDelete::Clamp,
+                    priority: 0,
+                },
+            });
+        }
+
+        let res = self.editor.apply_in(view, &plugin, ApiCall::FloatOpen {
+            buf,
+            config: neosh_proto::FloatConfig {
+                // Against the message field, which is where your eyes already are. Centred it would
+                // cover the answer you are deciding how to split.
+                anchor: neosh_proto::Anchor::Dock { dock: Dock::Bottom },
+                border: neosh_proto::BorderStyle::Rounded,
+                border_hl: Some("Tabline.Key".into()),
+                title: Some(format!(" {prefix} ")),
+                width: neosh_proto::Extent::Max { n: width as u16 },
+                // Tall enough for every verb there is, so the list is not silently short by three
+                // rows — the ones that would go are the tab verbs at the end, which is exactly the
+                // half somebody who has just found the prefix does not know about. The frontend
+                // clamps to the room there is, so a short terminal still gets as much as fits.
+                height: neosh_proto::Extent::Max { n: 32 },
+                // Neither focusable nor modal: the key you press next belongs to the chord this is
+                // describing. A panel that took the keyboard would be a hint you have to dismiss
+                // before you can use what it is hinting at.
+                focusable: false,
+                modal: false,
+                close_on_blur: false,
+                z: 300,
+                offset: Default::default(),
+            },
+            view: Some(view),
+        });
+        if let Ok(ApiOk::Win { win }) = res {
+            self.window_hint = Some((win, buf));
+        }
+    }
+
+    /// Ask what a new tab should hold.
+    ///
+    /// The tab is not made until you have answered. Making it first and filling it afterwards would
+    /// mean `Esc` had to *undo* one — and a tab that flickers into the bar and out again on a key
+    /// you cancelled is worse than the question taking a moment.
+    fn begin_tab_choice(&mut self) {
+        if self.tab_choice.is_some() {
+            return;
+        }
+        let view = self.view_now();
+        let plugin = PluginId::from(BUILTIN);
+        let buf = self.editor.create_buffer_of_kind("[new tab]", KIND_TAB_CHOICE);
+        let names = TAB_CHOICES.iter().map(|(n, _)| display_width(n)).max().unwrap_or(0);
+        let width = TAB_CHOICES
+            .iter()
+            .map(|(_, d)| names + display_width(d) + 6)
+            .max()
+            .unwrap_or(40);
+        let res = self.editor.apply_in(view, &plugin, ApiCall::FloatOpen {
+            buf,
+            config: neosh_proto::FloatConfig {
+                anchor: neosh_proto::Anchor::Dock { dock: Dock::Bottom },
+                border: neosh_proto::BorderStyle::Rounded,
+                border_hl: Some("Tabline.Key".into()),
+                title: Some(" new tab ".into()),
+                width: neosh_proto::Extent::Max { n: width as u16 },
+                height: neosh_proto::Extent::Max { n: TAB_CHOICES.len() as u16 },
+                // Focusable and modal: this is a question you are in the middle of answering, so
+                // nothing else may take the keyboard out from under it — including the keys that
+                // would open a second panel behind this one.
+                focusable: true,
+                modal: true,
+                close_on_blur: false,
+                z: 300,
+                offset: Default::default(),
+            },
+            view: Some(view),
+        });
+        let Ok(ApiOk::Win { win }) = res else { return };
+        self.tab_choice = Some(TabChooser { win, buf, at: 0 });
+        self.render_tab_choice();
+    }
+
+    fn render_tab_choice(&mut self) {
+        let Some(c) = self.tab_choice.as_ref() else { return };
+        let (buf, at) = (c.buf, c.at);
+        let view = self.view_now();
+        let plugin = PluginId::from(BUILTIN);
+        let names = TAB_CHOICES.iter().map(|(n, _)| display_width(n)).max().unwrap_or(0);
+        let lines: Vec<String> = TAB_CHOICES
+            .iter()
+            .enumerate()
+            // Numbered, because a list you can also answer with one key is a list you do not have
+            // to walk. The same numbering the tab bar uses, for the same reason.
+            //
+            // The second column is aligned, which is the whole of why this is not one `format!`:
+            // three rows whose descriptions each start somewhere different read as three unrelated
+            // sentences rather than as a table you can scan down.
+            .map(|(n, (name, desc))| format!(" {} {:<pad$}  {}", n + 1, name, desc, pad = names))
+            .collect();
+        let _ = self.editor.apply_in(view, &plugin, ApiCall::BufSetLines {
+            buf,
+            start: 0,
+            end: -1,
+            lines: lines.clone(),
+        });
+        let _ = self.editor.apply_in(view, &plugin, ApiCall::MarkClear {
+            ns: self.tabline_ns,
+            buf,
+            start: None,
+            end: None,
+        });
+        for (n, line) in lines.iter().enumerate() {
+            let group = if n == at { "Tabline.Active" } else { "Tabline.Tab" };
+            let _ = self.editor.apply_in(view, &plugin, ApiCall::MarkSet {
+                ns: self.tabline_ns,
+                buf,
+                row: n as u32,
+                col: 0,
+                opts: neosh_proto::ExtmarkOpts {
+                    end_col: Some(line.len() as u32),
+                    hl_group: Some(group.into()),
+                    line_hl_group: (n == at).then(|| "CursorLine".to_string()),
+                    virt_text: vec![],
+                    virt_text_pos: VirtTextPos::Eol,
+                    on_delete: neosh_proto::OnDelete::Clamp,
+                    priority: 0,
+                },
+            });
+        }
+    }
+
+    /// A key while the panel is up. Answers, moves, or gives up.
+    fn tab_choice_key(&mut self, key: neosh_proto::KeyPress) {
+        let Some(c) = self.tab_choice.as_ref() else { return };
+        let at = c.at;
+        let last = TAB_CHOICES.len() - 1;
+        match &key.code {
+            KeyCode::Esc => return self.end_tab_choice(None),
+            KeyCode::Enter => return self.end_tab_choice(Some(at)),
+            KeyCode::Down => self.move_tab_choice(at.saturating_add(1).min(last)),
+            KeyCode::Up => self.move_tab_choice(at.saturating_sub(1)),
+            KeyCode::Char { c } if key.mods.ctrl => match c.as_str() {
+                "n" => self.move_tab_choice(at.saturating_add(1).min(last)),
+                "p" => self.move_tab_choice(at.saturating_sub(1)),
+                "c" => return self.end_tab_choice(None),
+                _ => {}
+            },
+            KeyCode::Char { c } => match c.as_str() {
+                "j" => self.move_tab_choice(at.saturating_add(1).min(last)),
+                "k" => self.move_tab_choice(at.saturating_sub(1)),
+                "q" => return self.end_tab_choice(None),
+                d => {
+                    if let Some(n) = d.parse::<usize>().ok().filter(|n| *n >= 1 && *n <= last + 1) {
+                        return self.end_tab_choice(Some(n - 1));
+                    }
+                }
+            },
+            _ => {}
+        }
+    }
+
+    fn move_tab_choice(&mut self, to: usize) {
+        if let Some(c) = self.tab_choice.as_mut() {
+            c.at = to;
+        }
+        self.render_tab_choice();
+    }
+
+    /// Take the panel down, and make the tab it was asking about.
+    fn end_tab_choice(&mut self, pick: Option<usize>) {
+        let Some(c) = self.tab_choice.take() else { return };
+        let plugin = PluginId::from(BUILTIN);
+        let _ = self.editor.apply(&plugin, ApiCall::WinClose { win: c.win });
+        let _ = self.editor.apply(&plugin, ApiCall::BufDelete { buf: c.buf });
+        // Closed *before* the tab is made, so the panel is not on screen over the thing it just
+        // opened — and so the modal is off the focus stack before anything takes the keyboard.
+        // Positional, and deliberately not a lookup by label: the order is a product decision made
+        // in `TAB_CHOICES`, and reading it back out of a string would make renaming a row a way to
+        // silently change what it does.
+        match pick {
+            Some(0) => {
+                let cwd = self.session_cwd(&self.v().session.clone());
+                self.new_tab();
+                self.start_conversation_here(cwd);
+            }
+            Some(1) => self.run_builtin("tab.new.term", Vec::new(), None),
+            Some(2) => self.new_tab(),
+            _ => {}
+        }
+    }
+
+    /// Take the prefix panel down.
+    ///
+    /// Called from the key path on the press *after* it appeared, whatever that press was — the
+    /// panel describes one half-typed chord, and the chord is over either way.
+    fn drop_window_hint(&mut self) {
+        let Some((win, buf)) = self.window_hint.take() else { return };
+        let plugin = PluginId::from(BUILTIN);
+        let _ = self.editor.apply(&plugin, ApiCall::WinClose { win });
+        let _ = self.editor.apply(&plugin, ApiCall::BufDelete { buf });
+    }
+
+    /// Whether this key is the first press of the window prefix.
+    ///
+    /// The one key a terminal pane does not swallow. Parsed from the setting rather than compared
+    /// against `<C-w>`, so moving the prefix in `init.ts` moves the way out of a shell too — a
+    /// rebinding that left you unable to leave a full-screen program would be the worst possible
+    /// thing to get wrong here.
+    fn starts_prefix(&self, key: &neosh_proto::KeyPress) -> bool {
+        neosh_core::keymap::parse_keys(&self.window_prefix())
+            .ok()
+            .and_then(|seq| seq.first().cloned())
+            .is_some_and(|first| first == *key)
+    }
+
+    /// Whether the keys held so far are the window prefix and nothing more.
+    ///
+    /// What the hint timer asks before drawing. Any *other* half-typed chord — a `g` in the
+    /// transcript, a plugin's own prefix — is not this panel's business.
+    fn holding_window_prefix(&self) -> bool {
+        let view = self.view_now();
+        let held = self.editor.pending_keys(view);
+        !held.is_empty() && neosh_core::keymap::format_keys(&held) == self.window_prefix()
+    }
+
+    /// Start naming this tab, borrowing the composer to type in.
+    ///
+    /// The same borrow the search prompt makes, and given back the same way. A field of its own
+    /// would be a second text input to get right — cursor keys, `^U`, `^W`, paste, width — for one
+    /// verb, and the composer is already the thing your hands are on.
+    fn begin_tab_rename(&mut self) {
+        if self.v().rename.is_some() || self.v().search.is_some() || self.v().secret.is_some() {
+            return;
+        }
+        let view = self.view_now();
+        let Some(tab) = self.editor.active_tab_of(view) else { return };
+        // Prefilled with what it is called now, including the derived name — so `<C-w>r` then a
+        // word is an edit, and `^U` then a word is a replacement. Starting empty makes every rename
+        // a retype.
+        let current = self
+            .editor
+            .tabs_of(view)
+            .iter()
+            .find(|t| t.id == tab)
+            .map(|t| self.tab_title(view, t))
+            .unwrap_or_default();
+        self.vm().rename = Some(RenamePrompt {
+            tab,
+            value: current,
+            draft: self.composer_text(),
+        });
+        self.render_rename();
+        self.refresh_status();
+    }
+
+    fn render_rename(&mut self) {
+        let Some(p) = self.v().rename.as_ref() else { return };
+        let line = format!("name this tab: {}", p.value);
+        self.set_composer(&line);
+    }
+
+    fn rename_key(&mut self, key: neosh_proto::KeyPress) {
+        let Some(p) = self.vm().rename.as_mut() else { return };
+        match key.code {
+            KeyCode::Esc => return self.finish_rename(false),
+            KeyCode::Enter => return self.finish_rename(true),
+            KeyCode::Backspace => {
+                let keep = p.value.graphemes(true).count().saturating_sub(1);
+                p.value = p.value.graphemes(true).take(keep).collect();
+            }
+            KeyCode::Char { ref c } if key.mods.ctrl => match c.as_str() {
+                "u" => p.value.clear(),
+                "w" => {
+                    let kept = p.value.trim_end();
+                    let cut = kept.rfind(char::is_whitespace).map(|i| i + 1).unwrap_or(0);
+                    p.value.truncate(cut);
+                }
+                "c" => return self.finish_rename(false),
+                _ => return,
+            },
+            KeyCode::Char { ref c } if !key.mods.alt => p.value.push_str(c),
+            _ => return,
+        }
+        self.render_rename();
+    }
+
+    fn finish_rename(&mut self, submit: bool) {
+        let Some(p) = self.vm().rename.take() else { return };
+        self.set_composer(&p.draft);
+        if submit {
+            let view = self.view_now();
+            // An empty name is not a name: it gives the tab back to being called after what is in
+            // it, which is the only way back to a derived name once one has been set.
+            let title = Some(p.value.trim().to_string()).filter(|s| !s.is_empty());
+            self.editor.tab_rename(view, p.tab, title);
+        }
+        self.refresh_status();
+        self.refresh_composer();
+    }
+
+    fn shift_tab(&mut self, delta: i32) {
+        let view = self.view_now();
+        let Some(tab) = self.editor.active_tab_of(view) else { return };
+        let tabs = self.editor.tab_list(view).0;
+        let Some(at) = tabs.iter().position(|t| t.id == tab) else { return };
+        let to = (at as i32 + delta).clamp(0, tabs.len().saturating_sub(1) as i32) as u32;
+        self.editor.tab_move(view, tab, to);
     }
 
     /// Tear down everything configuration produced, then build it again from the files on disk.
@@ -10868,11 +12809,39 @@ impl Host {
                 ),
             },
             OptionSpec {
-                name: "ui.keys.delete_word".into(),
+                name: "ui.keys.window_prefix".into(),
                 ty: OptionType::Str,
                 default: OptionValue::Str("<C-w>".into()),
                 description: Some(
-                    "Delete the word behind the cursor — a path segment, in a path field.".into(),
+                    "The key everything about panes and tabs lives under — splitting, moving \
+                     between them, resizing, and the tab verbs. Vim's, because the fingers that \
+                     would reach for a prefix already know it, and because every Ctrl-with-a-letter \
+                     in this workspace is spoken for. Hold it to see what follows."
+                        .into(),
+                ),
+            },
+            OptionSpec {
+                name: "ui.keys.hint_delay".into(),
+                ty: OptionType::Int { min: Some(0), max: Some(5_000) },
+                default: OptionValue::Int(300),
+                description: Some(
+                    "How long to hold the window prefix before it lists what it can do, in \
+                     milliseconds. Long enough that typing a chord fluently never flashes a panel; \
+                     short enough that hesitating is answered. `0` shows it at once."
+                        .into(),
+                ),
+            },
+            OptionSpec {
+                name: "ui.keys.delete_word".into(),
+                ty: OptionType::Str,
+                default: OptionValue::Str("<C-BS>".into()),
+                description: Some(
+                    "Delete the word behind the cursor — a path segment, in a path field. Was \
+                     `<C-w>`, which is now the window prefix: one key cannot both delete a word \
+                     and wait to see whether a window verb follows it, because waiting is what \
+                     makes every word-delete feel late. `ui.keys.window_prefix` moves the prefix \
+                     instead, if `<C-w>` is the one you want back."
+                        .into(),
                 ),
             },
             OptionSpec {

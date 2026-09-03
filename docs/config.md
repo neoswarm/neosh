@@ -539,7 +539,7 @@ The protocol is specified in [ascp/SPEC.md](ascp/SPEC.md).
 
 **The filter line is the path field.** There is no row to reach first and no mode to enter: start
 typing `/`, `~` or `./` and the list under it becomes the directories that match. `<Tab>` takes the
-highlighted one into the field so you can keep descending, `<C-w>` goes back up a whole segment
+highlighted one into the field so you can keep descending, `<C-BS>` goes back up a whole segment
 rather than a character, and `<CR>` accepts either the highlighted row or exactly what you typed —
 because the directory you want may not be one it offered. `~` expands, and a path with no `/`
 completes against the conversation's own directory.
@@ -600,7 +600,9 @@ More than one key can mean the same thing:
 "ui.keys.dismiss" = "<Esc> <C-c>"
 "ui.keys.complete" = "<Tab> <Right>"
 "ui.keys.clear" = "<C-u>"
-"ui.keys.delete_word" = "<C-w>"
+"ui.keys.delete_word" = "<C-BS>"
+"ui.keys.window_prefix" = "<C-w>"
+"ui.keys.hint_delay" = 300
 ```
 
 A widget claims these **window-scoped** while it is open, so they outrank global bindings and are

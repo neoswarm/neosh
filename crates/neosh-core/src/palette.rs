@@ -498,6 +498,22 @@ pub fn groups(variant: Variant) -> Vec<(&'static str, HighlightDef)> {
         // span machines. What says where it is running is the host name on the end of the row.
         ("Sidebar.Remote", link("Comment")),
         ("Status.Line", link("Comment")),
+        // ---- the tab strip --------------------------------------------------
+        // One row across the top of the main region, and the only chrome that is *always* there
+        // whether or not there is anything in it to report — so it has to sit back. The tab you are
+        // in is the one thing on it that is content: everything else is a label for somewhere you
+        // are not, and a bar of equally bright names is a bar you have to read rather than glance
+        // at.
+        // The edges of the pane you are typing into. An accent rather than a brighter grey: with
+        // four panes of one conversation on screen, "which of these am I in" has to be answerable
+        // from the corner of your eye, and a separator one step up the same ramp is not.
+        ("Pane.Active", spec(fg(r.accent))),
+        ("Tabline.Tab", link("Comment")),
+        ("Tabline.Active", spec(bold(fg(r.fg)))),
+        // The keys, which wear what every other key in the workspace wears. A legend whose keys are
+        // dimmer than its words is a legend nobody reads twice.
+        ("Tabline.Key", link("Key")),
+        ("Tabline.Hint", link("Comment")),
         // ---- the composer -------------------------------------------------
         // The field you type into is chrome, not content: it should read as furniture at the
         // bottom of the screen and never compete with what the model just said. Hence a rule at

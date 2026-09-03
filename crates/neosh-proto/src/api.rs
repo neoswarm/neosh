@@ -16,7 +16,8 @@ use crate::agent::{
 };
 use crate::ascp::{AgentCommand, AgentSummary, NodeCapabilities, NodeId, NodeInfo, ProjectKey};
 use crate::ids::{
-    BufferId, ExtmarkId, NamespaceId, RequestId, SessionId, StreamId, SurfaceId, ViewId, WindowId,
+    BufferId, ExtmarkId, NamespaceId, PaneId, RequestId, SessionId, StreamId, SurfaceId, TabId,
+    ViewId, WindowId,
 };
 use crate::options::{OptionEntry, OptionSpec, OptionValue};
 use crate::provider::{
@@ -25,8 +26,9 @@ use crate::provider::{
 };
 use crate::quota::{QuotaSample, QuotaSnapshot, UsageHistory, UsageResolution};
 use crate::ui::{
-    CursorMotion, CursorShape, ExtmarkInfo, ExtmarkOpts, FloatConfig, HighlightDef, KeyPress,
-    LineDraw, MessageLevel, NoticeKind, Rect, SelectShape, SurfaceCell, TextEdit, WindowLayout,
+    CursorMotion, CursorShape, Direction, ExtmarkInfo, ExtmarkOpts, FloatConfig, HighlightDef,
+    KeyPress, LineDraw, MessageLevel, NoticeKind, Rect, SelectShape, SurfaceCell, TabInfo, TextEdit,
+    WindowLayout,
 };
 use crate::vcs::{BranchInfo, CommitInfo, DiffTarget, RepoStatus, WorktreeInfo};
 
@@ -291,6 +293,19 @@ pub enum ApiCall {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         kind: Option<String>,
     },
+    /// Destroy a buffer and close every window showing it.
+    ///
+    /// The counterpart [`ApiCall::BufCreate`] never had. Buffers were made and never unmade, which
+    /// was survivable while every one of them was a panel that lived as long as its plugin — and
+    /// stopped being survivable the moment closing a split had to take a transcript with it, since
+    /// a workspace somebody splits and unsplits all afternoon would keep every one of them.
+    ///
+    /// Windows on it close rather than being left pointing at nothing: a viewport onto a buffer
+    /// that is gone has no honest thing to draw, and `:bdelete` has meant this for thirty years.
+    /// Extmarks go with it, because they are on the buffer rather than beside it.
+    BufDelete {
+        buf: BufferId,
+    },
     BufLineCount {
         buf: BufferId,
     },
@@ -437,6 +452,140 @@ pub enum ApiCall {
     /// findable. Without it a plugin can only ever act on windows it opened itself, which means the
     /// only way to extend somebody else's panel is to replace it.
     WinList,
+
+    // ---- tabs & panes --------------------------------------------------
+    // A pane is a rectangle of the main region and a tab is a tree of them. Both are ordinary
+    // public API for the reason everything here is: the tab bar is a plugin drawing a buffer, the
+    // keys are ordinary bindings pointed at named commands, and a third party replacing either
+    // needs the same calls ours makes and no others.
+    //
+    // Note what is *not* here: no call places a pane at coordinates. Splitting is always relative
+    // to an existing pane, which is what keeps the tree a tree — a pane placed absolutely would
+    // have to be reconciled against the nesting afterwards, and the reconciliation is the bug.
+    /// Divide a pane in two, and answer with the new one.
+    ///
+    /// The new pane takes half of `pane`'s space on the named side and is empty: it has no windows
+    /// until something opens one docked in it, which is what makes a split of a chat and a split of
+    /// a terminal the same call. Focus does not move — a caller that wants it to says so, because
+    /// the plugin splitting to show you something and the key you pressed to go there are different
+    /// intentions.
+    PaneSplit {
+        pane: PaneId,
+        /// Which side of `pane` the new one takes. `Right` and `Down` put it after `pane` in the
+        /// split; `Left` and `Up` put it before.
+        dir: Direction,
+    },
+    /// Take a pane out of its tab, closing every window docked in it.
+    ///
+    /// The space goes back to its siblings, and a split left with one child collapses into that
+    /// child — so closing the second of two panes leaves the first as the whole region rather than
+    /// as the only child of a split nothing can see. Closing a tab's last pane closes the tab; the
+    /// view's last tab is refused, because a terminal with no tabs has nowhere to draw and no key
+    /// that would bring one back.
+    PaneClose {
+        pane: PaneId,
+    },
+    /// Give a pane the keyboard, and whatever in it had it last.
+    PaneFocus {
+        pane: PaneId,
+    },
+    /// Move the keyboard to the nearest pane in a direction, and answer with it.
+    ///
+    /// Resolved against the tree rather than against cell geometry: walk up to the first split
+    /// dividing space along this axis where there is a sibling to move to, then down its near edge.
+    /// Which is exact for every layout the tree can express, needs no viewport feedback, and gives
+    /// the same answer in a frontend that has no cells at all. Answers with nothing at the edge —
+    /// there is deliberately no wrap-around, because a `<C-w>l` that lands on the far left is a key
+    /// whose result you cannot predict without counting panes first.
+    PaneFocusDir {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        view: Option<ViewId>,
+        dir: Direction,
+    },
+    /// Grow a pane along one axis, at the expense of the neighbour on that side.
+    ///
+    /// `delta` is in weight units — see [`crate::WEIGHT`] — so a resize means the same thing at
+    /// every terminal size and survives the terminal being resized under it. Negative shrinks. A
+    /// pane with no neighbour on that axis is a no-op rather than an error: the key is held down,
+    /// and refusing the press that ran out of room would put a message on screen for every one
+    /// after it.
+    PaneResize {
+        pane: PaneId,
+        dir: Direction,
+        delta: i16,
+    },
+    /// Swap two panes' places in the tree, keeping what is in each.
+    ///
+    /// How a pane is *moved*: there is no "put this pane there", because every destination that is
+    /// not already a pane is a split that would have to be invented, and inventing one is how a
+    /// layout ends up with levels nobody asked for.
+    PaneSwap {
+        pane: PaneId,
+        with: PaneId,
+    },
+    /// Move a pane to the far edge of its tab.
+    ///
+    /// The counterpart to [`ApiCall::PaneFocusDir`]: that moves the keyboard between panes, this
+    /// moves the pane. Without it a layout that came out the wrong way round could only be closed
+    /// and rebuilt — you could go somewhere and not take anything with you.
+    ///
+    /// The pane arrives with an even share rather than the size it had: it is among different
+    /// neighbours now, and carrying the old number over would make it the odd one out for a reason
+    /// nobody could see.
+    PaneMoveEdge {
+        pane: PaneId,
+        dir: Direction,
+    },
+    /// Make every pane in the tab an equal share of its split, at every level.
+    PaneEqualize {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        view: Option<ViewId>,
+    },
+    /// Open a tab, and answer with it. Empty but for one pane, which becomes the active one.
+    TabNew {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        view: Option<ViewId>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        title: Option<String>,
+        /// Whether to go to it. A tab opened by a key is; a tab opened by an orchestrator putting
+        /// work somewhere is not, for the same reason `SessionNew { activate: false }` exists.
+        #[serde(default)]
+        activate: bool,
+    },
+    /// Close a tab and every pane in it. The view's last tab is refused.
+    TabClose {
+        tab: TabId,
+    },
+    /// Go to a tab.
+    TabSelect {
+        tab: TabId,
+    },
+    /// Go to the tab `delta` along, wrapping.
+    ///
+    /// Wrapping where [`ApiCall::PaneFocusDir`] does not, because a tab bar is a list you can see
+    /// all of: coming round from the last to the first is visible in the same glance as the key
+    /// that did it, and a pane you wrapped to may be off in a corner of a nested split.
+    TabStep {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        view: Option<ViewId>,
+        delta: i32,
+    },
+    /// Move a tab along the bar. Clamped at the ends rather than wrapping — this is a drag, and a
+    /// drag that teleports is a drag you did not mean.
+    TabMove {
+        tab: TabId,
+        to: u32,
+    },
+    /// Name a tab, or give it back its derived name with `None`.
+    TabRename {
+        tab: TabId,
+        title: Option<String>,
+    },
+    /// Every tab of a view, its panes, and which of each is active.
+    TabList {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        view: Option<ViewId>,
+    },
 
     // ---- editing -------------------------------------------------------
     // Motions and edits are verbs the core resolves, not positions the caller computes. Two
@@ -1521,6 +1670,11 @@ pub enum ApiOk {
     Views { views: Vec<ViewInfo> },
     Ns { ns: NamespaceId },
     Mark { id: ExtmarkId },
+    /// A pane, or none — which is what `PaneFocusDir` answers at the edge of the layout. Not an
+    /// error: running out of panes in a direction is an ordinary outcome of holding a key down.
+    Pane { pane: Option<PaneId> },
+    Tab { tab: TabId },
+    Tabs { tabs: Vec<TabInfo>, active: TabId },
     Surface { surface: SurfaceId },
     Lines { lines: Vec<String> },
     Count { n: u32 },

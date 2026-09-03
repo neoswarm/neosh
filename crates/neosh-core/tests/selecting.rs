@@ -52,7 +52,7 @@ impl Screen {
         let ApiOk::Win { win } = editor
             .apply(&plugin, ApiCall::WinOpen {
                 buf,
-                layout: WindowLayout::Docked {
+                layout: WindowLayout::Docked { pane: None,
                     dock: Dock::Main,
                     size: None,
                     gravity: Gravity::Start,

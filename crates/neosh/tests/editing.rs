@@ -278,14 +278,17 @@ fn control_arrows_move_a_word_at_a_time() {
 }
 
 #[test]
-fn control_w_deletes_the_word_behind_the_cursor() {
-    let sb = Sandbox::new("ctrlw");
+fn ctrl_backspace_deletes_the_word_behind_the_cursor() {
+    // `<C-BS>`, not `<C-w>`: the word-delete moved when `<C-w>` became the window prefix. One key
+    // cannot both delete a word and wait to see whether a window verb follows it — the waiting is
+    // what would make every word-delete feel late. `ui.keys.delete_word` swaps them back.
+    let sb = Sandbox::new("ctrlbs");
     let mut s = sb.start();
     s.ready();
 
     s.type_text("one two three");
     s.wait_composer(&["one two three"]);
-    s.press(json!({"kind": "char", "c": "w"}), &["ctrl"]);
+    s.special("backspace", &["ctrl"]);
     s.wait_composer(&["one two "]);
 }
 

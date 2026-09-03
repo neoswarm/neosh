@@ -396,7 +396,7 @@ mod tests {
         UiEvent::WindowOpened {
             win: WindowId(win),
             buf: neosh_proto::BufferId(1),
-            layout: neosh_proto::WindowLayout::Docked {
+            layout: neosh_proto::WindowLayout::Docked { pane: None,
                 dock: neosh_proto::Dock::Main,
                 size: None,
                 gravity: Default::default(),

@@ -77,7 +77,7 @@ fn a_workspace() -> (Editor, BufferId, neosh_proto::WindowId) {
 
     let main = match e.apply(&p, ApiCall::WinOpen {
         buf: chat,
-        layout: WindowLayout::Docked {
+        layout: WindowLayout::Docked { pane: None,
             dock: Dock::Main,
             size: None,
             gravity: Gravity::End,
@@ -90,7 +90,7 @@ fn a_workspace() -> (Editor, BufferId, neosh_proto::WindowId) {
     };
     let bottom = match e.apply(&p, ApiCall::WinOpen {
         buf: composer,
-        layout: WindowLayout::Docked {
+        layout: WindowLayout::Docked { pane: None,
             dock: Dock::Bottom,
             size: Some(3),
             gravity: Gravity::Start,

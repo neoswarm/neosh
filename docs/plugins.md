@@ -771,6 +771,52 @@ await neosh.cmd.register("mine.panel", async (args, key, here) => {
 each is looking at, and `session.onChange` says which one moved. If you are drawing something a
 person has to answer, that last one is what tells you which screen to put it on.
 
+## Panes and tabs
+
+A terminal's main region is divided into **panes**, and a tab is a tree of them. A pane is *where*,
+not *what*: it owns no buffer and draws nothing. You split one, then dock windows into it — which is
+why splitting a chat and splitting anything else are the same two calls.
+
+```ts
+const here = await neosh.pane.active();
+const right = await neosh.pane.split(here, "right");
+await neosh.win.open(buf, "main", { pane: right });          // fills it
+await neosh.win.open(field, "bottom", { pane: right, size: 3 });  // a field at its foot
+await neosh.pane.focus(right);
+```
+
+`win.open` takes the same four edges whether or not you name a pane — with one, the edge is measured
+against the pane's rectangle; without, against the screen's. That is the whole difference, and it is
+why nothing needed a second geometry vocabulary. **Omit `pane` for anything that belongs to the
+terminal rather than to one split**: a sidebar docked into a pane is a sidebar that disappears when
+you close that split.
+
+A window that names no pane and asks for `"main"` lands in the pane the person is *looking at* — the
+same rule as a float that names no view, one level down. So an existing plugin that opens a main
+window keeps working and keeps landing somewhere sensible.
+
+```ts
+await neosh.pane.focusDir("left");         // null at the edge; there is no wrap-around
+await neosh.pane.resize(here, "right", 10); // weight units, not cells
+await neosh.pane.swap(a, b);                // how a pane is moved: widths belong to the slots
+await neosh.pane.close(here);               // rejects on the last pane of the last tab
+
+const { tabs, active } = await neosh.tab.list();
+await neosh.tab.create({ title: "review", activate: false });
+await neosh.tab.rename(tabs[0].id, null);   // back to being named by what is in it
+```
+
+Sizes are **weights**, never cells: an even split is `WEIGHT` each, so a layout means the same thing
+at every terminal size and survives somebody dragging the window's corner. Splitting never nests a
+row inside a row — three panes side by side are one split of three — so a resize divides space you
+can actually see.
+
+Everything the workspace's own `^W` keys do is these calls and nothing else. `^Wv` is
+`pane.split(await pane.active(), "right")`; there is no private path, so a different window manager
+is a plugin rather than a fork. The tab strip is an ordinary buffer of kind `neosh.tabline`: bind
+keys against it, recolour it with `win.setHighlights`, or turn ours off and dock your own `"top"`
+window in its place.
+
 ## Conversations
 
 ```ts

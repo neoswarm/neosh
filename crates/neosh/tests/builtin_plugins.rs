@@ -8091,3 +8091,650 @@ fn the_plugins_panel_lists_what_loaded_and_what_each_registered() {
     s.wait_for("sidebar.decoration");
     s.wait_for("neosh.sidebar");
 }
+
+// ---------------------------------------------------------------------------
+// Panes and tabs
+// ---------------------------------------------------------------------------
+//
+// The layout arithmetic is unit-tested in `neosh_core::panes` and the rectangles in
+// `neosh-tui`'s `rendering`. What is left for a whole workspace to answer is the part neither of
+// those can see: that splitting produces a *second of everything a conversation needs* — its own
+// transcript, its own composer, its own draft — and that closing one takes all of it away again.
+
+impl Session {
+    /// Press the window prefix and then one key, which is what `<C-w>v` is.
+    fn window_key(&mut self, k: &str) {
+        self.ctrl("w");
+        self.key(k);
+    }
+
+    /// Every buffer whose name starts with `[chat]`, which is one per pane.
+    fn chat_buffers(&self) -> Vec<u64> {
+        let mut out: Vec<u64> = self
+            .events
+            .iter()
+            .filter(|e| {
+                e["type"] == "buffer_opened"
+                    && e["name"].as_str().is_some_and(|n| n.starts_with("[chat]"))
+            })
+            .filter_map(|e| e["buf"].as_u64())
+            .collect();
+        // A buffer that has since been closed is not a pane. Splitting and unsplitting all
+        // afternoon would otherwise look like a workspace with thirty panes in it.
+        let closed: Vec<u64> = self
+            .events
+            .iter()
+            .filter(|e| e["type"] == "buffer_closed")
+            .filter_map(|e| e["buf"].as_u64())
+            .collect();
+        out.retain(|b| !closed.contains(b));
+        out.dedup();
+        out
+    }
+
+    fn tabline_now(&self) -> String {
+        match self.buffer_named("[tabs]") {
+            Some(b) => self.lines_of(b).join(""),
+            None => String::new(),
+        }
+    }
+}
+
+/// Splitting gives you a second conversation surface, not a second view of one buffer.
+#[test]
+fn a_split_is_a_second_transcript_and_a_second_field() {
+    let sb = Sandbox::new("split");
+    let mut s = sb.start();
+    s.wait_for("PROJECTS");
+    assert_eq!(s.chat_buffers().len(), 1, "one pane to start with");
+
+    s.window_key("v");
+    assert!(
+        s.pump(|s| s.chat_buffers().len() == 2),
+        "splitting made a second transcript\n{:?}",
+        s.chat_buffers()
+    );
+    assert!(
+        s.pump(|s| s.tabline_now().contains("2 panes")),
+        "and the bar says so: {:?}",
+        s.tabline_now()
+    );
+}
+
+/// The whole point of a per-pane composer: two drafts at once, neither of them the other's.
+#[test]
+fn each_pane_holds_its_own_draft() {
+    let sb = Sandbox::new("drafts");
+    let mut s = sb.start();
+    s.wait_for("PROJECTS");
+    s.type_text("left");
+    s.window_key("v");
+    assert!(s.pump(|s| s.chat_buffers().len() == 2), "split");
+    s.type_text("right");
+
+    // Two composer buffers, one holding each. Read as a set rather than in order, because which
+    // one is "first" is an implementation detail of how the ids were handed out.
+    assert!(
+        s.pump(|s| {
+            let drafts: Vec<String> = s
+                .events
+                .iter()
+                .filter(|e| e["type"] == "buffer_opened")
+                .filter(|e| e["name"] == "[composer]")
+                .filter_map(|e| e["buf"].as_u64())
+                .map(|b| s.lines_of(b).join(""))
+                .collect();
+            drafts.iter().any(|d| d.contains("left")) && drafts.iter().any(|d| d.contains("right"))
+        }),
+        "each field kept what was typed into it"
+    );
+}
+
+/// And closing one takes its transcript with it, rather than leaving a buffer nothing can reach.
+#[test]
+fn closing_a_pane_takes_its_transcript_away() {
+    let sb = Sandbox::new("unsplit");
+    let mut s = sb.start();
+    s.wait_for("PROJECTS");
+    s.window_key("v");
+    assert!(s.pump(|s| s.chat_buffers().len() == 2), "split");
+
+    s.window_key("q");
+    assert!(
+        s.pump(|s| s.chat_buffers().len() == 1),
+        "closing gave the transcript back\n{:?}",
+        s.chat_buffers()
+    );
+    assert!(
+        s.pump(|s| !s.tabline_now().contains("panes")),
+        "and the bar is a single tab again: {:?}",
+        s.tabline_now()
+    );
+}
+
+/// The last pane is refused rather than leaving a terminal with nothing to draw in.
+#[test]
+fn the_last_pane_cannot_be_closed() {
+    let sb = Sandbox::new("lastpane");
+    let mut s = sb.start();
+    s.wait_for("PROJECTS");
+    s.window_key("q");
+    assert!(
+        s.pump(|s| s.chat_buffers().len() == 1),
+        "still exactly one pane\n{:?}",
+        s.chat_buffers()
+    );
+}
+
+/// A tab is a place, not a conversation.
+///
+/// Opening one used to start a conversation, which put a row in the project panel every time —
+/// a list of half-used "New conversation" entries nobody asked for, in the one panel whose job is
+/// the conversations you are actually working in. It inherits now, exactly as a split does; `^N` is
+/// still the key that starts one and still the key that asks where.
+#[test]
+fn a_new_tab_does_not_start_a_conversation() {
+    let sb = Sandbox::new("newtab");
+    let mut s = sb.start();
+    s.wait_for("PROJECTS");
+    let before = s.sidebar_rows();
+
+    // Through the chooser, taking the option that shows what you are already reading — the one
+    // that must not add a row to the project panel.
+    s.window_key("t");
+    assert!(s.pump(|s| s.buffer_named("[new tab]").is_some()), "the panel is up");
+    s.key("3");
+    assert!(
+        s.pump(|s| {
+            let t = s.tabline_now();
+            t.contains(" 1 ") && t.contains(" 2 ")
+        }),
+        "the bar has two tabs: {:?}",
+        s.tabline_now()
+    );
+    // Given a moment for a conversation to appear, if one were going to.
+    s.drain_for(Duration::from_millis(400));
+    assert_eq!(
+        s.sidebar_rows(),
+        before,
+        "and the project panel gained nothing\n{:?}",
+        s.sidebar_now()
+    );
+}
+
+/// The bar is always there, and always says how to reach the rest — which is the whole of why a
+/// prefix layer is affordable here at all.
+#[test]
+fn the_tab_bar_advertises_the_prefix_from_the_first_frame() {
+    let sb = Sandbox::new("tabbar");
+    let mut s = sb.start();
+    s.wait_for("PROJECTS");
+    assert!(
+        s.pump(|s| s.tabline_now().contains("windows")),
+        "the bar names the window prefix before anything has been done\n{:?}",
+        s.tabline_now()
+    );
+}
+
+/// Holding the prefix lists what follows it, built from the live keymap.
+#[test]
+fn holding_the_prefix_lists_what_it_can_do() {
+    let sb = Sandbox::new("whichkey");
+    let mut s = sb.start();
+    s.wait_for("PROJECTS");
+    s.ctrl("w");
+    assert!(
+        s.pump(|s| {
+            match s.buffer_named("[window keys]") {
+                Some(b) => {
+                    let rows = s.lines_of(b).join("\n");
+                    rows.contains("Split this pane") && rows.contains("Open a tab")
+                }
+                None => false,
+            }
+        }),
+        "the panel lists the verbs behind the prefix"
+    );
+}
+
+/// The layout is announced as soon as it exists, not only when something changes it.
+///
+/// A window docked in a pane the frontend has not heard of gets no rectangle and is not drawn —
+/// which is right, and is why the *first* tab has to announce itself. Left to the first mutation, a
+/// terminal that opens and is simply used had a transcript and a composer that existed, held the
+/// right text, and were never once on screen.
+#[test]
+fn the_pane_layout_is_announced_before_any_key_is_pressed() {
+    let sb = Sandbox::new("panes-init");
+    let mut s = sb.start();
+    s.wait_for("PROJECTS");
+    assert!(
+        s.pump(|s| s.events.iter().any(|e| e["type"] == "panes_changed")),
+        "the frontend was told how the main region is divided"
+    );
+
+    // And every window in it names a pane the layout contains, or it is a window nothing can draw.
+    let panes: Vec<u64> = s
+        .events
+        .iter()
+        .filter(|e| e["type"] == "panes_changed")
+        .filter_map(|e| e["tabs"].as_array())
+        .flatten()
+        .filter_map(|t| t["root"]["pane"].as_u64())
+        .collect();
+    let docked: Vec<u64> = s
+        .events
+        .iter()
+        .filter(|e| e["type"] == "window_opened")
+        .filter_map(|e| e["layout"]["pane"].as_u64())
+        .collect();
+    assert!(!docked.is_empty(), "the transcript and the composer are docked in a pane");
+    for p in &docked {
+        assert!(panes.contains(p), "window docked in pane {p}, which no tab contains: {panes:?}");
+    }
+}
+
+/// The window prefix waits for you.
+///
+/// `timeoutlen` is what stops a prefix from making a printable character untypeable — with `gd`
+/// bound, `g` has to reach the field eventually. Nothing is waiting to be typed behind `^W`, so the
+/// deadline protected nothing there and cost the thing that matters: the panel listing the verbs
+/// appeared at 300 ms, the chord expired at 500, and reading the list it had just drawn was enough
+/// to lose the chord it described — the verb you then pressed went into the message field.
+#[test]
+fn the_window_prefix_does_not_expire_while_you_read_the_panel() {
+    let sb = Sandbox::new("prefix-wait");
+    let mut s = sb.start();
+    s.wait_for("PROJECTS");
+
+    s.ctrl("w");
+    // Comfortably past `timeoutlen`, which is 500 ms by default.
+    std::thread::sleep(Duration::from_millis(1200));
+    s.key("v");
+
+    assert!(
+        s.pump(|s| s.chat_buffers().len() == 2),
+        "the split still happened after a pause\n{:?}",
+        s.chat_buffers()
+    );
+}
+
+/// And a key the prefix does not claim ends it, rather than leaving the keyboard held forever.
+#[test]
+fn a_key_the_prefix_does_not_claim_gives_the_keyboard_back() {
+    let sb = Sandbox::new("prefix-escape");
+    let mut s = sb.start();
+    s.wait_for("PROJECTS");
+
+    s.ctrl("w");
+    std::thread::sleep(Duration::from_millis(1200));
+    s.key("z");
+
+    assert!(
+        s.pump(|s| {
+            match s.buffer_named("[composer]") {
+                Some(b) => s.lines_of(b).join("").contains('z'),
+                None => false,
+            }
+        }),
+        "the unclaimed key was replayed into the field rather than swallowed"
+    );
+    assert_eq!(s.chat_buffers().len(), 1, "and nothing was split");
+}
+
+/// A prefix in flight must not disable the rest of the keyboard.
+///
+/// `<C-w><C-p>` is bound to nothing, so the sequence is abandoned — and abandoning it used to dump
+/// both keys into the *unbound* path, which skips the keymaps entirely. So while the window prefix
+/// was waiting, every other binding on the keyboard silently stopped working: `^P` did not open the
+/// model picker, `^V` did not attach the image on the clipboard, and the only sign was that the key
+/// you pressed did nothing.
+///
+/// Each key of an abandoned sequence is re-resolved on its own now. `^P` is bound by itself, so
+/// that is what it means.
+#[test]
+fn a_binding_still_fires_after_an_abandoned_prefix() {
+    let sb = Sandbox::new("prefix-passthru");
+    let mut s = sb.start();
+    s.wait_for("PROJECTS");
+
+    s.ctrl("w");
+    std::thread::sleep(Duration::from_millis(1200));
+    s.ctrl("p");
+
+    s.wait_for("Model");
+    assert_eq!(s.chat_buffers().len(), 1, "and the prefix itself did nothing");
+}
+
+/// A plugin that reports, and sets, the model the workspace thinks it is talking to.
+///
+/// `agent.selection()` is what `^P` reads and `^E` builds its option sheet from, and it resolves
+/// through the *store's current conversation* — which is the thing that had to start following the
+/// pane with the keyboard. Asking it is asking exactly the question those two ask.
+const PROBE: &str = r#"
+import type { PluginContext } from "@neosh/api";
+
+export async function activate({ neosh }: PluginContext) {
+  await neosh.provider.register("probe", [{
+    id: "probe", driver: "probe", display_name: "Probe",
+    models: [{ id: "one", display_name: "One" }, { id: "two", display_name: "Two" }],
+  }], async (_req, emit) => { emit({ type: "message_stop" }); });
+
+  await neosh.cmd.register("probe.pick", async (args) => {
+    await neosh.agent.setSelection({ instance: "probe", model: args[0] });
+  }, { desc: "choose a model" });
+
+  await neosh.cmd.register("probe.model", async () => {
+    const s = await neosh.agent.selection();
+    neosh.notify("model=" + (s ? s.model : "none"));
+  }, { desc: "say which model is selected" });
+
+  neosh.event.on("neosh.ready", () => neosh.notify("probe ready"));
+}
+"#;
+
+fn install_probe(sb: &Sandbox) {
+    let dir = sb.root.join("config/plugins/probe");
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    std::fs::write(
+        dir.join("plugin.toml"),
+        "name = \"probe\"\nversion = \"0.1.0\"\nentry = \"main.ts\"\npermissions = [\"providers\"]\n",
+    )
+    .expect("manifest");
+    std::fs::write(dir.join("main.ts"), PROBE).expect("plugin");
+}
+
+/// The pane with the keyboard is the conversation the model belongs to.
+///
+/// Which model answers, how hard it thinks, what the context meter measures and what the permission
+/// key sets are all facts about a *conversation*, and they resolve through the one conversation the
+/// store calls current. Nothing told it the keyboard had moved between panes — so with two chats
+/// side by side, `^P` showed the model of whichever pane you last started a conversation in, `^E`
+/// opened that one's options, and the footer named its model while you typed into the other.
+#[test]
+fn the_focused_pane_is_the_conversation_the_model_belongs_to() {
+    let sb = Sandbox::new("pane-model");
+    install_probe(&sb);
+    let mut s = sb.start();
+    s.wait_for("probe ready");
+    s.wait_for("PROJECTS");
+
+    /// Ask, and wait for an answer that says `want`.
+    ///
+    /// Retried rather than asked once: `setSelection` crosses the plugin boundary, so the first
+    /// answer can be the value from before it landed. Every retry is a fresh question, so a stale
+    /// notification cannot satisfy this by sitting in the log.
+    fn model_is(s: &mut Session, want: &str) -> bool {
+        for _ in 0..40 {
+            let before = s.texts().iter().filter(|t| t.starts_with("model=")).count();
+            s.send(&command("probe.model"));
+            let target = before;
+            s.pump(move |s| s.texts().iter().filter(|t| t.starts_with("model=")).count() > target);
+            if s.texts().iter().rev().find(|t| t.starts_with("model=")).is_some_and(|t| t == want) {
+                return true;
+            }
+        }
+        false
+    }
+
+    s.send(&command_with("probe.pick", "one"));
+    assert!(model_is(&mut s, "model=one"), "the left pane is on model one");
+
+    // A split onto a conversation of its own, given a different model.
+    s.window_key("c");
+    assert!(s.pump(|s| s.chat_buffers().len() == 2), "split onto a new conversation");
+    s.send(&command_with("probe.pick", "two"));
+    assert!(model_is(&mut s, "model=two"), "the right pane is on model two");
+
+    // And back. This is the assertion the bug failed: the keyboard moved and nothing told the
+    // store, so `^P`, `^E` and the footer all kept answering about the pane you had left.
+    s.window_key("h");
+    assert!(
+        model_is(&mut s, "model=one"),
+        "moving back to the left pane brought its model back, not the other pane's"
+    );
+}
+
+/// A shell in a tab: spawned, drawn, and named after what is running in it.
+///
+/// The unit tests in `crate::term` prove the pty and the parser; this is the wiring — that a pane
+/// can *be* a terminal, that its window gets a surface, and that keys reach the child rather than
+/// the composer.
+#[test]
+fn a_tab_can_run_a_shell() {
+    let sb = Sandbox::new("shell-tab");
+    let mut s = sb.start();
+    s.wait_for("PROJECTS");
+
+    s.window_key("T");
+    assert!(
+        s.pump(|s| s.buffer_named("[terminal]").is_some()),
+        "a terminal pane was furnished"
+    );
+    // A surface is what a terminal draws through — cells rather than lines of text.
+    assert!(
+        s.pump(|s| s.events.iter().any(|e| e["type"] == "surface_claimed")),
+        "and it claimed a surface to paint on"
+    );
+    assert!(
+        s.pump(|s| s.events.iter().any(|e| e["type"] == "surface_cells")),
+        "and the shell drew something"
+    );
+    // Named for the command, not for a conversation it is not in.
+    assert!(
+        s.pump(|s| {
+            let t = s.tabline_now();
+            t.contains("sh") || t.contains("bash") || t.contains("zsh")
+        }),
+        "the tab is named after the shell: {:?}",
+        s.tabline_now()
+    );
+}
+
+/// `<C-w>t` asks what the tab is for, rather than deciding.
+#[test]
+fn a_new_tab_asks_what_goes_in_it() {
+    let sb = Sandbox::new("tab-choice");
+    let mut s = sb.start();
+    s.wait_for("PROJECTS");
+
+    s.window_key("t");
+    assert!(
+        s.pump(|s| match s.buffer_named("[new tab]") {
+            Some(b) => {
+                let rows = s.lines_of(b).join("\n");
+                rows.contains("New conversation") && rows.contains("Terminal")
+            }
+            None => false,
+        }),
+        "the panel offers what a tab can be"
+    );
+}
+
+/// And the tab is not made until you have answered — a tab that flickers into the bar and out
+/// again on a key you cancelled is worse than the question taking a moment.
+#[test]
+fn cancelling_the_chooser_makes_no_tab() {
+    let sb = Sandbox::new("tab-cancel");
+    let mut s = sb.start();
+    s.wait_for("PROJECTS");
+    s.window_key("t");
+    assert!(s.pump(|s| s.buffer_named("[new tab]").is_some()), "the panel is up");
+
+    s.special("esc");
+    s.drain_for(Duration::from_millis(500));
+    let bar = s.tabline_now();
+    assert!(!bar.contains(" 2 "), "no second tab was made: {bar:?}");
+}
+
+/// Choosing the shell gives you one.
+#[test]
+fn choosing_a_terminal_starts_a_shell() {
+    let sb = Sandbox::new("tab-choice-term");
+    let mut s = sb.start();
+    s.wait_for("PROJECTS");
+    s.window_key("t");
+    assert!(s.pump(|s| s.buffer_named("[new tab]").is_some()), "the panel is up");
+
+    s.key("2");
+    assert!(
+        s.pump(|s| s.buffer_named("[terminal]").is_some()),
+        "a terminal pane was furnished"
+    );
+    assert!(
+        s.pump(|s| s.events.iter().any(|e| e["type"] == "surface_cells")),
+        "and the shell drew something"
+    );
+}
+
+/// A tab by number. The binding existed and the command did not, so every `<C-w>1` resolved to
+/// "no such command" — silently enough that the key just looked dead.
+#[test]
+fn a_tab_can_be_reached_by_its_number() {
+    let sb = Sandbox::new("tab-number");
+    let mut s = sb.start();
+    s.wait_for("PROJECTS");
+
+    // Two tabs, landing on the second.
+    s.window_key("t");
+    assert!(s.pump(|s| s.buffer_named("[new tab]").is_some()), "the panel is up");
+    s.key("3");
+    assert!(s.pump(|s| s.tabline_now().contains(" 2 ")), "there are two tabs");
+
+    s.window_key("1");
+    s.drain_for(Duration::from_millis(400));
+    assert!(
+        !s.texts().iter().any(|t| t.contains("no such command")),
+        "the key is bound to something that exists"
+    );
+}
+
+/// Every key the prefix panel advertises is a key that is actually bound.
+///
+/// A legend is a promise about a keyboard, and the panel is built from the live registry — so the
+/// way to break that promise is for a binding to fail to *register*, which is silent. `<C-w><` did:
+/// a bare `<` opens a special-key name in the notation, so the binding was rejected as an
+/// unterminated `<` and the key did nothing while `>` beside it worked. The panel listing it is the
+/// proof it registered, because the panel has no other source.
+#[test]
+fn every_window_key_the_panel_lists_is_bound() {
+    let sb = Sandbox::new("window-keys-real");
+    let mut s = sb.start();
+    s.wait_for("PROJECTS");
+
+    s.ctrl("w");
+    assert!(
+        s.pump(|s| match s.buffer_named("[window keys]") {
+            Some(b) => {
+                let rows = s.lines_of(b).join("\n");
+                rows.contains("Narrow this pane") && rows.contains("Widen this pane")
+            }
+            None => false,
+        }),
+        "both resize keys parsed, registered, and reached the legend"
+    );
+}
+
+/// The way out of a full-screen program is drawn over it.
+#[test]
+fn the_prefix_panel_opens_over_a_terminal() {
+    let sb = Sandbox::new("prefix-over-term");
+    let mut s = sb.start();
+    s.wait_for("PROJECTS");
+
+    s.window_key("T");
+    assert!(s.pump(|s| s.buffer_named("[terminal]").is_some()), "a shell is running");
+    assert!(s.pump(|s| s.events.iter().any(|e| e["type"] == "surface_cells")), "and drawing");
+
+    s.ctrl("w");
+    assert!(
+        s.pump(|s| match s.buffer_named("[window keys]") {
+            Some(b) => s.lines_of(b).join("\n").contains("Close this pane"),
+            None => false,
+        }),
+        "the panel opened while a shell had the pane"
+    );
+}
+
+impl Session {
+    /// The panes of the active tab, in tree order, as the core last said them.
+    fn pane_order(&self) -> Vec<u64> {
+        fn leaves(node: &serde_json::Value, out: &mut Vec<u64>) {
+            match node["kind"].as_str() {
+                Some("leaf") => {
+                    if let Some(p) = node["pane"].as_u64() {
+                        out.push(p);
+                    }
+                }
+                Some("split") => {
+                    for c in node["children"].as_array().into_iter().flatten() {
+                        leaves(&c["node"], out);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let last = self.events.iter().rev().find(|e| e["type"] == "panes_changed");
+        let Some(ev) = last else { return Vec::new() };
+        let active = &ev["active"];
+        let mut out = Vec::new();
+        for tab in ev["tabs"].as_array().into_iter().flatten() {
+            if &tab["id"] == active {
+                leaves(&tab["root"], &mut out);
+            }
+        }
+        out
+    }
+}
+
+/// You can move *between* panes and you can move *a* pane.
+///
+/// The second was missing: `PaneSwap` existed in the API with no key on it, and Vim's keys for
+/// moving a window were taken by a resize alias that `<`/`>` had made redundant. A layout that came
+/// out the wrong way round could only be closed and rebuilt.
+#[test]
+fn a_pane_can_be_sent_to_an_edge() {
+    let sb = Sandbox::new("pane-move");
+    let mut s = sb.start();
+    s.wait_for("PROJECTS");
+
+    s.window_key("v");
+    assert!(s.pump(|s| s.pane_order().len() == 2), "two panes");
+    s.window_key("s");
+    assert!(s.pump(|s| s.pane_order().len() == 3), "three panes");
+    let before = s.pane_order();
+    let moving = *before.last().expect("the pane with the keyboard is the newest");
+
+    s.window_key("H");
+    assert!(
+        s.pump(|s| s.pane_order().first() == Some(&moving)),
+        "the pane went to the far left: {:?} -> {:?}",
+        before,
+        s.pane_order()
+    );
+    assert_eq!(s.pane_order().len(), 3, "and nothing was lost on the way");
+}
+
+/// Exchange swaps two panes' places while the shape stays put — which is how you get the pane you
+/// care about into the wide half without resizing anything.
+#[test]
+fn two_panes_can_be_exchanged() {
+    let sb = Sandbox::new("pane-swap");
+    let mut s = sb.start();
+    s.wait_for("PROJECTS");
+
+    s.window_key("v");
+    assert!(s.pump(|s| s.pane_order().len() == 2), "two panes");
+    let before = s.pane_order();
+
+    s.window_key("x");
+    assert!(
+        s.pump(|s| {
+            let now = s.pane_order();
+            now.len() == 2 && now[0] == before[1] && now[1] == before[0]
+        }),
+        "the two swapped places: {:?} -> {:?}",
+        before,
+        s.pane_order()
+    );
+}

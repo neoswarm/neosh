@@ -8,6 +8,8 @@ import type { NoticeKind } from "./NoticeKind";
 import type { Rect } from "./Rect";
 import type { SurfaceCell } from "./SurfaceCell";
 import type { SurfaceId } from "./SurfaceId";
+import type { TabId } from "./TabId";
+import type { TabInfo } from "./TabInfo";
 import type { WindowId } from "./WindowId";
 import type { WindowLayout } from "./WindowLayout";
 
@@ -45,7 +47,9 @@ export type UiEvent =
   | { "type": "surface_claimed"; surface: SurfaceId; win: WindowId; rect: Rect }
   | { "type": "surface_cells"; surface: SurfaceId; cells: Array<SurfaceCell> }
   | { "type": "surface_released"; surface: SurfaceId }
+  | { "type": "panes_changed"; tabs: Array<TabInfo>; active: TabId }
   | { "type": "focus_changed"; win: WindowId | null }
+  | { "type": "home_changed"; win: WindowId | null }
   | {
     "type": "message";
     level: MessageLevel;

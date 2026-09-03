@@ -52,6 +52,27 @@ numeric_id!(
     SurfaceId
 );
 numeric_id!(
+    /// One rectangle of the main region, and everything docked inside it.
+    ///
+    /// A pane is *where* rather than *what*: it owns no buffer and draws nothing. A chat pane is a
+    /// transcript window docked `Main` in it plus a composer docked `Bottom` in it; a pane showing
+    /// one thing is one window docked `Main`. That is the whole of why splitting did not need a
+    /// second dock vocabulary — [`Dock`](crate::Dock) already answers "where inside this rectangle",
+    /// and a pane is just a smaller rectangle to ask it about.
+    ///
+    /// Panes live in a tree per tab ([`PaneNode`](crate::PaneNode)). The tree says how the main
+    /// region is divided; the frontend turns it into rectangles, exactly as it does for docks.
+    PaneId
+);
+numeric_id!(
+    /// One tab of one view: a title, and a tree of panes.
+    ///
+    /// Per view rather than per workspace, for the same reason a window is: what the agent produced
+    /// is the workspace's, and where you are looking is yours. Two terminals attached to one
+    /// workspace have their own tabs over the same conversations.
+    TabId
+);
+numeric_id!(
     /// One attached terminal.
     ///
     /// A workspace can have several, and they are not copies of each other: a window belongs to

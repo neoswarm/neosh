@@ -20,6 +20,7 @@ import type { ModelSelection } from "./ModelSelection";
 import type { NamespaceId } from "./NamespaceId";
 import type { NodeInfo } from "./NodeInfo";
 import type { OptionEntry } from "./OptionEntry";
+import type { PaneId } from "./PaneId";
 import type { PermissionDecision } from "./PermissionDecision";
 import type { PermissionMode } from "./PermissionMode";
 import type { PluginInfo } from "./PluginInfo";
@@ -34,6 +35,8 @@ import type { SurfaceId } from "./SurfaceId";
 import type { SwarmAgent } from "./SwarmAgent";
 import type { SwarmNode } from "./SwarmNode";
 import type { SwarmStranger } from "./SwarmStranger";
+import type { TabId } from "./TabId";
+import type { TabInfo } from "./TabInfo";
 import type { ToolDef } from "./ToolDef";
 import type { UpdateOutcome } from "./UpdateOutcome";
 import type { UpdateStatus } from "./UpdateStatus";
@@ -56,6 +59,9 @@ export type ApiOk =
   | { "ok": "views"; views: Array<ViewInfo> }
   | { "ok": "ns"; ns: NamespaceId }
   | { "ok": "mark"; id: ExtmarkId }
+  | { "ok": "pane"; pane: PaneId | null }
+  | { "ok": "tab"; tab: TabId }
+  | { "ok": "tabs"; tabs: Array<TabInfo>; active: TabId }
   | { "ok": "surface"; surface: SurfaceId }
   | { "ok": "lines"; lines: Array<string> }
   | { "ok": "count"; n: number }

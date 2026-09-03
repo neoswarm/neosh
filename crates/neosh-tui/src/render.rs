@@ -405,30 +405,164 @@ fn resolve_extent(e: Extent, content: u16, chrome: u16, available: u16) -> u16 {
 /// because a line break already separates it.
 const DOCK_RULE: u16 = 1;
 
+/// A line drawn between two regions, and which way it runs.
+///
+/// Orientation is carried rather than inferred from the rectangle's shape. A one-cell-square rule —
+/// two panes meeting inside a region three cells across — is a legitimate degenerate case, and
+/// "width is 1, so it must be vertical" answers it wrong half the time. It is one glyph, so getting
+/// it wrong is not a catastrophe; it is also one field, so there is no reason to guess.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Rule {
+    pub rect: Rect,
+    pub vertical: bool,
+    /// Whether this line is an edge of the pane that has the keyboard.
+    ///
+    /// Which pane you are typing into has to be visible without hunting for the caret. Four panes
+    /// of one conversation look identical, and the caret is one cell — so the thing that says
+    /// *here* is the border, lit on the sides that belong to the active pane. It is what tmux does,
+    /// it costs no rows, and unlike a title bar per pane it costs nothing at all when there is only
+    /// one pane, because then there are no borders.
+    pub active: bool,
+}
+
 pub fn resolve_layout(mirror: &Mirror, area: Rect) -> Vec<(WindowId, Rect)> {
     resolve_layout_with_rules(mirror, area).0
 }
 
-/// Layout, plus the columns where a separator should be drawn.
+/// Layout, plus where the separators go.
+///
+/// Three passes, in this order and for this reason:
+///
+/// 1. **Windows docked to the screen** — the sidebar, the tab bar, the status line — are carved off
+///    the edges. What is left is the main region.
+/// 2. **The active tab's pane tree** divides that region into one rectangle per pane, with a rule
+///    between every two.
+/// 3. **Windows docked in a pane** are carved off *its* rectangle by the same code that did step 1,
+///    which is the whole reason a pane needed no geometry vocabulary of its own.
+///
+/// Then floats, against whatever they are anchored to.
+///
+/// A window naming a pane that is not in the active tab gets no rectangle and is not drawn. That is
+/// how tabs work at all: switching tabs moves no windows and rebuilds nothing, it changes which
+/// pane ids have rectangles this frame.
 pub fn resolve_layout_with_rules(
     mirror: &Mirror,
     area: Rect,
-) -> (Vec<(WindowId, Rect)>, Vec<Rect>) {
+) -> (Vec<(WindowId, Rect)>, Vec<Rule>) {
     let mut out = Vec::new();
-    let mut rules: Vec<Rect> = Vec::new();
-    let mut main = area;
+    let mut rules: Vec<Rule> = Vec::new();
+
+    // Windows measured against the screen rather than against a pane — and *not* the one asking
+    // for the main region, which is settled below once the panes are known. Carved here as well it
+    // would be placed twice: once filling the whole region, and once in the active pane, with the
+    // first of the two winning every lookup that takes the earliest match.
+    let screen: Vec<WindowId> = mirror
+        .window_order
+        .iter()
+        .copied()
+        .filter(|w| {
+            matches!(mirror.windows.get(w).map(|w| &w.layout),
+                Some(WindowLayout::Docked { pane: None, dock, .. }) if *dock != Dock::Main)
+        })
+        .collect();
+    let main = carve(mirror, area, &screen, &mut out, &mut rules, false);
+
+    // The active tab's panes, and what is docked inside each.
+    let tree = mirror
+        .active_tab
+        .and_then(|id| mirror.tabs.iter().find(|t| t.id == id))
+        .map(|t| &t.root);
+
+    let mut pane_mains: Vec<(neosh_proto::PaneId, Rect)> = Vec::new();
+    if let Some(root) = tree {
+        let mut panes = Vec::new();
+        let active = mirror
+            .active_tab
+            .and_then(|id| mirror.tabs.iter().find(|t| t.id == id))
+            .map(|t| t.active_pane);
+        divide(root, main, active, &mut panes, &mut rules);
+        for (pane, rect) in panes {
+            let inside: Vec<WindowId> = mirror
+                .window_order
+                .iter()
+                .copied()
+                .filter(|w| {
+                    matches!(mirror.windows.get(w).map(|w| &w.layout),
+                        Some(WindowLayout::Docked { pane: Some(p), .. }) if *p == pane)
+                })
+                .collect();
+            let leftover = carve(mirror, rect, &inside, &mut out, &mut rules, true);
+            pane_mains.push((pane, leftover));
+        }
+    }
+
+    // `Dock::Main` on the *screen* means the main region, which — once there are panes — is the one
+    // you are looking at. A plugin opening a window without naming a pane is the ordinary case, and
+    // it should land where the person is, exactly as a float that names no view does. Only if the
+    // active pane has nothing of its own in that slot: a pane that has been furnished with a
+    // transcript already answers "what is in the main region here", and two windows in one `Main`
+    // slot is the one thing that dock promises never happens.
+    let active_pane = mirror
+        .active_tab
+        .and_then(|id| mirror.tabs.iter().find(|t| t.id == id))
+        .map(|t| t.active_pane);
+    let stray = mirror
+        .window_order
+        .iter()
+        .copied()
+        .find(|w| matches!(mirror.windows.get(w).map(|w| &w.layout),
+            Some(WindowLayout::Docked { pane: None, dock: Dock::Main, .. })));
+    if let Some(win) = stray {
+        let slot = match active_pane.and_then(|p| pane_mains.iter().find(|(id, _)| *id == p)) {
+            // The active pane has a `Main` window already: that slot is taken, and this one is not
+            // drawn rather than drawn over it.
+            Some((_, rect)) if out.iter().any(|(_, r)| r == rect) => None,
+            Some((_, rect)) => Some(*rect),
+            // No panes at all — a frontend that has not been told about them, a test driving the
+            // mirror directly. The main region is the whole of what the docks left.
+            None if tree.is_none() => Some(main),
+            None => None,
+        };
+        if let Some(rect) = slot {
+            out.push((win, rect));
+        }
+    }
+
+    // What the pane-relative anchors are measured against: the region the person is looking at.
+    let anchor_main = active_pane
+        .and_then(|p| pane_mains.iter().find(|(id, _)| *id == p))
+        .map(|(_, r)| *r)
+        .unwrap_or(main);
+
+    resolve_floats(mirror, area, anchor_main, &mut out);
+    (out, rules)
+}
+
+/// Carve every window in `windows` off the edges of `rect`, and answer with what is left.
+///
+/// `inside_pane` says whether this is a pane's rectangle, which changes exactly one thing: a
+/// side dock inside a pane draws no rule, because the pane already has one on that side and two
+/// adjacent separators read as a box somebody forgot to finish.
+fn carve(
+    mirror: &Mirror,
+    rect: Rect,
+    windows: &[WindowId],
+    out: &mut Vec<(WindowId, Rect)>,
+    rules: &mut Vec<Rule>,
+    inside_pane: bool,
+) -> Rect {
+    let mut main = rect;
 
     let dock_of = |w: &WindowId| match mirror.windows.get(w).map(|w| &w.layout) {
         Some(WindowLayout::Docked { dock, size, .. }) => Some((*dock, *size)),
         _ => None,
     };
 
-    for dock in [Dock::Left, Dock::Right, Dock::Bottom] {
+    for dock in [Dock::Left, Dock::Right, Dock::Top, Dock::Bottom] {
         // Every window on this edge, not just the first. Stacking them is what lets a status line
         // sit under the composer, and what stops a plugin's panel from being silently invisible
         // because something was already docked there.
-        let docked: Vec<WindowId> = mirror
-            .window_order
+        let docked: Vec<WindowId> = windows
             .iter()
             .copied()
             .filter(|w| dock_of(w).map(|d| d.0) == Some(dock))
@@ -448,10 +582,17 @@ pub fn resolve_layout_with_rules(
                         continue;
                     }
                     let w = size.unwrap_or(main.width / 4).clamp(1, avail);
-                    let rule = if avail > w { DOCK_RULE } else { 0 };
+                    // A pane already has a rule down the side it shares with its neighbour, and a
+                    // second one a column away reads as an unfinished box rather than as two
+                    // separations.
+                    let rule = if avail > w && !inside_pane { DOCK_RULE } else { 0 };
                     let (a, b) = if dock == Dock::Left {
                         if rule > 0 {
-                            rules.push(Rect { x: main.x + w, width: 1, ..main });
+                            rules.push(Rule {
+                                rect: Rect { x: main.x + w, width: 1, ..main },
+                                vertical: true,
+                                active: false,
+                            });
                         }
                         (Rect { width: w, ..main }, Rect {
                             x: main.x + w + rule,
@@ -461,7 +602,11 @@ pub fn resolve_layout_with_rules(
                     } else {
                         let edge = main.x + main.width - w;
                         if rule > 0 {
-                            rules.push(Rect { x: edge - 1, width: 1, ..main });
+                            rules.push(Rule {
+                                rect: Rect { x: edge - 1, width: 1, ..main },
+                                vertical: true,
+                                active: false,
+                            });
                         }
                         (
                             Rect { x: edge, width: w, ..main },
@@ -470,6 +615,15 @@ pub fn resolve_layout_with_rules(
                     };
                     out.push((win, a));
                     main = b;
+                }
+                Dock::Top => {
+                    let avail = main.height.saturating_sub(1);
+                    if avail == 0 {
+                        continue;
+                    }
+                    let h = size.unwrap_or(1).clamp(1, avail);
+                    out.push((win, Rect { height: h, ..main }));
+                    main = Rect { y: main.y + h, height: main.height - h, ..main };
                 }
                 Dock::Bottom => {
                     let avail = main.height.saturating_sub(1);
@@ -507,11 +661,140 @@ pub fn resolve_layout_with_rules(
         }
     }
 
-    if let Some(win) = mirror.window_order.iter().find(|w| dock_of(w).map(|d| d.0) == Some(Dock::Main))
-    {
-        out.push((*win, main));
+    // Exactly one, per rectangle. A second window asking for the same slot is not drawn rather than
+    // drawn over the first: `Dock::Main` is the one dock that promises to be alone in its region,
+    // and two panels stacked pixel-for-pixel is a bug you diagnose by closing things one at a time.
+    if let Some(win) = windows.iter().find(|w| dock_of(w).map(|d| d.0) == Some(Dock::Main)) {
+        if main.width > 0 && main.height > 0 {
+            out.push((*win, main));
+        }
     }
 
+    main
+}
+
+/// Turn a pane tree into one rectangle per pane, with a rule between every two siblings.
+///
+/// Space is divided by weight with the remainder handed out largest-first, so the rectangles sum to
+/// exactly the region rather than leaving a column of nothing down one edge. When there is not
+/// enough room for every pane to have a cell, the separators go first — chrome before content, as
+/// with [`DOCK_RULE`] — and then the panes that do not fit get no rectangle at all and are simply
+/// not drawn. Which is the honest answer: a pane rendered zero cells wide is a pane whose contents
+/// have silently vanished, and one with no rectangle is a pane you can still `<C-w>h` back out of.
+fn divide(
+    node: &neosh_proto::PaneNode,
+    rect: Rect,
+    active: Option<neosh_proto::PaneId>,
+    out: &mut Vec<(neosh_proto::PaneId, Rect)>,
+    rules: &mut Vec<Rule>,
+) {
+    use neosh_proto::{PaneNode, SplitDir};
+
+    // A rectangle with no cells in it is not a placement. Nothing downstream draws one, but a pane
+    // that "has" a rectangle is a pane windows get docked into, and a docked window is asked how
+    // many rows its content folds into — so the empty case is refused here rather than caught by
+    // each of the four places that would otherwise have to.
+    if rect.width == 0 || rect.height == 0 {
+        return;
+    }
+
+    let (dir, children) = match node {
+        PaneNode::Leaf { pane } => {
+            out.push((*pane, rect));
+            return;
+        }
+        PaneNode::Split { dir, children } => (*dir, children),
+    };
+    if children.is_empty() {
+        return;
+    }
+
+    let vertical = dir == SplitDir::Row;
+    let axis = if vertical { rect.width } else { rect.height };
+    let n = children.len() as u16;
+
+    // One cell between each pair, given up entirely before any pane is starved of its own.
+    let seps = if axis > n { n.saturating_sub(1) } else { 0 };
+    let avail = axis.saturating_sub(seps);
+    let sizes = share(avail, &children.iter().map(|c| c.weight).collect::<Vec<_>>());
+
+    let mut at = if vertical { rect.x } else { rect.y };
+    for (i, (child, size)) in children.iter().zip(sizes.iter().copied()).enumerate() {
+        if size == 0 {
+            continue;
+        }
+        let piece = if vertical {
+            Rect { x: at, width: size, ..rect }
+        } else {
+            Rect { y: at, height: size, ..rect }
+        };
+        divide(&child.node, piece, active, out, rules);
+        at += size;
+
+        // A rule after every child but the last one that got space. Drawn between this pane and
+        // whatever comes next, which is why it is placed here rather than derived afterwards from
+        // two rectangles: at small sizes some children have none, and "between the rectangles" then
+        // means a line beside a pane that is not there.
+        let next = children[i + 1..].iter().zip(sizes[i + 1..].iter()).find(|(_, s)| **s > 0);
+        if seps > 0 && let Some((after, _)) = next {
+            // Lit when the pane with the keyboard is on either side of it. Both sides, because a
+            // border belongs to the two panes it divides and lighting only the near one would draw
+            // half a box around the active pane and half around its neighbour.
+            let touches = |n: &neosh_proto::PaneNode| active.is_some_and(|a| n.contains(a));
+            let lit = touches(&child.node) || touches(&after.node);
+            let r = if vertical {
+                Rule { rect: Rect { x: at, width: 1, ..rect }, vertical: true, active: lit }
+            } else {
+                Rule { rect: Rect { y: at, height: 1, ..rect }, vertical: false, active: lit }
+            };
+            rules.push(r);
+            at += 1;
+        }
+    }
+}
+
+/// Divide `total` cells among `weights`, summing to exactly `total`.
+///
+/// Largest-remainder: floor everything, then hand the leftover out to whoever was rounded down
+/// hardest. Plain rounding loses up to one cell per pane, and a column of unpainted terminal down
+/// the right-hand edge of a four-way split is the kind of thing that looks like a rendering bug
+/// forever because nothing in the layout is actually wrong.
+fn share(total: u16, weights: &[u16]) -> Vec<u16> {
+    let sum: u32 = weights.iter().map(|w| u32::from(*w)).sum();
+    if weights.is_empty() || sum == 0 {
+        return vec![0; weights.len()];
+    }
+    let mut sizes: Vec<u16> = Vec::with_capacity(weights.len());
+    let mut remainders: Vec<(u32, usize)> = Vec::with_capacity(weights.len());
+    let mut given = 0u32;
+    for (i, w) in weights.iter().enumerate() {
+        let exact = u32::from(total) * u32::from(*w);
+        let whole = exact / sum;
+        sizes.push(whole as u16);
+        remainders.push((exact % sum, i));
+        given += whole;
+    }
+    // Biggest remainder first, and by index where two are equal — so the same layout at the same
+    // size always divides the same way, rather than shifting a column when a `HashMap` reorders.
+    remainders.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+    let mut left = u32::from(total).saturating_sub(given);
+    for (_, i) in remainders {
+        if left == 0 {
+            break;
+        }
+        sizes[i] += 1;
+        left -= 1;
+    }
+    sizes
+}
+
+/// Place every float against whatever it is anchored to.
+///
+/// `main` is the region the dock anchors are measured from — which, once panes exist, is the
+/// *active pane's* main slot rather than the whole region. A completion menu says "against the
+/// message field" and nothing else, and with two chats side by side there are two message fields;
+/// the one being typed into is the one the menu belongs over.
+fn resolve_floats(mirror: &Mirror, area: Rect, main: Rect, out: &mut Vec<(WindowId, Rect)>) {
     // Floats, in paint order so later entries draw on top.
     for win in mirror.paint_order() {
         let Some(w) = mirror.windows.get(&win) else { continue };
@@ -558,6 +841,7 @@ pub fn resolve_layout_with_rules(
             // what the docks left behind, so each of these is the edge that dock was carved from.
             Anchor::Dock { dock } => match dock {
                 Dock::Bottom => (main.x, (main.y + main.height).saturating_sub(ch)),
+                Dock::Top => (main.x, main.y),
                 Dock::Left => (main.x, main.y),
                 Dock::Right => ((main.x + main.width).saturating_sub(cw), main.y),
                 Dock::Main => (main.x, main.y),
@@ -571,8 +855,6 @@ pub fn resolve_layout_with_rules(
 
         out.push((win, Rect { x, y, width: cw, height: ch }));
     }
-
-    (out, rules)
 }
 
 // ---------------------------------------------------------------------------
@@ -595,11 +877,39 @@ pub fn draw(frame: &mut Frame, mirror: &Mirror, theme: &Theme) -> Drawn {
     // Drawn before the windows so a float still covers it, and before content so nothing has to
     // know the rule is there.
     let rule_style = theme.style("Separator");
-    for r in &rules {
-        for y in r.y..r.y.saturating_add(r.height) {
-            if let Some(cell) = frame.buffer_mut().cell_mut((r.x, y)) {
+    // The pane you are typing into, said with its own edges. Drawn *after* the dim ones would be
+    // simpler, but the order below is verticals-then-horizontals for the junction lookup — so the
+    // style is chosen per rule instead.
+    let lit_style = theme.style("Pane.Active");
+    let style_of = |r: &Rule| if r.active { lit_style } else { rule_style };
+    // Verticals first, then horizontals, so that where the two meet the horizontal is drawn over
+    // the vertical and the junction can be read off what is already in the cell. Both orders draw
+    // the same crossing; doing it in one fixed order is what makes the junction lookup a lookup
+    // rather than a guess about which line got there first.
+    for r in rules.iter().filter(|r| r.vertical) {
+        for y in r.rect.y..r.rect.y.saturating_add(r.rect.height) {
+            if let Some(cell) = frame.buffer_mut().cell_mut((r.rect.x, y)) {
                 cell.set_symbol("│");
-                cell.set_style(rule_style);
+                cell.set_style(style_of(r));
+            }
+        }
+    }
+    for r in rules.iter().filter(|r| !r.vertical) {
+        for x in r.rect.x..r.rect.x.saturating_add(r.rect.width) {
+            if let Some(cell) = frame.buffer_mut().cell_mut((x, r.rect.y)) {
+                // A horizontal meeting a vertical is a tee, not a crossed-out line. Which way the
+                // tee points depends on how far the vertical runs past this row, and that is not
+                // knowable from one cell — so the four-way piece is used wherever they meet. It is
+                // very slightly wrong at a T-junction and unmistakably right at a cross, where the
+                // alternative reads as two panes that are not actually divided.
+                let symbol = if cell.symbol() == "│" { "┼" } else { "─" };
+                cell.set_symbol(symbol);
+                // A crossing where one of the two lines is lit stays lit: the junction belongs to
+                // the active pane's outline, and dimming it would break the outline at its corners
+                // — which are the parts of a box the eye actually uses.
+                if r.active || cell.style() != lit_style {
+                    cell.set_style(style_of(r));
+                }
             }
         }
     }
@@ -727,30 +1037,37 @@ pub fn draw(frame: &mut Frame, mirror: &Mirror, theme: &Theme) -> Drawn {
         }
 
         frame.render_widget(Paragraph::new(lines).style(theme.style("Normal")), inner);
-    }
 
-    draw_notifications(frame, area, mirror, theme);
-
-    for surface in mirror.surfaces.values() {
-        let Some((_, host)) = rects.iter().find(|(id, _)| *id == surface.win) else { continue };
-        for cell in &surface.cells {
-            let x = host.x + surface.rect.col + cell.col;
-            let y = host.y + surface.rect.row + cell.row;
-            if x >= host.x + host.width || y >= host.y + host.height {
-                continue;
-            }
-            if let Some(target) = frame.buffer_mut().cell_mut((x, y)) {
-                target.set_symbol(&cell.grapheme);
-                if let Some(fg) = cell.fg {
-                    target.set_fg(theme.color(fg));
+        // A surface belongs to its window, so it is painted with it — *inside* the paint order
+        // rather than after it. Drawn in one pass at the end, every surface was on top of
+        // everything: a terminal pane filling a rectangle covered any float over it, so holding the
+        // window prefix in a shell drew the panel listing what follows and then painted the shell
+        // straight back over it. The one thing on screen that has to be visible over a full-screen
+        // program is the way out of it.
+        for surface in mirror.surfaces.values().filter(|s| s.win == win) {
+            for cell in &surface.cells {
+                let x = rect.x + surface.rect.col + cell.col;
+                let y = rect.y + surface.rect.row + cell.row;
+                if x >= rect.x + rect.width || y >= rect.y + rect.height {
+                    continue;
                 }
-                if let Some(bg) = cell.bg {
-                    target.set_bg(theme.color(bg));
+                if let Some(target) = frame.buffer_mut().cell_mut((x, y)) {
+                    target.set_symbol(&cell.grapheme);
+                    if let Some(fg) = cell.fg {
+                        target.set_fg(theme.color(fg));
+                    }
+                    if let Some(bg) = cell.bg {
+                        target.set_bg(theme.color(bg));
+                    }
+                    target.set_style(
+                        Style::default().add_modifier(crate::theme::modifiers(&cell.attrs)),
+                    );
                 }
-                target.set_style(Style::default().add_modifier(crate::theme::modifiers(&cell.attrs)));
             }
         }
     }
+
+    draw_notifications(frame, area, mirror, theme);
 
     // The block cursor, last of all and over whatever the row under it ended up being.
     //
@@ -873,8 +1190,11 @@ fn rendered_rows(
 /// The focused window if there is one, else the bottom-most docked window — which is the composer,
 /// and is where typing lands when nothing else has claimed the keyboard.
 fn caret_target(mirror: &Mirror, rects: &[(WindowId, Rect)]) -> Option<WindowId> {
-    mirror.focus.or_else(|| {
-        // The composer: the last docked-bottom window, matching how the host stacks them.
+    mirror.focus.or(mirror.home).or_else(|| {
+        // Neither a float holding focus nor a core that has said where the keyboard rests: a
+        // frontend talking to something older, or a test driving the mirror by hand. The composer,
+        // guessed as the bottom-most docked window — which is exact for a terminal with one of
+        // them, and is the reason `HomeChanged` had to exist for terminals with two.
         rects
             .iter()
             .filter(|(id, _)| {

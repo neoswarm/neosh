@@ -282,12 +282,12 @@ fn mirror_with_windows() -> Mirror {
     m.apply(UiEvent::WindowOpened {
         win: WindowId(1),
         buf: BufferId(1),
-        layout: WindowLayout::Docked { dock: Dock::Main, size: None, gravity: Gravity::Start, wrap: None },
+        layout: WindowLayout::Docked { pane: None, dock: Dock::Main, size: None, gravity: Gravity::Start, wrap: None },
     });
     m.apply(UiEvent::WindowOpened {
         win: WindowId(2),
         buf: BufferId(1),
-        layout: WindowLayout::Docked { dock: Dock::Left, size: Some(20), gravity: Gravity::Start, wrap: None },
+        layout: WindowLayout::Docked { pane: None, dock: Dock::Left, size: Some(20), gravity: Gravity::Start, wrap: None },
     });
     m
 }
@@ -317,7 +317,7 @@ fn a_side_dock_is_separated_from_what_is_beside_it() {
     m.apply(UiEvent::WindowOpened {
         win: WindowId(1),
         buf: BufferId(1),
-        layout: WindowLayout::Docked { dock: Dock::Left, size: Some(8), gravity: Gravity::Start, wrap: None },
+        layout: WindowLayout::Docked { pane: None, dock: Dock::Left, size: Some(8), gravity: Gravity::Start, wrap: None },
     });
     m.apply(UiEvent::BufferOpened { buf: BufferId(2), name: "main".into() });
     m.apply(UiEvent::BufferLines {
@@ -329,7 +329,7 @@ fn a_side_dock_is_separated_from_what_is_beside_it() {
     m.apply(UiEvent::WindowOpened {
         win: WindowId(2),
         buf: BufferId(2),
-        layout: WindowLayout::Docked { dock: Dock::Main, size: None, gravity: Gravity::Start, wrap: None },
+        layout: WindowLayout::Docked { pane: None, dock: Dock::Main, size: None, gravity: Gravity::Start, wrap: None },
     });
 
     let cells = cells_of(&m, 20, 3);
@@ -346,12 +346,12 @@ fn the_rule_is_the_first_thing_given_up_when_space_runs_out() {
     m.apply(UiEvent::WindowOpened {
         win: WindowId(1),
         buf: BufferId(1),
-        layout: WindowLayout::Docked { dock: Dock::Left, size: Some(9), gravity: Gravity::Start, wrap: None },
+        layout: WindowLayout::Docked { pane: None, dock: Dock::Left, size: Some(9), gravity: Gravity::Start, wrap: None },
     });
     m.apply(UiEvent::WindowOpened {
         win: WindowId(2),
         buf: BufferId(2),
-        layout: WindowLayout::Docked { dock: Dock::Main, size: None, gravity: Gravity::Start, wrap: None },
+        layout: WindowLayout::Docked { pane: None, dock: Dock::Main, size: None, gravity: Gravity::Start, wrap: None },
     });
     let rects = resolve_layout(&m, Rect::new(0, 0, 10, 4));
     let left = rects.iter().find(|(w, _)| *w == WindowId(1)).unwrap().1;
@@ -392,7 +392,7 @@ fn a_dock_anchored_float_sits_flush_against_the_dock_whatever_its_height() {
     m.apply(UiEvent::WindowOpened {
         win: WindowId(3),
         buf: BufferId(1),
-        layout: WindowLayout::Docked {
+        layout: WindowLayout::Docked { pane: None,
             dock: Dock::Bottom,
             size: Some(4),
             gravity: Gravity::Start,
@@ -580,7 +580,7 @@ fn a_float_draws_over_its_dock() {
     m.apply(UiEvent::WindowOpened {
         win: WindowId(1),
         buf: BufferId(1),
-        layout: WindowLayout::Docked { dock: Dock::Main, size: None, gravity: Gravity::Start, wrap: None },
+        layout: WindowLayout::Docked { pane: None, dock: Dock::Main, size: None, gravity: Gravity::Start, wrap: None },
     });
     m.apply(UiEvent::BufferOpened { buf: BufferId(2), name: "float".into() });
     m.apply(UiEvent::BufferLines {
@@ -628,13 +628,13 @@ fn docked_mirror(bottom: &[(u32, Option<u16>)]) -> Mirror {
     m.apply(UiEvent::WindowOpened {
         win: WindowId(1),
         buf: BufferId(1),
-        layout: WindowLayout::Docked { dock: Dock::Main, size: None, gravity: Gravity::Start, wrap: None },
+        layout: WindowLayout::Docked { pane: None, dock: Dock::Main, size: None, gravity: Gravity::Start, wrap: None },
     });
     for (id, size) in bottom {
         m.apply(UiEvent::WindowOpened {
             win: WindowId(*id),
             buf: BufferId(1),
-            layout: WindowLayout::Docked { dock: Dock::Bottom, size: *size, gravity: Gravity::Start, wrap: None },
+            layout: WindowLayout::Docked { pane: None, dock: Dock::Bottom, size: *size, gravity: Gravity::Start, wrap: None },
         });
     }
     m
@@ -729,7 +729,7 @@ fn main_window_with(lines: Vec<&str>) -> Mirror {
     m.apply(UiEvent::WindowOpened {
         win: WindowId(1),
         buf: BufferId(1),
-        layout: WindowLayout::Docked { dock: Dock::Main, size: None, gravity: Gravity::Start, wrap: None },
+        layout: WindowLayout::Docked { pane: None, dock: Dock::Main, size: None, gravity: Gravity::Start, wrap: None },
     });
     m
 }
@@ -983,12 +983,12 @@ fn a_side_panel_clips_instead_of_wrapping() {
     m.apply(UiEvent::WindowOpened {
         win: WindowId(1),
         buf: BufferId(1),
-        layout: WindowLayout::Docked { dock: Dock::Left, size: Some(20), gravity: Gravity::Start, wrap: None },
+        layout: WindowLayout::Docked { pane: None, dock: Dock::Left, size: Some(20), gravity: Gravity::Start, wrap: None },
     });
     m.apply(UiEvent::WindowOpened {
         win: WindowId(2),
         buf: BufferId(1),
-        layout: WindowLayout::Docked { dock: Dock::Main, size: None, gravity: Gravity::Start, wrap: None },
+        layout: WindowLayout::Docked { pane: None, dock: Dock::Main, size: None, gravity: Gravity::Start, wrap: None },
     });
     let rows = rows_of(&m, 60, 5);
     assert!(rows[1].starts_with("second row"), "row two is still row two: {rows:?}");
@@ -1007,7 +1007,7 @@ fn the_caret_lands_where_typing_goes() {
     m.apply(UiEvent::WindowOpened {
         win: WindowId(1),
         buf: BufferId(1),
-        layout: WindowLayout::Docked { dock: Dock::Bottom, size: Some(1), gravity: Gravity::Start, wrap: None },
+        layout: WindowLayout::Docked { pane: None, dock: Dock::Bottom, size: Some(1), gravity: Gravity::Start, wrap: None },
     });
     m.apply(UiEvent::CursorMoved { win: WindowId(1), row: 0, col: 5 });
 
@@ -1033,7 +1033,7 @@ fn the_caret_measures_columns_not_bytes() {
     m.apply(UiEvent::WindowOpened {
         win: WindowId(1),
         buf: BufferId(1),
-        layout: WindowLayout::Docked { dock: Dock::Bottom, size: Some(1), gravity: Gravity::Start, wrap: None },
+        layout: WindowLayout::Docked { pane: None, dock: Dock::Bottom, size: Some(1), gravity: Gravity::Start, wrap: None },
     });
     // Three bytes for 日, one for x: byte offset 4 is the end of the line, screen column 3.
     m.apply(UiEvent::CursorMoved { win: WindowId(1), row: 0, col: 4 });
@@ -1058,7 +1058,7 @@ fn a_focused_float_takes_the_caret() {
     m.apply(UiEvent::WindowOpened {
         win: WindowId(1),
         buf: BufferId(1),
-        layout: WindowLayout::Docked { dock: Dock::Bottom, size: Some(1), gravity: Gravity::Start, wrap: None },
+        layout: WindowLayout::Docked { pane: None, dock: Dock::Bottom, size: Some(1), gravity: Gravity::Start, wrap: None },
     });
     m.apply(UiEvent::BufferOpened { buf: BufferId(2), name: "prompt".into() });
     m.apply(UiEvent::BufferLines {
@@ -1122,7 +1122,7 @@ fn right_aligned_virtual_text_sits_against_the_window_edge() {
     m.apply(UiEvent::WindowOpened {
         win: WindowId(1),
         buf: BufferId(1),
-        layout: WindowLayout::Docked { dock: Dock::Main, size: None, gravity: Gravity::Start, wrap: None },
+        layout: WindowLayout::Docked { pane: None, dock: Dock::Main, size: None, gravity: Gravity::Start, wrap: None },
     });
     let rows = rows_of(&m, 20, 3);
     assert_eq!(rows[0], "a thread          2m", "flush right on a 20-wide pane: {rows:?}");
@@ -1143,7 +1143,7 @@ fn right_alignment_measures_columns_not_bytes() {
     m.apply(UiEvent::WindowOpened {
         win: WindowId(1),
         buf: BufferId(1),
-        layout: WindowLayout::Docked { dock: Dock::Main, size: None, gravity: Gravity::Start, wrap: None },
+        layout: WindowLayout::Docked { pane: None, dock: Dock::Main, size: None, gravity: Gravity::Start, wrap: None },
     });
     // Read cells rather than the joined string: the backend pads a wide glyph with a blank
     // continuation cell, so counting characters would measure the harness, not the layout.
@@ -1166,7 +1166,7 @@ fn right_aligned_text_that_does_not_fit_follows_the_line_instead_of_overflowing(
     m.apply(UiEvent::WindowOpened {
         win: WindowId(1),
         buf: BufferId(1),
-        layout: WindowLayout::Docked { dock: Dock::Main, size: None, gravity: Gravity::Start, wrap: None },
+        layout: WindowLayout::Docked { pane: None, dock: Dock::Main, size: None, gravity: Gravity::Start, wrap: None },
     });
     let rows = rows_of(&m, 20, 4);
     assert!(rows.join("").contains("status"), "the annotation is still shown: {rows:?}");
@@ -1188,7 +1188,7 @@ fn a_row_can_carry_both_a_right_aligned_and_a_trailing_annotation() {
     m.apply(UiEvent::WindowOpened {
         win: WindowId(1),
         buf: BufferId(1),
-        layout: WindowLayout::Docked { dock: Dock::Main, size: None, gravity: Gravity::Start, wrap: None },
+        layout: WindowLayout::Docked { pane: None, dock: Dock::Main, size: None, gravity: Gravity::Start, wrap: None },
     });
     // The grammar: `Eol` means "after the text", `Right` means "at the edge". Both fit on one row.
     let rows = rows_of(&m, 20, 3);
@@ -1284,7 +1284,7 @@ fn the_caret_moves_past_chrome_drawn_in_front_of_it() {
     m.apply(UiEvent::WindowOpened {
         win: WindowId(1),
         buf: BufferId(1),
-        layout: WindowLayout::Docked { dock: Dock::Bottom, size: Some(1), gravity: Gravity::Start, wrap: None },
+        layout: WindowLayout::Docked { pane: None, dock: Dock::Bottom, size: Some(1), gravity: Gravity::Start, wrap: None },
     });
     m.apply(UiEvent::CursorMoved { win: WindowId(1), row: 0, col: 2 });
 
@@ -1308,7 +1308,7 @@ fn a_line_drawn_above_the_first_row_pushes_the_caret_down() {
     m.apply(UiEvent::WindowOpened {
         win: WindowId(1),
         buf: BufferId(1),
-        layout: WindowLayout::Docked { dock: Dock::Bottom, size: Some(2), gravity: Gravity::Start, wrap: None },
+        layout: WindowLayout::Docked { pane: None, dock: Dock::Bottom, size: Some(2), gravity: Gravity::Start, wrap: None },
     });
     m.apply(UiEvent::CursorMoved { win: WindowId(1), row: 0, col: 2 });
 
@@ -1334,7 +1334,7 @@ fn short_content_settles_against_the_end_when_told_to() {
     m.apply(UiEvent::WindowOpened {
         win: WindowId(1),
         buf: BufferId(1),
-        layout: WindowLayout::Docked { dock: Dock::Main, size: None, gravity: Gravity::End, wrap: None },
+        layout: WindowLayout::Docked { pane: None, dock: Dock::Main, size: None, gravity: Gravity::End, wrap: None },
     });
 
     let mut terminal = Terminal::new(TestBackend::new(10, 5)).unwrap();
@@ -1361,7 +1361,7 @@ fn the_default_gravity_leaves_content_where_it_has_always_been() {
     m.apply(UiEvent::WindowOpened {
         win: WindowId(1),
         buf: BufferId(1),
-        layout: WindowLayout::Docked { dock: Dock::Main, size: None, gravity: Gravity::Start, wrap: None },
+        layout: WindowLayout::Docked { pane: None, dock: Dock::Main, size: None, gravity: Gravity::Start, wrap: None },
     });
 
     let mut terminal = Terminal::new(TestBackend::new(10, 4)).unwrap();
@@ -1399,7 +1399,7 @@ fn wrapped_transcript(cursor: (u32, u32)) -> Mirror {
     m.apply(UiEvent::WindowOpened {
         win: WindowId(1),
         buf: BufferId(1),
-        layout: WindowLayout::Docked { dock: Dock::Main, size: None, gravity: Gravity::Start, wrap: None },
+        layout: WindowLayout::Docked { pane: None, dock: Dock::Main, size: None, gravity: Gravity::Start, wrap: None },
     });
     m.apply(UiEvent::ScrollTo { win: WindowId(1), top_line: Some(0) });
     m.apply(UiEvent::CursorMoved { win: WindowId(1), row: cursor.0, col: cursor.1 });
@@ -1474,4 +1474,347 @@ fn a_block_caret_is_painted_over_the_character_it_is_on() {
         "the cell under the caret is turned inside out: {cell:?}"
     );
     assert_eq!(cell.symbol(), "a", "and it is still the character that was there");
+}
+
+// ---------------------------------------------------------------------------
+// Panes
+// ---------------------------------------------------------------------------
+//
+// The main region divided by a tab's pane tree. What these are checking is the arithmetic — that
+// the pieces tile the region exactly, that the separators are where the panes are not, and that a
+// pane belonging to a tab you are not on is simply absent rather than drawn somewhere plausible.
+
+use neosh_proto::{PaneChild, PaneId, PaneNode, SplitDir, TabId, TabInfo};
+
+fn pane_win(win: u32, pane: u32, dock: Dock, size: Option<u16>) -> UiEvent {
+    UiEvent::WindowOpened {
+        win: WindowId(win),
+        buf: BufferId(1),
+        layout: WindowLayout::Docked {
+            pane: Some(PaneId(pane)),
+            dock,
+            size,
+            gravity: Gravity::Start,
+            wrap: None,
+        },
+    }
+}
+
+fn split(dir: SplitDir, children: Vec<PaneNode>) -> PaneNode {
+    PaneNode::Split { dir, children: children.into_iter().map(PaneChild::new).collect() }
+}
+
+fn leaf(n: u32) -> PaneNode {
+    PaneNode::Leaf { pane: PaneId(n) }
+}
+
+/// A mirror with one tab whose root is `root`, and a buffer to put in windows.
+fn paned(root: PaneNode) -> Mirror {
+    let mut m = Mirror::new();
+    m.apply(UiEvent::BufferOpened { buf: BufferId(1), name: "buf".into() });
+    m.apply(UiEvent::BufferLines {
+        buf: BufferId(1),
+        start: 0,
+        old_end: 0,
+        lines: vec![line("x", vec![]); 4],
+    });
+    let active = TabId(1);
+    m.apply(UiEvent::PanesChanged {
+        tabs: vec![TabInfo { id: active, title: None, root, active_pane: PaneId(1) }],
+        active,
+    });
+    m
+}
+
+#[test]
+fn a_single_pane_is_the_whole_main_region() {
+    let mut m = paned(leaf(1));
+    m.apply(pane_win(1, 1, Dock::Main, None));
+    let rects = resolve_layout(&m, Rect::new(0, 0, 80, 24));
+    assert_eq!(rects.iter().find(|(w, _)| *w == WindowId(1)).unwrap().1, Rect::new(0, 0, 80, 24));
+}
+
+/// Side by side, with one column of separator between them, and the two halves plus the rule
+/// adding up to exactly the width — no unpainted column down the right-hand edge.
+#[test]
+fn a_row_splits_the_width_and_leaves_a_column_between() {
+    let mut m = paned(split(SplitDir::Row, vec![leaf(1), leaf(2)]));
+    m.apply(pane_win(1, 1, Dock::Main, None));
+    m.apply(pane_win(2, 2, Dock::Main, None));
+    let rects = resolve_layout(&m, Rect::new(0, 0, 81, 24));
+    let a = rects.iter().find(|(w, _)| *w == WindowId(1)).unwrap().1;
+    let b = rects.iter().find(|(w, _)| *w == WindowId(2)).unwrap().1;
+    assert_eq!(a, Rect::new(0, 0, 40, 24));
+    assert_eq!(b, Rect::new(41, 0, 40, 24));
+    assert_eq!(a.width + 1 + b.width, 81, "the panes and the rule tile the region exactly");
+}
+
+#[test]
+fn a_column_splits_the_height() {
+    let mut m = paned(split(SplitDir::Column, vec![leaf(1), leaf(2)]));
+    m.apply(pane_win(1, 1, Dock::Main, None));
+    m.apply(pane_win(2, 2, Dock::Main, None));
+    let rects = resolve_layout(&m, Rect::new(0, 0, 80, 25));
+    let a = rects.iter().find(|(w, _)| *w == WindowId(1)).unwrap().1;
+    let b = rects.iter().find(|(w, _)| *w == WindowId(2)).unwrap().1;
+    assert_eq!(a, Rect::new(0, 0, 80, 12));
+    assert_eq!(b, Rect::new(0, 13, 80, 12));
+}
+
+/// Odd widths must not evaporate. Three panes across 80 columns is 78 for content, which does not
+/// divide by three evenly — and the leftover has to land somewhere rather than nowhere.
+#[test]
+fn an_uneven_division_still_tiles_the_region() {
+    let mut m = paned(split(SplitDir::Row, vec![leaf(1), leaf(2), leaf(3)]));
+    for (w, p) in [(1, 1), (2, 2), (3, 3)] {
+        m.apply(pane_win(w, p, Dock::Main, None));
+    }
+    let rects = resolve_layout(&m, Rect::new(0, 0, 80, 24));
+    let mut widths: Vec<u16> = (1..=3)
+        .map(|w| rects.iter().find(|(id, _)| *id == WindowId(w)).unwrap().1.width)
+        .collect();
+    assert_eq!(widths.iter().sum::<u16>() + 2, 80, "content plus two rules is the whole width");
+    widths.sort();
+    assert!(widths[2] - widths[0] <= 1, "and the remainder is spread, not dumped: {widths:?}");
+}
+
+/// The composer moving inside the pane is the whole point of per-pane docks: two chats side by
+/// side are two transcripts and two fields, each pair inside its own half.
+#[test]
+fn a_dock_inside_a_pane_is_measured_against_the_pane() {
+    let mut m = paned(split(SplitDir::Row, vec![leaf(1), leaf(2)]));
+    m.apply(pane_win(1, 1, Dock::Main, None));
+    m.apply(pane_win(2, 1, Dock::Bottom, Some(4)));
+    m.apply(pane_win(3, 2, Dock::Main, None));
+    let rects = resolve_layout(&m, Rect::new(0, 0, 81, 24));
+    let transcript = rects.iter().find(|(w, _)| *w == WindowId(1)).unwrap().1;
+    let composer = rects.iter().find(|(w, _)| *w == WindowId(2)).unwrap().1;
+    let other = rects.iter().find(|(w, _)| *w == WindowId(3)).unwrap().1;
+    assert_eq!(composer, Rect::new(0, 20, 40, 4), "at the foot of its own pane, not the screen");
+    assert_eq!(transcript, Rect::new(0, 0, 40, 20));
+    assert_eq!(other, Rect::new(41, 0, 40, 24), "and the pane next door is untouched");
+}
+
+/// Switching tabs moves no windows. It changes which pane ids have a rectangle, and a window in
+/// a pane that is not on screen gets none — which is what makes a tab switch free.
+#[test]
+fn a_window_in_another_tab_is_not_drawn() {
+    let mut m = paned(leaf(1));
+    m.apply(pane_win(1, 1, Dock::Main, None));
+    m.apply(pane_win(2, 9, Dock::Main, None));
+    let rects = resolve_layout(&m, Rect::new(0, 0, 80, 24));
+    assert!(rects.iter().any(|(w, _)| *w == WindowId(1)));
+    assert!(
+        !rects.iter().any(|(w, _)| *w == WindowId(2)),
+        "a pane the active tab does not contain has no rectangle at all"
+    );
+}
+
+/// A screen dock is carved before the panes, so the sidebar is beside the whole split rather than
+/// inside the first pane of it.
+#[test]
+fn screen_docks_are_outside_the_panes() {
+    let mut m = paned(split(SplitDir::Row, vec![leaf(1), leaf(2)]));
+    m.apply(UiEvent::WindowOpened {
+        win: WindowId(9),
+        buf: BufferId(1),
+        layout: WindowLayout::Docked {
+            pane: None,
+            dock: Dock::Left,
+            size: Some(20),
+            gravity: Gravity::Start,
+            wrap: None,
+        },
+    });
+    m.apply(pane_win(1, 1, Dock::Main, None));
+    m.apply(pane_win(2, 2, Dock::Main, None));
+    let rects = resolve_layout(&m, Rect::new(0, 0, 102, 24));
+    let sidebar = rects.iter().find(|(w, _)| *w == WindowId(9)).unwrap().1;
+    let a = rects.iter().find(|(w, _)| *w == WindowId(1)).unwrap().1;
+    let b = rects.iter().find(|(w, _)| *w == WindowId(2)).unwrap().1;
+    assert_eq!(sidebar, Rect::new(0, 0, 20, 24));
+    assert_eq!(a.x, 21, "the panes start after the sidebar and its rule");
+    assert_eq!(b.x + b.width, 102, "and the last one reaches the right edge");
+}
+
+/// The tab bar: a one-row strip at the top of the main region, to the right of the sidebar rather
+/// than across it.
+#[test]
+fn a_top_dock_sits_inside_the_main_region() {
+    let mut m = paned(leaf(1));
+    m.apply(UiEvent::WindowOpened {
+        win: WindowId(9),
+        buf: BufferId(1),
+        layout: WindowLayout::Docked {
+            pane: None,
+            dock: Dock::Left,
+            size: Some(20),
+            gravity: Gravity::Start,
+            wrap: None,
+        },
+    });
+    m.apply(UiEvent::WindowOpened {
+        win: WindowId(8),
+        buf: BufferId(1),
+        layout: WindowLayout::Docked {
+            pane: None,
+            dock: Dock::Top,
+            size: Some(1),
+            gravity: Gravity::Start,
+            wrap: None,
+        },
+    });
+    m.apply(pane_win(1, 1, Dock::Main, None));
+    let rects = resolve_layout(&m, Rect::new(0, 0, 102, 24));
+    let bar = rects.iter().find(|(w, _)| *w == WindowId(8)).unwrap().1;
+    let pane = rects.iter().find(|(w, _)| *w == WindowId(1)).unwrap().1;
+    assert_eq!(bar, Rect::new(21, 0, 81, 1), "beside the sidebar, not over it");
+    assert_eq!(pane, Rect::new(21, 1, 81, 23), "and the panes start under it");
+}
+
+/// A plugin that opens a `Dock::Main` window without naming a pane lands where the person is
+/// looking — the same rule as a float that names no view, one level down.
+#[test]
+fn a_window_that_names_no_pane_lands_in_the_active_one() {
+    let mut m = paned(split(SplitDir::Row, vec![leaf(1), leaf(2)]));
+    m.apply(UiEvent::PanesChanged {
+        tabs: vec![TabInfo {
+            id: TabId(1),
+            title: None,
+            root: split(SplitDir::Row, vec![leaf(1), leaf(2)]),
+            active_pane: PaneId(2),
+        }],
+        active: TabId(1),
+    });
+    m.apply(UiEvent::WindowOpened {
+        win: WindowId(5),
+        buf: BufferId(1),
+        layout: WindowLayout::Docked {
+            pane: None,
+            dock: Dock::Main,
+            size: None,
+            gravity: Gravity::Start,
+            wrap: None,
+        },
+    });
+    let rects = resolve_layout(&m, Rect::new(0, 0, 81, 24));
+    assert_eq!(
+        rects.iter().find(|(w, _)| *w == WindowId(5)).unwrap().1,
+        Rect::new(41, 0, 40, 24),
+        "the second pane, which is the active one"
+    );
+}
+
+/// Nothing may panic or loop at any size, including sizes smaller than the layout needs. A pane
+/// that cannot fit gets no rectangle; it never gets a zero-width one.
+#[test]
+fn a_deep_layout_survives_every_terminal_size() {
+    let root = split(SplitDir::Row, vec![
+        leaf(1),
+        split(SplitDir::Column, vec![leaf(2), split(SplitDir::Row, vec![leaf(3), leaf(4)])]),
+        leaf(5),
+    ]);
+    let mut m = paned(root);
+    for p in 1..=5 {
+        m.apply(pane_win(p, p, Dock::Main, None));
+        m.apply(pane_win(p + 10, p, Dock::Bottom, Some(3)));
+    }
+    for w in 0..40u16 {
+        for h in 0..20u16 {
+            let rects = resolve_layout(&m, Rect::new(0, 0, w, h));
+            for (win, r) in &rects {
+                assert!(
+                    r.x + r.width <= w && r.y + r.height <= h,
+                    "window {win:?} at {r:?} escapes a {w}x{h} screen"
+                );
+                assert!(r.width > 0 && r.height > 0, "window {win:?} was given nothing: {r:?}");
+            }
+        }
+    }
+}
+
+/// A float is drawn over a surface, not under it.
+///
+/// A surface belongs to its window, so it is painted in that window's place in the paint order.
+/// Drawn in one pass at the end instead, every surface was on top of everything — so a terminal
+/// pane filling a rectangle covered any float above it, and the panel telling you how to get *out*
+/// of a full-screen program was painted over by the program.
+#[test]
+fn a_float_draws_over_a_surface() {
+    use neosh_proto::{Rect as PRect, SurfaceCell, SurfaceId};
+
+    let mut m = Mirror::new();
+    m.apply(UiEvent::BufferOpened { buf: BufferId(1), name: "under".into() });
+    m.apply(UiEvent::BufferLines {
+        buf: BufferId(1),
+        start: 0,
+        old_end: 0,
+        lines: vec![line("", vec![]); 6],
+    });
+    m.apply(UiEvent::WindowOpened {
+        win: WindowId(1),
+        buf: BufferId(1),
+        layout: WindowLayout::Docked {
+            pane: None,
+            dock: Dock::Main,
+            size: None,
+            gravity: Gravity::Start,
+            wrap: None,
+        },
+    });
+    // A surface covering the whole window, as a shell's would.
+    m.apply(UiEvent::SurfaceClaimed {
+        surface: SurfaceId(1),
+        win: WindowId(1),
+        rect: PRect { row: 0, col: 0, width: 20, height: 6 },
+    });
+    let mut cells = Vec::new();
+    for row in 0..6u16 {
+        for col in 0..20u16 {
+            cells.push(SurfaceCell {
+                row,
+                col,
+                grapheme: "#".into(),
+                fg: None,
+                bg: None,
+                attrs: Default::default(),
+            });
+        }
+    }
+    m.apply(UiEvent::SurfaceCells { surface: SurfaceId(1), cells });
+
+    // And a float over it, as the prefix panel is.
+    m.apply(UiEvent::BufferOpened { buf: BufferId(2), name: "over".into() });
+    m.apply(UiEvent::BufferLines {
+        buf: BufferId(2),
+        start: 0,
+        old_end: 0,
+        lines: vec![line("PANEL", vec![])],
+    });
+    m.apply(UiEvent::WindowOpened {
+        win: WindowId(2),
+        buf: BufferId(2),
+        layout: WindowLayout::Float {
+            config: FloatConfig {
+                anchor: Anchor::Screen,
+                width: Extent::Fixed { n: 5 },
+                height: Extent::Fixed { n: 1 },
+                border: BorderStyle::None,
+                ..Default::default()
+            },
+        },
+    });
+
+    let mut terminal = Terminal::new(TestBackend::new(20, 6)).unwrap();
+    let t = theme();
+    terminal.draw(|f| { neosh_tui::render::draw(f, &m, &t); }).unwrap();
+    let screen: String = {
+        let buf = terminal.backend().buffer();
+        (0..6)
+            .flat_map(|y| (0..20).map(move |x| (x, y)))
+            .filter_map(|(x, y)| buf.cell((x, y)).map(|c| c.symbol().to_string()))
+            .collect()
+    };
+    assert!(screen.contains("PANEL"), "the float is on top of the surface:\n{screen}");
+    assert!(screen.contains('#'), "and the surface is still drawn where the float is not");
 }

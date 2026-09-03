@@ -36,6 +36,7 @@ mod skill;
 mod update;
 mod quota;
 mod swarm;
+mod term;
 mod trust;
 mod usage;
 mod vars;
@@ -238,9 +239,15 @@ macro_rules! say {
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
-    // Logs go to a file, never stdout: stdout is the UI protocol, and a stray log line would
-    // corrupt the stream a frontend is parsing.
-    let log_path = std::env::var_os("NEOSH_LOG").map(PathBuf::from);
+    // Logs go to a file, never to a screen. stdout is the UI protocol, so a stray line there
+    // corrupts the stream a frontend is parsing — and **stderr is the terminal the UI is drawn on**,
+    // so a line there is written straight over it. That second half was missing: with nothing in
+    // `NEOSH_LOG`, a single `WARN` at startup — a second workspace already holding the swarm port
+    // is enough — landed across the tab strip, and stayed there until something happened to redraw
+    // that row. A log line is never worth a corrupted screen; see [`default_log_path`].
+    let log_path = std::env::var_os("NEOSH_LOG")
+        .map(PathBuf::from)
+        .or_else(|| default_log_path(cli.config_dir.clone(), cli.clean));
     let _guard = init_logging(log_path.as_deref());
 
     let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
@@ -253,6 +260,27 @@ fn main() -> anyhow::Result<()> {
     // teardown, restoring the terminal — has already happened by the time `run` returns.
     runtime.shutdown_background();
     result
+}
+
+/// Where logs go when nobody said, and `None` when stderr is safe to use.
+///
+/// Only when stderr is a terminal, because that is exactly when writing to it would draw over the
+/// UI. A piped stderr belongs to a parent process that asked for it — `neosh --ui-protocol=stdio`
+/// under an editor, a shell redirecting to a file, CI — and taking that away would be hiding output
+/// somebody had arranged to read.
+///
+/// Resolved here rather than reusing [`Paths`], which is settled later inside `run`: logging has to
+/// be up before anything that might log, and the state directory is the one field needed. A path
+/// that cannot be created falls back to no logging at all rather than to stderr — losing a warning
+/// is recoverable and a corrupted screen is what the user has to look at.
+fn default_log_path(config_override: Option<PathBuf>, clean: bool) -> Option<PathBuf> {
+    use std::io::IsTerminal;
+    if !std::io::stderr().is_terminal() {
+        return None;
+    }
+    let dir = Paths::resolve(config_override, clean).state;
+    std::fs::create_dir_all(&dir).ok()?;
+    Some(dir.join("neosh.log"))
 }
 
 fn init_logging(path: Option<&std::path::Path>) -> Option<std::fs::File> {
@@ -269,7 +297,16 @@ fn init_logging(path: Option<&std::path::Path>) -> Option<std::fs::File> {
             Some(file)
         }
         None => {
-            tracing_subscriber::fmt().with_env_filter(filter).with_writer(std::io::stderr).init();
+            // Nothing was asked for and stderr is not a screen — or a log file was asked for and
+            // could not be opened, in which case stderr is still the wrong place if it is a
+            // terminal, and `default_log_path` has already established that it is not.
+            use std::io::IsTerminal;
+            if !std::io::stderr().is_terminal() {
+                tracing_subscriber::fmt()
+                    .with_env_filter(filter)
+                    .with_writer(std::io::stderr)
+                    .init();
+            }
             None
         }
     }
