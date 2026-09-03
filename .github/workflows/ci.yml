@@ -10,29 +10,40 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  check:
-    name: everything check.sh runs
+  # Two runners, because the halves need different things and one of them needs nothing.
+  #
+  # The node checks read only committed files — the generated types, the plugins, the `files`
+  # lists — so queueing them behind a nine-minute cargo build spent five minutes of wall clock on
+  # a dependency that does not exist. `check.sh` still runs all of it with no argument, which is
+  # what a contributor types; the argument is how CI takes half each.
+  rust:
+    name: check.sh — the half that needs cargo
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
-
       - uses: dtolnay/rust-toolchain@stable
-
       - uses: actions/setup-node@v4
         with:
           node-version: 22
-
       - uses: Swatinem/rust-cache@v2
 
-      # The single source of truth: the same script contributors run locally,
-      # so "works locally" and "passes CI" are the same sentence.
-      #
       # One test at a time, because the integration suites each start a whole
       # workspace — a real daemon, a real socket, plugins and all — and a
       # 4-vCPU runner starting several at once is how a different test timed
       # out on every run: three runs, three different single failures, every
       # one a wait on something a starved workspace had not drawn yet.
-      - run: ./scripts/check.sh
+      - run: ./scripts/check.sh rust
         env:
           RUST_TEST_THREADS: "1"
+
+  web:
+    name: check.sh — the half that does not
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: ./scripts/check.sh web
