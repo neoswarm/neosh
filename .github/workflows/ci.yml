@@ -33,16 +33,6 @@ jobs:
       # 4-vCPU runner starting several at once is how a different test timed
       # out on every run: three runs, three different single failures, every
       # one a wait on something a starved workspace had not drawn yet.
-      # Most of this job is the linker, not the compiler and not the tests: ~9 minutes of a ~12
-      # minute run, with the tests themselves about 3. There are 28 integration test targets and
-      # each one links the whole `neosh` crate, so link time is multiplied by 28 — and the default
-      # `bfd` linker is the slowest part of that. `lld` is a drop-in for exactly this shape of
-      # build.
-      - run: sudo apt-get install -y lld
       - run: ./scripts/check.sh
         env:
           RUST_TEST_THREADS: "1"
-          RUSTFLAGS: "-C link-arg=-fuse-ld=lld"
-          # Incremental state is written and never read: every run starts from a restored cache and
-          # ends with the container. Pure write amplification here.
-          CARGO_INCREMENTAL: "0"
