@@ -9,6 +9,6 @@
     "shots": "astro build && node scripts/gen-shots.mjs"
   },
   "dependencies": {
-    "astro": "^5.13.0"
+    "astro": "^7.1.0"
   }
 }

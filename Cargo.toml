@@ -103,6 +103,17 @@ insta = { version = "1.48", features = ["json", "redactions"] }
 
 [profile.dev]
 opt-level = 1
+# Enough debug info to read a backtrace, and none of the rest.
+#
+# A test failure is a file and a line, and `line-tables-only` is exactly that. Full DWARF is what
+# a *debugger* needs to show you a local variable, and generating and linking it for eleven crates
+# and twenty-eight test binaries is a large share of a build that nothing here ever steps through:
+# `rust-cache` deliberately does not cache workspace members, so every CI run pays for all of it
+# from scratch. Set it back to `true` in a local override if you are attaching a debugger.
+debug = "line-tables-only"
 
 [profile.dev.package."*"]
 opt-level = 2
+# Dependencies are cached and never stepped into, so their debug info is weight in every link and
+# information nobody reads.
+debug = false

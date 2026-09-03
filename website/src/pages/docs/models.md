@@ -10,6 +10,7 @@ description: Any model, through the driver that suits it. A subscription you alr
 | --- | --- |
 | `claude-cli` | Your existing `claude` login |
 | `codex-cli` | Your existing `codex` login |
+| `antigravity` | Your existing `agy` login, including a Google AI subscription |
 | `anthropic` | `ANTHROPIC_API_KEY` |
 | `openai-compat` | Any endpoint speaking the OpenAI shape |
 | `google` | `GEMINI_API_KEY` |
@@ -44,10 +45,11 @@ Every provider lists models whether or not you have a key, because the list is h
 
 ## Plans
 
-`claude-cli` and `codex-cli` drive the vendor's own CLI as a provider. Neither needs an API key, neither stores a token, and neither is offered unless the program is actually on your `$PATH`. Two things worth knowing:
+`claude-cli`, `codex-cli` and `antigravity` drive the vendor's own CLI as a provider. None needs an API key, none stores a token, and none is offered unless the program is actually on your `$PATH`. Three things worth knowing:
 
 - They are agent drivers, running their own loop with their own tools and sandbox, so neosh's tool registry is not in play on those turns, and neither driver overrides the CLI's own approval policy. The place to change that is the CLI's configuration.
 - `codex exec --json` has no token deltas, so a Codex turn shows its tool activity live and then its answer all at once. That is the CLI's shape, not a shortcut.
+- `agy` headless has no way to ask you anything, so it denies whatever its own `permissions.allow` does not already cover. Full access — neosh's default, and `⇧⇥` from anywhere — is the mode where an Antigravity turn can act; in any other mode a turn that was blocked says so in the transcript rather than quietly returning nothing. Its reasoning effort is part of the model id (`gemini-3.8-flash-high` and `-low` are two entries), because that is how `agy models` publishes them, and `^E` carries one knob of its own: **Mode**, where `Plan` is Antigravity's own plan mode.
 
 A provider whose CLI is not installed still lists what it offers, greyed out, with the command that would fix it at the top.
 

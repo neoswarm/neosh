@@ -354,7 +354,9 @@ is `docs/releasing.md`.
   round, and always with a sendable value put back in the selection's place. `^E` shows *all* of
   them at once and applies as you move, because a knob you cannot see is a knob you do not have.
 - **Take the transport that can do the most.** `claude` in stream-json mode with the control
-  protocol; `codex app-server`, not `codex exec`. The cheaper one is not simpler for long — it is
+  protocol; `codex app-server`, not `codex exec`; `agy -p= --input-format stream-json`, not the
+  540 MB ACP runtime Google also ships — a vendor CLI the user already signed into beats a
+  binary neosh would have to fetch, verify and keep updated on their behalf. The cheaper one is not simpler for long — it is
   the one where streaming, approvals and interrupts turn out to be impossible rather than missing.
 - **The composer is the field; a menu over it is a suggestion about what is in it.** Anything that
   completes what is being typed mirrors it back with `onQuery`, matches on the *name* rather than

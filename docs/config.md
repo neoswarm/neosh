@@ -1120,10 +1120,19 @@ drops the setting rather than sending a value the driver would reject.
 
 ### Plans
 
-Two plans ship: `claude-cli` and `codex-cli`. Both are the vendor's own CLI, driven as a provider.
-Neither needs an API key, neither stores a token, and neither is offered unless the program is
-actually on your `$PATH` — a provider whose every turn would fail with "no such file" is worse than
-one that is not listed.
+Three plans ship: `claude-cli`, `codex-cli` and `antigravity`. All three are the vendor's own CLI,
+driven as a provider. None needs an API key, none stores a token, and none is offered unless the
+program is actually on your `$PATH` — a provider whose every turn would fail with "no such file" is
+worse than one that is not listed.
+
+`antigravity` is Google's `agy`, which carries its own Google sign-in — including the Antigravity
+access a Google AI subscription comes with, so there is nothing to paste. It is the CLI rather than
+the ACP runtime Google also publishes: that one is a ~540 MB download a client is expected to fetch,
+verify and keep updated, and `AuthRef::Cli` exists precisely so a vendor's binary stays the vendor's
+to install. One thing it cannot do is ask: `agy -p` has no channel for a permission prompt, so
+outside full access it denies whatever its own `permissions.allow` does not cover. A turn stopped
+that way says so in the transcript — silence would be indistinguishable from an agent with nothing
+to say.
 
 They are **agent drivers**: `claude -p` and `codex exec` run their own loop, with their own tools,
 their own sandbox and their own approval policy. So neosh's tool registry is not in play on those

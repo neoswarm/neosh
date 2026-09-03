@@ -235,13 +235,31 @@ fn claude(
         pricing: Some(Pricing {
             input_per_mtok: price.0,
             output_per_mtok: price.1,
-            cache_read_per_mtok: price.0 * 0.1,
+            cache_read_per_mtok: price.0 * cache_read_multiple(id),
             cache_write_per_mtok: price.0 * 1.25,
         }),
         family: Some(family.into()),
         tier: Some(tier),
         legacy,
         tagline: Some(tagline.into()),
+    }
+}
+
+/// What a cache hit costs, as a multiple of the base input price.
+///
+/// A rule with two exceptions, and the exceptions are the vendor's rather than ours: the pricing
+/// table's own footnote reads *"cache hits and refreshes on Claude Fable 5.1 and Claude Mythos 5.1
+/// are priced at 0.025x the base input price. All other models use the standard 0.1x multiplier."*
+///
+/// Written as an exception list rather than folded into every call site, because that is the shape
+/// of the fact — and because a flat `0.1` was wrong by **four times** on the most expensive model
+/// in the catalogue. This number is not decoration: `neosh::usage` and the sidebar both multiply a
+/// real `cache_read_tokens` count by it, so a stale multiplier is money reported wrongly on the one
+/// screen people check to find out what they are spending.
+fn cache_read_multiple(id: &str) -> f64 {
+    match id {
+        "claude-fable-5-1" | "claude-mythos-5-1" => 0.025,
+        _ => 0.1,
     }
 }
 
@@ -685,6 +703,75 @@ fn acp_models(entries: &[(&str, &str, ModelTier, &str)]) -> Vec<ModelInfo> {
         .collect()
 }
 
+/// The `mode` knob every Antigravity model carries.
+///
+/// `--mode plan` is Antigravity's own plan mode: work the change out and say what it would be,
+/// rather than making it. It is a knob rather than a fifth [`neosh_proto::PermissionMode`] because
+/// it is not a statement about what may happen — the agent still reads and still runs what it
+/// needs to in order to answer — and `^E` is where everything a model can be told already lives.
+fn antigravity_mode() -> ProviderOptionDescriptor {
+    ProviderOptionDescriptor::Select {
+        id: "mode".into(),
+        label: "Mode".into(),
+        description: Some("Plan mode works the change out instead of making it".into()),
+        options: vec![
+            OptionChoice {
+                id: "default".into(),
+                label: "Build".into(),
+                description: Some("Make the change".into()),
+                is_default: true,
+            },
+            OptionChoice {
+                id: "plan".into(),
+                label: "Plan".into(),
+                description: Some("Say what it would do, and stop".into()),
+                is_default: false,
+            },
+        ],
+        current_value: None,
+        prompt_injected_values: Vec::new(),
+    }
+}
+
+/// Models reachable through the `agy` CLI.
+///
+/// Seeds only: [`crate::drivers::AntigravityProvider::list_models`] asks `agy models` what this
+/// account is actually offered and replaces these. They are written down anyway because the list
+/// of models is how you decide whether to sign in, and a provider that shows an empty pane until
+/// you have is a provider nobody signs into.
+///
+/// Reasoning effort is part of the id rather than a knob beside it, because that is how
+/// Antigravity publishes them: `gemini-3.8-flash-high` and `gemini-3.8-flash-low` are two entries
+/// in `agy models`, not one entry with a ladder.
+pub fn antigravity_models() -> Vec<ModelInfo> {
+    use ModelTier::{Balanced, Fast, Frontier};
+    [
+        ("gemini-3.8-flash-high", "Gemini 3.8 Flash (High)", Frontier, "Thinks hardest"),
+        ("gemini-3.8-flash-medium", "Gemini 3.8 Flash (Medium)", Balanced, "The default"),
+        ("gemini-3.8-flash-low", "Gemini 3.8 Flash (Low)", Fast, "Quick answers"),
+        ("gemini-3.1-pro-high", "Gemini 3.1 Pro (High)", Frontier, "Most capable Gemini"),
+        ("claude-opus-4-6-thinking", "Claude Opus 4.6 (Thinking)", Frontier, "Anthropic, on your Antigravity plan"),
+        ("claude-sonnet-4-6", "Claude Sonnet 4.6 (Thinking)", Balanced, "Anthropic, for everyday work"),
+    ]
+    .into_iter()
+    .map(|(id, name, tier, tagline)| {
+        let mut m = ModelInfo::undescribed(id, name);
+        m.capabilities = ModelCapabilities {
+            tools: true,
+            vision: true,
+            streaming: true,
+            thinking: true,
+            prompt_caching: true,
+            option_descriptors: vec![antigravity_mode()],
+        };
+        m.family = Some("agent".to_string());
+        m.tier = Some(tier);
+        m.tagline = Some(tagline.to_string());
+        m
+    })
+    .collect()
+}
+
 fn instance(
     id: &str,
     driver: &str,
@@ -742,6 +829,9 @@ fn brand_for(id: &str) -> Option<Brand> {
         "claude-cli" | "anthropic" => (Some("\u{f0e79}"), "\u{2733}", "A", "Brand.Anthropic"),
         "codex-cli" | "openai" => (Some("\u{f0c9b}"), "\u{2b22}", "O", "Brand.OpenAI"),
         "gemini-cli" | "google" => (Some("\u{f05d1}"), "\u{25c6}", "G", "Brand.Google"),
+        // Antigravity is Google's, and wears its mark — but not its glyph: two rails drawn
+        // identically in one picker is a rail you have to read the label of.
+        "antigravity" => (None, "\u{25c7}", "A", "Brand.Google"),
         "openrouter" => (None, "\u{2b21}", "R", "Brand.OpenRouter"),
         "groq" => (None, "\u{25b6}", "Q", "Brand.Groq"),
         "deepseek" => (None, "\u{25c9}", "D", "Brand.DeepSeek"),
@@ -772,6 +862,9 @@ pub fn builtin_instances() -> Vec<InstanceConfig> {
         // --- plans: a subscription you already pay for -----------------
         instance("claude-cli", "claude-cli", "Claude", None, cli("claude", "claude login"), claude_cli_models()),
         instance("codex-cli", "codex-cli", "Codex", None, cli("codex", "codex login"), codex_cli_models()),
+        // Antigravity carries its own Google login, including the access a Google AI
+        // subscription comes with — so it belongs with the plans, not with the API keys.
+        instance("antigravity", "antigravity", "Antigravity", None, cli("agy", "agy"), antigravity_models()),
         // Everything below speaks the Agent Client Protocol, so they are one driver pointed at
         // three programs. A fourth is a line here, not a file.
         instance("cursor-cli", "cursor-cli", "Cursor", None, cli("cursor-agent", "cursor-agent login"), acp_models(&[
@@ -946,6 +1039,27 @@ mod tests {
     }
 
     #[test]
+    fn a_cache_hit_costs_what_the_vendor_says_it_costs() {
+        // Not a formula. Anthropic's pricing table carries a footnote — "cache hits and refreshes
+        // on Claude Fable 5.1 and Claude Mythos 5.1 are priced at 0.025x the base input price. All
+        // other models use the standard 0.1x multiplier" — and a flat 0.1 made the most expensive
+        // model in the catalogue read four times its real cache cost in `^L` and in the sidebar.
+        let by_id = |want: &str| {
+            anthropic_models().into_iter().find(|m| m.id.as_ref() == want).expect("in the catalogue")
+        };
+        let fable = by_id("claude-fable-5-1").pricing.expect("priced");
+        assert_eq!(fable.input_per_mtok, 10.0);
+        assert_eq!(fable.cache_read_per_mtok, 0.25, "Fable 5.1 reads from cache at 0.025x");
+
+        // The rule the exception is an exception to, checked on both sides so a future edit cannot
+        // quietly apply the discount everywhere.
+        let opus = by_id("claude-opus-5").pricing.expect("priced");
+        assert_eq!(opus.cache_read_per_mtok, 0.50, "Opus 5 is still the standard 0.1x");
+        let fable_5 = by_id("claude-fable-5").pricing.expect("priced");
+        assert_eq!(fable_5.cache_read_per_mtok, 1.0, "Fable 5 did not get 5.1's cache price");
+    }
+
+    #[test]
     fn every_instance_says_what_you_are_spending() {
         // The split the flat list could not make. A plan and a key are different things to buy,
         // bill and revoke, and a picker that shows them as one set cannot tell you which one the
@@ -953,7 +1067,8 @@ mod tests {
         for inst in builtin_instances() {
             let kind = inst.auth.account_kind();
             match inst.id.as_ref() {
-                "claude-cli" | "codex-cli" | "cursor-cli" | "grok-cli" | "gemini-cli" => {
+                "claude-cli" | "codex-cli" | "cursor-cli" | "grok-cli" | "gemini-cli"
+                | "antigravity" => {
                     assert_eq!(kind, neosh_proto::AccountKind::Plan, "{}", inst.id)
                 }
                 "ollama" | "llamacpp" | "lmstudio" | "vllm" => {
