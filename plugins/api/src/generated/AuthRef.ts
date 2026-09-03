@@ -9,6 +9,11 @@
 export type AuthRef =
   | { "kind": "env"; var: string }
   | { "kind": "command"; argv: Array<string> }
-  | { "kind": "cli"; program: string; login?: string | null }
+  | {
+    "kind": "cli";
+    program: string;
+    login?: string | null;
+    retired?: string | null;
+  }
   | { "kind": "inherited" }
   | { "kind": "none" };

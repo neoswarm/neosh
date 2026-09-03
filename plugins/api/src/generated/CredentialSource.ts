@@ -9,6 +9,7 @@
 export type CredentialSource =
   | { "kind": "plan"; via: string }
   | { "kind": "plan_missing"; program: string; hint?: string | null }
+  | { "kind": "plan_retired"; program: string; note: string }
   | { "kind": "env"; var: string }
   | { "kind": "keychain" }
   | { "kind": "session" }

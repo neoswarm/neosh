@@ -1263,6 +1263,19 @@ setting that does not work.
 for a plan behind a vendor CLI, or `{ kind = "none" }` for a local endpoint that wants none.
 Nothing writes a secret to this file, and nothing reads one from it.
 
+A `cli` plan also takes `retired = "…"`, for when the **vendor** has stopped serving it. A plan can
+end without its CLI going anywhere — the program is installed, it runs, and the account behind it is
+no longer served — which needs a different sentence from "install it" because the fix is somewhere
+else entirely. It is the sentence rather than a flag so it can name the date, the tiers that still
+work and where to go instead. The instance stays listed and its models stay selectable, because a
+plan can end for one tier and not another and nothing here knows which one is reading; what changes
+is that nothing *defaults* into it and every list says why.
+
+`gemini-cli` ships this way: Google ended Gemini CLI for individual accounts on 18 June 2026 — Code
+Assist for individuals, AI Pro and AI Ultra together, with "Login with Google" withdrawn alongside
+them — while Code Assist Standard and Enterprise are unchanged. Use the `google` instance and a
+`GEMINI_API_KEY` unless you are on one of those.
+
 ## Options
 
 Options are declared, typed, and owned. You cannot set one that does not exist, and you cannot set

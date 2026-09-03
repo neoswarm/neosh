@@ -255,6 +255,10 @@ function describe(source: CredentialSource): string {
       return source.hint
         ? `${source.program} is not installed — then \`${source.hint}\``
         : `${source.program} is not installed`;
+    // Already a whole sentence, and deliberately: what a retired plan needs said is the date, the
+    // accounts it still serves and where to go instead, and none of that can be assembled here.
+    case "plan_retired":
+      return source.note;
     case "inherited":
       return "signs in on its own";
     // A key, and which of the four places it is coming from.
@@ -332,10 +336,17 @@ async function pickModel(neosh: Neosh): Promise<void> {
       const entries = await neosh.agent.listModels(c.instance).catch(() => [] as ModelEntry[]);
       // Why nothing here can be chosen, at the top, where it will be read before the list it is
       // about. `⨯` on the rail says *that* it is unavailable; this says what to do.
-      const blocked: PaneItem<ModelEntry>[] = c.driver_available
+      //
+      // A retired plan gets the same row and keeps its models selectable, which is the one place
+      // the two states differ. A missing CLI means nothing below can run; a plan the vendor
+      // withdrew from one tier still runs for the tiers it did not, and we cannot tell from here
+      // which one is reading. Disabling the list would be this program guessing about somebody
+      // else's billing and taking their working setup away on the guess.
+      const retired = c.source.kind === "plan_retired";
+      const blocked: PaneItem<ModelEntry>[] = c.driver_available && !retired
         ? []
         : [{
-            label: "unavailable",
+            label: retired ? "no longer served" : "unavailable",
             detail: describe(c.source),
             disabled: true,
             value: undefined as unknown as ModelEntry,
@@ -372,6 +383,13 @@ async function pickModel(neosh: Neosh): Promise<void> {
       const pressed = key.key.code.c.toLowerCase();
       if (pressed === "s") {
         if (!c) return "handled";
+        // Where the rest of a retired plan's sentence is said. The row in the pane is clipped to
+        // whatever the detail column has room for, and this key — which the hint row already
+        // advertises — is the one thing you would press on a provider that will not answer.
+        if (c.source.kind === "plan_retired") {
+          neosh.notify(`${c.display_name}: ${c.source.note}`, "warn");
+          return "handled";
+        }
         if (!c.accepts_key) {
           neosh.notify(`${c.display_name}: ${describe(c.source)}`, "info");
           return "handled";
@@ -561,6 +579,10 @@ function badgeFor(
     case "missing":
     case "plan_missing":
       return { text: "!", hl: "Account.Missing" };
+    // Not `!`, which means "you can fix this". Nobody here can: the vendor stopped serving it, and
+    // the only thing to do about it is read the row.
+    case "plan_retired":
+      return { text: glyphs.ascii ? "-" : "⨯", hl: "Comment" };
     case "not_needed":
       return undefined;
     case "plan":
@@ -756,6 +778,13 @@ async function pickProvider(neosh: Neosh): Promise<void> {
         : `${program} is not installed.`,
       "warn",
     );
+    return;
+  }
+  // Before the `accepts_key` branch below, which would say the same sentence at `info`. This is
+  // not an ordinary fact about a working provider — it is the reason the one you just chose will
+  // not answer — and the two read very differently going past.
+  if (chosen.source.kind === "plan_retired") {
+    neosh.notify(`${chosen.display_name}: ${chosen.source.note}`, "warn");
     return;
   }
   if (!chosen.accepts_key) {
