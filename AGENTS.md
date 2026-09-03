@@ -399,6 +399,24 @@ is `docs/releasing.md`.
   showing none. And starting one over there **opens it** — `swarm.command` answers with the
   conversation `NewSession` made, which until it did meant the same key did visibly less for the same
   intention: you had to go and find, in `^J`, the thing you had just made.
+- **Nothing there and not allowed to look are different answers.** They are the same empty list, and
+  only one of them is fixed by typing a different path — so a path field drawing `no directory
+  matches` over a refusal sends somebody off to check a path that was right all along. macOS is
+  where this bites: TCC grants folder access to the **terminal**, so `~/Documents` with a year of
+  work in it completes to nothing until a box is ticked in System Settings, and `chmod` does not
+  help, the file's owner does not help, and `sudo` — which is what everybody reaches for — does not
+  help either. The kernel hands over the one bit that separates the two and Rust throws it away:
+  `EACCES` is the mode bits, `EPERM` is the privacy layer, and `ErrorKind::PermissionDenied` is
+  both, so `crate::access` reads the raw errno and nothing else can. What it answers with names the
+  folder, the application the grant actually belongs to and the pane it is granted in, because
+  "permission denied" is true and unactionable; the application is a guess from `TERM_PROGRAM` and
+  becomes "your terminal" when it cannot be one, since a workspace outlives the terminal that
+  started it and a confidently wrong name is what somebody then hunts for in a list of thirty. It
+  travels as `denied` on `ApiOk::Paths` and is drawn as a **notice** rather than a row — a row is a
+  thing you can put the cursor on, and this one would do nothing — and over ASCP it is an ordinary
+  `Refusal::Failed`, so a peer's protected folder reports itself without a wire change. **And what
+  cannot be detected is not guessed at**: a denied `display notification` on macOS exits `0`, so
+  nothing here claims to know whether a notification was ever seen.
 - **What you have archived is not in the sidebar at all, and it is something you can empty.** The
   panel is the list you work in; a section of things you are finished with is the only part of that
   column that is never the answer, and it grows forever. The first cut left one dim row with a count

@@ -1545,7 +1545,19 @@ pub enum ApiOk {
     FocusedWin { win: Option<WindowId> },
     Option { entry: Option<OptionEntry> },
     Options { options: Vec<OptionEntry> },
-    Paths { paths: Vec<String> },
+    /// Directories, and — when there are none — whether that is because the operating system
+    /// refused rather than because there was nothing there.
+    ///
+    /// The two are the same empty list and they are not the same answer. A macOS terminal without a
+    /// Files-and-Folders grant reads `~/Documents` as empty, so a path picker drawing "no directory
+    /// matches" says the folder is empty when the truth is that nobody was allowed to look — and
+    /// that sentence sends people to check a path that was right all along. `denied` carries the
+    /// reason and where it is granted, for a caller to put on screen instead.
+    Paths {
+        paths: Vec<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        denied: Option<String>,
+    },
     /// `None` until the frontend has drawn the window at least once.
     Viewport { viewport: Option<Viewport> },
     Sessions { sessions: Vec<SessionInfo> },

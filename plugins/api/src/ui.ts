@@ -1352,6 +1352,10 @@ export async function pathPicker(
   title: string,
   opts: { initial?: string; width?: number; height?: number } = {},
 ): Promise<string | null> {
+  // The last refusal said out loud, so a folder the OS is hiding is reported once rather than on
+  // every keystroke into it. `source` runs per character typed, and a notice per character is the
+  // same message forty times for one cause.
+  let saidDenied: string | null = null;
   return picker<string>(neosh, [], {
     title,
     width: Math.max(40, opts.width ?? 72),
@@ -1359,8 +1363,19 @@ export async function pathPicker(
     query: opts.initial ?? "",
     placeholder: "no directory matches — <CR> takes what you typed",
     source: async (query) => {
-      const paths = await neosh.path.complete(query).catch(() => []);
-      return paths.map((path) => ({ label: path, value: path }));
+      const answer = await neosh.path
+        .complete(query)
+        .catch(() => ({ paths: [] as string[], denied: undefined }));
+      // An empty list because nobody was allowed to look is not an empty directory, and the
+      // placeholder under this field can only say the second one. Said the way the remote branch
+      // of the same question says it — a notice, because it is feedback for a key you pressed.
+      if (answer.denied && answer.denied !== saidDenied) {
+        saidDenied = answer.denied;
+        neosh.notify(answer.denied, "warn");
+      } else if (!answer.denied) {
+        saidDenied = null;
+      }
+      return answer.paths.map((path) => ({ label: path, value: path }));
     },
     // What you typed, when it is not one of the offered rows. A completion list that refuses a path
     // it did not think of is a list that gets in the way.

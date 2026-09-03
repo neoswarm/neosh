@@ -1967,6 +1967,9 @@ async function whereTo(
     return machines.length > 0;
   };
 
+  // The last refusal reported, so a folder macOS is hiding is said once and not once per keystroke.
+  let saidDenied: string | null = null;
+
   for (;;) {
     const anyMachines = await refill();
 
@@ -1993,8 +1996,19 @@ async function whereTo(
             .map((r) => r.item);
         }
         if (field.kind === "local") {
-          const paths = await neosh.path.complete(field.path).catch(() => []);
-          return paths.map((path) => ({
+          const answer = await neosh.path
+            .complete(field.path)
+            .catch(() => ({ paths: [] as string[], denied: undefined }));
+          // Same rule the remote branch below follows: a directory the OS refused is said out
+          // loud, never drawn as a directory with nothing in it. Once per reason — this runs on
+          // every keystroke.
+          if (answer.denied && answer.denied !== saidDenied) {
+            saidDenied = answer.denied;
+            neosh.notify(answer.denied, "warn");
+          } else if (!answer.denied) {
+            saidDenied = null;
+          }
+          return answer.paths.map((path) => ({
             label: path,
             icon: ascii ? ">" : "▸",
             hl: "Sidebar.Dim",
