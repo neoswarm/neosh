@@ -349,10 +349,19 @@ pub enum AuthRef {
     /// at you when it is missing. neosh never holds a token for these — that is the point. An
     /// account subscription and an API key are different things to buy, bill and revoke, and a
     /// picker that lists them as one flat set cannot tell you which one you are about to spend.
+    ///
+    /// `retired` is the sentence to say when the **vendor** has stopped serving this plan. A plan
+    /// can end without its CLI going anywhere: the program is installed, it runs, and the account
+    /// behind it is no longer served — which is a different problem from "install it" and needs a
+    /// different sentence, because the fix is somewhere else entirely. It is a note rather than a
+    /// flag so the note can name the date, the tiers that still work and where to go instead; a
+    /// bare boolean would leave every reader inventing that sentence for itself.
     Cli {
         program: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         login: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        retired: Option<String>,
     },
     /// The driver authenticates itself and will not say how.
     ///
@@ -472,6 +481,19 @@ pub enum CredentialSource {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         hint: Option<String>,
     },
+    /// A plan the **vendor** has stopped serving. `note` says what happened and what to use now.
+    ///
+    /// Distinct from [`Self::PlanMissing`] because the CLI is fine — it is installed, it runs, and
+    /// the account behind it is no longer served. Telling somebody to install a program they
+    /// already have is the one answer that sends them looking in the wrong place.
+    ///
+    /// Not usable, so nothing defaults here, and **not hidden**, because a plan can end for one
+    /// tier and not another: the note is what carries that, and a provider that simply vanished
+    /// would ask "where did Gemini go" instead of answering it.
+    PlanRetired {
+        program: String,
+        note: String,
+    },
     /// This environment variable, which is set.
     Env { var: String },
     /// The OS keychain, via its command-line helper. Survives a restart.
@@ -502,6 +524,7 @@ impl CredentialSource {
                 Some(cmd) => format!("{program} is not installed — then `{cmd}`"),
                 None => format!("{program} is not installed"),
             },
+            Self::PlanRetired { note, .. } => note.clone(),
             Self::Env { var } => format!("${var}"),
             Self::Keychain => "key in the keychain".into(),
             Self::Session => "key entered this run".into(),
@@ -516,13 +539,20 @@ impl CredentialSource {
     }
 
     /// Whether a turn sent to this instance can authenticate.
+    ///
+    /// A retired plan says no, which is what keeps a fresh install from defaulting into one. It is
+    /// not a refusal: an account on a tier the vendor still serves picks it in the usual way and
+    /// the turn goes through — this only decides what happens when nobody has chosen.
     pub fn is_usable(&self) -> bool {
-        !matches!(self, Self::Missing | Self::PlanMissing { .. })
+        !matches!(self, Self::Missing | Self::PlanMissing { .. } | Self::PlanRetired { .. })
     }
 
     /// Whether it will still be there after a restart.
     pub fn is_durable(&self) -> bool {
-        !matches!(self, Self::Session | Self::Missing | Self::PlanMissing { .. })
+        !matches!(
+            self,
+            Self::Session | Self::Missing | Self::PlanMissing { .. } | Self::PlanRetired { .. }
+        )
     }
 }
 
@@ -991,8 +1021,18 @@ mod tests {
     #[test]
     fn a_plan_is_not_a_key_and_a_key_is_not_a_plan() {
         assert_eq!(
-            AuthRef::Cli { program: "claude".into(), login: None }.account_kind(),
+            AuthRef::Cli { program: "claude".into(), login: None, retired: None }.account_kind(),
             AccountKind::Plan
+        );
+        assert_eq!(
+            AuthRef::Cli {
+                program: "gemini".into(),
+                login: None,
+                retired: Some("the vendor stopped serving it".into()),
+            }
+            .account_kind(),
+            AccountKind::Plan,
+            "a plan that ended is still a plan — it is filed under what it was, not hidden"
         );
         assert_eq!(AuthRef::Inherited.account_kind(), AccountKind::Plan);
         assert_eq!(AuthRef::Env { var: "K".into() }.account_kind(), AccountKind::ApiKey);
@@ -1007,5 +1047,45 @@ mod tests {
         let json = serde_json::to_string(&CredentialSource::Plan { via: "claude".into() })
             .expect("serialises");
         assert_eq!(json, r#"{"kind":"plan","via":"claude"}"#);
+    }
+
+    #[test]
+    fn a_retired_plan_is_never_what_a_fresh_install_lands_on() {
+        // The whole of what "unavailable" means here. It is not a refusal — an account on a tier
+        // the vendor still serves picks it in the usual way — it only keeps `ready_instances` from
+        // choosing it for somebody who has expressed no preference at all.
+        let retired = CredentialSource::PlanRetired {
+            program: "gemini".into(),
+            note: "ended for individual accounts".into(),
+        };
+        assert!(!retired.is_usable());
+        assert!(!retired.is_durable());
+    }
+
+    #[test]
+    fn a_retired_plan_says_what_happened_rather_than_where_to_install_something() {
+        // The distinction the extra variant exists for: the CLI is installed and works, so
+        // `PlanMissing`'s sentence would send somebody to fix a machine that is fine.
+        let auth = AuthRef::Cli { program: "gemini".into(), login: None, retired: None };
+        let note = "Google ended it on 18 June 2026 — use a key.";
+        let summary = CredentialSource::PlanRetired {
+            program: "gemini".into(),
+            note: note.into(),
+        }
+        .summary(&auth);
+        assert_eq!(summary, note);
+        assert!(!summary.contains("not installed"));
+    }
+
+    #[test]
+    fn an_auth_ref_written_before_plans_could_retire_still_decodes() {
+        // `retired` is a later field on a type that is in every user's `config.toml`. Absent has to
+        // mean "serving", or upgrading neosh would retire every hand-written plan on the machine.
+        let auth: AuthRef = serde_json::from_str(r#"{"kind":"cli","program":"claude"}"#)
+            .expect("an older spelling still decodes");
+        assert_eq!(
+            auth,
+            AuthRef::Cli { program: "claude".into(), login: None, retired: None }
+        );
     }
 }

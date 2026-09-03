@@ -711,7 +711,18 @@ fn env(var: &str) -> AuthRef {
 
 /// A plan: a vendor CLI that carries its own login.
 fn cli(program: &str, login: &str) -> AuthRef {
-    AuthRef::Cli { program: program.into(), login: Some(login.into()) }
+    AuthRef::Cli { program: program.into(), login: Some(login.into()), retired: None }
+}
+
+/// A plan the vendor has stopped serving, and the sentence saying so.
+///
+/// Listed rather than deleted, for the reason an uninstalled CLI is listed: a provider that simply
+/// disappeared asks "where did it go" instead of answering it, and the answer here is one most
+/// people will otherwise go and look for in our bug tracker. The entry is not usable, so nothing
+/// defaults into it, and it is not *disabled* either — a plan can end for one tier and not another,
+/// and an account the vendor still serves must still be able to pick a model on it.
+fn retired_cli(program: &str, note: &str) -> AuthRef {
+    AuthRef::Cli { program: program.into(), login: None, retired: Some(note.into()) }
 }
 
 /// How each provider is drawn.
@@ -773,7 +784,23 @@ pub fn builtin_instances() -> Vec<InstanceConfig> {
             ("grok-4.6", "Grok 4.6", ModelTier::Frontier, "Latest Grok"),
             ("grok-4.5", "Grok 4.5", ModelTier::Balanced, "Previous generation"),
         ])),
-        instance("gemini-cli", "gemini-cli", "Gemini", None, cli("gemini", "gemini auth login"), acp_models(&[
+        // Google stopped serving Gemini CLI for individual accounts on 18 June 2026 — Code Assist
+        // for individuals, AI Pro and AI Ultra all at once — and withdrew "Login with Google"
+        // along with them; Code Assist Standard and Enterprise are unchanged, and everyone else is
+        // pointed at Antigravity. Which is why this is a note and not a deletion: the `gemini` on
+        // an Enterprise machine still works, and telling that user their CLI is missing would be
+        // the second wrong answer in a row. Not to be confused with the earlier crackdown on
+        // third-party software *borrowing* Gemini CLI's OAuth credentials — that never described
+        // us, because what is spawned here is Google's own binary doing its own login.
+        instance("gemini-cli", "gemini-cli", "Gemini", None, retired_cli(
+            "gemini",
+            // Front-loaded on purpose. Only the row under the cursor wraps its detail and this row
+            // is never under the cursor, so what a picker shows of this is the first thirty-odd
+            // columns of it — which have to be a whole clause rather than the first half of one.
+            // `^S` on the provider is where the rest of it is said.
+            "Individual accounts ended 18 June 2026 — Code Assist Standard and Enterprise still \
+             work. Use a Gemini API key instead.",
+        ), acp_models(&[
             ("gemini-3.1-pro-preview", "Gemini 3.1 Pro", ModelTier::Frontier, "Most capable Gemini"),
             ("gemini-3.8-flash", "Gemini 3.8 Flash", ModelTier::Balanced, "Quick, for everyday work"),
             ("gemini-3.1-flash-lite", "Gemini 3.1 Flash Lite", ModelTier::Fast, "Cheapest and fastest"),
@@ -853,6 +880,38 @@ mod tests {
         assert_eq!(merge(vec![], &seeds).len(), seeds.len());
     }
 
+
+    #[test]
+    fn a_plan_the_vendor_withdrew_is_still_in_the_catalogue() {
+        // Deleting the entry is the tempting fix and the wrong one twice over: Code Assist Standard
+        // and Enterprise still reach `gemini`, and somebody whose provider silently disappeared
+        // between two releases has nowhere to read why.
+        let g = builtin_instances().into_iter().find(|i| i.id.0 == "gemini-cli").unwrap();
+        let neosh_proto::AuthRef::Cli { retired, .. } = &g.auth else {
+            panic!("gemini-cli is still a plan");
+        };
+        let note = retired.as_deref().expect("says why it is no longer served");
+        assert!(note.contains("18 June 2026"), "a retirement without a date is a rumour");
+        assert!(!g.models.is_empty(), "and still lists what it offered");
+
+        let source = crate::credentials::credentials().source(&g);
+        assert!(!source.is_usable(), "so nothing defaults into it");
+        assert_eq!(source.summary(&g.auth), note, "and the note is what every reader shows");
+    }
+
+    #[test]
+    fn a_plan_that_is_merely_uninstalled_is_not_reported_as_retired() {
+        // The two states share a heading and need opposite sentences, so the one that is somebody's
+        // own machine must not start reading as the one that is Google's decision.
+        for id in ["claude-cli", "codex-cli", "cursor-cli", "grok-cli"] {
+            let inst = builtin_instances().into_iter().find(|i| i.id.0 == id).unwrap();
+            let neosh_proto::AuthRef::Cli { retired, login, .. } = &inst.auth else {
+                panic!("{id} is a plan");
+            };
+            assert!(retired.is_none(), "{id} is still served");
+            assert!(login.is_some(), "{id} needs the command that signs you in");
+        }
+    }
 
     #[test]
     fn every_builtin_instance_has_a_unique_id() {

@@ -311,7 +311,14 @@ impl Credentials {
             // them would send you to the wrong page. Whether you are signed *in* is deliberately
             // not claimed — finding out means running it, and a wrong guess either way is worse
             // than saying where to look.
-            AuthRef::Cli { program, login } => match which(program) {
+            // A plan the vendor has stopped serving is answered before anything is looked up on
+            // this machine, because nothing on this machine is what went wrong. Whether the program
+            // is installed is not the question and "install it" is not the fix.
+            AuthRef::Cli { program, retired: Some(note), .. } => CredentialSource::PlanRetired {
+                program: program.clone(),
+                note: note.clone(),
+            },
+            AuthRef::Cli { program, login, .. } => match which(program) {
                 Some(_) => CredentialSource::Plan { via: program.clone() },
                 None => CredentialSource::PlanMissing {
                     program: program.clone(),
