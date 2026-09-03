@@ -185,8 +185,15 @@ cargo update -w                          # so Cargo.lock agrees before anything 
 # 2. Prove it.
 ./scripts/check.sh
 
-# 3. Tag it.
-git commit -am "release: v0.3.0" && git tag v0.3.0 && git push --follow-tags
+# 3. Tag it. Annotated — `--follow-tags` silently skips a lightweight tag, so
+#    `git tag v0.3.0` alone pushes the commit and leaves the tag behind.
+git commit -am "release: v0.3.0" && git tag -a v0.3.0 -m v0.3.0 && git push --follow-tags
+
+# 4. Publish the GitHub release, wait for it to build, then point Homebrew at it.
+gh release create v0.3.0 --verify-tag --notes-file notes.md
+gh run watch
+scripts/brew-formula.sh v0.3.0 > ../homebrew-tap/Formula/neosh.rb
+(cd ../homebrew-tap && git commit -am "neosh 0.3.0" && git push)
 ```
 
 **Both halves of the root manifest**, and this is the one that bites. Every internal dependency in
@@ -214,8 +221,10 @@ the four binaries and attaches them, `publish-crates.yml` pushes the eleven crat
 `publish-npm.yml` pushes the plugin packages, skipping anything the registry already has — so it is
 safe to re-run a half-failed release.
 
-Then regenerate the Homebrew formula, as in step 8 — a release nobody points Homebrew at is a
-release `brew upgrade` cannot see.
+Then regenerate the Homebrew formula, as in step 9 — a release nobody points Homebrew at is a
+release `brew upgrade` cannot see. It is the one step of a release with nothing watching it:
+the registries are pushed by workflows that fail loudly, and the tap is a second repository
+that a green release says nothing about.
 
 **A new crate or a new bundled plugin needs its own first manual publish and its own trusted
 publisher**, exactly as in steps 3–5. Nothing else does — and this is the one part of a release that
