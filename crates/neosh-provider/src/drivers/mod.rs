@@ -8,10 +8,12 @@
 //! | [`claude_cli`] | agent | existing `claude` login | Claude, no API key |
 //! | [`codex_cli`] | agent | existing `codex` login | OpenAI, no API key |
 //! | [`acp`] | agent | the agent's own login | Cursor, Grok, Gemini — anything speaking ACP |
+//! | [`antigravity`] | agent | existing `agy` login | Google Antigravity, no API key |
 //! | [`mock`] | model | none | fixtures, for tests |
 
 pub mod acp;
 pub mod anthropic;
+pub mod antigravity;
 pub mod http;
 pub mod claude_cli;
 pub mod claude_control;
@@ -22,6 +24,7 @@ pub mod openai;
 
 pub use acp::AcpProvider;
 pub use anthropic::AnthropicProvider;
+pub use antigravity::AntigravityProvider;
 pub use claude_cli::ClaudeCliProvider;
 pub use codex_cli::CodexCliProvider;
 pub use google::GoogleProvider;

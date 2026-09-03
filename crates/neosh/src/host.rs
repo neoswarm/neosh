@@ -13596,6 +13596,13 @@ pub fn install_builtin_providers(
             reg.register_driver(codex.clone());
             out.push(codex);
         }
+        // Same bargain as the two above: its own login, so no key to paste, and only offered when
+        // the CLI is actually installed.
+        let antigravity = Arc::new(neosh_provider::drivers::AntigravityProvider::default());
+        if antigravity.available() {
+            reg.register_driver(antigravity.clone());
+            out.push(antigravity);
+        }
         // One driver, three programs: they all speak the Agent Client Protocol. Registered only
         // where the program exists, for the same reason as the other two — a provider whose every
         // turn fails with "no such file" is worse than one that is not offered.
