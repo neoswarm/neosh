@@ -84,7 +84,9 @@ fi
 if want web; then
   # `all` has already done this on its way through the rust half; doing it twice is a wasted
   # `npm install` rather than a wrong answer, so it is guarded rather than reordered.
-  [ "$WANT" = web ] && npm_ready
+  if [ "$WANT" = web ]; then
+    npm_ready
+  fi
 
   step "the example plugin type-checks against the published API"
   (cd examples/hello-plugin && ../../plugins/api/node_modules/.bin/tsc --noEmit)
