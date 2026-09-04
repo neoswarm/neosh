@@ -949,6 +949,11 @@ pub fn draw(frame: &mut Frame, mirror: &Mirror, theme: &Theme) -> Drawn {
                 if let Some(t) = &config.title {
                     b = b.title(Span::styled(t.clone(), theme.style("Float.Title")));
                 }
+                // On the bottom edge, dim: a legend, not a second title. Left-aligned to match the
+                // title above it, so a panel reads as one box rather than as two labelled corners.
+                if let Some(f) = &config.footer {
+                    b = b.title_bottom(Span::styled(f.clone(), theme.style("Float.Footer")));
+                }
                 (b.inner(rect), Some(b))
             }
             _ => (rect, None),
@@ -1038,6 +1043,22 @@ pub fn draw(frame: &mut Frame, mirror: &Mirror, theme: &Theme) -> Drawn {
 
         frame.render_widget(Paragraph::new(lines).style(theme.style("Normal")), inner);
 
+        // A panel that is showing less than it has says so on its own edge.
+        //
+        // The one thing a clipped float used to have no way of reporting: `height: Max { n: 30 }` on
+        // a twenty-row terminal is ten rows of panel and twenty rows of content drawn nowhere, and
+        // the screen was identical to a panel that simply ended there. Which is also why it is drawn
+        // here and not by whoever wrote the rows: how many of them fit is a question only the thing
+        // that laid the window out can answer, and it answers it after the fact.
+        // `rendered` begins at `top_line` — the rows above it were never built — so both numbers are
+        // relative to it and the bar has to be told where "it" is. Counted in buffer rows, which is
+        // exact here because a float does not wrap: one buffer row is one screen row, so the rows
+        // skipped and the rows scrolled past are the same count. Measured from `rendered` alone the
+        // thumb sat at the top of every panel and grew as you scrolled, which is a scrollbar saying
+        // the opposite of what is happening.
+        let above = w.top_line.unwrap_or(0) as usize;
+        draw_scrollbar(frame, &w.layout, rect, inner, above + start, above + rendered.len(), theme);
+
         // A surface belongs to its window, so it is painted with it — *inside* the paint order
         // rather than after it. Drawn in one pass at the end, every surface was on top of
         // everything: a terminal pane filling a rectangle covered any float over it, so holding the
@@ -1093,6 +1114,53 @@ pub fn draw(frame: &mut Frame, mirror: &Mirror, theme: &Theme) -> Drawn {
     }
 
     Drawn { caret, caret_win: caret.and(caret_win), tops }
+}
+
+/// A bar down a float's right border, when the float is showing less than it holds.
+///
+/// In the **border column**, so it costs no content: a panel is sized for the rows it wants to draw,
+/// and a scrollbar that took one of them would silently shorten every panel in the workspace by a
+/// column — including the ones that fit, where there is nothing to say. Which is also why a
+/// borderless float gets none: the only column left to put it in is one with text in it, and
+/// covering a character to report that characters are missing is not an improvement.
+///
+/// The thumb is at least one row tall and never fills the track when anything is hidden. Rounding a
+/// thumb up to the whole bar is how a scrollbar comes to say "all of it" about a panel with forty
+/// rows below the edge, and a bar that is always full is a bar nobody looks at twice.
+fn draw_scrollbar(
+    frame: &mut Frame,
+    layout: &WindowLayout,
+    rect: Rect,
+    inner: Rect,
+    start: usize,
+    total: usize,
+    theme: &Theme,
+) {
+    let WindowLayout::Float { config } = layout else { return };
+    if config.border == neosh_proto::BorderStyle::None {
+        return;
+    }
+    let shown = inner.height as usize;
+    if shown == 0 || total <= shown || inner.width == 0 {
+        return;
+    }
+    // Never the whole track: the last row of it is what says there is something below.
+    let thumb = ((shown * shown) / total).clamp(1, shown.saturating_sub(1).max(1));
+    let travel = shown - thumb;
+    let furthest = total - shown;
+    let at = (start.min(furthest) * travel).div_ceil(furthest.max(1));
+    let x = rect.x + rect.width.saturating_sub(1);
+    let style = theme.style("Float.Scroll");
+    for i in 0..thumb {
+        let y = inner.y + (at + i) as u16;
+        if y >= inner.y + inner.height {
+            break;
+        }
+        if let Some(cell) = frame.buffer_mut().cell_mut((x, y)) {
+            cell.set_symbol("┃");
+            cell.set_style(style);
+        }
+    }
 }
 
 /// What one frame turned out to be: where the caret goes, and what each window actually showed.

@@ -1818,3 +1818,88 @@ fn a_float_draws_over_a_surface() {
     assert!(screen.contains("PANEL"), "the float is on top of the surface:\n{screen}");
     assert!(screen.contains('#'), "and the surface is still drawn where the float is not");
 }
+
+// ---------------------------------------------------------------------------
+// A panel that is showing less than it has
+// ---------------------------------------------------------------------------
+//
+// A float is *asked* for a height and given whatever the screen has, so the rows past the bottom
+// edge are content that exists and is drawn nowhere. Before this there was nothing on screen to
+// tell that apart from a panel that simply ended there — the two were identical, and the second is
+// what everybody read.
+
+/// A float of `lines` rows, `n` of them on screen, scrolled to `top`.
+fn overflowing(lines: usize, n: u16, top: Option<u32>) -> Mirror {
+    let mut m = Mirror::default();
+    m.apply(UiEvent::BufferOpened { buf: BufferId(1), name: "[long]".into() });
+    m.apply(UiEvent::BufferLines {
+        buf: BufferId(1),
+        start: 0,
+        old_end: 0,
+        lines: (0..lines).map(|i| line(&format!("row {i}"), vec![])).collect(),
+    });
+    m.apply(UiEvent::WindowOpened {
+        win: WindowId(1),
+        buf: BufferId(1),
+        layout: WindowLayout::Float {
+            config: FloatConfig {
+                anchor: Anchor::Screen,
+                width: Extent::Fixed { n: 10 },
+                height: Extent::Fixed { n },
+                border: BorderStyle::Rounded,
+                ..Default::default()
+            },
+        },
+    });
+    if let Some(t) = top {
+        m.apply(UiEvent::ScrollTo { win: WindowId(1), top_line: Some(t) });
+    }
+    m
+}
+
+/// The column the bar is drawn in, and which rows of it are thumb.
+fn thumb_rows(m: &Mirror, w: u16, h: u16) -> Vec<usize> {
+    let cells = cells_of(m, w, h);
+    // The float is centred, so its top-right corner is wherever it landed rather than on row zero.
+    let x = cells
+        .iter()
+        .find_map(|row| row.iter().position(|c| c == "╮"))
+        .expect("a bordered float");
+    cells.iter().enumerate().filter(|(_, row)| row[x] == "┃").map(|(y, _)| y).collect()
+}
+
+#[test]
+fn a_float_that_fits_has_no_bar_on_it() {
+    // Four rows in a panel with room for four. There is nothing to say, and a bar that is always
+    // there is a bar nobody reads.
+    let m = overflowing(4, 4, None);
+    assert!(thumb_rows(&m, 20, 10).is_empty());
+}
+
+#[test]
+fn a_float_showing_less_than_it_has_says_so_on_its_right_border() {
+    // Forty rows in a panel with room for eight: a thumb of one row, at the top, in the border
+    // column — not in a column of content, which every panel would then be one narrower for.
+    let m = overflowing(40, 8, None);
+    let thumb = thumb_rows(&m, 20, 14);
+    assert_eq!(thumb.len(), 1, "one row of forty is one row of eight, rounded up");
+    let top = *thumb.first().expect("a thumb");
+    assert!(top >= 1, "inside the border, not on its corner");
+
+    // And it moves. Scrolled to the end it is against the bottom of the track, which is the whole
+    // of what a scrollbar is for: measured off `rendered` alone — which begins at `top_line` — the
+    // thumb sat at the top of every panel and *grew* as you scrolled, saying the opposite.
+    let end = thumb_rows(&overflowing(40, 8, Some(32)), 20, 14);
+    assert!(end[0] > top, "the thumb moves down as the panel does\n{top} then {}", end[0]);
+}
+
+#[test]
+fn the_bar_is_never_the_whole_track_while_anything_is_hidden() {
+    // Nine rows in a panel with room for eight. Rounded honestly the thumb is the whole bar, and a
+    // full bar is what a panel with nothing hidden looks like — so the last row of the track is
+    // kept back to say there is one more.
+    let m = overflowing(9, 8, None);
+    let thumb = thumb_rows(&m, 20, 14);
+    assert!(!thumb.is_empty(), "there is a row below the edge, so there is a bar");
+    assert!(thumb.len() < 8, "and it does not fill the track\n{thumb:?}");
+}

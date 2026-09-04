@@ -34,6 +34,7 @@ import type {
   PluginContext,
   QuotaSnapshot,
   QuotaWindow,
+  ScrollAmount,
   SessionInfo,
   UsageBucket,
   UsageHistory,
@@ -846,13 +847,55 @@ async function installPanel({ neosh, subscriptions }: PluginContext) {
       await load();
     });
   }
-  await cmd("panel.down", "Move down", async () => {
-    list?.move(1);
-    await list?.render({ win: win ?? undefined });
+  /**
+   * Move the cursor, and scroll the panel when the cursor has nowhere left to go.
+   *
+   * This panel is two things stacked: gauges you can land on, and a month of history that is a
+   * chart. The chart is *inert* — there is nothing to select on a bar — so a cursor that had run
+   * out of rows stopped, and on a terminal shorter than the 34 rows this asks for the whole of the
+   * history was below the bottom edge with no key that reached it. Now the motion falls through to
+   * the window: it moves the cursor while there is a cursor to move and scrolls once there is not.
+   *
+   * Without a re-render, deliberately. `CursoredList.render` puts the cursor back on screen, which
+   * is right for every other key here and is exactly wrong for this one — the two would take turns
+   * and the panel would not move at all.
+   */
+  const step = (amount: ScrollAmount, rows: number) => async () => {
+    if (!list || win === null) return;
+    const was = list.index;
+    list.move(rows, { wrap: false });
+    if (list.index !== was) {
+      await list.render({ win });
+      return;
+    }
+    await neosh.win.scroll(win, amount).catch(() => {});
+  };
+  await cmd("panel.down", "Move down", step({ kind: "lines", n: 1 }, 1));
+  await cmd("panel.up", "Move up", step({ kind: "lines", n: -1 }, -1));
+  // A screen is however tall this panel turned out to be, which only the frontend knows — and on a
+  // short terminal it is a good deal less than the 34 rows asked for, which is exactly when walking
+  // a month of history one `j` at a time stops being reasonable. No wrapping on a page step: `^D` at
+  // the foot means there is no more, and a cursor that reappears at the top has thrown away the
+  // place you were reading from.
+  const by = (fraction: number, sign: 1 | -1, amount: ScrollAmount) => async () => {
+    if (!list || win === null) return;
+    const rows = Math.max(2, (await neosh.win.viewport(win).catch(() => null))?.height ?? 12);
+    await step(amount, sign * Math.max(1, Math.floor(rows * fraction)))();
+  };
+  await cmd("panel.half.down", "Half a screen down", by(0.5, 1, { kind: "half", n: 1 }));
+  await cmd("panel.half.up", "Half a screen up", by(0.5, -1, { kind: "half", n: -1 }));
+  await cmd("panel.page.down", "A screen down", by(1, 1, { kind: "page", n: 1 }));
+  await cmd("panel.page.up", "A screen up", by(1, -1, { kind: "page", n: -1 }));
+  await cmd("panel.top", "The top of the panel", async () => {
+    if (!list || win === null) return;
+    list.toEnd("first");
+    await list.render({ win });
   });
-  await cmd("panel.up", "Move up", async () => {
-    list?.move(-1);
-    await list?.render({ win: win ?? undefined });
+  await cmd("panel.bottom", "The bottom of the panel", async () => {
+    if (win === null) return;
+    // The bottom of what is *drawn*, not the last row you can land on: the last thing in this panel
+    // is the breakdown, and there is nothing in it to put a cursor on.
+    await neosh.win.scroll(win, { kind: "bottom" }).catch(() => {});
   });
   await cmd("report", "What this conversation has used", () => report(neosh));
 
@@ -874,6 +917,14 @@ async function installPanel({ neosh, subscriptions }: PluginContext) {
   await key("k", "panel.up");
   await key("<Down>", "panel.down");
   await key("<Up>", "panel.up");
+  // The same motions the project panel and the reader answer. A panel with a month of history in it
+  // is one you page through, and `j` thirty times is not paging.
+  await key("<C-d>", "panel.half.down");
+  await key("<C-u>", "panel.half.up");
+  await key("<PageDown>", "panel.page.down");
+  await key("<PageUp>", "panel.page.up");
+  await key("gg", "panel.top");
+  await key("G", "panel.bottom");
   await key("]", "panel.wider", "A longer span");
   await key("[", "panel.narrower", "A shorter span");
   for (const [lhs, days] of [["1", 1], ["7", 7], ["3", 30], ["9", 90]] as const) {

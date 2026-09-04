@@ -316,6 +316,13 @@ pub fn groups(variant: Variant) -> Vec<(&'static str, HighlightDef)> {
         // ---- floats -------------------------------------------------------
         ("Float.Border", spec(fg(r.faint))),
         ("Float.Title", spec(bold(fg(r.accent)))),
+        // The bar down a panel's right edge, drawn only while there is content past the bottom of
+        // it. Brighter than the border it sits in, because what it is saying is that the panel is
+        // not all of the thing — a marker the same colour as the frame is a frame.
+        ("Float.Scroll", spec(fg(r.muted))),
+        // The key strip on the bottom edge. Quiet on purpose: it is there to be found when you look
+        // for it and not to compete with what the panel is showing you.
+        ("Float.Footer", spec(dim(fg(r.muted)))),
         // ---- the agent ----------------------------------------------------
         ("Agent.User", spec(bold(fg(r.accent)))),
         ("Agent.Assistant", spec(fg(r.fg))),
