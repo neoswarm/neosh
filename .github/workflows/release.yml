@@ -175,29 +175,32 @@ jobs:
     # does nothing on a repository that has the token. Job-level `env` *can* read secrets, and
     # `env` *is* available in `if:`, so this is the one spelling that behaves.
     env:
-      HAS_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN != '' }}
+      HAS_TAP_KEY: ${{ secrets.HOMEBREW_TAP_KEY != '' }}
     steps:
-      # Not a failure. The token is the one credential in this release that OIDC cannot replace —
-      # trusted publishing authenticates *to a registry*, and this is a git push to another
-      # repository — so a fork, or this repository before somebody creates it, must skip rather than
-      # go red for a reason nobody has done anything wrong about.
-      - name: Say so when the tap cannot be pushed
-        if: env.HAS_TAP_TOKEN != 'true'
+      # Not a failure *on a fork*, which has no business pushing to our tap. On this repository it
+      # is one: a release that quietly leaves Homebrew on the previous version is the exact failure
+      # this job exists to remove, and "skipped" and "shipped" must not look the same here.
+      - name: The tap key has to be there
+        if: env.HAS_TAP_KEY != 'true'
         run: |
-          echo "::warning::HOMEBREW_TAP_TOKEN is not set — the tap still points at the old version."
-          echo "Create a fine-grained PAT with Contents: read and write on neoswarm/homebrew-tap,"
-          echo "then: gh secret set HOMEBREW_TAP_TOKEN"
+          echo "HOMEBREW_TAP_KEY is not set."
+          echo "It is the private half of a write-enabled deploy key on neoswarm/homebrew-tap."
+          if [ "${{ github.repository }}" = "neoswarm/neosh" ]; then
+            echo "::error::the tap cannot be updated, so this release would leave brew on the old version"
+            exit 1
+          fi
+          echo "::warning::not neoswarm/neosh — skipping the tap update"
 
       - uses: actions/checkout@v4
-        if: env.HAS_TAP_TOKEN == 'true'
+        if: env.HAS_TAP_KEY == 'true'
         with:
           ref: ${{ github.event.inputs.tag || github.ref }}
 
       - name: Point the tap at this release
-        if: env.HAS_TAP_TOKEN == 'true'
+        if: env.HAS_TAP_KEY == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
-          TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          TAP_KEY: ${{ secrets.HOMEBREW_TAP_KEY }}
         run: |
           set -euo pipefail
           tag="${{ github.event.inputs.tag || github.ref_name }}"
@@ -220,8 +223,25 @@ jobs:
             exit 1
           fi
 
-          git clone --depth 1 \
-            "https://x-access-token:$TAP_TOKEN@github.com/neoswarm/homebrew-tap" tap
+          # A **deploy key** rather than a personal access token, and the difference is that this
+          # one does not expire. The organisation caps fine-grained tokens at 365 days, and an
+          # expired credential here would skip rather than fail — a release going green a year from
+          # now while Homebrew silently stopped updating. A deploy key has no lifetime, is scoped to
+          # this one repository rather than to everything a person can reach, and belongs to the
+          # repository rather than to whoever happened to create it.
+          #
+          # Written to disk rather than passed through `ssh-agent`: the runner is single-use, the
+          # file is `0600` under a directory only this job has, and an agent is one more process to
+          # get wrong for no benefit at this scale.
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "$TAP_KEY" > ~/.ssh/tap
+          chmod 600 ~/.ssh/tap
+          # `IdentitiesOnly` so a runner that has any other key does not offer it first and get
+          # refused; `accept-new` because github.com's host key on a fresh runner is unknown, and
+          # this is a push to a name we control rather than an arbitrary host.
+          export GIT_SSH_COMMAND="ssh -i ~/.ssh/tap -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new"
+
+          git clone --depth 1 git@github.com:neoswarm/homebrew-tap.git tap
           ./scripts/brew-formula.sh "$tag" > tap/Formula/neosh.rb
 
           cd tap
