@@ -20,8 +20,8 @@ use neosh_proto::{
     Gravity,
     InputEvent,
     KeyCode, MessageLevel, Mode, OptionSpec, OptionType, OptionValue, PluginEvent, PluginId,
-    PluginInbound, PluginOutbound, PluginResponse, RequestId, SelectShape, TextEdit, UiEvent,
-    VirtTextPos, WindowId, WindowLayout,
+    PluginInbound, PluginOutbound, PluginResponse, RequestId, ScrollAmount, SelectShape, TextEdit,
+    UiEvent, VirtTextPos, WindowId, WindowLayout,
 };
 use neosh_provider::catalog;
 use neosh_script::{ScriptInbound, ScriptOutbound};
@@ -5001,34 +5001,112 @@ impl Host {
         let cost = |(k, l): &(String, String)| display_width(k) + display_width(l) + 2;
         // Two spaces between the keys and the last tab, so the bar never reads as one long run.
         let reserved = keys.first().map(cost).unwrap_or(0) + 2;
+
+        // `1` rather than `0`: the key is `<C-w>1`, and a bar counting from zero is a bar whose
+        // numbers are not the numbers you type.
+        let labels: Vec<String> = tabs
+            .iter()
+            .enumerate()
+            .map(|(n, tab)| format!(" {} {} ", n + 1, self.tab_title(view, tab)))
+            .collect();
+        let here = active
+            .and_then(|id| tabs.iter().position(|t| t.id == id))
+            .unwrap_or(0);
+        let mine = labels.get(here).map(|l| display_width(l)).unwrap_or(0);
         let room = match known {
-            true => width.saturating_sub(reserved),
+            // The reservation gives way rather than the tab you are in. `<C-w> windows` is fourteen
+            // columns, and a pane narrow enough that holding them leaves nothing behind is a pane
+            // where the bar read `+2` — three tabs open and not one of them named, the hint about
+            // the bar having crowded out the bar. A legend that does not fit is dropped by its own
+            // fitting below, so taking the room back here costs it nothing it could have used.
+            true => width.saturating_sub(reserved).max(mine.min(width)),
             false => usize::MAX,
         };
-
-        for (n, tab) in tabs.iter().enumerate() {
-            let name = self.tab_title(view, tab);
-            // `1` rather than `0`: the key is `<C-w>1`, and a bar counting from zero is a bar whose
-            // numbers are not the numbers you type.
-            let label = format!(" {} {} ", n + 1, name);
-            // Nothing is half-drawn. A tab label cut in the middle reads as a conversation with a
-            // different name, so the ones that do not fit are dropped and counted instead.
-            if display_width(&text) + display_width(&label) > room {
-                let more = format!(" +{} ", tabs.len() - n);
-                if display_width(&text) + display_width(&more) <= room {
-                    let from = text.len();
-                    text.push_str(&more);
-                    marks.push((from, text.len(), "Tabline.Tab".into()));
-                }
-                break;
+        // What was left out, on the side it was left out from. `+2` on the left and `+2` on the
+        // right are different sentences about where the tabs you cannot see are, and one counter at
+        // the end can only ever say the second of them.
+        let more = |n: usize| format!(" +{n} ");
+        // The room a window of tabs needs, counting what it leaves behind on either side.
+        let need = |lo: usize, hi: usize| -> usize {
+            let mut w: usize = labels[lo..=hi].iter().map(|l| display_width(l)).sum();
+            if lo > 0 {
+                w += display_width(&more(lo));
             }
-            let from = text.len();
-            text.push_str(&label);
-            let group = match Some(tab.id) == active {
-                true => "Tabline.Active",
-                false => "Tabline.Tab",
+            if hi + 1 < labels.len() {
+                w += display_width(&more(labels.len() - hi - 1));
+            }
+            w
+        };
+
+        // The tab you are in is what the room is spent on first, and the rest grow outward from it.
+        //
+        // Filled left to right and cut at the end, the bar dropped the one tab it exists to tell
+        // you about: four tabs open with the keyboard in the fourth read `1 foo  2 bar  +2`, which
+        // says where you are not. Nothing else on screen answers "which tab is this", so the answer
+        // has to survive the fitting rather than be the first thing it discards.
+        if !labels.is_empty() {
+            let (mut lo, mut hi) = (here, here);
+            loop {
+                let mut grew = false;
+                // Leftwards first, so the numbers on the bar keep counting up from wherever it
+                // starts rather than jumping.
+                if lo > 0 && need(lo - 1, hi) <= room {
+                    lo -= 1;
+                    grew = true;
+                }
+                if hi + 1 < labels.len() && need(lo, hi + 1) <= room {
+                    hi += 1;
+                    grew = true;
+                }
+                if !grew {
+                    break;
+                }
+            }
+
+            let left = (lo > 0).then(|| more(lo));
+            let right = (hi + 1 < labels.len()).then(|| more(labels.len() - hi - 1));
+            // What everything other than the tab you are in takes. The counters are dropped before
+            // that label is: a bar reading `+2` and nothing else has spent its only row saying how
+            // many answers it is not giving, and the number on the label — `3` — already says there
+            // are at least three tabs.
+            let others = need(lo, hi) - mine;
+            let counters: usize = [&left, &right]
+                .iter()
+                .flat_map(|m| m.iter())
+                .map(|m| display_width(m))
+                .sum();
+            let (left, right, others) = match room >= others + 1 {
+                true => (left, right, others),
+                false => (None, None, others - counters),
             };
-            marks.push((from, text.len(), group.into()));
+            if let Some(left) = left {
+                let from = text.len();
+                text.push_str(&left);
+                marks.push((from, text.len(), "Tabline.Tab".into()));
+            }
+            // Nothing is half-drawn. A tab label cut in the middle reads as a conversation with a
+            // different name — so every tab but the one you are in is dropped whole and counted.
+            // The one you are in is the exception, because dropping it is what this fitting exists
+            // to prevent: it is elided, with the `…` that says so, rather than left out.
+            let spare = room.saturating_sub(others);
+            for (n, label) in labels.iter().enumerate().take(hi + 1).skip(lo) {
+                let label = match n == here {
+                    true => elide(label, spare),
+                    false => label.clone(),
+                };
+                let from = text.len();
+                text.push_str(&label);
+                let group = match n == here {
+                    true => "Tabline.Active",
+                    false => "Tabline.Tab",
+                };
+                marks.push((from, text.len(), group.into()));
+            }
+            if let Some(right) = right {
+                let from = text.len();
+                text.push_str(&right);
+                marks.push((from, text.len(), "Tabline.Tab".into()));
+            }
         }
 
         // The legend, hard against the right edge. What it says depends on where you are, because a
@@ -10300,6 +10378,15 @@ impl Host {
                     .unwrap_or(3)
                     .clamp(1, 20) as i32;
                 let by = i32::from(rows) * step;
+                // A panel over the transcript is what the wheel is pointing at. Without this the
+                // notch went to the chat underneath, so a key sheet or a diff too long for the
+                // screen scrolled the one thing you could already see and not the one you could
+                // not — and the panel was opaque, so nothing on screen moved at all.
+                let view = self.view_now();
+                if self.editor.focused(view).is_some_and(|w| self.editor.scrollable(w)) {
+                    self.scroll_focused(ScrollAmount::Lines { n: by });
+                    return true;
+                }
                 // While reading, the cursor has to stay on screen, so this goes through the same
                 // path the reader's own scrolling does rather than moving the window out from
                 // under it.
@@ -11385,6 +11472,17 @@ impl Host {
             ("window.split.term", "Split this pane, and run a shell in the new one"),
             ("tab.new.term", "Open a tab with a shell in it"),
             ("window.keys", "Show what the window prefix can do"),
+            // Moving in a panel that does not fit. Named commands before they are keys, like
+            // everything else here — so `^K` runs them, `init.ts` moves them, and a plugin whose
+            // float sets `scroll` gets all eight without writing any of them.
+            ("scroll.down", "Scroll this panel down a line"),
+            ("scroll.up", "Scroll this panel up a line"),
+            ("scroll.half_down", "Scroll this panel down half a screen"),
+            ("scroll.half_up", "Scroll this panel up half a screen"),
+            ("scroll.page_down", "Scroll this panel down a screen"),
+            ("scroll.page_up", "Scroll this panel up a screen"),
+            ("scroll.top", "To the top of this panel"),
+            ("scroll.bottom", "To the bottom of this panel"),
         ];
         for (name, desc) in commands {
             let _ = self.editor.apply(&plugin, ApiCall::CmdRegister {
@@ -11460,7 +11558,67 @@ impl Host {
                 desc: Some(desc.to_string()),
             });
         }
+        self.bind_scroll_keys();
         self.bind_window_keys();
+    }
+
+    /// The reader's motions, on any panel that said it might not fit.
+    ///
+    /// Bound at `BufKind { name: "neosh.scroll" }`, which is a scope the core pushes into the chain
+    /// for a focused float whose [`FloatConfig::scroll`](neosh_proto::FloatConfig::scroll) is set —
+    /// so one set of defaults serves the key sheet, the git panels, the usage panel and a third
+    /// party's float alike, and none of them has to spell out eight bindings it would then own.
+    ///
+    /// These are Vim's, and the same ones the transcript reader answers, because a panel of rows you
+    /// are moving through is the thing the reader already is. What they are *not* is global: they
+    /// resolve below the panel's own kind, so a panel that wants `j` keeps it, and they do not exist
+    /// at all while the keyboard is in the composer, where `j` is a letter.
+    ///
+    /// Every key here is one every terminal sends. The arrows and the paging keys are bound as well
+    /// and are never the only way — which is the rule for arrows everywhere in this workspace.
+    fn bind_scroll_keys(&mut self) {
+        let plugin = PluginId::from(BUILTIN);
+        let scope = Some(neosh_proto::KeymapScope::BufKind {
+            name: neosh_core::editor::SCROLL_KIND.to_string(),
+        });
+        for (lhs, command, desc) in [
+            ("j", "scroll.down", "Down a line"),
+            ("<Down>", "scroll.down", "Down a line"),
+            ("k", "scroll.up", "Up a line"),
+            ("<Up>", "scroll.up", "Up a line"),
+            ("<C-d>", "scroll.half_down", "Down half a screen"),
+            ("<C-u>", "scroll.half_up", "Up half a screen"),
+            ("<C-f>", "scroll.page_down", "Down a screen"),
+            ("<PageDown>", "scroll.page_down", "Down a screen"),
+            ("<C-b>", "scroll.page_up", "Up a screen"),
+            ("<PageUp>", "scroll.page_up", "Up a screen"),
+            ("gg", "scroll.top", "To the top"),
+            ("<Home>", "scroll.top", "To the top"),
+            ("G", "scroll.bottom", "To the bottom"),
+            ("<End>", "scroll.bottom", "To the bottom"),
+        ] {
+            for mode in [Mode::Normal, Mode::Insert, Mode::Visual, Mode::Chat] {
+                let _ = self.editor.apply(&plugin, ApiCall::KeymapSet {
+                    mode,
+                    lhs: lhs.to_string(),
+                    command: command.to_string(),
+                    scope: scope.clone(),
+                    desc: Some(desc.to_string()),
+                });
+            }
+        }
+    }
+
+    /// Move the focused panel's scroll, if it is one that scrolls.
+    ///
+    /// Nothing happens when the keyboard is not in a scrollable float, which is not a case these
+    /// keys can normally reach — the scope they are bound at is only in the chain while one has
+    /// focus — but `^K` can run them by name from anywhere, and a command that reports a failure
+    /// nobody caused is worse than one that does nothing.
+    fn scroll_focused(&mut self, amount: ScrollAmount) {
+        let view = self.view_now();
+        let Some(win) = self.editor.focused(view) else { return };
+        let _ = self.editor.apply(&PluginId::from(BUILTIN), ApiCall::WinScroll { win, amount });
     }
 
     /// The window prefix, out of `ui.keys.window_prefix`.
@@ -11862,6 +12020,19 @@ impl Host {
             "window.move.right" => self.move_pane(Direction::Right),
             "window.exchange" => self.exchange_pane(),
             "window.keys" => self.show_window_keys(),
+
+            // ---- scrolling a panel that does not fit ---------------------
+            // Aimed at whatever has focus, which for these keys is always the float they resolved
+            // in: the scope they are bound at exists only while one is focused.
+            "scroll.down" => self.scroll_focused(ScrollAmount::Lines { n: 1 }),
+            "scroll.up" => self.scroll_focused(ScrollAmount::Lines { n: -1 }),
+            "scroll.half_down" => self.scroll_focused(ScrollAmount::Half { n: 1 }),
+            "scroll.half_up" => self.scroll_focused(ScrollAmount::Half { n: -1 }),
+            "scroll.page_down" => self.scroll_focused(ScrollAmount::Page { n: 1 }),
+            "scroll.page_up" => self.scroll_focused(ScrollAmount::Page { n: -1 }),
+            "scroll.top" => self.scroll_focused(ScrollAmount::Top),
+            "scroll.bottom" => self.scroll_focused(ScrollAmount::Bottom),
+
             "tab.open" => self.begin_tab_choice(),
             "tab.new" => self.new_tab(),
             "tab.new.chat" => {
@@ -12248,6 +12419,7 @@ impl Host {
                 border: neosh_proto::BorderStyle::Rounded,
                 border_hl: Some("Tabline.Key".into()),
                 title: Some(format!(" {prefix} ")),
+                footer: None,
                 width: neosh_proto::Extent::Max { n: width as u16 },
                 // Tall enough for every verb there is, so the list is not silently short by three
                 // rows — the ones that would go are the tab verbs at the end, which is exactly the
@@ -12259,6 +12431,11 @@ impl Host {
                 // before you can use what it is hinting at.
                 focusable: false,
                 modal: false,
+                // Which is also why it does not scroll: the scroll keys resolve against whatever
+                // has focus, and nothing that cannot take focus can be what they mean. On a
+                // terminal too short for the whole list it is clipped, and the bar down its right
+                // edge is what says so — `^Z` is where the rest of it is written down.
+                scroll: false,
                 close_on_blur: false,
                 z: 300,
                 offset: Default::default(),
@@ -12295,6 +12472,7 @@ impl Host {
                 border: neosh_proto::BorderStyle::Rounded,
                 border_hl: Some("Tabline.Key".into()),
                 title: Some(" new tab ".into()),
+                footer: Some(" 1-3 pick   jk move   esc cancel ".into()),
                 width: neosh_proto::Extent::Max { n: width as u16 },
                 height: neosh_proto::Extent::Max { n: TAB_CHOICES.len() as u16 },
                 // Focusable and modal: this is a question you are in the middle of answering, so
@@ -12302,6 +12480,9 @@ impl Host {
                 // would open a second panel behind this one.
                 focusable: true,
                 modal: true,
+                // Three rows, and `j`/`k` move between them: this is a list with a cursor, which is
+                // the case `scroll` is deliberately not for.
+                scroll: false,
                 close_on_blur: false,
                 z: 300,
                 offset: Default::default(),
@@ -13698,8 +13879,8 @@ async fn run_slow(svc: Services, call: ApiCall) -> ApiResult {
         ApiCall::GitRemoveWorktree { path, force, cwd } => {
             svc.git_remove_worktree(path, force, cwd).await
         }
-        ApiCall::GenComplete { prompt, system, json, selection } => {
-            svc.gen_complete(prompt, system, json, selection).await
+        ApiCall::GenComplete { prompt, system, json, field, selection } => {
+            svc.gen_complete(prompt, system, json, field, selection).await
         }
         // Off the host loop for the same reason as git: discovery is a network round trip per
         // configured provider, and doing it inline freezes typing for as long as it takes.
@@ -14193,6 +14374,31 @@ fn chunk(text: impl Into<String>, hl: &str) -> neosh_proto::VirtChunk {
 fn display_width(s: &str) -> usize {
     use unicode_width::UnicodeWidthStr;
     s.width()
+}
+
+/// `s`, or as much of it as fits in `room` columns with an `…` saying so.
+///
+/// By grapheme cluster and by display width, not by `char`: a byte slice can land mid-character and
+/// a `char` count is wrong about the first emoji it meets. Room for nothing but the ellipsis gives
+/// the ellipsis, and a `room` of zero gives an empty string — a caller with no space left is not
+/// helped by one column of something.
+fn elide(s: &str, room: usize) -> String {
+    if display_width(s) <= room {
+        return s.to_string();
+    }
+    let Some(budget) = room.checked_sub(1) else { return String::new() };
+    let mut out = String::new();
+    let mut used = 0usize;
+    for g in s.graphemes(true) {
+        let w = display_width(g);
+        if used + w > budget {
+            break;
+        }
+        out.push_str(g);
+        used += w;
+    }
+    out.push('\u{2026}');
+    out
 }
 
 /// What the host learned about a directory the first time it looked: the display name, and the

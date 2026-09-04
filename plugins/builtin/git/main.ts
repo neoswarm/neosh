@@ -37,6 +37,7 @@ import {
   confirm,
   confirmDestructive,
   defineHighlights,
+  pager,
   picker,
   prompt,
   statusPrefix,
@@ -268,6 +269,16 @@ two-word scratch name it was created with.",
       }).catch(() => {});
     }
   };
+  // The first thing asked in a scratch worktree is what its branch should have been called.
+  //
+  // Before the reads below for the same reason they register their own listeners first, and with
+  // more at stake: what follows is a `git status` per project in the sidebar, run one after
+  // another, and a workspace with a dozen of them on a slow disk spends seconds here. A turn
+  // started in that window is the *first* turn in a new worktree — the one turn this exists for —
+  // and a turn that starts before the listener does is a turn nobody hears.
+  subscriptions.push(
+    neosh.agent.onTurnStart((e) => void nameScratchBranch(neosh, e.session as SessionId)),
+  );
   // Listeners before the first read: the sidebar writes `sidebar.projects` from its first draw,
   // which can land while this plugin is still awaiting its own `git status`, and a change that
   // arrives before the listener exists is a change nobody hears.
@@ -316,10 +327,6 @@ two-word scratch name it was created with.",
       priority: 20,
     });
   };
-  // The first thing asked in a scratch worktree is what its branch should have been called.
-  subscriptions.push(
-    neosh.agent.onTurnStart((e) => void nameScratchBranch(neosh, e.session as SessionId)),
-  );
 
   // The block at the top of the sidebar: which branch, what has drifted, and the one key that does
   // something about it. Contributed, so `plugins.disabled = ["git"]` takes it away with everything
@@ -359,16 +366,15 @@ async function showStatus(neosh: Neosh): Promise<void> {
     }
   }
 
-  const buf = await neosh.buf.create({ name: "[git status]", scratch: true });
-  await neosh.buf.setLines(buf, 0, -1, lines);
-  await neosh.float.open(buf, {
-    anchor: { kind: "screen" },
-    width: { kind: "fixed", n: 76 },
-    height: { kind: "fixed", n: Math.min(24, lines.length) },
-    border: "rounded",
-    closeOnBlur: true,
-  });
+  // A repository mid-refactor has more changed files than any panel is tall, and every one past the
+  // bottom edge used to be drawn nowhere with nothing on screen to say the list went on. The height
+  // is a ceiling and the panel scrolls; the `Math.min(24, lines.length)` this used to compute was a
+  // guess at a number only the frontend has.
+  await pager(neosh, lines, { title: " git status ", width: 76, height: 24, kind: KIND_STATUS });
 }
+
+/** The status panel's kind, so `?` lists its keys and somebody else can add one. */
+const KIND_STATUS = "neosh.git.status";
 
 async function switchBranch(neosh: Neosh): Promise<void> {
   const branches = await neosh.git.branches().catch((e) => {
@@ -452,16 +458,20 @@ async function newBranch(neosh: Neosh): Promise<void> {
  * Throws rather than returning a fallback. There is no useful default branch name, and the two
  * callers want opposite things when this fails — one tells you, the other says nothing — which is
  * a decision for them and not for this.
+ *
+ * `gen.field` rather than `gen.json`, because a model asked for `{"branch": …}` answers with a
+ * bare `fix/tab-strip-missing-in-worktree` about one time in ten — the name it was asked for,
+ * without the envelope. Read as JSON that was a failed request and a worktree left on
+ * `warm-juniper` for good, with the name it should have had sitting in the reply and nothing
+ * anywhere saying so.
  */
 async function nameBranch(neosh: Neosh, description: string, cwd?: string): Promise<string> {
-  const answer = await neosh.gen.json<{ branch?: string }>(
+  const branch = await neosh.gen.field(
     `${await promptFor(neosh, "branch", BRANCH_PROMPT)}\n\nUser message:\n${description}`,
+    "branch",
     await branchModel(neosh),
   );
-  if (typeof answer.branch !== "string" || answer.branch.trim() === "") {
-    throw new Error("the model returned no branch name");
-  }
-  const name = slug(answer.branch);
+  const name = slug(branch);
   const prefix = (await neosh.opt.get<string>("git.branch.prefix")) ?? "";
   // Skipped when the model already chose a type. The built-in prompt asks for `fix/`, `feature/`
   // and the rest, so a `git.branch.prefix` applied unconditionally on top of it would read
@@ -717,27 +727,25 @@ async function showDiff(neosh: Neosh): Promise<void> {
     );
   }
 
-  const buf = await neosh.buf.create({ name: `[diff] ${chosen.path}`, scratch: true });
-  await neosh.buf.setLines(buf, 0, -1, parts);
-  const ns = await neosh.ns.create("neosh.git.diff");
-  for (let i = 0; i < parts.length; i++) {
-    const hl = diffHl(parts[i] ?? "");
-    if (hl) {
-      await neosh.ns.mark(ns, buf, i, 0, { hlGroup: hl, endCol: byteLength(parts[i] ?? "") });
-    }
-  }
-
-  const win = await neosh.float.open(buf, {
-    anchor: { kind: "screen" },
-    width: { kind: "max", n: 100 },
-    height: { kind: "max", n: 30 },
-    border: "rounded",
-    title: ` ${chosen.path} `,
-    closeOnBlur: true,
-    focusable: true,
+  // Which way a diff line went is a background, so the group bands the whole row.
+  const marks = parts.map((line) => {
+    const hl = diffHl(line);
+    return hl ? [{ col: 0, opts: { hlGroup: hl, endCol: byteLength(line) } }] : [];
   });
-  await neosh.focus.push(win);
+
+  // A diff is the panel most reliably longer than a screen — thirty rows was never the size of a
+  // patch, it was the size of the box we were prepared to draw one in.
+  await pager(neosh, parts, {
+    title: ` ${chosen.path} `,
+    width: 100,
+    height: 30,
+    kind: KIND_DIFF,
+    marks,
+  });
 }
+
+/** The diff panel's kind. */
+const KIND_DIFF = "neosh.git.diff";
 
 /**
  * Keep only the hunk belonging to one file.

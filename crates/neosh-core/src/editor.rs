@@ -35,6 +35,48 @@ use crate::window::{Viewport, Window};
 /// replaces this, including with an empty list — see [`Editor::is_modal_escape`].
 const MODAL_ESCAPES: &[&str] = &["<C-q>", "<C-r>"];
 
+/// The kind the workspace's scroll keys are bound on.
+///
+/// Not a kind any buffer *has* — it is pushed into the scope chain for a window whose float asked
+/// for it, which is what lets one set of bindings serve every panel that overflows without each of
+/// them having to declare a kind it does not otherwise want. Public because the host binds against
+/// it and `^Z` lists it under this name, which is also the name `init.ts` rebinds at.
+pub const SCROLL_KIND: &str = "neosh.scroll";
+
+/// Where a scroll of `amount` leaves a window, or `None` when it leaves it where it was.
+///
+/// Counted in the buffer rows the frontend last reported drawing, never in the window's height: a
+/// float that wraps draws fewer rows than it is tall, and paging by the height in that window skips
+/// whatever the difference is on every press. A window nothing has drawn yet has no answer at all —
+/// it is scrolled by the first frame, not by this — so it is left alone rather than guessed at.
+///
+/// The floor is the last *screenful*, not the last line. Stopping at the last line would put one row
+/// of content above an empty panel and call it the bottom, which reads as a panel that lost its
+/// contents rather than one you have reached the end of.
+fn scrolled_to(w: &Window, lines: u32, amount: neosh_proto::ScrollAmount) -> Option<u32> {
+    use neosh_proto::ScrollAmount as A;
+    let vp = w.viewport?;
+    // `rows` is what was drawn and is the honest number; `height` covers a window whose first frame
+    // reported geometry before it had any content to count.
+    let rows = if vp.rows > 0 { vp.rows } else { u32::from(vp.height) }.max(1);
+    let last = lines.saturating_sub(rows);
+    let from = w.top_line.unwrap_or(vp.top_line);
+    let by = |step: u32, n: i32| {
+        let delta = i64::from(step) * i64::from(n);
+        (i64::from(from) + delta).clamp(0, i64::from(last)) as u32
+    };
+    let to = match amount {
+        A::Lines { n } => by(1, n),
+        A::Half { n } => by((rows / 2).max(1), n),
+        // Less one row of overlap, which is what makes a page readable: the line you stopped on is
+        // the line at the top of the next screen rather than the one just off it.
+        A::Page { n } => by(rows.saturating_sub(1).max(1), n),
+        A::Top => 0,
+        A::Bottom => last,
+    };
+    (w.top_line != Some(to)).then_some(to)
+}
+
 /// A pane id nothing in the workspace knows about.
 ///
 /// Named rather than reported as a bare failure, because the two ways to get here are a plugin
@@ -1312,6 +1354,12 @@ impl Editor {
         self.peek(view).and_then(|v| v.focus.current())
     }
 
+    /// Whether this window is a panel the scroll keys — and the wheel — move.
+    /// See [`neosh_proto::FloatConfig::scroll`].
+    pub fn scrollable(&self, win: WindowId) -> bool {
+        self.windows.get(&win).is_some_and(Window::scrollable)
+    }
+
     /// Which terminal a window is in. `None` for a window that has been closed.
     pub fn view_of(&self, win: WindowId) -> Option<ViewId> {
         self.windows.get(&win).map(|w| w.view)
@@ -1449,6 +1497,13 @@ impl Editor {
                 scopes.push(KeymapScope::Buffer { buf: w.buf });
                 if let Some(kind) = self.buffers.get(&w.buf).and_then(|b| b.kind.clone()) {
                     scopes.push(KeymapScope::BufKind { name: kind });
+                }
+                // A panel that does not fit is a place you can move in, and this is the scope that
+                // says so. Below the panel's own kind, so a key it wants for itself is still its
+                // own; above `Global`, so it survives a modal — a sheet you cannot scroll and
+                // cannot escape from is the worst of both.
+                if w.scrollable() {
+                    scopes.push(KeymapScope::BufKind { name: SCROLL_KIND.to_string() });
                 }
             }
         }
@@ -2052,6 +2107,16 @@ impl Editor {
                     w.top_line = top_line;
                 }
                 self.push_ui(UiEvent::ScrollTo { win, top_line });
+                Ok(ApiOk::Unit)
+            }
+            ApiCall::WinScroll { win, amount } => {
+                let w = self.win(win)?;
+                let lines = self.buffers.get(&w.buf).map(|b| b.line_count() as u32).unwrap_or(0);
+                let Some(top) = scrolled_to(w, lines, amount) else { return Ok(ApiOk::Unit) };
+                if let Some(w) = self.windows.get_mut(&win) {
+                    w.top_line = Some(top);
+                }
+                self.push_ui(UiEvent::ScrollTo { win, top_line: Some(top) });
                 Ok(ApiOk::Unit)
             }
             ApiCall::WinList => {
@@ -2738,6 +2803,7 @@ fn call_name(call: &ApiCall) -> &'static str {
         ApiCall::KeymapCapture { .. } => "keymap.capture",
         ApiCall::KeymapRelease { .. } => "keymap.release",
         ApiCall::WinGetViewport { .. } => "win.getViewport",
+        ApiCall::WinScroll { .. } => "win.scroll",
         ApiCall::WinSelectShape { .. } => "win.selectShape",
         ApiCall::WinCursorShape { .. } => "win.cursorShape",
         ApiCall::RtpList => "rtp.list",

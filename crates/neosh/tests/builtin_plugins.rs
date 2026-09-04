@@ -756,13 +756,15 @@ fn a_picker_says_how_to_use_it() {
     let mut s = sb.start();
     s.wait_for("PROJECTS");
     s.ctrl("k");
+    // On the border, not in the list. A strip written as the last row of the buffer is a row of
+    // height every picker pays for on every screen, and on a short one it is the row that does not
+    // fit — which left the one panel you have to be told how to leave as the one with no legend.
     assert!(
-        s.pump(|s| s.picker_named("[Go to]").iter().any(|l| l.contains("choose"))),
+        s.pump(|s| s.footer_of("[Go to]").is_some_and(|f| f.contains("choose"))),
         "the key strip is there\n{:?}",
-        s.picker_named("[Go to]")
+        s.footer_of("[Go to]")
     );
-    let rows = s.picker_named("[Go to]");
-    let strip = rows.iter().find(|l| l.contains("choose")).expect("found above");
+    let strip = s.footer_of("[Go to]").expect("found above");
     assert!(strip.contains("close"), "and how to get out again: {strip:?}");
 }
 
@@ -776,10 +778,10 @@ fn the_key_strip_says_the_keys_that_are_actually_bound() {
     s.ctrl("k");
     assert!(
         // `^Y`, capitalised: nobody presses shift to send it, and the capital is how a terminal
-        // has spelled a chord since curses.
-        s.pump(|s| s.picker_named("[Go to]").iter().any(|l| l.contains("^Y choose"))),
+        // has spelled a chord since curses. Read off the border, which is where a legend lives now.
+        s.pump(|s| s.footer_of("[Go to]").is_some_and(|f| f.contains("^Y choose"))),
         "the strip follows the setting\n{:?}",
-        s.picker_named("[Go to]")
+        s.footer_of("[Go to]")
     );
 }
 
@@ -1270,6 +1272,66 @@ fn a_scratch_worktree_is_named_by_the_first_message_and_the_sidebar_follows() {
         s.pump(move |s| !s.sidebar_now().iter().any(|l| l.contains(&gone))),
         "and the scratch name is not still anywhere in the column\n{:?}",
         s.sidebar_now()
+    );
+}
+
+/// And named when the model answers with the name and nothing else.
+///
+/// The prompt asks for `{"branch": …}` and gets the object most of the time. The rest of the time
+/// — two runs in twenty-two, measured on a real workspace's own history — it gets
+/// `fix/the-login-redirect` on its own: the name it asked for, without the envelope. That was read
+/// as a failed request and swallowed by a `log.info` nothing prints, so the worktree kept the name
+/// nobody chose, for good, with the name it should have had sitting in the reply.
+///
+/// Deliberately end to end rather than a unit test of the parse: what broke was a *shape* crossing
+/// four layers — driver, host, the API's `gen.field`, and the plugin that acts on it — and every
+/// one of them could have thrown the answer away on its own.
+#[test]
+fn a_branch_name_without_its_json_envelope_still_names_the_branch() {
+    if !have_git() {
+        return;
+    }
+    let sb = Sandbox::new("branchbare");
+    sb.git_init();
+
+    let mut s = sb.start_with(
+        &Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/branch_name_bare.jsonl"),
+    );
+    s.wait_for("PROJECTS");
+
+    s.send(&command("git.worktree.new.inside"));
+    let under = sb.work().join(".worktrees");
+    assert!(
+        s.pump(|_| std::fs::read_dir(&under).is_ok_and(|d| d.count() > 0)),
+        "the worktree exists, on a name nobody chose"
+    );
+    let tree = std::fs::read_dir(&under)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .next()
+        .expect("one worktree");
+
+    let scratch = head_of(&tree);
+    assert!(scratch.contains('-'), "a two-word scratch name, not {scratch:?}");
+
+    // Waited for, for the reason the test above says: typing before the new conversation lands
+    // types into the one in the main checkout, where there is no scratch branch to rename.
+    let named_scratch = scratch.clone();
+    assert!(
+        s.pump(move |s| s.sidebar_now().iter().any(|l| l.contains(&named_scratch))),
+        "the worktree is a row in the panel\n{:?}",
+        s.sidebar_now()
+    );
+
+    s.type_text("the login page bounces");
+    s.special("enter");
+
+    assert!(
+        s.pump(|_| head_of(&tree) == "fix/the-login-redirect"),
+        "a bare answer is the answer — the branch is on {:?}\n{}",
+        head_of(&tree),
+        s.transcript()
     );
 }
 
@@ -1805,7 +1867,11 @@ fn a_knob_row_says_it_is_a_control_before_you_press_anything() {
     );
     // And the key that changes something is named before the key that leaves.
     // Letters, not arrows: the arrows are bound too, and the row is a promise about a keyboard.
-    assert!(s.saw("h l change"), "the hints lead with the key that does the thing\n{}", s.transcript());
+    assert!(
+        s.pump(|s| s.footer_of("[model options]").is_some_and(|f| f.starts_with(" h l change"))),
+        "the hints lead with the key that does the thing\n{:?}",
+        s.footer_of("[model options]")
+    );
 }
 
 #[test]
@@ -3699,8 +3765,14 @@ fn a_path_you_typed_in_full_is_accepted_even_though_it_was_never_offered() {
     );
 }
 
+/// The key sheet is the longest panel in the workspace, so it is one you move around in.
+///
+/// It used to close on *any* key, which on a screen shorter than the list meant the only thing you
+/// could do with the part you could not see was dismiss it. Now the scroll keys resolve at
+/// `neosh.scroll` and never reach its capture, and what closes it is named: `<Esc>`, `q`, `<CR>`,
+/// `^C`, and `^Z` again.
 #[test]
-fn the_key_list_opens_from_the_panel_and_any_key_dismisses_it() {
+fn the_key_list_scrolls_and_closes_on_a_key_that_means_close() {
     let sb = Sandbox::new("keylist");
     let mut s = sb.start();
     s.wait_for("PROJECTS");
@@ -3730,8 +3802,27 @@ fn the_key_list_opens_from_the_panel_and_any_key_dismisses_it() {
     // The text is written before the float is opened, so seeing the text is not seeing the window.
     assert!(s.pump(|s| s.windows_for(keys).len() == 1), "it is on screen\n{}", s.transcript());
 
+    // A scroll is counted in the rows the frontend says it drew, and a stdio frontend says nothing
+    // unless a test does — so a window nobody has laid out is one this deliberately leaves alone.
+    s.viewport("[keys]", 64, 10);
+
+    // A letter that is not a way out leaves it exactly where it was. `j` scrolls it — the binding
+    // is at `neosh.scroll`, which is nearer than the capture — and `z` does nothing at all, which
+    // is the whole point: a stray keystroke must not throw away where you had scrolled to.
+    let win = s.windows_for(keys)[0];
+    s.key("j");
+    assert!(
+        s.pump(|s| s.events.iter().any(|e| e["type"] == "scroll_to"
+            && e["win"].as_u64() == Some(win)
+            && e["top_line"].as_u64() == Some(1))),
+        "`j` scrolls the sheet\n{}",
+        s.transcript()
+    );
     s.key("z");
-    assert!(s.pump(|s| s.windows_for(keys).is_empty()), "any key closes it\n{}", s.transcript());
+    assert!(!s.windows_for(keys).is_empty(), "a stray letter does not close it\n{}", s.transcript());
+
+    s.key("q");
+    assert!(s.pump(|s| s.windows_for(keys).is_empty()), "`q` closes it\n{}", s.transcript());
 }
 
 /// The key list is reachable from the composer, and by a chord rather than by `F1`. Apple's top
@@ -6586,6 +6677,22 @@ impl Session {
         })
     }
 
+    /// The key strip on a float's bottom border, as the window it belongs to was announced.
+    ///
+    /// A legend is *not* a row of the buffer any more, and the reason is the reason it is worth
+    /// asserting: written as content it was both the row that scrolled away and the first row a
+    /// short terminal clipped, and the row in question is the one that says how to get out. It
+    /// travels on `FloatConfig`, so this reads it where the promise is actually made.
+    fn footer_of(&self, name: &str) -> Option<String> {
+        let buf = self.buffer_named(name)?;
+        let open = self.open_windows();
+        self.events
+            .iter()
+            .filter(|e| e["type"] == "window_opened" && e["buf"].as_u64() == Some(buf))
+            .filter(|e| e["win"].as_u64().is_some_and(|w| open.contains(&w)))
+            .find_map(|e| e["layout"]["config"]["footer"].as_str().map(str::to_string))
+    }
+
     /// Tell the core how big a window really is.
     ///
     /// A stdio frontend has no geometry of its own, so nothing reports this unless a test does —
@@ -8752,6 +8859,56 @@ fn a_tab_can_be_reached_by_its_number() {
     assert!(
         !s.texts().iter().any(|t| t.contains("no such command")),
         "the key is bound to something that exists"
+    );
+}
+
+/// The bar is fitted to its width, and the one tab it must never drop is the one you are in.
+///
+/// Filled left to right and cut at the end, four tabs with the keyboard in the fourth read
+/// `1 new  2 new` — the row whose whole job is saying which conversations are open spending itself
+/// on the ones you are not in. Nothing else on screen answers "which tab is this", so the answer
+/// has to survive the fitting rather than be the first thing it discards. The tabs are all called
+/// `new` here, which is exactly the case that makes this matter: with no titles to tell them apart,
+/// the number on the bar is the only answer there is.
+#[test]
+fn the_bar_always_names_the_tab_you_are_in() {
+    let sb = Sandbox::new("tabline-keeps-active");
+    let mut s = sb.start();
+    s.wait_for("PROJECTS");
+
+    // Four tabs, landing in the fourth. `3` is this conversation again, which is the cheap one —
+    // what is being tested is the bar, not what the tabs hold.
+    for n in 2..=4 {
+        s.window_key("t");
+        assert!(s.pump(|s| s.buffer_named("[new tab]").is_some()), "the panel is up");
+        s.key("3");
+        assert!(
+            s.pump(|s| s.tabline_now().contains(&format!(" {n} "))),
+            "there are {n} tabs: {:?}",
+            s.tabline_now()
+        );
+    }
+
+    // Narrow enough that not all four can be on it. A stdio frontend reports no geometry of its
+    // own, so until this is said the bar has infinite room and nothing is ever dropped.
+    s.viewport("[tabs]", 30, 1);
+    assert!(
+        s.pump(|s| s.tabline_now().contains('+')),
+        "the bar had to leave something out: {:?}",
+        s.tabline_now()
+    );
+    assert!(
+        s.pump(|s| s.tabline_now().contains(" 4 ")),
+        "and what it left out is not the tab the keyboard is in: {:?}",
+        s.tabline_now()
+    );
+
+    // And it is a window that moves with you, not a rule about the end of the list.
+    s.window_key("1");
+    assert!(
+        s.pump(|s| s.tabline_now().contains(" 1 ")),
+        "the bar followed the keyboard back: {:?}",
+        s.tabline_now()
     );
 }
 

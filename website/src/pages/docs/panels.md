@@ -100,6 +100,26 @@ if (!(await confirmDestructive(neosh, `Delete ${name}?`, {
 
 `railPicker` is the two-pane shape the model switcher is built from, for when one list would answer two questions at once. Widget keys come from `ui.keys.*` and are claimed window-scoped while open; you get that for free.
 
+`pager` is the read-only one: rows you look at rather than choose between, in a float that scrolls when the screen is shorter than the content.
+
+```ts
+import { pager } from "@neosh/api/ui";
+
+await pager(neosh, patch.split("\n"), { title: " changes ", width: 100, height: 30, marks });
+```
+
+`height` is a **ceiling, never a size** — a float is given whatever the screen has, so anything you ask for is a wish. What you get back is the reader's motions (`j`/`k`, `^D`/`^U`, `^F`/`^B`, `gg`/`G`, arrows, paging keys), the mouse wheel, a bar down the right border while anything is hidden, and a legend on the bottom border that cannot scroll away or be clipped.
+
+On a panel of your own, `scroll: true` on the float is the whole of it:
+
+```ts
+const win = await neosh.float.open(buf, { height: { kind: "max", n: 30 }, scroll: true });
+```
+
+That adds one scope to the keymap chain while the float has focus — `{ kind: "buf_kind", name: "neosh.scroll" }` — which is where those bindings live. It sits *below* your own buffer's kind, so a key you bind on your panel is still yours, and *above* `global`, so it works under `modal` too. Do not set it on a panel with a cursor of its own: a picker's filter would lose `j` and `G` to it.
+
+Anything a float draws on its bottom edge is `footer`, which is where a key strip belongs — written as the last row of the buffer it is both the row that scrolls away and the first row a short terminal clips.
+
 ## Building on another plugin
 
 ```ts

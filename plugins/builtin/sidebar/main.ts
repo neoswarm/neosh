@@ -2792,7 +2792,12 @@ async function openRemote(
     height: { kind: "max", n: 28 },
     border: "rounded",
     title: ` ${name} `,
+    footer: " j k move   ^D ^U half   gg G ends   esc close ",
     focusable: true,
+    // Somebody else's conversation, which is as long as it is. Twenty-eight rows was the most this
+    // panel would ever draw and everything above them was unreachable — on a short terminal, most
+    // of it. `G` puts you back on the end when you have finished reading up.
+    scroll: true,
   });
   await neosh.focus.push(win);
 
@@ -2803,6 +2808,14 @@ async function openRemote(
 
   const redraw = async () => {
     const all = [...header, ...body];
+    // Whether you are reading the end of it. Asked *before* the rows change, because afterwards
+    // "the end" is a different row and every panel is behind it. Parked on the last screenful you
+    // are carried along with what arrives; anywhere else you stay exactly where you are — the rule
+    // the transcript already follows, and the one thing that makes a live panel readable now that
+    // it can be scrolled at all.
+    const before = await neosh.win.viewport(win).catch(() => null);
+    const following = before === null ||
+      before.top_line + before.rows >= before.line_count;
     // One call. This redraws per token, so a repaint the frontend could draw halfway through — text
     // written, marks not yet — would be a transcript strobing white for the whole of an answer.
     const drawn: DrawnRow[] = all.map((text) => ({ text, marks: [] }));
@@ -2822,8 +2835,10 @@ async function openRemote(
     }
     await neosh.buf.render(buf, ns, 0, -1, drawn);
     // The newest line, not the oldest: a transcript you have just opened should be showing the end
-    // of the conversation, which is the part that is still happening.
-    await neosh.win.scrollTo(win, Math.max(0, all.length - 24));
+    // of the conversation, which is the part that is still happening. Measured rather than the flat
+    // 24 this used to subtract — that number was the height the panel *asked* for, so on any screen
+    // shorter than it the tail was scrolled past and the panel sat on rows nobody had written yet.
+    if (following) await neosh.win.scroll(win, { kind: "bottom" });
   };
 
   const sub = neosh.swarm.onStream(async (e) => {

@@ -316,6 +316,13 @@ pub fn groups(variant: Variant) -> Vec<(&'static str, HighlightDef)> {
         // ---- floats -------------------------------------------------------
         ("Float.Border", spec(fg(r.faint))),
         ("Float.Title", spec(bold(fg(r.accent)))),
+        // The bar down a panel's right edge, drawn only while there is content past the bottom of
+        // it. Brighter than the border it sits in, because what it is saying is that the panel is
+        // not all of the thing — a marker the same colour as the frame is a frame.
+        ("Float.Scroll", spec(fg(r.muted))),
+        // The key strip on the bottom edge. Quiet on purpose: it is there to be found when you look
+        // for it and not to compete with what the panel is showing you.
+        ("Float.Footer", spec(dim(fg(r.muted)))),
         // ---- the agent ----------------------------------------------------
         ("Agent.User", spec(bold(fg(r.accent)))),
         ("Agent.Assistant", spec(fg(r.fg))),
@@ -532,7 +539,12 @@ pub fn groups(variant: Variant) -> Vec<(&'static str, HighlightDef)> {
         // from the corner of your eye, and a separator one step up the same ramp is not.
         ("Pane.Active", spec(fg(r.accent))),
         ("Tabline.Tab", link("Comment")),
-        ("Tabline.Active", spec(bold(fg(r.fg)))),
+        // The accent, for the reason [`Pane.Active`] above wears it: the argument against a
+        // brighter grey does not stop being true one level up. Every tab in a project you have just
+        // started is called `new`, so the name distinguishes nothing and the colour is the whole
+        // answer to "which one am I in" — and bold-on-default against dim-grey is a difference you
+        // have to compare two labels to see, on a row whose job is to be glanced at.
+        ("Tabline.Active", spec(bold(fg(r.accent)))),
         // The keys, which wear what every other key in the workspace wears. A legend whose keys are
         // dimmer than its words is a legend nobody reads twice.
         ("Tabline.Key", link("Key")),

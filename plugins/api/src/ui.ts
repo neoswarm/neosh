@@ -513,7 +513,11 @@ export async function picker<T>(
   items: PickerItem<T>[],
   opts: PickerOptions<T> = {},
 ): Promise<T | null> {
-  const height = Math.max(1, opts.height ?? 12);
+  // What the list would like. What it *gets* is settled by `measure` below, once the frontend has
+  // said how much of the screen there was — a picker asking for twelve rows on a sixteen-row
+  // terminal is not a twelve-row picker, and every number this widget computes from `rows` was
+  // wrong by the difference until it asked.
+  let rows = Math.max(1, opts.height ?? 12);
   const width = Math.max(20, opts.width ?? 64);
   const filtering = opts.filter !== false;
 
@@ -530,13 +534,13 @@ export async function picker<T>(
     anchor: opts.anchor ?? { kind: "screen" },
     offset: opts.offset,
     width: { kind: "fixed", n: width },
-    // Exactly the rows that get drawn: the list, plus a filter line when there is one, a title
-    // when there is one, and the key strip unless it was waived.
-    height: {
-      kind: "fixed",
-      n: height + (filtering ? 1 : 0) + (opts.title ? 1 : 0) + (hints === "" ? 0 : 1),
-    },
+    // Exactly the rows that get drawn: the list, plus a filter line when there is one and a title
+    // when there is one. The key strip is not among them any more — it is on the bottom border,
+    // where it costs no row and cannot be the row that does not fit. It was a row, and on a
+    // sixteen-row terminal it was reliably the one clipped: the strip that says how to get out.
+    height: { kind: "fixed", n: rows + (filtering ? 1 : 0) + (opts.title ? 1 : 0) },
     border: "rounded",
+    footer: hints === "" ? undefined : ` ${hints} `,
     focusable: true,
     closeOnBlur: true,
     // Modal: nothing global resolves while this is up. Shadowing the keys a widget wants — which
@@ -625,7 +629,7 @@ export async function picker<T>(
     if (closed) return;
     // Keep the cursor on screen without recentring on every keystroke.
     if (cursor < top) top = cursor;
-    if (cursor >= top + height) top = cursor - height + 1;
+    if (cursor >= top + rows) top = cursor - rows + 1;
 
     const lines: string[] = [];
     if (opts.title) lines.push(opts.title);
@@ -636,7 +640,7 @@ export async function picker<T>(
     // dock. Measuring against anything else puts the last visible character on both lines — the
     // continuation says `/ finds` under a row that already ended in `/`.
     const inner = Math.max(8, width);
-    let window = visible.slice(top, top + height);
+    let window = visible.slice(top, top + rows);
     // One gutter for the whole list, or none at all. Giving it only to the rows that asked for an
     // icon would step every other label one column left, which reads as a list that cannot decide
     // where its left margin is.
@@ -672,7 +676,7 @@ export async function picker<T>(
     // float's height: the window was sized for `height` lines and growing past it would push the
     // key strip off the bottom, which is the row that says how to get out.
     if (rest.length > 0) {
-      const room = Math.max(1, height - rest.length);
+      const room = Math.max(1, rows - rest.length);
       if (cursor < top) top = cursor;
       if (cursor >= top + room) top = cursor - room + 1;
       window = visible.slice(top, top + room);
@@ -691,23 +695,6 @@ export async function picker<T>(
       if (!isCursor) continue;
       for (const line of rest) lines.push(`    ${line}`);
     }
-    // Pushed onto the last row rather than floated: the float is sized for it, and a strip that
-    // moved up as the list shortened would be a strip you have to look for.
-    //
-    // The placeholder takes a row of the list's own space, so an empty list has used one of the
-    // `height` rows and not none. Counting it as none put the strip one row past the bottom of a
-    // float sized for exactly `height`, where it was silently clipped — leaving the empty state,
-    // the one state where you most want to be told what the keys do, as the only one with no keys
-    // on it.
-    // Lines, not rows: the row under the cursor is more than one of them when it has unfolded, and
-    // counting rows here would leave the strip that many lines low — off the bottom of a float
-    // sized for exactly `height`.
-    const listRows = Math.max(1, lines.length - firstListLine);
-    const hintLine = hints === "" ? -1 : lines.length + Math.max(0, height - listRows);
-    if (hintLine >= 0) {
-      while (lines.length < hintLine) lines.push("");
-      lines.push(` ${hints}`);
-    }
     // Marks are collected against their row and handed over with the text, in one call. Set one at
     // a time they were a sequence the frontend could draw the middle of: the moment the clear had
     // landed and the marks had not, every row drew unmarked — in `Normal`, which is near-white.
@@ -716,9 +703,6 @@ export async function picker<T>(
       drawn[line]?.marks!.push({ col, opts: o });
     };
 
-    if (hintLine >= 0) {
-      mark(hintLine, 0, { hlGroup: "Sidebar.Dim", endCol: byteLength(lines[hintLine] ?? "") });
-    }
     const listTop = (opts.title ? 1 : 0) + (filtering ? 1 : 0);
     for (let i = 0; i < window.length; i++) {
       const row = window[i]!;
@@ -869,10 +853,10 @@ export async function picker<T>(
           cursor = Math.max(0, cursor - 1);
           break;
         case "page_down":
-          cursor = Math.min(last(), cursor + height);
+          cursor = Math.min(last(), cursor + rows);
           break;
         case "page_up":
-          cursor = Math.max(0, cursor - height);
+          cursor = Math.max(0, cursor - rows);
           break;
         case "first":
           cursor = 0;
@@ -923,6 +907,33 @@ export async function picker<T>(
     }, { desc: "picker key" }),
   );
 
+  /**
+   * How many list rows there turned out to be room for.
+   *
+   * A float is *asked* for a height and given whatever the screen has, so `opts.height` is a wish
+   * and this is the answer. Everything above counts in `rows` — where the window starts, what a
+   * page step is, how far the cursor may go before the list scrolls — and while that number was the
+   * wish, a picker on a short terminal scrolled to keep the cursor on a row that was not drawn.
+   *
+   * Read once when the panel opens and again whenever the frontend says this window changed size,
+   * rather than on every keystroke: a round trip per character typed is latency on the one path in
+   * this widget that has to feel immediate.
+   */
+  async function measure(): Promise<void> {
+    if (closed) return;
+    const v = await neosh.win.viewport(win).catch(() => null);
+    if (!v) return;
+    const next = Math.max(1, v.height - (filtering ? 1 : 0) - (opts.title ? 1 : 0));
+    if (next === rows) return;
+    rows = next;
+    await render();
+  }
+  disposers.push(
+    neosh.event.on("neosh.viewport", (e) => {
+      if ((e as { win?: WindowId }).win === win) void measure();
+    }),
+  );
+
   await neosh.focus.push(win);
   disposers.push(await neosh.keymap.capture(win, command));
   // `<C-c>` is bound globally to `interrupt`, which would arm "press again to quit" while a picker
@@ -935,6 +946,7 @@ export async function picker<T>(
   if (typeof opts.query === "function") query = opts.query();
   await refetch();
   await render();
+  await measure();
   if (opts.onHighlight) {
     const row = visible[cursor];
     if (row) opts.onHighlight(row.item, row.index);
@@ -955,6 +967,145 @@ function dropSegment(text: string): string {
   const trimmed = text.replace(/[\s/]+$/, "");
   const at = Math.max(trimmed.lastIndexOf("/"), trimmed.lastIndexOf(" "));
   return at < 0 ? "" : trimmed.slice(0, at + 1);
+}
+
+// ---------------------------------------------------------------------------
+// Reading something too long for the screen
+// ---------------------------------------------------------------------------
+
+export interface PagerOptions {
+  /** On the top border. */
+  title?: string;
+  /**
+   * On the bottom border, replacing the default legend.
+   *
+   * The default already names the scroll keys and the way out, read out of nothing — they are fixed
+   * defaults on `neosh.scroll` and `^Z` is where a rebinding shows up. Pass your own only to add a
+   * verb of your own to it.
+   */
+  footer?: string;
+  /** Columns of content. The border is drawn outside it. */
+  width?: number;
+  /**
+   * The most rows of content to ask for. Fewer if the content is shorter, fewer still if the screen
+   * is — which is the case this whole widget is about, and is why it is a ceiling and not a size.
+   */
+  height?: number;
+  /**
+   * The buffer kind, so a third party can bind keys in *this* panel and find it with `win.ofKind`.
+   *
+   * Defaults to {@link KIND_PAGER}, which every pager in the workspace shares. Pass your own when
+   * the panel is a thing in its own right — a diff, a status — and somebody might reasonably want
+   * keys on that and not on every pager there is.
+   */
+  kind?: string;
+  /** Marks to lay over the rows, in the same shape {@link Neosh.buf.render} takes. */
+  marks?: DrawnRow["marks"][];
+  z?: number;
+  /**
+   * Handed this panel's own close, as soon as it is on screen.
+   *
+   * For the caller that has to be able to put it away itself — a key that toggles, a panel that
+   * closes when the thing it is about goes. Without it the only way out is a key, and a `^Z` that
+   * opens a sheet and then opens a second one behind it is the bug this exists to prevent.
+   */
+  onOpen?: (close: () => Promise<void>) => void;
+}
+
+/** The kind a pager's buffer gets when the caller does not name one. */
+export const KIND_PAGER = "neosh.pager";
+
+/**
+ * Show rows you can read but not edit, in a float that scrolls when it does not fit.
+ *
+ * The shape almost every read-only panel in the workspace turned out to want, and the thing each of
+ * them was missing: a float is given whatever height the screen has, so a status of sixty changed
+ * files or a diff of four hundred lines was thirty rows on screen and the rest drawn nowhere, with
+ * no key pointed at it and nothing to say it was there. Every one of them had independently written
+ * "open a float, put lines in it" and independently stopped before the part where the terminal is
+ * short.
+ *
+ * What you get: the reader's motions (`j`/`k`, `^D`/`^U`, `^F`/`^B`, `gg`/`G`, arrows, paging keys)
+ * and the wheel, because the float sets `scroll` and those are ordinary bindings on
+ * `neosh.scroll` — so `^Z` lists them and `init.ts` moves them. A bar down the right border while
+ * anything is hidden. A legend on the bottom border, which cannot scroll away and is not the first
+ * row clipped. `<Esc>`, `q`, `<CR>` and `^C` close it.
+ *
+ * Resolves when it closes.
+ */
+export async function pager(
+  neosh: Neosh,
+  lines: string[],
+  opts: PagerOptions = {},
+): Promise<void> {
+  const buf = await neosh.buf.create({
+    name: `[${opts.title?.trim() || "pager"}]`,
+    scratch: true,
+    kind: opts.kind ?? KIND_PAGER,
+  });
+  const ns = await neosh.ns.create("neosh.ui.pager");
+  await neosh.buf.render(
+    buf,
+    ns,
+    0,
+    -1,
+    lines.map((text, i) => ({ text, marks: opts.marks?.[i] ?? [] })),
+  );
+
+  const win = await neosh.float.open(buf, {
+    anchor: { kind: "screen" },
+    width: opts.width === undefined ? { kind: "auto" } : { kind: "fixed", n: opts.width },
+    // A ceiling, never a size. `fixed` here would ask for rows the screen does not have and get
+    // clipped to them anyway — the difference being that `max` also shrinks to fit content that is
+    // shorter, so a two-line status is a two-line panel rather than a mostly empty box.
+    height: { kind: "max", n: opts.height ?? 30 },
+    border: "rounded",
+    title: opts.title,
+    footer: opts.footer ?? " j k move   ^D ^U half   gg G ends   esc close ",
+    focusable: true,
+    closeOnBlur: true,
+    scroll: true,
+    z: opts.z ?? 200,
+  });
+  await neosh.focus.push(win);
+
+  let settle: () => void = () => {};
+  const done = new Promise<void>((resolve) => {
+    settle = resolve;
+  });
+
+  const command = `neosh.ui.pager.key.${++pickerSeq}`;
+  const disposers: Disposable[] = [];
+  let closed = false;
+  const close = async () => {
+    if (closed) return;
+    closed = true;
+    for (const d of disposers) d.dispose();
+    await neosh.focus.pop().catch(() => {});
+    await neosh.win.close(win).catch(() => {});
+    settle();
+  };
+
+  disposers.push(
+    await neosh.cmd.register(command, (_args, key) => {
+      // Only what nothing else claimed reaches here, and the scroll keys are claimed — they resolve
+      // at `neosh.scroll`, which is nearer than this capture is late. So what is left is dismissal.
+      // Which is *named*: a panel you scroll is a panel you spend time in, and "any key closes it"
+      // turns a mistyped letter into losing your place.
+      if (!key || closesPager(key)) void close();
+    }, { desc: "close this panel" }),
+  );
+  disposers.push(await neosh.keymap.capture(win, command));
+  opts.onOpen?.(close);
+  return done;
+}
+
+/** `<Esc>`, `q`, `<CR>` and `^C` — the four keys every panel in this workspace closes on. */
+function closesPager(key: KeyContext): boolean {
+  const { code, mods } = key.key;
+  if (code.kind === "esc" || code.kind === "enter") return true;
+  if (code.kind !== "char") return false;
+  return mods.ctrl ? code.c.toLowerCase() === "c" : code.c.toLowerCase() === "q";
 }
 
 // ---------------------------------------------------------------------------
@@ -1013,6 +1164,18 @@ export async function confirm(
     `y ${yes.toLowerCase()}   n ${no.toLowerCase()}   ↵ choose   esc cancel`,
     width - 2,
   );
+  /**
+   * How many of the detail lines there is room for.
+   *
+   * Settled once the frontend has said how tall this dialog turned out to be — a dialog is asked
+   * for a height and given what the screen has, and the rows it loses are the ones at the bottom.
+   * Which for a question with the answers under the detail meant the answers, so a long `detail` on
+   * a short terminal was a dialog you could not see either option in.
+   *
+   * The detail is what gives way, because the detail is the part you can do without: the question
+   * and the two answers are the dialog. What went is said rather than silently dropped.
+   */
+  let room = detail.length;
 
   // On the answer that changes nothing, when the other one cannot be taken back.
   let cursor = opts.dangerous ? 1 : 0;
@@ -1025,14 +1188,17 @@ export async function confirm(
 
   /** Where each part of the dialog starts, so the marks do not have to count rows twice. */
   const detailAt = asked.length + 1;
-  const answersAt = detailAt + (detail.length === 0 ? 0 : detail.length + 1);
-  const stripAt = answersAt + answers.length + 1;
+  /** Every row but the detail: the question, the blanks around it, and the two answers. */
+  const fixedRows = asked.length + 1 + answers.length;
 
   const win = await neosh.float.open(buf, {
     anchor: { kind: "screen" },
     width: { kind: "fixed", n: width },
-    height: { kind: "fixed", n: stripAt + 1 },
+    height: { kind: "fixed", n: fixedRows + (detail.length === 0 ? 0 : detail.length + 1) },
     border: "rounded",
+    // The key strip, on the edge. It was the last row of the buffer, which made it both the row a
+    // long `detail` pushed off the bottom and a row of height every dialog had to pay for.
+    footer: ` ${strip} `,
     focusable: true,
     closeOnBlur: true,
     // Modal: nothing global resolves while this is up. Shadowing the keys a widget wants — which
@@ -1048,15 +1214,20 @@ export async function confirm(
   });
 
   const render = async () => {
+    const shownDetail = room >= detail.length
+      ? detail
+      : // One row of the budget goes to saying what is not being shown, so a dialog that has had to
+        // cut something never looks like a dialog that had nothing more to say.
+        [...detail.slice(0, Math.max(0, room - 1)), `… and ${detail.length - Math.max(0, room - 1)} more lines`];
+    const detailRows = shownDetail.length;
+    const answersAt = detailAt + (detailRows === 0 ? 0 : detailRows + 1);
     const lines: string[] = asked.map((l) => ` ${l}`);
     lines.push("");
-    if (detail.length > 0) {
-      lines.push(...detail.map((l) => ` ${l}`));
+    if (detailRows > 0) {
+      lines.push(...shownDetail.map((l) => ` ${l}`));
       lines.push("");
     }
     answers.forEach((a, i) => lines.push(`${i === cursor ? `${CURSOR_MARKER}` : BLANK_MARKER}${a}`));
-    lines.push("");
-    lines.push(` ${strip}`);
     // Text and marks together, in one call: this is redrawn on every keystroke, and a repaint the
     // frontend can draw the middle of is one that flashes — unmarked rows draw in `Normal`. It also
     // takes care of the older half of the same bug, that a mark whose line was replaced under it
@@ -1069,7 +1240,7 @@ export async function confirm(
     for (let i = 0; i < asked.length; i++) {
       mark(i, 0, { hlGroup: "Title", endCol: byteLength(lines[i] ?? "") });
     }
-    for (let i = 0; i < detail.length; i++) {
+    for (let i = 0; i < detailRows; i++) {
       mark(detailAt + i, 0, {
         hlGroup: "Comment",
         endCol: byteLength(lines[detailAt + i] ?? ""),
@@ -1090,7 +1261,6 @@ export async function confirm(
         });
       }
     }
-    mark(stripAt, 0, { hlGroup: "Sidebar.Dim", endCol: byteLength(lines[stripAt] ?? "") });
     await neosh.buf.render(buf, ns, 0, -1, drawn);
     // The caret marks the answer, since there is nothing here to type into.
     await neosh.win.setCursor(win, answersAt + cursor, 0);
@@ -1161,6 +1331,23 @@ export async function confirm(
   disposers.push(await neosh.keymap.capture(win, command));
   await bindWidgetKeys(neosh, win, command, keys);
   await render();
+  // And then how much of it there was room for. Asked after the first draw, because a window the
+  // frontend has never laid out has no answer to give.
+  const measure = async () => {
+    if (closed) return;
+    const v = await neosh.win.viewport(win).catch(() => null);
+    if (!v) return;
+    const next = Math.max(0, v.height - fixedRows - 1);
+    if (next === room) return;
+    room = next;
+    await render();
+  };
+  disposers.push(
+    neosh.event.on("neosh.viewport", (e) => {
+      if ((e as { win?: WindowId }).win === win) void measure();
+    }),
+  );
+  await measure();
   return done;
 }
 
@@ -1401,6 +1588,9 @@ export async function prompt(
     width: { kind: "fixed", n: width },
     height: { kind: "fixed", n: 2 },
     border: "rounded",
+    // A field with no legend on it is a field you guess at. On the border, so it costs neither of
+    // the two rows this has.
+    footer: " ↵ accept   ^W a word   ^U all   esc cancel ",
     focusable: true,
     closeOnBlur: true,
     // Modal: nothing global resolves while this is up. Shadowing the keys a widget wants — which
@@ -2224,9 +2414,11 @@ export async function railPicker<G, T>(
   const win = await neosh.float.open(buf, {
     anchor: { kind: "screen" },
     width: { kind: "fixed", n: total },
-    // title, filter, rule, body, rule, hints
-    height: { kind: "fixed", n: height + 5 },
+    // title, filter, rule, body, rule. The key strip is not among them: it is on the bottom border,
+    // where it costs no row of body and cannot be the row a short terminal clips.
+    height: { kind: "fixed", n: height + 4 },
     border: "rounded",
+    footer: ` ${opts.hints ?? "↵ use   ⇥ panes   ^N/^P move   esc close"} `,
     focusable: true,
     closeOnBlur: true,
     // Modal: nothing global resolves while this is up. Shadowing the keys a widget wants — which
@@ -2542,12 +2734,6 @@ export async function railPicker<G, T>(
     marks.push({
       line: lines.length - 1,
       mark: { from: 0, to: byteLength(lines[lines.length - 1]!), hl: "Separator" },
-    });
-    const hints = opts.hints ?? "↵ use   ⇥ panes   ^N/^P move   esc close";
-    lines.push(` ${hints}`);
-    marks.push({
-      line: lines.length - 1,
-      mark: { from: 0, to: byteLength(lines[lines.length - 1]!), hl: "Sidebar.Dim" },
     });
 
     // The marks were already collected against their rows; they now travel with them. One call

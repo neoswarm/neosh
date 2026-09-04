@@ -36,6 +36,7 @@ import type { CredentialSource } from "./generated/CredentialSource";
 import type { CursorMotion } from "./generated/CursorMotion";
 import type { CursorShape } from "./generated/CursorShape";
 import type { SelectShape } from "./generated/SelectShape";
+import type { ScrollAmount } from "./generated/ScrollAmount";
 import type { DiffTarget } from "./generated/DiffTarget";
 import type { Dock } from "./generated/Dock";
 import type { Gravity } from "./generated/Gravity";
@@ -153,7 +154,7 @@ export type {
   CostBasis, QuotaCredits, QuotaSample, QuotaSeverity, QuotaSnapshot, QuotaSource, QuotaWindow,
   InstallMethod, UpdateOutcome, UpdateStatus,
   UsageBucket, UsageHistory, UsageResolution, UsageScanSource,
-  Rect, RepoInfo, RepoStatus, SelectShape, SessionId, SessionInfo, StatusAlign, StatusSegment, StopReason,
+  Rect, RepoInfo, RepoStatus, ScrollAmount, SelectShape, SessionId, SessionInfo, StatusAlign, StatusSegment, StopReason,
   SurfaceCell, SurfaceId, TextEdit, ToolCall, ToolDef, ToolResult, TurnRequest, Usage,
   NodeCapabilities, NodeId, NodeInfo, ProjectKey, RemoteProject, StreamEvent,
   SwarmAgent, SwarmNode, SwarmStranger,
@@ -368,6 +369,16 @@ export interface FloatOptions {
   border?: FloatConfig["border"];
   borderHl?: string;
   title?: string;
+  /**
+   * A strip on the bottom border: what the keys here do.
+   *
+   * On the border rather than in the buffer, because a key strip written as a row of content is one
+   * that scrolls away exactly when it is wanted, and is the first thing clipped on a terminal too
+   * short for the panel. It costs no content row and cannot be scrolled off.
+   *
+   * Clipped to the border's width like the title, so it is for a legend and not for prose.
+   */
+  footer?: string;
   closeOnBlur?: boolean;
   focusable?: boolean;
   /**
@@ -384,6 +395,24 @@ export interface FloatOptions {
    * control sheet. Not for a hint or a hover card.
    */
   modal?: boolean;
+  /**
+   * This panel is a place you can move in when it does not fit.
+   *
+   * You ask for a height and get whatever there is: `{ kind: "max", n: 30 }` on a twenty-row
+   * terminal is ten rows of panel and twenty rows of content drawn nowhere, with no key pointed at
+   * them and nothing on screen to say they exist. Set this and the workspace's scroll keys resolve
+   * here — `j`/`k`, `^D`/`^U`, `^F`/`^B`, `gg`/`G`, the arrows and the paging keys — along with the
+   * mouse wheel, and a bar appears down the right border while anything is hidden.
+   *
+   * They are ordinary bindings on `{ kind: "buf_kind", name: "neosh.scroll" }`, so `^Z` lists them
+   * and `init.ts` moves them. That scope sits *below* your buffer's own kind, so a key you bind on
+   * your panel is still yours — and above `global`, so it works under `modal` too.
+   *
+   * For a panel of rows you read: a key sheet, a diff, a status, a help screen. **Not** for one with
+   * a cursor of its own — a picker, a list — which already scrolls to keep the cursor on screen and
+   * whose filter would lose `j` and `G` to this.
+   */
+  scroll?: boolean;
 }
 
 export interface Neosh {
@@ -689,6 +718,19 @@ export interface WindowApi {
    * its first row at `0`. Anything else shows the same thing either way.
    */
   scrollTo(win: WindowId, topLine: number | null): Promise<void>;
+  /**
+   * Move a window's scroll by a line, a half screen, a screen, or all the way to an end.
+   *
+   * What {@link scrollTo} cannot express, because the arithmetic is not yours to do: "half a screen"
+   * is counted in the buffer rows the frontend actually drew — which on a wrapping window is fewer
+   * than its height — and the floor is the last screenful rather than the last line, so the bottom
+   * is a full panel and not one row above an empty one. Both numbers are a frame old by the time
+   * {@link viewport} hands them to you; this reads them where they live.
+   *
+   * The keys bound on `neosh.scroll` run exactly this. Call it directly for a scroll a key did not
+   * ask for — following output, or a button on a panel of your own.
+   */
+  scroll(win: WindowId, amount: ScrollAmount): Promise<void>;
   /**
    * How big this window actually is, in cells.
    *
@@ -1213,6 +1255,32 @@ export interface GenApi {
    * do not each reimplement that. Rejects if there is no JSON in the response at all.
    */
   json<T = unknown>(prompt: string, opts?: { system?: string; selection?: ModelSelection }): Promise<T>;
+  /**
+   * One value, asked for as JSON and accepted however it comes back.
+   *
+   * The shape almost every generating plugin actually wants: a branch name, a thread title, a PR
+   * subject — one string, asked for as `{"branch": …}` because that is how you pin a model down,
+   * and answered as a bare `fix/composer-paste` often enough to matter. Both are the same answer,
+   * and {@link GenApi.json} rejects the second one — which is a correct name thrown away, with
+   * nothing on screen to say so.
+   *
+   * So the key is passed down and a bare reply is read as its value. Everything
+   * {@link GenApi.json} tolerates is tolerated first and unchanged; this is only what happens when
+   * there is no JSON at all. Rejects on an empty answer, or on prose it will not guess at.
+   *
+   * For one value only. A commit message is a subject and a body, and there is no answering the
+   * question of which one a lone paragraph is — that stays {@link GenApi.json}.
+   *
+   * And only for a value you would know was wrong on sight. A branch name is that, and a wrong one
+   * is one rename away; a thread title is any short line, and so is a refusal or a driver's own
+   * error message — where nothing distinguishes an answer from a remark, the envelope is the
+   * evidence, and {@link GenApi.json} is the call.
+   */
+  field(
+    prompt: string,
+    key: string,
+    opts?: { system?: string; selection?: ModelSelection },
+  ): Promise<string>;
 }
 
 /**
@@ -1996,9 +2064,11 @@ function floatConfig(o: FloatOptions = {}): FloatConfig {
     border: o.border ?? "rounded",
     border_hl: o.borderHl ?? null,
     title: o.title ?? null,
+    footer: o.footer ?? null,
     close_on_blur: o.closeOnBlur ?? false,
     focusable: o.focusable ?? true,
     modal: o.modal ?? false,
+    scroll: o.scroll ?? false,
   };
 }
 
@@ -2522,6 +2592,9 @@ function build(
       async scrollTo(win, topLine) {
         await c({ call: "win_scroll_to", win, top_line: topLine });
       },
+      async scroll(win, amount) {
+        await c({ call: "win_scroll", win, amount });
+      },
       async viewport(win) {
         return expect(await c({ call: "win_get_viewport", win }), "viewport").viewport ?? null;
       },
@@ -2877,6 +2950,23 @@ function build(
           selection: opts?.selection ?? null,
         });
         return expect(v, "json").value as never;
+      },
+      async field(prompt, key, opts) {
+        const v = await c({
+          call: "gen_complete",
+          prompt,
+          system: opts?.system ?? null,
+          json: true,
+          field: key,
+          selection: opts?.selection ?? null,
+        });
+        const value = (expect(v, "json").value as Record<string, unknown>)?.[key];
+        // A key that came back as something other than a non-empty string is an answer to a
+        // different question, and the caller is about to name a branch after it.
+        if (typeof value !== "string" || value.trim() === "") {
+          throw new Error(`the model returned no ${key}`);
+        }
+        return value.trim();
       },
     },
     view: {

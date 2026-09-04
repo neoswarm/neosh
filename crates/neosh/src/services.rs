@@ -486,6 +486,7 @@ impl Services {
         prompt: String,
         system: Option<String>,
         json: bool,
+        field: Option<String>,
         selection: Option<ModelSelection>,
     ) -> ApiResult {
         // Precedence: what the caller asked for, then `gen.model`, then the session's own model.
@@ -504,9 +505,17 @@ impl Services {
         }
         match extract_json(&text) {
             Some(value) => Ok(ApiOk::Json { value }),
-            None => Err(ApiError::Internal {
-                message: format!("expected JSON, got: {}", truncate(&text, 200)),
-            }),
+            // The envelope is missing and the caller said what a bare answer would be. See
+            // [`ApiCall::GenComplete::field`]: the model answered the question and skipped the
+            // wrapper, which is a shape to accept rather than a failure to report.
+            None => match field.and_then(|key| bare_value(&text).map(|v| (key, v))) {
+                Some((key, value)) => {
+                    Ok(ApiOk::Json { value: serde_json::json!({ key: value }) })
+                }
+                None => Err(ApiError::Internal {
+                    message: format!("expected JSON, got: {}", truncate(&text, 200)),
+                }),
+            },
         }
     }
 }
@@ -600,6 +609,41 @@ pub fn extract_json(text: &str) -> Option<serde_json::Value> {
     None
 }
 
+/// The answer itself, when the model gave the value and left the envelope off.
+///
+/// Only ever consulted after [`extract_json`] has failed, and only when the caller named the key a
+/// bare answer belongs under. What it accepts is deliberately narrow: **the whole reply, trimmed,
+/// is one short line.** `fix/tab-strip-missing-in-worktree` is that; a paragraph explaining why the
+/// model would rather not is not, and neither is an answer with a preamble above it — which stays a
+/// failure exactly as it was, because "the last line of some prose" is a guess and this is not.
+///
+/// A fence and the quotes some models wrap a lone string in come off first: ```` ```fix/thing``` ````
+/// and `"fix/thing"` are the same answer written three ways.
+///
+/// This is a check on the *shape* of a reply, not on the truth of it — which is what decides who
+/// may ask for it. A branch name is checkable by the caller and a wrong one is one `git branch -m`
+/// away; a *title* is any short line, and so is `(mock provider has no script)`, so the envelope is
+/// the only evidence a title was answered rather than commented on. The rule that falls out:
+/// `field` is for a value you would recognise as wrong on sight.
+fn bare_value(text: &str) -> Option<String> {
+    let mut body = text.trim();
+    // ```lang\n…\n``` — and ```…``` on one line, which is what a fenced single value looks like.
+    if let Some(rest) = body.strip_prefix("```")
+        && let Some(rest) = rest.strip_suffix("```")
+    {
+        body = match rest.split_once('\n') {
+            Some((first, tail)) if !first.contains(char::is_whitespace) => tail,
+            _ => rest,
+        }
+        .trim();
+    }
+    let body = body.trim_matches(['"', '\'', '`', ' ']).trim();
+    let one_line = !body.is_empty() && !body.contains('\n');
+    // Room for any name a prompt would ask for, and far short of anything with a second sentence
+    // in it.
+    (one_line && body.chars().count() <= 200).then(|| body.to_string())
+}
+
 fn truncate(s: &str, n: usize) -> String {
     // Byte slicing a model's output would panic on a multi-byte boundary, which is a spectacular
     // way to crash while reporting a different error.
@@ -664,6 +708,40 @@ mod tests {
     fn prose_with_no_json_is_none() {
         assert!(extract_json("I'm sorry, I can't do that.").is_none());
         assert!(extract_json("").is_none());
+    }
+
+    /// The whole reason [`bare_value`] exists, taken from two real answers.
+    ///
+    /// Asked for `{"branch": …}`, `claude` returned `feature/project-picker-locations` — the name
+    /// it had been asked for, without the envelope. Read as JSON that is a failed request, and the
+    /// worktree kept the name nobody chose for good.
+    #[test]
+    fn an_answer_without_its_envelope_is_still_the_answer() {
+        assert_eq!(bare_value("feature/project-picker-locations").as_deref(), Some("feature/project-picker-locations"));
+        assert_eq!(bare_value("\n  fix/tab-strip-missing-in-worktree \n").as_deref(), Some("fix/tab-strip-missing-in-worktree"));
+        // The wrappings a lone string arrives in.
+        assert_eq!(bare_value("\"fix/login\"").as_deref(), Some("fix/login"));
+        assert_eq!(bare_value("`fix/login`").as_deref(), Some("fix/login"));
+        assert_eq!(bare_value("```\nfix/login\n```").as_deref(), Some("fix/login"));
+        assert_eq!(bare_value("```text\nfix/login\n```").as_deref(), Some("fix/login"));
+        // A title is a value too, and it has spaces in it.
+        assert_eq!(
+            bare_value("Make popups scrollable with keys").as_deref(),
+            Some("Make popups scrollable with keys")
+        );
+    }
+
+    /// What it will not guess at.
+    ///
+    /// A reply with more than one line in it may be an answer with a preamble above it or a
+    /// refusal with a reason under it, and nothing here can tell which — so it stays the failure
+    /// it already was rather than becoming a branch named after the first sentence of an apology.
+    #[test]
+    fn bare_prose_is_not_a_value() {
+        assert!(bare_value("Here you go:\nfix/login").is_none());
+        assert!(bare_value("").is_none());
+        assert!(bare_value("   \n  ").is_none());
+        assert!(bare_value(&"x".repeat(201)).is_none());
     }
 
     #[test]

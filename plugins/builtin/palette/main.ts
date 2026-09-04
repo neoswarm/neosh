@@ -13,7 +13,7 @@
 
 import type { KeymapEntry, Neosh, PluginContext } from "@neosh/api";
 import { byteLength } from "@neosh/api";
-import { picker } from "@neosh/api/ui";
+import { pager, picker } from "@neosh/api/ui";
 
 type Entry =
   | { kind: "command"; name: string }
@@ -30,14 +30,6 @@ export async function activate({ neosh, subscriptions }: PluginContext) {
       desc: "Show every key binding",
     }),
   );
-  // Registered once rather than per overlay: a command name is global, and re-registering it on
-  // every `<C-z>` would leave the previous window's handler shadowed and its float on screen.
-  subscriptions.push(
-    await neosh.cmd.register("help.keys.key", () => void dismissKeys?.(), {
-      desc: "Dismiss the key list",
-    }),
-  );
-
   // `:checkhealth`: every plugin, what became of it, and what each one put in the registries.
   // No default key — `^K` runs it by name.
   subscriptions.push(
@@ -117,8 +109,13 @@ async function open(neosh: Neosh): Promise<void> {
  * Every binding, grouped by mode.
  *
  * Read from the registry rather than written down, so it cannot drift — and so a plugin's keys
- * appear here without that plugin knowing this exists. It closes on any key, because a help window
- * you have to work out how to dismiss is a help window that taught you the wrong thing first.
+ * appear here without that plugin knowing this exists.
+ *
+ * It is also, reliably, the longest panel in the workspace — a hundred and forty rows on a full
+ * install — and it used to close on *any* key, which on a screen shorter than the list meant the
+ * only thing you could do with the part you could not see was dismiss it. So it scrolls, and the
+ * keys that scroll it are the reader's; what closes it is `<Esc>`, `q`, `<CR>` and `^Z` again, said
+ * on the bottom edge where they cannot scroll away.
  */
 async function showKeys(neosh: Neosh): Promise<void> {
   const modes = ["chat", "normal", "insert", "visual"] as const;
@@ -206,47 +203,50 @@ async function showKeys(neosh: Neosh): Promise<void> {
   }
 
   if (rows.length === 0) rows.push({ text: "no bindings" });
-  rows.push({ text: "" });
-  rows.push({ text: "  any key closes this", heading: false });
 
-  // A second `<C-z>` replaces the first window rather than stacking one behind it.
-  await dismissKeys?.();
-
-  const buf = await neosh.buf.create({ name: "[keys]", scratch: true });
-  const ns = await neosh.ns.create("neosh.help");
-  await neosh.buf.setLines(buf, 0, -1, rows.map((r) => r.text));
-  for (let i = 0; i < rows.length; i++) {
-    const r = rows[i]!;
-    if (r.heading) {
-      await neosh.ns.mark(ns, buf, i, 0, { hlGroup: "Title", endCol: byteLength(r.text) });
-    } else if (r.key) {
-      await neosh.ns.mark(ns, buf, i, r.key[0], { hlGroup: "Key", endCol: r.key[1] });
-    }
+  // A second `<C-z>` closes the one that is open rather than replacing it. It used to rebuild the
+  // panel in place, which looks identical to nothing happening — and a key that opens a thing is
+  // the key everybody presses to put it away again.
+  if (dismissKeys) {
+    await dismissKeys();
+    return;
   }
 
-  const win = await neosh.float.open(buf, {
-    anchor: { kind: "screen" },
-    width: { kind: "max", n: 64 },
-    height: { kind: "max", n: 24 },
-    border: "rounded",
+  // Marks per row rather than a colour written into the text: the key is one group and what it does
+  // is another, and a heading is the row's whole width.
+  const marks = rows.map((r) =>
+    r.heading
+      ? [{ col: 0, opts: { hlGroup: "Title", endCol: byteLength(r.text) } }]
+      : r.key
+      ? [{ col: r.key[0], opts: { hlGroup: "Key", endCol: r.key[1] } }]
+      : []
+  );
+
+  await pager(neosh, rows.map((r) => r.text), {
     title: " keys ",
-    closeOnBlur: true,
-    focusable: true,
+    width: 64,
+    // A ceiling. The list is a hundred and forty rows on a full install and the screen is whatever
+    // it is; what is past the bottom is reached by scrolling, which is what this panel could not do
+    // and is the reason it used to close on any key at all.
+    height: 24,
+    kind: KIND_KEYS,
+    marks,
     // Above the panels, because this is asked *from* one. `?` in a panel is the key that answers
     // "what do the keys here do", and every panel worth asking it in is a float of its own — so at
     // the default depth the answer opened underneath the question and read as nothing happening.
     z: 300,
+    onOpen: (close) => {
+      dismissKeys = async () => {
+        dismissKeys = null;
+        await close();
+      };
+    },
   });
-  await neosh.focus.push(win);
-
-  const capture = await neosh.keymap.capture(win, "help.keys.key").catch(() => null);
-  dismissKeys = async () => {
-    dismissKeys = null;
-    capture?.dispose();
-    await neosh.focus.pop().catch(() => {});
-    await neosh.win.close(win).catch(() => {});
-  };
+  dismissKeys = null;
 }
+
+/** This panel's own kind, so `?` in it lists *its* keys and a third party can bind against it. */
+const KIND_KEYS = "neosh.keys";
 
 /** Closes whichever key list is open, if any. Set while one is on screen and cleared as it goes. */
 let dismissKeys: (() => Promise<void>) | null = null;
