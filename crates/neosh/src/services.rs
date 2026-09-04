@@ -291,10 +291,23 @@ impl Services {
         Ok(ApiOk::Unit)
     }
 
-    pub async fn git_pull(&self, cwd: Option<String>) -> ApiResult {
-        self.permit_write("pull")?;
+    /// Contact the remote and answer with where the tree now stands.
+    ///
+    /// Gated as a write, and the reason is not that anything in the working tree moves — nothing
+    /// does. It is that this leaves the machine: it opens a connection to whatever `origin` points
+    /// at, presents whatever credentials that host wants, and writes refs under `refs/remotes`. A
+    /// plugin that may not run `git pull` should not be able to have this workspace phone a remote
+    /// on its behalf either, and `vcs_write` is the word already in the manifests that says so.
+    pub async fn git_fetch(&self, cwd: Option<String>) -> ApiResult {
+        self.permit_write("fetch")?;
         let repo = self.repo_at(cwd).await?;
-        Ok(ApiOk::Text { text: repo.pull().await.map_err(vcs_err)? })
+        Ok(ApiOk::Status { status: repo.fetch().await.map_err(vcs_err)? })
+    }
+
+    pub async fn git_pull(&self, cwd: Option<String>, rebase: bool) -> ApiResult {
+        self.permit_write(if rebase { "pull --rebase" } else { "pull" })?;
+        let repo = self.repo_at(cwd).await?;
+        Ok(ApiOk::Text { text: repo.pull(rebase).await.map_err(vcs_err)? })
     }
 
     pub async fn git_remove_worktree(

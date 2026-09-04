@@ -1153,11 +1153,34 @@ export interface GitApi {
   unstage(paths?: string[]): Promise<void>;
   commit(message: string): Promise<CommitInfo>;
   /**
+   * `git fetch --prune`, answering with where the tree stands *after* it.
+   *
+   * **The one call that makes `ahead` and `behind` mean anything.** `status()` reads them off
+   * `git status --branch`, which compares HEAD with the remote-tracking ref sitting on this disk —
+   * so a panel drawing `↓0` from it is reporting the state of the world as of whenever this
+   * checkout last spoke to a remote. Call this first and the number is news; do not, and it is
+   * archaeology.
+   *
+   * It answers with the fresh {@link RepoStatus} rather than nothing, so "fetch and see where I am"
+   * is one round trip. Prunes, because a picker offering six branches that were deleted when their
+   * pull requests merged is worse than one that is a fetch behind.
+   *
+   * A write, and the reason is the network rather than the working tree, which does not move:
+   * this contacts a remote and writes refs. It fails rather than hangs when there are no
+   * credentials — stdin is closed and every askpass unset — which is what makes it safe to put on
+   * a timer. Expect it to reject routinely: no remote, no network, a key the host will not take.
+   */
+  fetch(opts?: { cwd?: string }): Promise<RepoStatus>;
+  /**
    * `git pull`, answering with git's own summary — "Already up to date.", the fast-forward range —
    * because those are different answers and a caller showing neither is a caller nobody trusts.
    * `cwd` picks the repository, as everywhere; absent means the conversation's own.
+   *
+   * `rebase` replays this branch's commits on top of what arrived instead of merging them. It is
+   * the answer to a diverged branch and it rewrites local commits, so ask before you set it — the
+   * caller this exists for is a panel that has just said "diverged" and offered the choice.
    */
-  pull(opts?: { cwd?: string }): Promise<string>;
+  pull(opts?: { cwd?: string; rebase?: boolean }): Promise<string>;
   addWorktree(
     path: string,
     branch: string,
@@ -2817,8 +2840,12 @@ function build(
           cwd: opts?.cwd ?? null,
         });
       },
+      async fetch(opts) {
+        const v = await c({ call: "git_fetch", cwd: opts?.cwd ?? null });
+        return expect(v, "status").status;
+      },
       async pull(opts) {
-        const v = await c({ call: "git_pull", cwd: opts?.cwd ?? null });
+        const v = await c({ call: "git_pull", cwd: opts?.cwd ?? null, rebase: opts?.rebase ?? false });
         return expect(v, "text").text;
       },
       async removeWorktree(path, opts) {

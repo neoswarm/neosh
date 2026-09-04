@@ -20,6 +20,43 @@ The arrangement (pins, order, folds) is saved under `~/.local/state/neosh/plugin
 "sidebar.refresh_ms" = 4000
 ```
 
+## The repository block
+
+At the top of the column, above the projects: which branch the conversation you are in is on, what has drifted from the remote, and one key that does something about it.
+
+```
+ GIT                           ^G
+──────────────────────────────────
+ main ↓3 ~1 ?1
+ ↓ pull 3 commits             now
+```
+
+The second row is a button, and its label is rebuilt from the state every time it is drawn, so it is never pointed at something that would do nothing:
+
+| It says | Because | `↵` does |
+|---|---|---|
+| `↓ pull 3 commits` | three commits are waiting for you | fast-forwards, and says what git said |
+| `⇄ diverged — 2 up, 3 down` | both sides have moved, so a plain pull cannot just fast-forward | asks **rebase or merge**, in those words, and does the one you pick |
+| `↻ check for changes` | nothing is waiting as of the last time we asked | asks the remote again |
+| `→ no upstream` | this branch tracks nothing, so there is nothing to be behind | nothing — it is a statement, not a verb |
+
+`⇥` on a git row steps the block between `one` (the two rows above) and `full`, which adds the upstream it tracks and a line about the working tree. `^G` opens the full status, and every row in the block opens it on `↵`… except the button, which is the button.
+
+### The numbers are asked for, not remembered
+
+`↑` and `↓` come from `git status`, which compares your branch with the copy of the remote **sitting on your disk** — so drawn without ever fetching, `↓0` means "nothing had arrived as of whenever this checkout last spoke to a server", which after an afternoon's work is a sentence about breakfast. So neosh fetches: on a slow timer, and when you arrive in a conversation.
+
+```toml
+[options]
+"git.sidebar" = true          # the block itself
+"git.sidebar.style" = "one"   # "one" or "full" — ⇥ steps it
+"git.fetch.interval" = 180    # seconds; 0 never asks on its own
+```
+
+Only the repository of the conversation you are in, and only when its branch tracks a remote one. The dim column at the right of the button is how old the numbers are — `now`, `12m`, or `⚠ offline` when the last ask failed. With `git.fetch.interval = 0` nothing leaves your machine unless you press the key, and that column is what tells you the numbers are old rather than untrue.
+
+While a fetch or a pull is out, the row spins and its text sweeps. Nothing else in the block moves: `↓3` is news, not something happening, and a row that blinks about news you have already read costs attention every time it changes.
+
 ## Worktrees
 
 A worktree is a second checkout of the same repository on a different branch, and neosh treats one as a project: it nests in the sidebar under the repository it is a tree of, named by its branch, with its own conversations, fold and order.

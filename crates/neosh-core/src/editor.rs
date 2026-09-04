@@ -844,6 +844,7 @@ impl Editor {
                 | ApiCall::GitStage { .. }
                 | ApiCall::GitUnstage { .. }
                 | ApiCall::GitCommit { .. }
+                | ApiCall::GitFetch { .. }
                 | ApiCall::GitPull { .. }
                 | ApiCall::GitAddWorktree { .. }
                 | ApiCall::GitRemoveWorktree { .. }
@@ -2752,6 +2753,7 @@ fn call_name(call: &ApiCall) -> &'static str {
         ApiCall::GitStage { .. } => "git.stage",
         ApiCall::GitUnstage { .. } => "git.unstage",
         ApiCall::GitCommit { .. } => "git.commit",
+        ApiCall::GitFetch { .. } => "git.fetch",
         ApiCall::GitPull { .. } => "git.pull",
         ApiCall::GitAddWorktree { .. } => "git.addWorktree",
         ApiCall::GitRemoveWorktree { .. } => "git.removeWorktree",

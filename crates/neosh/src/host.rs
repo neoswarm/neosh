@@ -1533,6 +1533,10 @@ impl Host {
                 | ApiCall::GitStage { .. }
                 | ApiCall::GitUnstage { .. }
                 | ApiCall::GitCommit { .. }
+                // Network, and the reason this list exists: a fetch against a remote that is
+                // slow, unreachable or asking for a key it will not get takes as long as a TCP
+                // timeout, and on the loop that is every terminal in the workspace frozen for it.
+                | ApiCall::GitFetch { .. }
                 | ApiCall::GitPull { .. }
                 | ApiCall::GitAddWorktree { .. }
                 | ApiCall::GitRemoveWorktree { .. }
@@ -13686,7 +13690,8 @@ async fn run_slow(svc: Services, call: ApiCall) -> ApiResult {
         ApiCall::GitStage { paths } => svc.git_stage(paths).await,
         ApiCall::GitUnstage { paths } => svc.git_unstage(paths).await,
         ApiCall::GitCommit { message } => svc.git_commit(message).await,
-        ApiCall::GitPull { cwd } => svc.git_pull(cwd).await,
+        ApiCall::GitFetch { cwd } => svc.git_fetch(cwd).await,
+        ApiCall::GitPull { cwd, rebase } => svc.git_pull(cwd, rebase).await,
         ApiCall::GitAddWorktree { path, branch, create, cwd } => {
             svc.git_add_worktree(path, branch, create, cwd).await
         }

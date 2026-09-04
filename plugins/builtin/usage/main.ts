@@ -198,13 +198,18 @@ async function installStrip({ neosh, subscriptions }: PluginContext) {
     }, { desc: "Show or hide the plan at the foot of the sidebar" }),
   );
   // And a key on the rows themselves. `<Tab>` because that is what opens and folds a thing you are
-  // standing on everywhere else in neosh, and `on: "custom"` so it is a verb about *these* rows
+  // standing on everywhere else in neosh, and `custom:plan` so it is a verb about *these* rows
   // rather than one advertised over every conversation in the panel.
+  //
+  // Named down to the section rather than left at bare `custom`, which is every contributed row in
+  // the column: that was fine while this was the only block in it and wrong the moment there was a
+  // second, since the git block wants `<Tab>` on its own rows for the same reason and both are
+  // right. One key, and the row under the cursor decides which of the two it means.
   await neosh.ext.contribute("sidebar.action", "plan.detail", {
     key: "<Tab>",
     label: "plan detail",
     command: `${NS}.sidebar.cycle`,
-    on: "custom",
+    on: "custom:plan",
   }).catch(() => {});
   subscriptions.push({
     dispose: () => void neosh.ext.remove("sidebar.action", "plan.detail").catch(() => {}),

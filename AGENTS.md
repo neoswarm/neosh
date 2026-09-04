@@ -426,6 +426,37 @@ is `docs/releasing.md`.
   read on every redraw, so `GitRenameBranch` is the one git write handled on the host loop, which
   is what makes the sidebar row follow instead of saying `wily-nimbus` until restart. The directory
   keeps the old name on purpose: moving it would invalidate the conversation's `cwd`.
+- **A number about a remote has an *as of*, or it is not a number about a remote.** `ahead` and
+  `behind` come out of `git status --porcelain=v2 --branch`, which compares HEAD with the
+  remote-tracking ref **on this disk** — so every panel drawing them was reporting the state of the
+  world as of whenever this checkout last spoke to a server, and none of them had a call available
+  to become right. `ApiCall::GitFetch` is that call, it answers with the fresh `RepoStatus` rather
+  than `Unit` because "where do I now stand" is the question actually being asked, and it is gated
+  as a **write** for the network rather than for the working tree: nothing in the tree moves, and it
+  contacts a remote and writes refs, which is not something a plugin barred from `git pull` should
+  be able to have the workspace do on its behalf. It is safe on a timer only because `run` closes
+  stdin and unsets every askpass, so no credentials means a failure in a moment rather than a hang
+  nobody can see — and a failure is *filed*, not announced, because a workspace fetching every three
+  minutes on a train would otherwise be a toast every three minutes about a network you know is not
+  there. What is said instead is the age beside the numbers: `now`, `12m`, `⚠ offline`. Without it,
+  a panel that has not fetched since Tuesday and one that fetched nine seconds ago draw the same
+  row.
+- **The verb on a panel row is rebuilt from the state, never fixed.** A `pull` button that is a
+  no-op nine times out of ten is a button people learn not to press, and the tenth time is the one
+  that mattered. So the sidebar's git row says `pull 3 commits` when there are three, `check for
+  changes` when nothing is waiting — the honest verb for a count that is only as fresh as the last
+  fetch — and, when the branch has gone both ways, it *names the choice*: `rebase or merge`, in
+  those words, as a picker, because the two do different things to your own commits, one of them
+  rewrites them, and neither is guessable from a row or from a yes-or-no over a question that was
+  never stated. A fast-forward asks nothing, for the reason everything reversible asks nothing.
+- **A key on a contributed row belongs to the section, not to "contributed".** `on: "custom"` meant
+  *every* contributed row in the panel, which was indistinguishable from "mine" while there was one
+  block in the column and wrong the moment there were two: the plan strip and the git block both
+  want `⇥` on their own rows and both are right, and one `keymap.set` per action made that one
+  winner and one plugin whose key silently did nothing. `custom:<section id>` is the narrow form,
+  the panel binds each key **once** and dispatches to whichever claimant matches the row under the
+  cursor — narrow before `any`, the same ranking the hint strip prints in — and the strip prints one
+  line per key, because advertising two meanings for one press is being wrong about at least one.
 - **A project outlives the conversations in it.** The panel's list is written down (`sidebar.projects`,
   a workspace var) rather than worked out from where the conversations happen to be — derived, it
   deleted the directory you had worked in all month the moment you cleared out the last thread in
@@ -999,9 +1030,48 @@ says how many are asking, `^T` is where you go, and it opens when you get there.
 | `d` | Remove a worktree from disk — its branch stays, and it asks first (a git-plugin contribution) |
 | `x` `X` | Archive, delete. On a project heading, `X` takes the project off the list — the only thing that does |
 | `a` | The archive — the popup below. Nothing archived is ever a row in *this* panel, and by default not even a count. An `archive.action` contribution, not a key this panel owns |
-| `⇥` | On the plan rows: how much of it to show — the limit that binds, every limit, or all of it with the account and the sentence. `usage.sidebar.style` is where it starts, `usage.sidebar` turns it off |
+| `⇥` | On the plan rows: how much of it to show — the limit that binds, every limit, or all of it with the account and the sentence. `usage.sidebar.style` is where it starts, `usage.sidebar` turns it off. On the **git** rows it is the same key about that block — `git.sidebar.style` — because a key on a contributed row is named down to the section (`custom:git`, `custom:plan`) and the panel sends the press to whichever block the cursor is over |
 | `?` | The keys for whatever row you are on |
 | `Esc` | Back to the composer |
+
+## The repository, at the top of the panel
+
+Two rows above the projects: which branch the conversation you are in is on, what has drifted from
+the remote, and **one key that does something about it**. It is a `sidebar.section` contribution
+like the plan strip, so `git.sidebar = false` takes it off and a panel that is not ours picks it up
+unchanged.
+
+```
+ GIT                           ^G
+──────────────────────────────────
+ main ↓3 ~1 ?1
+ ↓ pull 3 commits             now
+```
+
+**The verb row is rebuilt from the state every draw**, so the key is never pointed at something that
+would do nothing — which is what a fixed `pull` button that is a no-op nine times in ten teaches
+people. `↓ pull 3 commits` fast-forwards and says what git said; `⇄ diverged — 2 up, 3 down` asks
+*rebase or merge*, in those words, because the two answers do different things to your own commits
+and neither is guessable from the row; `↻ check for changes` asks the remote again, which is the
+honest verb for a number that is only as fresh as the last fetch; `→ no upstream` is a statement and
+not a verb, because a branch tracking nothing is not behind anything. `⇥` steps the block between
+`one` and `full`, which adds the upstream and a line about the working tree.
+
+**Ahead and behind are asked for, not remembered.** They come off `git status --branch`, which
+compares HEAD with the remote-tracking ref *on this disk* — so a panel drawing `↓0` without ever
+fetching is reporting the world as of whenever this checkout last spoke to a server, which after an
+afternoon is a sentence about breakfast. `ApiCall::GitFetch` is what makes it true: on
+`git.fetch.interval` (180 s, `0` never), on arriving in a conversation, and on the key. Only the
+repository of the conversation you are in, only when its branch tracks one, and the dim column at
+the right of the verb row is how old the answer is — `now`, `12m`, `⚠ offline` — because a claim
+about a remote without an *as of* cannot be told from a claim about now.
+
+**And the block moves only while it is talking to a server.** A fetch is seconds of nothing on
+screen against somebody else's machine, which is the one case where a still panel and a wedged one
+look identical, so it gets both halves of the vocabulary: a spinner glyph and `Git.Fetching`, which
+sweeps. Nothing else here animates, and the restraint is the point — `↓3` is news exactly as an
+unread conversation is news, it is true until you act rather than *happening*, and motion spent on
+it is attention charged every time it changes with nothing new to say.
 
 ## The archive — `^F`, or `a` in the project panel
 

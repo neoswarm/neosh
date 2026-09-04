@@ -1501,6 +1501,28 @@ pub enum ApiCall {
     GitCommit {
         message: String,
     },
+    /// `git fetch --prune`, answering with where the working tree now stands.
+    ///
+    /// **Ahead and behind are a fact about the last fetch, not about the remote.** They come off
+    /// the branch header `git status --porcelain=v2 --branch` prints, which compares HEAD with the
+    /// *remote-tracking ref on this disk* — so a panel drawing `↓0` is saying "nothing had arrived
+    /// as of whenever this checkout last spoke to its remote", which on a machine you have been
+    /// working on all afternoon is a sentence about breakfast. Every one of those panels was
+    /// therefore confidently wrong and had no call available to become right.
+    ///
+    /// It answers with a [`RepoStatus`] rather than `Unit` for the same reason
+    /// [`Self::GitPull`] answers with text: the question a caller is really asking is "where do I
+    /// now stand", and making them follow every fetch with a [`Self::GitStatus`] is a second round
+    /// trip for an answer this call already had in its hand. It is also the only shape in which
+    /// "the fetch moved nothing" and "the fetch brought three commits" are one answer.
+    ///
+    /// Network, so it is a *write* as far as the permission layer is concerned even though nothing
+    /// in the working tree moves: it contacts a remote and writes refs under `refs/remotes`.
+    GitFetch {
+        /// The repository to fetch in. The conversation's own when absent.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cwd: Option<String>,
+    },
     /// `git pull` in a repository, answering with what git said about it.
     ///
     /// The summary comes back rather than being swallowed, because "Already up to date" and
@@ -1510,6 +1532,16 @@ pub enum ApiCall {
         /// The repository to pull in. The conversation's own when absent.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         cwd: Option<String>,
+        /// Replay this branch's own commits on top of what arrived, rather than merging.
+        ///
+        /// A flag rather than a call of its own because it is one argument to one command, and the
+        /// caller that needs it is the one that has just been told the branch diverged — at which
+        /// point "rebase or merge" is the question being answered, and two entry points for the two
+        /// answers would be two things to keep in step for no gain.
+        ///
+        /// It rewrites local commits, which is why nothing sets it without asking first.
+        #[serde(default)]
+        rebase: bool,
     },
     GitAddWorktree {
         path: String,

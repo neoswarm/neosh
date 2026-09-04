@@ -479,11 +479,29 @@ export type ApiCall =
   | { "call": "git_unstage"; paths: Array<string> }
   | { "call": "git_commit"; message: string }
   | {
+    "call": "git_fetch";
+    /**
+     * The repository to fetch in. The conversation's own when absent.
+     */
+    cwd?: string | null;
+  }
+  | {
     "call": "git_pull";
     /**
      * The repository to pull in. The conversation's own when absent.
      */
     cwd?: string | null;
+    /**
+     * Replay this branch's own commits on top of what arrived, rather than merging.
+     *
+     * A flag rather than a call of its own because it is one argument to one command, and the
+     * caller that needs it is the one that has just been told the branch diverged — at which
+     * point "rebase or merge" is the question being answered, and two entry points for the two
+     * answers would be two things to keep in step for no gain.
+     *
+     * It rewrites local commits, which is why nothing sets it without asking first.
+     */
+    rebase: boolean;
   }
   | {
     "call": "git_add_worktree";
