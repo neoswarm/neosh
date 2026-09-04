@@ -48,7 +48,6 @@ import {
   spinnerFrame,
   statusPrefix,
 } from "@neosh/api/ui";
-import type { PickerItem } from "@neosh/api/ui";
 
 // ---------------------------------------------------------------------------
 // Default prompts
