@@ -12,6 +12,16 @@
 //! network, it can hang, and nothing on screen should wait for it. What it produces is kept, so
 //! the answer to "is there an update" is instant and the *checking* is what happens in the
 //! background.
+//!
+//! And there is a third question underneath both, which is the one people actually get stuck on:
+//! *is the binary on disk the binary I am running*. It is not the same as either. Most installs
+//! are managed, so most updates happen in another terminal — `brew upgrade neosh` finishes, says
+//! it succeeded, and the workspace goes on executing the inode it started with. Nothing had
+//! noticed and nothing said so, so the version you had just installed was not the version you were
+//! using, for as long as that workspace lived. It is answered by a `stat` rather than by a
+//! registry: the executable is stamped at startup and compared afterwards, which is true for a
+//! `brew upgrade`, an `npm install -g`, a `cargo install --force`, a re-run of `install.sh` and
+//! our own rename alike — and needs nothing from the network, so it is still true on a train.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -25,9 +35,20 @@ use tokio::sync::RwLock;
 const LATEST: &str = "https://api.github.com/repos/neoswarm/neosh/releases/latest";
 const DOWNLOAD: &str = "https://github.com/neoswarm/neosh/releases/download";
 
-/// How long a check is good for. A day: the thing being watched changes on the order of weeks, and
-/// a workspace can run for months.
-const FRESH_FOR: Duration = Duration::from_secs(60 * 60 * 24);
+/// How long a check is good for.
+///
+/// Six hours rather than the day it was. The number is a floor on how long a machine can be wrong
+/// about the world, and a workspace here runs for weeks — so a day meant a release could be out
+/// for most of a working day with the panel saying nothing. Four unauthenticated requests a day
+/// against a rate limit of sixty an hour is not a cost worth defending.
+const FRESH_FOR: Duration = Duration::from_secs(60 * 60 * 6);
+
+/// How long to give the binary on disk to say what version it is.
+///
+/// It is `--version` on a binary we shipped, so it prints and exits — but it is still an exec of a
+/// file somebody else just wrote, and a workspace must not be able to sit on one. The answer is
+/// decoration on a row that is already correct without it.
+const VERSION_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// The Rust target triple this binary was built for, which is what names the release asset.
 ///
@@ -94,14 +115,54 @@ fn is_newer(latest: &str, current: &str) -> bool {
     }
 }
 
+/// Enough of a file to tell it from the one that replaced it.
+///
+/// The inode is what carries this: every way neosh is actually updated ends in a rename or a fresh
+/// directory, so the number changes even when a package manager has preserved the modification
+/// time. Length and mtime are belt and braces for a filesystem with no meaningful inodes.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct Stamp {
+    len: u64,
+    mtime: u64,
+    #[cfg(unix)]
+    ino: u64,
+}
+
+impl Stamp {
+    fn of(path: &Path) -> Option<Self> {
+        let m = std::fs::metadata(path).ok()?;
+        if !m.is_file() {
+            return None;
+        }
+        Some(Self {
+            len: m.len(),
+            mtime: m
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                .map(|d| d.as_secs())
+                .unwrap_or(0),
+            #[cfg(unix)]
+            ino: {
+                use std::os::unix::fs::MetadataExt;
+                m.ino()
+            },
+        })
+    }
+}
+
 /// The last answer, and when it was given.
 #[derive(Default)]
 struct Cached {
     status: Option<UpdateStatus>,
     at: Option<SystemTime>,
-    /// Set once a new binary is on disk, so the UI keeps saying "restart" rather than "update"
-    /// after the download has already happened.
-    restart_pending: bool,
+    /// The version *we* put on disk, if we have. Not the whole of `restart_pending` — most
+    /// installs are replaced by somebody else's package manager and never come through here — but
+    /// still worth keeping, because it is the one case where we know without looking.
+    staged: Option<String>,
+    /// The version found on disk once a replacement was noticed, so `neosh --version` is exec'd
+    /// once rather than on every redraw of a panel.
+    found: Option<Option<String>>,
 }
 
 /// The update checker. One per workspace.
@@ -109,22 +170,150 @@ struct Cached {
 pub struct Updater {
     inner: Arc<RwLock<Cached>>,
     exe: PathBuf,
+    /// The unresolved path this process was started from — see [`crate::build::launch_path`].
+    launch: Option<PathBuf>,
     current: String,
+    /// What the executable looked like at startup. `None` when it could not be stat'd at all, in
+    /// which case nothing here claims anything: an unknown stamp compares equal to everything, and
+    /// the failure of guessing is a workspace that offers a restart on every redraw.
+    stamp: Option<Stamp>,
 }
 
 impl Updater {
-    /// `exe` and `version` come from [`crate::build::capture`] — read at startup, because a
+    /// `exe`, `launch` and `version` all come from [`crate::build`] — read at startup, because a
     /// workspace outlives the file it was loaded from and `current_exe` goes stale.
-    pub fn new(exe: PathBuf, current: String) -> Self {
-        Self { inner: Arc::new(RwLock::new(Cached::default())), exe, current }
+    ///
+    /// Both paths are passed in rather than one of them being fetched here, because they are two
+    /// different facts — [`crate::build::exe_path`] has followed the symlinks and
+    /// [`crate::build::launch_path`] deliberately has not — and a constructor that reached for a
+    /// process-wide one behind the caller's back would be a type nothing could test without being
+    /// the neosh binary.
+    pub fn new(exe: PathBuf, launch: Option<PathBuf>, current: String) -> Self {
+        Self {
+            inner: Arc::new(RwLock::new(Cached::default())),
+            stamp: Stamp::of(&exe),
+            launch,
+            exe,
+            current,
+        }
     }
 
     fn method(&self) -> InstallMethod {
         install_method(&self.exe)
     }
 
+    /// The binary that `neosh` would run *now*, and how it differs from the one running.
+    ///
+    /// Three candidates in order, and the order is the whole of it:
+    ///
+    /// 1. **The launch path, resolved afresh.** A managed install is a symlink into a versioned
+    ///    directory, and upgrading it repoints the link without touching the file we are executing.
+    ///    Following the link at startup and remembering the answer is exactly how that swap becomes
+    ///    invisible.
+    /// 2. **The resolved path from startup.** An install that is a real file — `install.sh`,
+    ///    `cargo install`, our own rename — is overwritten in place, and this is where.
+    /// 3. **`neosh` on `PATH`.** The case the first two miss: Homebrew removes the old keg, so on
+    ///    Linux, where `/proc/self/exe` is already fully resolved and there is no link left to
+    ///    follow, both paths are simply gone. What would run then is whatever the shell finds,
+    ///    which is also what the terminal is about to exec.
+    ///
+    /// `None` when nothing runnable can be found, and that is deliberate: a restart we cannot
+    /// finish is worse than no offer at all — it takes a working workspace away and does not bring
+    /// one back.
+    fn on_disk(&self) -> Option<(PathBuf, Stamp)> {
+        let candidates = self
+            .launch
+            .iter()
+            .cloned()
+            .chain(std::iter::once(self.exe.clone()))
+            .chain(which_neosh());
+        for p in candidates {
+            if let Ok(real) = p.canonicalize()
+                && let Some(s) = Stamp::of(&real)
+            {
+                return Some((real, s));
+            }
+        }
+        None
+    }
+
+    /// Whether the binary on disk is not the one this process is running, and where it is.
+    fn replaced(&self) -> Option<PathBuf> {
+        // A checkout is excluded here rather than at the row that draws it, because in one the
+        // answer is *yes, constantly*: `cargo run` unlinks `target/debug/neosh` and writes another
+        // one every build. It is not that the fact is uninteresting there — it is the single most
+        // interesting fact in a checkout — it is that it already has an answer, said by the
+        // terminal on attach out of `BuildId`, and which names `neosh stop`. Two notices about one
+        // thing is one notice nobody reads.
+        if self.method() == InstallMethod::Development {
+            return None;
+        }
+        let (path, now) = self.on_disk()?;
+        match (self.stamp, now) {
+            (Some(then), now) if then != now => Some(path),
+            _ => None,
+        }
+    }
+
+    /// Fill in the half of a status that is about this machine rather than about a registry.
+    ///
+    /// Applied on the way out of every answer, including a cached one — the network half is good
+    /// for hours and this half can change between two redraws, so serving them from one timestamp
+    /// is how a workspace goes on saying "up to date" for a day after being upgraded under it.
+    async fn with_local(&self, mut status: UpdateStatus) -> UpdateStatus {
+        let staged = self.inner.read().await.staged.clone();
+        match self.replaced() {
+            Some(path) => {
+                status.restart_pending = true;
+                status.restart_version = self.version_on_disk(&path).await.or(staged);
+            }
+            // Nothing on disk differs from what started. Our own download is not taken on trust
+            // against that: if we wrote a file and the stamp still matches, whatever we wrote is
+            // not there any more and a restart would come back to the very binary it left. The one
+            // exception is having had no stamp to begin with, where there is nothing to compare and
+            // our own word is the only evidence there is.
+            None => {
+                status.restart_pending = staged.is_some() && self.stamp.is_none();
+                status.restart_version = status.restart_pending.then_some(staged).flatten();
+            }
+        }
+        status
+    }
+
+    /// Ask the binary that is waiting what it calls itself, once.
+    ///
+    /// Asked of the file rather than assumed to be [`UpdateStatus::latest`]: somebody who ran
+    /// `brew upgrade` got whatever their tap had, which is not always the newest release, and a row
+    /// naming a version that is not the one about to start is a row that teaches you not to read
+    /// it. A failure is `None` and the row says "restart" without a number, which is still the one
+    /// thing there is to do.
+    async fn version_on_disk(&self, path: &Path) -> Option<String> {
+        if let Some(found) = &self.inner.read().await.found {
+            return found.clone();
+        }
+        let out = tokio::time::timeout(
+            VERSION_TIMEOUT,
+            tokio::process::Command::new(path)
+                .arg("--version")
+                .stdin(std::process::Stdio::null())
+                .output(),
+        )
+        .await;
+        let found = match out {
+            Ok(Ok(o)) if o.status.success() => String::from_utf8_lossy(&o.stdout)
+                .lines()
+                .next()
+                .and_then(|l| l.split_whitespace().last())
+                .map(|v| v.trim_start_matches('v').to_string())
+                .filter(|v| !v.is_empty()),
+            _ => None,
+        };
+        self.inner.write().await.found = Some(found.clone());
+        found
+    }
+
     /// A status with no network in it, for the shape of the answer before any check has run.
-    fn blank(&self, restart_pending: bool) -> UpdateStatus {
+    fn blank(&self) -> UpdateStatus {
         let method = self.method();
         UpdateStatus {
             current: self.current.clone(),
@@ -134,29 +323,36 @@ impl Updater {
             self_updatable: method.self_updatable(),
             upgrade_command: method.upgrade_command().map(str::to_string),
             error: None,
-            restart_pending,
+            restart_pending: false,
+            restart_version: None,
         }
     }
 
     /// What is known now, checking the network only if the last answer has gone stale or `force`.
-    pub async fn check(&self, force: bool) -> UpdateStatus {
+    ///
+    /// `local` never touches the network at all, which is what makes "has something replaced my
+    /// binary" answerable on a tick: it is a `stat`, and a panel asking it should not be the reason
+    /// a workspace makes an HTTP request.
+    pub async fn check(&self, force: bool, local: bool) -> UpdateStatus {
         {
             let c = self.inner.read().await;
             let fresh = c
                 .at
                 .and_then(|t| SystemTime::now().duration_since(t).ok())
                 .is_some_and(|age| age < FRESH_FOR);
-            if !force && fresh && let Some(s) = &c.status {
-                return s.clone();
+            if local || (!force && fresh) {
+                let known = c.status.clone();
+                drop(c);
+                return self.with_local(known.unwrap_or_else(|| self.blank())).await;
             }
         }
 
-        let mut status = self.blank(self.inner.read().await.restart_pending);
+        let mut status = self.blank();
 
         // A checkout is never told to update. Nothing published is newer than what is about to be
         // compiled, and a notice about it would fire on every developer's every start.
         if status.method == InstallMethod::Development {
-            return status;
+            return self.with_local(status).await;
         }
 
         match fetch_latest().await {
@@ -169,17 +365,29 @@ impl Updater {
             Err(e) => status.error = Some(e),
         }
 
-        let mut c = self.inner.write().await;
-        c.status = Some(status.clone());
-        c.at = Some(SystemTime::now());
-        status
+        {
+            let mut c = self.inner.write().await;
+            c.status = Some(status.clone());
+            c.at = Some(SystemTime::now());
+        }
+        self.with_local(status).await
     }
 
     /// Update, by whichever route this install takes.
     pub async fn apply(&self) -> UpdateOutcome {
-        let status = self.check(true).await;
+        let status = self.check(true, false).await;
         let method = status.method;
 
+        // Finish what is already half done before starting anything new. A binary already waiting
+        // on disk — ours, or one `brew upgrade` put there — is not a workspace that needs another
+        // download, and saying so here rather than only in the plugin means every caller of the API
+        // gets it, including `neosh agent run update`.
+        if status.restart_pending {
+            return UpdateOutcome::Applied {
+                version: status.restart_version.unwrap_or_else(|| self.current.clone()),
+                restart_required: true,
+            };
+        }
         if let Some(err) = status.error {
             return UpdateOutcome::Failed { reason: format!("could not check for updates: {err}") };
         }
@@ -206,7 +414,13 @@ impl Updater {
 
         match self.replace_binary(&latest).await {
             Ok(()) => {
-                self.inner.write().await.restart_pending = true;
+                let mut c = self.inner.write().await;
+                c.staged = Some(latest.clone());
+                // The file changed under us, so anything read off the old one is not about the new
+                // one. Cleared rather than left, or a second update in one workspace's life reports
+                // the version of the first.
+                c.found = None;
+                drop(c);
                 UpdateOutcome::Applied { version: latest, restart_required: true }
             }
             Err(reason) => UpdateOutcome::Failed { reason },
@@ -250,6 +464,34 @@ impl Updater {
             format!("replacing {}: {e}", self.exe.display())
         })
     }
+}
+
+/// `neosh` as the shell would find it, or nothing.
+///
+/// The last resort in [`Updater::on_disk`], and it exists for one shape: Homebrew removes the old
+/// keg on upgrade, so on a platform where the launch path is already fully resolved there is no
+/// link left to follow and no file left to stat — both of the specific answers are gone, and the
+/// only remaining true statement about what would run is "whatever is on `PATH`", which is also
+/// exactly what the terminal is about to exec.
+///
+/// Walked by hand rather than through a crate: it is one `split` and an `is_file`, and a
+/// dependency for that is a dependency to keep updated.
+pub fn which_neosh() -> Option<PathBuf> {
+    let path = std::env::var_os("PATH")?;
+    std::env::split_paths(&path)
+        .map(|d| d.join("neosh"))
+        .find(|p| p.is_file() && is_executable(p))
+}
+
+#[cfg(unix)]
+fn is_executable(p: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(p).is_ok_and(|m| m.permissions().mode() & 0o111 != 0)
+}
+
+#[cfg(not(unix))]
+fn is_executable(_p: &Path) -> bool {
+    true
 }
 
 async fn fetch_latest() -> Result<String, String> {
@@ -406,6 +648,140 @@ mod tests {
         assert!(!is_newer("0.2.0-rc.1", "0.1.0"));
         assert!(!is_newer("nightly", "0.1.0"));
         assert!(!is_newer("0.2.0", "some-git-build"));
+    }
+
+    /// A scratch directory of this test's own, with a fake `neosh` in it.
+    fn sandbox(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("neosh-update-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("bin")).expect("a scratch directory");
+        dir
+    }
+
+    /// Write `body` at `path`, executable, the way an installer would.
+    fn install(path: &Path, body: &str) {
+        if let Some(p) = path.parent() {
+            std::fs::create_dir_all(p).expect("a directory to install into");
+        }
+        std::fs::write(path, body).expect("a binary");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).expect("+x");
+        }
+    }
+
+    fn updater(exe: &Path, launch: &Path) -> Updater {
+        Updater::new(
+            exe.canonicalize().expect("a real path"),
+            Some(launch.to_path_buf()),
+            "0.4.1".into(),
+        )
+    }
+
+    /// The case the whole feature exists for: `brew upgrade` in the next terminal along.
+    ///
+    /// Homebrew never touches the file we are executing. It writes a new keg and repoints
+    /// `bin/neosh` at it — so a workspace that resolved the symlink at startup and remembered the
+    /// answer sees nothing at all, which is exactly what used to happen and why a machine ran the
+    /// old build for days after being told it had been updated.
+    #[test]
+    #[cfg(unix)]
+    fn a_repointed_symlink_is_a_binary_that_was_replaced() {
+        let dir = sandbox("brew");
+        let old = dir.join("Cellar/neosh/0.4.1/bin/neosh");
+        let new = dir.join("Cellar/neosh/0.4.2/bin/neosh");
+        let link = dir.join("bin/neosh");
+        install(&old, "i am 0.4.1");
+        std::os::unix::fs::symlink(&old, &link).expect("a link into the keg");
+
+        // Started as `bin/neosh`, which is what a shell on `PATH` does.
+        let u = updater(&link, &link);
+        assert!(u.replaced().is_none(), "nothing has happened yet");
+
+        // `brew upgrade`: a new keg, the link moved, and the old keg removed on cleanup.
+        install(&new, "i am 0.4.2 and longer");
+        std::fs::remove_file(&link).expect("the old link");
+        std::os::unix::fs::symlink(&new, &link).expect("the new link");
+        std::fs::remove_dir_all(dir.join("Cellar/neosh/0.4.1")).expect("brew cleanup");
+
+        assert_eq!(
+            u.replaced(),
+            Some(new.canonicalize().expect("the new keg")),
+            "following the link afresh is the only way to see this"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An install that is a plain file — `install.sh`, `cargo install`, our own rename.
+    #[test]
+    fn a_file_overwritten_in_place_is_a_binary_that_was_replaced() {
+        let dir = sandbox("inplace");
+        let exe = dir.join("bin/neosh");
+        install(&exe, "i am 0.4.1");
+
+        let u = updater(&exe, &exe);
+        assert!(u.replaced().is_none());
+
+        // Written beside and renamed on, which is what every safe replacement does — and what
+        // changes the inode even when a package manager has preserved the modification time.
+        let staged = dir.join("bin/.neosh-new");
+        install(&staged, "i am 0.4.2 and a different length");
+        std::fs::rename(&staged, &exe).expect("the swap");
+
+        assert_eq!(u.replaced(), Some(exe.canonicalize().expect("the new file")));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A restart is a promise to come back, and one that cannot be kept is worse than silence.
+    ///
+    /// With every candidate gone there is no binary to restart onto: saying "restart for the
+    /// update" would take a working workspace away and put nothing in its place.
+    #[test]
+    fn nothing_left_to_run_is_never_a_restart_worth_offering() {
+        let dir = sandbox("gone");
+        let exe = dir.join("bin/neosh");
+        install(&exe, "i am 0.4.1");
+        let u = updater(&exe, &exe);
+
+        std::fs::remove_file(&exe).expect("an uninstall");
+        // `which_neosh` may still find a real neosh on this machine's PATH, which would be a
+        // truthful answer. What must never happen is a claim with nothing behind it.
+        if let Some(found) = u.replaced() {
+            assert!(found.is_file(), "offered a restart onto {found:?}, which is not there");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A checkout is the one place where "the binary changed" is true on nearly every build, and
+    /// it already has an answer — the terminal says it on attach, out of `BuildId`, and names
+    /// `neosh stop`. Two notices about one thing is one notice nobody reads.
+    #[test]
+    fn a_checkout_is_never_told_to_restart() {
+        let dir = sandbox("checkout");
+        let exe = dir.join("target/debug/neosh");
+        install(&exe, "a build");
+        let u = updater(&exe, &exe);
+        install(&exe, "a rebuild, longer than the last one");
+
+        assert_eq!(u.method(), InstallMethod::Development);
+        assert!(u.replaced().is_none(), "the BuildId notice already covers a checkout");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An unknown stamp compares equal to everything rather than to nothing.
+    ///
+    /// The failure of guessing here is a workspace that offers a restart on every redraw, forever,
+    /// having never seen the file it is talking about.
+    #[test]
+    fn an_executable_that_could_not_be_stat_d_claims_nothing() {
+        let dir = sandbox("nostat");
+        let exe = dir.join("bin/neosh");
+        // Never created. `Updater::new` finds no stamp, and nothing may be inferred from that.
+        let u = Updater::new(exe.clone(), Some(exe), "0.4.1".into());
+        assert!(u.stamp.is_none());
+        assert!(u.replaced().is_none());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

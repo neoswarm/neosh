@@ -650,6 +650,16 @@ export type ApiCall =
      * Ask the network again rather than answering from the last check.
      */
     force: boolean;
+    /**
+     * Answer from what this machine already knows, and never reach the network.
+     *
+     * The two are not opposites and are never both set: `local` is checked first and wins.
+     * It exists because half of an update status is not about a registry at all —
+     * [`UpdateStatus::restart_pending`] is a `stat` of one file — and a caller that wants
+     * only that half should not be the reason a workspace makes an HTTP request. Which is
+     * what a panel polling for "has something replaced my binary" would otherwise be.
+     */
+    local: boolean;
   }
   | { "call": "update_apply" }
   | {

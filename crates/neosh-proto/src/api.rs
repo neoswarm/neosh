@@ -1796,6 +1796,15 @@ pub enum ApiCall {
         /// Ask the network again rather than answering from the last check.
         #[serde(default)]
         force: bool,
+        /// Answer from what this machine already knows, and never reach the network.
+        ///
+        /// The two are not opposites and are never both set: `local` is checked first and wins.
+        /// It exists because half of an update status is not about a registry at all —
+        /// [`UpdateStatus::restart_pending`] is a `stat` of one file — and a caller that wants
+        /// only that half should not be the reason a workspace makes an HTTP request. Which is
+        /// what a panel polling for "has something replaced my binary" would otherwise be.
+        #[serde(default)]
+        local: bool,
     },
     /// Update, by whichever route [`UpdateCheck`](ApiCall::UpdateCheck) said this install takes.
     ///
@@ -2231,8 +2240,27 @@ pub struct UpdateStatus {
     /// Why the last check failed, when it did. Kept so the UI can say *unknown, and here is why*.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
-    /// Whether an update has been downloaded and is waiting for a restart.
+    /// Whether the binary on disk is not the one this process is running.
+    ///
+    /// Not "whether neosh downloaded something": most installs are updated by somebody else's
+    /// package manager, in another terminal, and the workspace goes on executing the inode it
+    /// started with — which is the whole failure this field exists to name. `brew upgrade neosh`
+    /// finishes, says so, and leaves a workspace running the old code with nothing on screen to
+    /// say why the thing you just installed is not there. So this is a `stat` of the running
+    /// executable against the stamp taken at startup, and it is true for a self-update, a
+    /// `brew upgrade`, an `npm install -g` and a re-run of `install.sh` alike.
+    ///
+    /// Never set when there is no binary left to restart onto: a promise of a restart that cannot
+    /// come back is worse than saying nothing.
     pub restart_pending: bool,
+    /// What is waiting on disk, when it could be read.
+    ///
+    /// Asked of the binary itself (`neosh --version`) rather than assumed to be
+    /// [`latest`](UpdateStatus::latest): somebody who ran `brew upgrade` got whatever Homebrew had,
+    /// which is not always the newest release, and a row naming the wrong number is a row that
+    /// teaches you not to read it. `None` means *something* changed and it would not say what.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub restart_version: Option<String>,
 }
 
 /// What [`ApiCall::UpdateApply`] did.

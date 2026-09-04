@@ -81,4 +81,21 @@ export type UiEvent =
   }
   | { "type": "clipboard"; text: string }
   | { "type": "flush" }
-  | { "type": "shutdown" };
+  | {
+    "type": "shutdown";
+    /**
+     * Whether it is coming straight back, and this terminal should follow it.
+     *
+     * `neosh stop` and a restart are the same shutdown — conversations flushed, plugins torn
+     * down — and they differ entirely in what the *terminal* should do next. Stopping is
+     * somebody finishing; a restart is the second half of an update, and a terminal that
+     * exits to the shell there has turned "finish updating" into "and now type `neosh`
+     * again", which is the step nobody knows is owed. It cannot be worked out at the far end
+     * either: from a closed socket, a workspace that stopped and a workspace that is
+     * restarting look identical.
+     *
+     * `#[serde(default)]` so an older terminal reads it as an ordinary stop, which is the
+     * behaviour it already has.
+     */
+    restarting: boolean;
+  };

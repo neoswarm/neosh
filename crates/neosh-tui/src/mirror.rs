@@ -270,7 +270,7 @@ impl Mirror {
                 self.dirty = true;
                 return true;
             }
-            UiEvent::Shutdown => {
+            UiEvent::Shutdown { .. } => {
                 self.shutdown = true;
                 return true;
             }

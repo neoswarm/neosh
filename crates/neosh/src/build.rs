@@ -30,9 +30,35 @@ static ID: OnceLock<BuildId> = OnceLock::new();
 /// renaming onto it is exactly what an update does.
 static EXE: OnceLock<Option<std::path::PathBuf>> = OnceLock::new();
 
-/// Where this process's executable was when it started.
+/// The path this process was invoked by, before symlinks were followed.
+///
+/// Kept *unresolved* on purpose, and it is the only thing that can answer "has this install been
+/// replaced". A managed install is a symlink into a versioned directory — `/opt/homebrew/bin/neosh`
+/// into `Cellar/neosh/0.4.1/bin/neosh` — and upgrading it does not touch a single byte of the file
+/// we are executing: it writes a new directory and repoints the link. Resolved at startup, as
+/// [`exe_path`] is, that swap is invisible, because the answer was frozen on the side of it we can
+/// no longer see.
+static LAUNCH: OnceLock<Option<std::path::PathBuf>> = OnceLock::new();
+
+/// Where this process's executable was when it started, with every symlink already followed.
 pub fn exe_path() -> Option<std::path::PathBuf> {
     EXE.get_or_init(|| std::env::current_exe().ok().and_then(|p| p.canonicalize().ok())).clone()
+}
+
+/// The path this process was invoked by, made absolute but *not* resolved.
+///
+/// Absolute because a relative `current_exe` is relative to the directory the process started in,
+/// which is not where it stays; unresolved because following the link is what this exists to avoid.
+pub fn launch_path() -> Option<std::path::PathBuf> {
+    LAUNCH
+        .get_or_init(|| {
+            let raw = std::env::current_exe().ok()?;
+            match raw.is_absolute() {
+                true => Some(raw),
+                false => std::env::current_dir().ok().map(|d| d.join(raw)),
+            }
+        })
+        .clone()
 }
 
 /// Read this process's build identity now, while its executable is still on disk.

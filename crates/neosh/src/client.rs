@@ -33,6 +33,8 @@ pub enum Ended {
     Detached(DetachReason),
     /// The workspace itself is gone.
     Stopped,
+    /// The workspace is gone and coming straight back, and this terminal is meant to follow it.
+    Restarting,
 }
 
 /// Connect to the workspace for these paths, starting one if there is none.
@@ -66,13 +68,78 @@ pub async fn connect_or_start(socket: &Path, args: &[String]) -> anyhow::Result<
     )
 }
 
+/// The `neosh` to run, which after an update is not the file this process was loaded from.
+///
+/// Three candidates, most specific first, and the ordering is the same one the updater's detection
+/// uses because it is answering the same question from the other side: the path we were invoked by
+/// still points somewhere after a package manager repoints its symlink, the resolved path is right
+/// for an install that is a plain file, and `PATH` is what is left when the directory we were in
+/// has been removed — which is what `brew upgrade` does to the keg it replaced.
+///
+/// `current_exe` last rather than first: resolved at startup and asked afterwards it is a path with
+/// `(deleted)` on the end, which nothing can exec, and that is precisely the state an update leaves
+/// it in.
+fn neosh_binary() -> anyhow::Result<PathBuf> {
+    if let Some(p) = crate::build::launch_path().filter(|p| p.is_file()) {
+        return Ok(p);
+    }
+    if let Some(p) = crate::update::which_neosh() {
+        return Ok(p);
+    }
+    Ok(std::env::current_exe()?)
+}
+
+/// Wait until nothing answers on the socket.
+///
+/// The gap between "the workspace said it was going" and "the workspace has gone" is real: it
+/// writes [`UiEvent::Shutdown`] and then unwinds. Reconnecting into that window attaches to a
+/// process that is already tearing down, which looks exactly like a workspace that would not
+/// start — so a restart would fail about one time in five, on the machine that had just been
+/// updated, with no sentence anywhere about why.
+pub async fn wait_gone(socket: &Path) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while std::time::Instant::now() < deadline {
+        if UnixStream::connect(socket).await.is_err() {
+            return;
+        }
+        tokio::time::sleep(SPAWN_POLL).await;
+    }
+}
+
+/// Become the new neosh, in this terminal, with the arguments this one was given.
+///
+/// An `exec` rather than starting a workspace and reattaching, and the difference is what the
+/// person ends up running. Reattaching leaves *this* process — the terminal, the thing drawing
+/// every frame — as the old build talking to the new one, which is the half-updated state the whole
+/// feature exists to get rid of, and which the workspace would then correctly complain about on
+/// attach. Replacing the process makes "update" mean one thing.
+///
+/// The terminal has already been restored by the time this runs ([`attach`] does it on the way out
+/// whatever happened), so what the screen does is what starting neosh always does. On success this
+/// never returns.
+#[cfg(unix)]
+pub fn relaunch(args: &[String]) -> anyhow::Error {
+    use std::os::unix::process::CommandExt;
+    let exe = match neosh_binary() {
+        Ok(e) => e,
+        Err(e) => return anyhow::anyhow!("{e}"),
+    };
+    // `exec` only returns on failure, which is the one path out of here.
+    anyhow::anyhow!("{}", std::process::Command::new(&exe).args(args).exec())
+}
+
+#[cfg(not(unix))]
+pub fn relaunch(_args: &[String]) -> anyhow::Error {
+    anyhow::anyhow!("run `neosh` again to finish")
+}
+
 /// Start a workspace in the background, detached from this terminal.
 ///
 /// Detached is the point: it must survive the shell that started it, the terminal that shell is
 /// in, and the ssh session that terminal is in. Its own session (`setsid`) is what stops a
 /// `SIGHUP` on the way out from taking the workspace with it.
 fn start(args: &[String]) -> anyhow::Result<()> {
-    let exe = std::env::current_exe()?;
+    let exe = neosh_binary()?;
     let mut cmd = std::process::Command::new(exe);
     cmd.arg("--serve")
         .args(args)
@@ -232,12 +299,18 @@ async fn run(
                 };
                 match serde_json::from_str::<ServerMessage>(&l) {
                     Ok(ServerMessage::Events { batch }) => {
-                        let leaving = batch.iter().any(|e| matches!(e, UiEvent::Shutdown));
+                        let leaving = batch.iter().find_map(|e| match e {
+                            UiEvent::Shutdown { restarting } => Some(*restarting),
+                            _ => None,
+                        });
                         // Untagged on the way in: the workspace already decided this batch was
                         // for us, and what arrives here is one terminal's share of a frame.
                         ui.send(batch.into_iter().map(|e| (None, e)).collect()).await?;
-                        if leaving {
-                            return Ok(Ended::Stopped);
+                        if let Some(restarting) = leaving {
+                            return Ok(match restarting {
+                                true => Ended::Restarting,
+                                false => Ended::Stopped,
+                            });
                         }
                     }
                     Ok(ServerMessage::Detached { reason }) => return Ok(Ended::Detached(reason)),
@@ -311,6 +384,23 @@ fn stale(workspace: &BuildId, terminal: &BuildId) -> Option<String> {
     }
     let (t, w) = (&terminal.version, &workspace.version);
     Some(format!("terminal is neosh {t}, workspace is neosh {w}"))
+}
+
+/// The arguments a *terminal* we replace ourselves with should be given.
+///
+/// The workspace's arguments plus nothing, which is the point: not `args_os()`, because the one
+/// thing on that command line that must not be repeated is the prompt. `neosh "why is this slow"`
+/// starts a conversation and says that in it, and a relaunch carrying it forward would ask the
+/// question a second time, in a second conversation, on the far side of an update nobody connected
+/// it to.
+pub fn terminal_args(
+    config_dir: &Option<PathBuf>,
+    cwd: &Path,
+    model: &Option<String>,
+    plugin_dirs: &[PathBuf],
+    mock_script: &Option<PathBuf>,
+) -> Vec<String> {
+    workspace_args(config_dir, cwd, model, plugin_dirs, mock_script)
 }
 
 /// The arguments a workspace we start should be given.
