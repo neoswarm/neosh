@@ -1,6 +1,6 @@
 {
   "name": "@neosh/questions",
-  "version": "0.4.0",
+  "version": "0.4.1",
   "description": "Draws the question an agent asks you, and sends back what you said.",
   "license": "MIT",
   "type": "module",
