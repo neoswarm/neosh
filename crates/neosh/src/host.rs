@@ -4997,34 +4997,112 @@ impl Host {
         let cost = |(k, l): &(String, String)| display_width(k) + display_width(l) + 2;
         // Two spaces between the keys and the last tab, so the bar never reads as one long run.
         let reserved = keys.first().map(cost).unwrap_or(0) + 2;
+
+        // `1` rather than `0`: the key is `<C-w>1`, and a bar counting from zero is a bar whose
+        // numbers are not the numbers you type.
+        let labels: Vec<String> = tabs
+            .iter()
+            .enumerate()
+            .map(|(n, tab)| format!(" {} {} ", n + 1, self.tab_title(view, tab)))
+            .collect();
+        let here = active
+            .and_then(|id| tabs.iter().position(|t| t.id == id))
+            .unwrap_or(0);
+        let mine = labels.get(here).map(|l| display_width(l)).unwrap_or(0);
         let room = match known {
-            true => width.saturating_sub(reserved),
+            // The reservation gives way rather than the tab you are in. `<C-w> windows` is fourteen
+            // columns, and a pane narrow enough that holding them leaves nothing behind is a pane
+            // where the bar read `+2` — three tabs open and not one of them named, the hint about
+            // the bar having crowded out the bar. A legend that does not fit is dropped by its own
+            // fitting below, so taking the room back here costs it nothing it could have used.
+            true => width.saturating_sub(reserved).max(mine.min(width)),
             false => usize::MAX,
         };
-
-        for (n, tab) in tabs.iter().enumerate() {
-            let name = self.tab_title(view, tab);
-            // `1` rather than `0`: the key is `<C-w>1`, and a bar counting from zero is a bar whose
-            // numbers are not the numbers you type.
-            let label = format!(" {} {} ", n + 1, name);
-            // Nothing is half-drawn. A tab label cut in the middle reads as a conversation with a
-            // different name, so the ones that do not fit are dropped and counted instead.
-            if display_width(&text) + display_width(&label) > room {
-                let more = format!(" +{} ", tabs.len() - n);
-                if display_width(&text) + display_width(&more) <= room {
-                    let from = text.len();
-                    text.push_str(&more);
-                    marks.push((from, text.len(), "Tabline.Tab".into()));
-                }
-                break;
+        // What was left out, on the side it was left out from. `+2` on the left and `+2` on the
+        // right are different sentences about where the tabs you cannot see are, and one counter at
+        // the end can only ever say the second of them.
+        let more = |n: usize| format!(" +{n} ");
+        // The room a window of tabs needs, counting what it leaves behind on either side.
+        let need = |lo: usize, hi: usize| -> usize {
+            let mut w: usize = labels[lo..=hi].iter().map(|l| display_width(l)).sum();
+            if lo > 0 {
+                w += display_width(&more(lo));
             }
-            let from = text.len();
-            text.push_str(&label);
-            let group = match Some(tab.id) == active {
-                true => "Tabline.Active",
-                false => "Tabline.Tab",
+            if hi + 1 < labels.len() {
+                w += display_width(&more(labels.len() - hi - 1));
+            }
+            w
+        };
+
+        // The tab you are in is what the room is spent on first, and the rest grow outward from it.
+        //
+        // Filled left to right and cut at the end, the bar dropped the one tab it exists to tell
+        // you about: four tabs open with the keyboard in the fourth read `1 foo  2 bar  +2`, which
+        // says where you are not. Nothing else on screen answers "which tab is this", so the answer
+        // has to survive the fitting rather than be the first thing it discards.
+        if !labels.is_empty() {
+            let (mut lo, mut hi) = (here, here);
+            loop {
+                let mut grew = false;
+                // Leftwards first, so the numbers on the bar keep counting up from wherever it
+                // starts rather than jumping.
+                if lo > 0 && need(lo - 1, hi) <= room {
+                    lo -= 1;
+                    grew = true;
+                }
+                if hi + 1 < labels.len() && need(lo, hi + 1) <= room {
+                    hi += 1;
+                    grew = true;
+                }
+                if !grew {
+                    break;
+                }
+            }
+
+            let left = (lo > 0).then(|| more(lo));
+            let right = (hi + 1 < labels.len()).then(|| more(labels.len() - hi - 1));
+            // What everything other than the tab you are in takes. The counters are dropped before
+            // that label is: a bar reading `+2` and nothing else has spent its only row saying how
+            // many answers it is not giving, and the number on the label — `3` — already says there
+            // are at least three tabs.
+            let others = need(lo, hi) - mine;
+            let counters: usize = [&left, &right]
+                .iter()
+                .flat_map(|m| m.iter())
+                .map(|m| display_width(m))
+                .sum();
+            let (left, right, others) = match room >= others + 1 {
+                true => (left, right, others),
+                false => (None, None, others - counters),
             };
-            marks.push((from, text.len(), group.into()));
+            if let Some(left) = left {
+                let from = text.len();
+                text.push_str(&left);
+                marks.push((from, text.len(), "Tabline.Tab".into()));
+            }
+            // Nothing is half-drawn. A tab label cut in the middle reads as a conversation with a
+            // different name — so every tab but the one you are in is dropped whole and counted.
+            // The one you are in is the exception, because dropping it is what this fitting exists
+            // to prevent: it is elided, with the `…` that says so, rather than left out.
+            let spare = room.saturating_sub(others);
+            for (n, label) in labels.iter().enumerate().take(hi + 1).skip(lo) {
+                let label = match n == here {
+                    true => elide(label, spare),
+                    false => label.clone(),
+                };
+                let from = text.len();
+                text.push_str(&label);
+                let group = match n == here {
+                    true => "Tabline.Active",
+                    false => "Tabline.Tab",
+                };
+                marks.push((from, text.len(), group.into()));
+            }
+            if let Some(right) = right {
+                let from = text.len();
+                text.push_str(&right);
+                marks.push((from, text.len(), "Tabline.Tab".into()));
+            }
         }
 
         // The legend, hard against the right edge. What it says depends on where you are, because a
@@ -14188,6 +14266,31 @@ fn chunk(text: impl Into<String>, hl: &str) -> neosh_proto::VirtChunk {
 fn display_width(s: &str) -> usize {
     use unicode_width::UnicodeWidthStr;
     s.width()
+}
+
+/// `s`, or as much of it as fits in `room` columns with an `…` saying so.
+///
+/// By grapheme cluster and by display width, not by `char`: a byte slice can land mid-character and
+/// a `char` count is wrong about the first emoji it meets. Room for nothing but the ellipsis gives
+/// the ellipsis, and a `room` of zero gives an empty string — a caller with no space left is not
+/// helped by one column of something.
+fn elide(s: &str, room: usize) -> String {
+    if display_width(s) <= room {
+        return s.to_string();
+    }
+    let Some(budget) = room.checked_sub(1) else { return String::new() };
+    let mut out = String::new();
+    let mut used = 0usize;
+    for g in s.graphemes(true) {
+        let w = display_width(g);
+        if used + w > budget {
+            break;
+        }
+        out.push_str(g);
+        used += w;
+    }
+    out.push('\u{2026}');
+    out
 }
 
 /// What the host learned about a directory the first time it looked: the display name, and the

@@ -509,7 +509,12 @@ pub fn groups(variant: Variant) -> Vec<(&'static str, HighlightDef)> {
         // from the corner of your eye, and a separator one step up the same ramp is not.
         ("Pane.Active", spec(fg(r.accent))),
         ("Tabline.Tab", link("Comment")),
-        ("Tabline.Active", spec(bold(fg(r.fg)))),
+        // The accent, for the reason [`Pane.Active`] above wears it: the argument against a
+        // brighter grey does not stop being true one level up. Every tab in a project you have just
+        // started is called `new`, so the name distinguishes nothing and the colour is the whole
+        // answer to "which one am I in" — and bold-on-default against dim-grey is a difference you
+        // have to compare two labels to see, on a row whose job is to be glanced at.
+        ("Tabline.Active", spec(bold(fg(r.accent)))),
         // The keys, which wear what every other key in the workspace wears. A legend whose keys are
         // dimmer than its words is a legend nobody reads twice.
         ("Tabline.Key", link("Key")),
