@@ -141,7 +141,18 @@ export type ApiCall =
      * work somewhere is not, for the same reason `SessionNew { activate: false }` exists.
      */
     activate: boolean;
+    /**
+     * Which strip to open it on. See [`TabInfo::group`].
+     *
+     * `None` inherits the tab you are on, which is what a new tab almost always wants: opened
+     * while reading a conversation, it is that conversation's. Saying one is for a caller
+     * putting a tab somewhere *else* — and a group nothing is currently showing is a tab that
+     * is made and is off the bar, which is a legitimate thing to want and a surprising thing
+     * to do by accident.
+     */
+    group?: string | null;
   }
+  | { "call": "tab_group"; tab: TabId; group: string | null }
   | { "call": "tab_close"; tab: TabId }
   | { "call": "tab_select"; tab: TabId }
   | { "call": "tab_step"; view?: ViewId | null; delta: number }

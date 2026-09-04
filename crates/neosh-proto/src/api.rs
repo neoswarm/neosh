@@ -564,8 +564,27 @@ pub enum ApiCall {
         /// work somewhere is not, for the same reason `SessionNew { activate: false }` exists.
         #[serde(default)]
         activate: bool,
+        /// Which strip to open it on. See [`TabInfo::group`].
+        ///
+        /// `None` inherits the tab you are on, which is what a new tab almost always wants: opened
+        /// while reading a conversation, it is that conversation's. Saying one is for a caller
+        /// putting a tab somewhere *else* — and a group nothing is currently showing is a tab that
+        /// is made and is off the bar, which is a legitimate thing to want and a surprising thing
+        /// to do by accident.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        group: Option<String>,
     },
-    /// Close a tab and every pane in it. The view's last tab is refused.
+    /// Move a tab to another strip, or to nobody's with `None`. See [`TabInfo::group`].
+    ///
+    /// What the host calls when you switch conversation: the tab you did it in is now about the
+    /// conversation in it, so it leaves the old strip and joins the new one. A tab that is on
+    /// screen when this moves it stays on screen — you are in it — and what changes is which
+    /// *other* tabs are beside it.
+    TabGroup {
+        tab: TabId,
+        group: Option<String>,
+    },
+    /// Close a tab and every pane in it. A conversation's last tab is refused.
     TabClose {
         tab: TabId,
     },
@@ -573,11 +592,13 @@ pub enum ApiCall {
     TabSelect {
         tab: TabId,
     },
-    /// Go to the tab `delta` along, wrapping.
+    /// Go to the tab `delta` along the bar, wrapping.
     ///
     /// Wrapping where [`ApiCall::PaneFocusDir`] does not, because a tab bar is a list you can see
     /// all of: coming round from the last to the first is visible in the same glance as the key
-    /// that did it, and a pane you wrapped to may be off in a corner of a nested split.
+    /// that did it, and a pane you wrapped to may be off in a corner of a nested split. Along *the
+    /// bar*, which is this conversation's tabs — stepping into another conversation's would be a
+    /// key that changes what you are working on, from a key about where you are looking.
     TabStep {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         view: Option<ViewId>,
@@ -585,6 +606,10 @@ pub enum ApiCall {
     },
     /// Move a tab along the bar. Clamped at the ends rather than wrapping — this is a drag, and a
     /// drag that teleports is a drag you did not mean.
+    ///
+    /// `to` counts the tabs on the bar, which is the tabs of one conversation: it is the number
+    /// printed on the strip and the one `<C-w>1` takes, rather than a position in a list that
+    /// includes tabs nothing is drawing. Moving a tab to another conversation is [`ApiCall::TabGroup`].
     TabMove {
         tab: TabId,
         to: u32,
@@ -595,6 +620,11 @@ pub enum ApiCall {
         title: Option<String>,
     },
     /// Every tab of a view, its panes, and which of each is active.
+    ///
+    /// *Every* one, including the tabs of the conversations this terminal is not in — with
+    /// [`TabInfo::group`] on each, which is what tells them apart. The whole truth and the key to
+    /// filter it by: a caller drawing a bar wants the active tab's group, and one asking "what is
+    /// open in this terminal" wants all of them, and both are answers this can give.
     TabList {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         view: Option<ViewId>,

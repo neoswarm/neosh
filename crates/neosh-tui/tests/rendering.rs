@@ -1520,7 +1520,7 @@ fn paned(root: PaneNode) -> Mirror {
     });
     let active = TabId(1);
     m.apply(UiEvent::PanesChanged {
-        tabs: vec![TabInfo { id: active, title: None, root, active_pane: PaneId(1) }],
+        tabs: vec![TabInfo { id: active, title: None, root, active_pane: PaneId(1), group: None }],
         active,
     });
     m
@@ -1683,6 +1683,7 @@ fn a_window_that_names_no_pane_lands_in_the_active_one() {
             title: None,
             root: split(SplitDir::Row, vec![leaf(1), leaf(2)]),
             active_pane: PaneId(2),
+            group: None,
         }],
         active: TabId(1),
     });
