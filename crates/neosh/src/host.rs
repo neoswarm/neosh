@@ -1542,6 +1542,8 @@ impl Host {
                 // slow, unreachable or asking for a key it will not get takes as long as a TCP
                 // timeout, and on the loop that is every terminal in the workspace frozen for it.
                 | ApiCall::GitFetch { .. }
+                // Somebody else's server, over the network, through another program.
+                | ApiCall::ForgePulls { .. }
                 | ApiCall::GitPull { .. }
                 | ApiCall::GitAddWorktree { .. }
                 | ApiCall::GitRemoveWorktree { .. }
@@ -14063,6 +14065,7 @@ async fn run_slow(svc: Services, call: ApiCall) -> ApiResult {
         ApiCall::GitUnstage { paths } => svc.git_unstage(paths).await,
         ApiCall::GitCommit { message } => svc.git_commit(message).await,
         ApiCall::GitFetch { cwd } => svc.git_fetch(cwd).await,
+        ApiCall::ForgePulls { cwd } => svc.forge_pulls(cwd).await,
         ApiCall::GitPull { cwd, rebase } => svc.git_pull(cwd, rebase).await,
         ApiCall::GitAddWorktree { path, branch, create, cwd } => {
             svc.git_add_worktree(path, branch, create, cwd).await

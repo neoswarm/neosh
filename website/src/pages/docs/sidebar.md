@@ -42,6 +42,39 @@ The second row is a button, and its label is rebuilt from the state every time i
 
 `⇥` on a git row steps the block between `one` (the two rows above) and `full`, which adds the upstream it tracks and a line about the working tree. `^G` opens the full status, and every row in the block opens it on `↵`… except the button, which is the button.
 
+### The pull request
+
+A branch tells you nothing about whether anybody has looked at it. So the block names the pull request for the branch you are on, and every project and worktree row carries its number:
+
+```
+ GIT                           ^G
+──────────────────────────────────
+ fix/the-login ↑2
+ #91 open                 ✗ failing
+ ↻ check for changes           now
+```
+
+```
+ ▾ neosh
+   ▾ ⎇ fix/the-login  #91 ✗   2
+   ▾ ⎇ feature/panels #88 •   1
+   ▾ ⎇ chore/deps     #84     3
+```
+
+The number is coloured by state — open, draft, merged, closed — and a check mark appears **only when there is something to say**: `✗2` when checks are failing, one glyph that turns while they are running, and nothing at all when they passed. A tick beside every merged pull request from the last six months is a column of marks nobody reads.
+
+`↵` on the pull request row copies its URL. It does not open a browser: neosh has none, and on the machine a coding agent usually runs on there is not one to open — the clipboard reaches the laptop you are actually sitting at, which is why it is OSC 52.
+
+It asks `gh`, the CLI you have already signed into, so tokens, enterprise hosts and SSO are already handled and the answer is the one you get in your own terminal. One request per **repository**, not per row: six worktrees of one checkout are one call and six lookups.
+
+```toml
+[options]
+"git.pulls" = true            # the number on the rows
+"git.pulls.interval" = 180    # seconds; 0 asks only when you press the key
+```
+
+Without `gh`, signed out, or on a repository with no forge remote, the rows simply carry no pull request. It is said once in the log, not every few minutes — those are states somebody has to fix, not events. `^K git.pulls` re-asks and tells you out loud.
+
 ### The numbers are asked for, not remembered
 
 `↑` and `↓` come from `git status`, which compares your branch with the copy of the remote **sitting on your disk** — so drawn without ever fetching, `↓0` means "nothing had arrived as of whenever this checkout last spoke to a server", which after an afternoon's work is a sentence about breakfast. So neosh fetches: on a slow timer, and when you arrive in a conversation.

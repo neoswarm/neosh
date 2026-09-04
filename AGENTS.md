@@ -519,6 +519,29 @@ is `docs/releasing.md`.
   never a modal: a large repository is minutes, and the phases are git's own words with a meter only
   where git gave a total, because a bar creeping along on an invented denominator is the one thing a
   progress display must not do.
+- **A branch is a local fact and a pull request is not.** `feature/the-thing` with three commits on
+  it reads identically whether it went green an hour ago, is failing, is a draft nobody has been
+  asked to look at, or merged last week and left a worktree behind — four different things to do
+  next, drawn as one row. `ApiCall::ForgePulls` is the other half, answered by `gh` for the reason
+  every vendor CLI here is preferred to a binary neosh would fetch and keep updated: it already
+  handles tokens, enterprise hosts, SSO and rate limits, and its answer is the one the user gets in
+  their own terminal. **One call per repository, keyed by head branch** — six worktrees of one
+  checkout are one request and six lookups, which is the whole reason it is affordable on a timer —
+  and it is a **read**, ungated, because unlike `GitFetch` it writes nothing anywhere and gating it
+  would be charging a permission for a fact. It **rejects rather than answering empty** when it
+  cannot know: an empty list is the claim *this repository has no pull requests*, and no `gh`, not
+  signed in and no forge remote would each be making it falsely. Those three are *states* rather
+  than events — permanent until somebody acts — so they are said once and filed, never on the
+  timer. And **a check that has not finished is not a check that passed**: the rollup is every run
+  in every state at once, so failing outranks pending outranks passing, an empty rollup is `None`
+  rather than green, and `SKIPPED` on a docs-only change must not paint the row red.
+- **A mark that is always there is a mark you stop seeing.** The badge is `#86` in the state's
+  colour, plus a check mark **only when it is news** — `✗2` failing, one turning glyph while they
+  run, and nothing at all when they passed. The transcript's rule about tool calls, one panel along:
+  a green tick beside every merged pull request from the last six months is a column nobody reads,
+  and the one time something is red it has to be what the eye lands on. Merged and closed say
+  nothing about checks at all, because a merged pull request's checks are *why* it merged and
+  sixteen columns spent on that clipped the state it was qualifying down to `#86 mer…`.
 - **A project outlives the conversations in it.** The panel's list is written down (`sidebar.projects`,
   a workspace var) rather than worked out from where the conversations happen to be — derived, it
   deleted the directory you had worked in all month the moment you cleared out the last thread in

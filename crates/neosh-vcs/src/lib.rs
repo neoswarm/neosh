@@ -19,8 +19,10 @@ use neosh_proto::{
 };
 use tokio::process::Command;
 
+mod forge;
 mod parse;
 
+pub use forge::pulls;
 pub use parse::{parse_porcelain_v2, parse_worktree_list};
 
 #[derive(Debug, thiserror::Error)]
@@ -31,6 +33,13 @@ pub enum VcsError {
     GitMissing,
     #[error("git {command} failed: {message}")]
     Command { command: String, message: String },
+    /// The forge could not be asked: no `gh`, not signed in, no remote on one.
+    ///
+    /// Its own variant rather than a `Command` failure because the three of these that matter are
+    /// *states of the machine* rather than things that went wrong with a request, and a caller on a
+    /// timer has to be able to tell "ask again in a minute" from "stop asking and say so once".
+    #[error("{message}")]
+    ForgeUnavailable { message: String },
     #[error("{0}")]
     Io(#[from] std::io::Error),
 }

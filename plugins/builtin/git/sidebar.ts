@@ -49,7 +49,8 @@
  */
 
 import { byteLength } from "@neosh/api";
-import type { Disposable, Neosh, PluginContext, RepoStatus } from "@neosh/api";
+import type { Disposable, Neosh, PluginContext, PullRequest, RepoStatus } from "@neosh/api";
+import { checksWord, type Pulls, stateHl } from "./pulls.ts";
 import { confirm, onTick, picker, spinnerFrame } from "@neosh/api/ui";
 
 /** The contribution id, and therefore what `on: "custom:git"` names. */
@@ -150,6 +151,13 @@ interface State {
   /** The checkout being reported on, so a stale answer arriving after a switch is discarded. */
   cwd: string | null;
   status: RepoStatus | null;
+  /**
+   * The pull request for the branch this checkout has out, if the forge has one.
+   *
+   * Held rather than looked up at draw time because the lookup crosses a module and a cache, and
+   * this block redraws ten times a second while a fetch is out. Refreshed with the status.
+   */
+  pull: PullRequest | null;
   busy: Busy;
   /** When the remote last *answered*, in epoch ms. `null` is "never, this session". */
   checkedAt: number | null;
@@ -213,14 +221,25 @@ export interface GitSectionHooks {
 }
 
 export async function installGitSection(
-  { neosh, subscriptions }: PluginContext,
-  hooks: GitSectionHooks,
+  ctx: PluginContext,
+  hooks: GitSectionHooks & {
+    /**
+     * What the forge knows, so the block can name the pull request for the branch it is drawing.
+     *
+     * Passed in rather than read here because it is a different server on a much slower clock, and
+     * because one cache for the whole plugin is what keeps a repository with six worktrees to one
+     * request rather than seven.
+     */
+    pulls: Pulls;
+  },
 ): Promise<GitSection> {
+  const { neosh, subscriptions } = ctx;
   await declareOptions(neosh);
 
   const state: State = {
     cwd: null,
     status: null,
+    pull: null,
     busy: null,
     checkedAt: null,
     askedAt: null,
@@ -307,8 +326,14 @@ export async function installGitSection(
       state.askedAt = null;
       state.error = null;
       state.said = null;
+      state.pull = null;
     }
     state.status = await neosh.git.status().catch(() => null);
+    // Which pull request this branch is, out of the cache the whole plugin shares. A lookup rather
+    // than a request: whoever holds that cache decides when to ask the forge again, on a clock far
+    // slower than this one.
+    const branch = state.status?.repo.branch;
+    state.pull = cwd && branch ? hooks.pulls.forBranch(cwd, branch) : null;
     // Everything else that draws a branch name, off the same read. See {@link GitSectionHooks}.
     hooks.onStatus(state.status);
     await draw();
@@ -471,6 +496,21 @@ export async function installGitSection(
       "git.sidebar.action",
       () => pull(),
       "The sidebar's git verb: pull, choose how to reconcile, or go and look",
+    ],
+    [
+      // Copies rather than opens, for the reason on [`pullRow`]: there is no browser capability,
+      // and on the machine a coding agent usually runs on there is no browser either.
+      "git.pull.copy",
+      async () => {
+        const url = state.pull?.url;
+        if (!url) {
+          neosh.notify("no pull request for this branch", "warn");
+          return;
+        }
+        await neosh.edit.copy(url);
+        neosh.notify(`copied #${state.pull?.number}`);
+      },
+      "Copy the URL of this branch's pull request",
     ],
     [
       "git.sidebar.cycle",
@@ -651,6 +691,14 @@ function section(state: State, settings: Settings, now: number) {
     command: "git.status",
   });
 
+  // ---- the pull request --------------------------------------------------
+  //
+  // In **both** styles when there is one, unlike everything else that `full` adds. It is the one
+  // row here that is not derivable from this disk — the branch, the counts and the working tree are
+  // all things you could have worked out, and whether anybody has reviewed your work is not — and
+  // it costs a row only on the branches that have one, which is never the busy case.
+  if (state.pull) rows.push(pullRow(state.pull, room, settings.ascii));
+
   if (settings.style === "full") {
     rows.push({
       text: `${g.upstream} ${clip(status.repo.upstream ?? "no upstream", room - 2)}`,
@@ -662,6 +710,45 @@ function section(state: State, settings: Settings, now: number) {
 
   rows.push(verbRow(state, settings, now, room, g));
   return { title: "GIT", hint: "^G", before: "projects", rows };
+}
+
+/**
+ * The pull request this branch is, and what its checks say.
+ *
+ * `#86 open` with the state's colour on the whole row, and the checks on the right — where the
+ * freshness column sits on the verb row, because both answer "how much should I trust this". The
+ * check word is dropped entirely when there are no checks configured: a repository that runs none
+ * has told you nothing, and "checks passing" over it would be a sentence nobody wrote.
+ *
+ * `↵` copies the URL. Not *opens* it: neosh has no browser capability and inventing one for this
+ * would be a new outward-facing verb for a row — and on the machine this most often runs on, a big
+ * one over SSH, opening a browser would open it in the wrong place anyway. Copying reaches the
+ * laptop you are sitting at, which is the same reason the clipboard is OSC 52.
+ */
+function pullRow(pr: PullRequest, room: number, ascii: boolean): StripRow {
+  const said = checksWord(pr, ascii);
+  // The right column is measured out of the room first, as everywhere else in this block: it is
+  // drawn *over* the row rather than after it, so a row built to the full width collides with it.
+  const right = said ? { text: said, hl: checksHl(pr) } : undefined;
+  const label = `#${pr.number} ${pr.state}`;
+  return {
+    text: clip(label, Math.max(8, room - (said ? cells(said) + 1 : 0))),
+    hl: stateHl(pr.state),
+    right,
+    command: "git.pull.copy",
+  };
+}
+
+/** The colour of what the checks say. Nothing to say is the row's own colour rather than a third. */
+function checksHl(pr: PullRequest): string {
+  switch (pr.checks) {
+    case "failing":
+      return "Forge.ChecksFailed";
+    case "pending":
+      return "Forge.ChecksRunning";
+    default:
+      return "Sidebar.Dim";
+  }
 }
 
 /**

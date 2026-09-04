@@ -155,3 +155,68 @@ pub enum DiffTarget {
     /// `base...head`, the merge-base diff a pull request shows.
     Range { base: String, head: String },
 }
+
+// ---------------------------------------------------------------------------
+// The forge
+// ---------------------------------------------------------------------------
+
+/// Where a pull request has got to.
+///
+/// Four states because that is what a person means by "what happened to it": one is a review you
+/// are waiting for, one is a review you have not asked for yet, one is done, and one is not going
+/// to happen. Draft is its own state rather than a flag on `Open` because on a row it is the whole
+/// difference between "somebody should look at this" and "I am still writing it".
+#[derive(TS, Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
+#[serde(rename_all = "snake_case")]
+#[ts(export)]
+pub enum PullState {
+    Open,
+    Draft,
+    Merged,
+    Closed,
+}
+
+/// What the forge's checks say, folded to the one thing a row has room for.
+///
+/// Folded here rather than on the wire as a list, because the question a project row answers is
+/// "is anything wrong" and the answer is one glyph. The counts travel beside it for whoever wants
+/// to say `✗2`; the full list of check names is a panel's job and a different call.
+///
+/// `Pending` and `None` are deliberately different. Nothing has run yet is a state that resolves on
+/// its own in a few minutes; there are no checks configured at all is permanent, and drawing a
+/// spinner over it for ever is the failure this distinction avoids.
+#[derive(TS, Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
+#[serde(rename_all = "snake_case")]
+#[ts(export)]
+pub enum ChecksState {
+    /// This repository runs no checks on this branch.
+    None,
+    /// At least one is still going, and nothing has failed yet.
+    Pending,
+    Passing,
+    Failing,
+}
+
+/// One pull request, as much of it as a row can use.
+///
+/// **Keyed by `branch`**, which is what makes one call answer for every worktree at once: a
+/// repository's pull requests come back together and each checkout finds its own by the branch it
+/// has out. Asking per branch would be one network round trip per row in the panel.
+#[derive(TS, Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
+#[ts(export)]
+pub struct PullRequest {
+    #[ts(type = "number")]
+    pub number: u64,
+    pub title: String,
+    /// For opening it. The forge's own URL, so nothing here has to know how to build one.
+    pub url: String,
+    /// The head branch. What a checkout matches itself against.
+    pub branch: String,
+    pub state: PullState,
+    pub checks: ChecksState,
+    /// How many checks have failed, for a row that wants to say `✗2` rather than `✗`.
+    #[serde(default)]
+    pub checks_failed: u32,
+    #[serde(default)]
+    pub checks_total: u32,
+}
