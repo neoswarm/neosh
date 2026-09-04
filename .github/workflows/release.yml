@@ -10,6 +10,10 @@ name: release
 # macOS and Linux only, deliberately: the workspace talks to its terminals over a Unix socket
 # (`daemon.rs`), so there is nothing to ship for Windows yet.
 on:
+  # A tag is the release. This file keeps its name because npm binds the `@neosh/cli-*` trusted
+  # publishers to it.
+  push:
+    tags: ["v*"]
   release:
     types: [published]
   workflow_dispatch:
@@ -148,3 +152,87 @@ jobs:
             exit 0
           fi
           (cd npm/neosh && npm publish --access public --provenance)
+
+  # The step docs/releasing.md called "the one with nothing watching it", now watched.
+  #
+  # `brew upgrade` cannot see a release the tap does not point at, so until this existed a green
+  # release still left every Homebrew user on the previous version — silently, because nothing in
+  # the release reports on a second repository. It ran by hand or not at all, and "not at all" looks
+  # exactly like "shipped".
+  #
+  # `needs: build` because the formula is *written from the release*: `brew-formula.sh` reads the
+  # four `.sha256` files off it, so running before the tarballs are attached produces a formula with
+  # nothing in it.
+  homebrew:
+    name: Homebrew formula
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    # Mapped to `env` rather than tested directly. The `secrets` context is not available in a step's
+    # `if:` — it evaluates to empty there, so `if: secrets.X` is always false and the job silently
+    # does nothing on a repository that has the token. Job-level `env` *can* read secrets, and
+    # `env` *is* available in `if:`, so this is the one spelling that behaves.
+    env:
+      HAS_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN != '' }}
+    steps:
+      # Not a failure. The token is the one credential in this release that OIDC cannot replace —
+      # trusted publishing authenticates *to a registry*, and this is a git push to another
+      # repository — so a fork, or this repository before somebody creates it, must skip rather than
+      # go red for a reason nobody has done anything wrong about.
+      - name: Say so when the tap cannot be pushed
+        if: env.HAS_TAP_TOKEN != 'true'
+        run: |
+          echo "::warning::HOMEBREW_TAP_TOKEN is not set — the tap still points at the old version."
+          echo "Create a fine-grained PAT with Contents: read and write on neoswarm/homebrew-tap,"
+          echo "then: gh secret set HOMEBREW_TAP_TOKEN"
+
+      - uses: actions/checkout@v4
+        if: env.HAS_TAP_TOKEN == 'true'
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+
+      - name: Point the tap at this release
+        if: env.HAS_TAP_TOKEN == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        run: |
+          set -euo pipefail
+          tag="${{ github.event.inputs.tag || github.ref_name }}"
+
+          # The assets are attached by four independent matrix jobs, and `needs:` waits for the jobs
+          # rather than for the release to have settled. Wait for the eight files themselves.
+          n=0
+          for _ in $(seq 30); do
+            # `|| echo 0` because a five-minute poll against an API is a five-minute window for one
+            # request to fail, and `set -e` on an empty command substitution would end the release
+            # over a blip the next iteration would have sailed through.
+            n=$(gh release view "$tag" --json assets \
+                  --jq '[.assets[] | select(.name | endswith(".sha256"))] | length' 2>/dev/null || echo 0)
+            [ "$n" -eq 4 ] && break
+            echo "waiting for checksums — $n of 4"
+            sleep 10
+          done
+          if [ "$n" -ne 4 ]; then
+            echo "::error::only $n of 4 checksums on $tag; not writing a formula from a partial release"
+            exit 1
+          fi
+
+          git clone --depth 1 \
+            "https://x-access-token:$TAP_TOKEN@github.com/neoswarm/homebrew-tap" tap
+          ./scripts/brew-formula.sh "$tag" > tap/Formula/neosh.rb
+
+          cd tap
+          # Nothing to say is a success. Re-running a release over a tap that is already correct
+          # must not fail on an empty commit.
+          if git diff --quiet; then
+            echo "the tap already points at $tag"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -qam "neosh ${tag#v}"
+          git push
+          echo "tap now points at $tag"
