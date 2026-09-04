@@ -40,6 +40,7 @@ import {
   defineHighlights,
   meter,
   onTick,
+  pager,
   pathPicker,
   picker,
   type PickerItem,
@@ -384,16 +385,15 @@ async function showStatus(neosh: Neosh): Promise<void> {
     }
   }
 
-  const buf = await neosh.buf.create({ name: "[git status]", scratch: true });
-  await neosh.buf.setLines(buf, 0, -1, lines);
-  await neosh.float.open(buf, {
-    anchor: { kind: "screen" },
-    width: { kind: "fixed", n: 76 },
-    height: { kind: "fixed", n: Math.min(24, lines.length) },
-    border: "rounded",
-    closeOnBlur: true,
-  });
+  // A repository mid-refactor has more changed files than any panel is tall, and every one past the
+  // bottom edge used to be drawn nowhere with nothing on screen to say the list went on. The height
+  // is a ceiling and the panel scrolls; the `Math.min(24, lines.length)` this used to compute was a
+  // guess at a number only the frontend has.
+  await pager(neosh, lines, { title: " git status ", width: 76, height: 24, kind: KIND_STATUS });
 }
+
+/** The status panel's kind, so `?` lists its keys and somebody else can add one. */
+const KIND_STATUS = "neosh.git.status";
 
 async function switchBranch(neosh: Neosh): Promise<void> {
   const branches = await neosh.git.branches().catch((e) => {
@@ -738,27 +738,25 @@ async function showDiff(neosh: Neosh): Promise<void> {
     );
   }
 
-  const buf = await neosh.buf.create({ name: `[diff] ${chosen.path}`, scratch: true });
-  await neosh.buf.setLines(buf, 0, -1, parts);
-  const ns = await neosh.ns.create("neosh.git.diff");
-  for (let i = 0; i < parts.length; i++) {
-    const hl = diffHl(parts[i] ?? "");
-    if (hl) {
-      await neosh.ns.mark(ns, buf, i, 0, { hlGroup: hl, endCol: byteLength(parts[i] ?? "") });
-    }
-  }
-
-  const win = await neosh.float.open(buf, {
-    anchor: { kind: "screen" },
-    width: { kind: "max", n: 100 },
-    height: { kind: "max", n: 30 },
-    border: "rounded",
-    title: ` ${chosen.path} `,
-    closeOnBlur: true,
-    focusable: true,
+  // Which way a diff line went is a background, so the group bands the whole row.
+  const marks = parts.map((line) => {
+    const hl = diffHl(line);
+    return hl ? [{ col: 0, opts: { hlGroup: hl, endCol: byteLength(line) } }] : [];
   });
-  await neosh.focus.push(win);
+
+  // A diff is the panel most reliably longer than a screen — thirty rows was never the size of a
+  // patch, it was the size of the box we were prepared to draw one in.
+  await pager(neosh, parts, {
+    title: ` ${chosen.path} `,
+    width: 100,
+    height: 30,
+    kind: KIND_DIFF,
+    marks,
+  });
 }
+
+/** The diff panel's kind. */
+const KIND_DIFF = "neosh.git.diff";
 
 /**
  * Keep only the hunk belonging to one file.

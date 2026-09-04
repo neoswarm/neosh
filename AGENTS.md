@@ -181,6 +181,31 @@ is `docs/releasing.md`.
   own scroll to keep its cursor on screen and reports back what it actually drew, including `rows`,
   the buffer rows on the screen — which is what `^D` and `H`/`M`/`L` are counted in and is not the
   height.
+- **A panel that does not fit is a place you move in too, and it says so on its own edge.** A float
+  *asks* for a height and is given whatever the screen has, so `height: Max { n: 30 }` on a
+  twenty-row terminal is ten rows of panel and twenty rows of content drawn nowhere, with no key
+  pointed at it — which is what the key sheet, git status, a diff and another machine's transcript
+  each were. `FloatConfig::scroll` puts one more scope in the chain while that float has focus,
+  `BufKind { name: "neosh.scroll" }`, and the workspace binds the reader's motions there: `j`/`k`,
+  `^D`/`^U`, `^F`/`^B`, `gg`/`G`, the arrows and the paging keys. A **scope** rather than a capture,
+  so the three usual rules hold — `^Z` lists them, `init.ts` moves them, and a panel that wants `j`
+  for itself binds it on *its* kind, which is nearer and wins. Below the panel's kind and above
+  `Global`, so it survives a modal without ever taking a key from the thing it is scrolling. It is
+  **opt-in and stays that way**: a scope beats a capture, so a picker whose filter takes printable
+  characters through one would have `j` and `G` resolved out from under it, and typing a model's
+  name would scroll. A panel that moves in itself already keeps its cursor on screen and says
+  nothing here. What the frontend adds is the part nobody else can: **a bar in the right border
+  while anything is hidden**, drawn from how many rows actually fit, which is a number known only
+  after the fact and only there — in the *border*, because a scrollbar that took a content column
+  would shorten every panel in the workspace including the ones with nothing to say. And the wheel
+  goes to whatever has the keyboard: a notch over an opaque panel used to scroll the transcript
+  behind it, so nothing on screen moved at all.
+- **A key strip belongs on the border, not in the buffer.** `FloatConfig::footer` is the bottom edge,
+  and it is where every legend in the workspace now lives — because written as the last row of
+  content it is both the row that scrolls away exactly when it is wanted and the first row a short
+  terminal clips. Both happened, to the same row: the picker's strip is the one that says how to get
+  out, and on a sixteen-row screen it was the one that did not fit. It also costs a row of height,
+  which every panel was paying for on every screen.
 - **A list is a place you move in.** Anywhere there is a cursor over rows and no text field — the
   project panel, the transcript reader — the motions are Vim's and they take a count: `5j` is five
   rows you can *land on*, `^D`/`^U` are half of the panel's real height, `12G` is a row rather than

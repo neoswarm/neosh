@@ -32,6 +32,7 @@ import type { ProjectKey } from "./ProjectKey";
 import type { ProviderEvent } from "./ProviderEvent";
 import type { QuotaSnapshot } from "./QuotaSnapshot";
 import type { Rect } from "./Rect";
+import type { ScrollAmount } from "./ScrollAmount";
 import type { SelectShape } from "./SelectShape";
 import type { SessionId } from "./SessionId";
 import type { StatusSegment } from "./StatusSegment";
@@ -113,6 +114,7 @@ export type ApiCall =
   | { "call": "win_set_cursor"; win: WindowId; row: number; col: number }
   | { "call": "win_get_viewport"; win: WindowId }
   | { "call": "win_scroll_to"; win: WindowId; top_line: number | null }
+  | { "call": "win_scroll"; win: WindowId; amount: ScrollAmount }
   | { "call": "win_list" }
   | {
     "call": "pane_split";

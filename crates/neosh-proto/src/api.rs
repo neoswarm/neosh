@@ -27,8 +27,8 @@ use crate::provider::{
 use crate::quota::{QuotaSample, QuotaSnapshot, UsageHistory, UsageResolution};
 use crate::ui::{
     CursorMotion, CursorShape, Direction, ExtmarkInfo, ExtmarkOpts, FloatConfig, HighlightDef,
-    KeyPress, LineDraw, MessageLevel, NoticeKind, Rect, SelectShape, SurfaceCell, TabInfo, TextEdit,
-    WindowLayout,
+    KeyPress, LineDraw, MessageLevel, NoticeKind, Rect, ScrollAmount, SelectShape, SurfaceCell,
+    TabInfo, TextEdit, WindowLayout,
 };
 use crate::vcs::{BranchInfo, CommitInfo, DiffTarget, RepoStatus, WorktreeInfo};
 
@@ -445,6 +445,19 @@ pub enum ApiCall {
     WinScrollTo {
         win: WindowId,
         top_line: Option<u32>,
+    },
+    /// Move a window's scroll by a screenful, a half, a line, or all the way to an end.
+    ///
+    /// The counterpart to [`ApiCall::WinScrollTo`], and it exists because the caller cannot do this
+    /// arithmetic. "Half a screen" is counted in the *buffer rows the frontend actually drew* —
+    /// which on a wrapping window is not the height and on any window is not the line count — and
+    /// the floor is the last screenful rather than the last line, so scrolling to the bottom leaves
+    /// a full panel rather than one row above an empty one. Both numbers live beside each other in
+    /// the core; a plugin subtracting its own would be re-deriving a viewport it was told about one
+    /// frame late.
+    WinScroll {
+        win: WindowId,
+        amount: ScrollAmount,
     },
     /// Every window that is open, what is in it, and where it sits.
     ///
