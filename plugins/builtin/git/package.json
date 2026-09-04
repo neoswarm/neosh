@@ -1,6 +1,6 @@
 {
   "name": "@neosh/git",
-  "version": "0.4.1",
+  "version": "0.4.2",
   "description": "Branch, commit and status, with model-written names and messages you can re-prompt.",
   "license": "MIT",
   "type": "module",
