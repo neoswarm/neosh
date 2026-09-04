@@ -992,6 +992,23 @@ pub struct Host {
     /// [`neosh_provider::drivers::Unasked`].
     unasked_rx: Option<tokio::sync::mpsc::UnboundedReceiver<Unheard>>,
     unasked_tx: tokio::sync::mpsc::UnboundedSender<Unheard>,
+    /// Conversations that reported one of those while the turn it interrupted was still winding
+    /// down, and which therefore still have to be heard out.
+    ///
+    /// The report cannot simply be acted on where it arrives. A driver notices an unasked turn
+    /// because *nothing is reading its pipe*, and the moment nothing is reading is the moment the
+    /// last turn let go — which is strictly **before** that turn's `TurnEnded` reaches this loop.
+    /// So [`Host::hear_out`] is always called with the finished turn still in [`Self::turns`], sees
+    /// a turn running, and declines; and because the driver only ever reports a *new* `init`,
+    /// nothing would ever mention it again. What the agent said next then sat in the pipe until the
+    /// next message was sent, where [`drain_between_turns`](neosh_provider) drops it by design —
+    /// the answer to a question that was never put. Which is what it looked like from the keyboard:
+    /// a turn ends, you type, something is instantly running, and whatever the agent said in
+    /// between is gone under your message.
+    ///
+    /// Held here instead and spent by the ending that was in the way, so the report survives the
+    /// gap rather than falling into it.
+    unheard: std::collections::HashSet<neosh_proto::SessionId>,
     /// Set by a turn ending, cleared by the poll that follows it. See [`crate::quota::AFTER_TURN`].
     quota_due: bool,
     /// Conversations that were blocked on an answer as of the last `question.asking`.
@@ -1277,6 +1294,21 @@ const VERBS: &[&str] = &[
     "Mulling", "Deliberating", "Reckoning", "Chewing", "Turning it over",
 ];
 
+/// What a turn opened to *hear* the agent out is doing. See [`Host::hear_out`].
+///
+/// Not one of [`VERBS`], and that is the point: those all describe the agent answering something
+/// you asked, and nobody asked this. It is also how the line is recognised when the turn stops
+/// being a report and starts being an answer — see the `Steered` arm.
+const REPORTING: &str = "Reporting back";
+
+/// One of [`VERBS`], per turn.
+///
+/// Not random: the turn id would be ideal but is not known yet, and a clock read is the one varying
+/// thing already to hand.
+fn a_verb() -> &'static str {
+    VERBS.get(now_secs().unsigned_abs() as usize % VERBS.len()).copied().unwrap_or("Working")
+}
+
 /// A key being typed in, and who is waiting to hear how it went.
 /// A search being typed in the transcript.
 ///
@@ -1443,6 +1475,7 @@ impl Host {
             quota_rx: Some(quota_rx),
             unasked_rx: Some(unasked_rx),
             unasked_tx,
+            unheard: std::collections::HashSet::new(),
             quota_due: false,
             asking: Vec::new(),
             permitting: Vec::new(),
@@ -2464,6 +2497,9 @@ impl Host {
                     t.cancel.cancel();
                 }
                 self.rounds.remove(&session);
+                // Nothing left to hear out: the transcript this would have been drawn into is about
+                // to be deleted, and the CLI holding it is closed a few lines below.
+                self.unheard.remove(&session);
                 self.driver_commands.remove(&session);
                 // A vendor CLI held open for this conversation has nothing left to answer. Left
                 // alone it would sit there for the rest of the program, holding a conversation
@@ -3367,14 +3403,9 @@ impl Host {
         let token = CancellationToken::new();
         self.turns
             .insert(session.clone(), Running { cancel: token.clone(), cancelling: false });
-        // Not random: the turn id would be ideal but is not known yet, and a clock read is the one
-        // varying thing already to hand. Per turn, so it does not change under you mid-answer.
-        let verb = VERBS
-            .get(now_secs().unsigned_abs() as usize % VERBS.len())
-            .copied()
-            .unwrap_or("Working");
         self.rounds.insert(session.clone(), Round {
-            verb,
+            // Per turn, so it does not change under you mid-answer.
+            verb: a_verb(),
             started: std::time::Instant::now(),
             note: None,
             note_is_wait: false,
@@ -9619,6 +9650,18 @@ impl Host {
                 // poll at zero reliably returns the figure from *before* the turn — which draws as
                 // a turn that cost nothing at all.
                 self.quota_due = true;
+                // The ending this conversation was waiting for. A turn nobody asked for that began
+                // while this one was winding down could not be opened then — see [`Self::unheard`]
+                // — and the gap it fell into ends exactly here.
+                //
+                // Before the leftover below, and that ordering is the whole of it: what the agent
+                // has already started saying came first, so it is heard first, and the message you
+                // typed in the meantime is steered into that listening turn and asked at the end of
+                // it. The other way round, your turn would drain what the agent said and drop it —
+                // your message written over the thing it was answering.
+                if self.unheard.remove(&session) {
+                    self.hear_out(session.clone());
+                }
                 if !leftover.is_empty() {
                     self.start_turn_in(session, Prompt {
                         text: leftover
@@ -9651,6 +9694,13 @@ impl Host {
                 self.persist_session(&session);
             }
             AgentEvent::Steered { session, prompt, .. } => {
+                // A turn opened to hear the agent out has just been handed a question, so it is not
+                // a report any more. Left alone, the line went on saying `Reporting back` over the
+                // answer to the thing you had typed — which is the same lie as the one that label
+                // exists to stop, told the other way round.
+                if let Some(r) = self.rounds.get_mut(&session).filter(|r| r.verb == REPORTING) {
+                    r.verb = a_verb();
+                }
                 // Drawn now rather than when it was typed: until the model has been told, a
                 // transcript showing the question is a transcript that is lying about what was
                 // asked. Off screen it needs no drawing at all — it is in the conversation's
@@ -10559,20 +10609,37 @@ impl Host {
     /// The turn says nothing: [`AgentDriver::listen_only`] is what tells the driver that, and it is
     /// set here rather than carried on the wire because it is true of exactly the turn about to
     /// start and of nothing else.
+    ///
+    /// A turn already running is *deferred*, never dropped. See [`Self::unheard`]: the report is
+    /// raised by the driver letting go of the pipe, which happens a moment before the ending that
+    /// frees this conversation gets here, so "a turn is running" is the ordinary case rather than
+    /// the exception — and a report dropped here is the only one that was ever going to be made.
     fn hear_out(&mut self, session: neosh_proto::SessionId) {
-        // A turn is already reading that pipe. Nothing to open, and opening one would put an empty
-        // message into a conversation that is mid-answer.
-        if self.turns.contains_key(&session) {
-            return;
-        }
-        // Gone since the driver said so — closed, or a workspace shutting down.
+        // Gone since the driver said so — closed, or a workspace shutting down. Asked first, so a
+        // conversation that is not there does not leave a note nothing will ever spend.
         if !self.agent.sessions().list().iter().any(|s| s.id == session) {
+            self.unheard.remove(&session);
             return;
         }
+        // A turn is already reading that pipe. Opening one here would put an empty message into a
+        // conversation that is mid-answer, so this waits for the ending that is in the way.
+        if self.turns.contains_key(&session) {
+            self.unheard.insert(session);
+            return;
+        }
+        self.unheard.remove(&session);
         for d in &self.agent_drivers {
             d.listen_only(&session);
         }
-        self.start_turn_in(session, neosh_agent::Prompt::default());
+        self.start_turn_in(session.clone(), neosh_agent::Prompt::default());
+        // Said for what it is. Every other turn on this line was started by something you did, and
+        // a spinner wearing "Pondering" over a report the agent volunteered is the workspace
+        // claiming a question you never asked — which, arriving in the second between reading an
+        // answer and typing the next thing, reads as your own message having started it.
+        if let Some(r) = self.rounds.get_mut(&session) {
+            r.verb = REPORTING;
+        }
+        self.each_view_showing(&session, |me| me.draw_working());
     }
 
     /// Emit one coalesced frame.

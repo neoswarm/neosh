@@ -762,7 +762,23 @@ is `docs/releasing.md`.
   a turn opened to hold an answer has no question above it. **A turn still ends on its own
   `result`** — `init` opens one and `result` closes one for their turns as much as ours, so a prompt
   queued behind one has two endings to wait for, and ending on the first is how a message that had
-  not been read yet came back as `{"type":"thinking","text":""}`.
+  not been read yet came back as `{"type":"thinking","text":""}`. **And the report has to outlive
+  the turn it interrupted, because it is raised by that turn ending.** The driver notices an
+  unasked turn precisely because *nothing is reading the pipe* — which is the moment the last turn
+  let go of it, strictly before that turn's `TurnEnded` reaches the host loop. So `hear_out` was
+  always called with the finished turn still in `turns`, declined on "a turn is already running",
+  and nothing ever mentioned it again: a driver reports a *new* `init`, and that one had been and
+  gone. What the agent said then sat in the pipe until the next message was sent, where
+  `drain_between_turns` drops it by design. From the keyboard that is the whole bug in one
+  sentence: a turn ends, you type, something is instantly running, and what the agent said in
+  between is gone under your message — or, when its turn was still going, streamed in *below* the
+  message as though it were the answer to it. `Host::unheard` holds the report and the ending that
+  was in the way spends it, **before** the leftover steering starts its turn: what the agent had
+  already begun saying came first, so it is heard first, and the message you typed meanwhile is
+  steered into that listening turn and asked at the end of it. The listening turn also says what it
+  is (`Reporting back`, not one of `VERBS`) and stops saying it the moment steering hands it a
+  question — a spinner claiming to be working on something you never asked is what made your own
+  message look like the thing that started it.
 - **A vendor CLI outlives the turn, so an abandoned turn has to be *drained*.** `Live::lines` is
   per conversation. A turn that is walked away from — `<Esc>`, a switch — leaves the CLI mid-answer
   with the rest of it in the pipe, and the next turn reads it as its own: someone else's reply, and
