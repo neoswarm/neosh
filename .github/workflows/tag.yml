@@ -1,0 +1,80 @@
+name: tag
+
+# A release is one `git push --follow-tags`, and nothing after it.
+#
+# What this file does is small on purpose: it checks the tag against the version in the manifest,
+# and it creates the GitHub release page. Everything that *publishes* — the four binaries, the
+# eleven crates, the sixteen npm packages, the Homebrew formula — is triggered by the same tag push
+# in its own file, in parallel with this one.
+#
+# **The publishing jobs are not moved into here, and that is deliberate.** crates.io and npm bind a
+# trusted publisher to a repository *and a workflow filename*: `publish-crates.yml` and
+# `publish-npm.yml` are written down on both registries. Consolidating them into one file would
+# change `job_workflow_ref`, every OIDC exchange would stop matching, and the failure would arrive
+# at the worst possible moment — mid-release, on a tag that already exists, with half the crates up.
+# So each keeps its name and gains a trigger.
+#
+# The release page is created with `GITHUB_TOKEN`, which by GitHub's own loop-prevention rule does
+# *not* fire the `release: published` event for other workflows. That is the property this design
+# needs rather than a limitation to work around: the publish workflows are already running from the
+# tag, and a release event would start a second copy of each.
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: create the release page
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # The generated notes need history to diff against the previous tag.
+          fetch-depth: 0
+
+      # The one thing worth failing a release over, and the cheapest to check.
+      #
+      # `[workspace.package] version` is what ends up on crates.io and in every npm package, and the
+      # tag is what Homebrew and the binary tarballs are named after. Nothing downstream compares
+      # them, so `git tag v0.4.2` on a commit that still says `0.4.1` publishes nothing new — every
+      # registry skips the version it already has — and leaves a release page full of binaries
+      # labelled with a version the code inside them does not carry.
+      - name: The tag and the manifest agree
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME#v}"
+          manifest=$(cargo metadata --format-version 1 --no-deps \
+            | jq -r '.packages[] | select(.name=="neosh") | .version')
+          if [ "$tag" != "$manifest" ]; then
+            echo "::error::tag v$tag does not match [workspace.package] version $manifest"
+            echo "Bump the version, commit, and re-tag. Both halves of the root manifest:"
+            echo "  [workspace.package] version, and the ten pins in [workspace.dependencies]."
+            exit 1
+          fi
+          echo "v$tag matches the manifest"
+
+      # A file if you wrote one, generated notes if you did not. Writing them is the one part of a
+      # release a person is better at than a script, and not writing them must not be a reason to
+      # stop — `--generate-notes` lists the commits, which is worse than prose and much better than
+      # an empty page.
+      - name: Publish the release page
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag="$GITHUB_REF_NAME"
+          if gh release view "$tag" >/dev/null 2>&1; then
+            echo "release $tag already exists — leaving it alone"
+            exit 0
+          fi
+          notes="docs/release-notes/$tag.md"
+          if [ -f "$notes" ]; then
+            gh release create "$tag" --verify-tag --title "$tag" --notes-file "$notes"
+          else
+            echo "::notice::no $notes — generating notes from the commit log"
+            gh release create "$tag" --verify-tag --title "$tag" --generate-notes
+          fi

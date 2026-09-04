@@ -178,23 +178,27 @@ checksum somebody typed is a formula that installs whatever is at that URL now.
 # 1. Bump the version — in both halves of the root manifest.
 $EDITOR Cargo.toml                       # [workspace.package] version
                                          # AND the ten internal pins in [workspace.dependencies]
-$EDITOR npm/neosh/package.json          # version AND the four optionalDependencies
+$EDITOR npm/neosh/package.json           # version AND the four optionalDependencies
 $EDITOR plugins/api/package.json plugins/builtin/*/package.json
 cargo update -w                          # so Cargo.lock agrees before anything is committed
 
 # 2. Prove it.
 ./scripts/check.sh
 
-# 3. Tag it. Annotated — `--follow-tags` silently skips a lightweight tag, so
-#    `git tag v0.3.0` alone pushes the commit and leaves the tag behind.
-git commit -am "release: v0.3.0" && git tag -a v0.3.0 -m v0.3.0 && git push --follow-tags
-
-# 4. Publish the GitHub release, wait for it to build, then point Homebrew at it.
-gh release create v0.3.0 --verify-tag --notes-file notes.md
-gh run watch
-scripts/brew-formula.sh v0.3.0 > ../homebrew-tap/Formula/neosh.rb
-(cd ../homebrew-tap && git commit -am "neosh 0.3.0" && git push)
+# 3. Push a tag. That is the whole release.
+git commit -am "release: v0.4.2" && git tag -a v0.4.2 -m v0.4.2 && git push --follow-tags
 ```
+
+There is no step 4. The tag push runs `tag.yml`, which checks the tag against the manifest and
+creates the release page, and it runs `release.yml`, `publish-crates.yml` and `publish-npm.yml`
+straight from the tag — four binaries onto the release, eleven crates onto crates.io, sixteen
+packages onto npm, and then the Homebrew formula, which waits for the checksums it is written from.
+
+Write `docs/release-notes/v0.4.2.md` first if you want prose on the release page; without one the
+notes are generated from the commit log, because not having written them is not a reason to stop.
+
+**Annotated tags.** `--follow-tags` silently skips a lightweight one, so `git tag v0.4.2` alone
+pushes the commit and leaves the tag behind — and here that means nothing publishes at all.
 
 **Both halves of the root manifest**, and this is the one that bites. Every internal dependency in
 `[workspace.dependencies]` carries a `version` beside its `path` — it has to, or `cargo package`
@@ -206,8 +210,11 @@ error: failed to select a version for the requirement `neosh-proto = "^0.2.0"`
 candidate versions found which didn't match: 0.3.0
 ```
 
-It fails loudly and on the first command, which is the good case. It is in step 1 rather than in a
-troubleshooting section because reading it after `check.sh` has already died is reading it too late.
+It fails loudly and on the first command, which is the good case. `tag.yml` also refuses a tag whose
+number does not match the manifest, because the failure that used to be possible was silent: every
+registry skips the version it already has, so `git tag v0.4.2` on a commit that still says `0.4.1`
+published nothing and left a release page full of binaries labelled with a version the code inside
+them did not carry.
 
 **Which number.** `0.x` is breaking at the *minor*, and Cargo means it: a new variant on a public
 `enum` or a new field on a public `struct` breaks an exhaustive `match` or a struct literal
@@ -215,16 +222,35 @@ downstream, and both are ordinary things to add. `0.2.0` → `0.3.0` was exactly
 gained `Waiting`, `SwarmEvent` gained `Unapproved`, `allow::Peer` gained `alias`. Ship those as a
 patch and the version number has stopped telling anybody anything.
 
-Then publish the GitHub release for that tag. Publishing it is the trigger: `release.yml` builds
-the four binaries and attaches them, `publish-crates.yml` pushes the eleven crates,
-`release.yml` pushes the four platform packages and then the `neosh` launcher, and
-`publish-npm.yml` pushes the plugin packages, skipping anything the registry already has — so it is
-safe to re-run a half-failed release.
+### Why the publishing is spread across three files rather than one
 
-Then regenerate the Homebrew formula, as in step 9 — a release nobody points Homebrew at is a
-release `brew upgrade` cannot see. It is the one step of a release with nothing watching it:
-the registries are pushed by workflows that fail loudly, and the tap is a second repository
-that a green release says nothing about.
+Because crates.io and npm bind a trusted publisher to a repository **and a workflow filename**.
+`publish-crates.yml` and `publish-npm.yml` are written down on both registries, so consolidating
+them into a single release workflow would change `job_workflow_ref`, every OIDC exchange would stop
+matching, and it would fail mid-release on a tag that already exists with half the crates up. Each
+file keeps its name and gained a trigger.
+
+The release page is created with `GITHUB_TOKEN`, which by GitHub's loop-prevention rule does not
+fire `release: published` for other workflows — which is the property this needs rather than a
+limitation: the publish workflows are already running from the tag, and a release event would start
+a second copy of each. Creating a release **by hand** still publishes, because the
+`release: published` trigger is kept.
+
+### The one credential OIDC cannot replace
+
+Homebrew is a git push to `neoswarm/homebrew-tap`, not an upload to a registry, so there is nothing
+to exchange an OIDC identity for. It needs a fine-grained PAT with **Contents: read and write** on
+that repository, once:
+
+```sh
+gh secret set HOMEBREW_TAP_TOKEN
+```
+
+Without it the `homebrew` job skips with a warning rather than failing — a fork has no business
+pushing to our tap — and the tap stays where it was, which `brew upgrade` reports as "already
+installed". Note that Homebrew caches its copy of a tap: after a release, `brew update` then
+`brew upgrade neosh`, and if it still claims the old version, `git -C "$(brew --repository
+neoswarm/tap)" pull` is the thing that was stale.
 
 **A new crate or a new bundled plugin needs its own first manual publish and its own trusted
 publisher**, exactly as in steps 3–5. Nothing else does — and this is the one part of a release that

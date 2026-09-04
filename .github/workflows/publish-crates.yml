@@ -10,6 +10,13 @@ name: publish-crates
 # a crate that already exists — which is why the first version is published by hand, once, for all
 # ten. See docs/releasing.md.
 on:
+  # A tag *is* the release. The publish jobs run from the tag push rather than from the release
+  # page so that this file keeps its name — crates.io and npm bind a trusted publisher to a
+  # workflow filename, so moving this job is what breaks authentication, not renaming the trigger.
+  push:
+    tags: ["v*"]
+  # Kept: a release created by hand in the UI still publishes, and re-running one that half failed
+  # is the documented way out of a network blip mid-way through eleven crates.
   release:
     types: [published]
   workflow_dispatch:
