@@ -578,6 +578,17 @@ export async function activate({ neosh, subscriptions }: PluginContext) {
       }
     }),
   );
+  // A worktree moved. The conversations in it have already followed — the host re-points them —
+  // but this list is a list of *directories*, and nothing about a conversation's `cwd` changing
+  // says whether one project moved or one went and another arrived. Which is the whole difference:
+  // the second reading loses the place you put the row in.
+  subscriptions.push(
+    neosh.project.onMove((e) => {
+      void arrangement.relocate(e.from, e.to).then((moved) => {
+        if (moved) drawAll();
+      });
+    }),
+  );
   // Rows somebody contributed came or went. Redrawing on this is what stops a plugin that loads
   // after us contributing rows nobody sees until the next unrelated refresh.
   subscriptions.push(
@@ -865,6 +876,37 @@ class Arrangement {
         void this.set(cwd, VAR_ROOT, root);
       }
     }
+  }
+
+  /**
+   * A project's directory moved — a worktree that was relocated.
+   *
+   * **In place, keeping its position.** This is not `forget` plus `note`: the list is an order
+   * somebody arranged by hand, and a project that left the bottom and came back at the top is a
+   * reorder nobody asked for. The vars themselves have already travelled — the host moves the
+   * project scope, which is where the pin and the fold live — so what is left is this list and the
+   * cache in front of it.
+   *
+   * Written back only when something actually changed, because this runs on an event anybody may
+   * raise and a `vars.set` per no-op is a disk write per no-op.
+   *
+   * A destination that is somehow already on the list collapses onto it rather than appearing
+   * twice, and takes the earlier of the two positions: two rows for one directory is a panel where
+   * the cursor lands on a project that is not the one it is pointing at.
+   */
+  async relocate(from: string, to: string): Promise<boolean> {
+    if (from === to) return false;
+    const at = this.known.indexOf(from);
+    if (at < 0) return false;
+    const already = this.known.indexOf(to);
+    this.known[at] = to;
+    // Both indices now name the destination. The later one goes, so the row keeps the earlier of
+    // the two places in the order rather than jumping to wherever the arriving tree happened to be.
+    if (already >= 0 && already !== at) this.known.splice(Math.max(at, already), 1);
+    this.cache.set(to, await this.neosh.vars.all(projectScope(to)).catch(() => ({})));
+    this.cache.delete(from);
+    await this.neosh.vars.set({ scope: "global" }, VAR_KNOWN, this.known);
+    return true;
   }
 
   /**

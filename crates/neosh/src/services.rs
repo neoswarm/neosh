@@ -405,6 +405,18 @@ impl Services {
         Ok(ApiOk::Unit)
     }
 
+    pub async fn git_move_worktree(
+        &self,
+        path: String,
+        dest: String,
+        cwd: Option<String>,
+    ) -> ApiResult {
+        self.permit_write("worktree move")?;
+        let repo = self.repo_at(cwd).await?;
+        repo.move_worktree(&PathBuf::from(path), &PathBuf::from(dest)).await.map_err(vcs_err)?;
+        Ok(ApiOk::Unit)
+    }
+
     // ---- models ----------------------------------------------------------
 
     /// Every reachable model, paired with the instance that serves it.

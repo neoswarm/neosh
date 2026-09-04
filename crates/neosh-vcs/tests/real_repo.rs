@@ -170,6 +170,60 @@ async fn branches_worktrees_and_log_round_trip() {
     assert_eq!(git.default_branch().await.as_deref(), Some("main"));
 }
 
+/// A worktree moved into the repository and back out again, with git still able to find it.
+///
+/// The reason this is a real-git test and not a parser one: `git worktree move` rewrites two
+/// pointers that nothing in this crate can see — `.git` in the tree, `gitdir` in the admin
+/// directory — and the only honest way to check they still agree is to ask git afterwards. A plain
+/// `mv` passes every assertion about paths and leaves a checkout git calls `prunable`.
+#[tokio::test]
+async fn a_worktree_moves_in_and_out_of_the_repository() {
+    if !have_git() {
+        return;
+    }
+    let repo = Repo::new("worktree-move");
+    repo.write("a.txt", "1\n");
+    repo.git(&["add", "."]);
+    repo.git(&["commit", "-m", "initial"]);
+
+    let git = Git::discover(repo.path()).await.expect("repo");
+    let inside = repo.path().join(".worktrees").join("feature-thing");
+    git.add_worktree(&inside, "feature/thing", true).await.expect("add worktree");
+
+    // In the repository, so the whole checkout would otherwise read as one untracked directory.
+    // The line is in the tracked `.gitignore`, not `.git/info/exclude`, so every clone gets it.
+    let ignored = std::fs::read_to_string(repo.path().join(".gitignore")).unwrap_or_default();
+    assert!(ignored.lines().any(|l| l.trim() == "/.worktrees/"), "got {ignored:?}");
+
+    // Out of the repository, to a sibling — and to a parent that does not exist yet, which is the
+    // case `move_worktree` creates rather than refuses.
+    let outside = repo.path().parent().expect("parent").join("neosh-vcs-worktree-move-trees/thing");
+    git.move_worktree(&inside, &outside).await.expect("move out");
+    assert!(outside.join("a.txt").is_file(), "the checkout came with it");
+    assert!(!inside.exists(), "and left nothing behind");
+
+    let trees = git.worktrees().await.expect("worktrees");
+    let moved = trees.iter().find(|t| !t.is_main).expect("the linked tree is still listed");
+    assert_eq!(
+        std::fs::canonicalize(&moved.path).ok(),
+        std::fs::canonicalize(&outside).ok(),
+        "git knows where it went",
+    );
+    assert_eq!(moved.branch.as_deref(), Some("feature/thing"), "on the branch it was made on");
+
+    // And back in. Asking git from *inside the moved tree* is the half a `mv` breaks: it works
+    // only if the tree's own `.git` file still points at an admin directory that points back.
+    let back = repo.path().join(".worktrees").join("feature-thing");
+    git.move_worktree(&outside, &back).await.expect("move back in");
+    let from_tree = Git::discover(&back).await.expect("the moved tree is still a checkout");
+    assert_eq!(
+        from_tree.status().await.expect("status").repo.branch.as_deref(),
+        Some("feature/thing"),
+    );
+
+    let _ = std::fs::remove_dir_all(outside.parent().expect("sibling dir"));
+}
+
 #[tokio::test]
 async fn diff_and_commit_go_through() {
     if !have_git() {

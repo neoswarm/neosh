@@ -48,6 +48,7 @@ import {
   spinnerFrame,
   statusPrefix,
 } from "@neosh/api/ui";
+import type { PickerItem } from "@neosh/api/ui";
 
 // ---------------------------------------------------------------------------
 // Default prompts
@@ -184,6 +185,15 @@ two-word scratch name it was created with.",
       (args: string[]) => removeWorktree(neosh, { path: arg(args, 0), cwd: arg(args, 1) }),
       "Remove a worktree — `git.worktree.remove [path] [cwd]`",
     ],
+    [
+      "git.worktree.move",
+      // Same shape one argument further: the tree, then where it goes. Both optional and both
+      // asked for when missing, so this is the palette's verb, the panel's verb and a script's
+      // verb without any of them needing a form of its own.
+      (args: string[]) =>
+        moveWorktree(neosh, { path: arg(args, 0), dest: arg(args, 1), cwd: arg(args, 2) }),
+      "Move a worktree somewhere else — `git.worktree.move [path] [dest] [cwd]`",
+    ],
     // The sidebar hands a row over as `(kind, cwd, …)`, which is not the shape the commands above
     // take from the palette. Two small verbs translate rather than every command growing a second
     // calling convention.
@@ -196,6 +206,11 @@ two-word scratch name it was created with.",
       "git.sidebar.worktree.remove",
       (args: string[]) => removeWorktree(neosh, { path: arg(args, 1), cwd: arg(args, 1) }),
       "Remove the worktree of the sidebar row under the cursor",
+    ],
+    [
+      "git.sidebar.worktree.move",
+      (args: string[]) => moveWorktree(neosh, { path: arg(args, 1), cwd: arg(args, 1) }),
+      "Move the worktree of the sidebar row under the cursor",
     ],
   ];
   for (const [name, fn, desc] of cmds) {
@@ -231,6 +246,16 @@ two-word scratch name it was created with.",
     key: "d",
     label: "remove worktree",
     command: "git.sidebar.worktree.remove",
+    on: "project",
+  });
+  // `m` for move, on the rows it can mean something on. A plain letter rather than a chord for the
+  // reason `d` and `p` are: the panel is not a text field, and the letters that read as the verb
+  // are the ones worth spending. Nothing global — a verb about the row under the cursor asked from
+  // a conversation has no row to be about, and `^K` runs `git.worktree.move` by name.
+  await neosh.ext.contribute("sidebar.action", "worktree-move", {
+    key: "m",
+    label: "move worktree",
+    command: "git.sidebar.worktree.move",
     on: "project",
   });
 
@@ -1080,15 +1105,94 @@ async function worktreePath(
   branch: string,
   inside = false,
 ): Promise<string> {
+  const layouts = await worktreeLayouts(neosh, repoRoot, branch);
+  const want = inside ? "inside" : "configured";
+  // The list is deduplicated, so the layout asked for may have been folded into an earlier one
+  // that lands in the same place — a relative `worktree.root` is both `configured` and `inside`.
+  // Falling back to the head of the list is that same answer under its other name.
+  return (layouts.find((l) => l.kind === want) ?? layouts[0]!).path;
+}
+
+/** One place a worktree can live, as both a path and a row somebody can be offered. */
+interface Layout {
+  kind: "configured" | "inside" | "beside";
+  label: string;
+  detail: string;
+  icon: string;
+  hl: string;
+  path: string;
+}
+
+/**
+ * Every default place this repository's worktrees go, in the order the "where?" question offers
+ * them.
+ *
+ * One list, read twice. {@link worktreePath} asks it where a *new* tree lands, and
+ * {@link moveWorktree} draws it as a menu for one that already exists — which is the whole reason
+ * it is a list rather than three branches of an `if`. The alternative was what this replaced: the
+ * layouts computed here and *described*, separately, in the panel's own rows, so a fourth place to
+ * put a worktree would have had to be added in two files that never reference each other.
+ *
+ * **Deduplicated by path, first one wins.** The three layouts are not always three places: a
+ * relative `worktree.root` makes `configured` and `inside` the same directory, and an empty one
+ * makes `configured` and `beside` the same. A menu offering the same destination twice under two
+ * names is a menu where picking the wrong row is impossible to notice, and the row that survives
+ * is the one whose name matches what the configuration actually says.
+ *
+ * Slashes in a branch become dashes throughout: `feat/thing` is one directory, not two, because
+ * the directory is a name and not a path.
+ */
+async function worktreeLayouts(
+  neosh: Neosh,
+  repoRoot: string,
+  branch: string,
+): Promise<Layout[]> {
   const leaf = branch.replace(/\//g, "-");
   const repoName = repoRoot.split("/").filter(Boolean).pop() ?? "repo";
   const configured = ((await neosh.opt.get<string>("worktree.root")) ?? "").trim();
-  // Asked to stay inside regardless of what is configured. A relative root still names the
-  // directory; anything else falls back to the conventional one.
-  if (inside) return `${repoRoot}/${insideDir(configured)}/${leaf}`;
-  if (configured === "") return `${parentOf(repoRoot)}/${repoName}-worktrees/${leaf}`;
-  if (configured.startsWith("/")) return `${configured}/${repoName}/${leaf}`;
-  return `${repoRoot}/${configured}/${leaf}`;
+  const dir = insideDir(configured);
+
+  const all: Layout[] = [
+    {
+      kind: "configured",
+      label: "Where worktrees go",
+      // What `worktree.root` currently says, rather than a description of what it could say: a row
+      // that names the setting is a row you have to go and read the setting to understand.
+      detail: configured === ""
+        ? "beside the repository — `worktree.root` is unset"
+        : `under ${configured}`,
+      icon: "+",
+      hl: "Diagnostic.Ok",
+      path: configured === ""
+        ? `${parentOf(repoRoot)}/${repoName}-worktrees/${leaf}`
+        : configured.startsWith("/")
+        ? `${configured}/${repoName}/${leaf}`
+        : `${repoRoot}/${configured}/${leaf}`,
+    },
+    {
+      kind: "inside",
+      label: "In this project",
+      detail: `kept in ${dir}/ — travels with the repository`,
+      icon: "⌂",
+      hl: "Accent",
+      path: `${repoRoot}/${dir}/${leaf}`,
+    },
+    {
+      kind: "beside",
+      label: "Beside the repository",
+      detail: `a sibling of ${repoName}/`,
+      icon: "⎇",
+      hl: "Sidebar.Dim",
+      path: `${parentOf(repoRoot)}/${repoName}-worktrees/${leaf}`,
+    },
+  ];
+
+  const seen = new Set<string>();
+  return all.filter((l) => {
+    if (seen.has(l.path)) return false;
+    seen.add(l.path);
+    return true;
+  });
 }
 
 /** The in-repository directory worktrees go in: a relative `worktree.root`, else `.worktrees`. */
@@ -1197,6 +1301,194 @@ async function removeWorktree(
     }
   }
   neosh.notify(`removed ${chosen.path}`);
+}
+
+/**
+ * Move a worktree somewhere else, asking where the way `^N` asks where.
+ *
+ * The question is the same question — a worktree lands in one of a few places, and those places
+ * have names — so it is asked with the same rows, out of {@link worktreeLayouts}, plus the path
+ * field for a destination nobody listed. What it is *not* is a second vocabulary: somebody who has
+ * learnt that "In this project" means `.worktrees/` when they make a tree has learnt what it means
+ * when they move one.
+ *
+ * `path` given is the sidebar's flow — `m` on the row *is* the pointing — and `dest` given as well
+ * is the scripted one, which asks nothing. Without either it is the palette's flow and both are
+ * pickers. The move runs from the main checkout for the reason removal does: git will not saw off
+ * the branch it is standing on, and the conversation this runs in may be standing in the tree.
+ *
+ * **Where it is now is a row, drawn as such and declining to be picked.** Hiding it would leave a
+ * menu of two places for a repository that has three, which reads as the third one not existing —
+ * and the question somebody presses `m` to answer is *which of these am I in*.
+ *
+ * No confirmation. A move is reversible by pressing `m` again, and a dialog charged for something
+ * you can undo is what teaches people to clear dialogs without reading them. What it is not
+ * allowed to do is happen while an agent is working in the tree, and that is the host's to refuse
+ * — it holds the conversations and knows which of them has a turn in flight.
+ */
+async function moveWorktree(
+  neosh: Neosh,
+  spec: { path?: string; dest?: string; cwd?: string } = {},
+): Promise<void> {
+  const all = await neosh.git.worktrees(spec.cwd ? { cwd: spec.cwd } : undefined).catch(() => []);
+  const main = all.find((t) => t.is_main)?.path;
+  const movable = all.filter((t) => !t.is_main);
+
+  let tree: WorktreeInfo | undefined;
+  if (spec.path) {
+    const named = all.find((t) => t.path === spec.path);
+    if (!named) {
+      neosh.notify(`no worktree at ${spec.path}`, "warn");
+      return;
+    }
+    // The repository itself. `git worktree move` refuses it, and it should: the main checkout is
+    // where the `.git` directory lives, and moving that is not this feature.
+    if (named.is_main) {
+      neosh.notify("this is the repository itself — `m` moves a worktree row", "warn");
+      return;
+    }
+    tree = named;
+  } else {
+    if (movable.length === 0) {
+      neosh.notify("nothing to move — this repository has only its main checkout");
+      return;
+    }
+    tree = await picker(
+      neosh,
+      movable.map((t) => ({
+        label: t.branch ?? t.path,
+        detail: t.path,
+        icon: "⎇",
+        hl: "Git.Branch",
+        value: t,
+      })),
+      { title: "Move worktree", width: 78 },
+    ) ?? undefined;
+  }
+  if (!tree) return;
+  const from = tree.path;
+
+  let dest = spec.dest;
+  if (!dest) {
+    const branch = tree.branch ?? basename(from);
+    const layouts = await worktreeLayouts(neosh, main ?? from, branch);
+    const rows: Array<PickerItem<Layout | { kind: "elsewhere" }>> = layouts.map((l) => ({
+      // "where it is now" goes in the *label*, not after the path. Both are one row and the row
+      // is a float's width, so something is getting clipped — and a clipped path still reads as a
+      // path while a clipped sentence is gone. The label is also what the eye lands on, which is
+      // where the one row you must not pick should say so.
+      label: l.path === from ? `${l.label} — where it is now` : l.label,
+      // The resolved path, and only that. A choice between places is only a choice if each row
+      // says where it goes — but the *path* is that sentence: `…/work/.worktrees/crisp-yarrow`
+      // already says it is in the project, and a row that then adds "kept in .worktrees/" is one
+      // that wraps onto a second line to repeat itself. The description each layout carries is
+      // still what the row is *called*, and still matches the filter.
+      detail: l.path,
+      keywords: `${l.path} ${l.detail}`,
+      icon: l.path === from ? "●" : l.icon,
+      hl: l.path === from ? "Sidebar.Dim" : l.hl,
+      value: l,
+    }));
+    rows.push({
+      label: "Somewhere else…",
+      detail: "type a path — completes as you go",
+      keywords: "path directory elsewhere custom rename",
+      icon: "/",
+      hl: "Status.Input",
+      value: { kind: "elsewhere" },
+    });
+
+    const chosen = await picker(neosh, rows, {
+      title: `Move ${tree.branch ?? basename(from)}`,
+      width: 78,
+    }).catch(() => null);
+    if (!chosen) return;
+    if (chosen.kind === "elsewhere") {
+      // Seeded with the whole path rather than its parent, so `<CR>` on an untouched field is a
+      // no-op and editing the tail renames the directory. `^W` walks back up a segment, which is
+      // how this field is also the way to move it somewhere unrelated.
+      const typed = await pathPicker(neosh, "Move worktree to", { initial: from, width: 78 });
+      if (typed === null || typed.trim() === "") return;
+      dest = typed.trim();
+    } else {
+      dest = chosen.path;
+    }
+  }
+
+  if (dest === from) {
+    neosh.notify("already there");
+    return;
+  }
+
+  neosh.progress("git.worktree.move", "moving…");
+  try {
+    await neosh.git.moveWorktree(from, dest, main ? { cwd: main } : undefined);
+  } catch (e) {
+    // A destination that exists, a tree git has locked, a turn running in it — the host and git
+    // each word their own refusal better than anything this plugin could invent from the outside.
+    neosh.notify(String(e), "error");
+    return;
+  } finally {
+    neosh.done("git.worktree.move");
+  }
+  await landed(neosh, dest);
+  neosh.notify(`moved to ${dest}`);
+}
+
+/**
+ * Light the row it landed on, once.
+ *
+ * The panel redraws on its own the moment the conversations move, so the row is *correct* without
+ * this — and a row that is merely correct is one you have to go and find, having pressed a key
+ * whose whole effect happened in a directory you cannot see. `Agent.ToolLanded` is the same
+ * argument one surface along: half of watching something happen is watching it land.
+ *
+ * A decoration rather than a redraw of our own, because this plugin does not own that panel; and
+ * withdrawn on a timer just past the flash, because a decoration left behind is a row that lights
+ * up again every time anything else redraws it.
+ */
+async function landed(neosh: Neosh, cwd: string): Promise<void> {
+  if (!(await ensureMovedGroup(neosh))) return;
+  const id = `moved:${cwd}`;
+  await neosh.ext.contribute("sidebar.decoration", id, {
+    target: { project: cwd },
+    hl: HL_MOVED,
+  }).catch(() => {});
+  neosh.timer.after(FLASH_MS + 250, () => {
+    void neosh.ext.remove("sidebar.decoration", id).catch(() => {});
+  });
+}
+
+const HL_MOVED = "Git.Moved";
+/** Long enough to be seen from the other side of the panel, short enough not to be a state. */
+const FLASH_MS = 420;
+
+/**
+ * Define the group the flash rides on, colour and all, from the palette rather than from here.
+ *
+ * A flash is a property of a *group*, and the frontend lifts a run's foreground toward white for
+ * as long as it lasts — so the group needs a real colour underneath or the row draws in `Normal`
+ * for the third of a second it is lit, which is the near-white flicker a panel full of running
+ * agents used to have. It cannot be a `link` either: a link resolves to somebody else's spec, and
+ * this needs that spec *plus* one field.
+ *
+ * So the colour is read out of `Diagnostic.Ok` — the green the "where?" question already draws the
+ * row that makes something in — and re-read whenever the theme moves. `default: true`, so a user's
+ * `init.ts` still wins. `false` when the palette cannot answer, and then there is simply no
+ * decoration: a flash is the least important thing in this operation.
+ */
+async function ensureMovedGroup(neosh: Neosh): Promise<boolean> {
+  const base = await neosh.hl.get("Diagnostic.Ok").then((h) => h.resolved).catch(() => null);
+  if (!base) return false;
+  return await neosh.hl
+    .define(HL_MOVED, { ...base, animate: { kind: "flash", ms: FLASH_MS } }, { default: true })
+    .then(() => true)
+    .catch(() => false);
+}
+
+/** The last segment of a path — a worktree's directory name, when it has no branch to be named by. */
+function basename(path: string): string {
+  return path.replace(/\/+$/, "").split("/").filter(Boolean).pop() ?? path;
 }
 
 function parentOf(path: string): string {

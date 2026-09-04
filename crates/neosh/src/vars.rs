@@ -113,6 +113,48 @@ impl Vars {
         }
     }
 
+    /// A project's directory moved: carry everything set on it across.
+    ///
+    /// A project scope is keyed by the path, so a worktree that has been relocated would otherwise
+    /// leave its pin, its fold state and its rank behind under a directory that no longer exists —
+    /// and arrive at the far end as a project nobody has ever arranged. The keys are what the panel
+    /// calls an arrangement, and losing one because a directory moved is the thing vars exist to
+    /// prevent.
+    ///
+    /// Whatever is already at `to` wins. A destination with vars on it is a directory somebody has
+    /// worked in before, and their arrangement of it is a decision; the tree arriving has no claim
+    /// to overwrite it. The old scope goes either way — leaving it would put a ghost project back
+    /// on the panel's list the next time anything read it.
+    ///
+    /// Returns the keys that landed, so their listeners can be told: a var that changes without a
+    /// [`neosh_proto::PluginEvent::VarChanged`] is a cache somewhere that is now wrong.
+    pub fn rename_project(&mut self, from: &str, to: &str) -> Map<String, Value> {
+        self.load();
+        if from == to {
+            return Map::new();
+        }
+        let old = Self::key(&VarScope::Project { cwd: from.to_string() });
+        let new = Self::key(&VarScope::Project { cwd: to.to_string() });
+        let Some(moved) = self.scopes.remove(&old) else { return Map::new() };
+        // Nothing to carry, and nothing to create: an empty scope is removed rather than left
+        // behind here as everywhere else in this file.
+        if moved.is_empty() {
+            self.flush();
+            return Map::new();
+        }
+        let entry = self.scopes.entry(new).or_default();
+        let mut landed = Map::new();
+        for (key, value) in moved {
+            if entry.contains_key(&key) {
+                continue;
+            }
+            entry.insert(key.clone(), value.clone());
+            landed.insert(key, value);
+        }
+        self.flush();
+        landed
+    }
+
     /// The on-disk name of a scope. Prefixed by kind so a project whose path happens to look like a
     /// conversation id cannot collide with one.
     fn key(scope: &VarScope) -> String {

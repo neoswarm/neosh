@@ -1190,6 +1190,192 @@ fn a_branch_name_without_its_json_envelope_still_names_the_branch() {
     );
 }
 
+/// Moving a worktree takes the conversations in it with it.
+///
+/// The git call is the easy half and is covered in `neosh-vcs`. What this is about is the half a
+/// `git worktree move` on its own cannot do: a worktree's path is the key of the facts every list
+/// draws, of the conversations living there, and of the project vars holding somebody's pin — so a
+/// move that only moved the directory would leave the panel pointing at nothing and the agent
+/// running somewhere that is not there. `Host::relocated` is what this asserts, one field at a
+/// time.
+#[test]
+fn moving_a_worktree_takes_its_conversations_and_its_arrangement_with_it() {
+    if !have_git() {
+        return;
+    }
+    let sb = Sandbox::new("wtmove");
+    sb.git_init();
+    let mut s = sb.start();
+    s.wait_for("PROJECTS");
+
+    // A tree inside the repository, with a conversation in it — which is what `new.inside` makes:
+    // it creates the worktree and lands you in it.
+    s.send(&command("git.worktree.new.inside"));
+    let under = sb.work().join(".worktrees");
+    assert!(
+        s.pump(|_| std::fs::read_dir(&under).is_ok_and(|d| d.count() > 0)),
+        "the worktree exists"
+    );
+    // Resolved, because the workspace's copy of this path came from git and git follows symlinks:
+    // on macOS the sandbox is under `/tmp`, which is `/private/tmp`, and a worktree named by the
+    // unresolved spelling is a worktree the panel has never heard of. The product compares paths
+    // as strings — as removing one does — so it is the test's job to name it the way git does.
+    let from = std::fs::read_dir(&under)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .next()
+        .and_then(|p| std::fs::canonicalize(p).ok())
+        .expect("one worktree");
+    let branch = head_of(&from);
+    // Waited for, not assumed: creating the tree also starts a conversation in it, and asserting
+    // before that lands is asserting about the main checkout.
+    let leaf = from.file_name().unwrap().to_string_lossy().into_owned();
+    assert!(
+        s.pump({
+            let leaf = leaf.clone();
+            move |s| s.sidebar_now().iter().any(|l| l.contains(leaf.trim_end_matches('/')))
+                || s.sidebar_now().iter().any(|l| l.contains(&branch))
+        }),
+        "the tree is a row in the panel\n{:?}",
+        s.sidebar_now()
+    );
+
+    // Out of the repository, to a sibling of it. Both paths given, so this is the scripted form
+    // and no picker is involved — the picker is a separate test, and what is under test here is
+    // what happens *after* a destination has been chosen.
+    let to = std::fs::canonicalize(&sb.root).unwrap_or_else(|_| sb.root.clone()).join("moved-tree");
+    s.send(&format!(
+        r#"{{"type":"command","name":"git.worktree.move","args":["{}","{}"]}}"#,
+        from.display(),
+        to.display(),
+    ));
+
+    assert!(
+        s.pump(|_| to.join(".git").exists() && !from.exists()),
+        "the checkout moved and left nothing behind\n{:?}",
+        s.texts()
+            .iter()
+            .filter(|t| t.contains("worktree") || t.contains("moved") || t.contains("git"))
+            .collect::<Vec<_>>()
+    );
+
+    // The conversation followed. This is the field nothing else in the workspace rewrites, and
+    // without it the agent's tools would resolve against a directory that no longer exists.
+    assert!(
+        s.pump(|s| s.sidebar_now().iter().any(|l| l.contains("moved-tree"))
+            || s.sidebar_now().iter().any(|l| l.contains(&head_of(&to)))),
+        "the panel is drawing the tree where it is now\n{:?}",
+        s.sidebar_now()
+    );
+
+    // And the old path is not still a row beside it. A move that reads as "one project went and
+    // another arrived" is the bug `PluginEvent::ProjectMoved` exists to prevent: the list would
+    // keep both, and the cursor would land on a directory that is not there.
+    let stale = from.display().to_string();
+    assert!(
+        !s.sidebar_now().iter().any(|l| l.contains(&stale)),
+        "and the directory it left is not still listed\n{:?}",
+        s.sidebar_now()
+    );
+
+    // The project vars came across — this is the pin, the fold and the rank. Read off disk rather
+    // than through the panel, because what is being asserted is that the *store* re-keyed rather
+    // than that one panel happened to redraw.
+    let vars = std::fs::read_to_string(sb.root.join("state/vars.json")).unwrap_or_default();
+    assert!(
+        !vars.contains(&format!("project:{}", from.display())),
+        "nothing is still filed under where it was\n{vars}"
+    );
+
+    // **Once.** Not "the new path is present and the old one is not" — that passed while the
+    // destination was on the list twice, because a conversation at the tree's own root has an
+    // empty tail and `to.join("")` appends a separator: `/…/moved-tree` and `/…/moved-tree/` are
+    // one directory under two spellings, and every list keyed by the path kept both. A duplicate
+    // is invisible to an assertion about membership and obvious in the panel, which is exactly the
+    // class of bug this file exists to hold on to.
+    let listed = |v: &str| {
+        let want = to.display().to_string();
+        serde_json::from_str::<serde_json::Value>(v)
+            .ok()
+            .and_then(|j| j["global"]["sidebar.projects"].as_array().cloned())
+            .unwrap_or_default()
+            .iter()
+            .filter(|p| p.as_str().is_some_and(|p| p.trim_end_matches('/') == want))
+            .count()
+    };
+    assert_eq!(listed(&vars), 1, "the panel's list names it exactly once\n{vars}");
+}
+
+/// `m` on a worktree row offers the same places `^N` offers when it makes one.
+///
+/// The point of the feature, and the thing that made it worth a picker rather than a path prompt:
+/// somebody who has learnt that "In this project" means `.worktrees/` when they create a tree has
+/// learnt what it means when they move one. Every row names its resolved path, and the row for
+/// where the tree already is says so rather than being quietly dropped — a menu that hides the
+/// answer you were looking for reads as the option not existing.
+#[test]
+fn moving_a_worktree_offers_the_places_a_new_one_would_go() {
+    if !have_git() {
+        return;
+    }
+    let sb = Sandbox::new("wtmovewhere");
+    sb.git_init();
+    let mut s = sb.start();
+    s.wait_for("PROJECTS");
+
+    s.send(&command("git.worktree.new.inside"));
+    let under = sb.work().join(".worktrees");
+    assert!(
+        s.pump(|_| std::fs::read_dir(&under).is_ok_and(|d| d.count() > 0)),
+        "the worktree exists"
+    );
+    // Resolved for the reason the move test resolves it: git's spelling of this path is the one
+    // the workspace is holding.
+    let tree = std::fs::read_dir(&under)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .next()
+        .and_then(|p| std::fs::canonicalize(p).ok())
+        .expect("one worktree");
+
+    // The tree named, so the first picker is skipped and the one under test is the destination.
+    s.send(&command_with("git.worktree.move", &tree.display().to_string()));
+    // The picker names its buffer after its title, which here is the branch being moved.
+    let named = |s: &Session| {
+        s.events.iter().find_map(|e| {
+            let n = e["name"].as_str()?;
+            (e["type"] == "buffer_opened" && n.starts_with("[Move ")).then(|| n.to_string())
+        })
+    };
+    // Waited on the *rows*, not on the buffer: a picker opens its buffer before it has anything in
+    // it, and reading at that moment is reading an empty float that is about to be correct.
+    let rows_now =
+        |s: &Session| named(s).map(|n| s.picker_named(&n)).unwrap_or_default();
+    assert!(s.pump(|s| !rows_now(s).is_empty()), "the destination picker opened with rows in it");
+    let rows = rows_now(&s);
+
+    assert!(
+        rows.iter().any(|l| l.contains("In this project")),
+        "the place it can be kept in the repository\n{rows:?}"
+    );
+    assert!(
+        rows.iter().any(|l| l.contains("Beside the repository")),
+        "and the place beside it\n{rows:?}"
+    );
+    assert!(
+        rows.iter().any(|l| l.contains("Somewhere else")),
+        "and the path field, for one nobody listed\n{rows:?}"
+    );
+    // Where it is now is a row, and says so. Hiding it would leave a menu of two places for a
+    // repository that has three.
+    assert!(
+        rows.iter().any(|l| l.contains("where it is now")),
+        "the row for where it already is says so\n{rows:?}"
+    );
+}
+
 /// Which branch a checkout is on, asked of git rather than of anything under test.
 fn head_of(dir: &Path) -> String {
     let out = Command::new("git")
