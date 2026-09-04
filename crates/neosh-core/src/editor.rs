@@ -204,6 +204,39 @@ impl Tabs {
         self.tab(self.active)
     }
 
+    /// Which strip is on screen: the group of the tab you are in. See [`TabInfo::group`].
+    ///
+    /// Read off the active tab rather than kept beside it, because the two could then disagree —
+    /// and a terminal whose remembered strip does not contain the tab it is showing is one where
+    /// the bar and the screen are about different conversations.
+    fn group(&self) -> Option<&str> {
+        self.active_tab().and_then(|t| t.group.as_deref())
+    }
+
+    /// The tabs on the bar, in bar order: the ones sharing the active tab's group.
+    ///
+    /// Always at least the tab you are in, which is what every caller here relies on — an empty bar
+    /// is not a state a terminal can be in, and the numbering, the stepping and the last-tab rule
+    /// are all counted in this rather than in `tabs`.
+    fn visible(&self) -> Vec<&TabInfo> {
+        let group = self.group().map(|g| g.to_string());
+        self.at(&group).into_iter().map(|i| &self.tabs[i]).collect()
+    }
+
+    /// Where one strip's tabs sit in `tabs`, in bar order. What a move has to translate through.
+    ///
+    /// Asked with a group rather than reading the active tab's, because a move is in the middle of
+    /// taking that tab out: with the active tab lifted, "the group on screen" is momentarily
+    /// nobody's, and the second half of the move would put it back among a different conversation's.
+    fn at(&self, group: &Option<String>) -> Vec<usize> {
+        self.tabs
+            .iter()
+            .enumerate()
+            .filter(|(_, t)| t.group == *group)
+            .map(|(i, _)| i)
+            .collect()
+    }
+
     /// Remember that a pane has the keyboard.
     fn touch(&mut self, pane: PaneId) {
         self.mru.retain(|p| *p != pane);
@@ -332,6 +365,9 @@ impl Editor {
                 title: None,
                 root: PaneNode::Leaf { pane },
                 active_pane: pane,
+                // Ungrouped until something furnishes it: only the host knows which conversation a
+                // terminal opens in, and a group invented here would be one nothing else can name.
+                group: None,
             };
             self.view(view).tabs =
                 Some(Tabs { tabs: vec![first], active: tab, mru: vec![pane] });
@@ -396,15 +432,51 @@ impl Editor {
         self.peek_tabs(view).map(|t| t.active)
     }
 
-    /// How many tabs a view has. One for a view nothing has laid out yet, which is what it will
-    /// have the moment anything asks.
+    /// How many tabs are on the bar — this conversation's, not this terminal's.
+    ///
+    /// What a legend counts: `next tab` is a key worth printing when there is a second tab *you can
+    /// get to*, and one that steps to a tab of a conversation you are not in is not that. One for a
+    /// view nothing has laid out yet, which is what it will have the moment anything asks.
     pub fn tab_count_of(&self, view: ViewId) -> usize {
-        self.peek_tabs(view).map(|t| t.tabs.len()).unwrap_or(1)
+        self.peek_tabs(view).map(|t| t.visible().len()).unwrap_or(1)
     }
 
-    /// Every tab of a view, without settling one that has never been laid out.
+    /// Every tab of a view, whatever strip it is on, without settling one that has never been laid
+    /// out. Filter by [`TabInfo::group`] for the bar; see [`Editor::visible_tabs_of`].
     pub fn tabs_of(&self, view: ViewId) -> Vec<TabInfo> {
         self.peek_tabs(view).map(|t| t.tabs.clone()).unwrap_or_default()
+    }
+
+    /// The tabs on a view's bar, in bar order: the ones grouped with the tab it is showing.
+    ///
+    /// What the strip is drawn from and what `<C-w>1`…`<C-w>9` count, so that the number on a tab
+    /// is the number you type. See [`TabInfo::group`].
+    pub fn visible_tabs_of(&self, view: ViewId) -> Vec<TabInfo> {
+        self.peek_tabs(view)
+            .map(|t| t.visible().into_iter().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    /// Which strip a view is showing, if its tabs have been settled.
+    pub fn tab_group_of(&self, view: ViewId) -> Option<String> {
+        self.peek_tabs(view).and_then(|t| t.group()).map(|g| g.to_string())
+    }
+
+    /// Move a tab to another strip. See [`TabInfo::group`].
+    ///
+    /// The tab keeps its panes, its windows and anything running in them: this says which
+    /// conversation's bar it is on, and nothing else. Moving the tab you are *in* is therefore not
+    /// a move at all from the screen's point of view — you go with it, and what changes is which
+    /// other tabs are beside it.
+    pub fn tab_set_group(&mut self, view: ViewId, tab: TabId, group: Option<String>) -> bool {
+        let t = self.tabs(view);
+        let Some(info) = t.tab_mut(tab) else { return false };
+        if info.group == group {
+            return false;
+        }
+        info.group = group;
+        self.publish_panes(view);
+        true
     }
 
     /// Every binding in a mode, as [`ApiCall::KeymapList`] would report them.
@@ -590,6 +662,10 @@ impl Editor {
     }
 
     /// Open a tab with one empty pane, and answer with both ids.
+    ///
+    /// On the bar you are looking at: it inherits the active tab's group, so a tab opened while
+    /// reading a conversation is that conversation's. See [`TabInfo::group`], and
+    /// [`Editor::tab_set_group`] for putting it somewhere else.
     pub fn tab_new(
         &mut self,
         view: ViewId,
@@ -604,11 +680,13 @@ impl Editor {
         self.next_tab += 1;
         self.next_pane += 1;
         let t = self.tabs(view);
+        let group = t.group().map(|g| g.to_string());
         t.tabs.push(TabInfo {
             id: tab,
             title,
             root: PaneNode::Leaf { pane },
             active_pane: pane,
+            group,
         });
         if activate {
             t.active = tab;
@@ -618,10 +696,21 @@ impl Editor {
         (tab, pane)
     }
 
-    /// Close a tab and every window in it. The view's last tab is refused.
+    /// Close a tab and every window in it. The last tab *on its bar* is refused.
+    ///
+    /// The bar rather than the terminal, because the tab you are in is the conversation you are in:
+    /// closing the only one it has would land you in some other conversation's tabs, which is a key
+    /// about where you are looking doing something to what you are working on. A terminal with one
+    /// tab is the case that used to be refused and still is — it is the same rule, counted where the
+    /// rule now lives. A tab on a bar nobody is looking at has no such problem and goes.
     pub fn tab_close(&mut self, view: ViewId, tab: TabId) -> bool {
         let t = self.tabs(view);
-        if t.tabs.len() <= 1 || t.tab(tab).is_none() {
+        let Some(going) = t.tab(tab).map(|t| t.group.clone()) else { return false };
+        let showing = t.active == tab;
+        // A floor under both rules: a terminal with no tabs has nowhere to draw and no key that
+        // would bring one back, and `active` naming a tab that is not there is a state this must
+        // not be able to turn into an empty one.
+        if t.tabs.len() <= 1 || (showing && t.visible().len() <= 1) {
             return false;
         }
         let panes = t.tab(tab).map(|t| t.root.panes()).unwrap_or_default();
@@ -633,13 +722,23 @@ impl Editor {
         let at = t.tabs.iter().position(|t| t.id == tab).unwrap_or(0);
         t.tabs.retain(|t| t.id != tab);
         t.mru.retain(|p| !panes.contains(p));
-        if t.active == tab {
-            // The tab to its left, or the first one — never "the one that is now at this index",
-            // which for the last tab is nothing at all.
-            let next = at.min(t.tabs.len().saturating_sub(1));
-            t.active = t.tabs[next].id;
-            let pane = t.tabs[next].active_pane;
-            t.touch(pane);
+        if showing {
+            // The tab to its left *on this bar*, or the first one on it — never "the one that is
+            // now at this index", which is another conversation's tab whenever one happens to sit
+            // there, and for the last tab is nothing at all. Non-empty by the refusal above.
+            let mine: Vec<usize> = t
+                .tabs
+                .iter()
+                .enumerate()
+                .filter(|(_, x)| x.group == going)
+                .map(|(i, _)| i)
+                .collect();
+            let next = mine.iter().rev().find(|i| **i < at).or_else(|| mine.first()).copied();
+            if let Some(next) = next {
+                t.active = t.tabs[next].id;
+                let pane = t.tabs[next].active_pane;
+                t.touch(pane);
+            }
         }
         self.publish_panes(view);
         true
@@ -660,28 +759,50 @@ impl Editor {
     }
 
     /// Go `delta` tabs along the bar, wrapping.
+    ///
+    /// Along *this conversation's* tabs. Wrapping over all of them would step out of the
+    /// conversation you are in — the one thing a key called "next tab" should never do — and would
+    /// wrap after a number that is not the number the bar is showing.
     pub fn tab_step(&mut self, view: ViewId, delta: i32) -> Option<TabId> {
         let t = self.tabs(view);
-        let n = t.tabs.len() as i32;
+        let bar: Vec<TabId> = t.visible().into_iter().map(|x| x.id).collect();
+        let n = bar.len() as i32;
         if n == 0 {
             return None;
         }
-        let at = t.tabs.iter().position(|x| x.id == t.active)? as i32;
-        let to = (at + delta).rem_euclid(n) as usize;
-        let id = t.tabs[to].id;
+        let at = bar.iter().position(|id| *id == t.active)? as i32;
+        let id = bar[(at + delta).rem_euclid(n) as usize];
         self.tab_select(view, id).then_some(id)
     }
 
     /// Move a tab along the bar, clamped at the ends.
+    ///
+    /// `to` is a position on the bar, so it is the number printed on the strip: the tabs of other
+    /// conversations sit between these in `tabs` and are not places you can drag one to. Which is
+    /// why this is an insert rather than a swap — a drag past a hidden tab has to land where the
+    /// bar says it landed, and the tab it displaces has to end up on the side it came from.
     pub fn tab_move(&mut self, view: ViewId, tab: TabId, to: u32) -> bool {
         let t = self.tabs(view);
-        let Some(from) = t.tabs.iter().position(|x| x.id == tab) else { return false };
-        let to = (to as usize).min(t.tabs.len().saturating_sub(1));
+        let Some(group) = t.tab(tab).map(|x| x.group.clone()) else { return false };
+        let bar = t.at(&group);
+        let Some(from) = bar.iter().position(|i| t.tabs[*i].id == tab) else { return false };
+        let to = (to as usize).min(bar.len().saturating_sub(1));
         if from == to {
             return false;
         }
-        let info = t.tabs.remove(from);
-        t.tabs.insert(to, info);
+        let info = t.tabs.remove(bar[from]);
+        // Recomputed after the removal: every index past the hole moved, and an insert against the
+        // stale ones puts the tab one place off whenever a hidden tab lies between the two.
+        let rest = t.at(&group);
+        let at = match rest.get(to) {
+            // Immediately before whichever tab is to hold that place, which for a move rightwards
+            // is the one currently after the hole — so the result reads as the drag you did.
+            Some(i) => *i,
+            // Past the end of the bar: after its last tab, not after every tab there is. A hidden
+            // tab beyond it belongs to a conversation this move has nothing to do with.
+            None => rest.last().map(|i| i + 1).unwrap_or(t.tabs.len()),
+        };
+        t.tabs.insert(at, info);
         self.publish_panes(view);
         true
     }
@@ -2203,15 +2324,27 @@ impl Editor {
                 self.pane_equalize(named.unwrap_or(view));
                 Ok(ApiOk::Unit)
             }
-            ApiCall::TabNew { view: named, title, activate } => {
-                let (tab, _) = self.tab_new(named.unwrap_or(view), title, activate);
+            ApiCall::TabNew { view: named, title, activate, group } => {
+                let at = named.unwrap_or(view);
+                let (tab, _) = self.tab_new(at, title, activate);
+                // After it exists, so that the common case — no group named — is the inheritance
+                // `tab_new` already did, and a named one is a tab that moves before anything has
+                // had a chance to draw it anywhere else.
+                if group.is_some() {
+                    self.tab_set_group(at, tab, group);
+                }
                 Ok(ApiOk::Tab { tab })
+            }
+            ApiCall::TabGroup { tab, group } => {
+                let at = self.view_of_tab(tab).ok_or_else(|| no_tab(tab))?;
+                self.tab_set_group(at, tab, group);
+                Ok(ApiOk::Unit)
             }
             ApiCall::TabClose { tab } => {
                 let at = self.view_of_tab(tab).ok_or_else(|| no_tab(tab))?;
                 if !self.tab_close(at, tab) {
                     return Err(ApiError::InvalidArgument {
-                        message: "a terminal's last tab cannot be closed".into(),
+                        message: "the last tab of a conversation cannot be closed".into(),
                     });
                 }
                 Ok(ApiOk::Unit)

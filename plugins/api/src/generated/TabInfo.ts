@@ -24,4 +24,20 @@ export type TabInfo = {
    * rather than in whichever pane happens to be first.
    */
   active_pane: PaneId;
+  /**
+   * Which strip this tab is on — the conversation it belongs to.
+   *
+   * **A tab belongs to a conversation, and the bar shows one conversation's tabs.** A shell
+   * opened while reading one is *that* conversation's shell: it was started in its directory,
+   * about its work, and a bar that goes on showing it after you have switched is a bar about
+   * the terminal rather than about what you are doing. The tabs of the conversations you are
+   * not in are not closed, and nothing in them stops — they are off the strip until you go
+   * back, which is what makes leaving a build running and returning to it work.
+   *
+   * Opaque here and in the editor, which only ever asks whether two of them are equal: the host
+   * fills it with a [`crate::SessionId`], and a plugin that grouped its tabs by project would be
+   * using it exactly as intended. `None` is a group of its own — where a tab nobody has filed
+   * sits, and what every tab was before this existed.
+   */
+  group?: string | null;
 };

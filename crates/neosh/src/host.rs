@@ -105,8 +105,14 @@ pub const KIND_TAB_CHOICE: &str = "neosh.tab_choice";
 /// split already covers — it is offered because a *tab* of it is a whole screen where a split is
 /// half of one, and it is last because that is a thing you want occasionally rather than by
 /// default.
+///
+/// **And the first row says where it puts you.** A tab belongs to the conversation in it — see
+/// [`neosh_proto::TabInfo::group`] — so a tab on a *new* conversation is that conversation's first
+/// tab, and the bar it lands on is that conversation's rather than this one's. The two rows below
+/// it stay on this bar, which is the difference worth printing: without it the row is a key whose
+/// visible effect is the tabs you had open disappearing.
 const TAB_CHOICES: &[(&str, &str)] = &[
-    ("New conversation", "a fresh one, here in this directory"),
+    ("New conversation", "a fresh one here, with tabs of its own"),
     ("Terminal", "a shell, here in this directory"),
     ("This conversation again", "a second place to read it, with its own scroll"),
 ];
@@ -2484,6 +2490,13 @@ impl Host {
                 // in `vars.json` per conversation ever deleted, and a future id collision inherits
                 // somebody's stale colour.
                 self.vars.forget_session(&session);
+                // And its bar comes with you. A deleted conversation is a group nothing can ever
+                // show again, so a shell you had open in a second tab of it would keep running
+                // where no key could reach it — a process with no way back, which is the one thing
+                // hiding a tab must never turn into. Deleting is the irreversible one; archiving
+                // deliberately does not do this, because going back to the conversation is what
+                // brings its tabs back with it.
+                self.adopt_tabs_of(&session);
                 if closing_active {
                     // Where you landed is a conversation of its own, and it may be in another
                     // directory: the banner names one, the file tools are pointed at one, and
@@ -3051,14 +3064,45 @@ impl Host {
     /// The conversation being left is named rather than worked out by the store, because the store
     /// has no idea how many terminals there are: leaving a placeholder is what drops it, and a
     /// placeholder somebody else is still sitting in is not one anybody left.
+    ///
+    /// **And the tab comes with you.** A tab belongs to the conversation in it — see
+    /// [`neosh_proto::TabInfo::group`] — so switching is what moves this tab onto the new
+    /// conversation's bar, beside whatever was already open there and away from the shell you left
+    /// running in the old one. Guarded on the conversation actually changing, because this is also
+    /// the call [`Self::rehome`] makes when the keyboard merely moves *between* panes: a tab split
+    /// across two conversations would otherwise change which bar it is on every time you crossed
+    /// the boundary, and the strip would flicker between two conversations under `<C-w>l`.
     fn arrive_in(
         &mut self,
         session: &neosh_proto::SessionId,
     ) -> Result<(), neosh_agent::StoreError> {
         let leaving = self.abandoning(session);
+        let switching = self.v().session != *session;
         self.agent.sessions().enter(session, leaving.as_ref())?;
         self.vm().session = session.clone();
+        if switching {
+            self.file_tab(session.clone());
+        }
         Ok(())
+    }
+
+    /// Put the tab this pane is in on a conversation's bar.
+    ///
+    /// The tab *containing the acting pane*, which is not always the one the terminal is showing:
+    /// an orchestrator steering another view, or a call that named a pane, is arriving somewhere
+    /// that may be a tab along. Filing the tab on screen instead would leave the pane that actually
+    /// moved on a bar about a conversation it is no longer in.
+    fn file_tab(&mut self, group: neosh_proto::SessionId) {
+        let view = self.view_now();
+        let Some(pane) = self.acting_pane.or_else(|| self.editor.active_pane_of(view)) else {
+            return;
+        };
+        let Some(tab) =
+            self.editor.tabs_of(view).iter().find(|t| t.root.contains(pane)).map(|t| t.id)
+        else {
+            return;
+        };
+        self.editor.tab_set_group(view, tab, Some(group.0));
     }
 
     /// The conversation this pane is leaving, if nothing else is showing it.
@@ -3903,9 +3947,69 @@ impl Host {
                 }
             }
 
+            self.settle_tab_groups(view);
             self.rehome(view);
         }
         self.refresh_tabline();
+    }
+
+    /// Hand a gone conversation's tabs to the conversation each terminal landed in.
+    ///
+    /// Every view, not only the one that asked: the same conversation can have had a tab open in
+    /// two terminals, and a tab left on a group nothing will ever show again is a pane, its
+    /// windows, and whatever is running in it, all unreachable. Where they land is that terminal's
+    /// own bar, which by the time this runs is the conversation it stepped out into.
+    fn adopt_tabs_of(&mut self, gone: &neosh_proto::SessionId) {
+        let views: Vec<neosh_proto::ViewId> = self.views.keys().copied().collect();
+        for view in views {
+            let Some(here) = self.editor.tab_group_of(view) else { continue };
+            if here == gone.0 {
+                // The terminal is still standing in the conversation that has gone — nothing has
+                // moved it, so its tabs are all together and all on screen. Moving them somewhere
+                // would be inventing a destination this does not have.
+                continue;
+            }
+            let orphans: Vec<neosh_proto::TabId> = self
+                .editor
+                .tabs_of(view)
+                .iter()
+                .filter(|t| t.group.as_deref() == Some(gone.0.as_str()))
+                .map(|t| t.id)
+                .collect();
+            for tab in orphans {
+                self.editor.tab_set_group(view, tab, Some(here.clone()));
+            }
+        }
+    }
+
+    /// File any tab nobody has filed yet under the conversation in it.
+    ///
+    /// The editor makes the first tab of a terminal before anything knows which conversation that
+    /// terminal is opening in, and a workspace restored from disk puts a conversation into a pane
+    /// without ever *arriving* in it — so both leave a tab on the group `None` is. Left there, the
+    /// first shell you opened would inherit `None` and go on being drawn beside every conversation,
+    /// which is the whole of what this change is about.
+    ///
+    /// Only ever a tab with no group at all: it is a settling, not a reconciliation. Re-deriving
+    /// every tab's group from its active pane on each pass would make a tab split across two
+    /// conversations change bars whenever the keyboard crossed the split — see [`Self::arrive_in`],
+    /// which is the other and only place a tab moves.
+    fn settle_tab_groups(&mut self, view: neosh_proto::ViewId) {
+        let unfiled: Vec<(neosh_proto::TabId, neosh_proto::PaneId)> = self
+            .editor
+            .tabs_of(view)
+            .iter()
+            .filter(|t| t.group.is_none())
+            .map(|t| (t.id, t.active_pane))
+            .collect();
+        for (tab, pane) in unfiled {
+            let Some(session) =
+                self.views.get(&view).and_then(|v| v.panes.get(&pane)).map(|p| p.session.clone())
+            else {
+                continue;
+            };
+            self.editor.tab_set_group(view, tab, Some(session.0));
+        }
     }
 
     /// Start a shell in a pane, and claim the surface it draws on.
@@ -5043,7 +5147,10 @@ impl Host {
         // viewports at all is never.
         let known = width > 0;
 
-        let (tabs, active) = (self.editor.tab_list(view).0, self.editor.active_tab_of(view));
+        // This conversation's tabs, not this terminal's. A tab belongs to the conversation in it —
+        // see [`neosh_proto::TabInfo::group`] — so the shell you left running in another one is not
+        // on this bar, and the numbers here are the numbers `<C-w>1` takes.
+        let (tabs, active) = (self.editor.visible_tabs_of(view), self.editor.active_tab_of(view));
         // Text and its colours, built together and written as one line plus range marks — the way
         // the status strip does it, and for the same reason: virtual text on an empty line cannot
         // be selected, searched or read back, and this is a row people will want to screenshot.
@@ -11168,7 +11275,12 @@ impl Host {
             landed
         };
         if let Some(id) = landed {
-            self.vm().session = id;
+            self.vm().session = id.clone();
+            // The tab is filed with it. This is an arrival that does not come through `arrive_in` —
+            // the pane is simply told which conversation it holds — and a first tab left on the
+            // placeholder's group is a bar that the first `^T` strands: the tab moves to where you
+            // went, and a shell opened before that stays behind on a group nothing will ever show.
+            self.file_tab(id);
             let _ = self.agent.sessions().remove(&placeholder);
         }
         // Every restored conversation may live in a different checkout — that is what makes a
@@ -12254,7 +12366,10 @@ impl Host {
                     .or_else(|| args.first().and_then(|a| a.parse::<u32>().ok()));
                 if let Some(n) = n.filter(|n| *n >= 1) {
                     let view = self.view_now();
-                    let tabs = self.editor.tab_list(view).0;
+                    // Counted on the bar, which is what the bar numbered: a conversation's tabs are
+                    // `1`…`n` on screen, and indexing the whole list would take `<C-w>2` to whatever
+                    // tab of whatever other conversation happens to sit second in memory.
+                    let tabs = self.editor.visible_tabs_of(view);
                     match tabs.get(n as usize - 1) {
                         Some(t) => {
                             let id = t.id;
@@ -12476,9 +12591,13 @@ impl Host {
         let view = self.view_now();
         let Some(tab) = self.editor.active_tab_of(view) else { return };
         if !self.editor.tab_close(view, tab) {
+            // Of *this conversation*, which is the honest sentence now that a bar is one
+            // conversation's: there may well be tabs open elsewhere, and closing this one would
+            // have landed you in them — which is a key about where you are looking deciding what
+            // you are working on. `^T` goes to another conversation and `^Q` closes the terminal.
             self.editor_message(
                 MessageLevel::Warn,
-                "this is the last tab — ^Q closes the terminal, and the turns keep running",
+                "this conversation's last tab — ^T goes elsewhere, ^Q closes the terminal",
             );
             return;
         }
@@ -12890,7 +13009,9 @@ impl Host {
     fn shift_tab(&mut self, delta: i32) {
         let view = self.view_now();
         let Some(tab) = self.editor.active_tab_of(view) else { return };
-        let tabs = self.editor.tab_list(view).0;
+        // Positions on the bar, which is what a drag is in: `to` is a place among this
+        // conversation's tabs, and one place along has to be one place along on screen.
+        let tabs = self.editor.visible_tabs_of(view);
         let Some(at) = tabs.iter().position(|t| t.id == tab) else { return };
         let to = (at as i32 + delta).clamp(0, tabs.len().saturating_sub(1) as i32) as u32;
         self.editor.tab_move(view, tab, to);

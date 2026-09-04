@@ -662,21 +662,63 @@ export interface PaneApi {
   equalize(view?: ViewId): Promise<void>;
 }
 
-/** The tabs of one terminal. Each is a title and a tree of panes. */
+/**
+ * The tabs of one terminal. Each is a title, a tree of panes, and the conversation it belongs to.
+ *
+ * **A tab belongs to a conversation, and the bar shows one conversation's tabs** — that is
+ * {@link TabInfo.group}, and it is why a shell opened while reading one conversation is not still
+ * on the bar after you have switched to another. The tabs of the conversations you are not in are
+ * not closed and nothing in them stops; they are off the strip until you go back.
+ *
+ * Which splits these calls in two. {@link TabApi.list} answers with *every* tab of a terminal,
+ * whatever bar it is on, because "what is open here" is a real question — and {@link TabApi.step},
+ * {@link TabApi.move} and the numbers on the strip all count the tabs of one conversation, because
+ * a key about where you are looking must not change what you are working on.
+ */
 export interface TabApi {
-  /** Every tab of a terminal, its panes, and which one is on screen. */
+  /**
+   * Every tab of a terminal, its panes, and which one is on screen.
+   *
+   * All of them, including the ones on other conversations' bars: filter by {@link TabInfo.group}
+   * for what is drawn, which is the tabs sharing the active tab's group.
+   */
   list(view?: ViewId): Promise<{ tabs: TabInfo[]; active: TabId }>;
   /**
    * Open a tab with one empty pane. `activate` goes to it — `false` is for putting work somewhere
    * without moving the screen out from under whoever is reading it.
+   *
+   * On the bar you are looking at unless `group` says otherwise: a tab opened while reading a
+   * conversation is that conversation's, which is what a new tab almost always wants.
    */
-  create(opts?: { title?: string; activate?: boolean; view?: ViewId }): Promise<TabId>;
-  /** Close a tab and every pane in it. Rejects on a terminal's last tab. */
+  create(opts?: {
+    title?: string;
+    activate?: boolean;
+    view?: ViewId;
+    group?: string;
+  }): Promise<TabId>;
+  /**
+   * Move a tab to another conversation's bar, or to nobody's with `null`. See
+   * {@link TabInfo.group}.
+   *
+   * It keeps its panes, its windows and anything running in them — this says which bar it is on
+   * and nothing else, so moving the tab you are *in* changes which other tabs are beside it.
+   */
+  group(tab: TabId, group: string | null): Promise<void>;
+  /** Close a tab and every pane in it. Rejects on a conversation's last tab. */
   close(tab: TabId): Promise<void>;
   select(tab: TabId): Promise<void>;
-  /** Go `delta` tabs along, wrapping — a tab bar is a list you can see all of. */
+  /**
+   * Go `delta` tabs along, wrapping — a tab bar is a list you can see all of. Along *this
+   * conversation's* tabs: stepping into another one's would be a key that changes what you are
+   * working on.
+   */
   step(delta: number, view?: ViewId): Promise<void>;
-  /** Move a tab along the bar, clamped at the ends. This is a drag; a drag that teleports is a bug. */
+  /**
+   * Move a tab along the bar, clamped at the ends. This is a drag; a drag that teleports is a bug.
+   *
+   * `to` counts the tabs on the bar, which is the number printed on the strip — the tabs of other
+   * conversations sit between these and are not places a drag can land.
+   */
   move(tab: TabId, to: number): Promise<void>;
   /** Name a tab, or pass `null` to give it back its derived name. */
   rename(tab: TabId, title: string | null): Promise<void>;
@@ -2648,9 +2690,13 @@ function build(
             view: opts?.view,
             title: opts?.title,
             activate: opts?.activate ?? true,
+            group: opts?.group,
           }),
           "tab",
         ).tab;
+      },
+      async group(tab, group) {
+        await c({ call: "tab_group", tab, group });
       },
       async close(tab) {
         await c({ call: "tab_close", tab });

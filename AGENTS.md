@@ -136,11 +136,33 @@ is `docs/releasing.md`.
   drawn, even with one tab, because a bar that appears when you make a second tab is a bar whose
   arrival moves every other row down and which nothing had ever mentioned. Numbered from one,
   because the key is `<C-w>1`. When the row is short the **legend** is what gives way, never the
-  tab names: crowded out by three key names the bar said `+1` where a conversation's title belongs,
-  on the one row whose job is telling you which conversations are open. The first hint is reserved
+  tab names: crowded out by three key names the bar said `+1` where a tab's title belongs, on the
+  one row whose job is telling you what is open. The first hint is reserved
   for, since everything else is behind it. And **which pane has the keyboard is said with its
   edges** — `Pane.Active` on the borders that belong to it, tmux's answer, because four panes of
   one conversation look identical and the caret is one cell.
+- **A tab belongs to a conversation, and the bar is one conversation's tabs.** A shell opened while
+  reading one is *that* conversation's: it was started in its directory, about its work, and a bar
+  that goes on drawing it after you have switched is a bar about the terminal rather than about what
+  you are doing — four conversations in, every one of them showed the same three tabs and two of
+  them were about none of it. `TabInfo::group` is the whole mechanism and is opaque to the editor,
+  which only ever asks whether two of them are equal: the host fills it with a `SessionId`, and a
+  plugin grouping its tabs by project would be using it exactly as intended. **A tab is filed once
+  and moves only when you switch** — `arrive_in` is the one place, guarded on the conversation
+  actually changing, because that is also what `rehome` calls when the keyboard merely crosses a
+  split, and a group re-derived from the active pane on every pass would change bars under
+  `<C-w>l`. `settle_tab_groups` is the other half and only ever fills a group that is *absent*: the
+  editor makes a terminal's first tab before anything knows which conversation it is opening in, and
+  a restored workspace puts one into a pane without ever arriving in it. Everything counted on the
+  bar is counted in the visible tabs — `<C-w>1`…`9`, `<C-w>n`, the drag, and the last-one refusal,
+  which is now a *conversation's* last tab, because closing it would land you in another
+  conversation's tabs and that is a key about where you are looking deciding what you are working
+  on. **Nothing is closed and nothing stops**: the tabs of the conversations you are not in are off
+  the strip rather than gone, so a build left running in one is still running when you come back —
+  which is why *deleting* a conversation hands its tabs to wherever each terminal landed, and
+  archiving deliberately does not. A group nothing can ever show again is a pane, its windows and
+  whatever is running in them, with no key on any keyboard that reaches it; an archived conversation
+  is one `^T` from having its tabs back.
 - **A panel you are in the middle of using has the keyboard.** `FloatConfig::modal` takes
   `KeymapScope::Global` out of the chain, and a key nothing claimed is swallowed rather than reaching
   the composer behind the float. Shadowing the keys a widget wants is the other half and not a
@@ -978,7 +1000,7 @@ table. `ui.keys.hint_delay = 0` shows it at once; a larger number keeps it out o
 |---|---|
 | `v` `s` | Split: the new pane on the right, or below. Focus follows |
 | `c` | Split to the right **on a new conversation** — the one-key version of splitting and then `^N` |
-| `q` | Close this pane. The last one is refused: `^Q` closes the terminal |
+| `q` | Close this pane. The last one of a conversation is refused: `^T` goes elsewhere, `^Q` closes the terminal |
 | `o` | Close every pane but this one |
 | `h` `j` `k` `l` | Go to the pane that way. No wrap-around — the edge is where it stops |
 | `w` | The next pane, or the next **tab** when this one has a single pane, so it always goes somewhere |
@@ -988,10 +1010,10 @@ table. `ui.keys.hint_delay = 0` shows it at once; a larger number keeps it out o
 | `x` | Swap this pane with the next, keeping their places — how the one you care about gets the wide half |
 | `=` | Give every pane an equal share |
 | `t` | A tab. **Asks what goes in it**: a new conversation, a shell, or this conversation again |
-| `T` | A tab with a **shell**, skipping the question |
+| `T` | A tab with a **shell**, skipping the question. It is this conversation's shell, and it is on this conversation's bar |
 | `S` | Split into a **shell** |
-| `X` | Close this tab and everything in it |
-| `n` `p` | The next / previous tab, wrapping |
+| `X` | Close this tab and everything in it. This conversation's last one is refused |
+| `n` `p` | The next / previous tab on this bar, wrapping |
 | `1`–`9` | That tab, counting from the left as the bar numbers them |
 | `r` | Name this tab. `↵` on an empty name gives it back to being named by what is in it |
 | `,` `.` | Move this tab along the bar |
@@ -1000,6 +1022,13 @@ table. `ui.keys.hint_delay = 0` shows it at once; a larger number keeps it out o
 A split shows what you were reading — Vim's answer for `:split`, and the only one that needs no
 dialog — and each pane then has **its own transcript, composer, draft, scroll and search**. `^T` and
 `^N` change what is in the pane you are in.
+
+**The tabs belong to the conversation you are in.** A shell you open while reading one is that
+conversation's shell, and switching with `^T` shows the tabs of where you have gone — the ones you
+left are off the bar rather than closed, so the build still running in one is still running when you
+come back to it, and it is on the bar again the moment you do. Which is also why `<C-w>X` refuses a
+conversation's last tab where it used to refuse a terminal's: closing it would land you in some other
+conversation's tabs, and a key about where you are looking should not decide what you are working on.
 
 ## A shell in a pane
 
@@ -1011,6 +1040,11 @@ move, `Esc` gives up. Every row says *what you get*: the first cut called the th
 indistinguishable from `New conversation` on the row below — and the likeliest intent is first,
 because that is where the cursor starts and `⏎` is what people press. The three verbs behind it (`tab.new`, `tab.new.chat`, `tab.new.term`) stay separate
 commands, so a script or a key can skip the question — which is what `<C-w>T` does.
+
+The first row is the one that goes somewhere: a tab on a *new* conversation is that conversation's
+first tab, so the bar it lands on is its own and the tabs you had open are the ones you came from.
+The other two stay here. That is what the row says — `a fresh one here, with tabs of its own` — rather
+than something you find out by watching the bar empty.
 
 
 `<C-w>T` opens a tab with one, `<C-w>S` splits into one. A terminal pane is one window and no
