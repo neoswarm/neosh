@@ -1544,6 +1544,27 @@ pub enum ApiCall {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         cwd: Option<String>,
     },
+    /// Clone `url` into `path`, saying how far it has got as it goes.
+    ///
+    /// The one git call with no `cwd`, because it is the call that makes one: everything else here
+    /// asks a repository a question, and this arrives before there is a repository to ask.
+    ///
+    /// **A clone is the one git operation long enough to need watching.** A shallow one is a
+    /// second and a big history is minutes, and the difference is not knowable in advance — so
+    /// this streams rather than answering once at the end. Progress arrives on the bus as
+    /// `neosh.git.clone`, keyed by `path` because a workspace may be cloning more than one thing
+    /// and a progress row that two clones share is a row that reports neither. The reply, when it
+    /// comes, is the path that now exists.
+    ///
+    /// `path` is absolute and its parent need not exist — a clone into a location you have just
+    /// invented is the ordinary case, not an error to hand back.
+    GitClone {
+        /// Anything `git clone` takes: an `https://` or `git@` URL, or a local path.
+        url: String,
+        /// Where the working tree lands, in full. The caller resolved the root and the name, so
+        /// that a picker can *show* the destination on the row before anything is written.
+        path: String,
+    },
 
     // ---- one-shot generation -------------------------------------------
     /// Run a prompt through a model *outside* the conversation.

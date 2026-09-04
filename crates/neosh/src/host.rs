@@ -34,7 +34,7 @@ use crate::bridge::{PluginProvider, ScriptBridge};
 use crate::cards::{self, Glyphs, ToolState};
 use crate::config::{Config, Resolved};
 use crate::frontend::Frontend;
-use crate::services::Services;
+use crate::services::{Services, Subscribers};
 use crate::vim;
 
 /// How long mutations accumulate before a frame is emitted.
@@ -1019,7 +1019,11 @@ pub struct Host {
     /// Behind a lock rather than plain, because [`Host::broadcast`] is called from `&self` in a
     /// dozen places and the alternative — never pruning — is a workspace that accumulates one dead
     /// sender per script that has ever watched it, and clones every token into all of them.
-    subscribers: std::sync::Mutex<Vec<tokio::sync::mpsc::UnboundedSender<PluginEvent>>>,
+    /// Shared, so a call running off the loop can reach it. A slow call is spawned with only its
+    /// [`Services`], and an event it emits has to arrive at the control socket's subscribers as
+    /// well as at the plugins — a script watching the stream sees what a plugin sees, or the two
+    /// surfaces have come to disagree about what happened.
+    subscribers: Subscribers,
     /// Where a picture that had to be fetched comes back to.
     ///
     /// Same reason as the quota channel above: what is on the clipboard is sometimes only the
@@ -1484,6 +1488,7 @@ impl Host {
             caller: plugin.0.clone(),
             state_dir: self.state_dir.clone(),
             bridge: self.bridge.clone(),
+            subscribers: self.subscribers.clone(),
             model_cache: self.model_cache.clone(),
             updater: self.updater.clone(),
         }
@@ -1536,6 +1541,9 @@ impl Host {
                 | ApiCall::GitPull { .. }
                 | ApiCall::GitAddWorktree { .. }
                 | ApiCall::GitRemoveWorktree { .. }
+                // The slowest of the lot by a wide margin: a large history is minutes of network,
+                // and on the loop that is a workspace frozen for every terminal in it.
+                | ApiCall::GitClone { .. }
                 | ApiCall::GenComplete { .. }
                 | ApiCall::AgentListModels { .. }
                 | ApiCall::PermissionCheck { .. }
@@ -13059,6 +13067,23 @@ impl Host {
                         .into(),
                 ),
             },
+            // Where clones go. Host-owned for the two reasons `worktree.root` is, and separate
+            // from it for a third: `worktree.root` puts trees at `<root>/<repo>/<branch>`, so a
+            // clone into `<worktree.root>/<repo>` would land exactly on the directory that
+            // repository's worktrees live *inside*. One setting for both would make cloning a
+            // repository you already have worktrees of an error about a non-empty directory.
+            OptionSpec {
+                name: "clone.root".into(),
+                ty: OptionType::Str,
+                default: OptionValue::Str(default_clone_root()),
+                description: Some(
+                    "Where `^O` clones a repository, as `<root>/<owner>/<repo>`. A leading `~` is \
+                     expanded. Nested by owner so two projects called `api` from different \
+                     accounts do not collide. This is the first destination offered; others you \
+                     have cloned into are remembered and offered beside it."
+                        .into(),
+                ),
+            },
             // Display settings every widget reads. Declared here rather than by whichever plugin
             // happens to load first: two plugins declaring one name is an error, and a plugin that
             // is switched off must not take the setting away from everything else — which is
@@ -13859,6 +13884,7 @@ async fn run_slow(svc: Services, call: ApiCall) -> ApiResult {
             svc.git_branches(include_remote, cwd).await
         }
         ApiCall::GitWorktrees { cwd } => svc.git_worktrees(cwd).await,
+        ApiCall::GitClone { url, path } => svc.git_clone(url, path).await,
         ApiCall::GitLog { limit } => svc.git_log(limit).await,
         ApiCall::GitDiff { target, stat } => svc.git_diff(target, stat).await,
         ApiCall::GitDefaultBranch => svc.git_default_branch().await,
@@ -14515,6 +14541,15 @@ fn expand_tilde(raw: &str) -> Option<String> {
 /// without thinking.
 fn default_worktree_root() -> String {
     expand_tilde("~/.nsh").unwrap_or_else(|| ".nsh".to_string())
+}
+
+/// Where clones go unless told otherwise.
+///
+/// Under `~/.nsh` like worktrees, and in a directory of its own beneath it: `worktree.root` spends
+/// `<root>/<repo>/` on one repository's *branches*, so a clone written to `<root>/<repo>` would be
+/// asked to create the very directory those branches live in.
+fn default_clone_root() -> String {
+    expand_tilde("~/.nsh/repos").unwrap_or_else(|| ".nsh/repos".to_string())
 }
 
 /// A path with the home directory written the way people say it.

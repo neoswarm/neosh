@@ -311,3 +311,93 @@ async fn a_branch_is_renamed_under_the_worktree_standing_on_it() {
 
     let _ = std::fs::remove_dir_all(&extra);
 }
+
+/// A clone of a real repository, reporting real progress, into a directory that does not exist yet.
+///
+/// The last part is the case the UI actually produces: a destination is `<root>/<owner>/<repo>`
+/// and nothing has ever created `<root>/<owner>`. `git clone` makes the leaf and not the path to
+/// it, so a clone that only ever ran into an existing directory would work in every test and fail
+/// on the first real use.
+#[tokio::test]
+async fn cloning_reports_progress_and_makes_its_own_parents() {
+    if !have_git() {
+        return;
+    }
+    let repo = Repo::new("clonesrc");
+    repo.write("a.txt", "1\n");
+    repo.git(&["add", "."]);
+    repo.git(&["commit", "-m", "initial"]);
+
+    let into = repo
+        .path()
+        .parent()
+        .unwrap()
+        .join(format!("neosh-vcs-clone-{}", std::process::id()))
+        // Two levels neither of which exists, which is what makes this the create_dir_all test.
+        .join("owner")
+        .join("repo");
+    let _ = std::fs::remove_dir_all(into.parent().unwrap().parent().unwrap());
+
+    // `file://` rather than a bare path, deliberately. A plain local clone hardlinks the object
+    // store and reports nothing at all — so a test cloning `repo.path()` would exercise the
+    // *parser* against an empty stream and pass whatever the streaming code did. Over `file://`
+    // git runs its real transport and emits the phases an `https://` clone emits, which is the
+    // thing being tested.
+    let url = format!("file://{}", repo.path().display());
+    let mut seen: Vec<(String, Option<u8>)> = Vec::new();
+    neosh_vcs::clone(&url, &into, |phase, percent| seen.push((phase.to_string(), percent)))
+        .await
+        .expect("clone");
+
+    assert!(into.join("a.txt").is_file(), "the working tree is there");
+    assert!(into.join(".git").exists(), "and it is a repository");
+    assert!(!seen.is_empty(), "progress was reported: {seen:?}");
+    // The `remote:`-prefixed phases are the ones a two-colon line produces, and getting them back
+    // under their own name is what says the prefix came off before the phase was split out.
+    assert!(
+        seen.iter().any(|(p, _)| p == "Counting objects"),
+        "including the server's own phases, unprefixed: {seen:?}"
+    );
+    assert!(
+        seen.iter().any(|(_, pct)| *pct == Some(100)),
+        "and a percentage that reaches the end: {seen:?}"
+    );
+
+    // Discoverable afterwards, which is the whole point of having cloned it.
+    let git = Git::discover(&into).await.expect("the clone is a repository");
+    assert_eq!(git.root(), into.canonicalize().unwrap_or(into.clone()).as_path());
+
+    let _ = std::fs::remove_dir_all(into.parent().unwrap().parent().unwrap());
+}
+
+/// Cloning into a directory with something in it is refused before git is started.
+///
+/// git's own message is about a `destination path` and reads, to somebody who pressed a key on a
+/// menu row, as though the clone went wrong rather than as though the row was already taken.
+#[tokio::test]
+async fn cloning_onto_something_that_exists_is_refused_by_name() {
+    if !have_git() {
+        return;
+    }
+    let repo = Repo::new("cloneclash");
+    repo.write("a.txt", "1\n");
+    repo.git(&["add", "."]);
+    repo.git(&["commit", "-m", "initial"]);
+
+    let into = repo.path().parent().unwrap().join(format!("neosh-vcs-clash-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&into);
+    std::fs::create_dir_all(&into).expect("dir");
+    std::fs::write(into.join("occupied.txt"), "mine\n").expect("write");
+
+    let err = neosh_vcs::clone(&repo.path().display().to_string(), &into, |_, _| {})
+        .await
+        .expect_err("refused");
+    let said = err.to_string();
+    assert!(said.contains(&into.display().to_string()), "it names the directory: {said}");
+    assert!(
+        std::fs::read_to_string(into.join("occupied.txt")).is_ok(),
+        "and what was there is still there"
+    );
+
+    let _ = std::fs::remove_dir_all(&into);
+}

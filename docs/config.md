@@ -544,8 +544,48 @@ rather than a character, and `<CR>` accepts either the highlighted row or exactl
 because the directory you want may not be one it offered. `~` expands, and a path with no `/`
 completes against the conversation's own directory.
 
-Underneath, as suggestions rather than a menu: `Type a path…` first, then the worktrees of the
-repository you are in that are not open yet, then every computer you have paired.
+Underneath: `Type a path…`, which is the row that says the field takes one, and every computer you
+have paired. Nothing else. It used to list the worktrees of the repository you are standing in,
+which was wrong twice over — the ones already on the panel were an offer to add what was added, and
+the ones not on it were the scratch branches you had removed, handed back. `^O` means *somewhere I
+do not work yet*, and a list of the repository you are already in cannot answer that. `^N` is where
+this repository's worktrees are offered, and there they are the ones on the panel's own list.
+
+#### From a repository address
+
+Paste one into the same field and the row becomes *clone it*:
+
+```
+https://github.com/owner/repo        git@github.com:owner/repo.git
+ssh://git@host/owner/repo            file:///srv/mirrors/repo
+owner/repo                           # github.com, spelled out on the row before anything is fetched
+```
+
+**It always asks where.** A clone writes a repository's whole history onto your disk, and that is
+not a thing to decide for you and mention afterwards. The first row is `clone.root` — `~/.nsh/repos`
+unless you set it, as `<root>/<owner>/<repo>` so two accounts' `api` do not collide — and `<CR>`
+takes it, so the asking costs a keystroke you were pressing anyway.
+
+Under it is everywhere you have cloned to before, and then `Somewhere else…`, which asks for a
+folder and puts `<folder>/<repo>` in it. **Whatever you pick through that is remembered** and is a
+row from then on, up to the six most recent. That is the whole of adding a location: there is no
+list to maintain and no setting to find.
+
+A destination that already exists is shown, greyed, and refused — the directory being there is very
+often the answer to "why is this repository not in my sidebar", and a row that quietly disappeared
+could not tell you.
+
+While it fetches, a progress row shows git's own phases with a meter where git gave a total and a
+spinner where it did not. Nothing takes the keyboard: the picker has closed and you can carry on. A
+failure says git's own last line — `Repository not found`, `Permission denied (publickey)`, `could
+not resolve host` — because each of those is a different thing to go and do.
+
+When it lands, the project opens. `^K git.clone <url>` is the same verb from the palette or a
+script, and answers with the directory.
+
+Private repositories work wherever `git clone` already does: neosh uses your git credential helpers
+and your SSH agent, and never prompts — a password prompt underneath a full-screen program is a hang
+with no visible cause, so an unauthenticated clone fails with git's message instead.
 
 #### On another computer
 

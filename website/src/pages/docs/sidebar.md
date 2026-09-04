@@ -6,7 +6,7 @@ description: Projects, conversations, worktrees and the archive. What the panel 
 
 ## Projects
 
-The sidebar groups conversations by the directory they were opened in. There is no registry to maintain: opening a conversation somewhere else is how a second project appears. `^O` adds one by path, with completion as you type; `f` pins one to the top, `J`/`K` reorder, and `r` renames a conversation.
+The sidebar groups conversations by the directory they were opened in. There is no registry to maintain: opening a conversation somewhere else is how a second project appears. `^O` adds one by path, with completion as you type — or by repository address, which clones it: paste `https://github.com/owner/repo`, the `git@` spelling, or just `owner/repo`, and it asks where it should go, remembers the folders you pick, and leaves you in the new project. `f` pins one to the top, `J`/`K` reorder, and `r` renames a conversation.
 
 A conversation's directory is where its work happens, not just where it is filed: the repository git answers about, the root the agent's file tools resolve against, and the directory the model's own agent is started in. Switching conversations moves all of it.
 

@@ -25,7 +25,7 @@ Every default is a key your terminal already sends: Ctrl with a letter, `⇧⇥`
 | `^J` | The computers in this workspace |
 | `^F` | The archive |
 | `^N` | New conversation. In a repository it asks where |
-| `^O` | Add a project |
+| `^O` | Add a project — a path, another computer, or a repository address to clone |
 | `^B` | Toggle the sidebar |
 | `^K` | Command palette |
 | `^W` | Windows, panes and tabs — hold it to see what follows. See below |

@@ -37,8 +37,10 @@
  */
 
 import { byteLength, projectScope } from "@neosh/api";
+import { CLONE_EVENT } from "@neosh/api";
 import type {
   AgentSummary,
+  CloneProgress,
   Contribution,
   Disposable,
   DrawnRow,
@@ -71,6 +73,7 @@ import {
   type ListRow,
   type Match,
   mergeDecorations,
+  meter,
   placeSections,
   type SectionItem,
   sectionRows as contributedRows,
@@ -1768,6 +1771,8 @@ type Where =
   | { kind: "new" }
   | { kind: "elsewhere"; path?: string }
   | { kind: "tree"; path: string; label: string }
+  /** A repository to fetch first and open second. */
+  | { kind: "clone"; url: GitUrl }
   /** On another computer, in one of its directories. */
   | { kind: "host"; node: string; cwd: string; label: string }
   /** Look at one machine's directories rather than every machine's projects. */
@@ -1800,11 +1805,92 @@ function elsewhereRow(label: string): PickerItem<Where> {
 type Field =
   | { kind: "rows" }
   | { kind: "local"; path: string }
-  | { kind: "remote"; node: SwarmNode; path: string };
+  | { kind: "remote"; node: SwarmNode; path: string }
+  | { kind: "clone"; url: GitUrl };
 
 /** Whether a query has started to look like a path rather than a search. */
 function looksLikePath(q: string): boolean {
   return q.startsWith("/") || q.startsWith("~") || q.startsWith("./") || q.startsWith("../");
+}
+
+/** A repository to clone, and the two names its destination is built from. */
+type GitUrl = { url: string; owner: string; repo: string; host: string };
+
+/**
+ * The git plugin's verb for fetching one.
+ *
+ * Called by name rather than imported, which is what keeps this panel free of a hard dependency on
+ * git: `requires` would order the two plugins and make one unloadable without the other, and the
+ * sidebar has to work in a workspace where git is disabled. Absent, the address row is not offered
+ * at all.
+ */
+const CLONE_COMMAND = "git.clone";
+
+/** The characters GitHub, GitLab and the rest allow in an account or repository name. */
+const NAME = /^[A-Za-z0-9._-]+$/;
+
+/**
+ * A repository address, or `null` for anything that is not one.
+ *
+ * Four spellings, because all four are things people have in the clipboard: the `https://` URL a
+ * browser's address bar holds, the `git@host:owner/repo` one the *Clone* button offers, `ssh://`
+ * for the same thing written in full, and bare `owner/repo`.
+ *
+ * **The shorthand is only safe because this field has no menu behind it.** `^O` used to rank rows
+ * against what you typed, so `docs/api` was a filter; with the worktree list gone it matches
+ * nothing, and a two-segment name is far likelier to be a repository than a relative directory
+ * nobody said what it was relative to. `Type a path…` stays on screen either way, so the other
+ * reading is still one keystroke away — and the row names the full URL it resolved to rather than
+ * echoing the shorthand, so what is about to be fetched is never a guess the reader has to make.
+ */
+function readGitUrl(q: string): GitUrl | null {
+  const text = q.trim().replace(/\/+$/, "");
+  if (text === "" || looksLikePath(text)) return null;
+  const strip = (s: string) => s.replace(/\.git$/, "");
+
+  // `git@github.com:owner/repo.git`, and the `ssh://git@host/owner/repo` spelling of the same.
+  const scp = /^(?:ssh:\/\/)?([A-Za-z0-9._-]+@)([A-Za-z0-9.-]+)[:/]+(.+)$/.exec(text);
+  if (scp) {
+    const parts = strip(scp[3]!).split("/").filter(Boolean);
+    const repo = parts.pop();
+    const owner = parts.pop();
+    if (!repo || !owner || !NAME.test(repo) || !NAME.test(owner)) return null;
+    return { url: text, owner, repo, host: scp[2]! };
+  }
+
+  // `file:///srv/mirrors/thing` — a local mirror or a bare repository on a mounted volume. The
+  // host is empty by construction, which is why it cannot go through the branch below: `[^/]+`
+  // needs a character and `file://` is followed straight by the path's leading slash.
+  const file = /^file:\/\/(\/.+)$/.exec(text);
+  if (file) {
+    const parts = strip(file[1]!).split("/").filter(Boolean);
+    const repo = parts.pop();
+    if (!repo || !NAME.test(repo)) return null;
+    const owner = parts.pop() ?? "";
+    return { url: text, owner: NAME.test(owner) ? owner : "", repo, host: "" };
+  }
+
+  const web = /^(https?|ssh|git):\/\/([^/]+)\/(.+)$/.exec(text);
+  if (web) {
+    const parts = strip(web[3]!).split("/").filter(Boolean);
+    const repo = parts.pop();
+    const owner = parts.pop();
+    if (!repo || !owner || !NAME.test(repo) || !NAME.test(owner)) return null;
+    // The host with any `user@` in front of it dropped: it belongs to the URL, which is kept
+    // whole, and not to the sentence naming where this is coming from.
+    return { url: text, owner, repo, host: web[2]!.replace(/^.*@/, "") };
+  }
+
+  // `owner/repo`. Exactly two segments — `a/b/c` is a path far more often than it is anything
+  // else, and guessing which two of the three were meant is a guess nobody asked for.
+  const parts = text.split("/");
+  if (parts.length === 2 && parts.every((p) => NAME.test(p)) && !text.includes("@")) {
+    const [owner, repo] = parts as [string, string];
+    const bare = strip(repo);
+    if (!NAME.test(bare)) return null;
+    return { url: `https://github.com/${owner}/${bare}`, owner, repo: bare, host: "github.com" };
+  }
+  return null;
 }
 
 /**
@@ -1816,7 +1902,7 @@ function looksLikePath(q: string): boolean {
  * names no machine is not a host prefix: it is a directory with a colon in it, which is legal on
  * every filesystem this runs on.
  */
-function readField(query: string, nodes: SwarmNode[]): Field {
+function readField(query: string, nodes: SwarmNode[], clone: boolean): Field {
   const at = query.indexOf(":");
   if (at > 0) {
     const who = query.slice(0, at).toLowerCase();
@@ -1825,6 +1911,14 @@ function readField(query: string, nodes: SwarmNode[]): Field {
     );
     if (node) return { kind: "remote", node, path: query.slice(at + 1) };
   }
+  // After the machines and before the paths. After, because a machine you have named `git` is
+  // still yours and `git:` should reach it — the check above is an exact match on a name you
+  // chose, so it cannot be shadowed by a spelling nobody registered. Before the paths, because a
+  // URL is not one and `looksLikePath` would not have claimed it anyway; the order that matters
+  // is that `~/repos/thing` never reaches the shorthand branch, which is why that test is inside
+  // `readGitUrl` rather than out here.
+  const url = clone ? readGitUrl(query) : null;
+  if (url) return { kind: "clone", url };
   return looksLikePath(query) ? { kind: "local", path: query } : { kind: "rows" };
 }
 
@@ -1934,7 +2028,7 @@ function projectRows(node: SwarmNode, ascii: boolean): PickerItem<Where>[] {
 async function whereTo(
   neosh: Neosh,
   base: PickerItem<Where>[],
-  opts: { title: string; seed?: string },
+  opts: { title: string; seed?: string; clone?: boolean },
 ): Promise<Where | null> {
   const ascii = (await neosh.opt.get<boolean>("ui.ascii_only").catch(() => false)) ?? false;
   let seed = opts.seed ?? "";
@@ -1983,7 +2077,27 @@ async function whereTo(
         ? "↵ choose   ⇥ into a directory   / a path   name: another computer"
         : "↵ choose   ⇥ into a directory   / or ~ for a path",
       source: async (query) => {
-        const field = readField(query, nodes);
+        const field = readField(query, nodes, opts.clone ?? false);
+        if (field.kind === "clone") {
+          // One row, and no directory completions under it: what has been typed is an address, so
+          // there is nothing on this disk it could be completing towards. The label is the *full*
+          // URL rather than what was typed — `owner/repo` is a shorthand this expanded, and the
+          // one moment to say what it expanded to is before anything is fetched.
+          const { url } = field;
+          // The detail is the URL and nothing else. It wrapped onto a second line with a sentence
+          // about what `↵` does on the end of it — which the hint strip two rows below already
+          // says, on every row, for free. What only this row can tell you is what the shorthand
+          // turned into.
+          return [{
+            // `owner` is empty for a `file://` mirror that is not two levels deep, and
+            // `Clone /thing` reads as a path rather than as a repository.
+            label: `Clone ${url.owner ? `${url.owner}/` : ""}${url.repo}`,
+            detail: url.url,
+            icon: ascii ? "v" : "⤓",
+            hl: "Diagnostic.Ok",
+            value: { kind: "clone" as const, url },
+          }];
+        }
         if (field.kind === "rows") {
           // Our own ranking, because a `source` replaces the picker's filtering wholesale. Same
           // fuzzy scorer the picker uses, over the same label-and-keywords, so a query that is not
@@ -2048,7 +2162,11 @@ async function whereTo(
       // What `↵` means when the field holds something no row offered — which for a directory you
       // know the name of is the ordinary case, not the exception.
       freeform: (query) => {
-        const field = readField(query, nodes);
+        const field = readField(query, nodes, opts.clone ?? false);
+        // A URL is deliberately not freeform-able. `↵` on the address row is what clones, and this
+        // is the path that runs when *no* row matched — so answering here would mean a clone
+        // starting from a keystroke aimed at a row the reader could not see.
+        if (field.kind === "clone") return null;
         if (field.kind === "local") return { kind: "elsewhere", path: query.trim() };
         if (field.kind === "remote" && field.path.trim() !== "") {
           return {
@@ -2170,46 +2288,67 @@ function owningProject(target: Target | undefined): string | null {
 /**
  * Which directory to add — here, or on another computer.
  *
- * **The path is the first thing now, not the last.** This was a list of the current repository's
- * worktrees with `Type a path…` under it, and a path is what somebody pressing this key almost
- * always has: the row they wanted sat at the bottom of a list they had to read to the end of every
- * time, and the list was of the one place they were already in. So the filter line *is* the path
- * field from the first keystroke — `/`, `~` and `./` complete directories as you go — and the
- * worktrees are suggestions under it rather than a menu in front of it.
+ * **This is the path field, and nothing else.** It used to open onto every checkout `git worktree
+ * list` could see, and every one of those rows was wrong in one of two ways. The trees already on
+ * the panel were an offer to add what was added — the repository you are standing in was the
+ * second row — and the trees that were *not* on it were the scratch branches you finished with in
+ * March and took off the list with `X`, handed straight back. Its one filter was a live
+ * conversation's `cwd`, which is neither of those things, so what survived it was exactly the set
+ * nobody wanted: twenty paths of finished work, each one drawn as its own full path with its
+ * basename and branch repeated after it, in a float too narrow for either, so the rows truncated
+ * mid-branch and read as noise. That was the same twenty rows
+ * {@link newConversation} had already stopped offering, still here under the other key.
  *
- * And the machines are on it, because "add a project" never had a reason to mean "on this
- * computer". `linux-box:` completes over there and `↵` starts the conversation there; the row for
- * it arrives in the panel the way every other remote conversation's does.
+ * And there is no filter that fixes it, which is the point: `^O` means *somewhere I do not work
+ * yet*, and the one list that cannot answer that is a list of the repository you are already in.
+ * So the filter line **is** the path field from the first keystroke — `/`, `~` and `./` complete
+ * directories as you go — and `Type a path…` stays as the row that says so, because a field whose
+ * behaviour is only in the hint strip is a field you have to be told about twice.
+ *
+ * The machines stay, because "add a project" never had a reason to mean "on this computer".
+ * `linux-box:` completes over there and `↵` starts the conversation there; the row for it arrives
+ * in the panel the way every other remote conversation's does.
+ *
+ * And an address is the third thing this field takes. Paste `https://github.com/owner/repo`, the
+ * `git@` spelling, or just `owner/repo`, and the row becomes *clone it* — because "add a project"
+ * is as often about a repository you do not have yet as about a directory you do, and the
+ * alternative was leaving neosh, cloning in a shell, and coming back to type the path.
  *
  * Answers `null` for anything that was not a local directory — including a remote one, which has
  * been acted on by then. The caller's job is to open a path here, and a path on somebody else's
- * disk is not one.
+ * disk is not one. A clone answers with where it landed, which *is* a local directory, so the
+ * project opens exactly as a typed one does.
  */
 async function chooseDirectory(neosh: Neosh): Promise<string | null> {
-  const [worktrees, sessions] = await Promise.all([
-    neosh.git.worktrees().catch(() => []),
-    neosh.session.list().catch(() => [] as SessionInfo[]),
-  ]);
-  const open = new Set(sessions.map((s) => s.cwd));
-
   const rows: PickerItem<Where>[] = [elsewhereRow("Type a path…")];
-  for (const t of worktrees.filter((w) => !open.has(w.path))) {
-    rows.push({
-      // The path, not the basename: `<Tab>` puts a row's label back in the field, and a bare
-      // directory name there is a path relative to somewhere nobody chose.
-      label: t.path,
-      detail: [basename(t.path), t.branch ?? ""].filter(Boolean).join("  ·  "),
-      keywords: `${basename(t.path)} worktree`,
-      icon: "⎇",
-      hl: "Git.Branch",
-      value: { kind: "elsewhere", path: t.path },
-    });
-  }
+  // Whether an address is worth recognising at all. The git plugin is what clones — and it can be
+  // switched off — so without it a pasted URL is not a row this could act on. Offering a verb that
+  // cannot happen is worse than not offering it, which is the rule `^N`'s worktree rows follow one
+  // function up.
+  const clone = (await neosh.cmd.list().catch(() => [])).some((c) => c.name === CLONE_COMMAND);
 
-  const chosen = await whereTo(neosh, rows, { title: "Add project" });
+  const chosen = await whereTo(neosh, rows, { title: "Add project", clone });
   if (chosen === null) return null;
   if (chosen.kind === "host") {
     await startThere(neosh, chosen);
+    return null;
+  }
+  if (chosen.kind === "clone") {
+    // The git plugin owns the asking and the fetching, exactly as it owns making a worktree: this
+    // panel decides that what you typed is an address, and nothing more.
+    //
+    // `null` on the way out even when it worked, because a successful clone has *already* opened
+    // the conversation — it does that so `^K git.clone` lands you in the repository too, rather
+    // than fetching one and leaving you where you were. Returning the path here would be a second
+    // `session.create` on the same directory, which is two conversations for one keypress.
+    // Only the URL. The shorthand has already been expanded into one, which is what this panel's
+    // parse is *for* — the row had to name what it resolved to before anything was fetched. Git
+    // reads the owner and repository back off it rather than being handed them, so `git.clone
+    // <url>` is a complete call from a key, the palette or a script, and there are not two parses
+    // to keep in step.
+    await neosh.cmd
+      .call(CLONE_COMMAND, [chosen.url.url])
+      .catch((e: unknown) => neosh.notify(String(e), "warn"));
     return null;
   }
   if (chosen.kind !== "elsewhere") return null;

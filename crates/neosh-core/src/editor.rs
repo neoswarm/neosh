@@ -889,6 +889,7 @@ impl Editor {
                 | ApiCall::GitPull { .. }
                 | ApiCall::GitAddWorktree { .. }
                 | ApiCall::GitRemoveWorktree { .. }
+                | ApiCall::GitClone { .. }
                 | ApiCall::GenComplete { .. }
                 | ApiCall::SessionList { .. }
                 | ApiCall::ViewList
@@ -2821,6 +2822,7 @@ fn call_name(call: &ApiCall) -> &'static str {
         ApiCall::GitPull { .. } => "git.pull",
         ApiCall::GitAddWorktree { .. } => "git.addWorktree",
         ApiCall::GitRemoveWorktree { .. } => "git.removeWorktree",
+        ApiCall::GitClone { .. } => "git.clone",
         ApiCall::GenComplete { .. } => "gen.complete",
         ApiCall::PermissionGetMode => "permission.mode",
         ApiCall::PermissionSetMode { .. } => "permission.setMode",
