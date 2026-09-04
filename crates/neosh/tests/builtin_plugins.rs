@@ -8609,6 +8609,56 @@ fn a_tab_can_be_reached_by_its_number() {
     );
 }
 
+/// The bar is fitted to its width, and the one tab it must never drop is the one you are in.
+///
+/// Filled left to right and cut at the end, four tabs with the keyboard in the fourth read
+/// `1 new  2 new` — the row whose whole job is saying which conversations are open spending itself
+/// on the ones you are not in. Nothing else on screen answers "which tab is this", so the answer
+/// has to survive the fitting rather than be the first thing it discards. The tabs are all called
+/// `new` here, which is exactly the case that makes this matter: with no titles to tell them apart,
+/// the number on the bar is the only answer there is.
+#[test]
+fn the_bar_always_names_the_tab_you_are_in() {
+    let sb = Sandbox::new("tabline-keeps-active");
+    let mut s = sb.start();
+    s.wait_for("PROJECTS");
+
+    // Four tabs, landing in the fourth. `3` is this conversation again, which is the cheap one —
+    // what is being tested is the bar, not what the tabs hold.
+    for n in 2..=4 {
+        s.window_key("t");
+        assert!(s.pump(|s| s.buffer_named("[new tab]").is_some()), "the panel is up");
+        s.key("3");
+        assert!(
+            s.pump(|s| s.tabline_now().contains(&format!(" {n} "))),
+            "there are {n} tabs: {:?}",
+            s.tabline_now()
+        );
+    }
+
+    // Narrow enough that not all four can be on it. A stdio frontend reports no geometry of its
+    // own, so until this is said the bar has infinite room and nothing is ever dropped.
+    s.viewport("[tabs]", 30, 1);
+    assert!(
+        s.pump(|s| s.tabline_now().contains('+')),
+        "the bar had to leave something out: {:?}",
+        s.tabline_now()
+    );
+    assert!(
+        s.pump(|s| s.tabline_now().contains(" 4 ")),
+        "and what it left out is not the tab the keyboard is in: {:?}",
+        s.tabline_now()
+    );
+
+    // And it is a window that moves with you, not a rule about the end of the list.
+    s.window_key("1");
+    assert!(
+        s.pump(|s| s.tabline_now().contains(" 1 ")),
+        "the bar followed the keyboard back: {:?}",
+        s.tabline_now()
+    );
+}
+
 /// Every key the prefix panel advertises is a key that is actually bound.
 ///
 /// A legend is a promise about a keyboard, and the panel is built from the live registry — so the
