@@ -2357,6 +2357,27 @@ impl Session {
         }
     }
 
+    /// The sidebar from the `PROJECTS` heading down.
+    ///
+    /// Which is what a question about the project list actually means, and is not the same as the
+    /// whole column. The git block sits *above* `PROJECTS` and its second row is the **current
+    /// branch** — so a worktree test asking whether `sideline` appears anywhere in the sidebar
+    /// finds the branch row, two lines from the top, rather than the tree row. It then finds it
+    /// *above* the repository, and concludes the tree is not nested, for a reason with nothing to
+    /// do with nesting.
+    ///
+    /// That failure is timing-shaped without being a timing bug: the git block polls, so on a fast
+    /// machine the assertion often runs before the branch row exists and the test passes. It went
+    /// red on CI under load, which is the same test being right about the same code — the sidebar
+    /// had simply had time to finish drawing.
+    fn projects_now(&self) -> Vec<String> {
+        let rows = self.sidebar_now();
+        match rows.iter().position(|l| l.contains("PROJECTS")) {
+            Some(i) => rows[i..].to_vec(),
+            None => rows,
+        }
+    }
+
     /// Replay every edit to one buffer, so what comes back is what is on screen now rather than
     /// everything that was ever drawn there.
     /// The highlight groups on each row of a buffer, folded the same way its text is.
@@ -3078,7 +3099,9 @@ fn a_worktree_nests_under_the_repository_it_belongs_to() {
     s.send(&command_with("git.worktree.new", "sideline"));
     assert!(
         s.pump(|s| {
-            let rows = s.sidebar_now();
+            // The project list alone: the git block above it prints the branch, which is the same
+            // word and is not a project row. See `projects_now`.
+            let rows = s.projects_now();
             let repo = rows.iter().position(|l| l.contains("work") && !l.contains("sideline"));
             let tree = rows.iter().position(|l| l.contains("sideline"));
             match (repo, tree) {
@@ -3094,6 +3117,43 @@ fn a_worktree_nests_under_the_repository_it_belongs_to() {
         }),
         "the worktree is a nested row named by its branch\n{:?}",
         s.sidebar_now()
+    );
+}
+
+/// The git block prints the branch, and the branch is very often a worktree's name.
+///
+/// Which is the trap the test above fell into, and it is worth one test of its own rather than a
+/// comment: the two rows say the same word for different reasons, they are in different sections,
+/// and only one of them is a project. A helper that cannot tell them apart is one every future
+/// worktree test inherits.
+#[test]
+fn the_project_list_does_not_include_the_branch_the_git_block_names() {
+    let sb = Sandbox::new("wtscope");
+    sb.git_init();
+    let root = sb.root.join("trees");
+    sb.write_config(&format!("[options]\n\"worktree.root\" = \"{}\"\n", root.display()));
+    let mut s = sb.start_letting_config_choose();
+    s.wait_for("PROJECTS");
+    s.send(&command_with("git.worktree.new", "sideline"));
+
+    // Wait for the state the old assertion could not survive: the git block has caught up and is
+    // naming the branch above `PROJECTS`.
+    assert!(
+        s.pump(|s| {
+            let all = s.sidebar_now();
+            let head = all.iter().position(|l| l.contains("PROJECTS")).unwrap_or(0);
+            all[..head].iter().any(|l| l.contains("sideline"))
+        }),
+        "the git block names the branch\n{:?}",
+        s.sidebar_now()
+    );
+    // And with it there, the project list still puts the tree under its repository.
+    let rows = s.projects_now();
+    let repo = rows.iter().position(|l| l.contains("work") && !l.contains("sideline"));
+    let tree = rows.iter().position(|l| l.contains("sideline"));
+    assert!(
+        matches!((repo, tree), (Some(r), Some(t)) if t > r),
+        "the tree is still below its repository once the branch row exists\n{rows:?}"
     );
 }
 
