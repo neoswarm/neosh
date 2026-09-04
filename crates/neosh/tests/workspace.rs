@@ -290,7 +290,7 @@ impl Client {
             match serde_json::from_str::<ServerMessage>(&line) {
                 Ok(ServerMessage::Events { batch }) => {
                     for ev in batch {
-                        if matches!(ev, UiEvent::Shutdown) {
+                        if matches!(ev, UiEvent::Shutdown { .. }) {
                             self.stopped = true;
                         }
                         self.mirror.apply(ev);

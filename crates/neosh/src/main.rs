@@ -640,6 +640,24 @@ async fn run_client(cli: &Cli, paths: &Paths, cwd: &std::path::Path) -> anyhow::
         }
         client::Ended::Detached(neosh_proto::DetachReason::Stopping)
         | client::Ended::Stopped => {}
+        // The second half of an update. The workspace has gone so the new binary can serve, and
+        // this process is the old one — so it stands aside for the new one too, with the arguments
+        // it was given, in the terminal it is already in. Anything else leaves somebody looking at
+        // a shell prompt with a job half done and nothing saying what the other half is.
+        client::Ended::Restarting => {
+            client::wait_gone(&socket).await;
+            let again = client::terminal_args(
+                &cli.config_dir,
+                cwd,
+                &cli.model,
+                &cli.plugin_dirs,
+                &cli.mock_script,
+            );
+            // Only ever reached when `exec` failed, which is a `neosh` that has moved out from
+            // under us. The update itself is done and the sentence has to say so, or the fix looks
+            // bigger than typing one word.
+            say!("neosh: updated. Run `neosh` again to pick it up ({}).", client::relaunch(&again));
+        }
     }
     Ok(())
 }

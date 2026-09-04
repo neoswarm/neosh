@@ -1834,6 +1834,17 @@ export interface UpdateApi {
    */
   check(force?: boolean): Promise<UpdateStatus>;
   /**
+   * The same answer, from this machine alone, never touching the network.
+   *
+   * Which is enough for the half that matters most often. {@link UpdateStatus.restart_pending} is a
+   * `stat` of one file — *is the binary on disk the binary this workspace is running* — and it goes
+   * true when somebody runs `brew upgrade neosh` in another terminal, which is how most installs
+   * are actually updated and the moment nothing used to say anything. Cheap enough to poll on a
+   * tick; {@link check} is not, and a panel that used it for this would be a workspace making an
+   * HTTP request every thirty seconds.
+   */
+  local(): Promise<UpdateStatus>;
+  /**
    * Update, by whichever route this install takes.
    *
    * Never runs somebody's package manager for them: a managed install comes back as
@@ -2467,7 +2478,16 @@ function build(
     },
     update: {
       async check(force) {
-        return expect(await c({ call: "update_check", force: force ?? false }), "update").update;
+        return expect(
+          await c({ call: "update_check", force: force ?? false, local: false }),
+          "update",
+        ).update;
+      },
+      async local() {
+        return expect(
+          await c({ call: "update_check", force: false, local: true }),
+          "update",
+        ).update;
       },
       async apply() {
         return expect(await c({ call: "update_apply" }), "update_applied").outcome;

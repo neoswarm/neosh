@@ -33,7 +33,27 @@ export type UpdateStatus = {
    */
   error?: string | null;
   /**
-   * Whether an update has been downloaded and is waiting for a restart.
+   * Whether the binary on disk is not the one this process is running.
+   *
+   * Not "whether neosh downloaded something": most installs are updated by somebody else's
+   * package manager, in another terminal, and the workspace goes on executing the inode it
+   * started with — which is the whole failure this field exists to name. `brew upgrade neosh`
+   * finishes, says so, and leaves a workspace running the old code with nothing on screen to
+   * say why the thing you just installed is not there. So this is a `stat` of the running
+   * executable against the stamp taken at startup, and it is true for a self-update, a
+   * `brew upgrade`, an `npm install -g` and a re-run of `install.sh` alike.
+   *
+   * Never set when there is no binary left to restart onto: a promise of a restart that cannot
+   * come back is worse than saying nothing.
    */
   restart_pending: boolean;
+  /**
+   * What is waiting on disk, when it could be read.
+   *
+   * Asked of the binary itself (`neosh --version`) rather than assumed to be
+   * [`latest`](UpdateStatus::latest): somebody who ran `brew upgrade` got whatever Homebrew had,
+   * which is not always the newest release, and a row naming the wrong number is a row that
+   * teaches you not to read it. `None` means *something* changed and it would not say what.
+   */
+  restart_version?: string | null;
 };

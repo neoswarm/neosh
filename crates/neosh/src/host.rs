@@ -870,6 +870,12 @@ pub struct Host {
     /// Set by the `stop` command — and by `quit`, when this host *is* the process; the run loop
     /// notices and shuts down cleanly.
     quitting: bool,
+    /// Whether this shutdown is the second half of an update rather than somebody finishing.
+    ///
+    /// The same shutdown either way — conversations flushed, plugins torn down — and a completely
+    /// different thing for the *terminal* to do next. It rides out on [`UiEvent::Shutdown`],
+    /// because the far end cannot work it out: a closed socket is a closed socket.
+    restarting: bool,
     /// What `quit` means for this host.
     ///
     /// Two different things, and they used to be the same thing because there was only ever one
@@ -1428,6 +1434,7 @@ impl Host {
             keys_touched: false,
             startup: Startup::default(),
             quitting: false,
+            restarting: false,
             on_quit: OnQuit::Stop,
             detaching: None,
             from: crate::clients::Source::LOCAL,
@@ -1462,6 +1469,7 @@ impl Host {
             // loaded from, so `current_exe` asked later is a path with `(deleted)` on the end.
             updater: crate::update::Updater::new(
                 crate::build::exe_path().unwrap_or_default(),
+                crate::build::launch_path(),
                 crate::build::capture().version.clone(),
             ),
             vars: crate::vars::Vars::new(None),
@@ -2072,7 +2080,13 @@ impl Host {
                 // conversations flushed, plugins torn down. Restarting *in place* is not this
                 // process's to do: it is the terminal that runs `neosh`, and `neosh` starts a
                 // workspace when there is none, which by then is the new binary.
+                //
+                // Which is why the terminals have to be *told* it was a restart. From a closed
+                // socket a workspace that stopped and one that is coming straight back look
+                // identical, and a terminal that guesses wrong either exits out of an update
+                // half-finished or refuses to let go of a `neosh stop`.
                 self.quitting = true;
+                self.restarting = true;
                 Ok(ApiOk::Unit)
             }
             // ---- plugin state ------------------------------------------
@@ -11274,7 +11288,7 @@ impl Host {
         // needs telling about.
         self.deliver_alerts_now().await?;
         self.flush().await?;
-        self.frontend.send(vec![(None, UiEvent::Shutdown)]).await?;
+        self.frontend.send(vec![(None, UiEvent::Shutdown { restarting: self.restarting })]).await?;
         self.frontend.shutdown().await?;
         Ok(())
     }
@@ -14232,8 +14246,8 @@ enum Unheard {
 async fn run_slow(svc: Services, call: ApiCall) -> ApiResult {
     match call {
         ApiCall::PathComplete { prefix } => svc.path_complete(prefix).await,
-        ApiCall::UpdateCheck { force } => {
-            Ok(ApiOk::Update { update: svc.updater.check(force).await })
+        ApiCall::UpdateCheck { force, local } => {
+            Ok(ApiOk::Update { update: svc.updater.check(force, local).await })
         }
         ApiCall::UpdateApply => {
             Ok(ApiOk::UpdateApplied { outcome: svc.updater.apply().await })
