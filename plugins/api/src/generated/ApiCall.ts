@@ -522,6 +522,20 @@ export type ApiCall =
     path: string;
   }
   | {
+    "call": "git_move_worktree";
+    path: string;
+    /**
+     * Where it lands, in full. The leaf must not exist; the parent is created.
+     */
+    dest: string;
+    /**
+     * The repository it belongs to. `git worktree move` runs from a checkout, and the
+     * conversation the caller is in may be standing in the one being moved — the same reason
+     * [`Self::GitRemoveWorktree`] takes one.
+     */
+    cwd?: string | null;
+  }
+  | {
     "call": "gen_complete";
     prompt: string;
     system?: string | null;

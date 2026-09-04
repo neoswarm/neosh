@@ -349,7 +349,17 @@ impl Git {
         // "Inside the repository" means inside the *main* checkout — the common dir's parent —
         // not inside whichever worktree this command happened to run from.
         let Some(main) = common.parent().map(Path::to_path_buf) else { return };
-        let Ok(rel) = path.strip_prefix(&main) else { return };
+        // Both sides resolved before they are compared. `rev-parse` answers with symlinks followed
+        // — `/private/var/…` on macOS, wherever `~/Code` really lives on anybody who keeps their
+        // projects on another volume — while `path` is whatever the caller was holding, which is
+        // the unresolved one. Compared as written, `strip_prefix` fails, this returns quietly, and
+        // the result is a repository that reports itself as one giant untracked directory for ever
+        // with nothing anywhere saying why. Only the *comparison* is canonical: the line written
+        // below is still relative, so what lands in `.gitignore` is `/.worktrees/` and not
+        // somebody's home directory.
+        let real_main = tokio::fs::canonicalize(&main).await.unwrap_or_else(|_| main.clone());
+        let real_path = tokio::fs::canonicalize(path).await.unwrap_or_else(|_| path.to_path_buf());
+        let Ok(rel) = real_path.strip_prefix(&real_main) else { return };
         let rel_text = rel.to_string_lossy().replace('\\', "/");
         if rel_text.is_empty() {
             return;
@@ -385,6 +395,42 @@ impl Git {
         }
         args.push(path.display().to_string());
         self.git(args).await.map(|_| ())
+    }
+
+    /// Move a linked worktree to another directory, keeping git's own bookkeeping in step.
+    ///
+    /// `git worktree move` is the only correct way to do this: a worktree is a directory *and* two
+    /// pointers — `.git` in the tree naming its admin directory, and `gitdir` in the admin
+    /// directory naming the tree — so a `mv` leaves a checkout git reports as `prunable` and a
+    /// repository that has forgotten where half of itself went.
+    ///
+    /// The parent is created and the leaf is not: git requires the destination itself not to
+    /// exist, and refuses when its parent does not either — which for "move this into the project"
+    /// is the common case, since `.worktrees/` may never have been made. Failing on a directory
+    /// this call could have created would be a refusal with nothing behind it.
+    ///
+    /// Then [`Self::exclude_if_inside`], for the same reason [`Self::add_worktree`] runs it: a tree
+    /// that has just been moved *into* the repository reports the whole checkout as one untracked
+    /// directory until the repository's `.gitignore` says otherwise. Best-effort there and
+    /// best-effort here — the move has already happened when it runs, and failing the call over a
+    /// status-noise fix would report an operation as failed after it worked.
+    ///
+    /// Nothing is taken *out* of `.gitignore` on the way back out: the line names the worktrees'
+    /// directory rather than this tree, its siblings may still be living there, and a shared file
+    /// this edited on both directions of travel would be churn everybody has to pull.
+    pub async fn move_worktree(&self, from: &Path, to: &Path) -> Result<(), VcsError> {
+        if let Some(parent) = to.parent() {
+            if !parent.as_os_str().is_empty() {
+                tokio::fs::create_dir_all(parent).await?;
+            }
+        }
+        // The paths go through as `OsStr` rather than `display().to_string()`: a directory name is
+        // not required to be UTF-8, and a lossy conversion here would hand git a path with a
+        // replacement character in it and fail on the one checkout that has an odd byte in its name.
+        self.git([OsStr::new("worktree"), OsStr::new("move"), from.as_os_str(), to.as_os_str()])
+            .await?;
+        self.exclude_if_inside(to).await;
+        Ok(())
     }
 
     /// Everything a status line or a prompt builder needs, gathered concurrently.
