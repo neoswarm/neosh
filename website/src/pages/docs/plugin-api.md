@@ -99,12 +99,13 @@ const status = await neosh.git.status();       // rejects with not_found outside
 await neosh.git.diff({ kind: "staged" }, { stat: true });
 await neosh.git.commit("fix: the thing");      // needs vcs_write; reads need nothing
 
-const { branch } = await neosh.gen.json<{ branch: string }>(
+const branch = await neosh.gen.field(
   "Return JSON with one key: branch.\n\nUser message:\n" + text,
+  "branch",
 );
 ```
 
-`gen` runs one-shot generation outside any conversation: nothing enters session history, so asking for a commit message does not change what the agent believes it was asked to do. `gen.json` tolerates what models actually return, fences and preambles included. Make your prompts options rather than constants, in the two layers the git plugin uses: `*.instructions` appended, `*.prompt` replacing.
+`gen` runs one-shot generation outside any conversation: nothing enters session history, so asking for a commit message does not change what the agent believes it was asked to do. `gen.json` tolerates what models actually return, fences and preambles included. `gen.field` tolerates the one thing it cannot: an answer that is a single value often arrives *as* that value — `fix/composer-paste`, with the object the prompt asked for left off — and naming the key makes both the same answer. Use it for a value you would know was wrong on sight, which a branch name is; a thread title is any short line, and so is a refusal, so there the envelope is the evidence the question was answered at all. Make your prompts options rather than constants, in the two layers the git plugin uses: `*.instructions` appended, `*.prompt` replacing.
 
 ## Sessions and views
 

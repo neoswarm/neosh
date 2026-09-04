@@ -1,0 +1,27 @@
+{"type": "message_start", "model": "mock", "usage": {}}
+{"type": "block_start", "index": 0, "block": {"kind": "text"}}
+{"type": "text_delta", "index": 0, "text": "fix/the-login-redirect"}
+{"type": "block_stop", "index": 0}
+{"type": "message_delta", "stop_reason": {"kind": "end_turn"}, "usage": {}}
+{"type": "message_stop"}
+
+{"type": "message_start", "model": "mock", "usage": {}}
+{"type": "block_start", "index": 0, "block": {"kind": "text"}}
+{"type": "text_delta", "index": 0, "text": "fix/the-login-redirect"}
+{"type": "block_stop", "index": 0}
+{"type": "message_delta", "stop_reason": {"kind": "end_turn"}, "usage": {}}
+{"type": "message_stop"}
+
+{"type": "message_start", "model": "mock", "usage": {}}
+{"type": "block_start", "index": 0, "block": {"kind": "text"}}
+{"type": "text_delta", "index": 0, "text": "fix/the-login-redirect"}
+{"type": "block_stop", "index": 0}
+{"type": "message_delta", "stop_reason": {"kind": "end_turn"}, "usage": {}}
+{"type": "message_stop"}
+
+{"type": "message_start", "model": "mock", "usage": {}}
+{"type": "block_start", "index": 0, "block": {"kind": "text"}}
+{"type": "text_delta", "index": 0, "text": "fix/the-login-redirect"}
+{"type": "block_stop", "index": 0}
+{"type": "message_delta", "stop_reason": {"kind": "end_turn"}, "usage": {}}
+{"type": "message_stop"}

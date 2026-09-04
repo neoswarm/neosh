@@ -117,6 +117,14 @@ async function retitle(neosh: Neosh, attempted: Set<SessionId>, forced: boolean)
   const prompt = `${extra ? `${base}\n\nAdditional instructions:\n${extra}` : base}\n\nConversation:\n${transcript}`;
 
   try {
+    // `json` rather than `gen.field`, and the difference is what a wrong answer costs. A branch
+    // name is checkable — `fix/…`, one line, no spaces — so a bare reply can be read as the name
+    // it plainly is. A title is *any* short line, which is also what a refusal, a stack trace's
+    // first row and a driver's own error message look like: `(mock provider has no script)` is a
+    // sentence, and nothing here can tell it from a title. The envelope is the only evidence that
+    // the model answered the question rather than said something, so here it is worth the one
+    // reply in ten that arrives without it — an untitled conversation says what it is in the
+    // sidebar, and `r` names it.
     const answer = await neosh.gen.json<{ title?: string }>(prompt);
     const title = (answer.title ?? "").trim().replace(/^["']|["']$/g, "");
     if (title === "") return;

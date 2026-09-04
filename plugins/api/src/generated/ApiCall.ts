@@ -518,6 +518,30 @@ export type ApiCall =
      */
     json: boolean;
     /**
+     * The one key the answer is *about*, when the whole answer is one value.
+     *
+     * A prompt that says "return `{"branch": …}`" is answered with the object most of the
+     * time and with a bare `fix/composer-paste` the rest of it — the model did the work and
+     * skipped the envelope, and a caller that only accepts the envelope throws a correct
+     * answer away. Measured on this workspace's own history it was two runs in twenty-two:
+     * twice a branch was never named, silently, and both times the name was sitting in the
+     * reply.
+     *
+     * So: extraction first, exactly as before, and this is what a *bare* answer means. Named
+     * rather than inferred, because only the caller knows which key one value belongs under
+     * — and absent, nothing changes, which is what every existing caller wants.
+     *
+     * Only for a one-value answer. A commit message is a subject *and* a body, and guessing
+     * which half a bare paragraph is would be inventing the other one.
+     *
+     * And only for a value a *wrong* answer is recognisable in. A branch name is checkable
+     * and one `git branch -m` from being fixed; a thread title is any short line, which is
+     * also what a refusal and a driver's own error message look like — there the envelope is
+     * the only evidence the question was answered rather than commented on, and it is worth
+     * the one reply in ten that arrives without it.
+     */
+    field?: string | null;
+    /**
      * Defaults to `gen.model` if set, else the session's own selection.
      */
     selection?: ModelSelection | null;

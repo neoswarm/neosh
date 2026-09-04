@@ -1130,6 +1130,66 @@ fn a_scratch_worktree_is_named_by_the_first_message_and_the_sidebar_follows() {
     );
 }
 
+/// And named when the model answers with the name and nothing else.
+///
+/// The prompt asks for `{"branch": …}` and gets the object most of the time. The rest of the time
+/// — two runs in twenty-two, measured on a real workspace's own history — it gets
+/// `fix/the-login-redirect` on its own: the name it asked for, without the envelope. That was read
+/// as a failed request and swallowed by a `log.info` nothing prints, so the worktree kept the name
+/// nobody chose, for good, with the name it should have had sitting in the reply.
+///
+/// Deliberately end to end rather than a unit test of the parse: what broke was a *shape* crossing
+/// four layers — driver, host, the API's `gen.field`, and the plugin that acts on it — and every
+/// one of them could have thrown the answer away on its own.
+#[test]
+fn a_branch_name_without_its_json_envelope_still_names_the_branch() {
+    if !have_git() {
+        return;
+    }
+    let sb = Sandbox::new("branchbare");
+    sb.git_init();
+
+    let mut s = sb.start_with(
+        &Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/branch_name_bare.jsonl"),
+    );
+    s.wait_for("PROJECTS");
+
+    s.send(&command("git.worktree.new.inside"));
+    let under = sb.work().join(".worktrees");
+    assert!(
+        s.pump(|_| std::fs::read_dir(&under).is_ok_and(|d| d.count() > 0)),
+        "the worktree exists, on a name nobody chose"
+    );
+    let tree = std::fs::read_dir(&under)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .next()
+        .expect("one worktree");
+
+    let scratch = head_of(&tree);
+    assert!(scratch.contains('-'), "a two-word scratch name, not {scratch:?}");
+
+    // Waited for, for the reason the test above says: typing before the new conversation lands
+    // types into the one in the main checkout, where there is no scratch branch to rename.
+    let named_scratch = scratch.clone();
+    assert!(
+        s.pump(move |s| s.sidebar_now().iter().any(|l| l.contains(&named_scratch))),
+        "the worktree is a row in the panel\n{:?}",
+        s.sidebar_now()
+    );
+
+    s.type_text("the login page bounces");
+    s.special("enter");
+
+    assert!(
+        s.pump(|_| head_of(&tree) == "fix/the-login-redirect"),
+        "a bare answer is the answer — the branch is on {:?}\n{}",
+        head_of(&tree),
+        s.transcript()
+    );
+}
+
 /// Which branch a checkout is on, asked of git rather than of anything under test.
 fn head_of(dir: &Path) -> String {
     let out = Command::new("git")

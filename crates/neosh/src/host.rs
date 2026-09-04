@@ -13874,8 +13874,8 @@ async fn run_slow(svc: Services, call: ApiCall) -> ApiResult {
         ApiCall::GitRemoveWorktree { path, force, cwd } => {
             svc.git_remove_worktree(path, force, cwd).await
         }
-        ApiCall::GenComplete { prompt, system, json, selection } => {
-            svc.gen_complete(prompt, system, json, selection).await
+        ApiCall::GenComplete { prompt, system, json, field, selection } => {
+            svc.gen_complete(prompt, system, json, field, selection).await
         }
         // Off the host loop for the same reason as git: discovery is a network round trip per
         // configured provider, and doing it inline freezes typing for as long as it takes.

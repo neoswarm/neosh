@@ -442,7 +442,22 @@ is `docs/releasing.md`.
   shape of the name, which cannot tell `brisk-otter` we picked from `brisk-otter` you typed. At
   turn *start*, because the panel is drawn all through a turn — `git branch -m` is one ref write,
   so it is safe under a running agent and safe on uncommitted work. **One attempt, ever**: the mark
-  is spent before the model is asked, or a cheap model's hiccup becomes a request per message. The
+  is spent before the model is asked, or a cheap model's hiccup becomes a request per message —
+  which is exactly why **an answer that arrives without its envelope has to count as an answer**.
+  Asked for `{"branch": …}`, a model replies `fix/tab-strip-missing-in-worktree` on its own about
+  one time in ten: it did the work and skipped the wrapper, `gen.json` read that as a failed
+  request, the one attempt was already spent and the `log.info` that said so prints nowhere. Two
+  worktrees in twenty-two kept the name nobody chose, for good, with the name they should have had
+  sitting in the reply. `gen.field` is the fix and it is the host's, beside `extract_json` and for
+  the same reason — every generating plugin has this problem and none should solve it twice. **Only
+  for a value a wrong answer is recognisable in**, though: a branch name is checkable and one
+  `git branch -m` from being fixed, while a *title* is any short line and so is `(mock provider has
+  no script)` — pointed at titles this named thirteen test conversations after a driver's error
+  message. Where nothing tells an answer from a remark, the envelope is the evidence and
+  `gen.json` is the call. It is
+  also why the turn-start listener is registered **before** the plugin's own first reads: what
+  follows it is a `git status` per project, and the turn it exists for is the first one in a
+  worktree that was made seconds ago. The
   *type* is the model's — `feature/`, `fix/`, `chore/` — so `git.branch.prefix` applies only to a
   name that arrived without one, or you get `feature/fix/the-login` under a type that is now wrong.
   `git.branch.model` is unset by default and the plugin sends **no selection at all** rather than a
