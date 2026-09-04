@@ -239,18 +239,41 @@ a second copy of each. Creating a release **by hand** still publishes, because t
 ### The one credential OIDC cannot replace
 
 Homebrew is a git push to `neoswarm/homebrew-tap`, not an upload to a registry, so there is nothing
-to exchange an OIDC identity for. It needs a fine-grained PAT with **Contents: read and write** on
-that repository, once:
+to exchange an OIDC identity for. It is a **deploy key** — an SSH key belonging to that repository,
+with write access to it and to nothing else — kept as `HOMEBREW_TAP_KEY`.
+
+A deploy key rather than a personal access token, and the reason is expiry. The organisation caps
+fine-grained tokens at 365 days, and a credential that lapses here fails *quietly*: the job would
+skip, the release would go green, and Homebrew would stop updating with nothing on screen saying so.
+A deploy key has no lifetime at all. It is also narrower — scoped to one repository rather than to
+everything the person who made it can reach — and it belongs to the repository rather than to
+whoever happened to create it, so it does not leave with them.
+
+Setting one up again, if it is ever lost:
 
 ```sh
-gh secret set HOMEBREW_TAP_TOKEN
+ssh-keygen -t ed25519 -N "" -C "neosh release → homebrew-tap" -f /tmp/tapkey
+gh api repos/neoswarm/homebrew-tap/keys -X POST \
+  -f title="neosh release (github actions)" -f key="$(cat /tmp/tapkey.pub)" -F read_only=false
+gh secret set HOMEBREW_TAP_KEY --repo neoswarm/neosh < /tmp/tapkey
+rm -f /tmp/tapkey /tmp/tapkey.pub
 ```
 
-Without it the `homebrew` job skips with a warning rather than failing — a fork has no business
-pushing to our tap — and the tap stays where it was, which `brew upgrade` reports as "already
-installed". Note that Homebrew caches its copy of a tap: after a release, `brew update` then
-`brew upgrade neosh`, and if it still claims the old version, `git -C "$(brew --repository
-neoswarm/tap)" pull` is the thing that was stale.
+Deploy keys are disabled organisation-wide by default, which the `POST` reports as
+`Deploy keys are disabled for this repository` — a message about the repository for a setting that
+is on the organisation. An owner turns it on once:
+
+```sh
+gh api -X PATCH orgs/neoswarm -F deploy_keys_enabled_for_repositories=true
+```
+
+**Missing on `neoswarm/neosh` is an error, not a skip.** A fork has no business pushing to our tap
+and skips with a warning; here, a release that leaves Homebrew on the previous version is the exact
+failure this job exists to remove, and "skipped" must not look like "shipped".
+
+Note that Homebrew caches its own clone of a tap: after a release, `brew update` then
+`brew upgrade neosh`, and if it still claims the old version is current,
+`git -C "$(brew --repository neoswarm/tap)" pull` is the thing that was stale.
 
 **A new crate or a new bundled plugin needs its own first manual publish and its own trusted
 publisher**, exactly as in steps 3–5. Nothing else does — and this is the one part of a release that
