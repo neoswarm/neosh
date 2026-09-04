@@ -227,7 +227,7 @@ function paint(row: Row, labelWidth: number, mark: string, glyph: string): Paint
   return { text, spans, rails: [left, [rightStart, byteLength(text)]] };
 }
 
-async function draw(neosh: Neosh, s: Sheet, hints: string): Promise<void> {
+async function draw(neosh: Neosh, s: Sheet): Promise<void> {
   // The panel this frame is about may have been dismissed while the frame was being computed —
   // every line of it is a round trip. Drawing into a window that is gone is this widget racing
   // itself, not something the user did wrong.
@@ -244,7 +244,10 @@ async function draw(neosh: Neosh, s: Sheet, hints: string): Promise<void> {
   // panel that got wider when the cursor moved onto the row with the long sentence would be a panel
   // that never stops moving.
   const said = clipToWidth(here?.choices[here.at]?.detail || here?.description || "", s.inner - 3);
-  const lines = [...painted.map((p) => p.text), "", `  ${said}`, ` ${hints}`];
+  // The key strip is on the bottom border rather than the last row: a model with a dozen knobs on a
+  // short terminal is a sheet clipped to what fits, and the rows it loses are the ones at the end —
+  // which is where the strip that says how to close it used to be.
+  const lines = [...painted.map((p) => p.text), "", `  ${said}`];
   await neosh.buf.setLines(s.buf, 0, -1, lines);
 
   // The whole surface says when the next turn is not an ordinary one. A word in the message is
@@ -306,10 +309,10 @@ async function draw(neosh: Neosh, s: Sheet, hints: string): Promise<void> {
     hlGroup: here?.choices[here.at]?.spoken ? "Option.Beyond" : "Picker.Detail",
     endCol: byteLength(lines[detail] ?? ""),
   });
-  await neosh.ns.mark(s.ns, s.buf, detail + 1, 0, {
-    hlGroup: "Sidebar.Dim",
-    endCol: byteLength(lines[detail + 1] ?? ""),
-  });
+  // The row after this one used to be the key strip, and marking it was the last thing here. The
+  // strip is on the border now, so that row does not exist — and a mark past the end of a buffer
+  // *rejects*, which took `draw` down with it and, since the panel is drawn before it is applied,
+  // meant a level chosen with `l` was shown on screen and never once put into effect.
   await neosh.win.setCursor(s.win, s.cursor, 0);
 }
 
@@ -380,7 +383,7 @@ export async function installOptions(
     }
   };
 
-  const redraw = async (s: Sheet) => draw(neosh, s, hintsFor());
+  const redraw = async (s: Sheet) => draw(neosh, s);
 
   const move = async (s: Sheet, delta: number) => {
     s.cursor = Math.min(s.rows.length - 1, Math.max(0, s.cursor + delta));
@@ -492,9 +495,10 @@ export async function openOptions(neosh: Neosh): Promise<void> {
   const config: FloatOptions = {
     anchor: { kind: "screen" },
     width: { kind: "max", n: inner },
-    height: { kind: "fixed", n: rows.length + 3 },
+    height: { kind: "fixed", n: rows.length + 2 },
     border: "rounded",
     title: ` ${model?.display_name ?? current.model} `,
+    footer: ` ${hintsFor()} `,
     focusable: true,
     closeOnBlur: true,
     // Nothing else reaches the keyboard while this is up. It is a control sheet you are in the
@@ -529,5 +533,5 @@ export async function openOptions(neosh: Neosh): Promise<void> {
     },
   };
   sheet = s;
-  await draw(neosh, s, hintsFor());
+  await draw(neosh, s);
 }

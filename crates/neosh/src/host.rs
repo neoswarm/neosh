@@ -20,8 +20,8 @@ use neosh_proto::{
     Gravity,
     InputEvent,
     KeyCode, MessageLevel, Mode, OptionSpec, OptionType, OptionValue, PluginEvent, PluginId,
-    PluginInbound, PluginOutbound, PluginResponse, RequestId, SelectShape, TextEdit, UiEvent,
-    VirtTextPos, WindowId, WindowLayout,
+    PluginInbound, PluginOutbound, PluginResponse, RequestId, ScrollAmount, SelectShape, TextEdit,
+    UiEvent, VirtTextPos, WindowId, WindowLayout,
 };
 use neosh_provider::catalog;
 use neosh_script::{ScriptInbound, ScriptOutbound};
@@ -10296,6 +10296,15 @@ impl Host {
                     .unwrap_or(3)
                     .clamp(1, 20) as i32;
                 let by = i32::from(rows) * step;
+                // A panel over the transcript is what the wheel is pointing at. Without this the
+                // notch went to the chat underneath, so a key sheet or a diff too long for the
+                // screen scrolled the one thing you could already see and not the one you could
+                // not — and the panel was opaque, so nothing on screen moved at all.
+                let view = self.view_now();
+                if self.editor.focused(view).is_some_and(|w| self.editor.scrollable(w)) {
+                    self.scroll_focused(ScrollAmount::Lines { n: by });
+                    return true;
+                }
                 // While reading, the cursor has to stay on screen, so this goes through the same
                 // path the reader's own scrolling does rather than moving the window out from
                 // under it.
@@ -11381,6 +11390,17 @@ impl Host {
             ("window.split.term", "Split this pane, and run a shell in the new one"),
             ("tab.new.term", "Open a tab with a shell in it"),
             ("window.keys", "Show what the window prefix can do"),
+            // Moving in a panel that does not fit. Named commands before they are keys, like
+            // everything else here — so `^K` runs them, `init.ts` moves them, and a plugin whose
+            // float sets `scroll` gets all eight without writing any of them.
+            ("scroll.down", "Scroll this panel down a line"),
+            ("scroll.up", "Scroll this panel up a line"),
+            ("scroll.half_down", "Scroll this panel down half a screen"),
+            ("scroll.half_up", "Scroll this panel up half a screen"),
+            ("scroll.page_down", "Scroll this panel down a screen"),
+            ("scroll.page_up", "Scroll this panel up a screen"),
+            ("scroll.top", "To the top of this panel"),
+            ("scroll.bottom", "To the bottom of this panel"),
         ];
         for (name, desc) in commands {
             let _ = self.editor.apply(&plugin, ApiCall::CmdRegister {
@@ -11456,7 +11476,67 @@ impl Host {
                 desc: Some(desc.to_string()),
             });
         }
+        self.bind_scroll_keys();
         self.bind_window_keys();
+    }
+
+    /// The reader's motions, on any panel that said it might not fit.
+    ///
+    /// Bound at `BufKind { name: "neosh.scroll" }`, which is a scope the core pushes into the chain
+    /// for a focused float whose [`FloatConfig::scroll`](neosh_proto::FloatConfig::scroll) is set —
+    /// so one set of defaults serves the key sheet, the git panels, the usage panel and a third
+    /// party's float alike, and none of them has to spell out eight bindings it would then own.
+    ///
+    /// These are Vim's, and the same ones the transcript reader answers, because a panel of rows you
+    /// are moving through is the thing the reader already is. What they are *not* is global: they
+    /// resolve below the panel's own kind, so a panel that wants `j` keeps it, and they do not exist
+    /// at all while the keyboard is in the composer, where `j` is a letter.
+    ///
+    /// Every key here is one every terminal sends. The arrows and the paging keys are bound as well
+    /// and are never the only way — which is the rule for arrows everywhere in this workspace.
+    fn bind_scroll_keys(&mut self) {
+        let plugin = PluginId::from(BUILTIN);
+        let scope = Some(neosh_proto::KeymapScope::BufKind {
+            name: neosh_core::editor::SCROLL_KIND.to_string(),
+        });
+        for (lhs, command, desc) in [
+            ("j", "scroll.down", "Down a line"),
+            ("<Down>", "scroll.down", "Down a line"),
+            ("k", "scroll.up", "Up a line"),
+            ("<Up>", "scroll.up", "Up a line"),
+            ("<C-d>", "scroll.half_down", "Down half a screen"),
+            ("<C-u>", "scroll.half_up", "Up half a screen"),
+            ("<C-f>", "scroll.page_down", "Down a screen"),
+            ("<PageDown>", "scroll.page_down", "Down a screen"),
+            ("<C-b>", "scroll.page_up", "Up a screen"),
+            ("<PageUp>", "scroll.page_up", "Up a screen"),
+            ("gg", "scroll.top", "To the top"),
+            ("<Home>", "scroll.top", "To the top"),
+            ("G", "scroll.bottom", "To the bottom"),
+            ("<End>", "scroll.bottom", "To the bottom"),
+        ] {
+            for mode in [Mode::Normal, Mode::Insert, Mode::Visual, Mode::Chat] {
+                let _ = self.editor.apply(&plugin, ApiCall::KeymapSet {
+                    mode,
+                    lhs: lhs.to_string(),
+                    command: command.to_string(),
+                    scope: scope.clone(),
+                    desc: Some(desc.to_string()),
+                });
+            }
+        }
+    }
+
+    /// Move the focused panel's scroll, if it is one that scrolls.
+    ///
+    /// Nothing happens when the keyboard is not in a scrollable float, which is not a case these
+    /// keys can normally reach — the scope they are bound at is only in the chain while one has
+    /// focus — but `^K` can run them by name from anywhere, and a command that reports a failure
+    /// nobody caused is worse than one that does nothing.
+    fn scroll_focused(&mut self, amount: ScrollAmount) {
+        let view = self.view_now();
+        let Some(win) = self.editor.focused(view) else { return };
+        let _ = self.editor.apply(&PluginId::from(BUILTIN), ApiCall::WinScroll { win, amount });
     }
 
     /// The window prefix, out of `ui.keys.window_prefix`.
@@ -11858,6 +11938,19 @@ impl Host {
             "window.move.right" => self.move_pane(Direction::Right),
             "window.exchange" => self.exchange_pane(),
             "window.keys" => self.show_window_keys(),
+
+            // ---- scrolling a panel that does not fit ---------------------
+            // Aimed at whatever has focus, which for these keys is always the float they resolved
+            // in: the scope they are bound at exists only while one is focused.
+            "scroll.down" => self.scroll_focused(ScrollAmount::Lines { n: 1 }),
+            "scroll.up" => self.scroll_focused(ScrollAmount::Lines { n: -1 }),
+            "scroll.half_down" => self.scroll_focused(ScrollAmount::Half { n: 1 }),
+            "scroll.half_up" => self.scroll_focused(ScrollAmount::Half { n: -1 }),
+            "scroll.page_down" => self.scroll_focused(ScrollAmount::Page { n: 1 }),
+            "scroll.page_up" => self.scroll_focused(ScrollAmount::Page { n: -1 }),
+            "scroll.top" => self.scroll_focused(ScrollAmount::Top),
+            "scroll.bottom" => self.scroll_focused(ScrollAmount::Bottom),
+
             "tab.open" => self.begin_tab_choice(),
             "tab.new" => self.new_tab(),
             "tab.new.chat" => {
@@ -12244,6 +12337,7 @@ impl Host {
                 border: neosh_proto::BorderStyle::Rounded,
                 border_hl: Some("Tabline.Key".into()),
                 title: Some(format!(" {prefix} ")),
+                footer: None,
                 width: neosh_proto::Extent::Max { n: width as u16 },
                 // Tall enough for every verb there is, so the list is not silently short by three
                 // rows — the ones that would go are the tab verbs at the end, which is exactly the
@@ -12255,6 +12349,11 @@ impl Host {
                 // before you can use what it is hinting at.
                 focusable: false,
                 modal: false,
+                // Which is also why it does not scroll: the scroll keys resolve against whatever
+                // has focus, and nothing that cannot take focus can be what they mean. On a
+                // terminal too short for the whole list it is clipped, and the bar down its right
+                // edge is what says so — `^Z` is where the rest of it is written down.
+                scroll: false,
                 close_on_blur: false,
                 z: 300,
                 offset: Default::default(),
@@ -12291,6 +12390,7 @@ impl Host {
                 border: neosh_proto::BorderStyle::Rounded,
                 border_hl: Some("Tabline.Key".into()),
                 title: Some(" new tab ".into()),
+                footer: Some(" 1-3 pick   jk move   esc cancel ".into()),
                 width: neosh_proto::Extent::Max { n: width as u16 },
                 height: neosh_proto::Extent::Max { n: TAB_CHOICES.len() as u16 },
                 // Focusable and modal: this is a question you are in the middle of answering, so
@@ -12298,6 +12398,9 @@ impl Host {
                 // would open a second panel behind this one.
                 focusable: true,
                 modal: true,
+                // Three rows, and `j`/`k` move between them: this is a list with a cursor, which is
+                // the case `scroll` is deliberately not for.
+                scroll: false,
                 close_on_blur: false,
                 z: 300,
                 offset: Default::default(),

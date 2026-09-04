@@ -184,6 +184,34 @@ Rows can be ticked, and every verb means what is ticked or — with nothing tick
 | `Esc` | One thing per press: the marks, then the filter, then the panel |
 | `^F` `q` `^C` | Close it |
 
+## A panel that does not fit
+
+Every read-only panel in the workspace — the key sheet, git status, a diff, another machine's
+conversation — is given whatever height the screen has. When that is less than it wants to draw, the
+panel **scrolls**, a bar appears down its right border to say there is more, and the mouse wheel
+scrolls whatever the keyboard is in rather than the transcript underneath it.
+
+| Key | Does |
+| --- | --- |
+| `j` `k`, `↓` `↑` | A line |
+| `^D` `^U` | Half a screen |
+| `^F` `^B`, `PgDn` `PgUp` | A screen, less a row of overlap |
+| `gg` `G`, `Home` `End` | The ends |
+| `Esc` `q` `↵` `^C` | Close |
+
+They are ordinary bindings on the `neosh.scroll` buffer kind, so `^Z` lists them and `init.ts` moves
+them:
+
+```ts
+await neosh.keymap.set("normal", "<C-n>", "scroll.down", {
+  scope: { kind: "buf_kind", name: "neosh.scroll" },
+});
+```
+
+A panel with a cursor of its own — a picker, the project panel, the usage panel — is not one of
+these: it moves its cursor and the view follows, which is why `j` there means "the next row" and not
+"one line down".
+
 ## Pickers
 
 | Key | Does |

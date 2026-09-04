@@ -112,4 +112,12 @@ impl Window {
             WindowLayout::Docked { .. } => false,
         }
     }
+
+    /// Whether the workspace's scroll keys resolve here. See [`FloatConfig::scroll`].
+    pub fn scrollable(&self) -> bool {
+        match &self.layout {
+            WindowLayout::Float { config } => config.scroll,
+            WindowLayout::Docked { .. } => false,
+        }
+    }
 }

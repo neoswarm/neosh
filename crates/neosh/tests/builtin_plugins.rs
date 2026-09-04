@@ -748,13 +748,15 @@ fn a_picker_says_how_to_use_it() {
     let mut s = sb.start();
     s.wait_for("PROJECTS");
     s.ctrl("k");
+    // On the border, not in the list. A strip written as the last row of the buffer is a row of
+    // height every picker pays for on every screen, and on a short one it is the row that does not
+    // fit — which left the one panel you have to be told how to leave as the one with no legend.
     assert!(
-        s.pump(|s| s.picker_named("[Go to]").iter().any(|l| l.contains("choose"))),
+        s.pump(|s| s.footer_of("[Go to]").is_some_and(|f| f.contains("choose"))),
         "the key strip is there\n{:?}",
-        s.picker_named("[Go to]")
+        s.footer_of("[Go to]")
     );
-    let rows = s.picker_named("[Go to]");
-    let strip = rows.iter().find(|l| l.contains("choose")).expect("found above");
+    let strip = s.footer_of("[Go to]").expect("found above");
     assert!(strip.contains("close"), "and how to get out again: {strip:?}");
 }
 
@@ -768,10 +770,10 @@ fn the_key_strip_says_the_keys_that_are_actually_bound() {
     s.ctrl("k");
     assert!(
         // `^Y`, capitalised: nobody presses shift to send it, and the capital is how a terminal
-        // has spelled a chord since curses.
-        s.pump(|s| s.picker_named("[Go to]").iter().any(|l| l.contains("^Y choose"))),
+        // has spelled a chord since curses. Read off the border, which is where a legend lives now.
+        s.pump(|s| s.footer_of("[Go to]").is_some_and(|f| f.contains("^Y choose"))),
         "the strip follows the setting\n{:?}",
-        s.picker_named("[Go to]")
+        s.footer_of("[Go to]")
     );
 }
 
@@ -1660,7 +1662,11 @@ fn a_knob_row_says_it_is_a_control_before_you_press_anything() {
     );
     // And the key that changes something is named before the key that leaves.
     // Letters, not arrows: the arrows are bound too, and the row is a promise about a keyboard.
-    assert!(s.saw("h l change"), "the hints lead with the key that does the thing\n{}", s.transcript());
+    assert!(
+        s.pump(|s| s.footer_of("[model options]").is_some_and(|f| f.starts_with(" h l change"))),
+        "the hints lead with the key that does the thing\n{:?}",
+        s.footer_of("[model options]")
+    );
 }
 
 #[test]
@@ -3553,8 +3559,14 @@ fn a_path_you_typed_in_full_is_accepted_even_though_it_was_never_offered() {
     );
 }
 
+/// The key sheet is the longest panel in the workspace, so it is one you move around in.
+///
+/// It used to close on *any* key, which on a screen shorter than the list meant the only thing you
+/// could do with the part you could not see was dismiss it. Now the scroll keys resolve at
+/// `neosh.scroll` and never reach its capture, and what closes it is named: `<Esc>`, `q`, `<CR>`,
+/// `^C`, and `^Z` again.
 #[test]
-fn the_key_list_opens_from_the_panel_and_any_key_dismisses_it() {
+fn the_key_list_scrolls_and_closes_on_a_key_that_means_close() {
     let sb = Sandbox::new("keylist");
     let mut s = sb.start();
     s.wait_for("PROJECTS");
@@ -3584,8 +3596,27 @@ fn the_key_list_opens_from_the_panel_and_any_key_dismisses_it() {
     // The text is written before the float is opened, so seeing the text is not seeing the window.
     assert!(s.pump(|s| s.windows_for(keys).len() == 1), "it is on screen\n{}", s.transcript());
 
+    // A scroll is counted in the rows the frontend says it drew, and a stdio frontend says nothing
+    // unless a test does — so a window nobody has laid out is one this deliberately leaves alone.
+    s.viewport("[keys]", 64, 10);
+
+    // A letter that is not a way out leaves it exactly where it was. `j` scrolls it — the binding
+    // is at `neosh.scroll`, which is nearer than the capture — and `z` does nothing at all, which
+    // is the whole point: a stray keystroke must not throw away where you had scrolled to.
+    let win = s.windows_for(keys)[0];
+    s.key("j");
+    assert!(
+        s.pump(|s| s.events.iter().any(|e| e["type"] == "scroll_to"
+            && e["win"].as_u64() == Some(win)
+            && e["top_line"].as_u64() == Some(1))),
+        "`j` scrolls the sheet\n{}",
+        s.transcript()
+    );
     s.key("z");
-    assert!(s.pump(|s| s.windows_for(keys).is_empty()), "any key closes it\n{}", s.transcript());
+    assert!(!s.windows_for(keys).is_empty(), "a stray letter does not close it\n{}", s.transcript());
+
+    s.key("q");
+    assert!(s.pump(|s| s.windows_for(keys).is_empty()), "`q` closes it\n{}", s.transcript());
 }
 
 /// The key list is reachable from the composer, and by a chord rather than by `F1`. Apple's top
@@ -6438,6 +6469,22 @@ impl Session {
             (e["type"] == "window_opened" && e["buf"].as_u64() == Some(buf))
                 .then(|| e["win"].as_u64())?
         })
+    }
+
+    /// The key strip on a float's bottom border, as the window it belongs to was announced.
+    ///
+    /// A legend is *not* a row of the buffer any more, and the reason is the reason it is worth
+    /// asserting: written as content it was both the row that scrolled away and the first row a
+    /// short terminal clipped, and the row in question is the one that says how to get out. It
+    /// travels on `FloatConfig`, so this reads it where the promise is actually made.
+    fn footer_of(&self, name: &str) -> Option<String> {
+        let buf = self.buffer_named(name)?;
+        let open = self.open_windows();
+        self.events
+            .iter()
+            .filter(|e| e["type"] == "window_opened" && e["buf"].as_u64() == Some(buf))
+            .filter(|e| e["win"].as_u64().is_some_and(|w| open.contains(&w)))
+            .find_map(|e| e["layout"]["config"]["footer"].as_str().map(str::to_string))
     }
 
     /// Tell the core how big a window really is.

@@ -309,6 +309,16 @@ pub struct FloatConfig {
     pub border_hl: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
+    /// A strip on the bottom border: what the keys here do.
+    ///
+    /// On the border rather than in the buffer, because a key strip written as a row of content is
+    /// one that scrolls away exactly when it is wanted, and is the first thing clipped on a terminal
+    /// too short for the panel. Both of those happened: the picker's strip is the row that says how
+    /// to get out, and on a sixteen-row screen it was the row that did not fit.
+    ///
+    /// Clipped to the border's width like the title, so it is for a legend and not for prose.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub footer: Option<String>,
     /// Close automatically when focus moves elsewhere. The right default for pickers and hovers.
     #[serde(default)]
     pub close_on_blur: bool,
@@ -343,6 +353,27 @@ pub struct FloatConfig {
     /// characters through to the composer would be typing into a field you cannot see.
     #[serde(default)]
     pub modal: bool,
+    /// This panel is a place you can move in when it does not fit.
+    ///
+    /// A float asks for a height and the frontend gives it what there is — so on a short terminal
+    /// every row past the bottom edge is content that exists, is drawn nowhere, and has no key
+    /// pointed at it. `height: Max { n: 30 }` on a twenty-row screen is not thirty rows of panel, it
+    /// is ten rows of panel and twenty rows nobody can reach.
+    ///
+    /// Setting this adds one scope to the keymap chain while this float has focus —
+    /// `BufKind { name: "neosh.scroll" }` — which is where the workspace binds the reader's motions:
+    /// `j`/`k`, `<C-d>`/`<C-u>`, `<C-f>`/`<C-b>`, `gg`/`G`, the arrows and the paging keys. A scope
+    /// rather than a capture, so all three of the usual rules hold: `^Z` lists the keys, `init.ts`
+    /// moves them, and a panel that wants `j` for something of its own binds it on *its* kind, which
+    /// is nearer and wins. It sits below the panel's own kind and above `Global`, so it is a default
+    /// that never takes a key away from the thing it is scrolling.
+    ///
+    /// Off by default, and not for want of ambition: a picker whose filter takes printable
+    /// characters through a capture would have `j` and `G` resolved out from under it by a scope, so
+    /// typing a model's name would scroll instead of filtering. A panel that already moves in itself
+    /// says so by staying quiet here.
+    #[serde(default)]
+    pub scroll: bool,
 }
 
 impl Default for FloatConfig {
@@ -356,9 +387,11 @@ impl Default for FloatConfig {
             border: BorderStyle::Rounded,
             border_hl: None,
             title: None,
+            footer: None,
             close_on_blur: false,
             focusable: true,
             modal: false,
+            scroll: false,
         }
     }
 }
@@ -1075,6 +1108,28 @@ pub enum CursorMotion {
     WordRight,
     BufStart,
     BufEnd,
+}
+
+/// How far to move a window's scroll. See [`crate::ApiCall::WinScroll`].
+///
+/// Verbs rather than a row number, for the reason [`CursorMotion`] is: only the core knows how many
+/// buffer rows the frontend last drew, so "half a screen" is a question the caller cannot answer and
+/// a caller that tried would answer it with a height. Signed, so one variant covers both directions
+/// and a binding for `<C-d>` is the binding for `<C-u>` with the sign flipped.
+#[derive(TS, Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+#[ts(export)]
+pub enum ScrollAmount {
+    /// Buffer rows. Negative is towards the top.
+    Lines { n: i32 },
+    /// Half of what is on screen, `n` times. Negative is towards the top.
+    Half { n: i32 },
+    /// A screenful, `n` times, less one row of overlap — the line you were reading stays on the
+    /// screen it moved to, which is what makes paging through a panel readable rather than a series
+    /// of unrelated screens.
+    Page { n: i32 },
+    Top,
+    Bottom,
 }
 
 /// A change to make at a window's cursor.
