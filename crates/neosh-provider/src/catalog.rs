@@ -242,6 +242,9 @@ fn claude(
         tier: Some(tier),
         legacy,
         tagline: Some(tagline.into()),
+        // Nothing in a catalogue is unavailable: a catalogue says what exists. Whether *this*
+        // machine can run it is the driver's answer, and `claude-cli` is the one that has one.
+        unavailable: None,
     }
 }
 
@@ -268,6 +271,14 @@ fn cache_read_multiple(id: &str) -> f64 {
 /// The effort/thinking split is load-bearing: `budget_tokens` is rejected outright on the 5 and
 /// 4.7+ generations, and `effort` gained `xhigh` there, so a single flattened option set would
 /// produce 400s on half the catalog.
+///
+/// # Newest first
+///
+/// One rule, and it decides two things at once: what a picker draws at the top, and — through
+/// [`crate::ProviderRegistry::default_selection`], which takes the first live entry — what a fresh
+/// install with nothing configured lands on. Read as capability order instead, this list put Opus
+/// above the 5.1 that supersedes it, and the newest model in the catalogue was the second row of a
+/// list whose whole job is saying what is current.
 pub fn anthropic_models() -> Vec<ModelInfo> {
     use ModelTier::{Balanced, Fast, Frontier};
     const OPUS: &str = "Most capable for complex work";
@@ -277,10 +288,10 @@ pub fn anthropic_models() -> Vec<ModelInfo> {
     // agentic work, and it is the one row whose price says so.
     const FABLE: &str = "Deepest reasoning and long-running work";
     vec![
-        claude("claude-opus-5", "Claude Opus 5", "opus", Frontier, OPUS, 1_000_000, 128_000, (5.0, 25.0), Some(EFFORT_5), true, false),
         claude("claude-fable-5-1", "Claude Fable 5.1", "fable", Frontier, FABLE, 1_000_000, 128_000, (10.0, 50.0), Some(EFFORT_5), false, false),
-        claude("claude-fable-5", "Claude Fable 5", "fable", Frontier, FABLE, 1_000_000, 128_000, (10.0, 50.0), Some(EFFORT_5), false, true),
+        claude("claude-opus-5", "Claude Opus 5", "opus", Frontier, OPUS, 1_000_000, 128_000, (5.0, 25.0), Some(EFFORT_5), true, false),
         claude("claude-sonnet-5", "Claude Sonnet 5", "sonnet", Balanced, SONNET, 1_000_000, 128_000, (2.0, 10.0), Some(EFFORT_5), false, false),
+        claude("claude-fable-5", "Claude Fable 5", "fable", Frontier, FABLE, 1_000_000, 128_000, (10.0, 50.0), Some(EFFORT_5), false, true),
         claude("claude-opus-4-8", "Claude Opus 4.8", "opus", Frontier, OPUS, 1_000_000, 128_000, (5.0, 25.0), Some(EFFORT_5), true, true),
         claude("claude-opus-4-7", "Claude Opus 4.7", "opus", Frontier, OPUS, 1_000_000, 128_000, (5.0, 25.0), Some(EFFORT_5), false, true),
         claude("claude-opus-4-6", "Claude Opus 4.6", "opus", Frontier, OPUS, 1_000_000, 128_000, (5.0, 25.0), Some(EFFORT_46), false, true),
@@ -351,17 +362,23 @@ type ClaudeCliEntry = (
 /// version's own option set, and hides every model that is not the newest in its line. Pinning
 /// slugs and letting `model.line opus` do the resolving separates the two jobs: the catalogue says
 /// what exists, and the ladder says which one is current.
+///
+/// # Newest first
+///
+/// As in [`anthropic_models`], and for the same two reasons. Note that "too new for the `claude`
+/// on this machine" is not a reason to move one down the list or take it out of it — see
+/// [`crate::drivers::claude_cli`], which answers that by *saying so on the row*.
 pub fn claude_cli_models() -> Vec<ModelInfo> {
     use ModelTier::{Balanced, Fast, Frontier};
     const OPUS: &str = "Most capable for complex work";
     const SONNET: &str = "Best for everyday tasks";
     const FABLE: &str = "Deepest reasoning and long-running work";
     const ENTRIES: &[ClaudeCliEntry] = &[
-        ("claude-opus-5", "Claude Opus 5", "opus", Frontier, OPUS, 1_000_000, Some(EFFORT_5), true, Some(true), false),
         ("claude-fable-5-1", "Claude Fable 5.1", "fable", Frontier, FABLE, 1_000_000, Some(EFFORT_5), false, Some(true), false),
-        ("claude-fable-5", "Claude Fable 5", "fable", Frontier, FABLE, 1_000_000, Some(EFFORT_5), false, Some(true), true),
+        ("claude-opus-5", "Claude Opus 5", "opus", Frontier, OPUS, 1_000_000, Some(EFFORT_5), true, Some(true), false),
         ("claude-sonnet-5", "Claude Sonnet 5", "sonnet", Balanced, SONNET, 1_000_000, Some(EFFORT_5), false, Some(false), false),
         ("claude-haiku-4-5", "Claude Haiku 4.5", "haiku", Fast, "Fastest, for quick answers", 200_000, None, false, None, false),
+        ("claude-fable-5", "Claude Fable 5", "fable", Frontier, FABLE, 1_000_000, Some(EFFORT_5), false, Some(true), true),
         ("claude-opus-4-8", "Claude Opus 4.8", "opus", Frontier, OPUS, 1_000_000, Some(EFFORT_5), true, None, true),
         ("claude-opus-4-7", "Claude Opus 4.7", "opus", Frontier, OPUS, 1_000_000, Some(EFFORT_5), false, None, true),
         ("claude-opus-4-6", "Claude Opus 4.6", "opus", Frontier, OPUS, 1_000_000, Some(EFFORT_46), false, None, true),
@@ -475,6 +492,14 @@ pub fn verbosity_levels() -> ProviderOptionDescriptor {
 /// from the id, because the failure mode of guessing is a 400 on send rather than a knob that reads
 /// slightly wrong — the same reason the Anthropic catalogue is written down at all.
 fn openai_knobs(id: &str) -> Vec<ProviderOptionDescriptor> {
+    // GPT-6 is the generation that *dropped* a rung as well as gaining one: the docs say
+    // `reasoning.effort supports low, medium, high, xhigh, and max`, and `minimal` — which every
+    // GPT-5 takes — is not among them. It also documents no `verbosity`, so it is not offered:
+    // this file exists to keep a knob nobody advertised off the wire, and inheriting the GPT-5 set
+    // by prefix is exactly how a model gains two parameters it will 400 on.
+    if id.starts_with("gpt-6") {
+        return vec![effort(&["low", "medium", "high", "xhigh", "max"], "medium")];
+    }
     let levels: &[&str] = if id.starts_with("gpt-5.6") {
         &["minimal", "low", "medium", "high", "xhigh"]
     } else if id.starts_with("gpt-5") {
@@ -549,6 +574,9 @@ fn seed_models(instance: &str) -> Vec<ModelInfo> {
     };
     seeded(match instance {
         "openai" => &[
+            // Newest first, as everywhere. Its own family rather than a version of `sol`: Astra is
+            // a generation up and both are current, so `model.line sol` has to keep meaning Sol.
+            ("gpt-6-astra", "GPT-6 Astra", "astra", Frontier, "Frontier reasoning and computer use", false),
             ("gpt-5.6-sol", "GPT-5.6 Sol", "sol", Frontier, "Frontier agentic coding", false),
             ("gpt-5.6-terra", "GPT-5.6 Terra", "terra", Balanced, "Balanced, for everyday work", false),
             ("gpt-5.6-luna", "GPT-5.6 Luna", "luna", Fast, "Fast and affordable", false),
@@ -622,6 +650,12 @@ pub fn merge(discovered: Vec<ModelInfo>, seeds: &[ModelInfo]) -> Vec<ModelInfo> 
                     out.capabilities.option_descriptors = m.capabilities.option_descriptors.clone();
                     out.capabilities.thinking = m.capabilities.thinking;
                 }
+                // Taken whole rather than `or`-ed with the seed's: whether this machine can run it
+                // is the driver's answer and only the driver's, and a seed is a catalogue — it has
+                // never heard of the `claude` you have installed. `or` would also make the reason
+                // sticky, so a model that started working after `claude update` would keep telling
+                // you to run it.
+                out.unavailable = m.unavailable.clone();
                 described.push(out);
             }
             None => rest.push(m),
@@ -954,6 +988,26 @@ mod tests {
         assert_eq!(merged[1].id.0, "something-new", "and a model we had not heard of survives");
     }
 
+    /// A field the merge does not carry is a field that comes back wrong, and this one is the
+    /// difference between a row that says "run `claude update`" and a row that looks ordinary and
+    /// fails the turn. The seed cannot supply it — a catalogue has never heard of the CLI you have
+    /// installed — so the driver's answer is taken whole, including its absence.
+    #[test]
+    fn why_a_model_cannot_be_run_survives_the_merge() {
+        let seeds = seed_models("openai");
+        let known = seeds[0].id.clone();
+        let mut said = ModelInfo::undescribed(known.0.as_str(), known.0.as_str());
+        said.unavailable = Some("needs a newer CLI".into());
+        let merged = merge(vec![said], &seeds);
+        assert_eq!(merged[0].unavailable.as_deref(), Some("needs a newer CLI"));
+        assert_eq!(merged[0].display_name, seeds[0].display_name, "and it is still described");
+
+        // And it goes away again when the driver stops saying it, or `claude update` would fix the
+        // model and leave the sentence behind.
+        let quiet = ModelInfo::undescribed(known.0.as_str(), known.0.as_str());
+        assert_eq!(merge(vec![quiet], &seeds)[0].unavailable, None);
+    }
+
     #[test]
     fn a_seeded_model_the_endpoint_does_not_serve_is_not_offered() {
         // The endpoint is the authority on what your account can reach. Keeping a seed it did not
@@ -1026,6 +1080,48 @@ mod tests {
             "a fresh install must land on a plan, not on something that needs a key"
         );
         assert!(!all[0].models.is_empty(), "needs models so default_selection can resolve");
+    }
+
+    /// The first row of these lists is two things at once: what `^P` opens on, and what a fresh
+    /// install talks to. Both want the same answer — the newest thing the vendor serves — and the
+    /// list read as a capability ladder instead, which put Opus 5 above the Fable 5.1 that
+    /// supersedes it and made the newest model in the catalogue the second row of a list whose
+    /// whole job is saying what is current.
+    #[test]
+    fn the_newest_model_is_the_first_row() {
+        for (who, models) in [("anthropic", anthropic_models()), ("claude-cli", claude_cli_models())]
+        {
+            let first = models.first().expect("a catalogue with models in it");
+            assert_eq!(first.id.as_ref(), "claude-fable-5-1", "{who} leads with the newest");
+            assert!(!first.legacy, "{who}: a superseded model is never the top row");
+        }
+    }
+
+    /// A live model buried under superseded ones is a live model that
+    /// [`crate::ProviderRegistry::default_selection`] walks past a handful of dead ids to reach,
+    /// and — with the fold in the picker keyed on `legacy` rather than on position — a list whose
+    /// order stops meaning anything at the point the first old one appears.
+    #[test]
+    fn nothing_current_is_listed_below_something_superseded_it_replaced() {
+        for (who, models) in [("anthropic", anthropic_models()), ("claude-cli", claude_cli_models())]
+        {
+            let mut seen_legacy: Option<String> = None;
+            for m in &models {
+                if m.legacy {
+                    seen_legacy.get_or_insert_with(|| m.id.to_string());
+                } else if let Some(older) = &seen_legacy {
+                    // Only within a line: Haiku 4.5 is current and genuinely older than every 5.
+                    let same_line = models
+                        .iter()
+                        .any(|o| o.legacy && o.family == m.family && o.id.as_ref() == older.as_str());
+                    assert!(
+                        !same_line,
+                        "{who}: {} is current and sits below {older}, which it replaced",
+                        m.id
+                    );
+                }
+            }
+        }
     }
 
     #[test]
@@ -1151,6 +1247,40 @@ mod tests {
             panic!("expected an effort select");
         };
         assert!(!options.iter().any(|o| o.id == "xhigh"), "4.6 predates xhigh");
+    }
+
+    /// GPT-6 is the first generation here to *lose* a rung as well as gain one, so it cannot inherit
+    /// the GPT-5 set by prefix — and the two knobs it would inherit are two parameters the endpoint
+    /// documents no support for, which is a 400 after the question has been typed rather than a
+    /// dial that reads slightly wrong. `reasoning.effort supports low, medium, high, xhigh, and
+    /// max`, and nothing on the page mentions `verbosity`.
+    #[test]
+    fn gpt_6_takes_max_and_neither_minimal_nor_verbosity() {
+        let astra = seed_models("openai")
+            .into_iter()
+            .find(|m| m.id.0 == "gpt-6-astra")
+            .expect("Astra is seeded so it is visible before a key is present");
+
+        let ids: Vec<&str> =
+            astra.capabilities.option_descriptors.iter().map(|d| d.id()).collect();
+        assert_eq!(ids, vec!["effort"], "the only knob it advertises");
+
+        let ProviderOptionDescriptor::Select { options, .. } =
+            &astra.capabilities.option_descriptors[0]
+        else {
+            panic!("expected an effort select");
+        };
+        let levels: Vec<&str> = options.iter().map(|o| o.id.as_str()).collect();
+        assert_eq!(levels, vec!["low", "medium", "high", "xhigh", "max"]);
+        assert!(astra.capabilities.thinking, "an effort ladder is a model that reasons");
+
+        // The generation below it keeps both, so this is a difference and not a rewrite.
+        let sol = seed_models("openai")
+            .into_iter()
+            .find(|m| m.id.0 == "gpt-5.6-sol")
+            .expect("Sol is still current");
+        let sol_ids: Vec<&str> = sol.capabilities.option_descriptors.iter().map(|d| d.id()).collect();
+        assert_eq!(sol_ids, vec!["effort", "verbosity"]);
     }
 
     #[test]

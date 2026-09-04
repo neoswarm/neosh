@@ -12,4 +12,4 @@ permissions = ["vcs_write"]
 after = ["sidebar"]
 
 [provides]
-vars = ["git.branch.scratch"]
+vars = ["git.branch.scratch", "clone.locations"]

@@ -12,7 +12,7 @@ use std::sync::Arc;
 use std::collections::HashMap;
 use std::sync::{Arc as StdArc, Mutex};
 
-use neosh_agent::Agent;
+use neosh_agent::{Agent, PluginBridge};
 use neosh_proto::{ApiError, ApiOk, ApiResult, DiffTarget, InstanceId, ModelEntry, ModelSelection};
 use neosh_vcs::{Git, VcsError};
 use tokio_util::sync::CancellationToken;
@@ -43,6 +43,8 @@ pub struct Services {
     pub state_dir: Option<PathBuf>,
     /// The plugin boundary, so a permission question can reach whoever answers it.
     pub bridge: StdArc<crate::bridge::ScriptBridge>,
+    /// Scripts watching the event stream, so [`Services::emit`] reaches them too.
+    pub subscribers: Subscribers,
     /// Models discovered from each endpoint this session.
     ///
     /// Shared with the host so it survives across calls and is cleared on reload. Without it every
@@ -54,11 +56,48 @@ pub struct Services {
 /// Discovered models per instance, for the life of a session.
 pub type ModelCache = StdArc<Mutex<HashMap<InstanceId, Vec<neosh_proto::ModelInfo>>>>;
 
+/// Everyone attached to the control socket who asked for the event stream.
+///
+/// Shared with [`Services`] so a call running off the host loop can reach them: a slow call is
+/// spawned with its services and nothing else, and an event only the plugins receive is a bus that
+/// says different things depending on which surface you are watching from.
+pub type Subscribers =
+    StdArc<Mutex<Vec<tokio::sync::mpsc::UnboundedSender<neosh_proto::PluginEvent>>>>;
+
+/// What a clone says about itself while it runs.
+///
+/// A bus event rather than a `UiEvent`, because nothing about it is the host's to draw: a plugin
+/// asked for the clone and a plugin decides what watching one looks like. Named here so the
+/// emitter and the built-in reader cannot drift — a subscriber to a misspelled name is a panel
+/// that spins for ever with no error anywhere.
+pub const CLONE_EVENT: &str = "neosh.git.clone";
+
 impl Services {
     fn repo(&self) -> Result<&Git, ApiError> {
         self.git.as_ref().ok_or_else(|| ApiError::NotFound {
             what: format!("no git repository at {}", self.cwd.display()),
         })
+    }
+
+    /// Put an event on the bus from a call running off the host loop.
+    ///
+    /// `from: "neosh"` for the same reason the host stamps it on `EventEmit`: who said a thing is
+    /// one of the few facts in a plugin message that must not be forgeable, and this one was said
+    /// by the workspace itself.
+    ///
+    /// Both audiences, because they are one bus. A subscriber that has gone is dropped rather than
+    /// queued for — the send fails, it leaves the list, and a script walking away mid-clone cannot
+    /// cost this workspace memory.
+    fn emit(&self, name: &str, data: serde_json::Value) {
+        let event = neosh_proto::PluginEvent::Event {
+            name: name.to_string(),
+            data: Some(data),
+            from: "neosh".into(),
+        };
+        self.bridge.broadcast(event.clone());
+        if let Ok(mut subs) = self.subscribers.lock() {
+            subs.retain(|s| s.send(event.clone()).is_ok());
+        }
     }
 
     /// The repository at `cwd`, or this conversation's when nobody asked for one in particular.
@@ -213,6 +252,63 @@ impl Services {
         Ok(ApiOk::Worktrees { worktrees: repo.worktrees().await.map_err(vcs_err)? })
     }
 
+    /// Clone `url` into `path`, reporting progress on the bus as it goes.
+    ///
+    /// The one git call that takes no repository: there is not one yet, which is the point of it.
+    ///
+    /// **Progress is keyed by `path`, not by the plugin that asked.** A workspace can be cloning
+    /// two things at once and a progress row the two of them share is a row reporting neither —
+    /// the destination is the only thing about a clone that is certainly unique, since the same
+    /// repository may legitimately be cloned to two places.
+    ///
+    /// A `done` event is emitted on the way out either way, success or failure, because a panel
+    /// that draws itself from these has no other way to learn it may stop: an error goes back to
+    /// the caller as a `Refusal`, and a caller is not necessarily the thing drawing.
+    pub async fn git_clone(&self, url: String, path: String) -> ApiResult {
+        self.permit_write("clone")?;
+        let at = std::path::PathBuf::from(&path);
+        if !at.is_absolute() {
+            return Err(ApiError::InvalidArgument {
+                message: format!("git.clone needs an absolute path, got {path}"),
+            });
+        }
+        self.emit(
+            CLONE_EVENT,
+            serde_json::json!({ "path": path, "url": url, "phase": "Starting", "percent": null }),
+        );
+        let result = neosh_vcs::clone(&url, &at, |phase, percent| {
+            self.emit(
+                CLONE_EVENT,
+                serde_json::json!({
+                    "path": path, "url": url, "phase": phase, "percent": percent,
+                }),
+            );
+        })
+        .await;
+        match result {
+            Ok(()) => {
+                self.emit(
+                    CLONE_EVENT,
+                    serde_json::json!({
+                        "path": path, "url": url, "phase": "done", "percent": 100, "done": true,
+                    }),
+                );
+                Ok(ApiOk::Text { text: path })
+            }
+            Err(e) => {
+                let message = e.to_string();
+                self.emit(
+                    CLONE_EVENT,
+                    serde_json::json!({
+                        "path": path, "url": url, "phase": "failed", "done": true,
+                        "error": message,
+                    }),
+                );
+                Err(vcs_err(e))
+            }
+        }
+    }
+
     pub async fn git_log(&self, limit: u32) -> ApiResult {
         Ok(ApiOk::Commits { commits: self.repo()?.log(limit).await.map_err(vcs_err)? })
     }
@@ -291,10 +387,23 @@ impl Services {
         Ok(ApiOk::Unit)
     }
 
-    pub async fn git_pull(&self, cwd: Option<String>) -> ApiResult {
-        self.permit_write("pull")?;
+    /// Contact the remote and answer with where the tree now stands.
+    ///
+    /// Gated as a write, and the reason is not that anything in the working tree moves — nothing
+    /// does. It is that this leaves the machine: it opens a connection to whatever `origin` points
+    /// at, presents whatever credentials that host wants, and writes refs under `refs/remotes`. A
+    /// plugin that may not run `git pull` should not be able to have this workspace phone a remote
+    /// on its behalf either, and `vcs_write` is the word already in the manifests that says so.
+    pub async fn git_fetch(&self, cwd: Option<String>) -> ApiResult {
+        self.permit_write("fetch")?;
         let repo = self.repo_at(cwd).await?;
-        Ok(ApiOk::Text { text: repo.pull().await.map_err(vcs_err)? })
+        Ok(ApiOk::Status { status: repo.fetch().await.map_err(vcs_err)? })
+    }
+
+    pub async fn git_pull(&self, cwd: Option<String>, rebase: bool) -> ApiResult {
+        self.permit_write(if rebase { "pull --rebase" } else { "pull" })?;
+        let repo = self.repo_at(cwd).await?;
+        Ok(ApiOk::Text { text: repo.pull(rebase).await.map_err(vcs_err)? })
     }
 
     pub async fn git_remove_worktree(
@@ -306,6 +415,18 @@ impl Services {
         self.permit_write("worktree remove")?;
         let repo = self.repo_at(cwd).await?;
         repo.remove_worktree(&PathBuf::from(path), force).await.map_err(vcs_err)?;
+        Ok(ApiOk::Unit)
+    }
+
+    pub async fn git_move_worktree(
+        &self,
+        path: String,
+        dest: String,
+        cwd: Option<String>,
+    ) -> ApiResult {
+        self.permit_write("worktree move")?;
+        let repo = self.repo_at(cwd).await?;
+        repo.move_worktree(&PathBuf::from(path), &PathBuf::from(dest)).await.map_err(vcs_err)?;
         Ok(ApiOk::Unit)
     }
 
@@ -473,6 +594,7 @@ impl Services {
         prompt: String,
         system: Option<String>,
         json: bool,
+        field: Option<String>,
         selection: Option<ModelSelection>,
     ) -> ApiResult {
         // Precedence: what the caller asked for, then `gen.model`, then the session's own model.
@@ -491,9 +613,17 @@ impl Services {
         }
         match extract_json(&text) {
             Some(value) => Ok(ApiOk::Json { value }),
-            None => Err(ApiError::Internal {
-                message: format!("expected JSON, got: {}", truncate(&text, 200)),
-            }),
+            // The envelope is missing and the caller said what a bare answer would be. See
+            // [`ApiCall::GenComplete::field`]: the model answered the question and skipped the
+            // wrapper, which is a shape to accept rather than a failure to report.
+            None => match field.and_then(|key| bare_value(&text).map(|v| (key, v))) {
+                Some((key, value)) => {
+                    Ok(ApiOk::Json { value: serde_json::json!({ key: value }) })
+                }
+                None => Err(ApiError::Internal {
+                    message: format!("expected JSON, got: {}", truncate(&text, 200)),
+                }),
+            },
         }
     }
 }
@@ -587,6 +717,41 @@ pub fn extract_json(text: &str) -> Option<serde_json::Value> {
     None
 }
 
+/// The answer itself, when the model gave the value and left the envelope off.
+///
+/// Only ever consulted after [`extract_json`] has failed, and only when the caller named the key a
+/// bare answer belongs under. What it accepts is deliberately narrow: **the whole reply, trimmed,
+/// is one short line.** `fix/tab-strip-missing-in-worktree` is that; a paragraph explaining why the
+/// model would rather not is not, and neither is an answer with a preamble above it — which stays a
+/// failure exactly as it was, because "the last line of some prose" is a guess and this is not.
+///
+/// A fence and the quotes some models wrap a lone string in come off first: ```` ```fix/thing``` ````
+/// and `"fix/thing"` are the same answer written three ways.
+///
+/// This is a check on the *shape* of a reply, not on the truth of it — which is what decides who
+/// may ask for it. A branch name is checkable by the caller and a wrong one is one `git branch -m`
+/// away; a *title* is any short line, and so is `(mock provider has no script)`, so the envelope is
+/// the only evidence a title was answered rather than commented on. The rule that falls out:
+/// `field` is for a value you would recognise as wrong on sight.
+fn bare_value(text: &str) -> Option<String> {
+    let mut body = text.trim();
+    // ```lang\n…\n``` — and ```…``` on one line, which is what a fenced single value looks like.
+    if let Some(rest) = body.strip_prefix("```")
+        && let Some(rest) = rest.strip_suffix("```")
+    {
+        body = match rest.split_once('\n') {
+            Some((first, tail)) if !first.contains(char::is_whitespace) => tail,
+            _ => rest,
+        }
+        .trim();
+    }
+    let body = body.trim_matches(['"', '\'', '`', ' ']).trim();
+    let one_line = !body.is_empty() && !body.contains('\n');
+    // Room for any name a prompt would ask for, and far short of anything with a second sentence
+    // in it.
+    (one_line && body.chars().count() <= 200).then(|| body.to_string())
+}
+
 fn truncate(s: &str, n: usize) -> String {
     // Byte slicing a model's output would panic on a multi-byte boundary, which is a spectacular
     // way to crash while reporting a different error.
@@ -651,6 +816,40 @@ mod tests {
     fn prose_with_no_json_is_none() {
         assert!(extract_json("I'm sorry, I can't do that.").is_none());
         assert!(extract_json("").is_none());
+    }
+
+    /// The whole reason [`bare_value`] exists, taken from two real answers.
+    ///
+    /// Asked for `{"branch": …}`, `claude` returned `feature/project-picker-locations` — the name
+    /// it had been asked for, without the envelope. Read as JSON that is a failed request, and the
+    /// worktree kept the name nobody chose for good.
+    #[test]
+    fn an_answer_without_its_envelope_is_still_the_answer() {
+        assert_eq!(bare_value("feature/project-picker-locations").as_deref(), Some("feature/project-picker-locations"));
+        assert_eq!(bare_value("\n  fix/tab-strip-missing-in-worktree \n").as_deref(), Some("fix/tab-strip-missing-in-worktree"));
+        // The wrappings a lone string arrives in.
+        assert_eq!(bare_value("\"fix/login\"").as_deref(), Some("fix/login"));
+        assert_eq!(bare_value("`fix/login`").as_deref(), Some("fix/login"));
+        assert_eq!(bare_value("```\nfix/login\n```").as_deref(), Some("fix/login"));
+        assert_eq!(bare_value("```text\nfix/login\n```").as_deref(), Some("fix/login"));
+        // A title is a value too, and it has spaces in it.
+        assert_eq!(
+            bare_value("Make popups scrollable with keys").as_deref(),
+            Some("Make popups scrollable with keys")
+        );
+    }
+
+    /// What it will not guess at.
+    ///
+    /// A reply with more than one line in it may be an answer with a preamble above it or a
+    /// refusal with a reason under it, and nothing here can tell which — so it stays the failure
+    /// it already was rather than becoming a branch named after the first sentence of an apology.
+    #[test]
+    fn bare_prose_is_not_a_value() {
+        assert!(bare_value("Here you go:\nfix/login").is_none());
+        assert!(bare_value("").is_none());
+        assert!(bare_value("   \n  ").is_none());
+        assert!(bare_value(&"x".repeat(201)).is_none());
     }
 
     #[test]

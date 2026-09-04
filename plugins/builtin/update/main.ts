@@ -173,9 +173,9 @@ export async function activate({ neosh, subscriptions }: PluginContext) {
   // `↵`, and one row that means the one thing there is to do — update, or restart once it is
   // downloaded — is better than two keys for two states that never coexist.
   //
-  // It also sidesteps something worth fixing properly one day: `on: "custom"` matches *any*
-  // contributed row rather than the contributor's own, so a key added here is advertised on the
-  // plan strip too, and the strip's own `<Tab>` hint gets pushed off the end of the row.
+  // If it ever wants one, the spelling is `on: "custom:update"`. Bare `custom` is every contributed
+  // row in the column, which is how a key added here used to be advertised on the plan strip and
+  // push that strip's own `<Tab>` hint off the end of the row.
 
   await refresh();
   const timer = await neosh.timer.every(EVERY_MS, () => void refresh(true));

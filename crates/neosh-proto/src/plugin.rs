@@ -283,6 +283,22 @@ pub enum PluginEvent {
         #[ts(type = "unknown")]
         value: Option<serde_json::Value>,
     },
+    /// A project's directory is now somewhere else — a worktree that was moved.
+    ///
+    /// Said rather than derived, because a directory is an *identity* here and not a coordinate:
+    /// project vars are keyed by it, a panel's list is a list of them, and a plugin that had to
+    /// work out "the thing at `/a` is the thing now at `/b`" from a conversation whose `cwd`
+    /// changed would be guessing at exactly the moment it must not. The host has already moved
+    /// everything it owns — the conversations, the project vars, the facts every list draws — so
+    /// what this is for is the lists somebody else keeps.
+    ///
+    /// A re-key and not a remove-and-add, which is why one event carries both ends: told
+    /// separately, a panel would drop the row and put a stranger back, losing its place in an
+    /// order you arranged by hand.
+    ProjectMoved {
+        from: String,
+        to: String,
+    },
     /// Highlight groups were defined, reset, or replaced by a theme switch.
     ///
     /// Broadcast, because the plugin that cached a colour — a panel that computed a blend, a

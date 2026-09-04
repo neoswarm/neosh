@@ -334,14 +334,24 @@ git through a registered tool, gated like every tool.
 ## Generation
 
 ```ts
-const { branch } = await neosh.gen.json<{ branch: string }>(
+const branch = await neosh.gen.field(
   'Return JSON with one key: branch.\n\nUser message:\n' + text,
+  'branch',
 );
 ```
 
 Nothing here enters session history, so asking for a commit message does not change what the agent
 believes it was asked to do. `gen.json` tolerates what models actually return — code fences, a
 "Sure!" preamble.
+
+`gen.field` is that plus the one thing `gen.json` cannot do: when the answer is a single value, a
+model asked for `{"branch": …}` sometimes replies `fix/composer-paste` and nothing else. It did the
+work and left the envelope off, and `gen.json` rejects it. Name the key and both are the same
+answer. For one value only — a commit message is a subject *and* a body, and there is no telling
+which half a lone paragraph is — and only for a value you would know was wrong on sight. A branch
+name is that. A thread title is any short line, and so is a refusal or a driver's own error
+message; where nothing tells an answer from a remark, the envelope is the evidence and `gen.json`
+is the call.
 
 Make your prompts options rather than constants, in two layers: `<thing>.instructions` appended to
 your default, `<thing>.prompt` replacing it. That is what the bundled `git` plugin does, and it is

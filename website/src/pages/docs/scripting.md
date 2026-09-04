@@ -84,8 +84,14 @@ Check whether `active_turn` is set. Set, with nothing arriving on `watch`, usual
 ```bash
 neosh agent commands                                              # every command, plugins included
 neosh agent run git.pull                                          # run one
+neosh agent run git.clone https://github.com/owner/repo ~/src/repo   # say where: see below
 neosh agent call '{"call":"session_list","include_archived":true}'
 ```
+
+A verb that would otherwise open a picker takes the answer as an argument, because a picker is a
+thing only a person at a terminal can answer and a call that opens one with no screen behind it
+never returns. `git.clone <url>` asks where the repository goes; `git.clone <url> <destination>`
+writes it there and answers with the path.
 
 `call` takes a JSON-encoded `ApiCall` — the variants are the ones in `@neosh/api` — and prints the `ApiOk` it got back. `-` reads it from stdin. This is the whole plugin API with no verb in front of it.
 

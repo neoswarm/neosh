@@ -85,11 +85,20 @@ The last two are the window prefix and how long you have to hold it before it li
 | `sidebar.hints` | `true` | The contextual key strip at the foot of the panel |
 | `sidebar.refresh_ms` | `4000` | A workspace re-read per tick |
 
+## The repository block
+
+| Option | Default | Effect |
+| --- | --- | --- |
+| `git.sidebar` | `true` | The branch, what has drifted from the remote, and the one key that does something about it, at the top of the sidebar |
+| `git.sidebar.style` | `"one"` | `one` is the branch and one verb; `full` adds the upstream it tracks and the working tree. `⇥` on a git row steps between them |
+| `git.fetch.interval` | `180` | Seconds between asking the remote what is new, so `↓3` means three waiting for you rather than three as of whenever this checkout last spoke to a server. `0` never asks on its own, and the block then says how old its numbers are. Only the repository of the conversation you are in, and only when its branch tracks one |
+
 ## Worktrees
 
 | Option | Default | Effect |
 | --- | --- | --- |
 | `worktree.root` | `"~/.nsh"` | Where new worktrees go, as `<root>/<repo>/<branch>`. A relative value keeps them inside the repository as `<repo>/<value>/<branch>`, with the `.gitignore` entry written for you. `""` restores the sibling layout |
+| `clone.root` | `"~/.nsh/repos"` | Where `^O` clones a repository, as `<root>/<owner>/<repo>`. The first destination offered; folders you clone into through `Somewhere else…` are remembered and offered beside it. Separate from `worktree.root`, which spends `<root>/<repo>/` on one repository's branches |
 
 ## Git prompts
 

@@ -37,8 +37,10 @@
  */
 
 import { byteLength, projectScope } from "@neosh/api";
+import { CLONE_EVENT } from "@neosh/api";
 import type {
   AgentSummary,
+  CloneProgress,
   Contribution,
   Disposable,
   DrawnRow,
@@ -71,6 +73,7 @@ import {
   type ListRow,
   type Match,
   mergeDecorations,
+  meter,
   placeSections,
   type SectionItem,
   sectionRows as contributedRows,
@@ -92,8 +95,13 @@ type Target =
   /** The row that opens another directory. A row rather than only a key, because a verb nobody
    * can see is a verb nobody uses. */
   | { kind: "add" }
-  /** A row somebody else contributed. `command` runs on `↵`, with `args` as given. */
-  | { kind: "custom"; command?: string; args?: string[] }
+  /**
+   * A row somebody else contributed. `command` runs on `↵`, with `args` as given.
+   *
+   * `section` is which contribution it came from, and it is what lets a verb belong to *one*
+   * plugin's block rather than to every contributed row in the column — see {@link applies}.
+   */
+  | { kind: "custom"; command?: string; args?: string[]; section?: string }
   /** A conversation on another computer. Addressed as `(node, session)`; the session id alone is
    * unique only on its own machine. */
   | { kind: "remote"; node: string; session: string; cwd: string; host: string };
@@ -157,8 +165,14 @@ interface ActionItem {
    * own. Without it a plugin can put rows in this column and then has nowhere to put a key that
    * belongs to them: `any` binds the key on every row in the panel and advertises it on all of
    * them, which is a verb about the plan gauge appearing while the cursor is on a conversation.
+   *
+   * `custom:<section id>` goes one step narrower and names *which* contributed block — `custom:git`
+   * is a verb about the git rows and nowhere else. Bare `custom` is every contributed row in the
+   * column, which stops being what anybody means the moment there are two blocks in it: the plan
+   * and git both wanting `<Tab>` on their own rows is two correct requests and one key, and the
+   * panel is what resolves it — see {@link applies}.
    */
-  on?: "project" | "session" | "custom" | "any";
+  on?: string;
 }
 
 /** A project as the panel thinks of it: a directory, and what is going on in it. */
@@ -575,6 +589,17 @@ export async function activate({ neosh, subscriptions }: PluginContext) {
       }
     }),
   );
+  // A worktree moved. The conversations in it have already followed — the host re-points them —
+  // but this list is a list of *directories*, and nothing about a conversation's `cwd` changing
+  // says whether one project moved or one went and another arrived. Which is the whole difference:
+  // the second reading loses the place you put the row in.
+  subscriptions.push(
+    neosh.project.onMove((e) => {
+      void arrangement.relocate(e.from, e.to).then((moved) => {
+        if (moved) drawAll();
+      });
+    }),
+  );
   // Rows somebody contributed came or went. Redrawing on this is what stops a plugin that loads
   // after us contributing rows nobody sees until the next unrelated refresh.
   subscriptions.push(
@@ -676,12 +701,34 @@ export async function activate({ neosh, subscriptions }: PluginContext) {
   });
 }
 
+/**
+ * Whether two rows are the *same row*, so the cursor survives the list being rebuilt under it.
+ *
+ * The panel redraws on a tick and re-contributed sections replace themselves wholesale, so this is
+ * what stands between "the row I was on moved" and "I am somewhere else now". Every kind is
+ * compared by what identifies it rather than by what it says: a conversation by its id, a project
+ * by its directory, a remote by the pair that is unique across machines.
+ *
+ * **A contributed row is identified by its section and its verb.** It used to fall through to
+ * `a.kind === b.kind`, which made every custom row in the column identical to every other — so on
+ * the next redraw the cursor snapped to the *first* one, wherever it had been. Two rows of the plan
+ * strip were enough to see it; a block whose second row is the button and whose first row is a
+ * label made it a button you could not reach, because the cursor was back on the label before you
+ * pressed the key.
+ */
 function same(a: Target, b: Target): boolean {
   if (a.kind === "remote") {
     return b.kind === "remote" && a.node === b.node && a.session === b.session;
   }
   if (a.kind === "session") return b.kind === "session" && a.id === b.id;
   if (a.kind === "project") return b.kind === "project" && a.cwd === b.cwd;
+  if (a.kind === "custom") {
+    // The args too: a section whose rows all run one command with a different argument each — a
+    // list of branches, a list of pull requests — is exactly the case the command alone cannot tell
+    // apart, and it is a common enough shape to be worth the join.
+    return b.kind === "custom" && a.section === b.section && a.command === b.command &&
+      (a.args ?? []).join(" ") === (b.args ?? []).join(" ");
+  }
   return a.kind === b.kind;
 }
 
@@ -862,6 +909,37 @@ class Arrangement {
         void this.set(cwd, VAR_ROOT, root);
       }
     }
+  }
+
+  /**
+   * A project's directory moved — a worktree that was relocated.
+   *
+   * **In place, keeping its position.** This is not `forget` plus `note`: the list is an order
+   * somebody arranged by hand, and a project that left the bottom and came back at the top is a
+   * reorder nobody asked for. The vars themselves have already travelled — the host moves the
+   * project scope, which is where the pin and the fold live — so what is left is this list and the
+   * cache in front of it.
+   *
+   * Written back only when something actually changed, because this runs on an event anybody may
+   * raise and a `vars.set` per no-op is a disk write per no-op.
+   *
+   * A destination that is somehow already on the list collapses onto it rather than appearing
+   * twice, and takes the earlier of the two positions: two rows for one directory is a panel where
+   * the cursor lands on a project that is not the one it is pointing at.
+   */
+  async relocate(from: string, to: string): Promise<boolean> {
+    if (from === to) return false;
+    const at = this.known.indexOf(from);
+    if (at < 0) return false;
+    const already = this.known.indexOf(to);
+    this.known[at] = to;
+    // Both indices now name the destination. The later one goes, so the row keeps the earlier of
+    // the two places in the order rather than jumping to wherever the arriving tree happened to be.
+    if (already >= 0 && already !== at) this.known.splice(Math.max(at, already), 1);
+    this.cache.set(to, await this.neosh.vars.all(projectScope(to)).catch(() => ({})));
+    this.cache.delete(from);
+    await this.neosh.vars.set({ scope: "global" }, VAR_KNOWN, this.known);
+    return true;
   }
 
   /**
@@ -1497,6 +1575,13 @@ function installActions(
     registered = [];
     const reserved = await reservedKeys(neosh);
 
+    // Every action still gets a command of its own — `^K` runs it by name whether or not it won a
+    // key — but the *binding* is per key, not per action. Two plugins may each want `<Tab>` on
+    // their own rows and both are right; one `keymap.set` per action made that the second one
+    // overwriting the first, so whichever loaded last owned the key everywhere and the other
+    // plugin's rows had a key that did nothing. One binding, and the row under the cursor decides
+    // which of them it means.
+    const sharing = new Map<string, Array<Contribution & { item: ActionItem }>>();
     for (const c of valid) {
       const name = `${NS}.action.${c.plugin}.${c.id}`;
       const command = await neosh.cmd.register(name, async (_args, key) => {
@@ -1521,9 +1606,38 @@ function installActions(
         );
         continue;
       }
-      await neosh.keymap.set("chat", c.item.key, name, { scope, desc: c.item.label })
-        .catch(() => {});
-      bound.push({ key: c.item.key, command: name });
+      const share = sharing.get(c.item.key);
+      if (share) share.push(c);
+      else sharing.set(c.item.key, [c]);
+    }
+
+    for (const [key, claimants] of sharing) {
+      // The narrow verbs first: a verb about the row you are standing on beats one about every row,
+      // which is the same ranking the hint strip prints them in and for the same reason. A key that
+      // meant "cycle the plan detail" wherever the cursor was would be a key that did the wrong
+      // thing on somebody else's block.
+      const ranked = [
+        ...claimants.filter((c) => (c.item.on ?? "any") !== "any"),
+        ...claimants.filter((c) => (c.item.on ?? "any") === "any"),
+      ];
+      const name = ranked.length === 1 && ranked[0]
+        ? `${NS}.action.${ranked[0].plugin}.${ranked[0].id}`
+        : `${NS}.action.key.${key}`;
+      if (ranked.length > 1) {
+        const command = await neosh.cmd.register(name, async (_args, k) => {
+          const target = panel(k?.view)?.list.value;
+          const hit = ranked.find((c) => applies(c.item.on ?? "any", target));
+          if (!hit) return;
+          await neosh.cmd.exec(hit.item.command, argsFor(target)).catch((e: unknown) => {
+            neosh.notify(String(e), "warn");
+          });
+          onChange();
+        }, { desc: ranked.map((c) => c.item.label).join(" / ") }).catch(() => null);
+        if (command) registered.push(command);
+      }
+      const label = ranked[0]?.item.label ?? key;
+      await neosh.keymap.set("chat", key, name, { scope, desc: label }).catch(() => {});
+      bound.push({ key, command: name });
     }
     current = valid;
     onChange();
@@ -1566,11 +1680,21 @@ async function reservedKeys(neosh: Neosh): Promise<Set<string>> {
   );
 }
 
-function applies(
-  on: "project" | "session" | "custom" | "any",
-  target: Target | undefined,
-): boolean {
+/**
+ * Whether a contributed verb is about the row under the cursor.
+ *
+ * `custom:<section id>` is the narrow form and the one most contributors want: a verb about *my*
+ * block rather than about every block anybody has put in this column. Bare `custom` is still every
+ * contributed row, because a verb about contributions in general is a real thing to want — but it
+ * is not what "a key on my rows" means, and until this existed it was the only spelling available.
+ * Two plugins each asking for `<Tab>` on their own rows were one binding, one winner and one plugin
+ * whose key quietly did nothing.
+ */
+function applies(on: string, target: Target | undefined): boolean {
   if (on === "any") return target !== undefined;
+  if (on.startsWith("custom:")) {
+    return target?.kind === "custom" && target.section === on.slice("custom:".length);
+  }
   return target?.kind === on;
 }
 
@@ -1579,6 +1703,9 @@ function argsFor(target: Target | undefined): string[] {
   if (!target) return [];
   if (target.kind === "session") return ["session", target.cwd, target.id];
   if (target.kind === "project") return ["project", target.cwd];
+  // Which block it came from, so a verb bound across several sections can tell them apart without
+  // the panel having to hand over the row's own command as well.
+  if (target.kind === "custom") return ["custom", target.section ?? ""];
   return [target.kind];
 }
 
@@ -1768,6 +1895,8 @@ type Where =
   | { kind: "new" }
   | { kind: "elsewhere"; path?: string }
   | { kind: "tree"; path: string; label: string }
+  /** A repository to fetch first and open second. */
+  | { kind: "clone"; url: GitUrl }
   /** On another computer, in one of its directories. */
   | { kind: "host"; node: string; cwd: string; label: string }
   /** Look at one machine's directories rather than every machine's projects. */
@@ -1800,11 +1929,92 @@ function elsewhereRow(label: string): PickerItem<Where> {
 type Field =
   | { kind: "rows" }
   | { kind: "local"; path: string }
-  | { kind: "remote"; node: SwarmNode; path: string };
+  | { kind: "remote"; node: SwarmNode; path: string }
+  | { kind: "clone"; url: GitUrl };
 
 /** Whether a query has started to look like a path rather than a search. */
 function looksLikePath(q: string): boolean {
   return q.startsWith("/") || q.startsWith("~") || q.startsWith("./") || q.startsWith("../");
+}
+
+/** A repository to clone, and the two names its destination is built from. */
+type GitUrl = { url: string; owner: string; repo: string; host: string };
+
+/**
+ * The git plugin's verb for fetching one.
+ *
+ * Called by name rather than imported, which is what keeps this panel free of a hard dependency on
+ * git: `requires` would order the two plugins and make one unloadable without the other, and the
+ * sidebar has to work in a workspace where git is disabled. Absent, the address row is not offered
+ * at all.
+ */
+const CLONE_COMMAND = "git.clone";
+
+/** The characters GitHub, GitLab and the rest allow in an account or repository name. */
+const NAME = /^[A-Za-z0-9._-]+$/;
+
+/**
+ * A repository address, or `null` for anything that is not one.
+ *
+ * Four spellings, because all four are things people have in the clipboard: the `https://` URL a
+ * browser's address bar holds, the `git@host:owner/repo` one the *Clone* button offers, `ssh://`
+ * for the same thing written in full, and bare `owner/repo`.
+ *
+ * **The shorthand is only safe because this field has no menu behind it.** `^O` used to rank rows
+ * against what you typed, so `docs/api` was a filter; with the worktree list gone it matches
+ * nothing, and a two-segment name is far likelier to be a repository than a relative directory
+ * nobody said what it was relative to. `Type a path…` stays on screen either way, so the other
+ * reading is still one keystroke away — and the row names the full URL it resolved to rather than
+ * echoing the shorthand, so what is about to be fetched is never a guess the reader has to make.
+ */
+function readGitUrl(q: string): GitUrl | null {
+  const text = q.trim().replace(/\/+$/, "");
+  if (text === "" || looksLikePath(text)) return null;
+  const strip = (s: string) => s.replace(/\.git$/, "");
+
+  // `git@github.com:owner/repo.git`, and the `ssh://git@host/owner/repo` spelling of the same.
+  const scp = /^(?:ssh:\/\/)?([A-Za-z0-9._-]+@)([A-Za-z0-9.-]+)[:/]+(.+)$/.exec(text);
+  if (scp) {
+    const parts = strip(scp[3]!).split("/").filter(Boolean);
+    const repo = parts.pop();
+    const owner = parts.pop();
+    if (!repo || !owner || !NAME.test(repo) || !NAME.test(owner)) return null;
+    return { url: text, owner, repo, host: scp[2]! };
+  }
+
+  // `file:///srv/mirrors/thing` — a local mirror or a bare repository on a mounted volume. The
+  // host is empty by construction, which is why it cannot go through the branch below: `[^/]+`
+  // needs a character and `file://` is followed straight by the path's leading slash.
+  const file = /^file:\/\/(\/.+)$/.exec(text);
+  if (file) {
+    const parts = strip(file[1]!).split("/").filter(Boolean);
+    const repo = parts.pop();
+    if (!repo || !NAME.test(repo)) return null;
+    const owner = parts.pop() ?? "";
+    return { url: text, owner: NAME.test(owner) ? owner : "", repo, host: "" };
+  }
+
+  const web = /^(https?|ssh|git):\/\/([^/]+)\/(.+)$/.exec(text);
+  if (web) {
+    const parts = strip(web[3]!).split("/").filter(Boolean);
+    const repo = parts.pop();
+    const owner = parts.pop();
+    if (!repo || !owner || !NAME.test(repo) || !NAME.test(owner)) return null;
+    // The host with any `user@` in front of it dropped: it belongs to the URL, which is kept
+    // whole, and not to the sentence naming where this is coming from.
+    return { url: text, owner, repo, host: web[2]!.replace(/^.*@/, "") };
+  }
+
+  // `owner/repo`. Exactly two segments — `a/b/c` is a path far more often than it is anything
+  // else, and guessing which two of the three were meant is a guess nobody asked for.
+  const parts = text.split("/");
+  if (parts.length === 2 && parts.every((p) => NAME.test(p)) && !text.includes("@")) {
+    const [owner, repo] = parts as [string, string];
+    const bare = strip(repo);
+    if (!NAME.test(bare)) return null;
+    return { url: `https://github.com/${owner}/${bare}`, owner, repo: bare, host: "github.com" };
+  }
+  return null;
 }
 
 /**
@@ -1816,7 +2026,7 @@ function looksLikePath(q: string): boolean {
  * names no machine is not a host prefix: it is a directory with a colon in it, which is legal on
  * every filesystem this runs on.
  */
-function readField(query: string, nodes: SwarmNode[]): Field {
+function readField(query: string, nodes: SwarmNode[], clone: boolean): Field {
   const at = query.indexOf(":");
   if (at > 0) {
     const who = query.slice(0, at).toLowerCase();
@@ -1825,6 +2035,14 @@ function readField(query: string, nodes: SwarmNode[]): Field {
     );
     if (node) return { kind: "remote", node, path: query.slice(at + 1) };
   }
+  // After the machines and before the paths. After, because a machine you have named `git` is
+  // still yours and `git:` should reach it — the check above is an exact match on a name you
+  // chose, so it cannot be shadowed by a spelling nobody registered. Before the paths, because a
+  // URL is not one and `looksLikePath` would not have claimed it anyway; the order that matters
+  // is that `~/repos/thing` never reaches the shorthand branch, which is why that test is inside
+  // `readGitUrl` rather than out here.
+  const url = clone ? readGitUrl(query) : null;
+  if (url) return { kind: "clone", url };
   return looksLikePath(query) ? { kind: "local", path: query } : { kind: "rows" };
 }
 
@@ -1934,7 +2152,7 @@ function projectRows(node: SwarmNode, ascii: boolean): PickerItem<Where>[] {
 async function whereTo(
   neosh: Neosh,
   base: PickerItem<Where>[],
-  opts: { title: string; seed?: string },
+  opts: { title: string; seed?: string; clone?: boolean },
 ): Promise<Where | null> {
   const ascii = (await neosh.opt.get<boolean>("ui.ascii_only").catch(() => false)) ?? false;
   let seed = opts.seed ?? "";
@@ -1983,7 +2201,27 @@ async function whereTo(
         ? "↵ choose   ⇥ into a directory   / a path   name: another computer"
         : "↵ choose   ⇥ into a directory   / or ~ for a path",
       source: async (query) => {
-        const field = readField(query, nodes);
+        const field = readField(query, nodes, opts.clone ?? false);
+        if (field.kind === "clone") {
+          // One row, and no directory completions under it: what has been typed is an address, so
+          // there is nothing on this disk it could be completing towards. The label is the *full*
+          // URL rather than what was typed — `owner/repo` is a shorthand this expanded, and the
+          // one moment to say what it expanded to is before anything is fetched.
+          const { url } = field;
+          // The detail is the URL and nothing else. It wrapped onto a second line with a sentence
+          // about what `↵` does on the end of it — which the hint strip two rows below already
+          // says, on every row, for free. What only this row can tell you is what the shorthand
+          // turned into.
+          return [{
+            // `owner` is empty for a `file://` mirror that is not two levels deep, and
+            // `Clone /thing` reads as a path rather than as a repository.
+            label: `Clone ${url.owner ? `${url.owner}/` : ""}${url.repo}`,
+            detail: url.url,
+            icon: ascii ? "v" : "⤓",
+            hl: "Diagnostic.Ok",
+            value: { kind: "clone" as const, url },
+          }];
+        }
         if (field.kind === "rows") {
           // Our own ranking, because a `source` replaces the picker's filtering wholesale. Same
           // fuzzy scorer the picker uses, over the same label-and-keywords, so a query that is not
@@ -2048,7 +2286,11 @@ async function whereTo(
       // What `↵` means when the field holds something no row offered — which for a directory you
       // know the name of is the ordinary case, not the exception.
       freeform: (query) => {
-        const field = readField(query, nodes);
+        const field = readField(query, nodes, opts.clone ?? false);
+        // A URL is deliberately not freeform-able. `↵` on the address row is what clones, and this
+        // is the path that runs when *no* row matched — so answering here would mean a clone
+        // starting from a keystroke aimed at a row the reader could not see.
+        if (field.kind === "clone") return null;
         if (field.kind === "local") return { kind: "elsewhere", path: query.trim() };
         if (field.kind === "remote" && field.path.trim() !== "") {
           return {
@@ -2170,46 +2412,67 @@ function owningProject(target: Target | undefined): string | null {
 /**
  * Which directory to add — here, or on another computer.
  *
- * **The path is the first thing now, not the last.** This was a list of the current repository's
- * worktrees with `Type a path…` under it, and a path is what somebody pressing this key almost
- * always has: the row they wanted sat at the bottom of a list they had to read to the end of every
- * time, and the list was of the one place they were already in. So the filter line *is* the path
- * field from the first keystroke — `/`, `~` and `./` complete directories as you go — and the
- * worktrees are suggestions under it rather than a menu in front of it.
+ * **This is the path field, and nothing else.** It used to open onto every checkout `git worktree
+ * list` could see, and every one of those rows was wrong in one of two ways. The trees already on
+ * the panel were an offer to add what was added — the repository you are standing in was the
+ * second row — and the trees that were *not* on it were the scratch branches you finished with in
+ * March and took off the list with `X`, handed straight back. Its one filter was a live
+ * conversation's `cwd`, which is neither of those things, so what survived it was exactly the set
+ * nobody wanted: twenty paths of finished work, each one drawn as its own full path with its
+ * basename and branch repeated after it, in a float too narrow for either, so the rows truncated
+ * mid-branch and read as noise. That was the same twenty rows
+ * {@link newConversation} had already stopped offering, still here under the other key.
  *
- * And the machines are on it, because "add a project" never had a reason to mean "on this
- * computer". `linux-box:` completes over there and `↵` starts the conversation there; the row for
- * it arrives in the panel the way every other remote conversation's does.
+ * And there is no filter that fixes it, which is the point: `^O` means *somewhere I do not work
+ * yet*, and the one list that cannot answer that is a list of the repository you are already in.
+ * So the filter line **is** the path field from the first keystroke — `/`, `~` and `./` complete
+ * directories as you go — and `Type a path…` stays as the row that says so, because a field whose
+ * behaviour is only in the hint strip is a field you have to be told about twice.
+ *
+ * The machines stay, because "add a project" never had a reason to mean "on this computer".
+ * `linux-box:` completes over there and `↵` starts the conversation there; the row for it arrives
+ * in the panel the way every other remote conversation's does.
+ *
+ * And an address is the third thing this field takes. Paste `https://github.com/owner/repo`, the
+ * `git@` spelling, or just `owner/repo`, and the row becomes *clone it* — because "add a project"
+ * is as often about a repository you do not have yet as about a directory you do, and the
+ * alternative was leaving neosh, cloning in a shell, and coming back to type the path.
  *
  * Answers `null` for anything that was not a local directory — including a remote one, which has
  * been acted on by then. The caller's job is to open a path here, and a path on somebody else's
- * disk is not one.
+ * disk is not one. A clone answers with where it landed, which *is* a local directory, so the
+ * project opens exactly as a typed one does.
  */
 async function chooseDirectory(neosh: Neosh): Promise<string | null> {
-  const [worktrees, sessions] = await Promise.all([
-    neosh.git.worktrees().catch(() => []),
-    neosh.session.list().catch(() => [] as SessionInfo[]),
-  ]);
-  const open = new Set(sessions.map((s) => s.cwd));
-
   const rows: PickerItem<Where>[] = [elsewhereRow("Type a path…")];
-  for (const t of worktrees.filter((w) => !open.has(w.path))) {
-    rows.push({
-      // The path, not the basename: `<Tab>` puts a row's label back in the field, and a bare
-      // directory name there is a path relative to somewhere nobody chose.
-      label: t.path,
-      detail: [basename(t.path), t.branch ?? ""].filter(Boolean).join("  ·  "),
-      keywords: `${basename(t.path)} worktree`,
-      icon: "⎇",
-      hl: "Git.Branch",
-      value: { kind: "elsewhere", path: t.path },
-    });
-  }
+  // Whether an address is worth recognising at all. The git plugin is what clones — and it can be
+  // switched off — so without it a pasted URL is not a row this could act on. Offering a verb that
+  // cannot happen is worse than not offering it, which is the rule `^N`'s worktree rows follow one
+  // function up.
+  const clone = (await neosh.cmd.list().catch(() => [])).some((c) => c.name === CLONE_COMMAND);
 
-  const chosen = await whereTo(neosh, rows, { title: "Add project" });
+  const chosen = await whereTo(neosh, rows, { title: "Add project", clone });
   if (chosen === null) return null;
   if (chosen.kind === "host") {
     await startThere(neosh, chosen);
+    return null;
+  }
+  if (chosen.kind === "clone") {
+    // The git plugin owns the asking and the fetching, exactly as it owns making a worktree: this
+    // panel decides that what you typed is an address, and nothing more.
+    //
+    // `null` on the way out even when it worked, because a successful clone has *already* opened
+    // the conversation — it does that so `^K git.clone` lands you in the repository too, rather
+    // than fetching one and leaving you where you were. Returning the path here would be a second
+    // `session.create` on the same directory, which is two conversations for one keypress.
+    // Only the URL. The shorthand has already been expanded into one, which is what this panel's
+    // parse is *for* — the row had to name what it resolved to before anything was fetched. Git
+    // reads the owner and repository back off it rather than being handed them, so `git.clone
+    // <url>` is a complete call from a key, the palette or a script, and there are not two parses
+    // to keep in step.
+    await neosh.cmd
+      .call(CLONE_COMMAND, [chosen.url.url])
+      .catch((e: unknown) => neosh.notify(String(e), "warn"));
     return null;
   }
   if (chosen.kind !== "elsewhere") return null;
@@ -2710,7 +2973,12 @@ async function openRemote(
     height: { kind: "max", n: 28 },
     border: "rounded",
     title: ` ${name} `,
+    footer: " j k move   ^D ^U half   gg G ends   esc close ",
     focusable: true,
+    // Somebody else's conversation, which is as long as it is. Twenty-eight rows was the most this
+    // panel would ever draw and everything above them was unreachable — on a short terminal, most
+    // of it. `G` puts you back on the end when you have finished reading up.
+    scroll: true,
   });
   await neosh.focus.push(win);
 
@@ -2721,6 +2989,14 @@ async function openRemote(
 
   const redraw = async () => {
     const all = [...header, ...body];
+    // Whether you are reading the end of it. Asked *before* the rows change, because afterwards
+    // "the end" is a different row and every panel is behind it. Parked on the last screenful you
+    // are carried along with what arrives; anywhere else you stay exactly where you are — the rule
+    // the transcript already follows, and the one thing that makes a live panel readable now that
+    // it can be scrolled at all.
+    const before = await neosh.win.viewport(win).catch(() => null);
+    const following = before === null ||
+      before.top_line + before.rows >= before.line_count;
     // One call. This redraws per token, so a repaint the frontend could draw halfway through — text
     // written, marks not yet — would be a transcript strobing white for the whole of an answer.
     const drawn: DrawnRow[] = all.map((text) => ({ text, marks: [] }));
@@ -2740,8 +3016,10 @@ async function openRemote(
     }
     await neosh.buf.render(buf, ns, 0, -1, drawn);
     // The newest line, not the oldest: a transcript you have just opened should be showing the end
-    // of the conversation, which is the part that is still happening.
-    await neosh.win.scrollTo(win, Math.max(0, all.length - 24));
+    // of the conversation, which is the part that is still happening. Measured rather than the flat
+    // 24 this used to subtract — that number was the height the panel *asked* for, so on any screen
+    // shorter than it the tail was scrolled past and the panel sat on rows nobody had written yet.
+    if (following) await neosh.win.scroll(win, { kind: "bottom" });
   };
 
   const sub = neosh.swarm.onStream(async (e) => {
@@ -3168,7 +3446,7 @@ async function collect(
   const section = (c: Contribution & { item: SectionItem }) =>
     rows.push(...contributedRows<Target>(c, {
       width: opts.width,
-      custom: (command, args) => ({ kind: "custom", command, args }),
+      custom: (command, args, id) => ({ kind: "custom", command, args, section: id }),
     }));
 
   // The blocks this panel draws, each the same shape: so that a section can sit before or after
@@ -3768,10 +4046,20 @@ function contributedHint(opts: DrawOptions): string {
     ...applicable.filter((a) => (a.on ?? "any") !== "any"),
     ...applicable.filter((a) => (a.on ?? "any") === "any"),
   ];
-  return clip(
-    ranked.map((a) => `${a.key} ${a.label}`).join("   "),
-    Math.max(4, opts.width - 2),
-  );
+  // One line per key, and the line is what that key would actually do here.
+  //
+  // Several plugins may want one key on their own rows and the binding sends it to whichever of
+  // them the cursor is over — so a strip that printed all of them would advertise two meanings for
+  // one press and be wrong about at least one. The ranking above is the same one the dispatcher
+  // uses, so the survivor is the verb that fires.
+  const seen = new Set<string>();
+  const cells: string[] = [];
+  for (const a of ranked) {
+    if (seen.has(a.key)) continue;
+    seen.add(a.key);
+    cells.push(`${a.key} ${a.label}`);
+  }
+  return clip(cells.join("   "), Math.max(4, opts.width - 2));
 }
 
 /**

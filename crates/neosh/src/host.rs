@@ -20,8 +20,8 @@ use neosh_proto::{
     Gravity,
     InputEvent,
     KeyCode, MessageLevel, Mode, OptionSpec, OptionType, OptionValue, PluginEvent, PluginId,
-    PluginInbound, PluginOutbound, PluginResponse, RequestId, SelectShape, TextEdit, UiEvent,
-    VirtTextPos, WindowId, WindowLayout,
+    PluginInbound, PluginOutbound, PluginResponse, RequestId, ScrollAmount, SelectShape, TextEdit,
+    UiEvent, VirtTextPos, WindowId, WindowLayout,
 };
 use neosh_provider::catalog;
 use neosh_script::{ScriptInbound, ScriptOutbound};
@@ -34,7 +34,7 @@ use crate::bridge::{PluginProvider, ScriptBridge};
 use crate::cards::{self, Glyphs, ToolState};
 use crate::config::{Config, Resolved};
 use crate::frontend::Frontend;
-use crate::services::Services;
+use crate::services::{Services, Subscribers};
 use crate::vim;
 
 /// How long mutations accumulate before a frame is emitted.
@@ -1019,7 +1019,11 @@ pub struct Host {
     /// Behind a lock rather than plain, because [`Host::broadcast`] is called from `&self` in a
     /// dozen places and the alternative — never pruning — is a workspace that accumulates one dead
     /// sender per script that has ever watched it, and clones every token into all of them.
-    subscribers: std::sync::Mutex<Vec<tokio::sync::mpsc::UnboundedSender<PluginEvent>>>,
+    /// Shared, so a call running off the loop can reach it. A slow call is spawned with only its
+    /// [`Services`], and an event it emits has to arrive at the control socket's subscribers as
+    /// well as at the plugins — a script watching the stream sees what a plugin sees, or the two
+    /// surfaces have come to disagree about what happened.
+    subscribers: Subscribers,
     /// Where a picture that had to be fetched comes back to.
     ///
     /// Same reason as the quota channel above: what is on the clipboard is sometimes only the
@@ -1484,6 +1488,7 @@ impl Host {
             caller: plugin.0.clone(),
             state_dir: self.state_dir.clone(),
             bridge: self.bridge.clone(),
+            subscribers: self.subscribers.clone(),
             model_cache: self.model_cache.clone(),
             updater: self.updater.clone(),
         }
@@ -1533,9 +1538,16 @@ impl Host {
                 | ApiCall::GitStage { .. }
                 | ApiCall::GitUnstage { .. }
                 | ApiCall::GitCommit { .. }
+                // Network, and the reason this list exists: a fetch against a remote that is
+                // slow, unreachable or asking for a key it will not get takes as long as a TCP
+                // timeout, and on the loop that is every terminal in the workspace frozen for it.
+                | ApiCall::GitFetch { .. }
                 | ApiCall::GitPull { .. }
                 | ApiCall::GitAddWorktree { .. }
                 | ApiCall::GitRemoveWorktree { .. }
+                // The slowest of the lot by a wide margin: a large history is minutes of network,
+                // and on the loop that is a workspace frozen for every terminal in it.
+                | ApiCall::GitClone { .. }
                 | ApiCall::GenComplete { .. }
                 | ApiCall::AgentListModels { .. }
                 | ApiCall::PermissionCheck { .. }
@@ -2521,8 +2533,8 @@ impl Host {
             ApiCall::ProviderSetCredential { .. } => Err(ApiError::Internal {
                 message: "credential prompts are answered by the host loop".into(),
             }),
-            // On the host loop rather than through `spawn_slow`, and it is the *only* git write
-            // that is. `git branch -m` is one ref write — the same order of cost as the
+            // On the host loop rather than through `spawn_slow`, and these two are the only git
+            // writes that are. `git branch -m` is one ref write — the same order of cost as the
             // `rev-parse` `remember_repo` already awaits here — and what follows it cannot be done
             // from a spawned task: the branch is half of what [`ProjectFacts`] cached the first
             // time this directory was seen, so a rename that did not reach the host would leave
@@ -2533,6 +2545,55 @@ impl Host {
                 let svc = self.services(plugin);
                 svc.git_rename_branch(old.clone(), new, cwd.clone()).await?;
                 self.rebranded(&old, cwd.as_deref()).await;
+                Ok(ApiOk::Unit)
+            }
+            // The other one, and here for a stronger version of the same reason: a branch name is
+            // one field the host cached, and a directory is the *key* of four maps, the
+            // conversations in it and a file on disk. See [`Self::relocated`], which is the half of
+            // this call that could not be done from a spawned task.
+            //
+            // `git worktree move` is a rename — it refuses a cross-device move rather than copying
+            // — so there is no slow case here to keep off the loop.
+            ApiCall::GitMoveWorktree { path, dest, cwd } => {
+                let from = std::path::PathBuf::from(&path);
+                let to = std::path::PathBuf::from(&dest);
+                // Refused rather than survived. A vendor CLI holds its working directory from the
+                // moment it is spawned; renaming a tree an agent is mid-turn in can land the file
+                // it is writing in the old place, with nothing on screen to say it went there. One
+                // `<Esc>` is a much better price than a silently misplaced edit, and the message
+                // says which conversation to press it in.
+                // The ids first and the store second. `sessions()` is a plain `Mutex` guard and a
+                // `std::sync::Mutex` is not reentrant, so asking `sessions_under` while already
+                // holding one is not a borrow error, it is a workspace that stops answering.
+                let under = self.sessions_under(&from);
+                let busy: Vec<String> = {
+                    let store = self.agent.sessions();
+                    under
+                        .iter()
+                        .filter_map(|id| store.get(id))
+                        .filter(|s| s.active_turn.is_some())
+                        .map(|s| {
+                            s.title.clone().unwrap_or_else(|| {
+                                s.cwd
+                                    .file_name()
+                                    .map(|n| n.to_string_lossy().into_owned())
+                                    .unwrap_or_else(|| s.id.0.clone())
+                            })
+                        })
+                        .collect()
+                };
+                if !busy.is_empty() {
+                    return Err(ApiError::InvalidArgument {
+                        message: format!(
+                            "a turn is running in this worktree — interrupt it with <Esc> and \
+                             try again ({})",
+                            busy.join(", "),
+                        ),
+                    });
+                }
+                let svc = self.services(plugin);
+                svc.git_move_worktree(path, dest, cwd).await?;
+                self.relocated(&from, &to).await;
                 Ok(ApiOk::Unit)
             }
             ApiCall::SessionRename { session, title } => {
@@ -10374,6 +10435,15 @@ impl Host {
                     .unwrap_or(3)
                     .clamp(1, 20) as i32;
                 let by = i32::from(rows) * step;
+                // A panel over the transcript is what the wheel is pointing at. Without this the
+                // notch went to the chat underneath, so a key sheet or a diff too long for the
+                // screen scrolled the one thing you could already see and not the one you could
+                // not — and the panel was opaque, so nothing on screen moved at all.
+                let view = self.view_now();
+                if self.editor.focused(view).is_some_and(|w| self.editor.scrollable(w)) {
+                    self.scroll_focused(ScrollAmount::Lines { n: by });
+                    return true;
+                }
                 // While reading, the cursor has to stay on screen, so this goes through the same
                 // path the reader's own scrolling does rather than moving the window out from
                 // under it.
@@ -11296,6 +11366,122 @@ impl Host {
         self.refresh_status();
     }
 
+    /// Which live conversations are in `dir` or under it.
+    ///
+    /// "Under it" as well as "in it", because a worktree is a directory somebody works *in*: a
+    /// conversation started in `<tree>/crates/neosh-tui` is as much a conversation in that tree as
+    /// one started at its root, and a move that re-pointed only the exact matches would leave the
+    /// nested ones naming a path that no longer exists.
+    ///
+    /// A path comparison rather than a string one: `starts_with` on a `Path` is by component, so
+    /// `/w/tree-2` is not read as being inside `/w/tree`.
+    fn sessions_under(&self, dir: &std::path::Path) -> Vec<neosh_proto::SessionId> {
+        self.agent
+            .sessions()
+            .iter()
+            .filter(|s| s.cwd.starts_with(dir))
+            .map(|s| s.id.clone())
+            .collect()
+    }
+
+    /// A worktree's directory moved: put right everything the host had keyed by where it was.
+    ///
+    /// [`Self::rebranded`] is the same shape one field along — a label the host cached and then
+    /// drew on every frame — and this is the harder version of it, because a directory is not a
+    /// label. It is the key of the facts every list draws, of the conversations that live there, of
+    /// the project vars holding somebody's pin, and of the working directory each vendor CLI was
+    /// started in. Four maps and a disk file, and a move that updates three of them is a workspace
+    /// pointing at a directory that is not there any more.
+    ///
+    /// In order, and each for its own reason:
+    ///
+    /// * **The conversations.** `Session::cwd` is what the agent's tools resolve against and what
+    ///   every panel groups by, and this is the only thing in the workspace that rewrites one.
+    ///   Persisted immediately: a workspace that stopped between the `git worktree move` and the
+    ///   next autosave would come back with every conversation in the tree pointing at nothing.
+    /// * **The facts and the repository handle.** Re-asked through [`Self::remember_repo`] rather
+    ///   than moved across, for the reason `rebranded` re-asks: `identity()` is the call they were
+    ///   built from, so a move that half happened is simply not reflected rather than confidently
+    ///   wrong.
+    /// * **The project vars.** The pin, the fold, the rank and the name the panel remembered. See
+    ///   [`crate::vars::Vars::rename_project`]; the listeners are told, or every cache holding an
+    ///   arrangement is now wrong and nothing said so.
+    /// * **The vendor CLIs.** One process per conversation, each started in a directory that has
+    ///   moved out from under it. Closed rather than migrated — a CLI's cwd is fixed at spawn and
+    ///   there is no message in any of these protocols for "you are somewhere else now" — so the
+    ///   next turn starts one in the right place and resumes by id. Safe precisely because the call
+    ///   refused to run while a turn was in flight.
+    ///
+    /// And `self.cwd` last, when the host was itself standing in the tree: it is what a new
+    /// conversation with no directory of its own inherits.
+    async fn relocated(&mut self, from: &std::path::Path, to: &std::path::Path) {
+        let moved = self.sessions_under(from);
+        {
+            let mut store = self.agent.sessions();
+            for id in &moved {
+                let Some(s) = store.get_mut(id) else { continue };
+                // The tail is what makes a nested conversation follow its tree: `<from>/a/b`
+                // becomes `<to>/a/b`. The tree's own root has an *empty* tail, and `join("")`
+                // appends a separator rather than doing nothing — so the root came out as
+                // `<to>/`, which is the same directory under a spelling nothing else uses. Every
+                // list keyed by the path then held both: two rows for one worktree, and a second
+                // entry in `sidebar.projects` that no amount of moving it again would clear.
+                let Ok(tail) = s.cwd.strip_prefix(from) else { continue };
+                s.cwd = if tail.as_os_str().is_empty() { to.to_path_buf() } else { to.join(tail) };
+            }
+        }
+        self.persist_sessions();
+
+        self.projects.remove(from);
+        self.repos.remove(from);
+        self.project_keys.remove(from);
+        self.remember_repo(to.to_path_buf()).await;
+        // Every directory the move carried, not only the tree's root: a conversation in a
+        // subdirectory has facts of its own under a key that has just changed.
+        for id in &moved {
+            let dir = { self.agent.sessions().get(id).map(|s| s.cwd.clone()) };
+            let Some(dir) = dir else { continue };
+            self.remember_repo(dir).await;
+        }
+
+        let old = from.display().to_string();
+        let new = to.display().to_string();
+        for (key, value) in self.vars.rename_project(&old, &new) {
+            self.broadcast(PluginEvent::VarChanged {
+                scope: neosh_proto::VarScope::Project { cwd: new.clone() },
+                key,
+                value: Some(value),
+            });
+        }
+
+        for id in &moved {
+            for d in &self.agent_drivers {
+                d.close_conversation(id);
+            }
+        }
+
+        let here = self
+            .cwd
+            .strip_prefix(from)
+            .map(|tail| if tail.as_os_str().is_empty() { to.to_path_buf() } else { to.join(tail) })
+            .ok();
+        if let Some(here) = here {
+            self.work_in(here).await;
+        }
+
+        // Said rather than left to be worked out: a panel keeping a list of directories cannot tell
+        // "the thing at `from` is the thing at `to`" from "one project went and another arrived",
+        // and the difference is whether it keeps your place in an order you arranged by hand.
+        self.broadcast(PluginEvent::ProjectMoved { from: old, to: new });
+        // The same signal `rebranded` ends on, for the same reason: every list drawing a
+        // conversation is drawing something that just changed.
+        self.broadcast(PluginEvent::SessionChanged {
+            session: self.active_session(),
+            view: self.from.view,
+        });
+        self.refresh_status();
+    }
+
     /// Stamp the display name onto a conversation's info.
     ///
     /// Done here rather than in the session store because naming a checkout means having looked at
@@ -11459,6 +11645,17 @@ impl Host {
             ("window.split.term", "Split this pane, and run a shell in the new one"),
             ("tab.new.term", "Open a tab with a shell in it"),
             ("window.keys", "Show what the window prefix can do"),
+            // Moving in a panel that does not fit. Named commands before they are keys, like
+            // everything else here — so `^K` runs them, `init.ts` moves them, and a plugin whose
+            // float sets `scroll` gets all eight without writing any of them.
+            ("scroll.down", "Scroll this panel down a line"),
+            ("scroll.up", "Scroll this panel up a line"),
+            ("scroll.half_down", "Scroll this panel down half a screen"),
+            ("scroll.half_up", "Scroll this panel up half a screen"),
+            ("scroll.page_down", "Scroll this panel down a screen"),
+            ("scroll.page_up", "Scroll this panel up a screen"),
+            ("scroll.top", "To the top of this panel"),
+            ("scroll.bottom", "To the bottom of this panel"),
         ];
         for (name, desc) in commands {
             let _ = self.editor.apply(&plugin, ApiCall::CmdRegister {
@@ -11534,7 +11731,67 @@ impl Host {
                 desc: Some(desc.to_string()),
             });
         }
+        self.bind_scroll_keys();
         self.bind_window_keys();
+    }
+
+    /// The reader's motions, on any panel that said it might not fit.
+    ///
+    /// Bound at `BufKind { name: "neosh.scroll" }`, which is a scope the core pushes into the chain
+    /// for a focused float whose [`FloatConfig::scroll`](neosh_proto::FloatConfig::scroll) is set —
+    /// so one set of defaults serves the key sheet, the git panels, the usage panel and a third
+    /// party's float alike, and none of them has to spell out eight bindings it would then own.
+    ///
+    /// These are Vim's, and the same ones the transcript reader answers, because a panel of rows you
+    /// are moving through is the thing the reader already is. What they are *not* is global: they
+    /// resolve below the panel's own kind, so a panel that wants `j` keeps it, and they do not exist
+    /// at all while the keyboard is in the composer, where `j` is a letter.
+    ///
+    /// Every key here is one every terminal sends. The arrows and the paging keys are bound as well
+    /// and are never the only way — which is the rule for arrows everywhere in this workspace.
+    fn bind_scroll_keys(&mut self) {
+        let plugin = PluginId::from(BUILTIN);
+        let scope = Some(neosh_proto::KeymapScope::BufKind {
+            name: neosh_core::editor::SCROLL_KIND.to_string(),
+        });
+        for (lhs, command, desc) in [
+            ("j", "scroll.down", "Down a line"),
+            ("<Down>", "scroll.down", "Down a line"),
+            ("k", "scroll.up", "Up a line"),
+            ("<Up>", "scroll.up", "Up a line"),
+            ("<C-d>", "scroll.half_down", "Down half a screen"),
+            ("<C-u>", "scroll.half_up", "Up half a screen"),
+            ("<C-f>", "scroll.page_down", "Down a screen"),
+            ("<PageDown>", "scroll.page_down", "Down a screen"),
+            ("<C-b>", "scroll.page_up", "Up a screen"),
+            ("<PageUp>", "scroll.page_up", "Up a screen"),
+            ("gg", "scroll.top", "To the top"),
+            ("<Home>", "scroll.top", "To the top"),
+            ("G", "scroll.bottom", "To the bottom"),
+            ("<End>", "scroll.bottom", "To the bottom"),
+        ] {
+            for mode in [Mode::Normal, Mode::Insert, Mode::Visual, Mode::Chat] {
+                let _ = self.editor.apply(&plugin, ApiCall::KeymapSet {
+                    mode,
+                    lhs: lhs.to_string(),
+                    command: command.to_string(),
+                    scope: scope.clone(),
+                    desc: Some(desc.to_string()),
+                });
+            }
+        }
+    }
+
+    /// Move the focused panel's scroll, if it is one that scrolls.
+    ///
+    /// Nothing happens when the keyboard is not in a scrollable float, which is not a case these
+    /// keys can normally reach — the scope they are bound at is only in the chain while one has
+    /// focus — but `^K` can run them by name from anywhere, and a command that reports a failure
+    /// nobody caused is worse than one that does nothing.
+    fn scroll_focused(&mut self, amount: ScrollAmount) {
+        let view = self.view_now();
+        let Some(win) = self.editor.focused(view) else { return };
+        let _ = self.editor.apply(&PluginId::from(BUILTIN), ApiCall::WinScroll { win, amount });
     }
 
     /// The window prefix, out of `ui.keys.window_prefix`.
@@ -11936,6 +12193,19 @@ impl Host {
             "window.move.right" => self.move_pane(Direction::Right),
             "window.exchange" => self.exchange_pane(),
             "window.keys" => self.show_window_keys(),
+
+            // ---- scrolling a panel that does not fit ---------------------
+            // Aimed at whatever has focus, which for these keys is always the float they resolved
+            // in: the scope they are bound at exists only while one is focused.
+            "scroll.down" => self.scroll_focused(ScrollAmount::Lines { n: 1 }),
+            "scroll.up" => self.scroll_focused(ScrollAmount::Lines { n: -1 }),
+            "scroll.half_down" => self.scroll_focused(ScrollAmount::Half { n: 1 }),
+            "scroll.half_up" => self.scroll_focused(ScrollAmount::Half { n: -1 }),
+            "scroll.page_down" => self.scroll_focused(ScrollAmount::Page { n: 1 }),
+            "scroll.page_up" => self.scroll_focused(ScrollAmount::Page { n: -1 }),
+            "scroll.top" => self.scroll_focused(ScrollAmount::Top),
+            "scroll.bottom" => self.scroll_focused(ScrollAmount::Bottom),
+
             "tab.open" => self.begin_tab_choice(),
             "tab.new" => self.new_tab(),
             "tab.new.chat" => {
@@ -12322,6 +12592,7 @@ impl Host {
                 border: neosh_proto::BorderStyle::Rounded,
                 border_hl: Some("Tabline.Key".into()),
                 title: Some(format!(" {prefix} ")),
+                footer: None,
                 width: neosh_proto::Extent::Max { n: width as u16 },
                 // Tall enough for every verb there is, so the list is not silently short by three
                 // rows — the ones that would go are the tab verbs at the end, which is exactly the
@@ -12333,6 +12604,11 @@ impl Host {
                 // before you can use what it is hinting at.
                 focusable: false,
                 modal: false,
+                // Which is also why it does not scroll: the scroll keys resolve against whatever
+                // has focus, and nothing that cannot take focus can be what they mean. On a
+                // terminal too short for the whole list it is clipped, and the bar down its right
+                // edge is what says so — `^Z` is where the rest of it is written down.
+                scroll: false,
                 close_on_blur: false,
                 z: 300,
                 offset: Default::default(),
@@ -12369,6 +12645,7 @@ impl Host {
                 border: neosh_proto::BorderStyle::Rounded,
                 border_hl: Some("Tabline.Key".into()),
                 title: Some(" new tab ".into()),
+                footer: Some(" 1-3 pick   jk move   esc cancel ".into()),
                 width: neosh_proto::Extent::Max { n: width as u16 },
                 height: neosh_proto::Extent::Max { n: TAB_CHOICES.len() as u16 },
                 // Focusable and modal: this is a question you are in the middle of answering, so
@@ -12376,6 +12653,9 @@ impl Host {
                 // would open a second panel behind this one.
                 focusable: true,
                 modal: true,
+                // Three rows, and `j`/`k` move between them: this is a list with a cursor, which is
+                // the case `scroll` is deliberately not for.
+                scroll: false,
                 close_on_blur: false,
                 z: 300,
                 offset: Default::default(),
@@ -12953,6 +13233,23 @@ impl Host {
                      `.worktrees` puts them at `<repo>/.worktrees/<branch>`, kept out of `git \
                      status` for you. Empty means beside the repository instead, in \
                      `<repo>-worktrees/`."
+                        .into(),
+                ),
+            },
+            // Where clones go. Host-owned for the two reasons `worktree.root` is, and separate
+            // from it for a third: `worktree.root` puts trees at `<root>/<repo>/<branch>`, so a
+            // clone into `<worktree.root>/<repo>` would land exactly on the directory that
+            // repository's worktrees live *inside*. One setting for both would make cloning a
+            // repository you already have worktrees of an error about a non-empty directory.
+            OptionSpec {
+                name: "clone.root".into(),
+                ty: OptionType::Str,
+                default: OptionValue::Str(default_clone_root()),
+                description: Some(
+                    "Where `^O` clones a repository, as `<root>/<owner>/<repo>`. A leading `~` is \
+                     expanded. Nested by owner so two projects called `api` from different \
+                     accounts do not collide. This is the first destination offered; others you \
+                     have cloned into are remembered and offered beside it."
                         .into(),
                 ),
             },
@@ -13756,6 +14053,7 @@ async fn run_slow(svc: Services, call: ApiCall) -> ApiResult {
             svc.git_branches(include_remote, cwd).await
         }
         ApiCall::GitWorktrees { cwd } => svc.git_worktrees(cwd).await,
+        ApiCall::GitClone { url, path } => svc.git_clone(url, path).await,
         ApiCall::GitLog { limit } => svc.git_log(limit).await,
         ApiCall::GitDiff { target, stat } => svc.git_diff(target, stat).await,
         ApiCall::GitDefaultBranch => svc.git_default_branch().await,
@@ -13764,15 +14062,16 @@ async fn run_slow(svc: Services, call: ApiCall) -> ApiResult {
         ApiCall::GitStage { paths } => svc.git_stage(paths).await,
         ApiCall::GitUnstage { paths } => svc.git_unstage(paths).await,
         ApiCall::GitCommit { message } => svc.git_commit(message).await,
-        ApiCall::GitPull { cwd } => svc.git_pull(cwd).await,
+        ApiCall::GitFetch { cwd } => svc.git_fetch(cwd).await,
+        ApiCall::GitPull { cwd, rebase } => svc.git_pull(cwd, rebase).await,
         ApiCall::GitAddWorktree { path, branch, create, cwd } => {
             svc.git_add_worktree(path, branch, create, cwd).await
         }
         ApiCall::GitRemoveWorktree { path, force, cwd } => {
             svc.git_remove_worktree(path, force, cwd).await
         }
-        ApiCall::GenComplete { prompt, system, json, selection } => {
-            svc.gen_complete(prompt, system, json, selection).await
+        ApiCall::GenComplete { prompt, system, json, field, selection } => {
+            svc.gen_complete(prompt, system, json, field, selection).await
         }
         // Off the host loop for the same reason as git: discovery is a network round trip per
         // configured provider, and doing it inline freezes typing for as long as it takes.
@@ -14412,6 +14711,15 @@ fn expand_tilde(raw: &str) -> Option<String> {
 /// without thinking.
 fn default_worktree_root() -> String {
     expand_tilde("~/.nsh").unwrap_or_else(|| ".nsh".to_string())
+}
+
+/// Where clones go unless told otherwise.
+///
+/// Under `~/.nsh` like worktrees, and in a directory of its own beneath it: `worktree.root` spends
+/// `<root>/<repo>/` on one repository's *branches*, so a clone written to `<root>/<repo>` would be
+/// asked to create the very directory those branches live in.
+fn default_clone_root() -> String {
+    expand_tilde("~/.nsh/repos").unwrap_or_else(|| ".nsh/repos".to_string())
 }
 
 /// A path with the home directory written the way people say it.

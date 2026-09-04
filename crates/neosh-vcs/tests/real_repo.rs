@@ -170,6 +170,60 @@ async fn branches_worktrees_and_log_round_trip() {
     assert_eq!(git.default_branch().await.as_deref(), Some("main"));
 }
 
+/// A worktree moved into the repository and back out again, with git still able to find it.
+///
+/// The reason this is a real-git test and not a parser one: `git worktree move` rewrites two
+/// pointers that nothing in this crate can see — `.git` in the tree, `gitdir` in the admin
+/// directory — and the only honest way to check they still agree is to ask git afterwards. A plain
+/// `mv` passes every assertion about paths and leaves a checkout git calls `prunable`.
+#[tokio::test]
+async fn a_worktree_moves_in_and_out_of_the_repository() {
+    if !have_git() {
+        return;
+    }
+    let repo = Repo::new("worktree-move");
+    repo.write("a.txt", "1\n");
+    repo.git(&["add", "."]);
+    repo.git(&["commit", "-m", "initial"]);
+
+    let git = Git::discover(repo.path()).await.expect("repo");
+    let inside = repo.path().join(".worktrees").join("feature-thing");
+    git.add_worktree(&inside, "feature/thing", true).await.expect("add worktree");
+
+    // In the repository, so the whole checkout would otherwise read as one untracked directory.
+    // The line is in the tracked `.gitignore`, not `.git/info/exclude`, so every clone gets it.
+    let ignored = std::fs::read_to_string(repo.path().join(".gitignore")).unwrap_or_default();
+    assert!(ignored.lines().any(|l| l.trim() == "/.worktrees/"), "got {ignored:?}");
+
+    // Out of the repository, to a sibling — and to a parent that does not exist yet, which is the
+    // case `move_worktree` creates rather than refuses.
+    let outside = repo.path().parent().expect("parent").join("neosh-vcs-worktree-move-trees/thing");
+    git.move_worktree(&inside, &outside).await.expect("move out");
+    assert!(outside.join("a.txt").is_file(), "the checkout came with it");
+    assert!(!inside.exists(), "and left nothing behind");
+
+    let trees = git.worktrees().await.expect("worktrees");
+    let moved = trees.iter().find(|t| !t.is_main).expect("the linked tree is still listed");
+    assert_eq!(
+        std::fs::canonicalize(&moved.path).ok(),
+        std::fs::canonicalize(&outside).ok(),
+        "git knows where it went",
+    );
+    assert_eq!(moved.branch.as_deref(), Some("feature/thing"), "on the branch it was made on");
+
+    // And back in. Asking git from *inside the moved tree* is the half a `mv` breaks: it works
+    // only if the tree's own `.git` file still points at an admin directory that points back.
+    let back = repo.path().join(".worktrees").join("feature-thing");
+    git.move_worktree(&outside, &back).await.expect("move back in");
+    let from_tree = Git::discover(&back).await.expect("the moved tree is still a checkout");
+    assert_eq!(
+        from_tree.status().await.expect("status").repo.branch.as_deref(),
+        Some("feature/thing"),
+    );
+
+    let _ = std::fs::remove_dir_all(outside.parent().expect("sibling dir"));
+}
+
 #[tokio::test]
 async fn diff_and_commit_go_through() {
     if !have_git() {
@@ -310,4 +364,154 @@ async fn a_branch_is_renamed_under_the_worktree_standing_on_it() {
     );
 
     let _ = std::fs::remove_dir_all(&extra);
+}
+
+/// A fetch and a pull in one repository do not fight over `refs/remotes`.
+///
+/// The failure this pins is not hypothetical and not rare: run the two at once by hand and git says
+///
+/// ```text
+/// error: cannot lock ref 'refs/remotes/origin/main': is at 7f51353… but expected ae4cfd0…
+///  ! ae4cfd0..7f51353  main -> origin/main  (unable to update local ref)
+/// ```
+///
+/// and the pull exits non-zero having done nothing. It became reachable the moment anything fetched
+/// on a timer — a sidebar checking every few minutes against the key somebody pressed — and it
+/// presents as "pull is broken" in a repository where nothing is wrong.
+#[tokio::test]
+async fn a_fetch_and_a_pull_do_not_race_each_other() {
+    let repo = Repo::new("netlock");
+    repo.write("README.md", "hello\n");
+    repo.git(&["add", "."]);
+    repo.git(&["commit", "-m", "initial"]);
+
+    // A bare `origin` beside it, and a second clone playing the colleague who pushed.
+    let origin = repo.path().parent().expect("parent").join("neosh-vcs-netlock-origin.git");
+    let peer = repo.path().parent().expect("parent").join("neosh-vcs-netlock-peer");
+    let _ = std::fs::remove_dir_all(&origin);
+    let _ = std::fs::remove_dir_all(&peer);
+    repo.git(&["clone", "--bare", "--quiet", ".", &origin.to_string_lossy()]);
+    repo.git(&["remote", "add", "origin", &origin.to_string_lossy()]);
+    repo.git(&["fetch", "--quiet", "origin"]);
+    repo.git(&["branch", "--set-upstream-to=origin/main", "main"]);
+
+    let run = |dir: &Path, args: &[&str]| {
+        let out = Command::new("git")
+            .current_dir(dir)
+            .args(args)
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .output()
+            .expect("git runs");
+        assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+    };
+    run(repo.path(), &["clone", "--quiet", &origin.to_string_lossy(), &peer.to_string_lossy()]);
+    run(&peer, &["config", "user.email", "peer@neosh.invalid"]);
+    run(&peer, &["config", "user.name", "peer"]);
+    run(&peer, &["config", "commit.gpgsign", "false"]);
+    std::fs::write(peer.join("news.txt"), "from the remote\n").expect("write");
+    run(&peer, &["add", "."]);
+    run(&peer, &["commit", "--quiet", "-m", "news"]);
+    run(&peer, &["push", "--quiet", "origin", "main"]);
+
+    let git = Git::discover(repo.path()).await.expect("a repository");
+    let other = git.clone();
+    // Both at once, which is the sidebar's timer against somebody's keypress. Whichever wins, the
+    // other waits — so both succeed and the commit lands.
+    let (fetched, pulled) = tokio::join!(other.fetch(), git.pull(false));
+    assert!(fetched.is_ok(), "the background fetch: {fetched:?}");
+    assert!(pulled.is_ok(), "and the pull it overlapped: {pulled:?}");
+    assert!(repo.path().join("news.txt").is_file(), "the remote's commit arrived");
+
+    let _ = std::fs::remove_dir_all(&origin);
+    let _ = std::fs::remove_dir_all(&peer);
+}
+
+/// A clone of a real repository, reporting real progress, into a directory that does not exist yet.
+///
+/// The last part is the case the UI actually produces: a destination is `<root>/<owner>/<repo>`
+/// and nothing has ever created `<root>/<owner>`. `git clone` makes the leaf and not the path to
+/// it, so a clone that only ever ran into an existing directory would work in every test and fail
+/// on the first real use.
+#[tokio::test]
+async fn cloning_reports_progress_and_makes_its_own_parents() {
+    if !have_git() {
+        return;
+    }
+    let repo = Repo::new("clonesrc");
+    repo.write("a.txt", "1\n");
+    repo.git(&["add", "."]);
+    repo.git(&["commit", "-m", "initial"]);
+
+    let into = repo
+        .path()
+        .parent()
+        .unwrap()
+        .join(format!("neosh-vcs-clone-{}", std::process::id()))
+        // Two levels neither of which exists, which is what makes this the create_dir_all test.
+        .join("owner")
+        .join("repo");
+    let _ = std::fs::remove_dir_all(into.parent().unwrap().parent().unwrap());
+
+    // `file://` rather than a bare path, deliberately. A plain local clone hardlinks the object
+    // store and reports nothing at all — so a test cloning `repo.path()` would exercise the
+    // *parser* against an empty stream and pass whatever the streaming code did. Over `file://`
+    // git runs its real transport and emits the phases an `https://` clone emits, which is the
+    // thing being tested.
+    let url = format!("file://{}", repo.path().display());
+    let mut seen: Vec<(String, Option<u8>)> = Vec::new();
+    neosh_vcs::clone(&url, &into, |phase, percent| seen.push((phase.to_string(), percent)))
+        .await
+        .expect("clone");
+
+    assert!(into.join("a.txt").is_file(), "the working tree is there");
+    assert!(into.join(".git").exists(), "and it is a repository");
+    assert!(!seen.is_empty(), "progress was reported: {seen:?}");
+    // The `remote:`-prefixed phases are the ones a two-colon line produces, and getting them back
+    // under their own name is what says the prefix came off before the phase was split out.
+    assert!(
+        seen.iter().any(|(p, _)| p == "Counting objects"),
+        "including the server's own phases, unprefixed: {seen:?}"
+    );
+    assert!(
+        seen.iter().any(|(_, pct)| *pct == Some(100)),
+        "and a percentage that reaches the end: {seen:?}"
+    );
+
+    // Discoverable afterwards, which is the whole point of having cloned it.
+    let git = Git::discover(&into).await.expect("the clone is a repository");
+    assert_eq!(git.root(), into.canonicalize().unwrap_or(into.clone()).as_path());
+
+    let _ = std::fs::remove_dir_all(into.parent().unwrap().parent().unwrap());
+}
+
+/// Cloning into a directory with something in it is refused before git is started.
+///
+/// git's own message is about a `destination path` and reads, to somebody who pressed a key on a
+/// menu row, as though the clone went wrong rather than as though the row was already taken.
+#[tokio::test]
+async fn cloning_onto_something_that_exists_is_refused_by_name() {
+    if !have_git() {
+        return;
+    }
+    let repo = Repo::new("cloneclash");
+    repo.write("a.txt", "1\n");
+    repo.git(&["add", "."]);
+    repo.git(&["commit", "-m", "initial"]);
+
+    let into = repo.path().parent().unwrap().join(format!("neosh-vcs-clash-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&into);
+    std::fs::create_dir_all(&into).expect("dir");
+    std::fs::write(into.join("occupied.txt"), "mine\n").expect("write");
+
+    let err = neosh_vcs::clone(&repo.path().display().to_string(), &into, |_, _| {})
+        .await
+        .expect_err("refused");
+    let said = err.to_string();
+    assert!(said.contains(&into.display().to_string()), "it names the directory: {said}");
+    assert!(
+        std::fs::read_to_string(into.join("occupied.txt")).is_ok(),
+        "and what was there is still there"
+    );
+
+    let _ = std::fs::remove_dir_all(&into);
 }

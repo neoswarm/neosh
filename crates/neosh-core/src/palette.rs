@@ -316,6 +316,13 @@ pub fn groups(variant: Variant) -> Vec<(&'static str, HighlightDef)> {
         // ---- floats -------------------------------------------------------
         ("Float.Border", spec(fg(r.faint))),
         ("Float.Title", spec(bold(fg(r.accent)))),
+        // The bar down a panel's right edge, drawn only while there is content past the bottom of
+        // it. Brighter than the border it sits in, because what it is saying is that the panel is
+        // not all of the thing — a marker the same colour as the frame is a frame.
+        ("Float.Scroll", spec(fg(r.muted))),
+        // The key strip on the bottom edge. Quiet on purpose: it is there to be found when you look
+        // for it and not to compete with what the panel is showing you.
+        ("Float.Footer", spec(dim(fg(r.muted)))),
         // ---- the agent ----------------------------------------------------
         ("Agent.User", spec(bold(fg(r.accent)))),
         ("Agent.Assistant", spec(fg(r.fg))),
@@ -419,6 +426,29 @@ pub fn groups(variant: Variant) -> Vec<(&'static str, HighlightDef)> {
         ("Git.Branch", spec(fg(r.accent))),
         ("Git.Ahead", spec(fg(r.success))),
         ("Git.Behind", spec(fg(r.attention))),
+        // Both ways at once: this branch has commits the remote does not *and* the remote has
+        // commits this branch does not, so a plain pull will either build a merge nobody asked for
+        // or refuse outright. The danger hue rather than the attention one, because unlike `Behind`
+        // it is not a thing you fix by pressing the obvious key — it is a question with two answers,
+        // and the panel that draws this is about to ask which.
+        //
+        // Deliberately still: motion in this workspace means *something is happening you cannot
+        // see*, and a diverged branch is the opposite — nothing at all is happening, and will not
+        // until you decide. `Status.Unread` is the same argument about the same colour.
+        ("Git.Diverged", spec(bold(fg(r.danger)))),
+        // Talking to the remote, right now.
+        //
+        // The one git state that earns motion, and it earns it exactly the way `Status.Streaming`
+        // does: a fetch is seconds of nothing on screen against somebody else's server, which is
+        // the one case where a still panel and a wedged one are indistinguishable. A sweep rather
+        // than a blink for the reason given there — it reads as aliveness at the edge of vision and
+        // costs nothing to ignore — and slightly quicker than the transcript's, because this is one
+        // short row rather than a paragraph and the same period reads as slower over less text.
+        ("Git.Fetching", spec(shimmer(fg(r.active), 1600))),
+        // In step with the remote, as of the last time we asked. The quietest thing the section can
+        // say, because it is the answer you do not need to act on — and a row that says "fine" as
+        // loudly as one that says "three waiting" is a row you stop reading.
+        ("Git.Synced", spec(dim(fg(r.muted)))),
         // ---- diffs --------------------------------------------------------
         // Two families, and the split matters. `Diff.Add` and `Diff.Delete` are *foreground*: they
         // colour the `+5 -1` on a card header and in a turn's summary, where the number is the
@@ -743,9 +773,39 @@ mod tests {
             "Meter.Empty",
             "Status.Working",
             "Git.Added",
+            "Git.Fetching",
+            "Git.Diverged",
+            "Git.Synced",
             "Diff.Add",
         ] {
             assert!(names.contains(required), "{required} is missing from the palette");
+        }
+    }
+
+    /// Motion is for "something is happening and you cannot see it", and for nothing else.
+    ///
+    /// The two git groups are the pair that make the rule concrete, so they are the pair worth
+    /// pinning: talking to a remote is seconds of a still screen against somebody else's machine
+    /// and moves; a diverged branch is a fact that is true until you act on it and does not. The
+    /// second half is the one that erodes — every state feels like it deserves a pulse when you are
+    /// adding it — which is why the assertion is that `Git.Diverged` holds *still*.
+    #[test]
+    fn only_the_states_that_are_waiting_on_something_animate() {
+        let by_name: std::collections::HashMap<_, _> = groups(Variant::Dark).into_iter().collect();
+        let animation = |name: &str| match by_name.get(name) {
+            Some(HighlightDef::Spec { spec }) => spec.animate,
+            _ => panic!("{name} is missing from the palette"),
+        };
+        assert!(
+            matches!(animation("Git.Fetching"), Some(neosh_proto::Animation::Shimmer { .. })),
+            "a fetch is the one git state with a server at the other end of it"
+        );
+        for still in ["Git.Diverged", "Git.Synced", "Git.Behind", "Git.Ahead", "Git.Branch"] {
+            assert!(
+                animation(still).is_none(),
+                "{still} is news, not something happening — a row that blinks about it charges \
+                 attention every time it changes with nothing new to say"
+            );
         }
     }
 

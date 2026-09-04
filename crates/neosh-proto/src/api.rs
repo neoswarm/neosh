@@ -27,8 +27,8 @@ use crate::provider::{
 use crate::quota::{QuotaSample, QuotaSnapshot, UsageHistory, UsageResolution};
 use crate::ui::{
     CursorMotion, CursorShape, Direction, ExtmarkInfo, ExtmarkOpts, FloatConfig, HighlightDef,
-    KeyPress, LineDraw, MessageLevel, NoticeKind, Rect, SelectShape, SurfaceCell, TabInfo, TextEdit,
-    WindowLayout,
+    KeyPress, LineDraw, MessageLevel, NoticeKind, Rect, ScrollAmount, SelectShape, SurfaceCell,
+    TabInfo, TextEdit, WindowLayout,
 };
 use crate::vcs::{BranchInfo, CommitInfo, DiffTarget, RepoStatus, WorktreeInfo};
 
@@ -445,6 +445,19 @@ pub enum ApiCall {
     WinScrollTo {
         win: WindowId,
         top_line: Option<u32>,
+    },
+    /// Move a window's scroll by a screenful, a half, a line, or all the way to an end.
+    ///
+    /// The counterpart to [`ApiCall::WinScrollTo`], and it exists because the caller cannot do this
+    /// arithmetic. "Half a screen" is counted in the *buffer rows the frontend actually drew* —
+    /// which on a wrapping window is not the height and on any window is not the line count — and
+    /// the floor is the last screenful rather than the last line, so scrolling to the bottom leaves
+    /// a full panel rather than one row above an empty one. Both numbers live beside each other in
+    /// the core; a plugin subtracting its own would be re-deriving a viewport it was told about one
+    /// frame late.
+    WinScroll {
+        win: WindowId,
+        amount: ScrollAmount,
     },
     /// Every window that is open, what is in it, and where it sits.
     ///
@@ -1501,6 +1514,28 @@ pub enum ApiCall {
     GitCommit {
         message: String,
     },
+    /// `git fetch --prune`, answering with where the working tree now stands.
+    ///
+    /// **Ahead and behind are a fact about the last fetch, not about the remote.** They come off
+    /// the branch header `git status --porcelain=v2 --branch` prints, which compares HEAD with the
+    /// *remote-tracking ref on this disk* — so a panel drawing `↓0` is saying "nothing had arrived
+    /// as of whenever this checkout last spoke to its remote", which on a machine you have been
+    /// working on all afternoon is a sentence about breakfast. Every one of those panels was
+    /// therefore confidently wrong and had no call available to become right.
+    ///
+    /// It answers with a [`RepoStatus`] rather than `Unit` for the same reason
+    /// [`Self::GitPull`] answers with text: the question a caller is really asking is "where do I
+    /// now stand", and making them follow every fetch with a [`Self::GitStatus`] is a second round
+    /// trip for an answer this call already had in its hand. It is also the only shape in which
+    /// "the fetch moved nothing" and "the fetch brought three commits" are one answer.
+    ///
+    /// Network, so it is a *write* as far as the permission layer is concerned even though nothing
+    /// in the working tree moves: it contacts a remote and writes refs under `refs/remotes`.
+    GitFetch {
+        /// The repository to fetch in. The conversation's own when absent.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cwd: Option<String>,
+    },
     /// `git pull` in a repository, answering with what git said about it.
     ///
     /// The summary comes back rather than being swallowed, because "Already up to date" and
@@ -1510,6 +1545,16 @@ pub enum ApiCall {
         /// The repository to pull in. The conversation's own when absent.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         cwd: Option<String>,
+        /// Replay this branch's own commits on top of what arrived, rather than merging.
+        ///
+        /// A flag rather than a call of its own because it is one argument to one command, and the
+        /// caller that needs it is the one that has just been told the branch diverged — at which
+        /// point "rebase or merge" is the question being answered, and two entry points for the two
+        /// answers would be two things to keep in step for no gain.
+        ///
+        /// It rewrites local commits, which is why nothing sets it without asking first.
+        #[serde(default)]
+        rebase: bool,
     },
     GitAddWorktree {
         path: String,
@@ -1531,6 +1576,49 @@ pub enum ApiCall {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         cwd: Option<String>,
     },
+    /// Clone `url` into `path`, saying how far it has got as it goes.
+    ///
+    /// The one git call with no `cwd`, because it is the call that makes one: everything else here
+    /// asks a repository a question, and this arrives before there is a repository to ask.
+    ///
+    /// **A clone is the one git operation long enough to need watching.** A shallow one is a
+    /// second and a big history is minutes, and the difference is not knowable in advance — so
+    /// this streams rather than answering once at the end. Progress arrives on the bus as
+    /// `neosh.git.clone`, keyed by `path` because a workspace may be cloning more than one thing
+    /// and a progress row that two clones share is a row that reports neither. The reply, when it
+    /// comes, is the path that now exists.
+    ///
+    /// `path` is absolute and its parent need not exist — a clone into a location you have just
+    /// invented is the ordinary case, not an error to hand back.
+    GitClone {
+        /// Anything `git clone` takes: an `https://` or `git@` URL, or a local path.
+        url: String,
+        /// Where the working tree lands, in full. The caller resolved the root and the name, so
+        /// that a picker can *show* the destination on the row before anything is written.
+        path: String,
+    },
+    /// Move a linked worktree to another directory — `git worktree move`.
+    ///
+    /// The git part is a rename; the reason this is an API call rather than a shell-out is
+    /// everything that is *keyed by* the directory. A worktree's path is the key of the project
+    /// facts every list draws, of the conversations in it, of the project vars holding your pin
+    /// and your fold state, and of the working directory each vendor CLI was started in. Moving
+    /// the directory without moving all of that leaves a panel row pointing at nothing and an
+    /// agent running somewhere that no longer exists — so the host does both halves, and the
+    /// second half is the one it exists for. See `Host::relocated`.
+    ///
+    /// Refused while a turn is running in the tree: renaming a directory a CLI has open and is
+    /// writing files into can land an edit in the old place with nothing to say it did.
+    GitMoveWorktree {
+        path: String,
+        /// Where it lands, in full. The leaf must not exist; the parent is created.
+        dest: String,
+        /// The repository it belongs to. `git worktree move` runs from a checkout, and the
+        /// conversation the caller is in may be standing in the one being moved — the same reason
+        /// [`Self::GitRemoveWorktree`] takes one.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cwd: Option<String>,
+    },
 
     // ---- one-shot generation -------------------------------------------
     /// Run a prompt through a model *outside* the conversation.
@@ -1545,6 +1633,29 @@ pub enum ApiCall {
         /// Ask for JSON and parse it host-side, tolerating the code fences models wrap it in.
         #[serde(default)]
         json: bool,
+        /// The one key the answer is *about*, when the whole answer is one value.
+        ///
+        /// A prompt that says "return `{"branch": …}`" is answered with the object most of the
+        /// time and with a bare `fix/composer-paste` the rest of it — the model did the work and
+        /// skipped the envelope, and a caller that only accepts the envelope throws a correct
+        /// answer away. Measured on this workspace's own history it was two runs in twenty-two:
+        /// twice a branch was never named, silently, and both times the name was sitting in the
+        /// reply.
+        ///
+        /// So: extraction first, exactly as before, and this is what a *bare* answer means. Named
+        /// rather than inferred, because only the caller knows which key one value belongs under
+        /// — and absent, nothing changes, which is what every existing caller wants.
+        ///
+        /// Only for a one-value answer. A commit message is a subject *and* a body, and guessing
+        /// which half a bare paragraph is would be inventing the other one.
+        ///
+        /// And only for a value a *wrong* answer is recognisable in. A branch name is checkable
+        /// and one `git branch -m` from being fixed; a thread title is any short line, which is
+        /// also what a refusal and a driver's own error message look like — there the envelope is
+        /// the only evidence the question was answered rather than commented on, and it is worth
+        /// the one reply in ten that arrives without it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        field: Option<String>,
         /// Defaults to `gen.model` if set, else the session's own selection.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         selection: Option<ModelSelection>,

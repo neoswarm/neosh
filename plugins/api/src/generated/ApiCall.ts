@@ -32,6 +32,7 @@ import type { ProjectKey } from "./ProjectKey";
 import type { ProviderEvent } from "./ProviderEvent";
 import type { QuotaSnapshot } from "./QuotaSnapshot";
 import type { Rect } from "./Rect";
+import type { ScrollAmount } from "./ScrollAmount";
 import type { SelectShape } from "./SelectShape";
 import type { SessionId } from "./SessionId";
 import type { StatusSegment } from "./StatusSegment";
@@ -113,6 +114,7 @@ export type ApiCall =
   | { "call": "win_set_cursor"; win: WindowId; row: number; col: number }
   | { "call": "win_get_viewport"; win: WindowId }
   | { "call": "win_scroll_to"; win: WindowId; top_line: number | null }
+  | { "call": "win_scroll"; win: WindowId; amount: ScrollAmount }
   | { "call": "win_list" }
   | {
     "call": "pane_split";
@@ -479,11 +481,29 @@ export type ApiCall =
   | { "call": "git_unstage"; paths: Array<string> }
   | { "call": "git_commit"; message: string }
   | {
+    "call": "git_fetch";
+    /**
+     * The repository to fetch in. The conversation's own when absent.
+     */
+    cwd?: string | null;
+  }
+  | {
     "call": "git_pull";
     /**
      * The repository to pull in. The conversation's own when absent.
      */
     cwd?: string | null;
+    /**
+     * Replay this branch's own commits on top of what arrived, rather than merging.
+     *
+     * A flag rather than a call of its own because it is one argument to one command, and the
+     * caller that needs it is the one that has just been told the branch diverged — at which
+     * point "rebase or merge" is the question being answered, and two entry points for the two
+     * answers would be two things to keep in step for no gain.
+     *
+     * It rewrites local commits, which is why nothing sets it without asking first.
+     */
+    rebase: boolean;
   }
   | {
     "call": "git_add_worktree";
@@ -508,6 +528,32 @@ export type ApiCall =
     cwd?: string | null;
   }
   | {
+    "call": "git_clone";
+    /**
+     * Anything `git clone` takes: an `https://` or `git@` URL, or a local path.
+     */
+    url: string;
+    /**
+     * Where the working tree lands, in full. The caller resolved the root and the name, so
+     * that a picker can *show* the destination on the row before anything is written.
+     */
+    path: string;
+  }
+  | {
+    "call": "git_move_worktree";
+    path: string;
+    /**
+     * Where it lands, in full. The leaf must not exist; the parent is created.
+     */
+    dest: string;
+    /**
+     * The repository it belongs to. `git worktree move` runs from a checkout, and the
+     * conversation the caller is in may be standing in the one being moved — the same reason
+     * [`Self::GitRemoveWorktree`] takes one.
+     */
+    cwd?: string | null;
+  }
+  | {
     "call": "gen_complete";
     prompt: string;
     system?: string | null;
@@ -515,6 +561,30 @@ export type ApiCall =
      * Ask for JSON and parse it host-side, tolerating the code fences models wrap it in.
      */
     json: boolean;
+    /**
+     * The one key the answer is *about*, when the whole answer is one value.
+     *
+     * A prompt that says "return `{"branch": …}`" is answered with the object most of the
+     * time and with a bare `fix/composer-paste` the rest of it — the model did the work and
+     * skipped the envelope, and a caller that only accepts the envelope throws a correct
+     * answer away. Measured on this workspace's own history it was two runs in twenty-two:
+     * twice a branch was never named, silently, and both times the name was sitting in the
+     * reply.
+     *
+     * So: extraction first, exactly as before, and this is what a *bare* answer means. Named
+     * rather than inferred, because only the caller knows which key one value belongs under
+     * — and absent, nothing changes, which is what every existing caller wants.
+     *
+     * Only for a one-value answer. A commit message is a subject *and* a body, and guessing
+     * which half a bare paragraph is would be inventing the other one.
+     *
+     * And only for a value a *wrong* answer is recognisable in. A branch name is checkable
+     * and one `git branch -m` from being fixed; a thread title is any short line, which is
+     * also what a refusal and a driver's own error message look like — there the envelope is
+     * the only evidence the question was answered rather than commented on, and it is worth
+     * the one reply in ten that arrives without it.
+     */
+    field?: string | null;
     /**
      * Defaults to `gen.model` if set, else the session's own selection.
      */

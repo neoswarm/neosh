@@ -181,6 +181,31 @@ is `docs/releasing.md`.
   own scroll to keep its cursor on screen and reports back what it actually drew, including `rows`,
   the buffer rows on the screen — which is what `^D` and `H`/`M`/`L` are counted in and is not the
   height.
+- **A panel that does not fit is a place you move in too, and it says so on its own edge.** A float
+  *asks* for a height and is given whatever the screen has, so `height: Max { n: 30 }` on a
+  twenty-row terminal is ten rows of panel and twenty rows of content drawn nowhere, with no key
+  pointed at it — which is what the key sheet, git status, a diff and another machine's transcript
+  each were. `FloatConfig::scroll` puts one more scope in the chain while that float has focus,
+  `BufKind { name: "neosh.scroll" }`, and the workspace binds the reader's motions there: `j`/`k`,
+  `^D`/`^U`, `^F`/`^B`, `gg`/`G`, the arrows and the paging keys. A **scope** rather than a capture,
+  so the three usual rules hold — `^Z` lists them, `init.ts` moves them, and a panel that wants `j`
+  for itself binds it on *its* kind, which is nearer and wins. Below the panel's kind and above
+  `Global`, so it survives a modal without ever taking a key from the thing it is scrolling. It is
+  **opt-in and stays that way**: a scope beats a capture, so a picker whose filter takes printable
+  characters through one would have `j` and `G` resolved out from under it, and typing a model's
+  name would scroll. A panel that moves in itself already keeps its cursor on screen and says
+  nothing here. What the frontend adds is the part nobody else can: **a bar in the right border
+  while anything is hidden**, drawn from how many rows actually fit, which is a number known only
+  after the fact and only there — in the *border*, because a scrollbar that took a content column
+  would shorten every panel in the workspace including the ones with nothing to say. And the wheel
+  goes to whatever has the keyboard: a notch over an opaque panel used to scroll the transcript
+  behind it, so nothing on screen moved at all.
+- **A key strip belongs on the border, not in the buffer.** `FloatConfig::footer` is the bottom edge,
+  and it is where every legend in the workspace now lives — because written as the last row of
+  content it is both the row that scrolls away exactly when it is wanted and the first row a short
+  terminal clips. Both happened, to the same row: the picker's strip is the one that says how to get
+  out, and on a sixteen-row screen it was the one that did not fit. It also costs a row of height,
+  which every panel was paying for on every screen.
 - **A list is a place you move in.** Anywhere there is a cursor over rows and no text field — the
   project panel, the transcript reader — the motions are Vim's and they take a count: `5j` is five
   rows you can *land on*, `^D`/`^U` are half of the panel's real height, `12G` is a row rather than
@@ -417,7 +442,22 @@ is `docs/releasing.md`.
   shape of the name, which cannot tell `brisk-otter` we picked from `brisk-otter` you typed. At
   turn *start*, because the panel is drawn all through a turn — `git branch -m` is one ref write,
   so it is safe under a running agent and safe on uncommitted work. **One attempt, ever**: the mark
-  is spent before the model is asked, or a cheap model's hiccup becomes a request per message. The
+  is spent before the model is asked, or a cheap model's hiccup becomes a request per message —
+  which is exactly why **an answer that arrives without its envelope has to count as an answer**.
+  Asked for `{"branch": …}`, a model replies `fix/tab-strip-missing-in-worktree` on its own about
+  one time in ten: it did the work and skipped the wrapper, `gen.json` read that as a failed
+  request, the one attempt was already spent and the `log.info` that said so prints nowhere. Two
+  worktrees in twenty-two kept the name nobody chose, for good, with the name they should have had
+  sitting in the reply. `gen.field` is the fix and it is the host's, beside `extract_json` and for
+  the same reason — every generating plugin has this problem and none should solve it twice. **Only
+  for a value a wrong answer is recognisable in**, though: a branch name is checkable and one
+  `git branch -m` from being fixed, while a *title* is any short line and so is `(mock provider has
+  no script)` — pointed at titles this named thirteen test conversations after a driver's error
+  message. Where nothing tells an answer from a remark, the envelope is the evidence and
+  `gen.json` is the call. It is
+  also why the turn-start listener is registered **before** the plugin's own first reads: what
+  follows it is a `git status` per project, and the turn it exists for is the first one in a
+  worktree that was made seconds ago. The
   *type* is the model's — `feature/`, `fix/`, `chore/` — so `git.branch.prefix` applies only to a
   name that arrived without one, or you get `feature/fix/the-login` under a type that is now wrong.
   `git.branch.model` is unset by default and the plugin sends **no selection at all** rather than a
@@ -440,6 +480,59 @@ is `docs/releasing.md`.
   the way anyway — a tree removed by hand, a listing longer than the completion cap — the **branch**
   is what you asked for and the directory is only where it went, so the counter goes on the
   directory (`feat/thing` in `feat-thing-2`) and never on the branch.
+- **A number about a remote has an *as of*, or it is not a number about a remote.** `ahead` and
+  `behind` come out of `git status --porcelain=v2 --branch`, which compares HEAD with the
+  remote-tracking ref **on this disk** — so every panel drawing them was reporting the state of the
+  world as of whenever this checkout last spoke to a server, and none of them had a call available
+  to become right. `ApiCall::GitFetch` is that call, it answers with the fresh `RepoStatus` rather
+  than `Unit` because "where do I now stand" is the question actually being asked, and it is gated
+  as a **write** for the network rather than for the working tree: nothing in the tree moves, and it
+  contacts a remote and writes refs, which is not something a plugin barred from `git pull` should
+  be able to have the workspace do on its behalf. It is safe on a timer only because `run` closes
+  stdin and unsets every askpass, so no credentials means a failure in a moment rather than a hang
+  nobody can see — and a failure is *filed*, not announced, because a workspace fetching every three
+  minutes on a train would otherwise be a toast every three minutes about a network you know is not
+  there. What is said instead is the age beside the numbers: `now`, `12m`, `⚠ offline`. Without it,
+  a panel that has not fetched since Tuesday and one that fetched nine seconds ago draw the same
+  row.
+- **The verb on a panel row is rebuilt from the state, never fixed.** A `pull` button that is a
+  no-op nine times out of ten is a button people learn not to press, and the tenth time is the one
+  that mattered. So the sidebar's git row says `pull 3 commits` when there are three, `check for
+  changes` when nothing is waiting — the honest verb for a count that is only as fresh as the last
+  fetch — and, when the branch has gone both ways, it *names the choice*: `rebase or merge`, in
+  those words, as a picker, because the two do different things to your own commits, one of them
+  rewrites them, and neither is guessable from a row or from a yes-or-no over a question that was
+  never stated. A fast-forward asks nothing, for the reason everything reversible asks nothing.
+- **A key on a contributed row belongs to the section, not to "contributed".** `on: "custom"` meant
+  *every* contributed row in the panel, which was indistinguishable from "mine" while there was one
+  block in the column and wrong the moment there were two: the plan strip and the git block both
+  want `⇥` on their own rows and both are right, and one `keymap.set` per action made that one
+  winner and one plugin whose key silently did nothing. `custom:<section id>` is the narrow form,
+  the panel binds each key **once** and dispatches to whichever claimant matches the row under the
+  cursor — narrow before `any`, the same ranking the hint strip prints in — and the strip prints one
+  line per key, because advertising two meanings for one press is being wrong about at least one.
+- **A repository you do not have yet is a way a project arrives, and it always asks where.** Half of
+  "add a project" was never a directory on this disk: it was a URL, and the answer was to leave
+  neosh, clone in a shell, and come back to type the path. So an address in the `^O` field —
+  `https://`, `git@host:owner/repo`, `file://`, or bare `owner/repo`, which is only safe to guess
+  at because that field stopped having a menu to be a filter for — becomes an offer to fetch it.
+  **Where it lands is asked every time**, because a clone writes a whole history onto a disk and
+  people answer that differently — one root for work, another for what they are only reading — and
+  choosing silently means the first thing anybody does with the feature is go and find where it put
+  something. Asking costs nothing when the default is the first row and `↵` takes it. `clone.root`
+  is that default and is **not** `worktree.root`: the latter spends `<root>/<repo>/` on one
+  repository's branches, so a clone written to `<root>/<repo>` would be asked to create the very
+  directory those branches live in. Anywhere else you pick is *remembered* (`clone.locations`, most
+  recent handful) — which is the whole of adding a location: no list to curate, clone somewhere once
+  and it is a row from then on. A destination that already exists is shown and refused rather than
+  hidden, because the directory being there is very often the answer to "why is this not in my
+  sidebar". It is the **git plugin's** verb and not the panel's, like every other write to a
+  repository — the sidebar decides only that what you typed is an address — and a clone **lands you
+  in it**, so `^K git.clone` and `^O` do the same thing rather than one of them fetching a
+  repository and leaving you where you were. What it draws while it runs is a keyed progress row and
+  never a modal: a large repository is minutes, and the phases are git's own words with a meter only
+  where git gave a total, because a bar creeping along on an invented denominator is the one thing a
+  progress display must not do.
 - **A project outlives the conversations in it.** The panel's list is written down (`sidebar.projects`,
   a workspace var) rather than worked out from where the conversations happen to be — derived, it
   deleted the directory you had worked in all month the moment you cleared out the last thread in
@@ -450,14 +543,23 @@ is `docs/releasing.md`.
   every one of them and asks like one.
 - **"Where?" is one field, and the field is the path field.** `^N` and `^O` ask the same question and
   ask it the same way: type nothing and it is a menu, type `/`, `~` or `./` and it completes
-  directories, type `linux-box:` and it completes directories **on that computer**. `<Tab>` walks
+  directories, type `linux-box:` and it completes directories **on that computer**, and paste a
+  repository address and it offers to clone it. `<Tab>` walks
   into the highlighted one and `↵` takes it — `pathPicker`'s bargain, which is why a completion row's
   label has to be the whole path and why a remote one is prefixed rather than bare. The scp spelling
   is not decoration: `host:path` means there what it means here, it is what makes one field able to
   point at two machines, and it is learned by reading a machine's row rather than by being told. What
   this replaced was a path sitting at the bottom of a list of every worktree the program had ever
   heard of — a verb whose distance from the cursor grew with how long you had used it — so
-  `Another directory…` is above that list now and `Type a path…` is the first row of `^O`. Choosing a
+  `Another directory…` is above that list now, and under `^O` **there is no list at all**: moving
+  the row up left the trees beneath it, where each was wrong one of two ways. One already on the
+  panel is an offer to add what is added — the repository you are standing in was the second row —
+  and one that is not on the panel is a scratch branch you removed with `X`, handed back. Its only
+  filter was a live conversation's `cwd`, which is neither, so what survived was finished work,
+  each row its own full path with the basename and branch repeated after it and truncated
+  mid-branch. No filter fixes that, which is the point: `^O` means *somewhere I do not work yet*,
+  and a list of the repository you are in cannot answer it. What `^N` offers is the panel's own
+  list, which is the same rule and not an exception to it. Choosing a
   machine reopens the picker seeded with `<machine>:` rather than descending in place, because a
   second level whose rows lie about what is in the field is a `<Tab>` that jumps somewhere nobody
   asked for. **Every paired machine is a row, including the ones that cannot be used**, greyed with
@@ -810,7 +912,7 @@ only way to do anything.
 | `^J` | The computers in this workspace. Add one by its address, allow one that is asking, rename one (`^E`), or open what it is running. A machine this one has reached that has not allowed it back says so, and says which key to press over there |
 | `^F` | What you have archived — see below. Filter it, put some back, or finally empty it |
 | `^N` | New conversation. In a repository it asks where: here, a worktree you need not name, one kept inside the project, one you do name, an existing one, another machine, elsewhere. A worktree you did not name is named by your first message — `fix/composer-paste-truncation`, not `wily-nimbus-7hq2` |
-| `^O` | Add a project. The filter line **is** the path field: `/`, `~` and `./` complete directories from the first keystroke, `⇥` walks into the highlighted one, `↵` takes what you typed. `linux-box:` completes on that computer instead |
+| `^O` | Add a project. The filter line **is** the path field: `/`, `~` and `./` complete directories from the first keystroke, `⇥` walks into the highlighted one, `↵` takes what you typed. `linux-box:` completes on that computer instead. Paste a repository address — `https://…`, `git@…`, `file://…`, or just `owner/repo` — and it offers to **clone** it: it asks where, remembers the folders you pick, draws git's own progress while it fetches, and leaves you in the new project |
 | `^B` | Toggle the sidebar |
 | `^K` | Command palette |
 | `/` | Completes a command by name — neosh's, and whatever the agent says it accepts. Keep typing; the composer is still the field, and `↵` sends what you typed when nothing matches |
@@ -1013,9 +1115,48 @@ says how many are asking, `^T` is where you go, and it opens when you get there.
 | `d` | Remove a worktree from disk — its branch stays, and it asks first (a git-plugin contribution) |
 | `x` `X` | Archive, delete. On a project heading, `X` takes the project off the list — the only thing that does |
 | `a` | The archive — the popup below. Nothing archived is ever a row in *this* panel, and by default not even a count. An `archive.action` contribution, not a key this panel owns |
-| `⇥` | On the plan rows: how much of it to show — the limit that binds, every limit, or all of it with the account and the sentence. `usage.sidebar.style` is where it starts, `usage.sidebar` turns it off |
+| `⇥` | On the plan rows: how much of it to show — the limit that binds, every limit, or all of it with the account and the sentence. `usage.sidebar.style` is where it starts, `usage.sidebar` turns it off. On the **git** rows it is the same key about that block — `git.sidebar.style` — because a key on a contributed row is named down to the section (`custom:git`, `custom:plan`) and the panel sends the press to whichever block the cursor is over |
 | `?` | The keys for whatever row you are on |
 | `Esc` | Back to the composer |
+
+## The repository, at the top of the panel
+
+Two rows above the projects: which branch the conversation you are in is on, what has drifted from
+the remote, and **one key that does something about it**. It is a `sidebar.section` contribution
+like the plan strip, so `git.sidebar = false` takes it off and a panel that is not ours picks it up
+unchanged.
+
+```
+ GIT                           ^G
+──────────────────────────────────
+ main ↓3 ~1 ?1
+ ↓ pull 3 commits             now
+```
+
+**The verb row is rebuilt from the state every draw**, so the key is never pointed at something that
+would do nothing — which is what a fixed `pull` button that is a no-op nine times in ten teaches
+people. `↓ pull 3 commits` fast-forwards and says what git said; `⇄ diverged — 2 up, 3 down` asks
+*rebase or merge*, in those words, because the two answers do different things to your own commits
+and neither is guessable from the row; `↻ check for changes` asks the remote again, which is the
+honest verb for a number that is only as fresh as the last fetch; `→ no upstream` is a statement and
+not a verb, because a branch tracking nothing is not behind anything. `⇥` steps the block between
+`one` and `full`, which adds the upstream and a line about the working tree.
+
+**Ahead and behind are asked for, not remembered.** They come off `git status --branch`, which
+compares HEAD with the remote-tracking ref *on this disk* — so a panel drawing `↓0` without ever
+fetching is reporting the world as of whenever this checkout last spoke to a server, which after an
+afternoon is a sentence about breakfast. `ApiCall::GitFetch` is what makes it true: on
+`git.fetch.interval` (180 s, `0` never), on arriving in a conversation, and on the key. Only the
+repository of the conversation you are in, only when its branch tracks one, and the dim column at
+the right of the verb row is how old the answer is — `now`, `12m`, `⚠ offline` — because a claim
+about a remote without an *as of* cannot be told from a claim about now.
+
+**And the block moves only while it is talking to a server.** A fetch is seconds of nothing on
+screen against somebody else's machine, which is the one case where a still panel and a wedged one
+look identical, so it gets both halves of the vocabulary: a spinner glyph and `Git.Fetching`, which
+sweeps. Nothing else here animates, and the restraint is the point — `↓3` is news exactly as an
+unread conversation is news, it is true until you act rather than *happening*, and motion spent on
+it is attention charged every time it changes with nothing new to say.
 
 ## The archive — `^F`, or `a` in the project panel
 

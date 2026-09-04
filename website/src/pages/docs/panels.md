@@ -45,9 +45,11 @@ await neosh.ext.contribute("sidebar.action", "touch", {
   key: "t",
   label: "touch",
   command: "acme.touch",
-  on: "session",                       // or "project", or "any"
+  on: "session",                       // or "project", "any", "custom", "custom:<section id>"
 });
 ```
+
+`on: "custom:todo"` is a verb about **your** rows — the ones the `todo` section above put there — and it is what you want nearly every time. Bare `custom` is every contributed row in the column, which stops meaning "mine" the moment a second plugin has a block in it. Several plugins may ask for the same key on their own rows and all of them are right: the panel binds it once and sends the press to whichever of you the cursor is actually over, and the key strip at the foot prints the one that would fire.
 
 Your contributions go when your plugin does, so `plugins.disabled` takes your rows with it. Declare the points you read under `[provides]` in your manifest; a contribution to a point nobody reads is reported at startup with the nearest real name, `did you mean "sidebar.section"?`.
 
@@ -97,6 +99,26 @@ if (!(await confirmDestructive(neosh, `Delete ${name}?`, {
 `confirmDestructive` reads `ui.confirm_destructive`, starts the cursor on the answer that changes nothing, and draws the other in the error colour, so the setting means one thing everywhere without your plugin knowing it exists. The bar is irreversible, not merely significant: closing a panel asks nothing, deleting a file always asks.
 
 `railPicker` is the two-pane shape the model switcher is built from, for when one list would answer two questions at once. Widget keys come from `ui.keys.*` and are claimed window-scoped while open; you get that for free.
+
+`pager` is the read-only one: rows you look at rather than choose between, in a float that scrolls when the screen is shorter than the content.
+
+```ts
+import { pager } from "@neosh/api/ui";
+
+await pager(neosh, patch.split("\n"), { title: " changes ", width: 100, height: 30, marks });
+```
+
+`height` is a **ceiling, never a size** — a float is given whatever the screen has, so anything you ask for is a wish. What you get back is the reader's motions (`j`/`k`, `^D`/`^U`, `^F`/`^B`, `gg`/`G`, arrows, paging keys), the mouse wheel, a bar down the right border while anything is hidden, and a legend on the bottom border that cannot scroll away or be clipped.
+
+On a panel of your own, `scroll: true` on the float is the whole of it:
+
+```ts
+const win = await neosh.float.open(buf, { height: { kind: "max", n: 30 }, scroll: true });
+```
+
+That adds one scope to the keymap chain while the float has focus — `{ kind: "buf_kind", name: "neosh.scroll" }` — which is where those bindings live. It sits *below* your own buffer's kind, so a key you bind on your panel is still yours, and *above* `global`, so it works under `modal` too. Do not set it on a panel with a cursor of its own: a picker's filter would lose `j` and `G` to it.
+
+Anything a float draws on its bottom edge is `footer`, which is where a key strip belongs — written as the last row of the buffer it is both the row that scrolls away and the first row a short terminal clips.
 
 ## Building on another plugin
 
