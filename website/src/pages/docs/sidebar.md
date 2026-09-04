@@ -75,7 +75,7 @@ New conversation
 
 `Here` is selected, so `^N ⏎` is what `^N` always did, and outside a repository the question is not asked at all. `n` in the project panel asks the same question about the project under the cursor.
 
-The second row is the one you want most days: a clean branch named for you (`brisk-otter`, something you can say out loud), renamed automatically from your first message in it, so it becomes `fix/composer-paste-truncation` without you ever naming it.
+The second row is the one you want most days: a clean branch named for you (`brisk-otter-k3f9` — two words you can say out loud and a tag so no two trees ever collide), renamed automatically from your first message in it, so it becomes `fix/composer-paste-truncation` without you ever naming it.
 
 Where trees land is one setting:
 

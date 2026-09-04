@@ -1224,9 +1224,14 @@ fn a_scratch_worktree_is_named_by_the_first_message_and_the_sidebar_follows() {
         .next()
         .expect("one worktree");
 
-    // Whatever two words it landed on. Named for us, which is exactly what makes it replaceable.
+    // Whatever it landed on. Named for us, which is exactly what makes it replaceable — two words
+    // so it can be read out, and a tag so the twentieth one is not a name already on disk.
     let scratch = head_of(&tree);
-    assert!(scratch.contains('-'), "a two-word scratch name, not {scratch:?}");
+    assert_eq!(
+        scratch.split('-').count(),
+        3,
+        "two words and a tag, not {scratch:?} — see `scratchName`"
+    );
 
     // Waited for rather than assumed: creating the tree also starts a conversation in it and
     // switches to it, and a test that types before that lands is typing into the conversation in
@@ -1273,6 +1278,48 @@ fn a_scratch_worktree_is_named_by_the_first_message_and_the_sidebar_follows() {
         "and the scratch name is not still anywhere in the column\n{:?}",
         s.sidebar_now()
     );
+}
+
+/// A directory in the way does not cost a worktree its branch.
+///
+/// The case this exists for is the one the scratch names created: a tree is made at
+/// `.worktrees/brisk-otter` and the first message renames its *branch* to `fix/the-login`, leaving
+/// the directory where it is on purpose — moving it would invalidate the conversation's `cwd`. So
+/// `git branch` no longer mentions `brisk-otter` while the directory sits there forever, and the
+/// next tree to land on that name asked git for something git refused: `already exists`, on a name
+/// nothing on screen had said was taken.
+///
+/// Squatted by hand here rather than by renaming a generated branch, because which two words the
+/// generator picks is not a thing a test may depend on. The branch is what you asked for; where its
+/// checkout sits is the plugin's business, so the counter goes on the directory.
+#[test]
+fn a_directory_in_the_way_moves_the_worktree_not_the_branch() {
+    if !have_git() {
+        return;
+    }
+    let sb = Sandbox::new("worktreesquat");
+    sb.git_init();
+    // Relative, so the trees land inside the sandbox's own repository rather than beside it.
+    sb.write_config("[options]\n\"worktree.root\" = \".worktrees\"\n");
+
+    // Non-empty: `git worktree add` is happy to move into an empty directory, and a real leftover
+    // is a whole checkout.
+    let squat = sb.work().join(".worktrees/feat-thing");
+    std::fs::create_dir_all(&squat).expect("mkdir");
+    std::fs::write(squat.join("leftover"), "from a tree that has been renamed\n").expect("write");
+
+    let mut s = sb.start();
+    s.wait_for("PROJECTS");
+    s.send(&command_with("git.worktree.new", "feat/thing"));
+
+    let moved = sb.work().join(".worktrees/feat-thing-2");
+    assert!(
+        s.pump(|_| moved.join(".git").exists()),
+        "the worktree landed beside the squatter, at {}",
+        moved.display()
+    );
+    assert_eq!(head_of(&moved), "feat/thing", "on the branch that was asked for");
+    assert!(squat.join("leftover").exists(), "and nothing touched what was already there");
 }
 
 /// And named when the model answers with the name and nothing else.
@@ -3132,10 +3179,17 @@ fn a_worktree_can_be_had_without_answering_anything() {
         .map(|e| e.file_name().to_string_lossy().into_owned())
         .next()
         .expect("one worktree");
-    let words: Vec<&str> = made.split('-').collect();
+    // Words rather than an identifier, and then a tag: the words are what you read out of the
+    // panel, the tag is what stops the twentieth tree landing on a name already on disk.
+    let parts: Vec<&str> = made.split('-').collect();
+    assert_eq!(parts.len(), 3, "two words and a tag: {made}");
     assert!(
-        words.len() >= 2 && words.iter().all(|w| w.len() > 2 && w.chars().all(|c| c.is_ascii_lowercase())),
+        parts[..2].iter().all(|w| w.len() > 2 && w.chars().all(|c| c.is_ascii_lowercase())),
         "it is words rather than an identifier: {made}"
+    );
+    assert!(
+        parts[2].len() == 4 && parts[2].chars().all(|c| c.is_ascii_alphanumeric()),
+        "and a four-character tag: {made}"
     );
     assert!(
         s.pump(|s| s.chat_now().iter().any(|l| l.contains(&made))),

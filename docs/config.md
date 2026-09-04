@@ -182,8 +182,9 @@ always did — and because the question is about the row and not about you, the 
 that repository's.
 
 The second row is the one you want most days. **A worktree with nothing to answer**: the branch is
-named for you — two words, `brisk-otter`, a thing you can say out loud and find again in a list of
-eight of them — it lands under `worktree.root`, and you are in it. Naming a branch before you know
+named for you — two words and a tag, `brisk-otter-k3f9`, a thing you can say out loud and find again
+in a list of eight of them, on a name no other tree of yours has ever had — it lands under
+`worktree.root`, and you are in it. Naming a branch before you know
 what the work is is a decision made at the worst possible moment, and having to make it is what
 stops people reaching for a clean tree at all. Renaming it later is `git branch -m`, like any other
 branch. It is `git.worktree.new.auto` for a key or a script.
