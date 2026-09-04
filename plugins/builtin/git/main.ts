@@ -244,6 +244,16 @@ two-word scratch name it was created with.",
       }).catch(() => {});
     }
   };
+  // The first thing asked in a scratch worktree is what its branch should have been called.
+  //
+  // Before the reads below for the same reason they register their own listeners first, and with
+  // more at stake: what follows is a `git status` per project in the sidebar, run one after
+  // another, and a workspace with a dozen of them on a slow disk spends seconds here. A turn
+  // started in that window is the *first* turn in a new worktree — the one turn this exists for —
+  // and a turn that starts before the listener does is a turn nobody hears.
+  subscriptions.push(
+    neosh.agent.onTurnStart((e) => void nameScratchBranch(neosh, e.session as SessionId)),
+  );
   // Listeners before the first read: the sidebar writes `sidebar.projects` from its first draw,
   // which can land while this plugin is still awaiting its own `git status`, and a change that
   // arrives before the listener exists is a change nobody hears.
@@ -291,10 +301,6 @@ two-word scratch name it was created with.",
   await footer();
   subscriptions.push(neosh.agent.onTurnEnd(() => void footer()));
   subscriptions.push(neosh.session.onChange(() => void footer()));
-  // The first thing asked in a scratch worktree is what its branch should have been called.
-  subscriptions.push(
-    neosh.agent.onTurnStart((e) => void nameScratchBranch(neosh, e.session as SessionId)),
-  );
   // The working tree changes whenever anything writes a file, including the agent.
   subscriptions.push(neosh.timer.every(5000, () => void footer()));
 }
@@ -451,16 +457,20 @@ async function newBranch(neosh: Neosh): Promise<void> {
  * Throws rather than returning a fallback. There is no useful default branch name, and the two
  * callers want opposite things when this fails — one tells you, the other says nothing — which is
  * a decision for them and not for this.
+ *
+ * `gen.field` rather than `gen.json`, because a model asked for `{"branch": …}` answers with a
+ * bare `fix/tab-strip-missing-in-worktree` about one time in ten — the name it was asked for,
+ * without the envelope. Read as JSON that was a failed request and a worktree left on
+ * `warm-juniper` for good, with the name it should have had sitting in the reply and nothing
+ * anywhere saying so.
  */
 async function nameBranch(neosh: Neosh, description: string, cwd?: string): Promise<string> {
-  const answer = await neosh.gen.json<{ branch?: string }>(
+  const branch = await neosh.gen.field(
     `${await promptFor(neosh, "branch", BRANCH_PROMPT)}\n\nUser message:\n${description}`,
+    "branch",
     await branchModel(neosh),
   );
-  if (typeof answer.branch !== "string" || answer.branch.trim() === "") {
-    throw new Error("the model returned no branch name");
-  }
-  const name = slug(answer.branch);
+  const name = slug(branch);
   const prefix = (await neosh.opt.get<string>("git.branch.prefix")) ?? "";
   // Skipped when the model already chose a type. The built-in prompt asks for `fix/`, `feature/`
   // and the rest, so a `git.branch.prefix` applied unconditionally on top of it would read

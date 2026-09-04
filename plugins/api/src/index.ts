@@ -1190,6 +1190,32 @@ export interface GenApi {
    * do not each reimplement that. Rejects if there is no JSON in the response at all.
    */
   json<T = unknown>(prompt: string, opts?: { system?: string; selection?: ModelSelection }): Promise<T>;
+  /**
+   * One value, asked for as JSON and accepted however it comes back.
+   *
+   * The shape almost every generating plugin actually wants: a branch name, a thread title, a PR
+   * subject — one string, asked for as `{"branch": …}` because that is how you pin a model down,
+   * and answered as a bare `fix/composer-paste` often enough to matter. Both are the same answer,
+   * and {@link GenApi.json} rejects the second one — which is a correct name thrown away, with
+   * nothing on screen to say so.
+   *
+   * So the key is passed down and a bare reply is read as its value. Everything
+   * {@link GenApi.json} tolerates is tolerated first and unchanged; this is only what happens when
+   * there is no JSON at all. Rejects on an empty answer, or on prose it will not guess at.
+   *
+   * For one value only. A commit message is a subject and a body, and there is no answering the
+   * question of which one a lone paragraph is — that stays {@link GenApi.json}.
+   *
+   * And only for a value you would know was wrong on sight. A branch name is that, and a wrong one
+   * is one rename away; a thread title is any short line, and so is a refusal or a driver's own
+   * error message — where nothing distinguishes an answer from a remark, the envelope is the
+   * evidence, and {@link GenApi.json} is the call.
+   */
+  field(
+    prompt: string,
+    key: string,
+    opts?: { system?: string; selection?: ModelSelection },
+  ): Promise<string>;
 }
 
 /**
@@ -2850,6 +2876,23 @@ function build(
           selection: opts?.selection ?? null,
         });
         return expect(v, "json").value as never;
+      },
+      async field(prompt, key, opts) {
+        const v = await c({
+          call: "gen_complete",
+          prompt,
+          system: opts?.system ?? null,
+          json: true,
+          field: key,
+          selection: opts?.selection ?? null,
+        });
+        const value = (expect(v, "json").value as Record<string, unknown>)?.[key];
+        // A key that came back as something other than a non-empty string is an answer to a
+        // different question, and the caller is about to name a branch after it.
+        if (typeof value !== "string" || value.trim() === "") {
+          throw new Error(`the model returned no ${key}`);
+        }
+        return value.trim();
       },
     },
     view: {
