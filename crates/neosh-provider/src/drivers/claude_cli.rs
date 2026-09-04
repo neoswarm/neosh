@@ -2172,6 +2172,107 @@ done
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// And the report is raised *before* the turn it interrupted has ended.
+    ///
+    /// Which is the whole reason the workspace cannot act on it where it arrives. A turn's last act
+    /// is to ask how full the context is, and everything the CLI says while that answer is
+    /// outstanding is held for whatever comes next — so an unasked `init` landing there is never
+    /// read by the turn, the note stays up, and it is the turn *letting go of the pipe* that
+    /// reports it. That happens inside the stream's own task, ahead of the channel closing, which
+    /// is ahead of the ending the host is waiting for. Asserted with no polling loop on purpose:
+    /// `collect` cannot return until the stream is closed, so a count that is already 1 here is the
+    /// ordering itself, and a host that reads "is a turn running" at that moment always reads yes.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_turn_begun_while_the_last_one_was_winding_down_is_still_reported() {
+        use futures::StreamExt;
+        use std::os::unix::fs::PermissionsExt;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        #[derive(Debug, Default)]
+        struct Heard(AtomicUsize);
+        impl super::super::Unasked for Heard {
+            fn began(&self, _conversation: &SessionId) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+            fn background(&self, _conversation: &SessionId, _tasks: Vec<neosh_proto::BackgroundTask>) {}
+        }
+
+        let dir = std::env::temp_dir().join(format!("neosh-winding-down-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("dirs");
+        let script = dir.join("fake-claude");
+        // The turn is answered, and then — in the gap between it asking for one last number and
+        // being given it — the CLI opens a turn of its own. The rest of that turn arrives a moment
+        // later, so the listening turn has something to wait for rather than a pipe already empty.
+        std::fs::write(
+            &script,
+            r#"#!/bin/sh
+spoke=
+while IFS= read -r line; do
+  case "$line" in
+    *control_request*)
+      id=`printf '%s' "$line" | sed 's/.*"request_id":"\([^"]*\)".*/\1/'`
+      if [ -z "$spoke" ]; then
+        spoke=1
+        printf '{"type":"system","subtype":"init","session_id":"s","slash_commands":[]}\n'
+      fi
+      printf '{"type":"control_response","response":{"subtype":"success","request_id":"%s","response":{"totalTokens":10,"maxTokens":100}}}\n' "$id"
+      if [ "$spoke" = 1 ]; then
+        spoke=2
+        sleep 1
+        printf '{"type":"result","subtype":"success","is_error":false,"session_id":"s","result":"the background command finished"}\n'
+      fi
+      continue
+      ;;
+  esac
+  printf '{"type":"system","subtype":"init","session_id":"s","slash_commands":[]}\n'
+  printf '{"type":"result","subtype":"success","is_error":false,"session_id":"s","result":"answer"}\n'
+done
+"#,
+        )
+        .expect("script");
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+
+        let p = ClaudeCliProvider::new(script.display().to_string());
+        let heard = Arc::new(Heard::default());
+        crate::drivers::AgentDriver::set_unasked(&p, heard.clone());
+        let conversation = SessionId::from("test");
+        let said = |evs: Vec<ProviderEvent>| {
+            evs.into_iter()
+                .filter_map(|e| match e {
+                    ProviderEvent::TextDelta { text, .. } => Some(text),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join(" / ")
+        };
+
+        let first: Vec<_> =
+            p.stream(&inst(), req("claude-opus-5"), CancellationToken::new()).collect().await;
+        assert_eq!(said(first), "answer");
+        assert_eq!(
+            heard.0.load(Ordering::SeqCst),
+            1,
+            "the report is raised by the ending turn letting go, which is before its own ending"
+        );
+
+        // And what it was raised about is still there to be heard: held past the turn that could
+        // not use it, and read by the one opened for it.
+        crate::drivers::AgentDriver::listen_only(&p, &conversation);
+        let mut listening = req("claude-opus-5");
+        listening.messages.clear();
+        let heard_out: Vec<_> =
+            p.stream(&inst(), listening, CancellationToken::new()).collect().await;
+        assert_eq!(
+            said(heard_out),
+            "the background command finished",
+            "what the agent said between the turns is drawn, not drained away under the next one"
+        );
+
+        p.shutdown(&conversation);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// An empty directory means "wherever the host is", which is what a driver with no opinion did
     /// before the field existed — so a provider plugin written against the old shape still works.
     #[test]
