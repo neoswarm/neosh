@@ -95,8 +95,13 @@ type Target =
   /** The row that opens another directory. A row rather than only a key, because a verb nobody
    * can see is a verb nobody uses. */
   | { kind: "add" }
-  /** A row somebody else contributed. `command` runs on `↵`, with `args` as given. */
-  | { kind: "custom"; command?: string; args?: string[] }
+  /**
+   * A row somebody else contributed. `command` runs on `↵`, with `args` as given.
+   *
+   * `section` is which contribution it came from, and it is what lets a verb belong to *one*
+   * plugin's block rather than to every contributed row in the column — see {@link applies}.
+   */
+  | { kind: "custom"; command?: string; args?: string[]; section?: string }
   /** A conversation on another computer. Addressed as `(node, session)`; the session id alone is
    * unique only on its own machine. */
   | { kind: "remote"; node: string; session: string; cwd: string; host: string };
@@ -160,8 +165,14 @@ interface ActionItem {
    * own. Without it a plugin can put rows in this column and then has nowhere to put a key that
    * belongs to them: `any` binds the key on every row in the panel and advertises it on all of
    * them, which is a verb about the plan gauge appearing while the cursor is on a conversation.
+   *
+   * `custom:<section id>` goes one step narrower and names *which* contributed block — `custom:git`
+   * is a verb about the git rows and nowhere else. Bare `custom` is every contributed row in the
+   * column, which stops being what anybody means the moment there are two blocks in it: the plan
+   * and git both wanting `<Tab>` on their own rows is two correct requests and one key, and the
+   * panel is what resolves it — see {@link applies}.
    */
-  on?: "project" | "session" | "custom" | "any";
+  on?: string;
 }
 
 /** A project as the panel thinks of it: a directory, and what is going on in it. */
@@ -690,12 +701,34 @@ export async function activate({ neosh, subscriptions }: PluginContext) {
   });
 }
 
+/**
+ * Whether two rows are the *same row*, so the cursor survives the list being rebuilt under it.
+ *
+ * The panel redraws on a tick and re-contributed sections replace themselves wholesale, so this is
+ * what stands between "the row I was on moved" and "I am somewhere else now". Every kind is
+ * compared by what identifies it rather than by what it says: a conversation by its id, a project
+ * by its directory, a remote by the pair that is unique across machines.
+ *
+ * **A contributed row is identified by its section and its verb.** It used to fall through to
+ * `a.kind === b.kind`, which made every custom row in the column identical to every other — so on
+ * the next redraw the cursor snapped to the *first* one, wherever it had been. Two rows of the plan
+ * strip were enough to see it; a block whose second row is the button and whose first row is a
+ * label made it a button you could not reach, because the cursor was back on the label before you
+ * pressed the key.
+ */
 function same(a: Target, b: Target): boolean {
   if (a.kind === "remote") {
     return b.kind === "remote" && a.node === b.node && a.session === b.session;
   }
   if (a.kind === "session") return b.kind === "session" && a.id === b.id;
   if (a.kind === "project") return b.kind === "project" && a.cwd === b.cwd;
+  if (a.kind === "custom") {
+    // The args too: a section whose rows all run one command with a different argument each — a
+    // list of branches, a list of pull requests — is exactly the case the command alone cannot tell
+    // apart, and it is a common enough shape to be worth the join.
+    return b.kind === "custom" && a.section === b.section && a.command === b.command &&
+      (a.args ?? []).join(" ") === (b.args ?? []).join(" ");
+  }
   return a.kind === b.kind;
 }
 
@@ -1542,6 +1575,13 @@ function installActions(
     registered = [];
     const reserved = await reservedKeys(neosh);
 
+    // Every action still gets a command of its own — `^K` runs it by name whether or not it won a
+    // key — but the *binding* is per key, not per action. Two plugins may each want `<Tab>` on
+    // their own rows and both are right; one `keymap.set` per action made that the second one
+    // overwriting the first, so whichever loaded last owned the key everywhere and the other
+    // plugin's rows had a key that did nothing. One binding, and the row under the cursor decides
+    // which of them it means.
+    const sharing = new Map<string, Array<Contribution & { item: ActionItem }>>();
     for (const c of valid) {
       const name = `${NS}.action.${c.plugin}.${c.id}`;
       const command = await neosh.cmd.register(name, async (_args, key) => {
@@ -1566,9 +1606,38 @@ function installActions(
         );
         continue;
       }
-      await neosh.keymap.set("chat", c.item.key, name, { scope, desc: c.item.label })
-        .catch(() => {});
-      bound.push({ key: c.item.key, command: name });
+      const share = sharing.get(c.item.key);
+      if (share) share.push(c);
+      else sharing.set(c.item.key, [c]);
+    }
+
+    for (const [key, claimants] of sharing) {
+      // The narrow verbs first: a verb about the row you are standing on beats one about every row,
+      // which is the same ranking the hint strip prints them in and for the same reason. A key that
+      // meant "cycle the plan detail" wherever the cursor was would be a key that did the wrong
+      // thing on somebody else's block.
+      const ranked = [
+        ...claimants.filter((c) => (c.item.on ?? "any") !== "any"),
+        ...claimants.filter((c) => (c.item.on ?? "any") === "any"),
+      ];
+      const name = ranked.length === 1 && ranked[0]
+        ? `${NS}.action.${ranked[0].plugin}.${ranked[0].id}`
+        : `${NS}.action.key.${key}`;
+      if (ranked.length > 1) {
+        const command = await neosh.cmd.register(name, async (_args, k) => {
+          const target = panel(k?.view)?.list.value;
+          const hit = ranked.find((c) => applies(c.item.on ?? "any", target));
+          if (!hit) return;
+          await neosh.cmd.exec(hit.item.command, argsFor(target)).catch((e: unknown) => {
+            neosh.notify(String(e), "warn");
+          });
+          onChange();
+        }, { desc: ranked.map((c) => c.item.label).join(" / ") }).catch(() => null);
+        if (command) registered.push(command);
+      }
+      const label = ranked[0]?.item.label ?? key;
+      await neosh.keymap.set("chat", key, name, { scope, desc: label }).catch(() => {});
+      bound.push({ key, command: name });
     }
     current = valid;
     onChange();
@@ -1611,11 +1680,21 @@ async function reservedKeys(neosh: Neosh): Promise<Set<string>> {
   );
 }
 
-function applies(
-  on: "project" | "session" | "custom" | "any",
-  target: Target | undefined,
-): boolean {
+/**
+ * Whether a contributed verb is about the row under the cursor.
+ *
+ * `custom:<section id>` is the narrow form and the one most contributors want: a verb about *my*
+ * block rather than about every block anybody has put in this column. Bare `custom` is still every
+ * contributed row, because a verb about contributions in general is a real thing to want — but it
+ * is not what "a key on my rows" means, and until this existed it was the only spelling available.
+ * Two plugins each asking for `<Tab>` on their own rows were one binding, one winner and one plugin
+ * whose key quietly did nothing.
+ */
+function applies(on: string, target: Target | undefined): boolean {
   if (on === "any") return target !== undefined;
+  if (on.startsWith("custom:")) {
+    return target?.kind === "custom" && target.section === on.slice("custom:".length);
+  }
   return target?.kind === on;
 }
 
@@ -1624,6 +1703,9 @@ function argsFor(target: Target | undefined): string[] {
   if (!target) return [];
   if (target.kind === "session") return ["session", target.cwd, target.id];
   if (target.kind === "project") return ["project", target.cwd];
+  // Which block it came from, so a verb bound across several sections can tell them apart without
+  // the panel having to hand over the row's own command as well.
+  if (target.kind === "custom") return ["custom", target.section ?? ""];
   return [target.kind];
 }
 
@@ -3364,7 +3446,7 @@ async function collect(
   const section = (c: Contribution & { item: SectionItem }) =>
     rows.push(...contributedRows<Target>(c, {
       width: opts.width,
-      custom: (command, args) => ({ kind: "custom", command, args }),
+      custom: (command, args, id) => ({ kind: "custom", command, args, section: id }),
     }));
 
   // The blocks this panel draws, each the same shape: so that a section can sit before or after
@@ -3964,10 +4046,20 @@ function contributedHint(opts: DrawOptions): string {
     ...applicable.filter((a) => (a.on ?? "any") !== "any"),
     ...applicable.filter((a) => (a.on ?? "any") === "any"),
   ];
-  return clip(
-    ranked.map((a) => `${a.key} ${a.label}`).join("   "),
-    Math.max(4, opts.width - 2),
-  );
+  // One line per key, and the line is what that key would actually do here.
+  //
+  // Several plugins may want one key on their own rows and the binding sends it to whichever of
+  // them the cursor is over — so a strip that printed all of them would advertise two meanings for
+  // one press and be wrong about at least one. The ranking above is the same one the dispatcher
+  // uses, so the survivor is the verb that fires.
+  const seen = new Set<string>();
+  const cells: string[] = [];
+  for (const a of ranked) {
+    if (seen.has(a.key)) continue;
+    seen.add(a.key);
+    cells.push(`${a.key} ${a.label}`);
+  }
+  return clip(cells.join("   "), Math.max(4, opts.width - 2));
 }
 
 /**

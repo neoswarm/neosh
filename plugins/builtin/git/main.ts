@@ -48,7 +48,8 @@ import {
   spinnerFrame,
   statusPrefix,
 } from "@neosh/api/ui";
-import type { PickerItem } from "@neosh/api/ui";
+import { configureMotion } from "@neosh/api/ui";
+import { installGitSection, statParts } from "./sidebar.ts";
 
 // ---------------------------------------------------------------------------
 // Default prompts
@@ -81,8 +82,25 @@ Rules:
 - Describe the primary user-visible or developer-visible change.
 - Do not mention the diff format, the number of files, or that you are an assistant.`;
 
-export async function activate({ neosh, subscriptions }: PluginContext) {
+export async function activate(ctx: PluginContext) {
+  const { neosh, subscriptions } = ctx;
   await defineHighlights(neosh);
+
+  // The shared clock is module-global *per plugin*, so a spinner drawn here has to be told what
+  // this terminal can render even though the sidebar has already told its own copy.
+  configureMotion({
+    enabled: (await neosh.opt.get<boolean>("ui.motion").catch(() => true)) ?? true,
+    ascii: (await neosh.opt.get<boolean>("ui.ascii_only").catch(() => false)) ?? false,
+  });
+  subscriptions.push(neosh.opt.onChange((e) => {
+    if (e.name !== "ui.motion" && e.name !== "ui.ascii_only") return;
+    void (async () => {
+      configureMotion({
+        enabled: (await neosh.opt.get<boolean>("ui.motion").catch(() => true)) ?? true,
+        ascii: (await neosh.opt.get<boolean>("ui.ascii_only").catch(() => false)) ?? false,
+      });
+    })();
+  }));
 
   for (const spec of [
     {
@@ -199,7 +217,12 @@ two-word scratch name it was created with.",
     // calling convention.
     [
       "git.sidebar.pull",
-      (args: string[]) => pull(neosh, arg(args, 1)),
+      // A project or conversation row arrives as `(kind, cwd, …)`; a *contributed* row arrives as
+      // `("custom", <section>)`, where the second slot is a section id and emphatically not a path.
+      // Read as one, `p` on the git block tried to pull a repository called `git` and reported that
+      // it could not find one — which is a true sentence about a question nobody asked. A row of
+      // ours means the conversation's own checkout, which is what no `cwd` at all already says.
+      (args: string[]) => pull(neosh, arg(args, 0) === "custom" ? undefined : arg(args, 1)),
       "Pull the repository of the sidebar row under the cursor",
     ],
     [
@@ -321,8 +344,13 @@ two-word scratch name it was created with.",
   // The same vocabulary as the panel's badge, in one colour rather than several — a status segment
   // is one span, and the strip is short enough that the worst thing true of it is the right answer
   // to what colour it should be.
-  const footer = async () => {
-    const status = await neosh.git.status().catch(() => null);
+  //
+  // **Handed the status rather than reading one.** This used to run `git status` on its own five-
+  // second timer, and so did the sidebar block below — two subprocesses that stat the entire
+  // working tree, a few hundred milliseconds apart, for the same answer, for ever. Worse than the
+  // cost: they were two answers, so for a few seconds after every pull the footer and the panel
+  // disagreed about how far behind you were. One read, everybody told.
+  const footer = async (status: RepoStatus | null) => {
     if (!status) {
       await neosh.status.clear("branch");
       return;
@@ -345,56 +373,24 @@ two-word scratch name it was created with.",
       priority: 20,
     });
   };
-  refreshFooter = () => void footer();
-  await footer();
-  subscriptions.push(neosh.agent.onTurnEnd(() => void footer()));
-  subscriptions.push(neosh.session.onChange(() => void footer()));
-  // The working tree changes whenever anything writes a file, including the agent.
-  subscriptions.push(neosh.timer.every(5000, () => void footer()));
-}
 
-// ---------------------------------------------------------------------------
-// Where a checkout stands, in five columns or fewer per fact
-// ---------------------------------------------------------------------------
-
-/**
- * A repository's state as a run of coloured stats, worst first, nothing said about zero.
- *
- * It replaced a single amber `●3`. A dot with a number on it is one fact — *something* here has
- * been touched — drawn in the one colour the panel uses for "act now", on the rows you look at
- * most; and the thing it did not say is the thing you actually want off a project row, which is
- * whether this checkout has drifted from the remote. Ahead and behind are already in `RepoStatus`,
- * from the branch header `git status --porcelain=v2 --branch` prints, so this costs no extra call.
- *
- * The order is what would stop you: a conflict is a tree you cannot commit from, behind is work
- * you have not got yet, ahead is work nobody else has, and the two dirty counts are yours and
- * undecided. Each fact keeps its own colour — a strip drawn in one colour is a string you read
- * rather than a row you glance at — and every one of them is a glyph and a number, so the whole
- * strip is at most a handful of columns even when all five are true.
- *
- * `↑` and `↓` are the direction the *commits* would travel, which is the way every git prompt in
- * the world draws it: `↓2` is two waiting for you.
- */
-function statParts(status: RepoStatus, ascii: boolean): Array<{ text: string; hl?: string }> {
-  const parts: Array<{ text: string; hl?: string }> = [];
-  const say = (text: string, hl: string) => {
-    // The separator is a part of its own with no highlight: it belongs to neither side, and giving
-    // it to the run before it would colour a column that has nothing in it.
-    if (parts.length > 0) parts.push({ text: " " });
-    parts.push({ text, hl });
-  };
-  const is = (c: (typeof status.changes)[number], state: string) =>
-    c.staged === state || c.unstaged === state;
-  const conflicted = status.changes.filter((c) => is(c, "conflicted")).length;
-  const untracked = status.changes.filter((c) => !is(c, "conflicted") && is(c, "untracked")).length;
-  const dirty = status.changes.length - conflicted - untracked;
-
-  if (conflicted > 0) say(`${ascii ? "!" : "✗"}${conflicted}`, "Git.Conflict");
-  if (status.repo.behind > 0) say(`${ascii ? "v" : "↓"}${status.repo.behind}`, "Git.Behind");
-  if (status.repo.ahead > 0) say(`${ascii ? "^" : "↑"}${status.repo.ahead}`, "Git.Ahead");
-  if (dirty > 0) say(`~${dirty}`, "Git.Modified");
-  if (untracked > 0) say(`?${untracked}`, "Git.Untracked");
-  return parts;
+  // The block at the top of the sidebar: which branch, what has drifted, and the one key that does
+  // something about it. Contributed, so `plugins.disabled = ["git"]` takes it away with everything
+  // else here and a panel that is not ours picks it up unchanged.
+  //
+  // It also owns the reading. Whoever polls `git status` has to do it on a timer — the agent writes
+  // files all through a turn — and having *two* things poll it is two subprocesses for one answer
+  // and two answers for one question. So the block reads, and the footer above is told; a git block
+  // turned off with `git.sidebar = false` still reads, because the reading was never the block's.
+  const section = await installGitSection(ctx, {
+    onStatus: (status) => void footer(status),
+    // A pull moves HEAD, and the project rows carry a badge built from a different call than the
+    // one the block just refreshed.
+    onMoved: () => void decorate(),
+  });
+  // What anything moving `HEAD` calls. The block re-reads and hands the answer on, so the footer
+  // follows without this having to know it exists.
+  headMoved = () => void section.refresh();
 }
 
 // ---------------------------------------------------------------------------
@@ -448,7 +444,7 @@ async function switchBranch(neosh: Neosh): Promise<void> {
 
   try {
     await neosh.git.checkout(chosen);
-    refreshFooter();
+    headMoved();
   } catch (e) {
     // Almost always uncommitted changes that would be overwritten. git's own message says which
     // files, and is more useful than anything this plugin could invent.
@@ -457,14 +453,18 @@ async function switchBranch(neosh: Neosh): Promise<void> {
 }
 
 /**
- * Redraw the branch segment, now.
+ * Everything that draws a branch name, redrawn now.
  *
  * Set by `activate`. Anything that moves `HEAD` calls it instead of announcing the move in the
- * corner: the branch already has a place on screen, and a toast saying what the footer says is the
- * same fact printed twice. Without this the footer is up to five seconds stale — which is why the
- * toast was there, and is the thing to fix rather than to caption.
+ * corner: the branch already has two places on screen, and a toast saying what they say is the same
+ * fact printed three times. Without it both are up to five seconds stale — which is why the toast
+ * was there, and is the thing to fix rather than to caption.
+ *
+ * One hook rather than one per panel, because it is one `git status`: the sidebar block re-reads
+ * and hands the answer to the footer, so a third thing wanting a branch name is a subscriber rather
+ * than another subprocess.
  */
-let refreshFooter: () => void = () => {};
+let headMoved: () => void = () => {};
 
 async function newBranch(neosh: Neosh): Promise<void> {
   const description = await prompt(neosh, "What are you about to work on?", { width: 76 });
@@ -488,7 +488,7 @@ async function newBranch(neosh: Neosh): Promise<void> {
 
   try {
     await neosh.git.createBranch(edited.trim());
-    refreshFooter();
+    headMoved();
   } catch (e) {
     neosh.notify(String(e), "error");
   }
@@ -1017,6 +1017,11 @@ async function nameScratchBranch(neosh: Neosh, session: SessionId): Promise<void
     const named = await nameBranch(neosh, asked, info.cwd);
     if (named === scratch) return;
     await neosh.git.renameBranch(scratch, named, { cwd: info.cwd });
+    // The one write in this file that changes a branch name without going through a key. The host
+    // puts the *project row* right on its own; everything drawing the branch of the conversation
+    // you are in has to be told, or the block at the top of the panel says `stout-falcon` for up to
+    // five seconds after the sidebar row beside it has already caught up.
+    headMoved();
     neosh.notify(`branch is ${named}`);
   } catch (e) {
     // Not worth interrupting for: the worktree works, the branch has a name, and a popup every

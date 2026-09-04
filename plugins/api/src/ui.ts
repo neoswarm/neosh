@@ -2969,7 +2969,16 @@ export interface ActionItem {
   /** For the hint strip and `^Z`. */
   label: string;
   command: string;
-  /** Which rows it applies to — a row kind the panel names, `custom` for contributed rows, or `any`. */
+  /**
+   * Which rows it applies to — a row kind the panel names, `custom` for contributed rows, or `any`.
+   *
+   * `custom:<section id>` narrows it to the rows of **one** section: `custom:git` is a verb about
+   * the git block and nothing else. Bare `custom` means every contributed row in the panel, which
+   * is right for a verb about contributions in general and wrong for the usual case — two plugins
+   * each with a block in the column and each wanting `<Tab>` on their own rows were, without this,
+   * one key that one of them won and the other silently lost. A panel binds the key once and sends
+   * it to whichever action matches the row the cursor is actually on.
+   */
   on?: string;
 }
 
@@ -3215,7 +3224,16 @@ export function placeSections<S extends string>(
  */
 export function sectionRows<T>(
   c: Contribution & { item: SectionItem },
-  opts: { width: number; custom: (command: string, args: string[]) => T },
+  opts: {
+    width: number;
+    /**
+     * What a landable contributed row *is*, in the panel's own vocabulary.
+     *
+     * The section's id comes third so a panel can tell one contributor's rows from another's —
+     * which is what {@link ActionItem.on}'s `custom:<id>` form is matched against.
+     */
+    custom: (command: string, args: string[], section: string) => T;
+  },
 ): ListRow<T>[] {
   const rows: ListRow<T>[] = [];
   const contributed = Array.isArray(c.item?.rows) ? c.item.rows : [];
@@ -3255,7 +3273,7 @@ export function sectionRows<T>(
       spans: spans.length > 0 ? spans : undefined,
       right: typeof r.right?.text === "string" ? { text: `${r.right.text} `, hl: r.right.hl } : undefined,
       inert: typeof r.command !== "string",
-      value: typeof r.command === "string" ? opts.custom(r.command, args) : undefined,
+      value: typeof r.command === "string" ? opts.custom(r.command, args, c.id) : undefined,
     });
   }
   return rows;

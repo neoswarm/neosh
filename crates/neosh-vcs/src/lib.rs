@@ -8,9 +8,11 @@
 //! Every call is `async` and every call is *fallible* — a directory that is not a repository is an
 //! ordinary answer here, not an error to be unwrapped.
 
+use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 
 use neosh_proto::{
     BranchInfo, CommitInfo, DiffTarget, RepoInfo, RepoStatus, WorktreeInfo,
@@ -36,6 +38,13 @@ pub enum VcsError {
 /// Output of one `git` invocation that exited zero.
 struct Output {
     stdout: String,
+    /// What git said on the way, on a command that *succeeded*.
+    ///
+    /// Kept because git puts some of its most useful sentences here even when nothing went wrong:
+    /// `Successfully rebased and updated refs/heads/main.` is stderr, and so is every line of fetch
+    /// progress. A caller that wants to report what happened has to be able to see it; on failure
+    /// stderr is the error message and is carried by [`VcsError::Command`] instead.
+    stderr: String,
 }
 
 /// A working tree.
@@ -105,6 +114,64 @@ impl Git {
         S: AsRef<OsStr>,
     {
         run(&self.root, args).await
+    }
+
+    /// Hold the repository's turn at the network, until the guard is dropped.
+    ///
+    /// **Two git operations that talk to a remote must not overlap in one repository**, and git
+    /// does not enforce it: `refs/remotes/*` is updated under a ref lock but `FETCH_HEAD` is not,
+    /// and neither is the pair of them together. A fetch landing in the middle of a pull is
+    ///
+    /// ```text
+    /// error: cannot lock ref 'refs/remotes/origin/trunk': is at 7f51353… but expected ae4cfd0…
+    ///  ! ae4cfd0..7f51353  trunk -> origin/trunk  (unable to update local ref)
+    /// ```
+    ///
+    /// — a failed pull, in a repository where nothing was wrong. That became reachable the moment
+    /// something fetched on a timer: the sidebar's three-minute check against the key somebody
+    /// pressed, or against a script, or against another plugin. Every one of those is a different
+    /// caller, which is why the queue is *here* rather than in whichever of them was written last.
+    ///
+    /// Keyed by the **common** git directory, so the several worktrees of one repository queue with
+    /// each other: `refs/remotes` and `FETCH_HEAD` live in the common directory and are the shared
+    /// thing being written. Worth its own `rev-parse` — that is a subprocess that reads one config
+    /// value, on an operation about to open a socket to another machine.
+    ///
+    /// Only network operations take it. `git status` on a fifty-thousand-file tree must not wait
+    /// behind somebody's fetch of a large repository, and it has no reason to: it writes nothing.
+    async fn network_lock(&self) -> tokio::sync::OwnedMutexGuard<()> {
+        static QUEUES: OnceLock<StdMutex<HashMap<PathBuf, Arc<tokio::sync::Mutex<()>>>>> =
+            OnceLock::new();
+        let key = self.common_dir().await;
+        let queue = {
+            let mut map = QUEUES
+                .get_or_init(Default::default)
+                .lock()
+                // A poisoned map means some other task panicked while holding it for the length of
+                // two `HashMap` operations. There is nothing to be inconsistent about, and
+                // refusing every future fetch over it would be a worse outcome than the panic.
+                .unwrap_or_else(|e| e.into_inner());
+            Arc::clone(map.entry(key).or_default())
+        };
+        queue.lock_owned().await
+    }
+
+    /// The directory `refs/remotes` and `FETCH_HEAD` actually live in.
+    ///
+    /// `.git` in an ordinary checkout; the original repository's `.git` in a linked worktree, which
+    /// is the case this exists for. Falling back to the working-tree root is safe rather than
+    /// correct: it still serialises a checkout against itself, which is where the collision almost
+    /// always is, and only two *different* worktrees of one repository could then still race.
+    async fn common_dir(&self) -> PathBuf {
+        let Ok(out) = self.git(["rev-parse", "--path-format=absolute", "--git-common-dir"]).await
+        else {
+            return self.root.clone();
+        };
+        let path = PathBuf::from(out.stdout.trim());
+        if path.as_os_str().is_empty() {
+            return self.root.clone();
+        }
+        std::fs::canonicalize(&path).unwrap_or(path)
     }
 
     // ---- reading --------------------------------------------------------
@@ -279,26 +346,56 @@ impl Git {
         })
     }
 
+    /// `git fetch --prune`, then where this checkout now stands.
+    ///
+    /// The counterpart to [`Self::status`] rather than a version of it: `status` compares HEAD with
+    /// the remote-tracking ref *on this disk*, so its `behind` is only as true as the last fetch.
+    /// Nothing else here talks to the remote without also changing the working tree, which is why a
+    /// panel wanting to say "three waiting for you" had no way to find out.
+    ///
+    /// `--prune` because the alternative is a branch list that grows for ever: a remote branch
+    /// deleted after its pull request merged stays in `refs/remotes` until something removes it, and
+    /// a picker offering to check out six branches that no longer exist is worse than one that is a
+    /// fetch behind.
+    ///
+    /// Tags are left alone. The default refspec already brings the ones pointing at fetched commits,
+    /// and `--tags` on a timer against a repository with ten thousand of them is a lot of network
+    /// for something no panel here draws.
+    ///
+    /// Failure is ordinary and expected: no remote, no network, no credentials. `run` closes stdin
+    /// and unsets every askpass, so an unauthenticated fetch fails in a moment rather than hanging
+    /// on a prompt nobody can see — which is the whole reason this is safe to put on a timer.
+    pub async fn fetch(&self) -> Result<RepoStatus, VcsError> {
+        let _net = self.network_lock().await;
+        self.git(["fetch", "--prune"]).await?;
+        self.status().await
+    }
+
     /// `git pull`, answering with the last thing git said about it.
     ///
     /// `--no-edit` because there is no editor here to open: a pull that wants a merge message gets
     /// the default one, and a pull that wants credentials fails now rather than hanging — `run`
     /// closes stdin and forbids terminal prompts for exactly this call.
     ///
-    /// The summary is the tail of git's output, not the whole of it: "Already up to date." and
-    /// "Fast-forward" are what the caller wants to show, and the object-counting progress above
-    /// them is noise nobody typed `git pull` to read.
-    pub async fn pull(&self) -> Result<String, VcsError> {
-        let out = self.git(["pull", "--no-edit"]).await?;
-        let summary = out
-            .stdout
-            .lines()
-            .map(str::trim)
-            .filter(|l| !l.is_empty())
-            .next_back()
-            .unwrap_or("done")
-            .to_string();
-        Ok(summary)
+    /// `rebase` replays this branch's commits on top of what arrived instead of merging. Passed
+    /// explicitly rather than left to `pull.rebase`, because the caller for it is a panel that has
+    /// just told somebody their branch diverged and offered them the choice — and a choice that
+    /// then does whatever the config says is not one.
+    ///
+    /// The summary is one line out of git's several, chosen rather than taken off the end. See
+    /// [`pull_summary`], which is where the choosing is and why.
+    pub async fn pull(&self, rebase: bool) -> Result<String, VcsError> {
+        let _net = self.network_lock().await;
+        let out = if rebase {
+            // `--no-edit` has no meaning under `--rebase` and older gits complain about the pair.
+            self.git(["pull", "--rebase"]).await?
+        } else {
+            self.git(["pull", "--no-edit"]).await?
+        };
+        // Both streams. A successful rebase says so on stderr and prints nothing at all on stdout,
+        // so a summary read from stdout alone reported the one operation people most want confirmed
+        // as `done`.
+        Ok(pull_summary(&out.stdout, &out.stderr))
     }
 
     pub async fn add_worktree(
@@ -454,6 +551,59 @@ impl Git {
     }
 }
 
+/// What a pull did, in one line somebody can read on a status row.
+///
+/// **Chosen rather than taken off the end.** This used to be the last non-empty line of stdout,
+/// which is exactly right for `Already up to date.` — a one-line output — and wrong for every pull
+/// that actually brought something, because git's last line there is the tail of a diffstat:
+///
+/// ```text
+/// Updating 8e1234a..abc1234
+/// Fast-forward
+///  b.txt | 3 +++
+///  1 file changed, 3 insertions(+)
+///  create mode 100644 b.txt
+/// ```
+///
+/// So a panel reporting a successful three-commit fast-forward said `create mode 100644 b.txt`,
+/// which is true, is about one file, and is not what anybody asked. What people want is the *kind*
+/// of thing that happened and *how much* of it — so this looks for the line naming the kind, joins
+/// it to the diffstat line if there is one, and falls back to the first line rather than the last:
+/// git leads with its summary and trails off into detail, so the front is the better guess when
+/// nothing here recognises the shape.
+///
+/// Both streams, because a rebase reports itself on stderr and prints nothing on stdout.
+fn pull_summary(stdout: &str, stderr: &str) -> String {
+    // Split on carriage returns as well as newlines. Git redraws progress in place — a rebase
+    // writes `Rebasing (1/1)\rSuccessfully rebased and updated refs/heads/main.` — so `lines()`
+    // alone hands back one "line" with the progress counter welded to the front of the answer, and
+    // a row clipped to a sidebar's width then reads `Rebasing (1/1)Succes…`.
+    let lines: Vec<&str> = stdout
+        .split(['\n', '\r'])
+        .chain(stderr.split(['\n', '\r']))
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .collect();
+    // What happened, in git's own words. Matched loosely at the front of the line: the exact
+    // wording of the merge line names the strategy and has changed with it (`recursive`, then
+    // `ort`), and a test that pinned the whole sentence would fail on the next release.
+    let kind = lines.iter().find(|l| {
+        l.starts_with("Already up to date")
+            || l.starts_with("Fast-forward")
+            || l.starts_with("Merge made by")
+            || l.starts_with("Successfully rebased")
+            || l.starts_with("Current branch")
+    });
+    // How much of it. `git` writes this one line for every pull that changed anything.
+    let stat = lines.iter().find(|l| l.contains(" changed,") || l.ends_with(" changed"));
+    match (kind, stat) {
+        (Some(k), Some(s)) => format!("{k} · {s}"),
+        (Some(k), None) => (*k).to_string(),
+        (None, Some(s)) => (*s).to_string(),
+        (None, None) => lines.first().copied().unwrap_or("done").to_string(),
+    }
+}
+
 /// Clone `url` into `path`, calling `on_progress` with the phase and percentage as git reports it.
 ///
 /// A free function rather than a [`Git`] method, because it is the one call that arrives before
@@ -600,7 +750,10 @@ where
     };
 
     if out.status.success() {
-        return Ok(Output { stdout: String::from_utf8_lossy(&out.stdout).into_owned() });
+        return Ok(Output {
+            stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
+            stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+        });
     }
 
     let stderr = String::from_utf8_lossy(&out.stderr);
@@ -632,6 +785,30 @@ pub struct Snapshot {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_pull_is_summarised_by_what_it_did_and_not_by_its_last_line() {
+        // The bug this exists for: git trails off into a diffstat, so the tail of a successful
+        // fast-forward is a sentence about one file's mode bits.
+        let ff = "Updating 8e1234a..abc1234\nFast-forward\n b.txt | 3 +++\n 1 file changed, \
+                  3 insertions(+)\n create mode 100644 b.txt\n";
+        assert_eq!(pull_summary(ff, ""), "Fast-forward · 1 file changed, 3 insertions(+)");
+
+        // The one-line case that used to work, and still has to.
+        assert_eq!(pull_summary("Already up to date.\n", ""), "Already up to date.");
+
+        // A rebase says nothing on stdout at all, and redraws its progress in place — so the
+        // sentence people want arrives welded to a counter by a carriage return rather than
+        // separated from it by a newline.
+        assert_eq!(
+            pull_summary("", "Rebasing (1/1)\rSuccessfully rebased and updated refs/heads/main.\n"),
+            "Successfully rebased and updated refs/heads/main."
+        );
+
+        // Nothing recognised falls back to the *first* line: git leads with its summary.
+        assert_eq!(pull_summary("something new\nand detail below it\n", ""), "something new");
+        assert_eq!(pull_summary("", ""), "done");
+    }
 
     #[test]
     fn diff_args_pick_the_right_form() {

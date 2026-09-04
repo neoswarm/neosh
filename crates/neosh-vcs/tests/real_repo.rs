@@ -366,6 +366,66 @@ async fn a_branch_is_renamed_under_the_worktree_standing_on_it() {
     let _ = std::fs::remove_dir_all(&extra);
 }
 
+/// A fetch and a pull in one repository do not fight over `refs/remotes`.
+///
+/// The failure this pins is not hypothetical and not rare: run the two at once by hand and git says
+///
+/// ```text
+/// error: cannot lock ref 'refs/remotes/origin/main': is at 7f51353… but expected ae4cfd0…
+///  ! ae4cfd0..7f51353  main -> origin/main  (unable to update local ref)
+/// ```
+///
+/// and the pull exits non-zero having done nothing. It became reachable the moment anything fetched
+/// on a timer — a sidebar checking every few minutes against the key somebody pressed — and it
+/// presents as "pull is broken" in a repository where nothing is wrong.
+#[tokio::test]
+async fn a_fetch_and_a_pull_do_not_race_each_other() {
+    let repo = Repo::new("netlock");
+    repo.write("README.md", "hello\n");
+    repo.git(&["add", "."]);
+    repo.git(&["commit", "-m", "initial"]);
+
+    // A bare `origin` beside it, and a second clone playing the colleague who pushed.
+    let origin = repo.path().parent().expect("parent").join("neosh-vcs-netlock-origin.git");
+    let peer = repo.path().parent().expect("parent").join("neosh-vcs-netlock-peer");
+    let _ = std::fs::remove_dir_all(&origin);
+    let _ = std::fs::remove_dir_all(&peer);
+    repo.git(&["clone", "--bare", "--quiet", ".", &origin.to_string_lossy()]);
+    repo.git(&["remote", "add", "origin", &origin.to_string_lossy()]);
+    repo.git(&["fetch", "--quiet", "origin"]);
+    repo.git(&["branch", "--set-upstream-to=origin/main", "main"]);
+
+    let run = |dir: &Path, args: &[&str]| {
+        let out = Command::new("git")
+            .current_dir(dir)
+            .args(args)
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .output()
+            .expect("git runs");
+        assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+    };
+    run(repo.path(), &["clone", "--quiet", &origin.to_string_lossy(), &peer.to_string_lossy()]);
+    run(&peer, &["config", "user.email", "peer@neosh.invalid"]);
+    run(&peer, &["config", "user.name", "peer"]);
+    run(&peer, &["config", "commit.gpgsign", "false"]);
+    std::fs::write(peer.join("news.txt"), "from the remote\n").expect("write");
+    run(&peer, &["add", "."]);
+    run(&peer, &["commit", "--quiet", "-m", "news"]);
+    run(&peer, &["push", "--quiet", "origin", "main"]);
+
+    let git = Git::discover(repo.path()).await.expect("a repository");
+    let other = git.clone();
+    // Both at once, which is the sidebar's timer against somebody's keypress. Whichever wins, the
+    // other waits — so both succeed and the commit lands.
+    let (fetched, pulled) = tokio::join!(other.fetch(), git.pull(false));
+    assert!(fetched.is_ok(), "the background fetch: {fetched:?}");
+    assert!(pulled.is_ok(), "and the pull it overlapped: {pulled:?}");
+    assert!(repo.path().join("news.txt").is_file(), "the remote's commit arrived");
+
+    let _ = std::fs::remove_dir_all(&origin);
+    let _ = std::fs::remove_dir_all(&peer);
+}
+
 /// A clone of a real repository, reporting real progress, into a directory that does not exist yet.
 ///
 /// The last part is the case the UI actually produces: a destination is `<root>/<owner>/<repo>`

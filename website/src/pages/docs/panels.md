@@ -45,9 +45,11 @@ await neosh.ext.contribute("sidebar.action", "touch", {
   key: "t",
   label: "touch",
   command: "acme.touch",
-  on: "session",                       // or "project", or "any"
+  on: "session",                       // or "project", "any", "custom", "custom:<section id>"
 });
 ```
+
+`on: "custom:todo"` is a verb about **your** rows — the ones the `todo` section above put there — and it is what you want nearly every time. Bare `custom` is every contributed row in the column, which stops meaning "mine" the moment a second plugin has a block in it. Several plugins may ask for the same key on their own rows and all of them are right: the panel binds it once and sends the press to whichever of you the cursor is actually over, and the key strip at the foot prints the one that would fire.
 
 Your contributions go when your plugin does, so `plugins.disabled` takes your rows with it. Declare the points you read under `[provides]` in your manifest; a contribution to a point nobody reads is reported at startup with the nearest real name, `did you mean "sidebar.section"?`.
 

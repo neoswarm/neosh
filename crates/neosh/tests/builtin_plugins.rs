@@ -35,6 +35,14 @@ impl Drop for Sandbox {
 }
 
 impl Sandbox {
+    /// A directory of this test's own.
+    ///
+    /// **The name has to be unique across the file.** The pid keeps two `cargo test` runs apart and
+    /// does nothing at all about two *tests in one run*: they share a process, so the same name is
+    /// the same directory, and the suite runs several at once — so one test wipes the other's
+    /// checkout on the way in and its `Drop` deletes it again on the way out. It shows up as a
+    /// failure in whichever of the pair happened to be slower, which moves from run to run, which
+    /// is exactly what a flaky test looks like from the outside.
     fn new(name: &str) -> Self {
         let root = std::env::temp_dir().join(format!("neosh-builtin-{}-{name}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
@@ -911,6 +919,137 @@ fn outside_a_repository_git_status_warns_rather_than_throwing() {
     s.wait_for("no git repository");
 }
 
+impl Sandbox {
+    /// Give `work/` an `origin` that is three commits ahead of it.
+    ///
+    /// A bare repository on disk rather than a network remote: `git fetch` against a path is the
+    /// same code path, the same refs and the same `behind` count, and it is the only version of
+    /// this that a test can run without a server.
+    ///
+    /// The commits are pushed from a *second* clone, so `work/` genuinely does not have them —
+    /// which is the whole point. Committing them in `work` and resetting would leave the objects
+    /// present and the fetch with nothing to bring.
+    fn git_behind_by(&self, commits: usize) {
+        let run = |dir: &Path, args: &[&str]| {
+            let out = Command::new("git").current_dir(dir).args(args).output().expect("git runs");
+            assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        };
+        let origin = self.root.join("origin.git");
+        let other = self.root.join("other");
+        run(&self.work(), &["init", "--bare", "--initial-branch=trunk", &origin.to_string_lossy()]);
+        run(&self.work(), &["remote", "add", "origin", &origin.to_string_lossy()]);
+        run(&self.work(), &["push", "--set-upstream", "origin", "trunk"]);
+        run(&self.root, &["clone", &origin.to_string_lossy(), &other.to_string_lossy()]);
+        run(&other, &["config", "user.email", "test@neosh.invalid"]);
+        run(&other, &["config", "user.name", "neosh test"]);
+        run(&other, &["config", "commit.gpgsign", "false"]);
+        for i in 0..commits {
+            std::fs::write(other.join("README.md"), format!("upstream {i}\n")).expect("write");
+            run(&other, &["commit", "-am", &format!("upstream {i}")]);
+        }
+        run(&other, &["push", "origin", "trunk"]);
+    }
+}
+
+/// The sidebar says which branch, how far behind, and what pressing the key would do.
+///
+/// All three are the same claim: that a panel about a repository has to have *asked* a remote.
+/// `behind` out of `git status` is a comparison with the remote-tracking ref on this disk, so
+/// without the fetch this block would draw `check for changes` over a checkout that is three
+/// commits behind — confidently, and for as long as anybody looked at it.
+#[test]
+fn the_sidebar_says_the_branch_and_offers_the_pull() {
+    if !have_git() {
+        return;
+    }
+    let sb = Sandbox::new("gitsidebar");
+    sb.git_init();
+    sb.git_behind_by(3);
+
+    let mut s = sb.start();
+    s.wait_for("PROJECTS");
+    // The branch, on its own row, above the projects — the fact nothing else in the workspace says
+    // unless the footer happens to have room for it.
+    assert!(
+        s.pump(|s| s.sidebar_now().iter().any(|l| l.contains("GIT"))),
+        "the block has a heading\n{:?}",
+        s.sidebar_now()
+    );
+    assert!(
+        s.pump(|s| s.sidebar_now().iter().any(|l| l.contains("trunk"))),
+        "and names the branch\n{:?}",
+        s.sidebar_now()
+    );
+    // The verb is built from the state, so it counts what is actually waiting rather than offering
+    // a `pull` that would be a no-op.
+    assert!(
+        s.pump(|s| s.sidebar_now().iter().any(|l| l.contains("pull 3 commits"))),
+        "and offers the pull, counting what the fetch found\n{:?}",
+        s.sidebar_now()
+    );
+
+    // `⇥` on a git row steps the block, and it is *this* block's `⇥` rather than the plan strip's:
+    // both ask for the key on their own rows, and the panel sends the press to whichever the cursor
+    // is over.
+    s.enter_panel();
+    s.key("g");
+    s.key("g");
+    assert!(
+        s.pump(|s| s.sidebar_now().iter().any(|l| l.contains("detail"))),
+        "the key is advertised on the rows it applies to\n{:?}",
+        s.sidebar_now()
+    );
+    s.special("tab");
+    assert!(
+        s.pump(|s| s.sidebar_now().iter().any(|l| l.contains("origin/trunk"))),
+        "and one step up says what it tracks\n{:?}",
+        s.sidebar_now()
+    );
+}
+
+/// Pressing it pulls, and the row says what git said.
+///
+/// The half that matters is the last assertion: a button that goes back to looking exactly as it
+/// did before is one you press twice to find out whether the first press worked.
+#[test]
+fn the_pull_row_pulls_and_reports_what_happened() {
+    if !have_git() {
+        return;
+    }
+    let sb = Sandbox::new("gitpullrow");
+    sb.git_init();
+    sb.git_behind_by(2);
+
+    let mut s = sb.start();
+    s.wait_for("PROJECTS");
+    assert!(
+        s.pump(|s| s.sidebar_now().iter().any(|l| l.contains("pull 2 commits"))),
+        "two waiting\n{:?}",
+        s.sidebar_now()
+    );
+    s.enter_panel();
+    // The block's first landable row is the branch; the verb is the one under it.
+    s.key("g");
+    s.key("g");
+    s.key("j");
+    s.special("enter");
+    assert!(
+        s.pump(|s| s.sidebar_now().iter().any(|l| l.contains("Fast-forward"))),
+        "the row says what git said\n{:?}",
+        s.sidebar_now()
+    );
+    let head = Command::new("git")
+        .current_dir(sb.work())
+        .args(["log", "--oneline", "-1", "--format=%s"])
+        .output()
+        .expect("git runs");
+    assert_eq!(
+        String::from_utf8_lossy(&head.stdout).trim(),
+        "upstream 1",
+        "and the commits actually arrived"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Generated branch names — the whole point of `neosh.gen`
 // ---------------------------------------------------------------------------
@@ -1122,10 +1261,16 @@ fn a_scratch_worktree_is_named_by_the_first_message_and_the_sidebar_follows() {
         "the sidebar row followed it\n{:?}",
         s.sidebar_now()
     );
+    // And it is gone from the *whole* column, not merely replaced on the row above. The block at
+    // the top names the branch of the conversation you are in, which is this worktree — so a rename
+    // that only reached the project row would leave the panel saying two different things about one
+    // checkout. Pumped rather than read once: the row is put right by the host inside the rename
+    // call and the block by a plugin re-reading `git status` afterwards, so they settle a round trip
+    // apart and which one you catch first is a matter of scheduling.
     let gone = scratch.clone();
     assert!(
-        !s.sidebar_now().iter().any(|l| l.contains(&gone)),
-        "and the scratch name is not still a row beside it\n{:?}",
+        s.pump(move |s| !s.sidebar_now().iter().any(|l| l.contains(&gone))),
+        "and the scratch name is not still anywhere in the column\n{:?}",
         s.sidebar_now()
     );
 }
@@ -2799,7 +2944,8 @@ fn pulling_brings_the_remote_changes_into_the_checkout() {
     s.send(&command("git.pull"));
     assert!(
         s.pump(|_| sb.work().join("news.txt").is_file()),
-        "the remote's commit arrived in the working tree"
+        "the remote's commit arrived in the working tree\n{}",
+        s.transcript()
     );
 }
 
@@ -4773,7 +4919,7 @@ fn the_shortcut_row_is_off_because_the_sidebar_already_says_all_of_it() {
     // It read as a good idea and was not. `^T`, `^N` and `^K` are in the sidebar's own footer two
     // rows below, `^Z` is on the row it points at, and what the duplication actually bought was
     // one fewer line of transcript and a composer pressed against the status strip.
-    let sb = Sandbox::new("nohints");
+    let sb = Sandbox::new("nohintstrip");
     let mut s = sb.start();
     s.wait_for("PROJECTS");
     assert!(
@@ -4790,7 +4936,7 @@ fn the_shortcut_row_is_off_because_the_sidebar_already_says_all_of_it() {
 
 #[test]
 fn the_shortcut_row_comes_back_if_you_ask_for_it() {
-    let sb = Sandbox::new("hints");
+    let sb = Sandbox::new("hintstrip");
     sb.write_config("[options]\n\"ui.hints\" = true\n");
     let mut s = sb.start_letting_config_choose();
     // Waiting on a plugin's entry, not the host's: the host seeds `⏎ send` before any plugin has
@@ -8155,7 +8301,7 @@ export async function activate({ neosh }: PluginContext) {
 
 #[test]
 fn a_theme_is_a_plugin() {
-    let sb = Sandbox::new("theme");
+    let sb = Sandbox::new("themepoint");
     install_plugin(&sb, "gruvbox", "", THEME);
     let mut s = sb.start();
     s.wait_for("themes: dark,light,gruvbox");
