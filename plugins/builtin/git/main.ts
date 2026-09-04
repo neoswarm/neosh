@@ -15,7 +15,7 @@
  * ```
  *
  * **A worktree names itself once you have said what it is for.** `git.worktree.new.auto` creates a
- * branch called `brisk-otter`, because a name chosen before the work is a decision made at the
+ * branch called `brisk-otter-k3f9`, because a name chosen before the work is a decision made at the
  * worst possible moment. The first message sent in it is that decision, arriving on its own, so
  * the branch is renamed from it — `fix/composer-paste-truncation` — and never touched again.
  *
@@ -857,9 +857,13 @@ interface WorktreeSpec {
  * `auto` drops the last question too. Naming a branch before you know what the work is is a
  * decision you are not yet equipped to make, and every one of those is a reason not to start —
  * which is the opposite of what a key for "somewhere clean to try this" is for. So the branch is
- * real and its name is two words from a list, and the decision is deferred rather than skipped:
+ * real and its name is two words and a tag, and the decision is deferred rather than skipped:
  * the first message sent in the tree is what it should have been called, so that is what it gets
  * called. See [`nameScratchBranch`].
+ *
+ * **A name that is free is checked, not assumed.** Both namespaces a worktree lands in — the
+ * branches and the directories beside it — because the second outlives the first by design, and a
+ * key that works nineteen times and then says `already exists` is the shape that bug had.
  *
  * Landing in it is the point. Creating a directory you then have to go and find is not a feature,
  * it is a chore with extra steps.
@@ -876,13 +880,17 @@ async function newWorktree(neosh: Neosh, spec: WorktreeSpec = {}): Promise<void>
       .flatMap((b) => [b.name, b.name.replace(/^[^/]+\//, "")]),
   );
 
+  // A worktree occupies two namespaces and the branch list is only one of them. See `occupied`.
+  const parent = await worktreeParent(neosh, root, spec.inside);
+  const here = spec.path ? new Set<string>() : await occupied(neosh, parent);
+
   const asked = spec.branch ??
     (spec.auto
-      ? scratchName(taken)
+      ? scratchName(taken, here)
       : await prompt(neosh, "Branch for the new worktree", { width: 70 }));
   if (!asked || !asked.trim()) return;
   const name = slug(asked);
-  const where = (spec.path ?? (await worktreePath(neosh, root, name, spec.inside))).trim();
+  const where = (spec.path ?? worktreeDir(parent, name, here)).trim();
   if (where === "") return;
 
   const create = !taken.has(name);
@@ -987,25 +995,47 @@ async function repoRoot(neosh: Neosh, cwd?: string): Promise<string | null> {
 }
 
 /**
- * Two words that are not a branch yet.
+ * Two words and a tag that are not a branch yet.
  *
  * An adjective and a noun, because a name you can say out loud is a name you can find again in a
  * list of eight of them — `brisk-otter` is a thing you remember starting, `wt-3` is not, and a
  * timestamp is neither. Both lists are short, concrete and unambiguous when spoken.
  *
- * Collisions are checked rather than hoped away: with a few dozen worktrees the birthday problem
- * is real, and the caller has the branch list in its hand already. The counter suffix is the floor
- * — it never loops forever, and `brisk-otter-2` is still a name.
+ * The two words alone are 1,672 names, which sounds like plenty and is not: thirty trees in, a
+ * repository is about one in four to have already drawn the same name twice, and what that looks
+ * like from the keyboard is a key that fails with `already exists` some of the time and works the
+ * rest — which is worse than one that always does. So the words carry a four-character tag —
+ * `brisk-otter-k3f9` — which is what actually keeps them apart, and the words are what keep them
+ * *readable*. Together that is about 1.5 billion, which is not a secret and is not meant to be one:
+ * it is enough that nobody ever meets the same name twice, and short enough to type.
+ *
+ * The alphabet leaves out `0`, `1`, `i`, `l` and `o`, because a name is a thing you read off one
+ * screen and type into another.
+ *
+ * Collisions are still *checked* rather than hoped away — the caller has the branch list and the
+ * directory listing in its hand already, and those are the two namespaces a worktree occupies. The
+ * counter suffix is the floor: it never loops forever, and `brisk-otter-k3f9-2` is still a name.
  */
-function scratchName(taken: ReadonlySet<string>): string {
-  const pick = <T>(xs: readonly T[]): T => xs[Math.floor(Math.random() * xs.length)]!;
+function scratchName(...taken: ReadonlySet<string>[]): string {
+  const free = (name: string) => !taken.some((t) => t.has(name));
   for (let i = 0; i < 50; i++) {
-    const name = `${pick(SCRATCH_ADJECTIVES)}-${pick(SCRATCH_NOUNS)}`;
-    if (!taken.has(name)) return name;
+    const name = `${pick(SCRATCH_ADJECTIVES)}-${pick(SCRATCH_NOUNS)}-${tag()}`;
+    if (free(name)) return name;
   }
-  const base = `${pick(SCRATCH_ADJECTIVES)}-${pick(SCRATCH_NOUNS)}`;
-  for (let n = 2; ; n++) if (!taken.has(`${base}-${n}`)) return `${base}-${n}`;
+  const base = `${pick(SCRATCH_ADJECTIVES)}-${pick(SCRATCH_NOUNS)}-${tag()}`;
+  for (let n = 2; ; n++) if (free(`${base}-${n}`)) return `${base}-${n}`;
 }
+
+function pick<T>(xs: readonly T[]): T {
+  return xs[Math.floor(Math.random() * xs.length)]!;
+}
+
+/** Four characters of the alphabet above. */
+function tag(): string {
+  return Array.from({ length: 4 }, () => pick(SCRATCH_ALPHABET)).join("");
+}
+
+const SCRATCH_ALPHABET = "23456789abcdefghjkmnpqrstuvwxyz".split("");
 
 const SCRATCH_ADJECTIVES = [
   "amber", "brisk", "calm", "clever", "coral", "crisp", "dapper", "eager", "fleet", "gentle",
@@ -1023,9 +1053,13 @@ const SCRATCH_NOUNS = [
 ] as const;
 
 /**
- * Where a worktree for `branch` goes.
+ * The directory this repository's worktrees go in.
  *
- * `<root>/<repo>/<branch>` under `worktree.root`, which is `~/.nsh` unless configured — a
+ * The parent rather than the tree, because the two callers want different things from it: one
+ * wants somewhere to put a checkout, the other wants to know which names in there are spoken for.
+ * See {@link occupied}.
+ *
+ * `<root>/<repo>/` under `worktree.root`, which is `~/.nsh` unless configured — a
  * directory of neosh's own rather than a sibling of the repository, because a worktree is not part
  * of the project you are working on and littering its parent with `foo-worktrees/` is how people
  * end up with checkouts they cannot account for. The repository name is a level of its own so two
@@ -1040,25 +1074,57 @@ const SCRATCH_NOUNS = [
  *
  * An empty `worktree.root` restores the sibling layout, for anyone who wants their trees next to
  * the thing they are trees of.
- *
- * Slashes in a branch become dashes: `feat/thing` is one directory, not two, because the directory
- * is a name and not a path.
  */
-async function worktreePath(
-  neosh: Neosh,
-  repoRoot: string,
-  branch: string,
-  inside = false,
-): Promise<string> {
-  const leaf = branch.replace(/\//g, "-");
+async function worktreeParent(neosh: Neosh, repoRoot: string, inside = false): Promise<string> {
   const repoName = repoRoot.split("/").filter(Boolean).pop() ?? "repo";
   const configured = ((await neosh.opt.get<string>("worktree.root")) ?? "").trim();
   // Asked to stay inside regardless of what is configured. A relative root still names the
   // directory; anything else falls back to the conventional one.
-  if (inside) return `${repoRoot}/${insideDir(configured)}/${leaf}`;
-  if (configured === "") return `${parentOf(repoRoot)}/${repoName}-worktrees/${leaf}`;
-  if (configured.startsWith("/")) return `${configured}/${repoName}/${leaf}`;
-  return `${repoRoot}/${configured}/${leaf}`;
+  if (inside) return `${repoRoot}/${insideDir(configured)}`;
+  if (configured === "") return `${parentOf(repoRoot)}/${repoName}-worktrees`;
+  if (configured.startsWith("/")) return `${configured}/${repoName}`;
+  return `${repoRoot}/${configured}`;
+}
+
+/**
+ * The directory names already in use where a worktree would land.
+ *
+ * **A directory outlives the branch it was named after.** A scratch tree is created at
+ * `.worktrees/brisk-otter` on a branch of the same name, and then the first message renames the
+ * branch to `fix/the-login` and deliberately leaves the directory where it is — moving it would
+ * invalidate the conversation's `cwd`. So `git branch` stops mentioning `brisk-otter` while the
+ * directory sits there forever, and a branch list is not an answer to "is this name free": the
+ * next tree to land on those two words picks a name git is happy with and a path git refuses, and
+ * `git worktree add` fails with `already exists` on a name nothing on screen said was taken.
+ *
+ * Asked of the filesystem rather than of `git worktree list`, because a tree removed by hand, or
+ * pruned, leaves a directory that git no longer lists and `add` still trips over.
+ *
+ * Best-effort, and capped by the completion limit at two hundred entries — so this narrows the
+ * window rather than closing it, and the tag in {@link scratchName} is what carries the guarantee.
+ * A parent that does not exist yet is an empty list, which is the right answer.
+ */
+async function occupied(neosh: Neosh, parent: string): Promise<Set<string>> {
+  const answer = await neosh.path.complete(`${parent}/`).catch(() => ({ paths: [] as string[] }));
+  return new Set(
+    answer.paths.map((p) => p.replace(/\/+$/, "").split("/").pop() ?? "").filter((n) => n !== ""),
+  );
+}
+
+/**
+ * Where a worktree for `branch` goes, given what is already in `parent`.
+ *
+ * Slashes in a branch become dashes: `feat/thing` is one directory, not two, because the directory
+ * is a name and not a path.
+ *
+ * And the directory is *only* a place. The branch is what you named and what you will look for
+ * afterwards; where its checkout sits is this plugin's business, so a name already taken on disk
+ * gets the counter rather than the failure — `feat/thing` in `feat-thing-2` is a working tree on
+ * the branch you asked for, and `fatal: 'feat-thing' already exists` is a directory you now have to
+ * go and look at before you can start.
+ */
+function worktreeDir(parent: string, branch: string, taken: Set<string>): string {
+  return `${parent}/${dedupe(branch.replace(/\//g, "-"), taken)}`;
 }
 
 /** The in-repository directory worktrees go in: a relative `worktree.root`, else `.worktrees`. */

@@ -410,8 +410,8 @@ is `docs/releasing.md`.
   into the repository's `.gitignore` (tracked, so every clone gets it; skipped when already
   ignored), or every `git status` reads as one giant untracked directory.
 - **A branch is named by what you asked for, once you have asked.** A worktree you did not name
-  starts on `wily-nimbus`, because naming a branch before the work is a decision made at the worst
-  possible moment — and the first message sent in it *is* that decision, arriving on its own, so
+  starts on `wily-nimbus-7hq2`, because naming a branch before the work is a decision made at the
+  worst possible moment — and the first message sent in it *is* that decision, arriving on its own, so
   the branch is renamed from it and never touched again. Only a name nobody chose: the mark is a
   session var written by whoever generated it (`git.branch.scratch`), never a pattern match on the
   shape of the name, which cannot tell `brisk-otter` we picked from `brisk-otter` you typed. At
@@ -426,6 +426,20 @@ is `docs/releasing.md`.
   read on every redraw, so `GitRenameBranch` is the one git write handled on the host loop, which
   is what makes the sidebar row follow instead of saying `wily-nimbus` until restart. The directory
   keeps the old name on purpose: moving it would invalidate the conversation's `cwd`.
+- **A worktree occupies two namespaces, and the one that outlives it is the directory.** Which is
+  precisely what the rule above arranges: the branch is renamed and the directory is not, so
+  `git branch` stops mentioning `wily-nimbus` while `.worktrees/wily-nimbus` sits there forever —
+  and a branch list, which is what a generated name was checked against, is therefore not an answer
+  to *is this name free*. What that looked like from the keyboard is the shape this class of bug
+  always has: a key that works nineteen times and then fails with `already exists`, naming
+  something nothing on screen had said was taken. So both are asked — the branches, and the
+  directory listing beside the tree — and the name carries a **tag** (`brisk-otter-k3f9`) because
+  two words from two short lists are 1,672 names, and thirty trees in, a repository is about one in
+  four to have drawn the same one twice. Sayable *and* unique: the words are what you read out,
+  the tag is what keeps them apart, and neither is load-bearing on its own. When a directory is in
+  the way anyway — a tree removed by hand, a listing longer than the completion cap — the **branch**
+  is what you asked for and the directory is only where it went, so the counter goes on the
+  directory (`feat/thing` in `feat-thing-2`) and never on the branch.
 - **A project outlives the conversations in it.** The panel's list is written down (`sidebar.projects`,
   a workspace var) rather than worked out from where the conversations happen to be — derived, it
   deleted the directory you had worked in all month the moment you cleared out the last thread in
@@ -795,7 +809,7 @@ only way to do anything.
 | `^T` | Projects and conversations. Switching is never refused — turns keep running where they are |
 | `^J` | The computers in this workspace. Add one by its address, allow one that is asking, rename one (`^E`), or open what it is running. A machine this one has reached that has not allowed it back says so, and says which key to press over there |
 | `^F` | What you have archived — see below. Filter it, put some back, or finally empty it |
-| `^N` | New conversation. In a repository it asks where: here, a worktree you need not name, one kept inside the project, one you do name, an existing one, another machine, elsewhere. A worktree you did not name is named by your first message — `fix/composer-paste-truncation`, not `wily-nimbus` |
+| `^N` | New conversation. In a repository it asks where: here, a worktree you need not name, one kept inside the project, one you do name, an existing one, another machine, elsewhere. A worktree you did not name is named by your first message — `fix/composer-paste-truncation`, not `wily-nimbus-7hq2` |
 | `^O` | Add a project. The filter line **is** the path field: `/`, `~` and `./` complete directories from the first keystroke, `⇥` walks into the highlighted one, `↵` takes what you typed. `linux-box:` completes on that computer instead |
 | `^B` | Toggle the sidebar |
 | `^K` | Command palette |
