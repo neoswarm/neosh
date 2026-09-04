@@ -1,6 +1,6 @@
 {
   "name": "@neosh/sidebar",
-  "version": "0.4.1",
+  "version": "0.4.2",
   "description": "A docked panel: where you are, what changed, and what is answering.",
   "license": "MIT",
   "type": "module",
