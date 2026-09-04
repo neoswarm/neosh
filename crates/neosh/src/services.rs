@@ -12,7 +12,7 @@ use std::sync::Arc;
 use std::collections::HashMap;
 use std::sync::{Arc as StdArc, Mutex};
 
-use neosh_agent::Agent;
+use neosh_agent::{Agent, PluginBridge};
 use neosh_proto::{ApiError, ApiOk, ApiResult, DiffTarget, InstanceId, ModelEntry, ModelSelection};
 use neosh_vcs::{Git, VcsError};
 use tokio_util::sync::CancellationToken;
@@ -43,6 +43,8 @@ pub struct Services {
     pub state_dir: Option<PathBuf>,
     /// The plugin boundary, so a permission question can reach whoever answers it.
     pub bridge: StdArc<crate::bridge::ScriptBridge>,
+    /// Scripts watching the event stream, so [`Services::emit`] reaches them too.
+    pub subscribers: Subscribers,
     /// Models discovered from each endpoint this session.
     ///
     /// Shared with the host so it survives across calls and is cleared on reload. Without it every
@@ -54,11 +56,48 @@ pub struct Services {
 /// Discovered models per instance, for the life of a session.
 pub type ModelCache = StdArc<Mutex<HashMap<InstanceId, Vec<neosh_proto::ModelInfo>>>>;
 
+/// Everyone attached to the control socket who asked for the event stream.
+///
+/// Shared with [`Services`] so a call running off the host loop can reach them: a slow call is
+/// spawned with its services and nothing else, and an event only the plugins receive is a bus that
+/// says different things depending on which surface you are watching from.
+pub type Subscribers =
+    StdArc<Mutex<Vec<tokio::sync::mpsc::UnboundedSender<neosh_proto::PluginEvent>>>>;
+
+/// What a clone says about itself while it runs.
+///
+/// A bus event rather than a `UiEvent`, because nothing about it is the host's to draw: a plugin
+/// asked for the clone and a plugin decides what watching one looks like. Named here so the
+/// emitter and the built-in reader cannot drift — a subscriber to a misspelled name is a panel
+/// that spins for ever with no error anywhere.
+pub const CLONE_EVENT: &str = "neosh.git.clone";
+
 impl Services {
     fn repo(&self) -> Result<&Git, ApiError> {
         self.git.as_ref().ok_or_else(|| ApiError::NotFound {
             what: format!("no git repository at {}", self.cwd.display()),
         })
+    }
+
+    /// Put an event on the bus from a call running off the host loop.
+    ///
+    /// `from: "neosh"` for the same reason the host stamps it on `EventEmit`: who said a thing is
+    /// one of the few facts in a plugin message that must not be forgeable, and this one was said
+    /// by the workspace itself.
+    ///
+    /// Both audiences, because they are one bus. A subscriber that has gone is dropped rather than
+    /// queued for — the send fails, it leaves the list, and a script walking away mid-clone cannot
+    /// cost this workspace memory.
+    fn emit(&self, name: &str, data: serde_json::Value) {
+        let event = neosh_proto::PluginEvent::Event {
+            name: name.to_string(),
+            data: Some(data),
+            from: "neosh".into(),
+        };
+        self.bridge.broadcast(event.clone());
+        if let Ok(mut subs) = self.subscribers.lock() {
+            subs.retain(|s| s.send(event.clone()).is_ok());
+        }
     }
 
     /// The repository at `cwd`, or this conversation's when nobody asked for one in particular.
@@ -211,6 +250,63 @@ impl Services {
     pub async fn git_worktrees(&self, cwd: Option<String>) -> ApiResult {
         let repo = self.repo_at(cwd).await?;
         Ok(ApiOk::Worktrees { worktrees: repo.worktrees().await.map_err(vcs_err)? })
+    }
+
+    /// Clone `url` into `path`, reporting progress on the bus as it goes.
+    ///
+    /// The one git call that takes no repository: there is not one yet, which is the point of it.
+    ///
+    /// **Progress is keyed by `path`, not by the plugin that asked.** A workspace can be cloning
+    /// two things at once and a progress row the two of them share is a row reporting neither —
+    /// the destination is the only thing about a clone that is certainly unique, since the same
+    /// repository may legitimately be cloned to two places.
+    ///
+    /// A `done` event is emitted on the way out either way, success or failure, because a panel
+    /// that draws itself from these has no other way to learn it may stop: an error goes back to
+    /// the caller as a `Refusal`, and a caller is not necessarily the thing drawing.
+    pub async fn git_clone(&self, url: String, path: String) -> ApiResult {
+        self.permit_write("clone")?;
+        let at = std::path::PathBuf::from(&path);
+        if !at.is_absolute() {
+            return Err(ApiError::InvalidArgument {
+                message: format!("git.clone needs an absolute path, got {path}"),
+            });
+        }
+        self.emit(
+            CLONE_EVENT,
+            serde_json::json!({ "path": path, "url": url, "phase": "Starting", "percent": null }),
+        );
+        let result = neosh_vcs::clone(&url, &at, |phase, percent| {
+            self.emit(
+                CLONE_EVENT,
+                serde_json::json!({
+                    "path": path, "url": url, "phase": phase, "percent": percent,
+                }),
+            );
+        })
+        .await;
+        match result {
+            Ok(()) => {
+                self.emit(
+                    CLONE_EVENT,
+                    serde_json::json!({
+                        "path": path, "url": url, "phase": "done", "percent": 100, "done": true,
+                    }),
+                );
+                Ok(ApiOk::Text { text: path })
+            }
+            Err(e) => {
+                let message = e.to_string();
+                self.emit(
+                    CLONE_EVENT,
+                    serde_json::json!({
+                        "path": path, "url": url, "phase": "failed", "done": true,
+                        "error": message,
+                    }),
+                );
+                Err(vcs_err(e))
+            }
+        }
     }
 
     pub async fn git_log(&self, limit: u32) -> ApiResult {

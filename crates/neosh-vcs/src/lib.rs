@@ -408,6 +408,106 @@ impl Git {
     }
 }
 
+/// Clone `url` into `path`, calling `on_progress` with the phase and percentage as git reports it.
+///
+/// A free function rather than a [`Git`] method, because it is the one call that arrives before
+/// there is a repository to be a method on. It runs in `path`'s parent, which it creates: cloning
+/// into a location you have just invented is the ordinary case here, not an error to hand back.
+///
+/// **The destination is checked before git is started.** `git clone` into an existing non-empty
+/// directory fails with a message about `fatal: destination path ... already exists`, which is
+/// accurate and reads, to somebody who has just pressed a key on a menu row, as though the clone
+/// itself went wrong. Checked here it is a sentence naming the directory.
+///
+/// **Progress is `\r`-separated, not `\n`-separated**, which is why this reads bytes rather than
+/// using `BufReader::lines()`: git redraws one status line in place, so a whole clone's progress
+/// is a single line as far as a line reader is concerned, and the callback would fire once, at the
+/// end, having reported nothing anybody could watch.
+pub async fn clone(
+    url: &str,
+    path: &Path,
+    mut on_progress: impl FnMut(&str, Option<u8>),
+) -> Result<(), VcsError> {
+    if std::fs::read_dir(path).is_ok_and(|mut d| d.next().is_some()) {
+        return Err(VcsError::Command {
+            command: format!("clone {url}"),
+            message: format!("{} already exists and is not empty", path.display()),
+        });
+    }
+    let parent = path.parent().unwrap_or(path);
+    std::fs::create_dir_all(parent)?;
+
+    let mut cmd = Command::new("git");
+    cmd.current_dir(parent)
+        // `--progress` because git only reports it when stderr is a terminal, and here it is a
+        // pipe. Without it the whole clone is silent and the panel spins on nothing.
+        .args(["clone", "--progress", "--", url, &path.display().to_string()])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_PAGER", "cat")
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .env("LC_ALL", "C");
+    // The same scrub `run` does, and for the same reason: an askpass helper opening a window, or
+    // a prompt written onto a screen a TUI owns, is a hang with no visible cause. Credential
+    // *helpers* are untouched, so an https clone still works wherever `git pull` already does.
+    cmd.env_remove("GIT_ASKPASS");
+    cmd.env_remove("SSH_ASKPASS");
+
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Err(VcsError::GitMissing),
+        Err(e) => return Err(VcsError::Io(e)),
+    };
+    let mut stderr = child.stderr.take().expect("stderr is piped");
+
+    // Kept whole so the failure message can be git's own. Bounded, because a clone that fails in a
+    // redirect loop can write for a long time and none of it after the first screenful helps.
+    let mut said = String::new();
+    let mut buf = [0u8; 4096];
+    let mut pending = String::new();
+    loop {
+        let n = tokio::io::AsyncReadExt::read(&mut stderr, &mut buf).await?;
+        if n == 0 {
+            break;
+        }
+        pending.push_str(&String::from_utf8_lossy(&buf[..n]));
+        // Both separators: `\r` is a redraw of the current phase and `\n` ends one for good, and a
+        // reader that honours only the second sees one line per clone.
+        while let Some(at) = pending.find(['\r', '\n']) {
+            let line: String = pending.drain(..=at).collect();
+            let line = line.trim_end_matches(['\r', '\n']);
+            if said.len() < 8192 {
+                said.push_str(line);
+                said.push('\n');
+            }
+            if let Some((phase, percent)) = parse::clone_progress(line) {
+                on_progress(&phase, percent);
+            }
+        }
+    }
+    if let Some((phase, percent)) = parse::clone_progress(&pending) {
+        on_progress(&phase, percent);
+    }
+
+    let status = child.wait().await?;
+    if status.success() {
+        return Ok(());
+    }
+    // git's last word is the useful one — `Repository not found`, `Permission denied (publickey)`,
+    // `could not resolve host`. Each is a different thing for the person reading to do, and an
+    // exit code flattens all three into "clone failed".
+    let message = said
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && parse::clone_progress(l).is_none())
+        .next_back()
+        .unwrap_or("clone failed")
+        .to_string();
+    Err(VcsError::Command { command: format!("clone {url}"), message })
+}
+
 fn diff_args(target: &DiffTarget, stat: bool) -> Vec<String> {
     let mut args: Vec<String> = match target {
         DiffTarget::Unstaged => vec!["diff".into()],

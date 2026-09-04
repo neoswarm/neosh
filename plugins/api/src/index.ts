@@ -1169,6 +1169,42 @@ export interface GitApi {
    * exactly that one.
    */
   removeWorktree(path: string, opts?: { force?: boolean; cwd?: string }): Promise<void>;
+  /**
+   * Clone `url` into `path`, resolving to the path once it is there.
+   *
+   * The one call here with no `cwd`: everything else asks a repository a question, and this one
+   * arrives before there is a repository to ask. `path` is absolute and its parent need not
+   * exist — cloning into a location you have just invented is the ordinary case.
+   *
+   * **It reports progress while it runs**, on the bus as {@link CLONE_EVENT}, so a caller that
+   * wants to draw a clone rather than block on one subscribes before awaiting this. Keyed by
+   * `path`, because a workspace may be cloning two things at once.
+   *
+   * Needs `vcs_write` in the manifest, like every other call here that changes a disk.
+   */
+  clone(url: string, path: string): Promise<string>;
+}
+
+/**
+ * What {@link GitApi.clone} says about itself while it runs, on {@link EventsApi.on}.
+ *
+ * `phase` is git's own word for what it is doing — `Receiving objects`, `Resolving deltas` — and
+ * `percent` is absent for the phases that have no total, which draw as a spinner rather than as a
+ * bar. `done` arrives exactly once per clone, on success and on failure alike, because a panel
+ * drawing itself from these has no other way to learn it may stop.
+ */
+export const CLONE_EVENT = "neosh.git.clone";
+
+/** One {@link CLONE_EVENT} payload. */
+export interface CloneProgress {
+  /** Which clone this is about. The key, since two may be running. */
+  path: string;
+  url: string;
+  phase: string;
+  percent?: number | null;
+  done?: boolean;
+  /** Present, with git's own last word in it, only when the clone failed. */
+  error?: string;
 }
 
 /**
@@ -2828,6 +2864,10 @@ function build(
           force: opts?.force ?? false,
           cwd: opts?.cwd ?? null,
         });
+      },
+      async clone(url, path) {
+        const v = await c({ call: "git_clone", url, path });
+        return expect(v, "text").text;
       },
     },
     gen: {

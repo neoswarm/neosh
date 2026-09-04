@@ -508,6 +508,18 @@ export type ApiCall =
     cwd?: string | null;
   }
   | {
+    "call": "git_clone";
+    /**
+     * Anything `git clone` takes: an `https://` or `git@` URL, or a local path.
+     */
+    url: string;
+    /**
+     * Where the working tree lands, in full. The caller resolved the root and the name, so
+     * that a picker can *show* the destination on the row before anything is written.
+     */
+    path: string;
+  }
+  | {
     "call": "gen_complete";
     prompt: string;
     system?: string | null;

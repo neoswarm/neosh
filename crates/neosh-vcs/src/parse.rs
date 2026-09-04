@@ -245,9 +245,99 @@ pub fn commits(input: &str) -> Vec<CommitInfo> {
         .collect()
 }
 
+/// One line of `git clone --progress`, as a phase and how far through it git says it is.
+///
+/// `None` for anything that is not a progress line, which is most of what a clone writes to
+/// stderr: warnings, hints, and the `Cloning into '…'` banner all come down the same pipe and none
+/// of them is a state to draw.
+///
+/// The shape is `<phase>: <n>% (<done>/<total>)`, and the percentage is the only part worth
+/// keeping — `(1234/5678)` is the same fact counted differently, and a progress row with both on it
+/// is a row that has to be truncated on a narrow terminal.
+pub fn clone_progress(line: &str) -> Option<(String, Option<u8>)> {
+    // `remote:` comes off *before* the phase is split out, not after. git prefixes the phases the
+    // server is doing, and `split_once(": ")` takes the first colon — so stripping afterwards
+    // finds a phase called `remote` and throws away `Compressing objects: 100%` as its argument.
+    // Which side is counting is not something anybody watching can act on, so the prefix is
+    // dropped rather than kept.
+    let line = line.trim();
+    let line = line.strip_prefix("remote:").map(str::trim_start).unwrap_or(line);
+    let (phase, rest) = line.split_once(": ")?;
+    let phase = phase.trim();
+    if phase.is_empty() {
+        return None;
+    }
+
+    let rest = rest.trim_start();
+    let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+    if rest[digits.len()..].starts_with('%') {
+        // Anything over 100 is discarded rather than clamped: a bar pinned at 100% for the rest of
+        // a clone reports "finished" for as long as the slowest phase takes, which is the one
+        // wrong answer a progress bar must never give. Without a number it draws as a spinner,
+        // which is true — something is happening and we cannot say how much is left.
+        return Some((phase.to_string(), digits.parse::<u8>().ok().filter(|p| *p <= 100)));
+    }
+    // A phase that reports a bare count and then finishes — `Enumerating objects: 1234, done.` —
+    // has a name and no percentage, and both of those are the answer rather than a reason to drop
+    // it. Everything else on this pipe is a banner, a warning or a hint.
+    rest.contains("done").then(|| (phase.to_string(), None))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Captured from a real `git clone --progress` of a repository with a few thousand objects.
+    ///
+    /// Every one of these arrives on stderr, and the ones that are not progress have to come back
+    /// `None` rather than as a phase called something like `warning` — a clone that prints a
+    /// deprecation notice must not leave that notice on screen as the thing it is doing.
+    #[test]
+    fn clone_progress_reads_the_phase_and_the_percentage() {
+        assert_eq!(
+            clone_progress("Receiving objects:  47% (580/1234), 1.20 MiB | 2.40 MiB/s"),
+            Some(("Receiving objects".into(), Some(47)))
+        );
+        assert_eq!(
+            clone_progress("Resolving deltas: 100% (700/700), done."),
+            Some(("Resolving deltas".into(), Some(100)))
+        );
+        // The server's side of it, said without saying whose side it is. Two colons on the line,
+        // and the phase is the second one — taking the first gives a phase called `remote` with
+        // the real phase as its argument, which is what stripping the prefix afterwards does.
+        assert_eq!(
+            clone_progress("remote: Counting objects:  12% (150/1234)"),
+            Some(("Counting objects".into(), Some(12)))
+        );
+        assert_eq!(
+            clone_progress("remote: Compressing objects: 100% (567/567), done."),
+            Some(("Compressing objects".into(), Some(100)))
+        );
+        // A phase with a count and no total. It has a name and no percentage, and both of those
+        // are the answer rather than a reason to drop it.
+        assert_eq!(
+            clone_progress("remote: Enumerating objects: 1234, done."),
+            Some(("Enumerating objects".into(), None))
+        );
+        // Not progress. The banner, a warning and a hint all use the same `x: y` shape, which is
+        // why the percentage has to be *checked* rather than assumed from the colon.
+        assert_eq!(clone_progress("Cloning into '/tmp/thing'..."), None);
+        assert_eq!(clone_progress("warning: redirecting to https://example.com/repo.git/"), None);
+        assert_eq!(clone_progress(""), None);
+    }
+
+    /// A percentage git never emits, and one that would wrap a `u8`.
+    ///
+    /// `parse::<u8>` on `300` fails rather than wrapping to 44, so the phase survives with no
+    /// number on it — which draws as a spinner rather than as a bar that has gone backwards.
+    #[test]
+    fn clone_progress_never_reports_more_than_all_of_it() {
+        assert_eq!(clone_progress("Receiving objects: 300% (1/1)"), Some(("Receiving objects".into(), None)));
+        assert_eq!(
+            clone_progress("Receiving objects: 100% (1/1), done."),
+            Some(("Receiving objects".into(), Some(100)))
+        );
+    }
 
     /// Captured from a real `git status --porcelain=v2 --branch -z`, with NULs written explicitly.
     fn fixture() -> String {
