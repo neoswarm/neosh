@@ -84,6 +84,21 @@ pub trait Provider: Send + Sync {
         Ok(instance.models.clone())
     }
 
+    /// Why this driver will not run a model *on this machine*, in a sentence, or nothing.
+    ///
+    /// The vendor CLI being too old for a model the catalogue lists is the whole of it today. Two
+    /// callers, and they are the reason this is separate from [`Self::list_models`]: that one is
+    /// async and answers a picker, and the other is
+    /// [`ProviderRegistry::default_selection`](crate::ProviderRegistry::default_selection), which
+    /// is synchronous and has to pick something a first message will not bounce off. One question
+    /// asked twice from two places is how the picker and the default come to disagree.
+    ///
+    /// Cheap by contract: no network, no process launch per call. `claude --version` is asked once
+    /// per process and remembered, which is what makes that true here.
+    fn unavailable(&self, _instance: &InstanceConfig, _model: &neosh_proto::ModelId) -> Option<String> {
+        None
+    }
+
     /// Start a turn. Dropping the returned stream, or cancelling the token, must terminate any
     /// in-flight request and reap any child process.
     fn stream(
