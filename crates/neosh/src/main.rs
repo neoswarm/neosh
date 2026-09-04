@@ -1017,7 +1017,14 @@ async fn list_models(agent: &Agent) -> anyhow::Result<()> {
             }
         }
         for m in models {
-            say!("    {}/{}", inst.id, m.id);
+            // A model the driver has said it will not run is listed with the reason on the end,
+            // for the reason the picker draws it greyed rather than dropping it: `--list-models`
+            // is what somebody runs to find out why `--model` did not take, and a list that is
+            // silently missing the id they typed answers that with nothing.
+            match &m.unavailable {
+                Some(why) => say!("    {}/{}  ({why})", inst.id, m.id),
+                None => say!("    {}/{}", inst.id, m.id),
+            }
         }
     }
     Ok(())

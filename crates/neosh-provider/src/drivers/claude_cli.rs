@@ -107,15 +107,21 @@ pub fn control_mode(mode: PermissionMode) -> &'static str {
 /// The oldest `claude` that will accept a given model.
 ///
 /// A CLI that has not heard of a model does not degrade — it exits with "unknown model" after you
-/// have typed your question. So the picker is filtered rather than the failure explained, and
-/// anything not listed here has been around long enough that no installed version lacks it.
+/// have typed your question. So the model is marked rather than the failure explained afterwards,
+/// and anything not listed here has been around long enough that no installed version lacks it.
 ///
-/// Sourced from the release each model shipped in. Wrong in the safe direction if it drifts: a
-/// too-high floor hides a model until the next upgrade, a too-low one is the behaviour we have
-/// today.
+/// Sourced from the release each model shipped in — and where the CLI itself will say, from the CLI:
+/// the 400 it answers with reads *"Claude Code 2.1.222 does not support this model; version 2.1.251
+/// or newer is required"*, which is the number, the fix and the sentence to put on the row, all
+/// from the one place that cannot be wrong about it.
+///
+/// Wrong in the safe direction if it drifts: a too-high floor tells somebody to update a CLI that
+/// would have run the model, a too-low one is a failed turn. `claude-fable-5-1` was written down as
+/// 2.1.255 and is 2.1.251 — four releases in which the picker's answer was "update" and the CLI's
+/// was "yes".
 const MIN_VERSION: &[(&str, (u32, u32, u32))] = &[
     ("claude-opus-5", (2, 1, 219)),
-    ("claude-fable-5-1", (2, 1, 255)),
+    ("claude-fable-5-1", (2, 1, 251)),
     ("claude-fable-5", (2, 1, 170)),
     // 197, not 219. Read off the vendor's own table rather than assumed equal to Opus 5's, which
     // is what it was — and a floor twenty-two releases too high is a model missing from the picker
@@ -442,14 +448,27 @@ fn parse_version(out: &str) -> Option<(u32, u32, u32)> {
     Some((major, minor, patch))
 }
 
-/// Whether an installed version can serve a model.
+/// Why an installed version cannot serve a model, or nothing when it can.
 ///
-/// Unknown version means yes: see [`ClaudeCliProvider::version`].
-fn serves(model: &str, installed: Option<(u32, u32, u32)>) -> bool {
-    let Some(need) = MIN_VERSION.iter().find(|(id, _)| *id == model).map(|(_, v)| *v) else {
-        return true;
-    };
-    installed.is_none_or(|have| have >= need)
+/// Unknown version means it can: see [`ClaudeCliProvider::version`].
+///
+/// The sentence carries the fix. "unsupported" is a diagnosis and `claude update` is an action, and
+/// the one thing somebody reading a greyed-out row wants is the second. The version is on the end
+/// because *which* update is the next question — a `claude` installed by Homebrew does not update
+/// itself when the one the CLI ships with says it does.
+///
+/// Twenty-seven columns, and that is not an accident: this is read in the detail column of the
+/// model picker, which is twenty-eight wide on the row it is drawn on and cannot be landed on to
+/// wrap. A sentence one column too long is a row that says `run claude update (2.1.25` — the fix
+/// cut off mid-number, which is worse than not having said it. The version installed is not in
+/// here for the same reason and loses nothing: you are reading this *because* yours is older.
+fn too_old_for(model: &str, installed: Option<(u32, u32, u32)>) -> Option<String> {
+    let need = MIN_VERSION.iter().find(|(id, _)| *id == model).map(|(_, v)| *v)?;
+    let have = installed?;
+    (have < need).then(|| {
+        let (a, b, c) = need;
+        format!("run claude update ({a}.{b}.{c})")
+    })
 }
 
 /// The model string `--model` should be given.
@@ -487,16 +506,33 @@ impl Provider for ClaudeCliProvider {
         DriverKind::from("claude-cli")
     }
 
-    /// The catalogue, minus anything this install is too old to accept.
+    /// The catalogue, with anything this install is too old to accept marked as such.
+    ///
+    /// Marked, not removed. Filtered out, the newest model in the catalogue was simply absent from
+    /// the picker on every CLI older than its floor — no row, no reason, and nothing anywhere on
+    /// screen to say it had ever been there. What that looks like from the keyboard is the feature
+    /// not existing, which sends somebody to the release notes for an answer that was one `claude
+    /// update` away.
     ///
     /// Not a network call and not cached upstream by accident: `--version` is asked once per
-    /// process, and the filtering is a comparison over nine entries.
+    /// process, and the comparison is over nine entries.
     async fn list_models(&self, _instance: &InstanceConfig) -> Result<Vec<ModelInfo>, ProviderError> {
         let installed = self.version();
         Ok(catalog::claude_cli_models()
             .into_iter()
-            .filter(|m| serves(m.id.as_ref(), installed))
+            .map(|mut m| {
+                m.unavailable = too_old_for(m.id.as_ref(), installed);
+                m
+            })
             .collect())
+    }
+
+    fn unavailable(
+        &self,
+        _instance: &InstanceConfig,
+        model: &neosh_proto::ModelId,
+    ) -> Option<String> {
+        too_old_for(model.as_ref(), self.version())
     }
 
     fn delegates_agent_loop(&self) -> bool {
@@ -1702,41 +1738,80 @@ mod tests {
     }
 
     /// The ordering that matters is patch-level: the releases these models shipped in differ only
-    /// there, so a comparison that stopped at minor would offer every one of them to every install.
+    /// there, so a comparison that stopped at minor would clear every one of them on every install.
     #[test]
-    fn an_older_cli_is_not_offered_a_model_it_will_reject() {
-        assert!(!serves("claude-opus-5", Some((2, 1, 218))));
-        assert!(serves("claude-opus-5", Some((2, 1, 219))));
-        assert!(serves("claude-opus-5", Some((2, 2, 0))));
+    fn an_older_cli_is_told_what_it_would_reject() {
+        assert!(too_old_for("claude-opus-5", Some((2, 1, 218))).is_some());
+        assert!(too_old_for("claude-opus-5", Some((2, 1, 219))).is_none());
+        assert!(too_old_for("claude-opus-5", Some((2, 2, 0))).is_none());
         // Nothing recorded means it has always been there.
-        assert!(serves("claude-haiku-4-5", Some((1, 0, 0))));
+        assert!(too_old_for("claude-haiku-4-5", Some((1, 0, 0))).is_none());
     }
 
-    /// A CLI that will not say what it is gets the benefit of the doubt: hiding everything recent
-    /// from somebody whose install works is worse than offering one model too many.
+    /// The row has to say what to *do*. A greyed-out model whose only explanation is that it is
+    /// unsupported sends somebody to the release notes; one that names the command and the version
+    /// is answered where it is read — and it has to be answered *there*, because the row cannot be
+    /// landed on and so is never wrapped.
+    #[test]
+    fn the_reason_carries_the_fix_and_fits_the_column_it_is_read_in() {
+        let why = too_old_for("claude-fable-5-1", Some((2, 1, 222))).expect("too old");
+        assert!(why.contains("claude update"), "{why} says how to get there");
+        assert!(why.contains("2.1.251"), "{why} says which version would do");
+        assert!(why.chars().count() <= 28, "{why} is {} columns, and 28 is the room", why.len());
+    }
+
+    /// A CLI that will not say what it is gets the benefit of the doubt: greying out everything
+    /// recent for somebody whose install works is worse than offering one model too many.
     #[test]
     fn an_unknown_version_is_offered_everything() {
-        assert!(serves("claude-opus-5", None));
+        assert!(too_old_for("claude-opus-5", None).is_none());
     }
 
-    /// Every floor here is a number read off the vendor's release notes, and the failure it causes
-    /// is silent in both directions: too high and the model is missing from `^P` with nothing
-    /// saying why, too low and picking it fails the turn after you have typed the question. Pinned
-    /// per model rather than as one "is it recent" check, because they genuinely differ — Sonnet 5
-    /// landed twenty-two releases before Opus 5 and was hidden for all of them by a floor copied
-    /// from its neighbour.
+    /// Every floor here is a number read off the vendor's release notes — or, where it has said so,
+    /// off the CLI's own 400. The failure is silent in both directions: too high and a model that
+    /// would have run reads as one needing an update, too low and picking it fails the turn after
+    /// you have typed the question. Pinned per model rather than as one "is it recent" check,
+    /// because they genuinely differ — Sonnet 5 landed twenty-two releases before Opus 5 and was
+    /// hidden for all of them by a floor copied from its neighbour.
     #[test]
     fn each_model_carries_the_release_it_actually_shipped_in() {
         for (model, floor, before) in [
-            ("claude-fable-5-1", (2, 1, 255), (2, 1, 254)),
+            // 251, not 255. `claude --model claude-fable-5-1` on 2.1.222 answers *"version 2.1.251
+            // or newer is required"* — the vendor's own number, and four releases below what was
+            // written down here.
+            ("claude-fable-5-1", (2, 1, 251), (2, 1, 250)),
             ("claude-fable-5", (2, 1, 170), (2, 1, 169)),
             ("claude-sonnet-5", (2, 1, 197), (2, 1, 196)),
             ("claude-opus-5", (2, 1, 219), (2, 1, 218)),
             ("claude-opus-4-8", (2, 1, 154), (2, 1, 153)),
         ] {
-            assert!(serves(model, Some(floor)), "{model} is offered on the release that added it");
-            assert!(!serves(model, Some(before)), "{model} is hidden on the one before");
+            let at = too_old_for(model, Some(floor));
+            assert!(at.is_none(), "{model} is offered on the release that added it");
+            let under = too_old_for(model, Some(before));
+            assert!(under.is_some(), "{model} says so on the one before");
         }
+    }
+
+    /// The catalogue is the catalogue whatever is installed. A model too new for this `claude` is
+    /// still a row — with a sentence on it — because the alternative is a model that is simply
+    /// absent, which reads as neosh never having heard of it.
+    #[tokio::test]
+    async fn a_model_too_new_for_this_cli_is_listed_and_says_why() {
+        let provider = ClaudeCliProvider::default();
+        *provider.version.lock().expect("version lock") = Some(Some((2, 1, 222)));
+        let inst = crate::catalog::builtin_instances()
+            .into_iter()
+            .find(|i| i.id.as_ref() == "claude-cli")
+            .expect("claude-cli is a builtin");
+        let models = provider.list_models(&inst).await.expect("the catalogue needs no network");
+
+        let fable = models
+            .iter()
+            .find(|m| m.id.as_ref() == "claude-fable-5-1")
+            .expect("still listed on a CLI that cannot run it");
+        assert!(fable.unavailable.is_some(), "and says why");
+        let opus = models.iter().find(|m| m.id.as_ref() == "claude-opus-5").expect("listed");
+        assert!(opus.unavailable.is_none(), "2.1.222 runs Opus 5, so nothing is said about it");
     }
 
     #[test]

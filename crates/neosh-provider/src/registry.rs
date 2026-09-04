@@ -123,9 +123,28 @@ impl ProviderRegistry {
     ///
     /// Falls back to any usable instance so that `--list-models` and an explicit `--model` still
     /// behave when nothing is configured; the status line then shows what was picked.
+    ///
+    /// Within an instance it is the first model the driver will actually *run*, rather than the
+    /// first row. The catalogues are newest-first, so the first row is exactly the one most likely
+    /// to be ahead of the vendor CLI installed on this machine: `models.first()` alone is a fresh
+    /// install landing on a model whose first message comes back "version 2.1.251 or newer is
+    /// required" — which is the one turn where nobody yet suspects the model. Asked of the driver
+    /// rather than read off [`ModelInfo::unavailable`](neosh_proto::ModelInfo::unavailable),
+    /// because the field is set by `list_models` and what is being read here is the static
+    /// catalogue.
+    ///
+    /// Falls all the way back to the first row: a selection that will not run still says its name
+    /// in the footer, and an install with nothing selected has nowhere to start from.
     pub fn default_selection(&self) -> Option<ModelSelection> {
         let inst = self.ready_instances().next().or_else(|| self.usable_instances().next())?;
-        let model = inst.models.first()?;
+        let drv = self.drivers.get(&inst.driver);
+        let model = inst
+            .models
+            .iter()
+            .find(|m| {
+                !m.legacy && drv.is_none_or(|d| d.unavailable(inst, &m.id).is_none())
+            })
+            .or_else(|| inst.models.first())?;
         Some(ModelSelection {
             instance: inst.id.clone(),
             model: model.id.clone(),
@@ -191,4 +210,87 @@ mod tests {
         assert!(r.default_selection().is_some());
     }
 
+    /// The catalogues are newest-first, so the top row is the one a vendor CLI is most likely to be
+    /// behind. A fresh install taking it regardless spends its very first message finding out — the
+    /// one turn where nobody yet suspects the model, and where the error names a version rather
+    /// than anything the person did.
+    #[test]
+    fn a_first_run_skips_a_model_the_driver_says_it_cannot_run() {
+        struct Fussy;
+        #[async_trait::async_trait]
+        impl Provider for Fussy {
+            fn driver(&self) -> DriverKind {
+                DriverKind::from("fussy")
+            }
+            fn unavailable(&self, _i: &InstanceConfig, model: &ModelId) -> Option<String> {
+                (model.as_ref() == "too-new").then(|| "needs a newer CLI".to_string())
+            }
+            fn stream(
+                &self,
+                _i: &InstanceConfig,
+                _r: neosh_proto::TurnRequest,
+                _c: tokio_util::sync::CancellationToken,
+            ) -> crate::ProviderStream {
+                unreachable!("nothing here starts a turn")
+            }
+        }
+
+        let mut r = ProviderRegistry::new();
+        r.register_driver(std::sync::Arc::new(Fussy));
+        r.add_instance(InstanceConfig {
+            id: InstanceId::from("only"),
+            driver: DriverKind::from("fussy"),
+            display_name: "only".into(),
+            base_url: None,
+            brand: None,
+            auth: AuthRef::Inherited,
+            models: vec![
+                ModelInfo::undescribed(ModelId::from("too-new"), "Too New"),
+                ModelInfo::undescribed(ModelId::from("runs-here"), "Runs Here"),
+            ],
+            extra_headers: vec![],
+        });
+
+        let chosen = r.default_selection().expect("something is selectable");
+        assert_eq!(chosen.model, ModelId::from("runs-here"));
+    }
+
+    /// And when *every* model is refused it still picks one. A selection that will not run at least
+    /// puts a name in the footer and a row under the cursor in `^P`; nothing selected is a workspace
+    /// with nowhere to start and no explanation of why.
+    #[test]
+    fn a_run_where_nothing_can_be_served_still_selects_something() {
+        struct Nothing;
+        #[async_trait::async_trait]
+        impl Provider for Nothing {
+            fn driver(&self) -> DriverKind {
+                DriverKind::from("nothing")
+            }
+            fn unavailable(&self, _i: &InstanceConfig, _m: &ModelId) -> Option<String> {
+                Some("needs a newer CLI".into())
+            }
+            fn stream(
+                &self,
+                _i: &InstanceConfig,
+                _r: neosh_proto::TurnRequest,
+                _c: tokio_util::sync::CancellationToken,
+            ) -> crate::ProviderStream {
+                unreachable!("nothing here starts a turn")
+            }
+        }
+
+        let mut r = ProviderRegistry::new();
+        r.register_driver(std::sync::Arc::new(Nothing));
+        r.add_instance(InstanceConfig {
+            id: InstanceId::from("only"),
+            driver: DriverKind::from("nothing"),
+            display_name: "only".into(),
+            base_url: None,
+            brand: None,
+            auth: AuthRef::Inherited,
+            models: vec![ModelInfo::undescribed(ModelId::from("m"), "m")],
+            extra_headers: vec![],
+        });
+        assert_eq!(r.default_selection().map(|s| s.model), Some(ModelId::from("m")));
+    }
 }
