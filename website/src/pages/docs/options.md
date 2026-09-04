@@ -98,6 +98,7 @@ The last two are the window prefix and how long you have to hold it before it li
 | Option | Default | Effect |
 | --- | --- | --- |
 | `worktree.root` | `"~/.nsh"` | Where new worktrees go, as `<root>/<repo>/<branch>`. A relative value keeps them inside the repository as `<repo>/<value>/<branch>`, with the `.gitignore` entry written for you. `""` restores the sibling layout |
+| `clone.root` | `"~/.nsh/repos"` | Where `^O` clones a repository, as `<root>/<owner>/<repo>`. The first destination offered; folders you clone into through `Somewhere else…` are remembered and offered beside it. Separate from `worktree.root`, which spends `<root>/<repo>/` on one repository's branches |
 
 ## Git prompts
 

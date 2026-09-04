@@ -497,6 +497,28 @@ is `docs/releasing.md`.
   the panel binds each key **once** and dispatches to whichever claimant matches the row under the
   cursor — narrow before `any`, the same ranking the hint strip prints in — and the strip prints one
   line per key, because advertising two meanings for one press is being wrong about at least one.
+- **A repository you do not have yet is a way a project arrives, and it always asks where.** Half of
+  "add a project" was never a directory on this disk: it was a URL, and the answer was to leave
+  neosh, clone in a shell, and come back to type the path. So an address in the `^O` field —
+  `https://`, `git@host:owner/repo`, `file://`, or bare `owner/repo`, which is only safe to guess
+  at because that field stopped having a menu to be a filter for — becomes an offer to fetch it.
+  **Where it lands is asked every time**, because a clone writes a whole history onto a disk and
+  people answer that differently — one root for work, another for what they are only reading — and
+  choosing silently means the first thing anybody does with the feature is go and find where it put
+  something. Asking costs nothing when the default is the first row and `↵` takes it. `clone.root`
+  is that default and is **not** `worktree.root`: the latter spends `<root>/<repo>/` on one
+  repository's branches, so a clone written to `<root>/<repo>` would be asked to create the very
+  directory those branches live in. Anywhere else you pick is *remembered* (`clone.locations`, most
+  recent handful) — which is the whole of adding a location: no list to curate, clone somewhere once
+  and it is a row from then on. A destination that already exists is shown and refused rather than
+  hidden, because the directory being there is very often the answer to "why is this not in my
+  sidebar". It is the **git plugin's** verb and not the panel's, like every other write to a
+  repository — the sidebar decides only that what you typed is an address — and a clone **lands you
+  in it**, so `^K git.clone` and `^O` do the same thing rather than one of them fetching a
+  repository and leaving you where you were. What it draws while it runs is a keyed progress row and
+  never a modal: a large repository is minutes, and the phases are git's own words with a meter only
+  where git gave a total, because a bar creeping along on an invented denominator is the one thing a
+  progress display must not do.
 - **A project outlives the conversations in it.** The panel's list is written down (`sidebar.projects`,
   a workspace var) rather than worked out from where the conversations happen to be — derived, it
   deleted the directory you had worked in all month the moment you cleared out the last thread in
@@ -507,14 +529,23 @@ is `docs/releasing.md`.
   every one of them and asks like one.
 - **"Where?" is one field, and the field is the path field.** `^N` and `^O` ask the same question and
   ask it the same way: type nothing and it is a menu, type `/`, `~` or `./` and it completes
-  directories, type `linux-box:` and it completes directories **on that computer**. `<Tab>` walks
+  directories, type `linux-box:` and it completes directories **on that computer**, and paste a
+  repository address and it offers to clone it. `<Tab>` walks
   into the highlighted one and `↵` takes it — `pathPicker`'s bargain, which is why a completion row's
   label has to be the whole path and why a remote one is prefixed rather than bare. The scp spelling
   is not decoration: `host:path` means there what it means here, it is what makes one field able to
   point at two machines, and it is learned by reading a machine's row rather than by being told. What
   this replaced was a path sitting at the bottom of a list of every worktree the program had ever
   heard of — a verb whose distance from the cursor grew with how long you had used it — so
-  `Another directory…` is above that list now and `Type a path…` is the first row of `^O`. Choosing a
+  `Another directory…` is above that list now, and under `^O` **there is no list at all**: moving
+  the row up left the trees beneath it, where each was wrong one of two ways. One already on the
+  panel is an offer to add what is added — the repository you are standing in was the second row —
+  and one that is not on the panel is a scratch branch you removed with `X`, handed back. Its only
+  filter was a live conversation's `cwd`, which is neither, so what survived was finished work,
+  each row its own full path with the basename and branch repeated after it and truncated
+  mid-branch. No filter fixes that, which is the point: `^O` means *somewhere I do not work yet*,
+  and a list of the repository you are in cannot answer it. What `^N` offers is the panel's own
+  list, which is the same rule and not an exception to it. Choosing a
   machine reopens the picker seeded with `<machine>:` rather than descending in place, because a
   second level whose rows lie about what is in the field is a `<Tab>` that jumps somewhere nobody
   asked for. **Every paired machine is a row, including the ones that cannot be used**, greyed with
@@ -867,7 +898,7 @@ only way to do anything.
 | `^J` | The computers in this workspace. Add one by its address, allow one that is asking, rename one (`^E`), or open what it is running. A machine this one has reached that has not allowed it back says so, and says which key to press over there |
 | `^F` | What you have archived — see below. Filter it, put some back, or finally empty it |
 | `^N` | New conversation. In a repository it asks where: here, a worktree you need not name, one kept inside the project, one you do name, an existing one, another machine, elsewhere. A worktree you did not name is named by your first message — `fix/composer-paste-truncation`, not `wily-nimbus` |
-| `^O` | Add a project. The filter line **is** the path field: `/`, `~` and `./` complete directories from the first keystroke, `⇥` walks into the highlighted one, `↵` takes what you typed. `linux-box:` completes on that computer instead |
+| `^O` | Add a project. The filter line **is** the path field: `/`, `~` and `./` complete directories from the first keystroke, `⇥` walks into the highlighted one, `↵` takes what you typed. `linux-box:` completes on that computer instead. Paste a repository address — `https://…`, `git@…`, `file://…`, or just `owner/repo` — and it offers to **clone** it: it asks where, remembers the folders you pick, draws git's own progress while it fetches, and leaves you in the new project |
 | `^B` | Toggle the sidebar |
 | `^K` | Command palette |
 | `/` | Completes a command by name — neosh's, and whatever the agent says it accepts. Keep typing; the composer is still the field, and `↵` sends what you typed when nothing matches |

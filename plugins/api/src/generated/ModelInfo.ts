@@ -27,4 +27,20 @@ export type ModelInfo = {
    * numbers are already columns.
    */
   tagline?: string | null;
+  /**
+   * Why this one cannot be chosen here, in a sentence, or nothing when it can.
+   *
+   * A model a driver lists but will not run — the vendor CLI on this machine is too old for it,
+   * most often. Said rather than filtered out, for the reason a missing provider is listed
+   * rather than dropped: nothing there and not allowed are the same empty list, and only one of
+   * them is fixed by doing something. A model that silently vanishes from the picker is a
+   * question with nowhere to ask it — you go looking for the release notes, or for our bug
+   * tracker, and the answer was one `claude update` away the whole time.
+   *
+   * The sentence carries the fix, not just the diagnosis: "needs claude 2.1.251 — run `claude
+   * update`" is actionable and "unsupported model" is not. Anything reading a catalogue to
+   * *choose* — the startup default, `model.upgrade`, `model.line` — skips these; only a picker
+   * draws them, and draws them disabled.
+   */
+  unavailable?: string | null;
 };

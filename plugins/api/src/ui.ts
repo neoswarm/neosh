@@ -2528,8 +2528,21 @@ export async function railPicker<G, T>(
     all = got;
     rebuild();
     cursor = Math.max(0, Math.min(opts.itemAt?.(all) ?? 0, Math.max(0, rows.length - 1)));
-    // Land on something selectable rather than on a section header.
-    if (rows[cursor]?.kind !== "item") cursor = rows.findIndex((r) => r.kind === "item");
+    // Land on something you can actually press `↵` on: not a section header, and not a row the
+    // caller disabled. `movePane` has always stepped over disabled rows, so the only way to be
+    // standing on one was to open here — and the first row of a list is where a picker opens by
+    // default. A pane whose top row is "this needs a newer CLI" then greeted every `↵` with
+    // nothing happening, which reads as the picker being broken rather than the row being refused.
+    const landable = (at: number) => {
+      const row = rows[at];
+      return row?.kind === "item" && !row.item.disabled;
+    };
+    if (!landable(cursor)) {
+      const next = rows.findIndex((_, at) => landable(at));
+      // Every row refused is still a list worth opening — you came to read why. Falling back to
+      // the first item rather than to nothing keeps the detail line of *something* on screen.
+      cursor = next >= 0 ? next : rows.findIndex((r) => r.kind === "item");
+    }
     if (cursor < 0) cursor = 0;
     paneTop = 0;
   };
@@ -2607,7 +2620,11 @@ export async function railPicker<G, T>(
       ? takeWords(detail, Math.max(0, room))
       : [clipToWidth(detail, Math.max(0, room)), ""];
     const label = padToWidth(labelHead, labelWidth);
-    const badgeCell = badgeWidth === 0 ? "" : padToWidth(clipToWidth(badge, badgeWidth), badgeWidth);
+    // One column narrower than the cell it sits in, so there is always a space before the detail.
+    // Clipped to the full width, a badge that happens to fill it runs straight into the sentence
+    // after it and the two read as one word.
+    const badgeCell =
+      badgeWidth === 0 ? "" : padToWidth(clipToWidth(badge, badgeWidth - 1), badgeWidth);
     const text = `${head}${label}${badgeCell}${detailHead}`;
 
     const labelAt = byteLength(head);

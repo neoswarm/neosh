@@ -528,6 +528,32 @@ export type ApiCall =
     cwd?: string | null;
   }
   | {
+    "call": "git_clone";
+    /**
+     * Anything `git clone` takes: an `https://` or `git@` URL, or a local path.
+     */
+    url: string;
+    /**
+     * Where the working tree lands, in full. The caller resolved the root and the name, so
+     * that a picker can *show* the destination on the row before anything is written.
+     */
+    path: string;
+  }
+  | {
+    "call": "git_move_worktree";
+    path: string;
+    /**
+     * Where it lands, in full. The leaf must not exist; the parent is created.
+     */
+    dest: string;
+    /**
+     * The repository it belongs to. `git worktree move` runs from a checkout, and the
+     * conversation the caller is in may be standing in the one being moved — the same reason
+     * [`Self::GitRemoveWorktree`] takes one.
+     */
+    cwd?: string | null;
+  }
+  | {
     "call": "gen_complete";
     prompt: string;
     system?: string | null;

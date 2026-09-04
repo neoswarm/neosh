@@ -63,6 +63,7 @@ export type PluginEvent =
   | { "type": "composer_changed"; text: string }
   | { "type": "event"; name: string; data?: unknown; from: string }
   | { "type": "var_changed"; scope: VarScope; key: string; value?: unknown }
+  | { "type": "project_moved"; from: string; to: string }
   | { "type": "highlight_changed"; names: Array<string> }
   | { "type": "contributions_changed"; point: string }
   | { "type": "swarm_changed" }

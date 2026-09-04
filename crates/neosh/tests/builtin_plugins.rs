@@ -1335,6 +1335,192 @@ fn a_branch_name_without_its_json_envelope_still_names_the_branch() {
     );
 }
 
+/// Moving a worktree takes the conversations in it with it.
+///
+/// The git call is the easy half and is covered in `neosh-vcs`. What this is about is the half a
+/// `git worktree move` on its own cannot do: a worktree's path is the key of the facts every list
+/// draws, of the conversations living there, and of the project vars holding somebody's pin — so a
+/// move that only moved the directory would leave the panel pointing at nothing and the agent
+/// running somewhere that is not there. `Host::relocated` is what this asserts, one field at a
+/// time.
+#[test]
+fn moving_a_worktree_takes_its_conversations_and_its_arrangement_with_it() {
+    if !have_git() {
+        return;
+    }
+    let sb = Sandbox::new("wtmove");
+    sb.git_init();
+    let mut s = sb.start();
+    s.wait_for("PROJECTS");
+
+    // A tree inside the repository, with a conversation in it — which is what `new.inside` makes:
+    // it creates the worktree and lands you in it.
+    s.send(&command("git.worktree.new.inside"));
+    let under = sb.work().join(".worktrees");
+    assert!(
+        s.pump(|_| std::fs::read_dir(&under).is_ok_and(|d| d.count() > 0)),
+        "the worktree exists"
+    );
+    // Resolved, because the workspace's copy of this path came from git and git follows symlinks:
+    // on macOS the sandbox is under `/tmp`, which is `/private/tmp`, and a worktree named by the
+    // unresolved spelling is a worktree the panel has never heard of. The product compares paths
+    // as strings — as removing one does — so it is the test's job to name it the way git does.
+    let from = std::fs::read_dir(&under)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .next()
+        .and_then(|p| std::fs::canonicalize(p).ok())
+        .expect("one worktree");
+    let branch = head_of(&from);
+    // Waited for, not assumed: creating the tree also starts a conversation in it, and asserting
+    // before that lands is asserting about the main checkout.
+    let leaf = from.file_name().unwrap().to_string_lossy().into_owned();
+    assert!(
+        s.pump({
+            let leaf = leaf.clone();
+            move |s| s.sidebar_now().iter().any(|l| l.contains(leaf.trim_end_matches('/')))
+                || s.sidebar_now().iter().any(|l| l.contains(&branch))
+        }),
+        "the tree is a row in the panel\n{:?}",
+        s.sidebar_now()
+    );
+
+    // Out of the repository, to a sibling of it. Both paths given, so this is the scripted form
+    // and no picker is involved — the picker is a separate test, and what is under test here is
+    // what happens *after* a destination has been chosen.
+    let to = std::fs::canonicalize(&sb.root).unwrap_or_else(|_| sb.root.clone()).join("moved-tree");
+    s.send(&format!(
+        r#"{{"type":"command","name":"git.worktree.move","args":["{}","{}"]}}"#,
+        from.display(),
+        to.display(),
+    ));
+
+    assert!(
+        s.pump(|_| to.join(".git").exists() && !from.exists()),
+        "the checkout moved and left nothing behind\n{:?}",
+        s.texts()
+            .iter()
+            .filter(|t| t.contains("worktree") || t.contains("moved") || t.contains("git"))
+            .collect::<Vec<_>>()
+    );
+
+    // The conversation followed. This is the field nothing else in the workspace rewrites, and
+    // without it the agent's tools would resolve against a directory that no longer exists.
+    assert!(
+        s.pump(|s| s.sidebar_now().iter().any(|l| l.contains("moved-tree"))
+            || s.sidebar_now().iter().any(|l| l.contains(&head_of(&to)))),
+        "the panel is drawing the tree where it is now\n{:?}",
+        s.sidebar_now()
+    );
+
+    // And the old path is not still a row beside it. A move that reads as "one project went and
+    // another arrived" is the bug `PluginEvent::ProjectMoved` exists to prevent: the list would
+    // keep both, and the cursor would land on a directory that is not there.
+    let stale = from.display().to_string();
+    assert!(
+        !s.sidebar_now().iter().any(|l| l.contains(&stale)),
+        "and the directory it left is not still listed\n{:?}",
+        s.sidebar_now()
+    );
+
+    // The project vars came across — this is the pin, the fold and the rank. Read off disk rather
+    // than through the panel, because what is being asserted is that the *store* re-keyed rather
+    // than that one panel happened to redraw.
+    let vars = std::fs::read_to_string(sb.root.join("state/vars.json")).unwrap_or_default();
+    assert!(
+        !vars.contains(&format!("project:{}", from.display())),
+        "nothing is still filed under where it was\n{vars}"
+    );
+
+    // **Once.** Not "the new path is present and the old one is not" — that passed while the
+    // destination was on the list twice, because a conversation at the tree's own root has an
+    // empty tail and `to.join("")` appends a separator: `/…/moved-tree` and `/…/moved-tree/` are
+    // one directory under two spellings, and every list keyed by the path kept both. A duplicate
+    // is invisible to an assertion about membership and obvious in the panel, which is exactly the
+    // class of bug this file exists to hold on to.
+    let listed = |v: &str| {
+        let want = to.display().to_string();
+        serde_json::from_str::<serde_json::Value>(v)
+            .ok()
+            .and_then(|j| j["global"]["sidebar.projects"].as_array().cloned())
+            .unwrap_or_default()
+            .iter()
+            .filter(|p| p.as_str().is_some_and(|p| p.trim_end_matches('/') == want))
+            .count()
+    };
+    assert_eq!(listed(&vars), 1, "the panel's list names it exactly once\n{vars}");
+}
+
+/// `m` on a worktree row offers the same places `^N` offers when it makes one.
+///
+/// The point of the feature, and the thing that made it worth a picker rather than a path prompt:
+/// somebody who has learnt that "In this project" means `.worktrees/` when they create a tree has
+/// learnt what it means when they move one. Every row names its resolved path, and the row for
+/// where the tree already is says so rather than being quietly dropped — a menu that hides the
+/// answer you were looking for reads as the option not existing.
+#[test]
+fn moving_a_worktree_offers_the_places_a_new_one_would_go() {
+    if !have_git() {
+        return;
+    }
+    let sb = Sandbox::new("wtmovewhere");
+    sb.git_init();
+    let mut s = sb.start();
+    s.wait_for("PROJECTS");
+
+    s.send(&command("git.worktree.new.inside"));
+    let under = sb.work().join(".worktrees");
+    assert!(
+        s.pump(|_| std::fs::read_dir(&under).is_ok_and(|d| d.count() > 0)),
+        "the worktree exists"
+    );
+    // Resolved for the reason the move test resolves it: git's spelling of this path is the one
+    // the workspace is holding.
+    let tree = std::fs::read_dir(&under)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .next()
+        .and_then(|p| std::fs::canonicalize(p).ok())
+        .expect("one worktree");
+
+    // The tree named, so the first picker is skipped and the one under test is the destination.
+    s.send(&command_with("git.worktree.move", &tree.display().to_string()));
+    // The picker names its buffer after its title, which here is the branch being moved.
+    let named = |s: &Session| {
+        s.events.iter().find_map(|e| {
+            let n = e["name"].as_str()?;
+            (e["type"] == "buffer_opened" && n.starts_with("[Move ")).then(|| n.to_string())
+        })
+    };
+    // Waited on the *rows*, not on the buffer: a picker opens its buffer before it has anything in
+    // it, and reading at that moment is reading an empty float that is about to be correct.
+    let rows_now =
+        |s: &Session| named(s).map(|n| s.picker_named(&n)).unwrap_or_default();
+    assert!(s.pump(|s| !rows_now(s).is_empty()), "the destination picker opened with rows in it");
+    let rows = rows_now(&s);
+
+    assert!(
+        rows.iter().any(|l| l.contains("In this project")),
+        "the place it can be kept in the repository\n{rows:?}"
+    );
+    assert!(
+        rows.iter().any(|l| l.contains("Beside the repository")),
+        "and the place beside it\n{rows:?}"
+    );
+    assert!(
+        rows.iter().any(|l| l.contains("Somewhere else")),
+        "and the path field, for one nobody listed\n{rows:?}"
+    );
+    // Where it is now is a row, and says so. Hiding it would leave a menu of two places for a
+    // repository that has three.
+    assert!(
+        rows.iter().any(|l| l.contains("where it is now")),
+        "the row for where it already is says so\n{rows:?}"
+    );
+}
+
 /// Which branch a checkout is on, asked of git rather than of anything under test.
 fn head_of(dir: &Path) -> String {
     let out = Command::new("git")
@@ -2539,6 +2725,56 @@ fn add_project_puts_the_path_first() {
     // The title, then the filter line, then the rows — so the first row is the third line.
     let first = rows.iter().skip(2).find(|l| !l.trim().is_empty()).cloned().unwrap_or_default();
     assert!(first.contains("Type a path"), "the path is the first row\n{rows:?}");
+}
+
+/// `^O` offers no worktrees at all — not the ones on the list, and not the ones off it.
+///
+/// Moving the path row to the top left the trees underneath it, and every one of them was wrong in
+/// one of two ways. A tree already on the panel is an offer to add what is added — the repository
+/// you are standing in was the second row — and a tree that is *not* on the panel is a scratch
+/// branch you took off it with `X`, handed straight back. The only filter was a live conversation's
+/// `cwd`, which is neither, so what got through was finished work drawn as its own full path with
+/// the basename and branch repeated after it, truncated mid-branch in a float too narrow for both.
+///
+/// Two worktrees, one with a conversation in it and one without, because the old filter told those
+/// two apart and nothing else did: if either is a row, the list is back.
+#[test]
+fn add_project_offers_no_worktrees() {
+    if !have_git() {
+        return;
+    }
+    let sb = Sandbox::new("addnotrees");
+    sb.git_init();
+    let at = sb.root.join("sprout");
+    let out = Command::new("git")
+        .current_dir(sb.work())
+        .args(["worktree", "add", "-b", "sprout", &at.display().to_string()])
+        .output()
+        .expect("git runs");
+    assert!(out.status.success(), "worktree add: {}", String::from_utf8_lossy(&out.stderr));
+
+    let mut s = sb.start();
+    s.wait_for("PROJECTS");
+    // One of them gets a conversation, so the two trees differ in exactly the way the old filter
+    // read — and the assertion below is that neither is offered regardless.
+    s.send(&command_with("project.open", &at.display().to_string()));
+    assert!(s.pump(|s| s.sidebar_rows() >= 2), "it is a project now\n{:?}", s.sidebar_now());
+
+    s.send(&command("project.open"));
+    assert!(s.pump(|s| !s.float_named("[Add project").is_empty()), "the field opened");
+
+    let rows = s.float_named("[Add project");
+    assert!(
+        rows.iter().any(|l| l.contains("Type a path")),
+        "the path row is still there\n{rows:?}"
+    );
+    // The branch that has a conversation, and the checkout that does not. Neither is a row: `^O`
+    // means somewhere you do not work yet, and this repository is not that.
+    assert!(!rows.iter().any(|l| l.contains("sprout")), "the tree is not offered\n{rows:?}");
+    assert!(
+        !rows.iter().any(|l| l.contains(&sb.work().display().to_string())),
+        "and neither is the repository you are in\n{rows:?}"
+    );
 }
 
 /// The trees it offers under "an existing one" are the ones on the panel's list, not every
@@ -9039,5 +9275,197 @@ fn two_panes_can_be_exchanged() {
         "the two swapped places: {:?} -> {:?}",
         before,
         s.pane_order()
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Cloning — the other way a project arrives
+// ---------------------------------------------------------------------------
+
+/// An address in the `^O` field becomes an offer to clone, rather than a directory that is not there.
+///
+/// The shorthand is the case worth pinning: `owner/repo` is not a path and, since `^O` stopped
+/// having a menu behind it, it is not a filter either — so it matched nothing at all and the field
+/// sat there saying `no directory matches` at somebody who had pasted a perfectly good repository.
+/// The row names the **expanded** URL, because a shorthand that does not show what it expanded to
+/// is asking you to trust a guess about which host it means.
+#[test]
+fn an_address_in_the_add_project_field_offers_to_clone_it() {
+    if !have_git() {
+        return;
+    }
+    let sb = Sandbox::new("cloneoffer");
+    sb.git_init();
+    let mut s = sb.start();
+    s.wait_for("PROJECTS");
+
+    s.send(&command("project.open"));
+    assert!(s.pump(|s| !s.float_named("[Add project").is_empty()), "the field opened");
+    s.type_text("neoswarm/neosh");
+
+    assert!(
+        s.pump(|s| s.float_named("[Add project").iter().any(|l| l.contains("Clone neoswarm/neosh"))),
+        "the address is a row\n{:?}",
+        s.float_named("[Add project")
+    );
+    let rows = s.float_named("[Add project");
+    assert!(
+        rows.iter().any(|l| l.contains("https://github.com/neoswarm/neosh")),
+        "and it says what the shorthand expanded to\n{rows:?}"
+    );
+}
+
+/// A path is still a path. The shorthand must not eat the thing this field is mainly for.
+#[test]
+fn a_path_in_the_add_project_field_is_not_read_as_a_repository() {
+    let sb = Sandbox::new("clonenotpath");
+    let mut s = sb.start();
+    s.wait_for("PROJECTS");
+
+    s.send(&command("project.open"));
+    assert!(s.pump(|s| !s.float_named("[Add project").is_empty()), "the field opened");
+    // Two segments, exactly the shape the shorthand takes — and a path, because of the `~`.
+    s.type_text("~/");
+
+    assert!(
+        s.pump(|s| s.float_named("[Add project").iter().any(|l| l.contains('/'))),
+        "it completed directories\n{:?}",
+        s.float_named("[Add project")
+    );
+    let rows = s.float_named("[Add project");
+    assert!(!rows.iter().any(|l| l.contains("Clone ")), "and offered no clone\n{rows:?}");
+}
+
+/// `git.clone` fetches a real repository, into a directory whose parents do not exist yet.
+///
+/// The whole path end to end: the command the sidebar calls, the `ApiCall` behind it, the `git`
+/// process, and the directory afterwards. `file://` rather than a bare path on purpose — a plain
+/// local clone hardlinks and reports nothing, so the progress this feature exists to draw would
+/// never be exercised.
+#[test]
+fn cloning_puts_a_repository_where_it_was_asked_to() {
+    if !have_git() {
+        return;
+    }
+    let sb = Sandbox::new("clonereal");
+    sb.git_init();
+    // `clone.root` inside the sandbox, and not for tidiness: the default is `~/.nsh/repos`, so a
+    // test that pressed `↵` on the first row without setting this would clone into the home
+    // directory of whoever ran it.
+    let root = sb.root.join("myrepos");
+    sb.write_config(&format!("[options]\n\"clone.root\" = \"{}\"\n", root.display()));
+    // The source at a path whose last two segments are the owner and the repository, because that
+    // is what the destination is built from and `<sandbox>/work` would name them after the test.
+    let src = clone_source(&sb, "acme", "thing");
+    let url = format!("file://{}", src.display());
+
+    let mut s = sb.start_letting_config_choose();
+    s.wait_for("PROJECTS");
+    // One argument. The owner, repository and host are read back off the URL rather than passed,
+    // so this is the same call a script or the palette makes.
+    s.send(&format!(r#"{{"type":"command","name":"git.clone","args":["{url}"]}}"#));
+    assert!(s.pump(|s| !s.float_named("[Clone acme/thing").is_empty()), "it asked where");
+    s.enter();
+
+    // `<root>/acme/thing` — two levels of parent that have never existed. `git clone` makes the
+    // leaf and not the path to it, which is why the vcs layer creates them.
+    let at = root.join("acme").join("thing");
+    assert!(
+        s.pump(|_| at.join("README.md").is_file()),
+        "the working tree arrived at {}",
+        at.display()
+    );
+    assert!(at.join(".git").exists(), "and it is a repository");
+    // Cloning is how a project joins the list. The verb opens what it fetched — otherwise it does
+    // the work and withholds the reason for it, and you go and find the thing you just asked for.
+    assert!(
+        s.pump(|s| s.sidebar_now().iter().any(|l| l.contains("thing"))),
+        "and the project is on the panel\n{:?}",
+        s.sidebar_now()
+    );
+}
+
+/// A destination argument skips the asking, which is what makes this callable with no screen.
+///
+/// `neosh agent run git.clone <url>` opens a picker, and a picker is a thing only a person at a
+/// terminal can answer — so a caller without one names the destination and nothing is asked. A call
+/// that opens a dialog nobody can reach is a call that never returns.
+#[test]
+fn cloning_to_a_named_destination_asks_nothing() {
+    if !have_git() {
+        return;
+    }
+    let sb = Sandbox::new("clonedest");
+    sb.git_init();
+    let src = clone_source(&sb, "acme", "thing");
+    let at = sb.root.join("somewhere").join("particular");
+
+    let mut s = sb.start();
+    s.wait_for("PROJECTS");
+    s.send(&format!(
+        r#"{{"type":"command","name":"git.clone","args":["file://{}","{}"]}}"#,
+        src.display(),
+        at.display()
+    ));
+
+    assert!(
+        s.pump(|_| at.join("README.md").is_file()),
+        "it cloned straight to {}",
+        at.display()
+    );
+    assert!(
+        s.float_named("[Clone ").is_empty(),
+        "and asked nothing\n{:?}",
+        s.float_named("[Clone ")
+    );
+}
+
+/// A repository to clone from, at `<sandbox>/<owner>/<repo>`.
+///
+/// Cloned from the sandbox's own checkout rather than built from scratch, so it has the `README.md`
+/// the assertions look for and exactly one commit.
+fn clone_source(sb: &Sandbox, owner: &str, repo: &str) -> PathBuf {
+    let at = sb.root.join(owner).join(repo);
+    std::fs::create_dir_all(at.parent().expect("parent")).expect("mkdir");
+    let out = Command::new("git")
+        .args(["clone", "--quiet", "--", &sb.work().display().to_string(), &at.display().to_string()])
+        .output()
+        .expect("git runs");
+    assert!(out.status.success(), "clone source: {}", String::from_utf8_lossy(&out.stderr));
+    at
+}
+
+/// The destination picker offers `clone.root` first, and says which row that is.
+///
+/// Always asking is the point — a clone writes a whole history onto a disk and where that happens
+/// is a thing people answer differently. The default being *first* is what keeps that from costing
+/// anything: `↵` takes it.
+#[test]
+fn the_clone_destination_offers_the_configured_root_first() {
+    if !have_git() {
+        return;
+    }
+    let sb = Sandbox::new("cloneroot");
+    sb.git_init();
+    let root = sb.root.join("myrepos");
+    sb.write_config(&format!("[options]\n\"clone.root\" = \"{}\"\n", root.display()));
+    let src = clone_source(&sb, "acme", "thing");
+    let url = format!("file://{}", src.display());
+
+    let mut s = sb.start_letting_config_choose();
+    s.wait_for("PROJECTS");
+    s.send(&format!(r#"{{"type":"command","name":"git.clone","args":["{url}"]}}"#));
+
+    assert!(s.pump(|s| !s.float_named("[Clone acme/thing").is_empty()), "it asked where");
+    let rows = s.float_named("[Clone acme/thing");
+    // Nested by owner: one root collects repositories from everywhere, and `api` is the name of a
+    // great many of them.
+    assert!(
+        rows.iter().any(|l| l.contains("myrepos") && l.contains("acme") && l.contains("thing")),
+        "the configured root is a row, nested by owner\n{rows:?}"
+    );
+    assert!(
+        rows.iter().any(|l| l.contains("clone.root")),
+        "and it says which setting put it there\n{rows:?}"
     );
 }

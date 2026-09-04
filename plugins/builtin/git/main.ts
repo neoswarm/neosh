@@ -23,8 +23,9 @@
  * and replacing it with your own is `plugins.disabled = ["git"]` plus a plugin directory.
  */
 
-import { byteLength, sessionScope } from "@neosh/api";
+import { byteLength, CLONE_EVENT, sessionScope } from "@neosh/api";
 import type {
+  CloneProgress,
   CommitInfo,
   ModelSelection,
   Neosh,
@@ -37,9 +38,14 @@ import {
   confirm,
   confirmDestructive,
   defineHighlights,
+  meter,
+  onTick,
   pager,
+  pathPicker,
   picker,
+  type PickerItem,
   prompt,
+  spinnerFrame,
   statusPrefix,
 } from "@neosh/api/ui";
 import { configureMotion } from "@neosh/api/ui";
@@ -197,6 +203,15 @@ two-word scratch name it was created with.",
       (args: string[]) => removeWorktree(neosh, { path: arg(args, 0), cwd: arg(args, 1) }),
       "Remove a worktree — `git.worktree.remove [path] [cwd]`",
     ],
+    [
+      "git.worktree.move",
+      // Same shape one argument further: the tree, then where it goes. Both optional and both
+      // asked for when missing, so this is the palette's verb, the panel's verb and a script's
+      // verb without any of them needing a form of its own.
+      (args: string[]) =>
+        moveWorktree(neosh, { path: arg(args, 0), dest: arg(args, 1), cwd: arg(args, 2) }),
+      "Move a worktree somewhere else — `git.worktree.move [path] [dest] [cwd]`",
+    ],
     // The sidebar hands a row over as `(kind, cwd, …)`, which is not the shape the commands above
     // take from the palette. Two small verbs translate rather than every command growing a second
     // calling convention.
@@ -215,10 +230,31 @@ two-word scratch name it was created with.",
       (args: string[]) => removeWorktree(neosh, { path: arg(args, 1), cwd: arg(args, 1) }),
       "Remove the worktree of the sidebar row under the cursor",
     ],
+    [
+      "git.sidebar.worktree.move",
+      (args: string[]) => moveWorktree(neosh, { path: arg(args, 1), cwd: arg(args, 1) }),
+      "Move the worktree of the sidebar row under the cursor",
+    ],
   ];
   for (const [name, fn, desc] of cmds) {
     await neosh.cmd.register(name, fn, { desc });
   }
+
+  // Registered on its own rather than in the table above, because it *answers*: `cmd.call` gives a
+  // caller back what the handler returned, and the sidebar needs the directory this landed in so
+  // it can open the project. The table is typed `Promise<void>` and every verb in it is a thing
+  // you do rather than a thing you ask.
+  await neosh.cmd.register(
+    "git.clone",
+    // `?? ""` rather than a non-null assertion: no URL at all is a real call somebody will make —
+    // `git.clone` from the palette with nothing typed after it — and it is answered with the usage
+    // line rather than a crash.
+    (args: string[]) => cloneRepository(neosh, arg(args, 0) ?? "", arg(args, 1)),
+    {
+      desc:
+        "Clone a repository and open it — `git.clone <url> [destination]`. Asks where without one",
+    },
+  );
 
   // Verbs on the sidebar's rows. Contributed rather than baked into the panel, because that is
   // what the contribution point is for — a sidebar that is not ours picks these up unchanged, and
@@ -233,6 +269,16 @@ two-word scratch name it was created with.",
     key: "d",
     label: "remove worktree",
     command: "git.sidebar.worktree.remove",
+    on: "project",
+  });
+  // `m` for move, on the rows it can mean something on. A plain letter rather than a chord for the
+  // reason `d` and `p` are: the panel is not a text field, and the letters that read as the verb
+  // are the ones worth spending. Nothing global — a verb about the row under the cursor asked from
+  // a conversation has no row to be about, and `^K` runs `git.worktree.move` by name.
+  await neosh.ext.contribute("sidebar.action", "worktree-move", {
+    key: "m",
+    label: "move worktree",
+    command: "git.sidebar.worktree.move",
     on: "project",
   });
 
@@ -1064,15 +1110,94 @@ async function worktreePath(
   branch: string,
   inside = false,
 ): Promise<string> {
+  const layouts = await worktreeLayouts(neosh, repoRoot, branch);
+  const want = inside ? "inside" : "configured";
+  // The list is deduplicated, so the layout asked for may have been folded into an earlier one
+  // that lands in the same place — a relative `worktree.root` is both `configured` and `inside`.
+  // Falling back to the head of the list is that same answer under its other name.
+  return (layouts.find((l) => l.kind === want) ?? layouts[0]!).path;
+}
+
+/** One place a worktree can live, as both a path and a row somebody can be offered. */
+interface Layout {
+  kind: "configured" | "inside" | "beside";
+  label: string;
+  detail: string;
+  icon: string;
+  hl: string;
+  path: string;
+}
+
+/**
+ * Every default place this repository's worktrees go, in the order the "where?" question offers
+ * them.
+ *
+ * One list, read twice. {@link worktreePath} asks it where a *new* tree lands, and
+ * {@link moveWorktree} draws it as a menu for one that already exists — which is the whole reason
+ * it is a list rather than three branches of an `if`. The alternative was what this replaced: the
+ * layouts computed here and *described*, separately, in the panel's own rows, so a fourth place to
+ * put a worktree would have had to be added in two files that never reference each other.
+ *
+ * **Deduplicated by path, first one wins.** The three layouts are not always three places: a
+ * relative `worktree.root` makes `configured` and `inside` the same directory, and an empty one
+ * makes `configured` and `beside` the same. A menu offering the same destination twice under two
+ * names is a menu where picking the wrong row is impossible to notice, and the row that survives
+ * is the one whose name matches what the configuration actually says.
+ *
+ * Slashes in a branch become dashes throughout: `feat/thing` is one directory, not two, because
+ * the directory is a name and not a path.
+ */
+async function worktreeLayouts(
+  neosh: Neosh,
+  repoRoot: string,
+  branch: string,
+): Promise<Layout[]> {
   const leaf = branch.replace(/\//g, "-");
   const repoName = repoRoot.split("/").filter(Boolean).pop() ?? "repo";
   const configured = ((await neosh.opt.get<string>("worktree.root")) ?? "").trim();
-  // Asked to stay inside regardless of what is configured. A relative root still names the
-  // directory; anything else falls back to the conventional one.
-  if (inside) return `${repoRoot}/${insideDir(configured)}/${leaf}`;
-  if (configured === "") return `${parentOf(repoRoot)}/${repoName}-worktrees/${leaf}`;
-  if (configured.startsWith("/")) return `${configured}/${repoName}/${leaf}`;
-  return `${repoRoot}/${configured}/${leaf}`;
+  const dir = insideDir(configured);
+
+  const all: Layout[] = [
+    {
+      kind: "configured",
+      label: "Where worktrees go",
+      // What `worktree.root` currently says, rather than a description of what it could say: a row
+      // that names the setting is a row you have to go and read the setting to understand.
+      detail: configured === ""
+        ? "beside the repository — `worktree.root` is unset"
+        : `under ${configured}`,
+      icon: "+",
+      hl: "Diagnostic.Ok",
+      path: configured === ""
+        ? `${parentOf(repoRoot)}/${repoName}-worktrees/${leaf}`
+        : configured.startsWith("/")
+        ? `${configured}/${repoName}/${leaf}`
+        : `${repoRoot}/${configured}/${leaf}`,
+    },
+    {
+      kind: "inside",
+      label: "In this project",
+      detail: `kept in ${dir}/ — travels with the repository`,
+      icon: "⌂",
+      hl: "Accent",
+      path: `${repoRoot}/${dir}/${leaf}`,
+    },
+    {
+      kind: "beside",
+      label: "Beside the repository",
+      detail: `a sibling of ${repoName}/`,
+      icon: "⎇",
+      hl: "Sidebar.Dim",
+      path: `${parentOf(repoRoot)}/${repoName}-worktrees/${leaf}`,
+    },
+  ];
+
+  const seen = new Set<string>();
+  return all.filter((l) => {
+    if (seen.has(l.path)) return false;
+    seen.add(l.path);
+    return true;
+  });
 }
 
 /** The in-repository directory worktrees go in: a relative `worktree.root`, else `.worktrees`. */
@@ -1183,7 +1308,483 @@ async function removeWorktree(
   neosh.notify(`removed ${chosen.path}`);
 }
 
+/**
+ * Move a worktree somewhere else, asking where the way `^N` asks where.
+ *
+ * The question is the same question — a worktree lands in one of a few places, and those places
+ * have names — so it is asked with the same rows, out of {@link worktreeLayouts}, plus the path
+ * field for a destination nobody listed. What it is *not* is a second vocabulary: somebody who has
+ * learnt that "In this project" means `.worktrees/` when they make a tree has learnt what it means
+ * when they move one.
+ *
+ * `path` given is the sidebar's flow — `m` on the row *is* the pointing — and `dest` given as well
+ * is the scripted one, which asks nothing. Without either it is the palette's flow and both are
+ * pickers. The move runs from the main checkout for the reason removal does: git will not saw off
+ * the branch it is standing on, and the conversation this runs in may be standing in the tree.
+ *
+ * **Where it is now is a row, drawn as such and declining to be picked.** Hiding it would leave a
+ * menu of two places for a repository that has three, which reads as the third one not existing —
+ * and the question somebody presses `m` to answer is *which of these am I in*.
+ *
+ * No confirmation. A move is reversible by pressing `m` again, and a dialog charged for something
+ * you can undo is what teaches people to clear dialogs without reading them. What it is not
+ * allowed to do is happen while an agent is working in the tree, and that is the host's to refuse
+ * — it holds the conversations and knows which of them has a turn in flight.
+ */
+async function moveWorktree(
+  neosh: Neosh,
+  spec: { path?: string; dest?: string; cwd?: string } = {},
+): Promise<void> {
+  const all = await neosh.git.worktrees(spec.cwd ? { cwd: spec.cwd } : undefined).catch(() => []);
+  const main = all.find((t) => t.is_main)?.path;
+  const movable = all.filter((t) => !t.is_main);
+
+  let tree: WorktreeInfo | undefined;
+  if (spec.path) {
+    const named = all.find((t) => t.path === spec.path);
+    if (!named) {
+      neosh.notify(`no worktree at ${spec.path}`, "warn");
+      return;
+    }
+    // The repository itself. `git worktree move` refuses it, and it should: the main checkout is
+    // where the `.git` directory lives, and moving that is not this feature.
+    if (named.is_main) {
+      neosh.notify("this is the repository itself — `m` moves a worktree row", "warn");
+      return;
+    }
+    tree = named;
+  } else {
+    if (movable.length === 0) {
+      neosh.notify("nothing to move — this repository has only its main checkout");
+      return;
+    }
+    tree = await picker(
+      neosh,
+      movable.map((t) => ({
+        label: t.branch ?? t.path,
+        detail: t.path,
+        icon: "⎇",
+        hl: "Git.Branch",
+        value: t,
+      })),
+      { title: "Move worktree", width: 78 },
+    ) ?? undefined;
+  }
+  if (!tree) return;
+  const from = tree.path;
+
+  let dest = spec.dest;
+  if (!dest) {
+    const branch = tree.branch ?? basename(from);
+    const layouts = await worktreeLayouts(neosh, main ?? from, branch);
+    const rows: Array<PickerItem<Layout | { kind: "elsewhere" }>> = layouts.map((l) => ({
+      // "where it is now" goes in the *label*, not after the path. Both are one row and the row
+      // is a float's width, so something is getting clipped — and a clipped path still reads as a
+      // path while a clipped sentence is gone. The label is also what the eye lands on, which is
+      // where the one row you must not pick should say so.
+      label: l.path === from ? `${l.label} — where it is now` : l.label,
+      // The resolved path, and only that. A choice between places is only a choice if each row
+      // says where it goes — but the *path* is that sentence: `…/work/.worktrees/crisp-yarrow`
+      // already says it is in the project, and a row that then adds "kept in .worktrees/" is one
+      // that wraps onto a second line to repeat itself. The description each layout carries is
+      // still what the row is *called*, and still matches the filter.
+      detail: l.path,
+      keywords: `${l.path} ${l.detail}`,
+      icon: l.path === from ? "●" : l.icon,
+      hl: l.path === from ? "Sidebar.Dim" : l.hl,
+      value: l,
+    }));
+    rows.push({
+      label: "Somewhere else…",
+      detail: "type a path — completes as you go",
+      keywords: "path directory elsewhere custom rename",
+      icon: "/",
+      hl: "Status.Input",
+      value: { kind: "elsewhere" },
+    });
+
+    const chosen = await picker(neosh, rows, {
+      title: `Move ${tree.branch ?? basename(from)}`,
+      width: 78,
+    }).catch(() => null);
+    if (!chosen) return;
+    if (chosen.kind === "elsewhere") {
+      // Seeded with the whole path rather than its parent, so `<CR>` on an untouched field is a
+      // no-op and editing the tail renames the directory. `^W` walks back up a segment, which is
+      // how this field is also the way to move it somewhere unrelated.
+      const typed = await pathPicker(neosh, "Move worktree to", { initial: from, width: 78 });
+      if (typed === null || typed.trim() === "") return;
+      dest = typed.trim();
+    } else {
+      dest = chosen.path;
+    }
+  }
+
+  if (dest === from) {
+    neosh.notify("already there");
+    return;
+  }
+
+  neosh.progress("git.worktree.move", "moving…");
+  try {
+    await neosh.git.moveWorktree(from, dest, main ? { cwd: main } : undefined);
+  } catch (e) {
+    // A destination that exists, a tree git has locked, a turn running in it — the host and git
+    // each word their own refusal better than anything this plugin could invent from the outside.
+    neosh.notify(String(e), "error");
+    return;
+  } finally {
+    neosh.done("git.worktree.move");
+  }
+  await landed(neosh, dest);
+  neosh.notify(`moved to ${dest}`);
+}
+
+/**
+ * Light the row it landed on, once.
+ *
+ * The panel redraws on its own the moment the conversations move, so the row is *correct* without
+ * this — and a row that is merely correct is one you have to go and find, having pressed a key
+ * whose whole effect happened in a directory you cannot see. `Agent.ToolLanded` is the same
+ * argument one surface along: half of watching something happen is watching it land.
+ *
+ * A decoration rather than a redraw of our own, because this plugin does not own that panel; and
+ * withdrawn on a timer just past the flash, because a decoration left behind is a row that lights
+ * up again every time anything else redraws it.
+ */
+async function landed(neosh: Neosh, cwd: string): Promise<void> {
+  if (!(await ensureMovedGroup(neosh))) return;
+  const id = `moved:${cwd}`;
+  await neosh.ext.contribute("sidebar.decoration", id, {
+    target: { project: cwd },
+    hl: HL_MOVED,
+  }).catch(() => {});
+  neosh.timer.after(FLASH_MS + 250, () => {
+    void neosh.ext.remove("sidebar.decoration", id).catch(() => {});
+  });
+}
+
+const HL_MOVED = "Git.Moved";
+/** Long enough to be seen from the other side of the panel, short enough not to be a state. */
+const FLASH_MS = 420;
+
+/**
+ * Define the group the flash rides on, colour and all, from the palette rather than from here.
+ *
+ * A flash is a property of a *group*, and the frontend lifts a run's foreground toward white for
+ * as long as it lasts — so the group needs a real colour underneath or the row draws in `Normal`
+ * for the third of a second it is lit, which is the near-white flicker a panel full of running
+ * agents used to have. It cannot be a `link` either: a link resolves to somebody else's spec, and
+ * this needs that spec *plus* one field.
+ *
+ * So the colour is read out of `Diagnostic.Ok` — the green the "where?" question already draws the
+ * row that makes something in — and re-read whenever the theme moves. `default: true`, so a user's
+ * `init.ts` still wins. `false` when the palette cannot answer, and then there is simply no
+ * decoration: a flash is the least important thing in this operation.
+ */
+async function ensureMovedGroup(neosh: Neosh): Promise<boolean> {
+  const base = await neosh.hl.get("Diagnostic.Ok").then((h) => h.resolved).catch(() => null);
+  if (!base) return false;
+  return await neosh.hl
+    .define(HL_MOVED, { ...base, animate: { kind: "flash", ms: FLASH_MS } }, { default: true })
+    .then(() => true)
+    .catch(() => false);
+}
+
+/** The last segment of a path — a worktree's directory name, when it has no branch to be named by. */
+function basename(path: string): string {
+  return path.replace(/\/+$/, "").split("/").filter(Boolean).pop() ?? path;
+}
+
 function parentOf(path: string): string {
   const at = path.replace(/\/+$/, "").lastIndexOf("/");
   return at <= 0 ? "/" : path.slice(0, at);
+}
+
+// ---------------------------------------------------------------------------
+// Cloning — the other way a project arrives
+// ---------------------------------------------------------------------------
+
+/** Where a clone has been put before, remembered so the next one can offer it. */
+const VAR_CLONE_LOCATIONS = "clone.locations";
+
+/**
+ * How many remembered locations are kept.
+ *
+ * A list that only grows is a list nobody curates, and a destination picker twenty rows long is
+ * exactly what `^O` was rescued from. The most recent handful are the ones anybody means.
+ * `clone.root` is never in here — it is a setting, and a setting does not age out.
+ */
+const CLONE_LOCATION_LIMIT = 6;
+
+/**
+ * The parts of an address a destination is built from.
+ *
+ * Derived here rather than passed in, so `git.clone <url>` is a complete call from the palette, a
+ * key, or a script. The sidebar has already parsed the same thing to draw its row and could have
+ * handed it over — but an argument list of four positional strings is a worse public verb than one
+ * that reads its own URL, and the two parses agreeing is then not something anybody has to keep
+ * true.
+ */
+function readAddress(url: string): { owner: string; repo: string; host: string } {
+  const trimmed = url.replace(/\.git$/, "").replace(/\/+$/, "");
+  // `https://host/…` and `ssh://git@host/…`, then the `git@host:…` spelling. `file:///srv/x` has
+  // no host at all — `[^/]+` finds nothing after `//` — which is the right answer rather than a
+  // gap: there is no server in it.
+  const host = /^[a-z][a-z0-9+.-]*:\/\/(?:[^/@]*@)?([^/]+)/i.exec(trimmed)?.[1] ??
+    /^[^/@]+@([^:/]+)[:/]/.exec(trimmed)?.[1] ?? "";
+  const parts = trimmed
+    .replace(/^[a-z][a-z0-9+.-]*:\/\//i, "")
+    .replace(/^[^/@]*@/, "")
+    .split(/[/:]/)
+    .filter(Boolean);
+  // The host is a segment too, and it is not an owner. Dropped only when there *is* one, so the
+  // first directory of a `file://` path is not mistaken for a server and thrown away.
+  if (host && parts[0] === host) parts.shift();
+  const repo = parts.pop() ?? "repo";
+  return { owner: parts.pop() ?? "", repo, host };
+}
+
+/**
+ * Clone a repository, asking where it goes, and answer with the directory it landed in.
+ *
+ * `into` skips the asking. That is what makes this callable from a script: `git.clone <url>` opens
+ * a picker, and a picker is a thing only a person at a terminal can answer — so a caller with no
+ * screen names the destination and this writes it without a question. Every other path through
+ * here asks.
+ *
+ * **It always asks.** A clone writes a whole history onto your disk, and where that happens is a
+ * thing people care about differently — one root for work, another for things they are only
+ * reading, a directory an editor is already pointed at. Choosing silently and reporting it
+ * afterwards means the first thing anybody does with this is go and find where it put something.
+ * The default is the first row and `↵` takes it, so caring is optional and knowing is not.
+ *
+ * The rows are `clone.root` first, then everywhere you have cloned to before, then
+ * `Somewhere else…`. What you pick through that last one is remembered, and that is the whole of
+ * "adding a location": no list to curate, no setting to find — clone somewhere once and it is a
+ * row from then on.
+ *
+ * A destination that already exists is **shown and refused**, never hidden. The directory being
+ * there is very often the answer to "why is this repository not in my sidebar", and a row that
+ * quietly disappears cannot say so.
+ *
+ * Answers `null` for a clone that was cancelled or failed. The caller opens what comes back, and
+ * opening a directory that is not there is a second error about the first one.
+ */
+async function cloneRepository(
+  neosh: Neosh,
+  address: string,
+  into?: string,
+): Promise<string | null> {
+  const url = (address ?? "").trim();
+  if (url === "") {
+    neosh.notify("git.clone needs a repository URL — `git.clone <url> [destination]`", "warn");
+    return null;
+  }
+  const { owner, repo, host } = readAddress(url);
+  const name = owner ? `${owner}/${repo}` : repo;
+  const ascii = (await neosh.opt.get<boolean>("ui.ascii_only").catch(() => false)) ?? false;
+
+  // Told where, so nothing is asked. The script path: a picker is a thing only a person at a
+  // terminal can answer, and a call that opens one and waits is a call that never returns for a
+  // caller with no screen.
+  if (into && into.trim() !== "") {
+    const at = into.trim().replace(/\/+$/, "");
+    if (await directoryExists(neosh, at)) {
+      neosh.notify(`${at} is already there — nothing was cloned`, "warn");
+      return null;
+    }
+    if (!await runClone(neosh, url, at, name, ascii)) return null;
+    await neosh.session.create({ cwd: at }).catch((e: unknown) => neosh.notify(String(e), "warn"));
+    return at;
+  }
+
+  const root = ((await neosh.opt.get<string>("clone.root").catch(() => "")) ?? "").trim();
+  const remembered =
+    (await neosh.vars.get<string[]>({ scope: "global" }, VAR_CLONE_LOCATIONS).catch(() => null)) ??
+      [];
+
+  // `clone.root` nests by owner, because it is the one directory that collects repositories from
+  // everywhere and `api` is the name of a great many of them. A location you chose yourself does
+  // not: you picked `~/work` meaning "put it in here", and `~/work/owner/repo` answers a question
+  // you did not ask.
+  const destinations = [
+    ...(root ? [{ at: join(root, owner, repo), from: root, owned: true }] : []),
+    ...remembered.filter((l) => l && l !== root).map((l) => ({
+      at: join(l, "", repo),
+      from: l,
+      owned: false,
+    })),
+  ];
+  const taken = await Promise.all(destinations.map((d) => directoryExists(neosh, d.at)));
+
+  type Dest = { kind: "at"; path: string } | { kind: "ask" };
+  const rows: PickerItem<Dest>[] = destinations.map((d, i) => ({
+    label: d.at,
+    detail: taken[i]
+      ? "already there — pick another"
+      : d.owned
+      ? "clone.root"
+      : "you cloned here before",
+    keywords: `${d.from} ${repo}`,
+    icon: taken[i] ? (ascii ? "!" : "•") : ascii ? "v" : "⤓",
+    hl: taken[i] ? "Sidebar.Dim" : "Diagnostic.Ok",
+    value: { kind: "at" as const, path: d.at },
+  }));
+  rows.push({
+    label: "Somewhere else…",
+    detail: "pick a folder — it is remembered and offered next time",
+    keywords: "path folder directory browse elsewhere new location",
+    icon: "…",
+    hl: "Sidebar.Dim",
+    value: { kind: "ask" as const },
+  });
+
+  const picked = await picker<Dest>(neosh, rows, {
+    title: `Clone ${name}`,
+    width: 84,
+    height: Math.min(12, rows.length + 3),
+    hints: `${host ? `from ${host}   ` : ""}↵ clone here   Esc cancel`,
+  });
+  if (picked === null) return null;
+
+  let at: string;
+  let learn: string | null = null;
+  if (picked.kind === "at") {
+    at = picked.path;
+  } else {
+    // The *folder it goes in*, not the destination itself: `<folder>/<repo>` is what gets made, so
+    // the question has one answer rather than two — and that answer is exactly the thing worth
+    // remembering for next time.
+    const folder = await pathPicker(neosh, `Clone ${repo} into which folder?`, {
+      initial: root ? `${root}/` : "~/",
+    });
+    if (folder === null || folder.trim() === "") return null;
+    learn = folder.trim().replace(/\/+$/, "");
+    at = join(learn, "", repo);
+  }
+
+  if (await directoryExists(neosh, at)) {
+    // Said here rather than left to git, which reports it as a `fatal:` about a destination path —
+    // accurate, and reads to somebody who just pressed `↵` on a menu row as though the clone went
+    // wrong rather than as though that row was already taken.
+    neosh.notify(`${at} is already there — nothing was cloned`, "warn");
+    return null;
+  }
+
+  const ok = await runClone(neosh, url, at, name, ascii);
+  if (!ok) return null;
+  if (learn) await rememberLocation(neosh, remembered, learn, root);
+
+  // Landing in it is the point, exactly as it is for a worktree. A verb that fetches a repository
+  // and then leaves you where you were has done the work and withheld the reason for it — you
+  // would go and find the thing you just asked for, which is the complaint `swarm.command` fixed
+  // one panel along. Done here rather than by the caller so that `^K git.clone` and `^O` behave
+  // the same; the sidebar therefore takes the path as *already opened* and does not open it again.
+  await neosh.session.create({ cwd: at }).catch((e: unknown) => neosh.notify(String(e), "warn"));
+  return at;
+}
+
+/** `<root>/<owner>/<repo>`, skipping the middle when there is no owner to put there. */
+function join(root: string, owner: string, repo: string): string {
+  const base = root.replace(/\/+$/, "");
+  return owner ? `${base}/${owner}/${repo}` : `${base}/${repo}`;
+}
+
+/**
+ * Fetch the repository, drawing how far it has got, and say whether it arrived.
+ *
+ * **A progress row, not a panel.** This is the mechanism the workspace already has for this shape
+ * of thing — keyed, replaced in place, because a clone is a *state* and not a series of messages —
+ * and a float of its own would be the notice system rebuilt one plugin along, with a modal holding
+ * the keyboard for however long a large repository takes. Nothing here takes the keyboard: the
+ * picker has closed, the composer has focus, and the row updates beside whatever you do next.
+ *
+ * The bar is the honest part. git reports a percentage for the phases that have a total and a bare
+ * count for the ones that do not, so `Receiving objects` draws a meter and `Enumerating objects`
+ * draws a spinner — never a bar creeping along on an invented denominator, which is the one thing
+ * a progress display must not do. The phases are git's own words, so what is on screen is what
+ * `git clone` would have said in a shell.
+ */
+async function runClone(
+  neosh: Neosh,
+  url: string,
+  at: string,
+  name: string,
+  ascii: boolean,
+): Promise<boolean> {
+  const key = `git.clone.${at}`;
+  let phase = "Connecting";
+  let percent: number | null = null;
+
+  const draw = () => {
+    const tail = percent === null
+      ? `${spinnerFrame()}  ${phase}`
+      : `${meter(percent / 100, 12, { ascii })} ${String(percent).padStart(3)}%  ${phase}`;
+    neosh.progress(key, `${ascii ? "v" : "⤓"} ${name}   ${tail}`);
+  };
+  draw();
+
+  // Only this clone's events. Two can be running — a second `^O` while the first is still going —
+  // and a row fed by both would report whichever spoke last under the other's name.
+  const watching = neosh.event.on(CLONE_EVENT, (e) => {
+    const p = e.data as CloneProgress | undefined;
+    if (!p || p.path !== at || p.done) return;
+    phase = p.phase;
+    percent = typeof p.percent === "number" ? p.percent : null;
+    draw();
+  });
+  // The spinner's own clock. Without it a phase with no percentage is a frozen glyph for as long
+  // as that phase lasts, which reads as a workspace that has stopped rather than one waiting on a
+  // server.
+  const ticking = onTick(() => {
+    if (percent === null) draw();
+  });
+
+  try {
+    await neosh.git.clone(url, at);
+    neosh.notify(`cloned ${name} into ${at}`);
+    return true;
+  } catch (e) {
+    // git's own last line — `Repository not found`, `Permission denied (publickey)`, `could not
+    // resolve host`. Each is a different thing for the reader to go and do, and "clone failed" is
+    // none of them.
+    neosh.notify(`could not clone ${name} — ${String(e)}`, "warn");
+    return false;
+  } finally {
+    watching.dispose();
+    ticking.dispose();
+    neosh.done(key);
+  }
+}
+
+/**
+ * Whether `path` is a directory that is already there.
+ *
+ * Asked through `path.complete`, which answers with *full* paths and a trailing slash — so "does
+ * this exist" is an exact match inside the completion of its own name, and needs no call of its
+ * own. Matching the whole string matters: completing `…/neosh` also returns `…/neosh-web/`, and a
+ * prefix test would report the wrong directory as taken.
+ *
+ * Only ever `false` on failure. The clone itself refuses a non-empty directory by name, so being
+ * wrong here costs a keystroke rather than somebody's work.
+ */
+async function directoryExists(neosh: Neosh, path: string): Promise<boolean> {
+  const answer = await neosh.path.complete(path).catch(() => ({ paths: [] as string[] }));
+  const want = path.replace(/\/+$/, "");
+  return answer.paths.some((p) => p.replace(/\/+$/, "") === want);
+}
+
+/** Put a location at the front of the remembered list, deduplicated and bounded. */
+async function rememberLocation(
+  neosh: Neosh,
+  had: string[],
+  add: string,
+  root: string,
+): Promise<void> {
+  // Never `clone.root`: it is already the first row, from the setting, and a copy of it here would
+  // be a second row saying the same thing that no longer moves when the setting does.
+  if (add === root) return;
+  const next = [add, ...had.filter((l) => l && l !== add)].slice(0, CLONE_LOCATION_LIMIT);
+  await neosh.vars.set({ scope: "global" }, VAR_CLONE_LOCATIONS, next).catch(() => {});
 }

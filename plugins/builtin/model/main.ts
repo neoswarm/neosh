@@ -299,7 +299,7 @@ async function pickModel(neosh: Neosh): Promise<void> {
   const order: AccountKind[] = ["plan", "api_key", "local"];
   const rail: RailItem<CredentialInfo>[] = [];
   for (const account of order) {
-    for (const c of creds.filter((x) => x.account === account)) {
+    for (const c of creds.filter((x) => x.account === account).sort(byUsefulness)) {
       rail.push({
         mark: { text: markFor(c, glyphs), hl: c.brand?.hl ?? "Comment" },
         label: c.display_name,
@@ -363,9 +363,21 @@ async function pickModel(neosh: Neosh): Promise<void> {
       }));
       return blocked.concat(named).concat(entries.map((e) => ({
         label: e.model.display_name,
-        badge: e.model.tier ? { text: tierLabel(e.model.tier), hl: tierHl(e.model.tier) } : undefined,
-        detail: describeModel(e, showPricing),
-        disabled: !c.driver_available,
+        // What is wrong with it outranks what rung it is on: a model this machine cannot run is
+        // not going to be chosen for its tier. "too new" rather than "unavailable" because it is
+        // what is actually true — the model is ahead of the CLI installed here — and because it
+        // fits the column the rungs are read down, which the longer word does not.
+        badge: e.model.unavailable
+          ? { text: "too new", hl: "Diagnostic.Warn" }
+          : e.model.tier
+          ? { text: tierLabel(e.model.tier), hl: tierHl(e.model.tier) }
+          : undefined,
+        // The reason, in place of the tagline and the price — which are about a model you could
+        // choose, and this is not one. Stays in the main list rather than moving to "superseded":
+        // it is not last year's model, it is next month's, and burying the newest thing in the
+        // catalogue under a fold is the opposite of what the fold is for.
+        detail: e.model.unavailable ?? describeModel(e, showPricing),
+        disabled: !c.driver_available || Boolean(e.model.unavailable),
         keywords: `${e.model.id} ${e.model.family ?? ""}`,
         // Last year's models are reachable and out of the way. You go looking for one to
         // reproduce something, which is exactly when hiding it outright would be worst.
@@ -470,9 +482,19 @@ async function step(neosh: Neosh, delta: number): Promise<void> {
     neosh.notify(delta > 0 ? "already the most capable one here" : "already the quickest one here");
     return;
   }
-  const next = best(entries.filter((e) => e.model.tier === want));
+  const rung = entries.filter((e) => e.model.tier === want);
+  const next = best(rung);
   if (!next) {
-    neosh.notify(`${current.instance} has nothing on the ${tierLabel(want)} rung`, "warn");
+    // "Nothing on that rung" and "the thing on that rung needs a newer CLI" are the same empty
+    // answer and different problems, and only the second one is fixed by doing something. Said
+    // with the reason the row in `^P` carries, so the key and the picker agree.
+    const why = rung.find((e) => e.model.unavailable)?.model.unavailable;
+    neosh.notify(
+      why
+        ? `${tierLabel(want)} on ${current.instance} is out of reach — ${why}`
+        : `${current.instance} has nothing on the ${tierLabel(want)} rung`,
+      "warn",
+    );
     return;
   }
   await use(neosh, next, current);
@@ -514,10 +536,16 @@ async function useLine(neosh: Neosh, line: string | undefined): Promise<void> {
  *
  * Order within a rung is the catalogue's, which lists newest first — so "current" needs no version
  * parsing, which is the thing that goes wrong the moment a vendor renames something.
+ *
+ * Anything the driver has said it will not run is out before any of that. `model.upgrade` and
+ * `model.line` are the two callers, and both of them exist to be pressed without reading a list:
+ * a rung that answers with a model whose next message comes back "run `claude update`" is a key
+ * that reports success and breaks the conversation.
  */
 function best(entries: ModelEntry[]): ModelEntry | undefined {
-  const live = entries.filter((e) => !e.model.legacy);
-  const pool = live.length > 0 ? live : entries;
+  const runnable = entries.filter((e) => !e.model.unavailable);
+  const live = runnable.filter((e) => !e.model.legacy);
+  const pool = live.length > 0 ? live : runnable;
   const rank = (e: ModelEntry) =>
     e.model.tier === "frontier" ? 2 : e.model.tier === "balanced" ? 1 : 0;
   return pool.reduce<ModelEntry | undefined>(
@@ -543,6 +571,39 @@ async function use(
   });
   await refreshFooter();
   neosh.notify(`model: ${chosen.instance}/${chosen.model.display_name}`);
+}
+
+/**
+ * How much use a provider is to you right now, as a number to sort a group by.
+ *
+ * Three ranks, and the order they put a rail in is the order the column is read in: what works,
+ * then what you could make work, then what nothing here can fix.
+ *
+ *  * **2 — it answers.** Signed in, its driver is here, a model on it can be chosen today.
+ *  * **1 — one action away.** A CLI to install, a key to paste. `^S` is pointed at these.
+ *  * **0 — nothing to do.** A plan the vendor withdrew, or a driver no plugin provides.
+ *
+ * Why it is sorted at all: instances arrive alphabetically by id, so `antigravity` — whose `agy`
+ * is not installed on most machines — was the first row under PLANS, above the Claude and Codex
+ * logins that actually work, and the rail opened on a provider with nothing to offer. Alphabetical
+ * is a fine tie-break and a poor first key: which of these you can use is not a fact about how
+ * they are spelled.
+ *
+ * Stable within a rank, so that tie-break survives — `Array.prototype.sort` has been required to
+ * be stable since ES2019.
+ */
+function byUsefulness(a: CredentialInfo, b: CredentialInfo): number {
+  return usefulness(b) - usefulness(a);
+}
+
+function usefulness(c: CredentialInfo): number {
+  // A vendor that stopped serving the plan. Not `1`: `^S` on it has nothing to collect, and the
+  // only thing to do about it is read the row — which is why it sits under the ones you can act on.
+  if (c.source.kind === "plan_retired") return 0;
+  // No driver and no way to get one: nothing provides it, so there is nothing to install either.
+  // A missing *CLI* is not this — that is `plan_missing`, and it is one `brew install` away.
+  if (!c.driver_available) return c.source.kind === "plan_missing" ? 1 : 0;
+  return c.source.kind === "missing" ? 1 : 2;
 }
 
 function headingFor(account: AccountKind): string {
@@ -741,11 +802,12 @@ async function pickProvider(neosh: Neosh): Promise<void> {
   // Unavailable drivers are listed rather than hidden. The `claude` CLI not being installed is the
   // single most likely reason a subscription does not show up, and a provider that has silently
   // vanished from the list is a question with nowhere to ask it.
+  // The same order the `^P` rail is in, and by the same comparison — two lists of one set of
+  // providers that disagree about which of them is worth looking at first is a worse answer than
+  // either of them alone.
   const order = ["plan", "api_key", "local"] as const;
   const sorted = order.flatMap((account) =>
-    rows
-      .filter((c) => c.account === account)
-      .sort((a, b) => Number(b.driver_available) - Number(a.driver_available)),
+    rows.filter((c) => c.account === account).sort(byUsefulness),
   );
   const chosen = await picker(
     neosh,

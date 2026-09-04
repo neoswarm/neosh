@@ -34,7 +34,7 @@ use crate::bridge::{PluginProvider, ScriptBridge};
 use crate::cards::{self, Glyphs, ToolState};
 use crate::config::{Config, Resolved};
 use crate::frontend::Frontend;
-use crate::services::Services;
+use crate::services::{Services, Subscribers};
 use crate::vim;
 
 /// How long mutations accumulate before a frame is emitted.
@@ -1019,7 +1019,11 @@ pub struct Host {
     /// Behind a lock rather than plain, because [`Host::broadcast`] is called from `&self` in a
     /// dozen places and the alternative — never pruning — is a workspace that accumulates one dead
     /// sender per script that has ever watched it, and clones every token into all of them.
-    subscribers: std::sync::Mutex<Vec<tokio::sync::mpsc::UnboundedSender<PluginEvent>>>,
+    /// Shared, so a call running off the loop can reach it. A slow call is spawned with only its
+    /// [`Services`], and an event it emits has to arrive at the control socket's subscribers as
+    /// well as at the plugins — a script watching the stream sees what a plugin sees, or the two
+    /// surfaces have come to disagree about what happened.
+    subscribers: Subscribers,
     /// Where a picture that had to be fetched comes back to.
     ///
     /// Same reason as the quota channel above: what is on the clipboard is sometimes only the
@@ -1484,6 +1488,7 @@ impl Host {
             caller: plugin.0.clone(),
             state_dir: self.state_dir.clone(),
             bridge: self.bridge.clone(),
+            subscribers: self.subscribers.clone(),
             model_cache: self.model_cache.clone(),
             updater: self.updater.clone(),
         }
@@ -1540,6 +1545,9 @@ impl Host {
                 | ApiCall::GitPull { .. }
                 | ApiCall::GitAddWorktree { .. }
                 | ApiCall::GitRemoveWorktree { .. }
+                // The slowest of the lot by a wide margin: a large history is minutes of network,
+                // and on the loop that is a workspace frozen for every terminal in it.
+                | ApiCall::GitClone { .. }
                 | ApiCall::GenComplete { .. }
                 | ApiCall::AgentListModels { .. }
                 | ApiCall::PermissionCheck { .. }
@@ -2525,8 +2533,8 @@ impl Host {
             ApiCall::ProviderSetCredential { .. } => Err(ApiError::Internal {
                 message: "credential prompts are answered by the host loop".into(),
             }),
-            // On the host loop rather than through `spawn_slow`, and it is the *only* git write
-            // that is. `git branch -m` is one ref write — the same order of cost as the
+            // On the host loop rather than through `spawn_slow`, and these two are the only git
+            // writes that are. `git branch -m` is one ref write — the same order of cost as the
             // `rev-parse` `remember_repo` already awaits here — and what follows it cannot be done
             // from a spawned task: the branch is half of what [`ProjectFacts`] cached the first
             // time this directory was seen, so a rename that did not reach the host would leave
@@ -2537,6 +2545,55 @@ impl Host {
                 let svc = self.services(plugin);
                 svc.git_rename_branch(old.clone(), new, cwd.clone()).await?;
                 self.rebranded(&old, cwd.as_deref()).await;
+                Ok(ApiOk::Unit)
+            }
+            // The other one, and here for a stronger version of the same reason: a branch name is
+            // one field the host cached, and a directory is the *key* of four maps, the
+            // conversations in it and a file on disk. See [`Self::relocated`], which is the half of
+            // this call that could not be done from a spawned task.
+            //
+            // `git worktree move` is a rename — it refuses a cross-device move rather than copying
+            // — so there is no slow case here to keep off the loop.
+            ApiCall::GitMoveWorktree { path, dest, cwd } => {
+                let from = std::path::PathBuf::from(&path);
+                let to = std::path::PathBuf::from(&dest);
+                // Refused rather than survived. A vendor CLI holds its working directory from the
+                // moment it is spawned; renaming a tree an agent is mid-turn in can land the file
+                // it is writing in the old place, with nothing on screen to say it went there. One
+                // `<Esc>` is a much better price than a silently misplaced edit, and the message
+                // says which conversation to press it in.
+                // The ids first and the store second. `sessions()` is a plain `Mutex` guard and a
+                // `std::sync::Mutex` is not reentrant, so asking `sessions_under` while already
+                // holding one is not a borrow error, it is a workspace that stops answering.
+                let under = self.sessions_under(&from);
+                let busy: Vec<String> = {
+                    let store = self.agent.sessions();
+                    under
+                        .iter()
+                        .filter_map(|id| store.get(id))
+                        .filter(|s| s.active_turn.is_some())
+                        .map(|s| {
+                            s.title.clone().unwrap_or_else(|| {
+                                s.cwd
+                                    .file_name()
+                                    .map(|n| n.to_string_lossy().into_owned())
+                                    .unwrap_or_else(|| s.id.0.clone())
+                            })
+                        })
+                        .collect()
+                };
+                if !busy.is_empty() {
+                    return Err(ApiError::InvalidArgument {
+                        message: format!(
+                            "a turn is running in this worktree — interrupt it with <Esc> and \
+                             try again ({})",
+                            busy.join(", "),
+                        ),
+                    });
+                }
+                let svc = self.services(plugin);
+                svc.git_move_worktree(path, dest, cwd).await?;
+                self.relocated(&from, &to).await;
                 Ok(ApiOk::Unit)
             }
             ApiCall::SessionRename { session, title } => {
@@ -11309,6 +11366,122 @@ impl Host {
         self.refresh_status();
     }
 
+    /// Which live conversations are in `dir` or under it.
+    ///
+    /// "Under it" as well as "in it", because a worktree is a directory somebody works *in*: a
+    /// conversation started in `<tree>/crates/neosh-tui` is as much a conversation in that tree as
+    /// one started at its root, and a move that re-pointed only the exact matches would leave the
+    /// nested ones naming a path that no longer exists.
+    ///
+    /// A path comparison rather than a string one: `starts_with` on a `Path` is by component, so
+    /// `/w/tree-2` is not read as being inside `/w/tree`.
+    fn sessions_under(&self, dir: &std::path::Path) -> Vec<neosh_proto::SessionId> {
+        self.agent
+            .sessions()
+            .iter()
+            .filter(|s| s.cwd.starts_with(dir))
+            .map(|s| s.id.clone())
+            .collect()
+    }
+
+    /// A worktree's directory moved: put right everything the host had keyed by where it was.
+    ///
+    /// [`Self::rebranded`] is the same shape one field along — a label the host cached and then
+    /// drew on every frame — and this is the harder version of it, because a directory is not a
+    /// label. It is the key of the facts every list draws, of the conversations that live there, of
+    /// the project vars holding somebody's pin, and of the working directory each vendor CLI was
+    /// started in. Four maps and a disk file, and a move that updates three of them is a workspace
+    /// pointing at a directory that is not there any more.
+    ///
+    /// In order, and each for its own reason:
+    ///
+    /// * **The conversations.** `Session::cwd` is what the agent's tools resolve against and what
+    ///   every panel groups by, and this is the only thing in the workspace that rewrites one.
+    ///   Persisted immediately: a workspace that stopped between the `git worktree move` and the
+    ///   next autosave would come back with every conversation in the tree pointing at nothing.
+    /// * **The facts and the repository handle.** Re-asked through [`Self::remember_repo`] rather
+    ///   than moved across, for the reason `rebranded` re-asks: `identity()` is the call they were
+    ///   built from, so a move that half happened is simply not reflected rather than confidently
+    ///   wrong.
+    /// * **The project vars.** The pin, the fold, the rank and the name the panel remembered. See
+    ///   [`crate::vars::Vars::rename_project`]; the listeners are told, or every cache holding an
+    ///   arrangement is now wrong and nothing said so.
+    /// * **The vendor CLIs.** One process per conversation, each started in a directory that has
+    ///   moved out from under it. Closed rather than migrated — a CLI's cwd is fixed at spawn and
+    ///   there is no message in any of these protocols for "you are somewhere else now" — so the
+    ///   next turn starts one in the right place and resumes by id. Safe precisely because the call
+    ///   refused to run while a turn was in flight.
+    ///
+    /// And `self.cwd` last, when the host was itself standing in the tree: it is what a new
+    /// conversation with no directory of its own inherits.
+    async fn relocated(&mut self, from: &std::path::Path, to: &std::path::Path) {
+        let moved = self.sessions_under(from);
+        {
+            let mut store = self.agent.sessions();
+            for id in &moved {
+                let Some(s) = store.get_mut(id) else { continue };
+                // The tail is what makes a nested conversation follow its tree: `<from>/a/b`
+                // becomes `<to>/a/b`. The tree's own root has an *empty* tail, and `join("")`
+                // appends a separator rather than doing nothing — so the root came out as
+                // `<to>/`, which is the same directory under a spelling nothing else uses. Every
+                // list keyed by the path then held both: two rows for one worktree, and a second
+                // entry in `sidebar.projects` that no amount of moving it again would clear.
+                let Ok(tail) = s.cwd.strip_prefix(from) else { continue };
+                s.cwd = if tail.as_os_str().is_empty() { to.to_path_buf() } else { to.join(tail) };
+            }
+        }
+        self.persist_sessions();
+
+        self.projects.remove(from);
+        self.repos.remove(from);
+        self.project_keys.remove(from);
+        self.remember_repo(to.to_path_buf()).await;
+        // Every directory the move carried, not only the tree's root: a conversation in a
+        // subdirectory has facts of its own under a key that has just changed.
+        for id in &moved {
+            let dir = { self.agent.sessions().get(id).map(|s| s.cwd.clone()) };
+            let Some(dir) = dir else { continue };
+            self.remember_repo(dir).await;
+        }
+
+        let old = from.display().to_string();
+        let new = to.display().to_string();
+        for (key, value) in self.vars.rename_project(&old, &new) {
+            self.broadcast(PluginEvent::VarChanged {
+                scope: neosh_proto::VarScope::Project { cwd: new.clone() },
+                key,
+                value: Some(value),
+            });
+        }
+
+        for id in &moved {
+            for d in &self.agent_drivers {
+                d.close_conversation(id);
+            }
+        }
+
+        let here = self
+            .cwd
+            .strip_prefix(from)
+            .map(|tail| if tail.as_os_str().is_empty() { to.to_path_buf() } else { to.join(tail) })
+            .ok();
+        if let Some(here) = here {
+            self.work_in(here).await;
+        }
+
+        // Said rather than left to be worked out: a panel keeping a list of directories cannot tell
+        // "the thing at `from` is the thing at `to`" from "one project went and another arrived",
+        // and the difference is whether it keeps your place in an order you arranged by hand.
+        self.broadcast(PluginEvent::ProjectMoved { from: old, to: new });
+        // The same signal `rebranded` ends on, for the same reason: every list drawing a
+        // conversation is drawing something that just changed.
+        self.broadcast(PluginEvent::SessionChanged {
+            session: self.active_session(),
+            view: self.from.view,
+        });
+        self.refresh_status();
+    }
+
     /// Stamp the display name onto a conversation's info.
     ///
     /// Done here rather than in the session store because naming a checkout means having looked at
@@ -13063,6 +13236,23 @@ impl Host {
                         .into(),
                 ),
             },
+            // Where clones go. Host-owned for the two reasons `worktree.root` is, and separate
+            // from it for a third: `worktree.root` puts trees at `<root>/<repo>/<branch>`, so a
+            // clone into `<worktree.root>/<repo>` would land exactly on the directory that
+            // repository's worktrees live *inside*. One setting for both would make cloning a
+            // repository you already have worktrees of an error about a non-empty directory.
+            OptionSpec {
+                name: "clone.root".into(),
+                ty: OptionType::Str,
+                default: OptionValue::Str(default_clone_root()),
+                description: Some(
+                    "Where `^O` clones a repository, as `<root>/<owner>/<repo>`. A leading `~` is \
+                     expanded. Nested by owner so two projects called `api` from different \
+                     accounts do not collide. This is the first destination offered; others you \
+                     have cloned into are remembered and offered beside it."
+                        .into(),
+                ),
+            },
             // Display settings every widget reads. Declared here rather than by whichever plugin
             // happens to load first: two plugins declaring one name is an error, and a plugin that
             // is switched off must not take the setting away from everything else — which is
@@ -13863,6 +14053,7 @@ async fn run_slow(svc: Services, call: ApiCall) -> ApiResult {
             svc.git_branches(include_remote, cwd).await
         }
         ApiCall::GitWorktrees { cwd } => svc.git_worktrees(cwd).await,
+        ApiCall::GitClone { url, path } => svc.git_clone(url, path).await,
         ApiCall::GitLog { limit } => svc.git_log(limit).await,
         ApiCall::GitDiff { target, stat } => svc.git_diff(target, stat).await,
         ApiCall::GitDefaultBranch => svc.git_default_branch().await,
@@ -14520,6 +14711,15 @@ fn expand_tilde(raw: &str) -> Option<String> {
 /// without thinking.
 fn default_worktree_root() -> String {
     expand_tilde("~/.nsh").unwrap_or_else(|| ".nsh".to_string())
+}
+
+/// Where clones go unless told otherwise.
+///
+/// Under `~/.nsh` like worktrees, and in a directory of its own beneath it: `worktree.root` spends
+/// `<root>/<repo>/` on one repository's *branches*, so a clone written to `<root>/<repo>` would be
+/// asked to create the very directory those branches live in.
+fn default_clone_root() -> String {
+    expand_tilde("~/.nsh/repos").unwrap_or_else(|| ".nsh/repos".to_string())
 }
 
 /// A path with the home directory written the way people say it.

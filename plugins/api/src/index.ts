@@ -444,6 +444,8 @@ export interface Neosh {
   readonly opt: OptionApi;
   readonly state: StateApi;
   readonly vars: VarApi;
+  /** The directories somebody works in. See {@link ProjectApi}. */
+  readonly project: ProjectApi;
   readonly ext: ExtensionApi;
   readonly event: EventApi;
   readonly swarm: SwarmApi;
@@ -1234,6 +1236,60 @@ export interface GitApi {
    * exactly that one.
    */
   removeWorktree(path: string, opts?: { force?: boolean; cwd?: string }): Promise<void>;
+  /**
+   * Move a worktree to `dest` — `git worktree move`, and everything that has to follow it.
+   *
+   * A worktree's path is an identity here, not a coordinate: it is the key of the project facts
+   * every list draws, of the conversations living in it, of the project vars holding a pin and a
+   * fold state, and of the working directory each vendor CLI was started in. This call moves all
+   * of them, which is why it is a call rather than a `git worktree move` you could have run
+   * yourself — the git part is the part that was never hard.
+   *
+   * `dest` is the full path it lands at. Its parent is created; the leaf must not exist.
+   *
+   * Refused while a turn is running anywhere in the tree, because a CLI holds its working
+   * directory from the moment it is spawned and would otherwise write the file it is editing into
+   * the place the tree used to be. Interrupt it and ask again.
+   *
+   * `cwd` names the repository, as everywhere.
+   */
+  moveWorktree(path: string, dest: string, opts?: { cwd?: string }): Promise<void>;
+  /**
+   * Clone `url` into `path`, resolving to the path once it is there.
+   *
+   * The one call here with no `cwd`: everything else asks a repository a question, and this one
+   * arrives before there is a repository to ask. `path` is absolute and its parent need not
+   * exist — cloning into a location you have just invented is the ordinary case.
+   *
+   * **It reports progress while it runs**, on the bus as {@link CLONE_EVENT}, so a caller that
+   * wants to draw a clone rather than block on one subscribes before awaiting this. Keyed by
+   * `path`, because a workspace may be cloning two things at once.
+   *
+   * Needs `vcs_write` in the manifest, like every other call here that changes a disk.
+   */
+  clone(url: string, path: string): Promise<string>;
+}
+
+/**
+ * What {@link GitApi.clone} says about itself while it runs, on {@link EventsApi.on}.
+ *
+ * `phase` is git's own word for what it is doing — `Receiving objects`, `Resolving deltas` — and
+ * `percent` is absent for the phases that have no total, which draw as a spinner rather than as a
+ * bar. `done` arrives exactly once per clone, on success and on failure alike, because a panel
+ * drawing itself from these has no other way to learn it may stop.
+ */
+export const CLONE_EVENT = "neosh.git.clone";
+
+/** One {@link CLONE_EVENT} payload. */
+export interface CloneProgress {
+  /** Which clone this is about. The key, since two may be running. */
+  path: string;
+  url: string;
+  phase: string;
+  percent?: number | null;
+  done?: boolean;
+  /** Present, with git's own last word in it, only when the clone failed. */
+  error?: string;
 }
 
 /**
@@ -1538,6 +1594,27 @@ export interface VarApi {
   onChange(
     cb: (e: { scope: VarScope; key: string; value: unknown }) => void,
   ): Disposable;
+}
+
+/**
+ * The directories somebody works in, and the one thing that can happen to one.
+ *
+ * A project *is* its path everywhere else in this API — `projectScope` keys vars by it, a panel's
+ * list is a list of them, `SessionInfo.cwd` names one. Which is exactly why a path that changes
+ * needs saying out loud rather than inferring: from the outside, a worktree that moved and a
+ * project that was deleted while another was added are the same two facts in the same order.
+ */
+export interface ProjectApi {
+  /**
+   * A project's directory is now somewhere else — a worktree that was relocated.
+   *
+   * The host has already moved everything it owns by the time this arrives: the conversations, the
+   * project vars, the names and branches every list draws. What is left is whatever *you* keyed by
+   * the old path — a list of directories, a cache, a decoration target — and the point of getting
+   * both ends in one event is that you can re-key in place instead of dropping a row and gaining a
+   * stranger.
+   */
+  onMove(cb: (e: { from: string; to: string }) => void): Disposable;
 }
 
 /** Sugar for the two scopes anything with a panel spends its time in. */
@@ -1967,6 +2044,7 @@ interface Registered {
   composerListeners: Array<(e: { text: string }) => void>;
   activityListeners: Array<(e: { session: SessionId; turn: string; activity: Activity }) => void>;
   varListeners: Array<(e: { scope: VarScope; key: string; value: unknown }) => void>;
+  projectMovedListeners: Array<(e: { from: string; to: string }) => void>;
   swarmListeners: Array<() => void>;
   quotaListeners: Array<(snapshot: QuotaSnapshot) => void>;
   swarmStreamListeners: Array<
@@ -2013,6 +2091,7 @@ function reg(plugin: string): Registered {
       composerListeners: [],
       activityListeners: [],
       varListeners: [],
+      projectMovedListeners: [],
       swarmListeners: [],
       quotaListeners: [],
       swarmStreamListeners: [],
@@ -2225,6 +2304,11 @@ function build(
       },
       onChange(cb) {
         return listener(r.varListeners, cb);
+      },
+    },
+    project: {
+      onMove(cb) {
+        return listener(r.projectMovedListeners, cb);
       },
     },
     ext: {
@@ -2929,6 +3013,13 @@ function build(
           cwd: opts?.cwd ?? null,
         });
       },
+      async moveWorktree(path, dest, opts) {
+        await c({ call: "git_move_worktree", path, dest, cwd: opts?.cwd ?? null });
+      },
+      async clone(url, path) {
+        const v = await c({ call: "git_clone", url, path });
+        return expect(v, "text").text;
+      },
     },
     gen: {
       async complete(prompt, opts) {
@@ -3282,6 +3373,9 @@ async function dispatchEvent(
       case "var_changed":
         for (const cb of r.varListeners)
           cb({ scope: ev.scope, key: ev.key, value: ev.value });
+        break;
+      case "project_moved":
+        for (const cb of r.projectMovedListeners) cb({ from: ev.from, to: ev.to });
         break;
       case "quota":
         for (const cb of [...r.quotaListeners]) cb(ev.snapshot);
