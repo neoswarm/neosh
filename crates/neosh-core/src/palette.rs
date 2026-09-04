@@ -449,6 +449,33 @@ pub fn groups(variant: Variant) -> Vec<(&'static str, HighlightDef)> {
         // say, because it is the answer you do not need to act on — and a row that says "fine" as
         // loudly as one that says "three waiting" is a row you stop reading.
         ("Git.Synced", spec(dim(fg(r.muted)))),
+        // ---- the forge ----------------------------------------------------
+        // A pull request's state, in the four colours the state already means everywhere else:
+        // ready and waiting on somebody, not ready and waiting on you, done, and abandoned.
+        //
+        // Draft is *dim* rather than a fourth hue on purpose. It is the one state that is nobody
+        // else's business yet, and a row that shouts about work you have not asked anyone to look
+        // at is a row that costs attention for no reason — which is the same argument
+        // `Status.Idle` makes.
+        ("Forge.Open", spec(fg(r.success))),
+        ("Forge.Draft", spec(dim(fg(r.muted)))),
+        // Merged is the plan hue, which is also, by happy accident, the colour every forge on earth
+        // draws a merged pull request in. Recognisable before it is read.
+        ("Forge.Merged", spec(fg(r.plan))),
+        // Closed without merging. Dim, because it is over: a thing that is not going to happen is
+        // not an emergency, and drawing it in the same red as a failing check would make the two
+        // indistinguishable at a glance when only one of them wants anything from you.
+        ("Forge.Closed", spec(dim(fg(r.danger)))),
+        ("Forge.ChecksFailed", spec(bold(fg(r.danger)))),
+        // Checks still running, on somebody else's machine, for the next ten minutes.
+        //
+        // The one thing about a pull request that earns motion, and it earns it by the same rule
+        // `Git.Fetching` does: something is happening that you cannot see, and a still row and a
+        // wedged one look identical. Frames rather than a sweep because this is a *single glyph* on
+        // a project row rather than a run of text — a shape that changes reads as motion where a
+        // one-column band cannot — and the frontend clips every frame to the width underneath, so
+        // nothing to the right of it can ever move.
+        ("Forge.ChecksRunning", spec(frames(fg(r.attention), neosh_proto::FrameSet::Dots, 900))),
         // ---- diffs --------------------------------------------------------
         // Two families, and the split matters. `Diff.Add` and `Diff.Delete` are *foreground*: they
         // colour the `+5 -1` on a card header and in a turn's summary, where the number is the
@@ -774,6 +801,9 @@ mod tests {
             "Status.Working",
             "Git.Added",
             "Git.Fetching",
+            "Forge.Open",
+            "Forge.Merged",
+            "Forge.ChecksRunning",
             "Git.Diverged",
             "Git.Synced",
             "Diff.Add",
@@ -800,7 +830,17 @@ mod tests {
             matches!(animation("Git.Fetching"), Some(neosh_proto::Animation::Shimmer { .. })),
             "a fetch is the one git state with a server at the other end of it"
         );
-        for still in ["Git.Diverged", "Git.Synced", "Git.Behind", "Git.Ahead", "Git.Branch"] {
+        assert!(
+            matches!(animation("Forge.ChecksRunning"), Some(neosh_proto::Animation::Frames { .. })),
+            "checks running is work happening on somebody else's machine"
+        );
+        for still in [
+            "Git.Diverged", "Git.Synced", "Git.Behind", "Git.Ahead", "Git.Branch",
+            // A pull request's *state* is news and never motion: open is true until somebody
+            // reviews it, merged is true for ever, and a row that blinks about either charges
+            // attention every time it changes with nothing new to say.
+            "Forge.Open", "Forge.Draft", "Forge.Merged", "Forge.Closed", "Forge.ChecksFailed",
+        ] {
             assert!(
                 animation(still).is_none(),
                 "{still} is news, not something happening — a row that blinks about it charges \

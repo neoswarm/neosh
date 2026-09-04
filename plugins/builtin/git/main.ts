@@ -49,6 +49,7 @@ import {
   statusPrefix,
 } from "@neosh/api/ui";
 import { configureMotion } from "@neosh/api/ui";
+import { installPulls } from "./pulls.ts";
 import { installGitSection, statParts } from "./sidebar.ts";
 
 // ---------------------------------------------------------------------------
@@ -382,7 +383,13 @@ two-word scratch name it was created with.",
   // files all through a turn — and having *two* things poll it is two subprocesses for one answer
   // and two answers for one question. So the block reads, and the footer above is told; a git block
   // turned off with `git.sidebar = false` still reads, because the reading was never the block's.
+  // What the forge knows, on the same rows. Its own module because it is a different server, a
+  // different failure mode and a much slower clock: a working tree changes while you watch and a
+  // pull request changes while somebody else does.
+  const pulls = await installPulls(ctx);
+
   const section = await installGitSection(ctx, {
+    pulls,
     onStatus: (status) => void footer(status),
     // A pull moves HEAD, and the project rows carry a badge built from a different call than the
     // one the block just refreshed.

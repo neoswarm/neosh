@@ -137,6 +137,9 @@ import type { Viewport } from "./generated/Viewport";
 import type { WindowId } from "./generated/WindowId";
 import type { WindowInfo } from "./generated/WindowInfo";
 import type { WindowLayout } from "./generated/WindowLayout";
+import type { ChecksState } from "./generated/ChecksState";
+import type { PullRequest } from "./generated/PullRequest";
+import type { PullState } from "./generated/PullState";
 import type { WorktreeInfo } from "./generated/WorktreeInfo";
 
 export type {
@@ -160,6 +163,9 @@ export type {
   SwarmAgent, SwarmNode, SwarmStranger,
   VarScope, ViewId, ViewInfo, Viewport,
   WindowId, WindowInfo, WindowLayout,
+  ChecksState,
+  PullRequest,
+  PullState,
   WorktreeInfo,
 };
 
@@ -1215,6 +1221,23 @@ export interface GitApi {
    * a timer. Expect it to reject routinely: no remote, no network, a key the host will not take.
    */
   fetch(opts?: { cwd?: string }): Promise<RepoStatus>;
+  /**
+   * Every pull request the forge knows about for this repository, open and closed.
+   *
+   * **One call answers for every checkout.** They come back keyed by
+   * {@link PullRequest.branch}, so a repository with six worktrees is one request and six lookups
+   * — which is the difference between a panel that costs a round trip every few minutes and one
+   * that costs six.
+   *
+   * Answered by `gh`, the CLI the user has already signed into, so tokens, enterprise hosts, SSO
+   * and rate limits are already handled and the answer is the one they get in their own terminal.
+   *
+   * **Rejects rather than answering empty** when it cannot know — no `gh`, not signed in, no
+   * remote on a forge. An empty list is the claim "this repository has no pull requests", and
+   * three of the four ways this fails would be making it falsely. Catch it, say it once, and do
+   * not say it again every tick.
+   */
+  pulls(opts?: { cwd?: string }): Promise<PullRequest[]>;
   /**
    * `git pull`, answering with git's own summary — "Already up to date.", the fast-forward range —
    * because those are different answers and a caller showing neither is a caller nobody trusts.
@@ -3000,6 +3023,10 @@ function build(
       async fetch(opts) {
         const v = await c({ call: "git_fetch", cwd: opts?.cwd ?? null });
         return expect(v, "status").status;
+      },
+      async pulls(opts) {
+        const v = await c({ call: "forge_pulls", cwd: opts?.cwd ?? null });
+        return expect(v, "pulls").pulls;
       },
       async pull(opts) {
         const v = await c({ call: "git_pull", cwd: opts?.cwd ?? null, rebase: opts?.rebase ?? false });

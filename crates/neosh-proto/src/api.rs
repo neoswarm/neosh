@@ -30,7 +30,7 @@ use crate::ui::{
     KeyPress, LineDraw, MessageLevel, NoticeKind, Rect, ScrollAmount, SelectShape, SurfaceCell,
     TabInfo, TextEdit, WindowLayout,
 };
-use crate::vcs::{BranchInfo, CommitInfo, DiffTarget, RepoStatus, WorktreeInfo};
+use crate::vcs::{BranchInfo, CommitInfo, DiffTarget, PullRequest, RepoStatus, WorktreeInfo};
 
 /// Enough history for a commit-message prompt without turning one keystroke into a full `git log`.
 fn default_log_limit() -> u32 {
@@ -1556,6 +1556,27 @@ pub enum ApiCall {
         #[serde(default)]
         rebase: bool,
     },
+    /// Every pull request the forge knows about for this repository, open and closed.
+    ///
+    /// **One call answers for every checkout.** A repository with six worktrees has six branches on
+    /// screen and one set of pull requests behind them, joined on [`PullRequest::branch`] — so this
+    /// is one network round trip for the whole panel rather than one per row, which is the
+    /// difference between a sidebar that costs a request every few minutes and one that costs six.
+    ///
+    /// Answered by `gh`, the CLI the user has already signed into, for the reason every other
+    /// vendor CLI here is preferred to a binary neosh would have to fetch, verify and keep updated
+    /// on somebody's behalf: it already handles tokens, enterprise hosts, SSO and the credential
+    /// helper, and its answer is the same answer the user gets in their own terminal.
+    ///
+    /// Not having `gh`, not being signed in, and not being a forge repository at all are three
+    /// different things and are refused by name rather than folded into an empty list — an empty
+    /// list means "no pull requests", which is a claim, and three of the four ways this call fails
+    /// would be making it falsely.
+    ForgePulls {
+        /// The repository to ask about. The conversation's own when absent.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cwd: Option<String>,
+    },
     GitAddWorktree {
         path: String,
         branch: String,
@@ -1839,6 +1860,7 @@ pub enum ApiOk {
     Status { status: RepoStatus },
     Branches { branches: Vec<BranchInfo> },
     Worktrees { worktrees: Vec<WorktreeInfo> },
+    Pulls { pulls: Vec<PullRequest> },
     Commits { commits: Vec<CommitInfo> },
     Commit { commit: CommitInfo },
     Text { text: String },

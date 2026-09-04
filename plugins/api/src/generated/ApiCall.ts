@@ -506,6 +506,13 @@ export type ApiCall =
     rebase: boolean;
   }
   | {
+    "call": "forge_pulls";
+    /**
+     * The repository to ask about. The conversation's own when absent.
+     */
+    cwd?: string | null;
+  }
+  | {
     "call": "git_add_worktree";
     path: string;
     branch: string;

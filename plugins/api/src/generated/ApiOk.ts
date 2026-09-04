@@ -25,6 +25,7 @@ import type { PermissionDecision } from "./PermissionDecision";
 import type { PermissionMode } from "./PermissionMode";
 import type { PluginInfo } from "./PluginInfo";
 import type { PointInfo } from "./PointInfo";
+import type { PullRequest } from "./PullRequest";
 import type { QuestionAnswer } from "./QuestionAnswer";
 import type { QuotaSample } from "./QuotaSample";
 import type { QuotaSnapshot } from "./QuotaSnapshot";
@@ -92,6 +93,7 @@ export type ApiOk =
   | { "ok": "status"; status: RepoStatus }
   | { "ok": "branches"; branches: Array<BranchInfo> }
   | { "ok": "worktrees"; worktrees: Array<WorktreeInfo> }
+  | { "ok": "pulls"; pulls: Array<PullRequest> }
   | { "ok": "commits"; commits: Array<CommitInfo> }
   | { "ok": "commit"; commit: CommitInfo }
   | { "ok": "text"; text: string }

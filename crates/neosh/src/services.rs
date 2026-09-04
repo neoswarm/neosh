@@ -400,6 +400,22 @@ impl Services {
         Ok(ApiOk::Status { status: repo.fetch().await.map_err(vcs_err)? })
     }
 
+    /// What the forge knows: every pull request for this repository, keyed by head branch.
+    ///
+    /// **A read, not a write**, and the difference from [`Self::git_fetch`] is the point. That one
+    /// is gated because it writes refs onto this disk and presents credentials to do it; this
+    /// reads a list somebody else is already publishing, changes nothing anywhere, and is the same
+    /// answer `gh pr list` gives in a shell the plugin's author could have opened anyway. Gating it
+    /// would be charging a permission for a fact.
+    ///
+    /// Off the host loop like every other network call: `gh` against an unreachable host takes as
+    /// long as a TCP timeout, and on the loop that is every terminal in the workspace frozen for it.
+    pub async fn forge_pulls(&self, cwd: Option<String>) -> ApiResult {
+        let repo = self.repo_at(cwd).await?;
+        let pulls = neosh_vcs::pulls(repo.root()).await.map_err(vcs_err)?;
+        Ok(ApiOk::Pulls { pulls })
+    }
+
     pub async fn git_pull(&self, cwd: Option<String>, rebase: bool) -> ApiResult {
         self.permit_write(if rebase { "pull --rebase" } else { "pull" })?;
         let repo = self.repo_at(cwd).await?;
