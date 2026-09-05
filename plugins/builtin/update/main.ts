@@ -262,7 +262,25 @@ export async function activate({ neosh, subscriptions }: PluginContext) {
 
   subscriptions.push(
     await neosh.cmd.register(`${NS}.apply`, async () => {
+      // Raised and *always* cleared. A progress notice is keyed and replaced in place because it is
+      // a **state**, so one that is never `done` is a state with no end: `Updating neosh…` sat
+      // there, and the reply that followed it — including the one naming the command a managed
+      // install needs — never got a look in. From the keyboard that is the whole bug in a sentence:
+      // `/update` says "updating…", the row goes, and nothing has happened or been said.
+      //
+      // `finally`, not a call per branch. Every arm of the switch below returns, and one added
+      // later that forgets would put the hang straight back.
       neosh.progress(`${NS}`, "Updating neosh…");
+      try {
+        return await applyUpdate();
+      } finally {
+        neosh.done(`${NS}`);
+      }
+    }, { desc: "Update neosh to the newest version" }),
+  );
+
+  async function applyUpdate() {
+    {
       const outcome = await neosh.update.apply().catch((e) => ({
         outcome: "failed" as const,
         reason: String(e),
@@ -288,12 +306,17 @@ export async function activate({ neosh, subscriptions }: PluginContext) {
           // ends up in a state its owner cannot explain. What *is* now true is that running it is
           // the whole of the job: the next tick notices the binary changed and offers the restart,
           // so nobody has to know a workspace needs one.
+          //
+          // The command is the host's and carries whatever that install method actually needs —
+          // for Homebrew that is `brew update` before the upgrade, because brew reads a tap clone
+          // it only refreshes daily, and the bare upgrade spends the first day of a release saying
+          // the old version is the newest one.
           return neosh.notify(`Update with: ${outcome.command}`, "info");
         default:
           return neosh.notify(`Update failed: ${outcome.reason}`, "error");
       }
-    }, { desc: "Update neosh to the newest version" }),
-  );
+    }
+  }
 
   subscriptions.push(
     await neosh.cmd.register(`${NS}.restart`, async () => void (await restart()), {

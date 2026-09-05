@@ -67,7 +67,7 @@ neosh paths    # where config, data and state live on this machine
 
 ## Updating
 
-Re-run the install script, or `brew upgrade neosh`, or re-run the `cargo install` command. Each replaces the binary in place. A workspace that is already running keeps executing the old binary until you stop it; the terminal tells you when the two have drifted.
+Re-run the install script, or `brew update && brew upgrade neosh`, or re-run the `cargo install` command. (The `brew update` is not optional: Homebrew reads formulae from a clone of the tap on your disk and only refreshes it once a day, so a bare `brew upgrade` spends the first day of a release insisting the version you have is the newest one.) Each replaces the binary in place. A workspace that is already running keeps executing the old binary until you stop it; the terminal tells you when the two have drifted.
 
 ## Uninstalling
 

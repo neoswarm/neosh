@@ -795,4 +795,34 @@ mod tests {
         assert!(!InstallMethod::Development.self_updatable());
         assert!(InstallMethod::Development.upgrade_command().is_none());
     }
+
+    /// The command we print has to be one that actually updates.
+    ///
+    /// Homebrew resolves formulae out of a git clone of the tap **on this disk** and only refreshes
+    /// it every `HOMEBREW_AUTO_UPDATE_SECS` — 24 hours by default. So for the first day of a
+    /// release, which is precisely when somebody has been told there is one, a bare
+    /// `brew upgrade neosh` reads a stale clone and reports that the version they already have is
+    /// the newest published. That happened: the tap had 0.4.3, brew said 0.4.2 was current, and the
+    /// only thing wrong was the string in this file — `docs/releasing.md` had described the caching
+    /// all along.
+    ///
+    /// Asserted on the *content* rather than on equality, so rewording the command is free and
+    /// dropping the refresh is not.
+    #[test]
+    fn the_homebrew_command_refreshes_the_tap_before_it_upgrades() {
+        let brew = InstallMethod::Homebrew.upgrade_command().expect("homebrew names a command");
+        assert!(brew.contains("brew update"), "must refresh the tap clone first: {brew}");
+        assert!(brew.contains("brew upgrade"), "and then upgrade: {brew}");
+        assert!(
+            brew.find("brew update") < brew.find("brew upgrade"),
+            "and in that order, or the upgrade still reads the stale clone: {brew}"
+        );
+        // The other two resolve against the network on every run — npm against the registry for
+        // `@latest`, cargo against its index as part of `install` — so neither needs a refresh
+        // step, and adding one would be cargo-culting this fix onto tools that never had the bug.
+        for m in [InstallMethod::Npm, InstallMethod::Cargo] {
+            let c = m.upgrade_command().expect("names a command");
+            assert!(!c.contains("&&"), "{m:?} needs no refresh step: {c}");
+        }
+    }
 }

@@ -2210,7 +2210,21 @@ impl InstallMethod {
     /// The command that updates this install, for the kinds neosh will not do itself.
     pub fn upgrade_command(self) -> Option<&'static str> {
         match self {
-            Self::Homebrew => Some("brew upgrade neosh"),
+            // `brew update` first, and it is not politeness — it is the difference between this
+            // command working and this command lying.
+            //
+            // Homebrew reads formulae out of a git clone of the tap on this disk, and it only
+            // refreshes that clone on its own every `HOMEBREW_AUTO_UPDATE_SECS` — 24 hours by
+            // default. So for the whole first day of a release, which is exactly when somebody is
+            // told there is one, `brew upgrade neosh` consults a stale clone and answers that the
+            // version they already have is the newest there is. Reported from a real machine: the
+            // tap had 0.4.3, `brew upgrade neosh` said 0.4.2 was current, and the only thing wrong
+            // was the command we had printed.
+            //
+            // The other two do not need it. npm resolves `@latest` against the registry on every
+            // install, and cargo refreshes its index as part of `install`; only Homebrew keeps
+            // metadata on disk and ages it.
+            Self::Homebrew => Some("brew update && brew upgrade neosh"),
             Self::Npm => Some("npm install -g neosh@latest"),
             Self::Cargo => Some("cargo install neosh --force"),
             Self::Standalone | Self::Development => None,
