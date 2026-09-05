@@ -89,8 +89,7 @@ The last two are the window prefix and how long you have to hold it before it li
 
 | Option | Default | Effect |
 | --- | --- | --- |
-| `git.sidebar` | `true` | The branch, what has drifted from the remote, and the one key that does something about it, at the top of the sidebar |
-| `git.sidebar.style` | `"one"` | `one` is the branch and one verb; `full` adds the upstream it tracks and the working tree. `⇥` on a git row steps between them |
+| `git.sidebar` | `true` | Mark each project row with what has drifted from the remote, what is dirty, and which pull request its branch is |
 | `git.fetch.interval` | `180` | Seconds between asking the remote what is new, so `↓3` means three waiting for you rather than three as of whenever this checkout last spoke to a server. `0` never asks on its own, and the block then says how old its numbers are. Only the repository of the conversation you are in, and only when its branch tracks one |
 
 | `git.pulls` | `true` | The pull request on a project or worktree row: its number, its state, and its checks when they are failing or still running. Asks `gh`, so it needs the GitHub CLI signed in |

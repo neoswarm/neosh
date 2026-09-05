@@ -951,14 +951,15 @@ impl Sandbox {
     }
 }
 
-/// The sidebar says which branch, how far behind, and what pressing the key would do.
+/// How far behind is on the project's own row, and there is no block above it.
 ///
-/// All three are the same claim: that a panel about a repository has to have *asked* a remote.
-/// `behind` out of `git status` is a comparison with the remote-tracking ref on this disk, so
-/// without the fetch this block would draw `check for changes` over a checkout that is three
-/// commits behind — confidently, and for as long as anybody looked at it.
+/// The claim is the same one the block used to make — that a panel about a repository has to have
+/// *asked* a remote, because `behind` out of `git status` is a comparison with the remote-tracking
+/// ref on this disk — but it is now made where the repository already is. A `GIT` heading with the
+/// branch and a verb under it was a fourth and fifth row about one of the rows below it, on a
+/// column whose whole job is your conversations.
 #[test]
-fn the_sidebar_says_the_branch_and_offers_the_pull() {
+fn how_far_behind_is_on_the_project_row_and_there_is_no_git_block() {
     if !have_git() {
         return;
     }
@@ -968,51 +969,34 @@ fn the_sidebar_says_the_branch_and_offers_the_pull() {
 
     let mut s = sb.start();
     s.wait_for("PROJECTS");
-    // The branch, on its own row, above the projects — the fact nothing else in the workspace says
-    // unless the footer happens to have room for it.
+    // The count, on the row the repository is already on. `↓3` rather than `pull 3 commits`,
+    // because a row is a glance and a sentence is a thing you read.
     assert!(
-        s.pump(|s| s.sidebar_now().iter().any(|l| l.contains("GIT"))),
-        "the block has a heading\n{:?}",
+        s.pump(|s| s.projects_now().iter().any(|l| l.contains("↓3"))),
+        "the project row carries what the fetch found\n{:?}",
         s.sidebar_now()
     );
+    // And nothing above the list is about git any more.
+    let rows = s.sidebar_now();
+    let head = rows.iter().position(|l| l.contains("PROJECTS")).unwrap_or(0);
     assert!(
-        s.pump(|s| s.sidebar_now().iter().any(|l| l.contains("trunk"))),
-        "and names the branch\n{:?}",
-        s.sidebar_now()
+        !rows.iter().any(|l| l.contains("GIT")),
+        "no git heading anywhere\n{rows:?}"
     );
-    // The verb is built from the state, so it counts what is actually waiting rather than offering
-    // a `pull` that would be a no-op.
     assert!(
-        s.pump(|s| s.sidebar_now().iter().any(|l| l.contains("pull 3 commits"))),
-        "and offers the pull, counting what the fetch found\n{:?}",
-        s.sidebar_now()
-    );
-
-    // `⇥` on a git row steps the block, and it is *this* block's `⇥` rather than the plan strip's:
-    // both ask for the key on their own rows, and the panel sends the press to whichever the cursor
-    // is over.
-    s.enter_panel();
-    s.key("g");
-    s.key("g");
-    assert!(
-        s.pump(|s| s.sidebar_now().iter().any(|l| l.contains("detail"))),
-        "the key is advertised on the rows it applies to\n{:?}",
-        s.sidebar_now()
-    );
-    s.special("tab");
-    assert!(
-        s.pump(|s| s.sidebar_now().iter().any(|l| l.contains("origin/trunk"))),
-        "and one step up says what it tracks\n{:?}",
-        s.sidebar_now()
+        !rows[..head].iter().any(|l| l.contains("trunk") || l.contains("pull 3 commits")),
+        "and nothing about the branch above the projects\n{rows:?}"
     );
 }
 
-/// Pressing it pulls, and the row says what git said.
+/// `p` on the project row pulls, and says what git said.
 ///
-/// The half that matters is the last assertion: a button that goes back to looking exactly as it
-/// did before is one you press twice to find out whether the first press worked.
+/// The verb moved onto the key when the block went. That is not a smaller thing than it was: the
+/// key used to run `git pull` and report whatever came back, so the *choice* a diverged branch
+/// needs — rebase or merge, which do different things to your own commits — lived only on a row
+/// that no longer exists. `pullRepository` is the whole verb now, and `p` is one of its three doors.
 #[test]
-fn the_pull_row_pulls_and_reports_what_happened() {
+fn p_on_a_project_row_pulls_and_reports_what_happened() {
     if !have_git() {
         return;
     }
@@ -1023,20 +1007,22 @@ fn the_pull_row_pulls_and_reports_what_happened() {
     let mut s = sb.start();
     s.wait_for("PROJECTS");
     assert!(
-        s.pump(|s| s.sidebar_now().iter().any(|l| l.contains("pull 2 commits"))),
-        "two waiting\n{:?}",
+        s.pump(|s| s.projects_now().iter().any(|l| l.contains("↓2"))),
+        "two waiting, on the row\n{:?}",
         s.sidebar_now()
     );
     s.enter_panel();
-    // The block's first landable row is the branch; the verb is the one under it.
+    // The first row of the list is the project itself — no block above it to step past any more.
     s.key("g");
     s.key("g");
-    s.key("j");
-    s.special("enter");
+    s.key("p");
+    // What git said, as a notification. It used to be a row *in* the block, held for six seconds;
+    // with the block gone the answer to a key you just pressed is a reply, which is exactly what
+    // the notification vocabulary calls this and does not stack.
     assert!(
-        s.pump(|s| s.sidebar_now().iter().any(|l| l.contains("Fast-forward"))),
-        "the row says what git said\n{:?}",
-        s.sidebar_now()
+        s.pump(|s| s.saw("Fast-forward")),
+        "it says what git said\n{}",
+        s.transcript()
     );
     let head = Command::new("git")
         .current_dir(sb.work())
@@ -3120,14 +3106,18 @@ fn a_worktree_nests_under_the_repository_it_belongs_to() {
     );
 }
 
-/// The git block prints the branch, and the branch is very often a worktree's name.
+/// The project list is asked for by name, never taken as "the whole sidebar".
 ///
-/// Which is the trap the test above fell into, and it is worth one test of its own rather than a
-/// comment: the two rows say the same word for different reasons, they are in different sections,
-/// and only one of them is a project. A helper that cannot tell them apart is one every future
-/// worktree test inherits.
+/// This replaced a test that waited for the git block to print the branch above `PROJECTS` and
+/// then checked the tree was still nested below it. That block is gone — the stats it drew are on
+/// the rows now — so the specific trap it guarded cannot happen from that direction any more.
+///
+/// The helper stays and so does a test of it, because the hazard is structural rather than about
+/// git: `projects_now()` means "the rows that are projects", anything contributing a section above
+/// the list can put any word there, and a worktree is *named by its branch* — so a future block
+/// naming a branch would resurrect exactly this bug in a test that reads the whole column.
 #[test]
-fn the_project_list_does_not_include_the_branch_the_git_block_names() {
+fn the_project_list_is_the_rows_below_the_projects_heading() {
     let sb = Sandbox::new("wtscope");
     sb.git_init();
     let root = sb.root.join("trees");
@@ -3136,24 +3126,24 @@ fn the_project_list_does_not_include_the_branch_the_git_block_names() {
     s.wait_for("PROJECTS");
     s.send(&command_with("git.worktree.new", "sideline"));
 
-    // Wait for the state the old assertion could not survive: the git block has caught up and is
-    // naming the branch above `PROJECTS`.
     assert!(
         s.pump(|s| {
-            let all = s.sidebar_now();
-            let head = all.iter().position(|l| l.contains("PROJECTS")).unwrap_or(0);
-            all[..head].iter().any(|l| l.contains("sideline"))
+            let rows = s.projects_now();
+            let repo = rows.iter().position(|l| l.contains("work") && !l.contains("sideline"));
+            let tree = rows.iter().position(|l| l.contains("sideline"));
+            matches!((repo, tree), (Some(r), Some(t)) if t > r)
         }),
-        "the git block names the branch\n{:?}",
+        "the tree is below its repository in the project list\n{:?}",
         s.sidebar_now()
     );
-    // And with it there, the project list still puts the tree under its repository.
+    // And the helper really is a slice rather than the whole column: everything it returns is at or
+    // below the heading, so a section above the list can never be mistaken for a project row.
+    let all = s.sidebar_now();
     let rows = s.projects_now();
-    let repo = rows.iter().position(|l| l.contains("work") && !l.contains("sideline"));
-    let tree = rows.iter().position(|l| l.contains("sideline"));
+    assert!(rows.len() <= all.len(), "the slice is no longer than the column");
     assert!(
-        matches!((repo, tree), (Some(r), Some(t)) if t > r),
-        "the tree is still below its repository once the branch row exists\n{rows:?}"
+        rows.first().is_none_or(|l| l.contains("PROJECTS")),
+        "and it starts at the heading\n{rows:?}"
     );
 }
 

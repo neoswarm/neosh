@@ -16,7 +16,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.4.2"
+version = "0.4.3"
 edition = "2024"
 rust-version = "1.90"
 license = "MIT"
@@ -27,16 +27,16 @@ homepage = "https://github.com/neoswarm/neosh"
 # Every one of these carries a `version` as well as a `path`: cargo refuses to package a crate whose
 # dependency has only a path, and the published crate is built against the registry version while
 # a checkout is built against the directory next door.
-neosh-proto = { path = "crates/neosh-proto", version = "0.4.2" }
-neosh-core = { path = "crates/neosh-core", version = "0.4.2" }
-neosh-provider = { path = "crates/neosh-provider", version = "0.4.2" }
-neosh-vcs = { path = "crates/neosh-vcs", version = "0.4.2" }
-neosh-swarm = { path = "crates/neosh-swarm", version = "0.4.2" }
-neosh-agent = { path = "crates/neosh-agent", version = "0.4.2" }
-neosh-script = { path = "crates/neosh-script", version = "0.4.2" }
-neosh-tui = { path = "crates/neosh-tui", version = "0.4.2" }
-neosh-syntax = { path = "crates/neosh-syntax", version = "0.4.2" }
-neosh-plugins = { path = "plugins", version = "0.4.2" }
+neosh-proto = { path = "crates/neosh-proto", version = "0.4.3" }
+neosh-core = { path = "crates/neosh-core", version = "0.4.3" }
+neosh-provider = { path = "crates/neosh-provider", version = "0.4.3" }
+neosh-vcs = { path = "crates/neosh-vcs", version = "0.4.3" }
+neosh-swarm = { path = "crates/neosh-swarm", version = "0.4.3" }
+neosh-agent = { path = "crates/neosh-agent", version = "0.4.3" }
+neosh-script = { path = "crates/neosh-script", version = "0.4.3" }
+neosh-tui = { path = "crates/neosh-tui", version = "0.4.3" }
+neosh-syntax = { path = "crates/neosh-syntax", version = "0.4.3" }
+neosh-plugins = { path = "plugins", version = "0.4.3" }
 
 # async
 tokio = { version = "1.53", features = ["rt", "rt-multi-thread", "macros", "sync", "time", "process", "io-util", "fs", "signal", "net"] }

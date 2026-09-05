@@ -426,6 +426,15 @@ pub fn groups(variant: Variant) -> Vec<(&'static str, HighlightDef)> {
         ("Git.Branch", spec(fg(r.accent))),
         ("Git.Ahead", spec(fg(r.success))),
         ("Git.Behind", spec(fg(r.attention))),
+        // The numbers beside this are as of a fetch that did not reach the remote.
+        //
+        // Dim and faint on purpose, and the only git mark that qualifies another rather than
+        // stating a fact of its own: `↓3 ⚠` is still three waiting, it is simply three as of
+        // whenever the network last worked. Drawn as loudly as the count it qualifies, a train
+        // journey would repaint the whole panel in warning colours over a state nobody can act on
+        // — and unreachable is not the same kind of news as diverged, which is a decision waiting
+        // for you. Still, for the reason `Git.Behind` is: nothing is happening here.
+        ("Git.Stale", spec(dim(fg(r.faint)))),
         // Both ways at once: this branch has commits the remote does not *and* the remote has
         // commits this branch does not, so a plain pull will either build a merge nobody asked for
         // or refuse outright. The danger hue rather than the attention one, because unlike `Behind`
@@ -835,7 +844,7 @@ mod tests {
             "checks running is work happening on somebody else's machine"
         );
         for still in [
-            "Git.Diverged", "Git.Synced", "Git.Behind", "Git.Ahead", "Git.Branch",
+            "Git.Diverged", "Git.Synced", "Git.Behind", "Git.Ahead", "Git.Branch", "Git.Stale",
             // A pull request's *state* is news and never motion: open is true until somebody
             // reviews it, merged is true for ever, and a row that blinks about either charges
             // attention every time it changes with nothing new to say.

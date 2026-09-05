@@ -1,6 +1,6 @@
 {
   "name": "@neosh/slash",
-  "version": "0.4.2",
+  "version": "0.4.3",
   "description": "Type / to reach a command \u2014 neosh's own, and whatever the driver says it accepts.",
   "license": "MIT",
   "type": "module",

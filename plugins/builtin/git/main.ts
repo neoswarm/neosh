@@ -50,7 +50,7 @@ import {
 } from "@neosh/api/ui";
 import { configureMotion } from "@neosh/api/ui";
 import { installPulls } from "./pulls.ts";
-import { installGitSection, statParts } from "./sidebar.ts";
+import { fetchFailed, installGitStatus, pullRepository, statParts } from "./sidebar.ts";
 
 // ---------------------------------------------------------------------------
 // Default prompts
@@ -300,9 +300,25 @@ two-word scratch name it was created with.",
       ? projects.filter((p): p is string => typeof p === "string")
       : [];
     const ascii = (await neosh.opt.get<boolean>("ui.ascii_only").catch(() => false)) ?? false;
+    // `git.sidebar` used to turn off a block. There is no block, so it turns off these marks —
+    // which is what somebody setting it always meant: not "stop reading git", which the footer and
+    // the branch segment still need, but "keep git out of my project list".
+    const on = (await neosh.opt.get<boolean>("git.sidebar").catch(() => true)) ?? true;
     for (const cwd of cwds) {
+      if (!on) {
+        await neosh.ext.remove("sidebar.decoration", `dirty:${cwd}`).catch(() => {});
+        continue;
+      }
       const status = await neosh.git.status({ cwd }).catch(() => null);
       const parts = status ? statParts(status, ascii) : [];
+      // The one thing the block said that a count cannot: that these numbers are as of a fetch
+      // that did not reach the remote. Appended rather than led with, because it qualifies the
+      // stats rather than replacing them — and drawn only when there is trouble, so it is never a
+      // column of nothing.
+      if (fetchFailed(cwd)) {
+        if (parts.length > 0) parts.push({ text: " " });
+        parts.push({ text: ascii ? "!" : "⚠", hl: "Git.Stale" });
+      }
       if (parts.length === 0) {
         await neosh.ext.remove("sidebar.decoration", `dirty:${cwd}`).catch(() => {});
         continue;
@@ -375,29 +391,26 @@ two-word scratch name it was created with.",
     });
   };
 
-  // The block at the top of the sidebar: which branch, what has drifted, and the one key that does
-  // something about it. Contributed, so `plugins.disabled = ["git"]` takes it away with everything
-  // else here and a panel that is not ours picks it up unchanged.
-  //
-  // It also owns the reading. Whoever polls `git status` has to do it on a timer — the agent writes
-  // files all through a turn — and having *two* things poll it is two subprocesses for one answer
-  // and two answers for one question. So the block reads, and the footer above is told; a git block
-  // turned off with `git.sidebar = false` still reads, because the reading was never the block's.
   // What the forge knows, on the same rows. Its own module because it is a different server, a
   // different failure mode and a much slower clock: a working tree changes while you watch and a
   // pull request changes while somebody else does.
   const pulls = await installPulls(ctx);
 
-  const section = await installGitSection(ctx, {
+  // Nothing of git's is drawn in a place of its own any more — every mark is a decoration on a row
+  // the panel already has. What is left is the *reading*, and it still has to be one reading:
+  // whoever polls `git status` has to do it on a timer, because the agent writes files all through
+  // a turn, and having two things poll it is two subprocesses for one answer and two answers for
+  // one question. So this reads, and the footer is told.
+  const repo = await installGitStatus(ctx, {
     pulls,
     onStatus: (status) => void footer(status),
-    // A pull moves HEAD, and the project rows carry a badge built from a different call than the
-    // one the block just refreshed.
+    // A fetch or a pull moves where this checkout stands, and the project rows carry a badge built
+    // from a different call than the one that just refreshed.
     onMoved: () => void decorate(),
   });
-  // What anything moving `HEAD` calls. The block re-reads and hands the answer on, so the footer
-  // follows without this having to know it exists.
-  headMoved = () => void section.refresh();
+  // What anything moving `HEAD` calls. This re-reads and hands the answer on, so the footer follows
+  // without the caller having to know it exists.
+  headMoved = () => void repo.refresh();
 }
 
 // ---------------------------------------------------------------------------
@@ -1304,17 +1317,11 @@ function insideDir(configured: string): string {
  * and a command that swallows both teaches you to run it twice to be sure.
  */
 async function pull(neosh: Neosh, cwd?: string): Promise<void> {
-  neosh.progress("git.pull", "pulling…");
-  try {
-    const summary = await neosh.git.pull(cwd ? { cwd } : undefined);
-    neosh.notify(summary);
-  } catch (e) {
-    // Diverged branches, no remote, auth — git's message names it, and inventing a friendlier one
-    // here would mean guessing which of those it was.
-    neosh.notify(String(e), "error");
-  } finally {
-    neosh.done("git.pull");
-  }
+  // The whole verb lives in `sidebar.ts` now, because it is the same decision from three doors:
+  // `p` on a row, `git.pull` from the palette, and a script calling it by name. It fast-forwards
+  // without asking, names the choice when the branch has gone both ways, and goes and looks when
+  // nothing is waiting — which the block's verb row used to do and this key used not to.
+  await pullRepository(neosh, cwd);
 }
 
 /**

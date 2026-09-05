@@ -1184,52 +1184,67 @@ says how many are asking, `^T` is where you go, and it opens when you get there.
 | `J` `K` | Reorder within a group |
 | `r` | Rename a conversation |
 | `y` | Copy the row's directory — a worktree's path, ready to paste into a shell |
-| `p` | Pull that repository from its remote (a git-plugin contribution) |
+| `p` | Bring that repository up to date — fast-forwards silently, asks *rebase or merge* when the branch has gone both ways, and goes and looks when nothing is waiting (a git-plugin contribution) |
 | `d` | Remove a worktree from disk — its branch stays, and it asks first (a git-plugin contribution) |
 | `x` `X` | Archive, delete. On a project heading, `X` takes the project off the list — the only thing that does |
 | `a` | The archive — the popup below. Nothing archived is ever a row in *this* panel, and by default not even a count. An `archive.action` contribution, not a key this panel owns |
-| `⇥` | On the plan rows: how much of it to show — the limit that binds, every limit, or all of it with the account and the sentence. `usage.sidebar.style` is where it starts, `usage.sidebar` turns it off. On the **git** rows it is the same key about that block — `git.sidebar.style` — because a key on a contributed row is named down to the section (`custom:git`, `custom:plan`) and the panel sends the press to whichever block the cursor is over |
+| `⇥` | On the plan rows: how much of it to show — the limit that binds, every limit, or all of it with the account and the sentence. `usage.sidebar.style` is where it starts, `usage.sidebar` turns it off. A key on a contributed row is named down to the section (`custom:plan`), so the panel sends the press to whichever block the cursor is over rather than to whoever registered it first |
 | `?` | The keys for whatever row you are on |
 | `Esc` | Back to the composer |
 
-## The repository, at the top of the panel
+## The repository is on the row it is about
 
-Two rows above the projects: which branch the conversation you are in is on, what has drifted from
-the remote, and **one key that does something about it**. It is a `sidebar.section` contribution
-like the plan strip, so `git.sidebar = false` takes it off and a panel that is not ours picks it up
-unchanged.
+Not a block above the list. Where a checkout stands is a fact about a *project*, and the panel
+already draws one row per project — so it goes on that row, after the name, in the colour of what
+each fact is:
 
 ```
- GIT                           ^G
+ PROJECTS
 ──────────────────────────────────
- main ↓3 ~1 ?1
- ↓ pull 3 commits             now
+ ▾ neosh ↓3 ~1 ?1  #86 ✗2       4
+   ▾ ⎇ fix/the-thing ↑2  #91     1
+     ▸ Chasing the flake       12m
 ```
 
-**The verb row is rebuilt from the state every draw**, so the key is never pointed at something that
-would do nothing — which is what a fixed `pull` button that is a no-op nine times in ten teaches
-people. `↓ pull 3 commits` fast-forwards and says what git said; `⇄ diverged — 2 up, 3 down` asks
-*rebase or merge*, in those words, because the two answers do different things to your own commits
-and neither is guessable from the row; `↻ check for changes` asks the remote again, which is the
-honest verb for a number that is only as fresh as the last fetch; `→ no upstream` is a statement and
-not a verb, because a branch tracking nothing is not behind anything. `⇥` steps the block between
-`one` and `full`, which adds the upstream and a line about the working tree.
+**There was a `GIT` heading with the branch and a verb under it, and it was saying twice what the
+row below it already said.** `statParts` has always put `✗2 ↓3 ↑1 ~4 ?7` after a project's name and
+`pulls.ts` has always put `#86` after that, coloured by what the pull request *is* — `Forge.Merged`,
+`Forge.Open`, `Forge.Draft`, `Forge.Closed`. So the block was a fourth and fifth row about **one**
+of the rows underneath it, on a column whose whole job is your conversations. It was also the only
+thing here that could disagree with itself: the block read `git status` for the conversation you
+were in while the rows read one per project, on two clocks, so a fetch moved one a beat before the
+other. And a contribution is workspace-wide while a conversation is per view, so two panes on two
+repositories saw one block, about whichever conversation the workspace happened to call current — a
+problem a row about a directory has never had, because there is one of them per directory.
+
+**Each fact keeps its own colour, and that is what makes it a glance rather than a string.** A
+conflict is a tree you cannot commit from, behind is work you have not got yet, ahead is work
+nobody else has, and the two dirty counts are yours and undecided; worst first, nothing said about
+zero, so a clean checkout is a row with nothing extra on it. `git.sidebar = false` takes the marks
+off the rows — which is what somebody setting it always meant, and it does not stop the *reading*,
+because the footer's branch segment is the same `git status`.
+
+**The verb went onto the key, not away.** `p` on any row fast-forwards without asking, and when the
+branch has gone both ways it **names the choice** — *rebase or merge*, in those words, as a picker,
+because the two do different things to your own commits, one of them rewrites them, and neither is
+guessable from a row. When nothing is waiting it fetches instead, which is the honest reading of
+that key on a number only as fresh as the last fetch. All three used to live on the block's verb
+row, so deleting the block without moving them would have quietly demoted `p` to `git pull` and
+whatever it says about a divergence.
 
 **Ahead and behind are asked for, not remembered.** They come off `git status --branch`, which
-compares HEAD with the remote-tracking ref *on this disk* — so a panel drawing `↓0` without ever
-fetching is reporting the world as of whenever this checkout last spoke to a server, which after an
-afternoon is a sentence about breakfast. `ApiCall::GitFetch` is what makes it true: on
-`git.fetch.interval` (180 s, `0` never), on arriving in a conversation, and on the key. Only the
-repository of the conversation you are in, only when its branch tracks one, and the dim column at
-the right of the verb row is how old the answer is — `now`, `12m`, `⚠ offline` — because a claim
-about a remote without an *as of* cannot be told from a claim about now.
+compares HEAD with the remote-tracking ref *on this disk* — so `↓0` drawn without ever fetching is
+the world as of whenever this checkout last spoke to a server, which after an afternoon is a
+sentence about breakfast. `ApiCall::GitFetch` is what makes it true: on `git.fetch.interval`
+(180 s, `0` never), on arriving in a conversation, and on the key. Only the repository of the
+conversation you are in, and only when its branch tracks one.
 
-**And the block moves only while it is talking to a server.** A fetch is seconds of nothing on
-screen against somebody else's machine, which is the one case where a still panel and a wedged one
-look identical, so it gets both halves of the vocabulary: a spinner glyph and `Git.Fetching`, which
-sweeps. Nothing else here animates, and the restraint is the point — `↓3` is news exactly as an
-unread conversation is news, it is true until you act rather than *happening*, and motion spent on
-it is attention charged every time it changes with nothing new to say.
+**And a number whose fetch failed says so.** The block spent a column on `now` / `12m` / `⚠ offline`;
+a row spends one glyph on the only part of that you cannot afford to lose. `Git.Stale` is a dim `⚠`
+appended to the stats — it *qualifies* them rather than replacing them, `↓3 ⚠` still being three
+waiting, just three as of whenever the network last worked — and it appears only when the last fetch
+did not reach the remote. `now` and `12m` were not worth a column: a fetch every three minutes is
+fresh enough that saying so is noise. Being unreachable is not.
 
 ## The archive — `^F`, or `a` in the project panel
 
