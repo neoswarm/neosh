@@ -1,6 +1,6 @@
 {
   "name": "@neosh/palette",
-  "version": "0.4.2",
+  "version": "0.4.3",
   "description": "One key to everything: commands, conversations, and what they are bound to.",
   "license": "MIT",
   "type": "module",
