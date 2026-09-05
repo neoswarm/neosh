@@ -5366,10 +5366,23 @@ fn open_slash_menu(s: &mut Session) {
     for _ in 0..20 {
         s.type_text("/");
         s.drain_for(Duration::from_millis(150));
-        if s.buffer_named("[Run]").is_some() {
+        // Both halves, and the second is what this used to get wrong. The menu opening is not the
+        // whole success condition: the backspace below races the very `/` that opens it, so an
+        // attempt that timed out at 150ms and then had the menu appear anyway left the slash in the
+        // field *and* the menu up — and the next attempt's `/` landed on top of it. The composer
+        // then held `//`, the test typed `compact` after it, and the failure was
+        // `//compact` in a test about what the composer says.
+        //
+        // Asking about the field rather than lengthening the timeout, because no timeout fixes a
+        // race — a slower machine just moves it.
+        if s.buffer_named("[Run]").is_some()
+            && s.pump(|s| s.composer_now().iter().any(|l| l == "/"))
+        {
             return;
         }
-        s.special("backspace");
+        // `^U` rather than one backspace: what needs clearing is however many slashes got through,
+        // which is exactly the number this loop cannot know.
+        s.ctrl("u");
         s.drain_for(Duration::from_millis(50));
     }
     panic!("the slash menu never opened\n{}", s.transcript());
