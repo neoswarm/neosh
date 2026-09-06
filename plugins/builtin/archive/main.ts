@@ -56,7 +56,15 @@ import type {
   SessionInfo,
   WindowId,
 } from "@neosh/api";
-import { confirmDestructive, CursoredList, type ListRow, prompt } from "@neosh/api/ui";
+import {
+  confirmDestructive,
+  CursoredList,
+  discardWorktrees,
+  type ListRow,
+  orphanedWorktrees,
+  prompt,
+  worktreeLines,
+} from "@neosh/api/ui";
 
 const NS = "neosh.archive";
 /** What this panel's buffer says it is. Everything a third party binds or finds hangs off this. */
@@ -1048,6 +1056,10 @@ async function confirmDelete(
     ? `Delete all ${n} archived conversations shown?`
     : `Empty the archive — all ${n} conversations?`;
 
+  // The checkouts these were the last conversations in. Emptying the archive is the one moment
+  // a workspace sheds a season's worth of scratch worktrees, and a dialog that counted the
+  // messages and not the directories would be counting the small thing.
+  const trees = await orphanedWorktrees(neosh, chosen.map((e) => e.info.id));
   const detail = [
     `${messages} ${messages === 1 ? "message" : "messages"} in ${
       n === 1 ? "it" : "them"
@@ -1057,6 +1069,7 @@ async function confirmDelete(
     n === 1
       ? "It goes from disk, and there is no undo."
       : "They go from disk, and there is no undo.",
+    ...worktreeLines(trees),
     "`u` puts one back into your list instead, and costs nothing.",
   ];
 
@@ -1065,6 +1078,9 @@ async function confirmDelete(
 
 /** Delete them, saying what went and stopping at the first thing that would not. */
 async function destroy(neosh: Neosh, chosen: Entry[]): Promise<number> {
+  // Asked before anything goes, because afterwards there is nothing left to ask about: a
+  // worktree is orphaned by the conversations that *were* in it.
+  const trees = await orphanedWorktrees(neosh, chosen.map((e) => e.info.id));
   let done = 0;
   for (const e of chosen) {
     try {
@@ -1074,10 +1090,23 @@ async function destroy(neosh: Neosh, chosen: Entry[]): Promise<number> {
       // Named, because "12 of 40" with no reason is a state nobody can act on. The commonest cause
       // is a conversation that stopped being archived while the panel was open.
       neosh.notify(`stopped after ${done}: ${String(err)}`, "warn");
-      return done;
+      break;
     }
   }
-  if (done > 0) neosh.notify(done === 1 ? "deleted" : `deleted ${done} conversations`);
+  // Only the checkouts actually emptied. A stop halfway leaves conversations behind, and a tree
+  // one of them is in is a tree somebody may still come back to.
+  const gone = new Set(chosen.slice(0, done).map((e) => e.info.id));
+  const kept = new Set(chosen.slice(done).map((e) => e.info.cwd));
+  const emptied = trees.filter((t) => !kept.has(t.path));
+  const removed = gone.size === 0 ? 0 : await discardWorktrees(neosh, emptied);
+  if (done > 0) {
+    const what = done === 1 ? "deleted" : `deleted ${done} conversations`;
+    neosh.notify(
+      removed === 0
+        ? what
+        : `${what}, and ${removed === 1 ? "the worktree" : `${removed} worktrees`} they were in`,
+    );
+  }
   return done;
 }
 
@@ -1262,7 +1291,10 @@ const POINT_SIDEBAR_ACTION = "sidebar.action";
 async function contributeToSidebar(neosh: Neosh, subscriptions: Disposable[]): Promise<void> {
   await neosh.ext.contribute(POINT_SIDEBAR_ACTION, "browse", {
     key: "a",
-    label: "archive",
+    // Said as the door it is. On the panel's key card this sits two lines under `x archive`, and
+    // the same word for putting a conversation away and for going to see what was put away is two
+    // verbs the card could not tell apart.
+    label: "open the archive",
     command: "archive.open",
     on: "any",
   });

@@ -157,7 +157,7 @@ What an agent gets when it asks *you* something. Every key here is bound against
 | `y` | Copy the row's directory |
 | `p` | Pull that repository (a git-plugin contribution) |
 | `d` | Remove a worktree from disk. It asks first (a git-plugin contribution) |
-| `x` `X` | Archive, delete. On a project heading, `X` takes the project off the list |
+| `x` `X` | Archive, delete. Deleting the last conversation in a worktree removes the checkout too, and says so. On a repository's heading, `X` takes the project off the list; on a worktree's, it removes the checkout |
 | `a` | The archive |
 | `⇥` | On the plan rows: how much of it to show |
 | `?` | The keys for whatever row you are on |

@@ -308,10 +308,34 @@ pub fn stored(state: &Path, id: &SessionId) -> bool {
     is_safe_id(&id.0) && session_path(state, id).is_file()
 }
 
+/// Delete a conversation's file, and the pictures that were only ever in it.
+///
+/// An attached image is written once into `<state>/images` and the message says where — which is
+/// what keeps the transcript readable, and what left every screenshot ever pasted on disk after the
+/// conversation it was pasted into had gone. Each file is minted for one paste, so nothing else
+/// refers to it, and a delete that frees the transcript and keeps the megabytes it pointed at has
+/// freed the wrong thing. Only files *inside* the image store go: a path in a message is a claim,
+/// and a conversation is not allowed to claim a file anywhere else on the disk.
 pub fn forget(state: &Path, id: &SessionId) {
-    if is_safe_id(&id.0) {
-        let _ = std::fs::remove_file(session_path(state, id));
+    if !is_safe_id(&id.0) {
+        return;
     }
+    let path = session_path(state, id);
+    let store = state.join("images");
+    if let Some(stored) =
+        std::fs::read_to_string(&path).ok().and_then(|t| serde_json::from_str::<Stored>(&t).ok())
+    {
+        for message in &stored.messages {
+            for block in &message.content {
+                let neosh_proto::ContentBlock::Image { path, .. } = block else { continue };
+                let image = Path::new(path);
+                if image.parent() == Some(store.as_path()) && image.is_file() {
+                    let _ = std::fs::remove_file(image);
+                }
+            }
+        }
+    }
+    let _ = std::fs::remove_file(path);
 }
 
 /// Everything restorable, most recently used first, and which one was active.
@@ -390,6 +414,45 @@ mod tests {
         s.created_at = 100;
         s.updated_at = 100;
         s
+    }
+
+    /// The pictures pasted into a conversation go with it — and only those.
+    #[test]
+    fn forgetting_a_conversation_takes_its_images_off_the_disk_and_nothing_else() {
+        let t = tmp("forget-images");
+        let store = t.0.join("images");
+        std::fs::create_dir_all(&store).expect("images dir");
+        let mine = store.join("mine.png");
+        let theirs = store.join("theirs.png");
+        let elsewhere = t.0.join("elsewhere.png");
+        for f in [&mine, &theirs, &elsewhere] {
+            std::fs::write(f, b"png").expect("write");
+        }
+        let picture = |p: &PathBuf| neosh_proto::Message {
+            role: neosh_proto::Role::User,
+            content: vec![neosh_proto::ContentBlock::Image {
+                path: p.display().to_string(),
+                media_type: "image/png".into(),
+            }],
+        };
+        let mut going = session("look at this");
+        going.messages.push(picture(&mine));
+        // A message that names a file outside the store: the file is not the conversation's to
+        // delete, however the path got there.
+        going.messages.push(picture(&elsewhere));
+        let mut staying = session("and this");
+        staying.messages.push(picture(&theirs));
+        save(&t.0, &going).expect("save");
+        save(&t.0, &staying).expect("save");
+
+        forget(&t.0, &going.id);
+
+        assert!(!mine.exists(), "the deleted conversation's picture went with it");
+        assert!(theirs.exists(), "another conversation's picture stayed");
+        assert!(elsewhere.exists(), "a file outside the image store is never touched");
+        let (loaded, _) = load(&t.0);
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].id, staying.id);
     }
 
     #[test]
