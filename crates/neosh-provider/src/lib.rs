@@ -94,10 +94,25 @@ pub trait Provider: Send + Sync {
     /// asked twice from two places is how the picker and the default come to disagree.
     ///
     /// Cheap by contract: no network, no process launch per call. `claude --version` is asked once
-    /// per process and remembered, which is what makes that true here.
+    /// per *install* and remembered against the file that answered, which is what makes that true
+    /// there — and what makes the answer follow `claude update` without a restart.
+    ///
+    /// It is also the answer of record: the host re-stamps a cached model list with it on every
+    /// read, so a driver that sets [`ModelInfo::unavailable`](neosh_proto::ModelInfo::unavailable)
+    /// in [`Self::list_models`] must say the same thing here, or the picker will disagree with
+    /// itself between one open and the next.
     fn unavailable(&self, _instance: &InstanceConfig, _model: &neosh_proto::ModelId) -> Option<String> {
         None
     }
+
+    /// Forget anything remembered about the machine this runs on, so the next question is asked
+    /// afresh.
+    ///
+    /// Called when somebody asks for the model list *again* — `^R` in the picker, `neosh agent
+    /// models --refresh`. Endpoints are re-queried by the caller dropping its cache; this is the
+    /// driver's half, for facts it keeps itself: an installed CLI's version, whether a program is
+    /// there. A driver that remembers nothing has nothing to do.
+    fn refresh(&self) {}
 
     /// Start a turn. Dropping the returned stream, or cancelling the token, must terminate any
     /// in-flight request and reap any child process.

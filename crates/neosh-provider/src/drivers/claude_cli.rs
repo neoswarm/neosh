@@ -268,15 +268,30 @@ struct Conversation {
     listen: Arc<std::sync::atomic::AtomicBool>,
 }
 
+/// The identity of the file `PATH` resolves the CLI to: where it is, when it was written and how
+/// big it is. Two of these being equal is what "the same install as last time" means here.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Install {
+    path: std::path::PathBuf,
+    modified: Option<std::time::SystemTime>,
+    len: u64,
+}
+
 #[derive(Debug)]
 pub struct ClaudeCliProvider {
     program: String,
-    /// What `claude --version` said, asked once.
+    /// What `claude --version` said, and which file said it.
+    ///
+    /// Remembered against the [`Install`] that answered rather than for the life of the process:
+    /// `claude update` replaces the binary under a running workspace, and a workspace that had
+    /// asked once went on saying `run claude update (2.1.251)` about a CLI that had already been
+    /// updated — through `^R`, through every picker, until `neosh stop`. The stamp is re-read on
+    /// every ask; it is two `stat`s, and `--version` itself is only run again when they differ.
     ///
     /// `Some(None)` means we asked and could not tell — a CLI that will not report its version is
     /// treated as new enough, because hiding every recent model from somebody whose install works
     /// fine is the worse of the two mistakes.
-    version: Arc<Mutex<Option<Option<(u32, u32, u32)>>>>,
+    version: Arc<Mutex<Option<(Option<Install>, Option<(u32, u32, u32)>)>>>,
     /// One live CLI per conversation.
     ///
     /// Per conversation, not per driver. There is one of these objects for the whole program and
@@ -360,17 +375,51 @@ impl ClaudeCliProvider {
         }
     }
 
-    /// The installed version, asked once and remembered.
+    /// Which file `PATH` currently resolves the program to, or nothing when it is not there.
+    ///
+    /// Through the symlink: a Homebrew `claude` is a link into the Cellar that is repointed by an
+    /// upgrade, and an npm one is a link to a `cli.js` that is rewritten by one — either way the
+    /// file at the end changes and the link does not.
+    fn install(&self) -> Option<Install> {
+        let path = which(&self.program)?;
+        let meta = std::fs::metadata(&path).ok()?;
+        Some(Install { path, modified: meta.modified().ok(), len: meta.len() })
+    }
+
+    /// The installed version, asked of the binary that is there *now*.
+    ///
+    /// Remembered per install rather than per process — see the field. The stamp is re-read each
+    /// time because that is the whole point: the question is about a file somebody else may have
+    /// just replaced, and a cached answer with no key is an answer about the file that used to be
+    /// there.
     ///
     /// Blocking, deliberately: this is one `--version` on a program already on `PATH`, and the
     /// alternative is an async lock held across a spawn in a function whose only caller is itself
     /// async and already awaiting a list.
     fn version(&self) -> Option<(u32, u32, u32)> {
+        let now = self.install();
         let mut slot = self.version.lock().expect("version lock poisoned");
-        *slot.get_or_insert_with(|| {
-            let out = std::process::Command::new(&self.program).arg("--version").output().ok()?;
-            parse_version(&String::from_utf8_lossy(&out.stdout))
-        })
+        match &*slot {
+            Some((seen, version)) if *seen == now => *version,
+            _ => {
+                let version = std::process::Command::new(&self.program)
+                    .arg("--version")
+                    .output()
+                    .ok()
+                    .and_then(|out| parse_version(&String::from_utf8_lossy(&out.stdout)));
+                *slot = Some((now, version));
+                version
+            }
+        }
+    }
+
+    /// Forget what the CLI last said about itself, so the next question is put to it again.
+    ///
+    /// The stamp catches a replaced file, and this catches the case it cannot: a wrapper script on
+    /// `PATH` that did not change when the program behind it did. `^R` in the model picker ends up
+    /// here, so "ask again" asks the CLI too and not only the endpoints.
+    fn forget_version(&self) {
+        *self.version.lock().expect("version lock poisoned") = None;
     }
 
     /// The CLI takes a single prompt, not a message array, so we send only the newest user turn
@@ -514,8 +563,9 @@ impl Provider for ClaudeCliProvider {
     /// not existing, which sends somebody to the release notes for an answer that was one `claude
     /// update` away.
     ///
-    /// Not a network call and not cached upstream by accident: `--version` is asked once per
-    /// process, and the comparison is over nine entries.
+    /// Not a network call: `--version` is asked once per *install* — again the moment the file on
+    /// `PATH` changes, so `claude update` under a running workspace is noticed without a restart —
+    /// and the comparison is over nine entries.
     async fn list_models(&self, _instance: &InstanceConfig) -> Result<Vec<ModelInfo>, ProviderError> {
         let installed = self.version();
         Ok(catalog::claude_cli_models()
@@ -533,6 +583,10 @@ impl Provider for ClaudeCliProvider {
         model: &neosh_proto::ModelId,
     ) -> Option<String> {
         too_old_for(model.as_ref(), self.version())
+    }
+
+    fn refresh(&self) {
+        self.forget_version();
     }
 
     fn delegates_agent_loop(&self) -> bool {
@@ -1798,7 +1852,7 @@ mod tests {
     #[tokio::test]
     async fn a_model_too_new_for_this_cli_is_listed_and_says_why() {
         let provider = ClaudeCliProvider::default();
-        *provider.version.lock().expect("version lock") = Some(Some((2, 1, 222)));
+        *provider.version.lock().expect("version lock") = Some((provider.install(), Some((2, 1, 222))));
         let inst = crate::catalog::builtin_instances()
             .into_iter()
             .find(|i| i.id.as_ref() == "claude-cli")
@@ -1812,6 +1866,52 @@ mod tests {
         assert!(fable.unavailable.is_some(), "and says why");
         let opus = models.iter().find(|m| m.id.as_ref() == "claude-opus-5").expect("listed");
         assert!(opus.unavailable.is_none(), "2.1.222 runs Opus 5, so nothing is said about it");
+    }
+
+    /// `claude update` under a running workspace is noticed by the very next question.
+    ///
+    /// The bug: the version was asked once per process, so a workspace that had greyed Fable out
+    /// went on saying `run claude update` after the update had run — through `^R`, through every
+    /// picker, until `neosh stop`. A real file rather than a mock, because what is being tested is
+    /// that a *replaced binary* is seen as one: the stamp is read off the file system.
+    #[cfg(unix)]
+    #[test]
+    fn a_replaced_cli_is_asked_again() {
+        let dir = std::env::temp_dir().join(format!("neosh-upgrade-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let script = dir.join("fake-claude");
+        // Written by a child for the reason `the_child_is_started_in_the_conversations_directory`
+        // gives: a descriptor we hold open is one a sibling's spawn inherits, and `ETXTBSY` follows.
+        let write = |body: &str| {
+            let ok = std::process::Command::new("/bin/sh")
+                .args(["-c", r#"printf '%s' "$1" > "$2" && chmod 755 "$2""#, "neosh-test-write"])
+                .arg(body)
+                .arg(&script)
+                .status()
+                .expect("a shell to write the stand-in");
+            assert!(ok.success(), "writing the stand-in failed: {ok}");
+        };
+        // Different lengths on purpose: two writes inside one clock tick share a modification time
+        // on file systems that keep seconds, and the size is the half of the stamp that cannot.
+        write("#!/bin/sh\necho '2.1.222 (Claude Code)'\n");
+        let p = ClaudeCliProvider::new(script.display().to_string());
+        assert_eq!(p.version(), Some((2, 1, 222)));
+        assert!(p.unavailable(&inst(), &neosh_proto::ModelId::from("claude-fable-5-1")).is_some(), "too old");
+
+        write("#!/bin/sh\necho '2.1.260 (Claude Code)' # updated in place\n");
+        assert_eq!(p.version(), Some((2, 1, 260)), "the new file is asked, not the old answer");
+        assert!(
+            p.unavailable(&inst(), &neosh_proto::ModelId::from("claude-fable-5-1")).is_none(),
+            "and the row stops saying to run the update that has been run"
+        );
+
+        // A wrapper that did not change is the case the stamp cannot see, and `refresh` is for it.
+        let before = p.version.lock().expect("version lock").clone();
+        p.refresh();
+        assert!(p.version.lock().expect("version lock").is_none(), "forgotten");
+        assert_eq!(p.version(), Some((2, 1, 260)));
+        assert_eq!(p.version.lock().expect("version lock").clone(), before, "and re-learnt");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

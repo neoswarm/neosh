@@ -31,11 +31,25 @@ command palette, `<C-z>` every binding there is.
 ./scripts/check.sh              # everything CI runs — do this before committing
 ```
 
-Six steps: the workspace test suite, the ts-rs binding drift check, then `tsc` over the plugin API,
-the example plugin, the bundled plugins, and a freshly scaffolded config. The `tsc` steps matter
-because a Rust type change that silently breaks every plugin's types is exactly the failure this
-project is built to avoid — and the bundled-plugin step is what keeps "the sidebar is just a plugin"
-from quietly becoming false.
+Four stages, and CI runs each on a runner of its own so a pull request waits for the slowest
+rather than the sum: `crates` (every crate below the binary, plus the ts-rs binding drift check and
+what `cargo package` would ship), `binary` (the neosh binary's own tests, the suites that drive it,
+and a freshly scaffolded config type-checked against its own emitted types), `screen` (the bundled
+plugins, on screen, one whole neosh per test) and `web` (`tsc` over the plugin API, the example
+plugin and the bundled plugins, and what each of them publishes). The `tsc` steps matter because a
+Rust type change that silently breaks every plugin's types is exactly the failure this project is
+built to avoid — and the bundled-plugin step is what keeps "the sidebar is just a plugin" from
+quietly becoming false.
+
+```sh
+./scripts/check.sh crates       # one stage
+./scripts/check.sh screen 1/3   # one slice of one, the way a CI runner takes it
+```
+
+Tests run under [`cargo nextest`](https://nexte.st) when it is installed — one process per test,
+and a slice needs it — and under `cargo test` when it is not. Either way the pty suites run on half
+the machine's cores, because a workspace per test starved of CPU is a different timeout on every
+run; `NEOSH_TEST_THREADS` overrides that.
 
 Narrower loops:
 

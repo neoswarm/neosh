@@ -924,7 +924,9 @@ pub enum ApiCall {
         ///
         /// Discovery is a network round trip per instance. Doing it on every keystroke that opens a
         /// model picker is seconds of nothing happening, so the answer is cached for the session
-        /// and this is how you ask for a fresh one.
+        /// and this is how you ask for a fresh one. It reaches the driver too: whatever it
+        /// remembers about the machine — a vendor CLI's version — is forgotten and asked again,
+        /// so a `claude update` in another terminal is seen without restarting the workspace.
         #[serde(default)]
         refresh: bool,
     },
