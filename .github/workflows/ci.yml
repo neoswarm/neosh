@@ -45,7 +45,13 @@ jobs:
         with:
           # This stage never builds the binary, so its dependency set is smaller than the other
           # two's. A key of its own, or whichever job saved first would leave the others short.
-          shared-key: crates
+          #
+          # Bumped once (2026-09-06): a lockfile change misses the exact key and restores the
+          # nearest older cache, and the one on the shelf then held `v8`'s build-script fingerprint
+          # without the static library it downloads — every build of that job failed at
+          # "could not find native static library `rusty_v8`" and, with nothing saved on failure,
+          # kept restoring the same broken cache. A new name is a fresh shelf.
+          shared-key: crates-2
       - run: ./scripts/check.sh crates
 
   binary:
