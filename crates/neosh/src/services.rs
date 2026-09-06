@@ -469,6 +469,13 @@ impl Services {
             let mut cache = self.model_cache.lock().expect("model cache poisoned");
             for inst in &targets {
                 cache.remove(&inst.id);
+                // The driver's half of "ask again". Dropping our cache re-queries the endpoint;
+                // what the driver remembers about this machine — `claude --version`, say — is its
+                // own, and a refresh that left it standing was a `^R` that changed nothing about
+                // the one row it was pressed for.
+                if let Some(d) = self.agent.providers().driver(&inst.driver) {
+                    d.refresh();
+                }
             }
         }
 
@@ -481,7 +488,18 @@ impl Services {
                 .cloned();
             let driver = self.agent.providers().driver(&inst.driver);
             async move {
-                if let Some(models) = cached {
+                if let Some(mut models) = cached {
+                    // What the endpoint serves is cached; whether *this machine* can run it is
+                    // not, because it is cheap and it changes under us. `claude update` in another
+                    // terminal is the case: the list was right when it was cached and the
+                    // `run claude update` on Fable's row went on being drawn, from this cache,
+                    // after the update had run. Re-stamped from the driver on every read, so the
+                    // picker follows the install without anybody pressing `^R`.
+                    if let Some(d) = &driver {
+                        for m in &mut models {
+                            m.unavailable = d.unavailable(&inst, &m.id);
+                        }
+                    }
                     return (inst.id.clone(), models);
                 }
                 let models = match driver {
