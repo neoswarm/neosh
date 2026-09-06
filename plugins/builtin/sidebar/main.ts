@@ -28,7 +28,7 @@
  * - **`sidebar.section` is a contribution point.** Anything you can describe as rows appears in the
  *   column, in the position you ask for, invoking your commands.
  * - **`sidebar.action` is a verb on a row.** Say the key, the label and the command; this panel
- *   binds it, shows it in the hint strip when it applies, and invokes your command with the row
+ *   binds it, shows it on the key card when it applies, and invokes your command with the row
  *   under the cursor as arguments.
  *
  * What a project *is* — pinned, ordered, folded — lives in shared project vars rather than in this
@@ -36,7 +36,7 @@
  * favourites rather than each starting empty.
  */
 
-import { byteLength, projectScope } from "@neosh/api";
+import { byteLength, projectScope, width } from "@neosh/api";
 import { CLONE_EVENT } from "@neosh/api";
 import type {
   AgentSummary,
@@ -44,6 +44,7 @@ import type {
   Contribution,
   Disposable,
   DrawnRow,
+  KeymapEntry,
   Neosh,
   PluginContext,
   NodeInfo,
@@ -63,6 +64,10 @@ import {
   confirmDestructive,
   configureMotion,
   CursoredList,
+  discardWorktrees,
+  orphanedWorktrees,
+  worktreeAt,
+  worktreeLines,
   type Decoration,
   type DecorationItem,
   badgeWidth as badgeColumns,
@@ -82,6 +87,7 @@ import {
   pathPicker,
   picker,
   type PickerItem,
+  prettyKey,
   prompt,
   pulseBright,
   pulseHl,
@@ -155,7 +161,7 @@ function targetKey(t: Target | undefined): string | null {
 interface ActionItem {
   /** Key notation, as `keymap.set` takes it: `d`, `<C-y>`, `gd`. */
   key: string;
-  /** What it does, for the hint strip and for `^Z`. */
+  /** What it does, for the key card and for `^Z`. */
   label: string;
   command: string;
   /**
@@ -173,6 +179,17 @@ interface ActionItem {
    * panel is what resolves it — see {@link applies}.
    */
   on?: string;
+}
+
+/** A contributed verb as this panel bound it: whose it is, and the binding its key points at. */
+interface BoundAction extends ActionItem {
+  plugin: string;
+  /**
+   * The command the key was bound to here — the panel's wrapper, not the contributor's `command`,
+   * which is what the wrapper runs. `null` when the key was refused, one of ours, and so was never
+   * bound at all.
+   */
+  binding: string | null;
 }
 
 /** A project as the panel thinks of it: a directory, and what is going on in it. */
@@ -202,6 +219,20 @@ const KIND = "neosh.sidebar";
 
 /** Emitted on every cursor move, with the row under it as `data` — a {@link Target} or `null`. */
 const EVENT_CURSOR = "sidebar.cursor";
+
+/** The key card beside the panel. A kind of its own, so a theme or a plugin can find it. */
+const KIND_KEYS = "neosh.sidebar.keys";
+
+/**
+ * What each of this panel's verbs says on each kind of row, for the key card.
+ *
+ * Keyed by command name and holding only the *words*: the key itself is read out of the registry
+ * when the card is drawn, so a binding somebody moved in `init.ts` shows the letter that works —
+ * a legend is a promise about a keyboard. A verb with no entry here is about the panel rather than
+ * about a row (a motion, the width, the way out) and the card's foot covers those. Two keys with
+ * the same words on one kind of row share a line, which is what `↵` and `space` on a project are.
+ */
+const ABOUT = new Map<string, Partial<Record<Target["kind"], string>>>();
 
 /**
  * What this panel offers a plugin that imports it: `import { api } from "plugin:sidebar"`.
@@ -361,6 +392,12 @@ export async function activate({ neosh, subscriptions }: PluginContext) {
     const count = { pending: "" };
     let capture: Disposable | null = null;
     let running = false;
+    // The keys for the row under the cursor, beside the panel. Through `here`, so it opens on the
+    // terminal this panel is on; `arming` is the delay before it appears, cancelled by leaving.
+    const card = new KeyCard(here);
+    let arming: Disposable | null = null;
+    /** Where the card goes: just past the panel's rule, level with the cursor's row. */
+    const cardAt = (): [number, number] => [panelWidth + 1, list.cursorScreenRow ?? 0];
 
     // Serialises redraws. Two overlapping refreshes interleave their `setLines` and `mark` calls
     // and leave highlights pointing at rows that have already been replaced.
@@ -407,6 +444,12 @@ export async function activate({ neosh, subscriptions }: PluginContext) {
             win: win ?? undefined,
             pinned: built.pinned,
           });
+          // After the render, which is what decides which screen row the cursor's row is on. A
+          // draw that changed nothing the card says is a draw the card ignores.
+          if (focused && win !== null && card.isOpen()) {
+            const [col, row] = cardAt();
+            await card.draw(list.value, actions(), win, col, row);
+          }
         } while (again);
       } finally {
         drawing = false;
@@ -459,8 +502,35 @@ export async function activate({ neosh, subscriptions }: PluginContext) {
       focused = false;
       capture?.dispose();
       capture = null;
+      arming?.dispose();
+      arming = null;
+      await card.close();
       await here.focus.pop().catch(() => {});
       await draw();
+    };
+
+    /**
+     * Put the key card up, after the delay the window prefix's list waits.
+     *
+     * `ui.keys.hint_delay` rather than a setting of this panel's own, because it is the same
+     * bargain: a panel that appears while you are still typing is a flash, and one that appears
+     * when you have paused is an answer. Both are read here rather than at activation, so a change
+     * in `config.toml` takes effect the next time the panel is entered.
+     */
+    const armCard = async () => {
+      const wanted = (await neosh.opt.get<boolean>("sidebar.legend").catch(() => null)) ?? true;
+      if (!wanted) return;
+      const delay = (await neosh.opt.get<number>("ui.keys.hint_delay").catch(() => null)) ?? 300;
+      arming?.dispose();
+      arming = neosh.timer.after(Math.max(0, delay), () => {
+        arming = null;
+        void (async () => {
+          if (!focused || win === null) return;
+          const [col, row] = cardAt();
+          await card.open(win, col, row);
+          await card.draw(list.value, actions(), win, col, row);
+        })().catch((e: unknown) => neosh.log.warn(`sidebar: key card: ${String(e)}`));
+      });
     };
 
     const close = async () => {
@@ -495,6 +565,7 @@ export async function activate({ neosh, subscriptions }: PluginContext) {
         list.select((t) => t.kind === "session" && t.id === current.id);
       }
       await draw();
+      await armCard();
     };
 
     return {
@@ -523,9 +594,12 @@ export async function activate({ neosh, subscriptions }: PluginContext) {
       dispose: () => {
         capture?.dispose();
         capture = null;
+        arming?.dispose();
+        arming = null;
         // Not closed here: the terminal has gone and the host took its windows with it. Closing a
         // window that is already gone is an error message about nothing.
         win = null;
+        card.forget();
       },
     };
   };
@@ -750,7 +824,14 @@ async function declareOptions(neosh: Neosh): Promise<void> {
     type: { type: "bool" },
     default: true,
     description:
-      "Show the keys for whatever the cursor is on, at the foot of the panel. Turn it off once they are in your fingers.",
+      "Show the main keys at the foot of the panel. Turn it off once they are in your fingers.",
+  });
+  await neosh.opt.declare({
+    name: "sidebar.legend",
+    type: { type: "bool" },
+    default: true,
+    description:
+      "While the panel has the keyboard, a card beside it lists every key for the row under the cursor. It appears after `ui.keys.hint_delay`, so moving through the list never flashes one.",
   });
   await neosh.opt.declare({
     name: "sidebar.refresh_ms",
@@ -1125,8 +1206,12 @@ async function registerCommands(w: Wiring): Promise<void> {
     key: string | null,
     desc: string,
     fn: (p: Panel, target: Target | undefined, args: string[]) => Promise<void> | void,
-    opts: { redraw?: boolean } = {},
+    opts: { redraw?: boolean; on?: Partial<Record<Target["kind"], string>> } = {},
   ): Promise<void> => {
+    // What the card beside the panel says for it, per kind of row it applies to. `desc` is the
+    // sentence `^Z` prints for every row at once; this is the short form for the one row you are
+    // on, which is a different sentence on a project than on a conversation.
+    if (opts.on) ABOUT.set(name, opts.on);
     w.subscriptions.push(
       // The panel the key was pressed in. Every verb below acts on one terminal's column — its
       // cursor, its fold state, its half-typed count — and with several open, "the panel" is not
@@ -1266,12 +1351,21 @@ async function registerCommands(w: Wiring): Promise<void> {
     "<CR>",
     "Open a conversation, fold a project, or run the row",
     (p, target) => activateTarget(neosh, arrangement, target, p),
-    { redraw: false },
+    {
+      redraw: false,
+      on: {
+        session: "open",
+        project: "fold or unfold",
+        add: "add a project",
+        custom: "run it",
+        remote: "watch it",
+      },
+    },
   );
   await verb(`${NS}.fold`, "<Space>", "Fold or unfold this project", async (p, target) => {
     if (target?.kind !== "project") return;
     await arrangement.toggleFold(target.cwd);
-  });
+  }, { on: { project: "fold or unfold" } });
   await verb(`${NS}.favorite`, "f", "Pin this project to the top", async (p, target) => {
     let cwd = owningProject(target);
     if (cwd === null) return;
@@ -1285,7 +1379,7 @@ async function registerCommands(w: Wiring): Promise<void> {
     // is already in — saying so in the corner as well is the same fact twice, and a corner that is
     // usually restating something visible is one people stop reading.
     await arrangement.toggleFavorite(cwd);
-  });
+  }, { on: { project: "pin to the top", session: "pin its project to the top" } });
 
   // Shift moves the thing rather than the cursor — the one convention every list that can be
   // rearranged already shares.
@@ -1298,13 +1392,15 @@ async function registerCommands(w: Wiring): Promise<void> {
     if (cwd === null) return;
     await arrangement.move(await groups(), cwd, delta);
   };
-  await verb(`${NS}.move.down`, "J", "Move this project down", reorder(1));
-  await verb(`${NS}.move.up`, "K", "Move this project up", reorder(-1));
+  // One line on the card for the pair — the same words on both, so they share it.
+  const moving = { project: "move up or down", session: "move its project up or down" };
+  await verb(`${NS}.move.down`, "J", "Move this project down", reorder(1), { on: moving });
+  await verb(`${NS}.move.up`, "K", "Move this project up", reorder(-1), { on: moving });
 
   await verb(`${NS}.rename`, "r", "Rename this conversation", async (p, target) => {
     if (target?.kind !== "session") return;
     await renameSession(neosh, target.id);
-  });
+  }, { on: { session: "rename" } });
   // The panel's own copy verb, same letter the transcript uses. What a row is *at* is the thing
   // you paste into a terminal, an editor or a message, and retyping a generated worktree path is
   // the kind of chore this panel exists to remove.
@@ -1313,14 +1409,14 @@ async function registerCommands(w: Wiring): Promise<void> {
     if (cwd === null) return;
     await neosh.edit.copy(cwd);
     neosh.notify(`copied ${cwd}`);
-  }, { redraw: false });
+  }, { redraw: false, on: { project: "copy its directory", session: "copy its directory" } });
   // The everyday verb, and it is reversible. Archiving takes a conversation out of the list without
   // taking anything away, which is what people were reaching for `x` to do before `x` deleted
   // things. Where it goes is `a`, not four dim rows at the foot of this panel.
   await verb(`${NS}.archive`, "x", "Archive this conversation", async (p, target) => {
     if (target?.kind !== "session") return;
     await setArchived(neosh, target.id, true);
-  });
+  }, { on: { session: "archive" } });
   // Shifted, because this is the one that cannot be undone.
   //
   // One key, two rows, and the same sentence: take this off the list for good. On a heading that is
@@ -1338,6 +1434,7 @@ async function registerCommands(w: Wiring): Promise<void> {
       if (target?.kind !== "session") return;
       await deleteSession(neosh, target.id);
     },
+    { on: { session: "delete", project: "remove from the list" } },
   );
   await verb(`${NS}.new`, "n", "New conversation in this project", async (p, target) => {
     // The same question `^N` asks, about the project you are looking at — which is the whole reason
@@ -1348,7 +1445,10 @@ async function registerCommands(w: Wiring): Promise<void> {
     const cwd = owningProject(target) ?? undefined;
     await p.leave();
     await newConversation(neosh, arrangement, cwd);
-  }, { redraw: false });
+  }, {
+    redraw: false,
+    on: { project: "new conversation here", session: "new conversation in this project" },
+  });
 
   // ---- doors out of the panel ----
   //
@@ -1496,6 +1596,28 @@ async function registerCommands(w: Wiring): Promise<void> {
       w.each((p) => p.draw());
     }, { desc: "Take a project off the list" }),
   );
+  w.subscriptions.push(
+    await neosh.cmd.register("project.forget", async (args) => {
+      // The row, and only the row: no dialog and nothing deleted. For a directory that has already
+      // gone — a worktree the git plugin or the archive just took off the disk — whose row would
+      // otherwise sit here saying `nothing here yet` about a place that is not there. A project
+      // with conversations still in it is refused, because forgetting it would not empty it and a
+      // caller that wanted them deleted has `project.remove`.
+      const cwd = args[0]?.trim();
+      if (!cwd) {
+        neosh.notify("project.forget needs a directory", "warn");
+        return;
+      }
+      const inside = (await neosh.session.list({ includeArchived: true }).catch(() => []))
+        .some((s) => s.cwd === cwd);
+      if (inside) {
+        neosh.notify(`${short(cwd)} still has conversations in it — \`project.remove\` deletes them`, "warn");
+        return;
+      }
+      await arrangement.forget(cwd);
+      w.each((p) => p.draw());
+    }, { desc: "Drop a project's row without deleting anything — for a directory that has gone" }),
+  );
 
   await neosh.keymap.set("chat", "<C-b>", "sidebar.toggle", { desc: "Toggle the sidebar" });
   await neosh.keymap.set("chat", "<C-t>", "sidebar.focus", { desc: "Projects and conversations" });
@@ -1554,7 +1676,7 @@ function installActions(
   neosh: Neosh,
   panel: (view?: ViewId) => Panel | null,
   onChange: () => void,
-): { actions: () => ActionItem[]; dispose: Disposable } {
+): { actions: () => BoundAction[]; dispose: Disposable } {
   const scope = { kind: "buf_kind", name: KIND } as const;
   let current: Array<Contribution & { item: ActionItem }> = [];
   let bound: Array<{ key: string; command: string }> = [];
@@ -1613,7 +1735,7 @@ function installActions(
 
     for (const [key, claimants] of sharing) {
       // The narrow verbs first: a verb about the row you are standing on beats one about every row,
-      // which is the same ranking the hint strip prints them in and for the same reason. A key that
+      // which is the same ranking the key card prints them in and for the same reason. A key that
       // meant "cycle the plan detail" wherever the cursor was would be a key that did the wrong
       // thing on somebody else's block.
       const ranked = [
@@ -1649,7 +1771,16 @@ function installActions(
   });
 
   return {
-    actions: () => current.map((c) => c.item),
+    // With the command each one's key was bound under, which is how the key card finds the key
+    // in the registry rather than trusting the key the contributor asked for: a user who moved it
+    // in `init.ts` has the new letter on the card. A key that was refused has no binding and no
+    // command, and the card leaves it out for the reason the strip did.
+    actions: () =>
+      current.map((c) => ({
+        ...c.item,
+        plugin: c.plugin,
+        binding: bound.find((b) => b.key === c.item.key)?.command ?? null,
+      })),
     dispose: {
       dispose() {
         sub.dispose();
@@ -2511,10 +2642,16 @@ async function deleteSession(neosh: Neosh, session: string): Promise<boolean> {
   const info = (await neosh.session.list({ includeArchived: true }).catch(() => [] as SessionInfo[]))
     .find((s) => s.id === session);
   const count = info?.message_count ?? 0;
+  // The checkout this was the last conversation in, if it was one. A worktree is made for the
+  // conversations in it, so the last of them going takes the directory too — said in the same
+  // dialog, because a delete that quietly removes a directory is a delete whose question did not
+  // say what was at stake.
+  const trees = await orphanedWorktrees(neosh, [session]);
   const detail = [
     count === 0
       ? "Nothing has been said in it yet."
       : `${count} ${count === 1 ? "message" : "messages"}, in ${info?.project || basename(info?.cwd ?? "")}.`,
+    ...worktreeLines(trees),
     info?.archived
       ? "It is archived, so leaving it here costs nothing."
       : "Archiving keeps every word of it and takes it out of your list.",
@@ -2527,11 +2664,13 @@ async function deleteSession(neosh: Neosh, session: string): Promise<boolean> {
   if (!ok) return false;
   try {
     await neosh.session.close(session);
-    return true;
   } catch (e) {
     neosh.notify(String(e), "warn");
     return false;
   }
+  const removed = await discardWorktrees(neosh, trees);
+  if (removed > 0) neosh.notify(`removed the worktree at ${trees[0]?.path ?? ""}`);
+  return true;
 }
 
 /**
@@ -2558,15 +2697,31 @@ async function removeProject(
   const inside = (await neosh.session.list({ includeArchived: true }).catch(() => [] as SessionInfo[]))
     .filter((s) => s.cwd === cwd);
   const name = inside[0]?.project || arrangement.name(cwd) || basename(cwd);
+  // A worktree row is a directory this workspace made for the conversations in it, and removing
+  // the row is removing the last reason for the checkout to be on the disk. The repository itself
+  // is never this: `worktreeAt` answers only for a tree `git worktree list` says is one, and never
+  // for the main checkout, so `X` on a repository's row is what it always was — the row goes and
+  // the directory stays.
+  const root = inside.find((s) => s.repo_root)?.repo_root ?? arrangement.root(cwd) ?? "";
+  const tree = await worktreeAt(neosh, cwd, root);
+  const trees = tree ? [tree] : [];
 
-  if (inside.length > 0) {
+  if (inside.length > 0 || trees.length > 0) {
     const many = inside.length === 1 ? "conversation" : `${inside.length} conversations`;
-    const ok = await confirmDestructive(neosh, `Remove "${clip(name, 40)}" and its ${many}?`, {
-      yes: "Delete",
+    const question = inside.length === 0
+      ? `Remove the worktree "${clip(name, 40)}"?`
+      : trees.length > 0
+      ? `Remove the worktree "${clip(name, 40)}" and its ${many}?`
+      : `Remove "${clip(name, 40)}" and its ${many}?`;
+    const ok = await confirmDestructive(neosh, question, {
+      yes: trees.length > 0 ? "Remove" : "Delete",
       no: "Keep",
       detail: [
-        atStake(inside),
-        "`x` on a conversation archives it instead, and an archived one is already out of the way.",
+        ...(inside.length > 0 ? [atStake(inside)] : []),
+        ...worktreeLines(trees),
+        ...(inside.length > 0
+          ? ["`x` on a conversation archives it instead, and an archived one is already out of the way."]
+          : []),
       ],
     });
     if (!ok) return;
@@ -2580,8 +2735,11 @@ async function removeProject(
     }
   }
 
+  const removed = await discardWorktrees(neosh, trees);
   await arrangement.forget(cwd);
-  neosh.notify(`removed ${short(cwd)} — \`o\` adds it back`);
+  neosh.notify(
+    removed > 0 ? `removed the worktree at ${cwd}` : `removed ${short(cwd)} — \`o\` adds it back`,
+  );
 }
 
 /**
@@ -3357,8 +3515,8 @@ interface DrawOptions {
   hints: boolean;
   focused: boolean;
   selected: Target | undefined;
-  /** The verbs other plugins put on our rows, for the hint strip. */
-  actions: ActionItem[];
+  /** The verbs other plugins put on our rows, for the key card. */
+  actions: BoundAction[];
   /** Which conversations are waiting on an answer from you. See [`VAR_ASKING`]. */
   asking: Set<string>;
   /** Marks other plugins put on our rows, by [`targetKey`]. See [`POINT_DECORATION`]. */
@@ -3459,7 +3617,9 @@ async function collect(
       // to be widened, and `>` was bound, documented and invisible — advertised on contributed
       // rows only, which is the one kind of row most people never stand on. Only while the panel
       // has the keyboard, because that is when the key does anything.
-      rows.push(...heading("PROJECTS", opts.width, opts.focused ? "<> width" : undefined));
+      // The key on the heading is the one that gets you in, and then the one that gets you out:
+      // a key beside the thing it acts on, which is where a key is found rather than learned.
+      rows.push(...heading("PROJECTS", opts.width, opts.focused ? "esc" : "^T"));
       for (const p of projects) {
         rows.push(projectRow(p, arrangement, opts, now));
         if (arrangement.isFolded(p.cwd)) continue;
@@ -3505,6 +3665,9 @@ async function collect(
       rows.push({
         text: " + Add project",
         hl: "Accent",
+        // The key for this row, on this row. `^O` from the composer; `o` from anywhere in the
+        // panel, which is the same question asked from nearer by.
+        right: { text: `${opts.focused ? "o" : "^O"} `, hl: "Sidebar.Key" },
         value: { kind: "add" },
       });
     },
@@ -3537,9 +3700,9 @@ function heading(text: string, width: number, hint?: string): ListRow<Target>[] 
     {
       text: ` ${text}`,
       hl: "Sidebar.Heading",
-      // Dim, and on the heading rather than beside the title: it is an answer to "and then what",
-      // which is a question you ask after reading the section, not while finding it.
-      right: hint ? { text: `${hint} `, hl: "Sidebar.Dim" } : undefined,
+      // On the heading rather than beside the title: it is an answer to "and then what", which is
+      // a question you ask after reading the section, not while finding it.
+      right: hint ? { text: `${hint} `, hl: "Sidebar.Key" } : undefined,
       inert: true,
     },
     { text: "─".repeat(Math.max(1, width)), hl: "Separator", inert: true },
@@ -3937,37 +4100,44 @@ function turnFor(s: SessionInfo, now: number): string {
 }
 
 /**
- * The keys for whatever the cursor is on.
+ * The main keys, at the foot.
  *
- * Contextual rather than a fixed cheat sheet: `x` closes a conversation and means nothing on a
- * project, and a list of verbs that do not all apply is a list you learn to distrust. Everything
- * here is also reachable from `?`, which is the escape hatch when the panel is too narrow.
+ * Only the main ones. This strip used to carry every verb for the row under the cursor, packed two
+ * to a line in one dim colour, and what that looked like was a paragraph — a row of `f ★  JK move
+ * n new  y path` is read once and then never again. The verbs for a row are on the key card beside
+ * the panel now, one per line and level with the row they are about, and `?` is the whole sheet.
+ * What stays here is what you press from wherever you are: the way in, the way out, and the doors
+ * to the rest of the workspace.
+ *
+ * Laid out as a grid rather than packed: the keys line up in columns and wear `Sidebar.Key`, so
+ * the eye lands on the letters and the words are what they mean. Cells come off the end when the
+ * column is narrow, except the last, which is the way to everything that did not fit.
  */
 function hints(opts: DrawOptions): ListRow<Target>[] {
   const kind = opts.selected?.kind;
-  const lines = strip(
-    !opts.focused
-      // `^O` is not here and `+ Add project` is a row you can see: a key strip has two lines, and
-      // the verb with a row of its own is the one that can afford to give up its place on them.
-      ? ["^T projects", "^N new", "^F archive", "^K palette", "^B hide", "^Z keys"]
-      : kind === "custom"
-        ? ["↵ open it", "esc back", "? keys"]
-      : kind === "project"
-        // `X` is on the strip because a list you cannot shorten is a list that grows forever, and
-        // a project that outlives its conversations — which is the point of it — has to have a way
-        // off.
-        ? ["↵ fold", "f ★", "JK move", "n new", "y path", "X remove", "? keys"]
-        : kind === "session"
-          ? ["↵ open", "r rename", "x archive", "X delete", "y path", "? keys"]
-          : ["↵ add project", "esc back", "? keys"],
-    opts.width,
-  );
-
-  // Contributed verbs get their own line rather than being squeezed onto ours, because ours are
-  // laid out in columns that a third party's label of unknown length would break — and because a
-  // key nobody can see is a key nobody presses, which is the whole argument for this strip.
-  const mine = opts.focused ? contributedHint(opts) : "";
-
+  const cells: Array<[string, string]> = !opts.focused
+    // `^T` is on the heading and `^O` on the add row, beside what they act on. What is left is
+    // what has no row of its own.
+    ? [["^N", "new"], ["^F", "archive"], ["^K", "palette"], ["^B", "hide"], ["^Z", "keys"]]
+    : [
+      // What `↵` does *here*, because a strip that says `open` over a project is a strip you
+      // learn to distrust.
+      [
+        "↵",
+        kind === "project"
+          ? "fold"
+          : kind === "add"
+          ? "add"
+          : kind === "custom"
+          ? "run"
+          : kind === "remote"
+          ? "watch"
+          : "open",
+      ],
+      ["?", "keys"],
+      ["esc", "back"],
+    ];
+  const lines = grid(cells, opts.width);
   return [
     blank(),
     { text: "─".repeat(Math.max(1, opts.width)), hl: "Separator", inert: true },
@@ -3975,91 +4145,255 @@ function hints(opts: DrawOptions): ListRow<Target>[] {
     // effect until the next one, which is indistinguishable from a key that does nothing. On the
     // first key line rather than on the rule above it — the rule is a row of full width, and a
     // flush-right virtual text has nowhere to sit on a row that is already full.
-    ...lines.map((text, i) => ({
-      text: ` ${text}`,
+    ...lines.map((line, i) => ({
+      text: line.text,
+      spans: line.spans,
       hl: "Sidebar.Dim",
       right: i === 0 && opts.count !== "" ? { text: `${opts.count} `, hl: "Accent" } : undefined,
       inert: true,
     })),
-    ...(mine === "" ? [] : [{ text: ` ${mine}`, hl: "Sidebar.Dim", inert: true }]),
   ];
 }
 
 /**
- * A key strip packed into the column it is actually drawn in.
+ * Key cells in aligned columns, at most two lines of them.
  *
- * These lines used to be written out by hand with their columns lined up by eye, which is a layout
- * that is right at exactly one width: the project row's second line came to thirty-six columns in
- * a panel that is thirty-four wide by default, and what fell off the end was `? keys` — clipped to
- * `? k`. A strip that truncates its own escape hatch is worse than one that never mentioned it.
- *
- * So: verbs in order of how much you need them, packed greedily onto two lines, and whatever does
- * not fit is dropped. The **last** cell is the way to everything dropped — `? keys`, or `^Z keys`
- * when the panel does not have the keyboard — so if anything was dropped it takes the final slot.
- * Greedy rather than even columns because these cells are three columns wide (`f ★`) and eight
- * (`X remove`), and a grid sized for the widest fits four fewer verbs than the panel has room for.
+ * Every cell is padded to the widest, so the keys make a column and the words make another — a
+ * strip you can scan down rather than read along. How many columns is worked out from the width
+ * the panel actually has, and what does not fit in two lines is dropped from the end, keeping the
+ * last cell: that one is `keys`, the way to everything dropped, and a strip that truncates its own
+ * escape hatch is worse than one that never mentioned it.
  */
-function strip(cells: string[], width: number): string[] {
-  const cols = (s: string) => Array.from(s).length;
+function grid(
+  cells: Array<[string, string]>,
+  width: number,
+): Array<{ text: string; spans: Array<{ from: number; to: number; hl: string }> }> {
+  const cols = (t: string) => Array.from(t).length;
   const room = Math.max(1, width - 1);
-  const last = cells[cells.length - 1] ?? "";
-  const lines: string[] = [];
-  let placed = 0;
-  for (const cell of cells) {
-    const open = lines.length === 0 ? "" : lines[lines.length - 1] ?? "";
-    if (open !== "" && cols(`${open}  ${cell}`) <= room) {
-      lines[lines.length - 1] = `${open}  ${cell}`;
-    } else if (lines.length < 2 && cols(cell) <= room) {
-      lines.push(cell);
-    } else {
-      break;
-    }
-    placed++;
+  const cell = Math.max(...cells.map(([k, l]) => cols(k) + 1 + cols(l)));
+  const perLine = Math.max(1, Math.floor((room + 2) / (cell + 2)));
+  let shown = cells;
+  if (cells.length > perLine * 2) {
+    const last = cells[cells.length - 1];
+    shown = cells.slice(0, perLine * 2 - 1);
+    if (last) shown.push(last);
   }
-  // Anything left unplaced means the strip is incomplete, so its last line has to end at the way in
-  // to the rest. Verbs come off the tail to make room for it rather than it being appended, because
-  // appending is exactly what overflowed — this is counting the same columns the loop above did.
-  if (placed < cells.length && lines.length > 0) {
-    const at = lines.length - 1;
-    let tail = lines[at] ?? "";
-    while (tail !== "" && cols(`${tail}  ${last}`) > room) {
-      const cut = tail.lastIndexOf("  ");
-      tail = cut < 0 ? "" : tail.slice(0, cut);
+  const lines: Array<{ text: string; spans: Array<{ from: number; to: number; hl: string }> }> =
+    [];
+  for (let i = 0; i < shown.length; i += perLine) {
+    let text = " ";
+    const spans: Array<{ from: number; to: number; hl: string }> = [];
+    for (const [j, [key, label]] of shown.slice(i, i + perLine).entries()) {
+      if (j > 0) text += "  ";
+      const from = byteLength(text);
+      text += key;
+      spans.push({ from, to: byteLength(text), hl: "Sidebar.Key" });
+      text += ` ${label}`;
+      // Pad to the column, except the last cell on the line — trailing spaces are what a
+      // flush-right count would have to sit on top of.
+      if (j < perLine - 1) text += " ".repeat(Math.max(0, cell - cols(key) - 1 - cols(label)));
     }
-    lines[at] = tail === "" ? last : `${tail}  ${last}`;
+    lines.push({ text: text.trimEnd(), spans });
   }
   return lines;
 }
 
-/** The contributed verbs that apply to the row under the cursor, clipped to the column. */
-function contributedHint(opts: DrawOptions): string {
-  const applicable = opts.actions.filter((a) => applies(a.on ?? "any", opts.selected));
-  if (applicable.length === 0) return "";
-  // The verbs about *this row* first, then the ones about any of them.
-  //
-  // One line, in a column that is 34 wide by default, and a third plugin's verb is what takes it
-  // past the edge. Which one gets clipped is therefore a decision this makes rather than one the
-  // order plugins happened to load in makes for it — and a key that only applies to the row you are
-  // standing on is the one that has to survive: a verb about every row is a verb you will see again
-  // the moment you move.
+/** One line of the key card: the keys, and what they do on this row. */
+interface LegendLine {
+  keys: string[];
+  label: string;
+}
+
+/**
+ * What the card beside the panel says for the row under the cursor.
+ *
+ * Built from the registry and nothing else. `maps` is every binding on this panel's kind as the
+ * host holds it right now; {@link ABOUT} says which of this panel's verbs apply to this kind of row
+ * and in what words, and the contributed verbs say so themselves. So a key moved in `init.ts`
+ * shows the letter that works, a verb a plugin withdrew is gone, and a key nothing in the panel
+ * claims is not advertised. Two keys with the same words share a line.
+ *
+ * The contributed verbs about *this row* come before the ones about any row, which is the same
+ * ranking the dispatcher uses when two plugins want one key — so the line for a key is what that
+ * key would actually do here, and never a second meaning for the same press.
+ */
+function legendLines(
+  target: Target | undefined,
+  maps: KeymapEntry[],
+  actions: BoundAction[],
+): LegendLine[] {
+  const kind = target?.kind;
+  if (kind === undefined) return [];
+  const keysOf = new Map<string, string[]>();
+  for (const m of maps) {
+    if (m.scope.kind !== "buf_kind" || m.scope.name !== KIND) continue;
+    const list = keysOf.get(m.command) ?? [];
+    list.push(m.lhs);
+    keysOf.set(m.command, list);
+  }
+  const lines: LegendLine[] = [];
+  const add = (command: string, label: string, share: boolean) => {
+    const keys = keysOf.get(command);
+    if (!keys || keys.length === 0) return;
+    const pretty = keys.map(prettyKey);
+    // Only this panel's own verbs share a line, and only with each other: `↵` and `space` both
+    // say `fold or unfold` because they *are* the same verb. A contributed verb whose label
+    // happens to match one of ours is a different verb — the archive plugin's `a` opens the
+    // archive, `x` puts a conversation in it — and one line for both would be a lie about `a`.
+    const shared = share ? lines.find((l) => l.label === label) : undefined;
+    if (shared) shared.keys.push(...pretty.filter((k) => !shared.keys.includes(k)));
+    else lines.push({ keys: pretty, label });
+  };
+  for (const [command, about] of ABOUT) {
+    const label = about[kind];
+    if (label) add(command, label, true);
+  }
+  const applicable = actions.filter((a) => applies(a.on ?? "any", target));
   const ranked = [
     ...applicable.filter((a) => (a.on ?? "any") !== "any"),
     ...applicable.filter((a) => (a.on ?? "any") === "any"),
   ];
-  // One line per key, and the line is what that key would actually do here.
-  //
-  // Several plugins may want one key on their own rows and the binding sends it to whichever of
-  // them the cursor is over — so a strip that printed all of them would advertise two meanings for
-  // one press and be wrong about at least one. The ranking above is the same one the dispatcher
-  // uses, so the survivor is the verb that fires.
   const seen = new Set<string>();
-  const cells: string[] = [];
   for (const a of ranked) {
-    if (seen.has(a.key)) continue;
+    if (a.binding === null || seen.has(a.key)) continue;
     seen.add(a.key);
-    cells.push(`${a.key} ${a.label}`);
+    add(a.binding, a.label, false);
   }
-  return clip(cells.join("   "), Math.max(4, opts.width - 2));
+  return lines;
+}
+
+/** What the card is called, by the kind of row it is about. */
+function legendTitle(target: Target | undefined): string {
+  switch (target?.kind) {
+    case "session":
+      return "conversation";
+    case "project":
+      return "project";
+    case "add":
+      return "add a project";
+    case "remote":
+      return "on another machine";
+    case "custom":
+      return target.section ?? "this row";
+    default:
+      return "keys";
+  }
+}
+
+/**
+ * The key card: every key for the row under the cursor, beside the panel and level with the row.
+ *
+ * The strip at the foot used to try to say this and could not — two dim lines, packed, and the
+ * verbs that did not fit dropped. A card has room: one key per line, the key in its own colour,
+ * the words after it, as wide as the widest line and as tall as there are lines. It sits in the
+ * main region just past the panel's rule, at the row of the thing it is about, so the eye goes
+ * from the row to its keys and back without reading anything else.
+ *
+ * It appears after `ui.keys.hint_delay`, the rule the window prefix already follows: somebody who
+ * presses `^T j j ↵` fluently never sees it, and somebody who pauses is answered. Once open it
+ * follows the cursor without closing — a card that blinked on every `j` would be worse than none.
+ * It never takes the keyboard, and it goes with the panel's focus.
+ *
+ * One per panel, which is one per terminal, opened through the panel's own view-bound `neosh` so
+ * it lands on the screen the panel is on.
+ */
+class KeyCard {
+  private buf: BufferId | null = null;
+  private win: WindowId | null = null;
+  private ns: number | null = null;
+  private maps: KeymapEntry[] = [];
+  /** What is on it and where, so a tick that changes nothing costs nothing. */
+  private drawn = "";
+
+  constructor(private readonly neosh: Neosh) {}
+
+  isOpen(): boolean {
+    return this.win !== null;
+  }
+
+  /**
+   * Put the card up beside `anchor`, level with `row` of it.
+   *
+   * The registry is read here, once per opening, rather than on every move: a binding changes
+   * when a plugin loads or `init.ts` runs, both of which are before anybody is in the panel.
+   */
+  async open(anchor: WindowId, col: number, row: number): Promise<void> {
+    if (this.win !== null) return;
+    this.maps = await this.neosh.keymap.list("chat").catch(() => [] as KeymapEntry[]);
+    const buf = await this.neosh.buf.create({
+      name: "[sidebar keys]",
+      scratch: true,
+      kind: KIND_KEYS,
+    });
+    this.buf = buf;
+    this.ns = await this.neosh.ns.create(KIND_KEYS);
+    this.win = await this.neosh.float.open(buf, {
+      anchor: { kind: "window", win: anchor },
+      offset: { row, col },
+      width: { kind: "auto" },
+      height: { kind: "auto" },
+      border: "rounded",
+      focusable: false,
+      // Under the panels somebody opens on purpose — the key sheet, a picker, a question — and
+      // over the transcript it is drawn across.
+      z: 120,
+    });
+    this.drawn = "";
+  }
+
+  async draw(
+    target: Target | undefined,
+    actions: BoundAction[],
+    anchor: WindowId,
+    col: number,
+    row: number,
+  ): Promise<void> {
+    if (this.win === null || this.buf === null || this.ns === null) return;
+    const lines = legendLines(target, this.maps, actions);
+    const title = legendTitle(target);
+    const signature = JSON.stringify([title, lines, col, row]);
+    if (signature === this.drawn) return;
+    this.drawn = signature;
+    const keyWidth = Math.max(1, ...lines.map((l) => width(l.keys.join(" "))));
+    const rows = lines.length === 0
+      ? [{ text: "  nothing to do here  ", marks: [] }]
+      : lines.map((l) => {
+        const keys = l.keys.join(" ");
+        const pad = " ".repeat(keyWidth - width(keys));
+        const text = `  ${keys}${pad}   ${l.label}  `;
+        return {
+          text,
+          marks: [{ col: 2, opts: { hlGroup: "Sidebar.Key", endCol: 2 + byteLength(keys) } }],
+        };
+      });
+    await this.neosh.buf.render(this.buf, this.ns, 0, -1, rows);
+    await this.neosh.float.configure(this.win, {
+      anchor: { kind: "window", win: anchor },
+      // One row up, so the first key is level with the row it is about rather than the border.
+      offset: { row: row - 1, col },
+      width: { kind: "auto" },
+      height: { kind: "auto" },
+      border: "rounded",
+      title: ` ${title} `,
+      footer: " ? every key   esc back ",
+      focusable: false,
+      z: 120,
+    });
+  }
+
+  async close(): Promise<void> {
+    const win = this.win;
+    this.forget();
+    if (win !== null) await this.neosh.win.close(win).catch(() => {});
+  }
+
+  /** Drop the card without closing it, for when its terminal has already gone. */
+  forget(): void {
+    this.win = null;
+    this.buf = null;
+    this.ns = null;
+    this.drawn = "";
+  }
 }
 
 /**

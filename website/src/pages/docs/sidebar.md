@@ -8,6 +8,8 @@ description: Projects, conversations, worktrees and the archive. What the panel 
 
 The sidebar groups conversations by the directory they were opened in. There is no registry to maintain: opening a conversation somewhere else is how a second project appears. `^O` adds one by path, with completion as you type — or by repository address, which clones it: paste `https://github.com/owner/repo`, the `git@` spelling, or just `owner/repo`, and it asks where it should go, remembers the folders you pick, and leaves you in the new project. `f` pins one to the top, `J`/`K` reorder, and `r` renames a conversation.
 
+You do not have to know any of that. The keys sit beside what they act on — `^T` on the `PROJECTS` heading, `^O` on the `+ Add project` row — and pausing on a row inside the panel opens a **key card** beside it, level with the row, listing every key for that row: fold, pin, pull, remove the worktree, whatever the row is and whatever plugins have added to it. It reads the live keymap, so a key you moved in `init.ts` is the key it prints. It appears after `ui.keys.hint_delay` (300 ms), never takes the keyboard, and `?` is still the whole sheet. `sidebar.legend = false` turns it off.
+
 A conversation's directory is where its work happens, not just where it is filed: the repository git answers about, the root the agent's file tools resolve against, and the directory the model's own agent is started in. Switching conversations moves all of it.
 
 The arrangement (pins, order, folds) is saved under `~/.local/state/neosh/plugin-state/`, not in your config, because an editor that rewrites the file you hand-edited because you pressed a key is one you stop trusting with it.
@@ -16,7 +18,8 @@ The arrangement (pins, order, folds) is saved under `~/.local/state/neosh/plugin
 [options]
 "sidebar.open" = true        # show it at startup
 "sidebar.width" = 34         # also what > < = in the panel adjust
-"sidebar.hints" = true       # the key strip at the foot of the panel
+"sidebar.hints" = true       # the main keys, at the foot of the panel
+"sidebar.legend" = true      # the key card beside the row you are on
 "sidebar.refresh_ms" = 4000
 ```
 
@@ -123,6 +126,8 @@ With a relative root, neosh writes the directory into the repository's `.gitigno
 
 On a worktree's sidebar row: `y` copies its path for the shell you are about to `cd` in, `p` pulls its repository from the remote, and `d` removes the checkout from disk. The branch stays, it asks first, and it tells you how many conversations go with it.
 
+It works the other way round too. A worktree exists for the conversations in it, so deleting the last one — `X` on the row, `X` or `^X` in the archive, `archive.sweep` — removes the checkout as well, and the dialog says so: which directory, that the branch stays, and how many uncommitted changes go with it. `X` on a worktree's own row does the same. The repository itself is never removed; `X` on its heading only takes the row off the list. Pictures pasted into a conversation go with it as well.
+
 ## Generated branch names and commit messages
 
 `git.branch.new` has a model name the branch and shows you the name before creating it; `git.commit` writes a message from the staged diff and shows it before committing. Every prompt behind them is a setting, in two layers: `*.instructions` appends to the built-in prompt, `*.prompt` replaces it.
@@ -139,7 +144,7 @@ On a worktree's sidebar row: `y` copies its path for the shell you are about to 
 
 `x` archives. Everything is kept, every message and the file on disk; it simply leaves the panel. It asks nothing, because it takes nothing away. Archived conversations are not rows in the sidebar at all: `^F` from anywhere, or `a` in the panel, opens the archive as a popup of its own, with filtering, ticking, restore and export. `archive.sidebar = true` puts a count row back for anybody who wants one.
 
-`X` deletes: the file goes and there is no undo, so it always asks, in numbers, saying how many messages and which project. `ui.confirm_destructive = false` turns off every such dialog, everywhere.
+`X` deletes: the file goes and there is no undo, so it always asks, in numbers, saying how many messages and which project — and which worktrees are left empty by it and go too. `ui.confirm_destructive = false` turns off every such dialog, everywhere.
 
 Three time settings, none of which deletes on a timer: `archive.auto_days` archives what has gone idle (reversible, so it may happen on its own), `archive.retention_days` only ever counts, and `archive.sweep` is the same number with a person behind it.
 

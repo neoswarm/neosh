@@ -25,7 +25,9 @@ import type {
   KeyContext,
   MarkOptions,
   Neosh,
+  SessionInfo,
   WindowId,
+  WorktreeInfo,
 } from "@neosh/api";
 
 /**
@@ -258,6 +260,20 @@ function watchKeys(neosh: Neosh): void {
 function keyLabel(keys: Map<WidgetAction, KeySpec[]>, action: WidgetAction): string {
   const spec = keys.get(action)?.[0];
   if (!spec) return "";
+  // The first key of `ui.keys.*` is the one that reaches this — which is why the defaults lead
+  // with the chord and keep the arrow behind it.
+  return prettyKey(spec.lhs);
+}
+
+/**
+ * A key the way a person would press it, from the way a keymap spells it.
+ *
+ * `<C-n>` is `^N` — not `^n`: nobody presses shift to send it, and the capital is how every
+ * terminal program has written a chord since curses. `<CR>` is `↵`, `<Esc>` is `esc`, `<lt>` is
+ * `<`. For a legend, which is a promise about a keyboard: it prints what the registry holds, so a
+ * rebinding shows the letter that works.
+ */
+export function prettyKey(lhs: string): string {
   const pretty: Record<string, string> = {
     "<Tab>": "⇥",
     "<S-Tab>": "⇧⇥",
@@ -267,13 +283,15 @@ function keyLabel(keys: Map<WidgetAction, KeySpec[]>, action: WidgetAction): str
     "<Down>": "↓",
     "<CR>": "↵",
     "<Esc>": "esc",
+    "<Space>": "space",
+    "<BS>": "⌫",
+    "<lt>": "<",
+    "<PageUp>": "pgup",
+    "<PageDown>": "pgdn",
   };
-  // `^N`, not `^n`: nobody presses shift to send it, and the capital is how every terminal
-  // program has written a chord since curses. The first key of `ui.keys.*` is the one that
-  // reaches this — which is why the defaults lead with the chord and keep the arrow behind it.
   return (
-    pretty[spec.lhs] ??
-    spec.lhs.replace(/^<C-(.)>$/, (_, c: string) => `^${c.toUpperCase()}`).replace(/^<|>$/g, "")
+    pretty[lhs] ??
+    lhs.replace(/^<C-(.)>$/, (_, c: string) => `^${c.toUpperCase()}`).replace(/^<|>$/g, "")
   );
 }
 
@@ -1370,6 +1388,142 @@ export async function confirmDestructive(
   return confirm(neosh, question, { ...opts, dangerous: true });
 }
 
+// ---------------------------------------------------------------------------
+// What goes with a conversation
+// ---------------------------------------------------------------------------
+
+/**
+ * A worktree checkout that a delete is about to leave with nothing in it.
+ *
+ * `dirty` is how many files in it differ from its last commit — the number a dialog has to say,
+ * because `git worktree remove` refuses a tree with changes in it and forcing it is throwing those
+ * changes away.
+ */
+export interface OrphanedWorktree {
+  /** The checkout's directory: the conversations' `cwd`. */
+  path: string;
+  /** The repository it is a tree of, which is where the removal has to run from. */
+  root: string;
+  branch: string | null;
+  dirty: number;
+}
+
+/**
+ * The worktree at `cwd`, if it is one this workspace may take off the disk.
+ *
+ * Asked of git rather than of the sidebar: a directory is a worktree because `git worktree list`
+ * says so, and the main checkout — the repository itself — is never one, whatever a conversation's
+ * `repo_root` happens to say. Nor is the tree this workspace is running in: git refuses to remove
+ * the checkout it is standing in, and it is right to.
+ */
+export async function worktreeAt(
+  neosh: Neosh,
+  cwd: string,
+  root: string,
+): Promise<OrphanedWorktree | null> {
+  if (root === "" || root === cwd) return null;
+  const trees = await neosh.git.worktrees({ cwd: root }).catch(() => [] as WorktreeInfo[]);
+  const tree = trees.find((t) => t.path === cwd);
+  if (!tree || tree.is_main || tree.is_current) return null;
+  const status = await neosh.git.status({ cwd }).catch(() => null);
+  return { path: cwd, root, branch: tree.branch ?? null, dirty: status?.changes.length ?? 0 };
+}
+
+/**
+ * The worktrees that would be left with no conversation in them if `ids` were deleted.
+ *
+ * A worktree exists for the conversations in it — that is what `^N` makes one for — so the last of
+ * them going is the checkout's reason for being on the disk going with it. Counted over every
+ * conversation the workspace knows of, archived and on-disk-only included: a tree with an archived
+ * conversation still in it is a tree somebody may come back to.
+ */
+export async function orphanedWorktrees(
+  neosh: Neosh,
+  ids: Iterable<string>,
+): Promise<OrphanedWorktree[]> {
+  const doomed = new Set(ids);
+  if (doomed.size === 0) return [];
+  const [live, disk] = await Promise.all([
+    neosh.session.list({ includeArchived: true }).catch(() => [] as SessionInfo[]),
+    neosh.session.stored().catch(() => [] as SessionInfo[]),
+  ]);
+  const all = new Map<string, SessionInfo>();
+  for (const s of disk) all.set(s.id, s);
+  for (const s of live) all.set(s.id, s);
+  // Which checkouts the deletion empties: every conversation in them is going.
+  const roots = new Map<string, string>();
+  for (const s of all.values()) {
+    if (!s.repo_root || s.repo_root === s.cwd) continue;
+    if (doomed.has(s.id)) roots.set(s.cwd, s.repo_root);
+  }
+  for (const s of all.values()) {
+    if (!doomed.has(s.id)) roots.delete(s.cwd);
+  }
+  const found = await Promise.all(
+    [...roots].map(([cwd, root]) => worktreeAt(neosh, cwd, root)),
+  );
+  return found.filter((t): t is OrphanedWorktree => t !== null);
+}
+
+/**
+ * What a delete dialog says about the checkouts it takes with it.
+ *
+ * Lines for {@link ConfirmOptions.detail}: which directory goes, that the branch stays, and — the
+ * part that must never be a surprise — how many uncommitted changes go with it.
+ */
+export function worktreeLines(trees: OrphanedWorktree[]): string[] {
+  if (trees.length === 0) return [];
+  const lines: string[] = [];
+  if (trees.length === 1) {
+    const t = trees[0]!;
+    lines.push(
+      `Nothing else is in the worktree at ${t.path}, so the checkout goes too${
+        t.branch ? `; the branch ${t.branch} stays` : ""
+      }.`,
+    );
+  } else {
+    lines.push(
+      `${trees.length} worktrees are left with nothing in them and go from disk too; their branches stay.`,
+    );
+  }
+  const dirty = trees.reduce((n, t) => n + t.dirty, 0);
+  if (dirty > 0) {
+    lines.push(
+      trees.length === 1
+        ? `It has ${dirty} uncommitted ${dirty === 1 ? "change" : "changes"}, which go with it.`
+        : `${dirty} uncommitted ${dirty === 1 ? "change" : "changes"} across them go with them.`,
+    );
+  }
+  return lines;
+}
+
+/**
+ * Take the checkouts off the disk, after the dialog that named them has been answered.
+ *
+ * Through the git plugin's `git.worktree.discard` rather than the API directly, because a write
+ * to a repository is that plugin's verb — it holds the permission, it runs the removal from the
+ * repository rather than from the tree, and it drops the panel's row for the directory. Forced
+ * there, because the dialog already said what was in the tree, and git refusing now would be the
+ * same question asked twice. A tree that would not go is reported by path and left, with its
+ * conversations already gone; `^O` on the directory brings it back as a project. Answers with how
+ * many went.
+ */
+export async function discardWorktrees(
+  neosh: Neosh,
+  trees: OrphanedWorktree[],
+): Promise<number> {
+  let removed = 0;
+  for (const t of trees) {
+    try {
+      await neosh.cmd.exec("git.worktree.discard", [t.path, t.root]);
+      removed += 1;
+    } catch (e) {
+      neosh.notify(`could not remove the worktree at ${t.path}: ${String(e)}`, "warn");
+    }
+  }
+  return removed;
+}
+
 /**
  * Break text into lines of at most `width` characters.
  *
@@ -2026,6 +2180,8 @@ export interface CursoredListOptions {
 export class CursoredList<T = unknown> {
   private rows: ListRow<T>[] = [];
   private cursor = 0;
+  /** Where the last render put the cursor's row: its buffer line, and the window's top line. */
+  private placed: { line: number; top: number } | null = null;
 
   constructor(
     private readonly neosh: Neosh,
@@ -2053,6 +2209,19 @@ export class CursoredList<T = unknown> {
 
   get length(): number {
     return this.rows.length;
+  }
+
+  /**
+   * The window row the cursor's row was drawn on, as of the last `render` that had a window to
+   * measure — `null` before one has.
+   *
+   * For a panel beside this one that wants to sit level with the row under the cursor. Counted in
+   * drawn lines rather than in rows, because an unfolded row above the cursor is several, and it
+   * is read back from the scroll `render` settled on rather than from the viewport it was handed,
+   * which was where the window *had* been.
+   */
+  get cursorScreenRow(): number | null {
+    return this.placed === null ? null : Math.max(0, this.placed.line - this.placed.top);
   }
 
   /**
@@ -2277,11 +2446,11 @@ export class CursoredList<T = unknown> {
         // The whole of the row, not only the line it starts on: scrolling until the *first* line
         // is visible leaves the continuation you unfolded it for below the bottom edge.
         const end = at + Math.min(block, v.height) - 1;
-        const top = v.top_line;
-        if (at < top) await this.neosh.win.scrollTo(opts.win, at);
-        else if (end >= top + v.height) {
-          await this.neosh.win.scrollTo(opts.win, end - v.height + 1);
-        }
+        let top = v.top_line;
+        if (at < top) top = at;
+        else if (end >= top + v.height) top = end - v.height + 1;
+        if (top !== v.top_line) await this.neosh.win.scrollTo(opts.win, top);
+        this.placed = { line: at, top };
       }
     }
   }
@@ -3155,7 +3324,12 @@ export function decorateRow<T>(
     // badge's, and a span over it would be one colour claiming a column it does not fill.
     let at = byteLength(row.text) + 1;
     row.text = `${row.text}${mark}`;
-    if (row.full !== undefined) row.full = `${row.full}${mark}`;
+    // Not onto `full`. The badge goes *after* the clip — past the ellipsis, on the end of the row,
+    // where an unread dot or a count already sits — so it survives the clip and is on screen
+    // whether or not the name was cut. `overflowOf` compares the two strings as prefixes of each
+    // other, and a `full` that ends in the badge while `text` has a star and a mark between the
+    // name and the badge is a prefix of nothing: the whole of `full` was then said again under the
+    // cursor row, name and badge and all.
     const spans = [...(row.spans ?? [])];
     for (const part of d.badge.parts) {
       const to = at + byteLength(part.text);

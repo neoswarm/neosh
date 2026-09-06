@@ -205,6 +205,17 @@ two-word scratch name it was created with.",
       "Remove a worktree — `git.worktree.remove [path] [cwd]`",
     ],
     [
+      "git.worktree.discard",
+      // The half of `git.worktree.remove` that comes *after* the question. For a caller that has
+      // already asked — the sidebar deleting a worktree's last conversation, the archive emptying
+      // itself — and said in its own dialog which directory goes and what is uncommitted in it.
+      // Forced for that reason: git refusing a dirty tree here would be the same question asked
+      // twice. Needs a path, so `^K` cannot run it by accident; without one it points at the verb
+      // that asks.
+      (args: string[]) => discardWorktree(neosh, arg(args, 0), arg(args, 1)),
+      "Remove a worktree without asking — `git.worktree.discard <path> [cwd]`, for a caller that already did",
+    ],
+    [
       "git.worktree.move",
       // Same shape one argument further: the tree, then where it goes. Both optional and both
       // asked for when missing, so this is the palette's verb, the panel's verb and a script's
@@ -1403,7 +1414,35 @@ async function removeWorktree(
       await neosh.session.close(s.id).catch(() => {});
     }
   }
+  // And so is its row: with the checkout gone, a project row for it says `nothing here yet` about
+  // a directory that is not there. By name, so a sidebar that is not ours can answer the same call.
+  await neosh.cmd.exec("project.forget", [chosen.path]).catch(() => {});
   neosh.notify(`removed ${chosen.path}`);
+}
+
+/**
+ * Remove a worktree that somebody else has already asked about.
+ *
+ * Run from the repository rather than from the tree, for the reason {@link removeWorktree} is:
+ * git will not saw off the branch it is standing on. The row goes with it, so the panel does not
+ * keep a project for a directory that is no longer there. What is *not* here is any check on the
+ * conversations in the tree — the caller deleted them, which is how the tree came to be empty.
+ */
+async function discardWorktree(neosh: Neosh, path?: string, cwd?: string): Promise<void> {
+  if (!path) {
+    neosh.notify(
+      "git.worktree.discard removes without asking, so it needs a path — `git.worktree.remove` asks",
+      "warn",
+    );
+    return;
+  }
+  const all = await neosh.git.worktrees(cwd ? { cwd } : undefined).catch(() => []);
+  const main = all.find((t) => t.is_main)?.path;
+  const named = all.find((t) => t.path === path);
+  if (!named) throw new Error(`no worktree at ${path}`);
+  if (named.is_main) throw new Error(`${path} is the repository itself`);
+  await neosh.git.removeWorktree(path, { cwd: main ?? cwd, force: true });
+  await neosh.cmd.exec("project.forget", [path]).catch(() => {});
 }
 
 /**

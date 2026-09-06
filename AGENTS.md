@@ -578,14 +578,31 @@ is `docs/releasing.md`.
   and the one time something is red it has to be what the eye lands on. Merged and closed say
   nothing about checks at all, because a merged pull request's checks are *why* it merged and
   sixteen columns spent on that clipped the state it was qualifying down to `#86 mer…`.
-- **A project outlives the conversations in it.** The panel's list is written down (`sidebar.projects`,
+- **What a conversation owned goes with it, and the question says so.** A delete frees the disk it
+  was using or it has freed the wrong thing: the pictures pasted into it are files under
+  `<state>/images` minted for one paste each, so `sessions::forget` removes the ones its messages
+  name — and only those, and only inside the store, because a path in a message is a claim. A
+  worktree is made *for* the conversations in it, so the last of them going takes the checkout too:
+  `orphanedWorktrees` finds the trees a deletion empties (counted over every conversation the
+  workspace knows of, archived and on-disk-only included, because a tree with an archived
+  conversation still in it is a tree somebody may come back to), `worktreeLines` puts them in the
+  dialog — the directory, that the branch stays, and how many uncommitted changes go with it — and
+  `discardWorktrees` removes them afterwards, forced, from the repository rather than the tree.
+  Asked of `git worktree list` rather than of a var, so the repository itself is never one. The
+  sidebar's `X` and `x`-then-empty, the archive's `X`, `^X` and sweep all go through it; the git
+  plugin's `d` was already this from the other direction. `project.forget` is the row's half —
+  drop a project's row without deleting anything, for a directory that has already gone — so a
+  removed tree does not sit in the column saying `nothing here yet`.
+- **A project outlives the conversations in it — a repository does; a worktree does not.** The panel's list is written down (`sidebar.projects`,
   a workspace var) rather than worked out from where the conversations happen to be — derived, it
   deleted the directory you had worked in all month the moment you cleared out the last thread in
   it, and left nothing to start the next one from. A project arrives by being added or by a
   conversation being started in it, keeps the name the host gave it (`sidebar.name`, so emptying a
   worktree does not rename it to `wt-fe3c0d93`), and leaves by `X` on its heading and nothing else.
   Empty, that asks nothing — `o` puts it back; with conversations still in it, it is a delete of
-  every one of them and asks like one.
+  every one of them and asks like one. A *worktree* row is the exception, by the rule above it: the
+  checkout exists for the conversations in it, so the last of them going takes the directory, and
+  `X` on the row itself removes the checkout — asked, always, because a directory is not a row.
 - **"Where?" is one field, and the field is the path field.** `^N` and `^O` ask the same question and
   ask it the same way: type nothing and it is a menu, type `/`, `~` or `./` and it completes
   directories, type `linux-box:` and it completes directories **on that computer**, and paste a
@@ -1186,11 +1203,26 @@ says how many are asking, `^T` is where you go, and it opens when you get there.
 | `y` | Copy the row's directory — a worktree's path, ready to paste into a shell |
 | `p` | Bring that repository up to date — fast-forwards silently, asks *rebase or merge* when the branch has gone both ways, and goes and looks when nothing is waiting (a git-plugin contribution) |
 | `d` | Remove a worktree from disk — its branch stays, and it asks first (a git-plugin contribution) |
-| `x` `X` | Archive, delete. On a project heading, `X` takes the project off the list — the only thing that does |
+| `x` `X` | Archive, delete. Deleting the last conversation in a worktree takes the checkout with it, and the dialog says so — the branch stays. On a repository's heading, `X` takes the project off the list and leaves the directory; on a worktree's, it removes the checkout too |
 | `a` | The archive — the popup below. Nothing archived is ever a row in *this* panel, and by default not even a count. An `archive.action` contribution, not a key this panel owns |
 | `⇥` | On the plan rows: how much of it to show — the limit that binds, every limit, or all of it with the account and the sentence. `usage.sidebar.style` is where it starts, `usage.sidebar` turns it off. A key on a contributed row is named down to the section (`custom:plan`), so the panel sends the press to whichever block the cursor is over rather than to whoever registered it first |
-| `?` | The keys for whatever row you are on |
+| `?` | The keys for whatever row you are on, as a sheet |
 | `Esc` | Back to the composer |
+
+**The keys are beside what they act on, and the row's own keys are on a card next to it.** `^T` sits
+on the `PROJECTS` heading and becomes `esc` while you are in the panel; `^O` sits on the `+ Add
+project` row and becomes `o`. The strip at the foot keeps only the keys that have no row to sit on —
+`^N`, `^F`, `^K`, `^B`, `^Z` outside the panel; `↵`, `?`, `esc` inside — laid out in columns with
+the keys in `Sidebar.Key`, because a strip that said every verb for every row in one dim colour was
+a paragraph nobody read twice. What a row can do is the **key card**: pause on a row and a float
+appears just past the panel's rule, level with the row, one key per line — `↵ space fold or
+unfold`, `n new conversation here`, `p pull`, `d remove worktree` — with the contributed verbs
+after the panel's own. Built from the *registry* (`keymap.list` on the panel's kind, plus what each
+verb says about itself in `ABOUT` and what a `sidebar.action` says about itself), so a key moved in
+`init.ts` is printed as the letter that works. It waits `ui.keys.hint_delay` before appearing, the
+window prefix's rule, so `^T j j ↵` never flashes one; once up it follows the cursor without
+closing; it never takes the keyboard; `sidebar.legend = false` turns it off. `?` is still the whole
+sheet.
 
 ## The repository is on the row it is about
 
