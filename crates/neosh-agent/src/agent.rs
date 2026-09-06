@@ -792,7 +792,7 @@ impl Agent {
                                 call,
                             });
                         }
-                        TurnUpdate::ToolResult { id, content, is_error } => {
+                        TurnUpdate::ToolResult { id, content, is_error, images } => {
                             // Only a delegating driver sends these; our own tools report through
                             // `run_tool`, which knows a great deal more about the call.
                             if let Some(k) = announced.iter().position(|c| c.id == id) {
@@ -801,7 +801,7 @@ impl Agent {
                                     session: session.clone(),
                                     turn: turn.clone(),
                                     call,
-                                    result: ToolResult { content, is_error },
+                                    result: ToolResult { content, is_error, images },
                                 });
                             }
                         }
@@ -848,12 +848,13 @@ impl Agent {
                     id: call.id.clone(),
                     content: content.clone(),
                     is_error: true,
+                    images: Vec::new(),
                 });
                 self.emit(AgentEvent::ToolFinished {
                     session: session.clone(),
                     turn: turn.clone(),
                     call,
-                    result: ToolResult { content, is_error: true },
+                    result: ToolResult { content, is_error: true, images: Vec::new() },
                 });
             }
 

@@ -5388,6 +5388,7 @@ impl Host {
                     virt_text_pos: neosh_proto::VirtTextPos::Eol,
                     on_delete: neosh_proto::OnDelete::Clamp,
                     priority: 0,
+                    image: None,
                 },
             });
         }
@@ -5722,6 +5723,7 @@ impl Host {
                     virt_text_pos: neosh_proto::VirtTextPos::Eol,
                     on_delete: neosh_proto::OnDelete::Clamp,
                     priority: 0,
+                    image: None,
                 },
             });
         }
@@ -6018,6 +6020,7 @@ impl Host {
                 virt_text_pos: pos,
                 on_delete: neosh_proto::OnDelete::Clamp,
                 priority: 0,
+                image: None,
             },
         });
     }
@@ -6412,10 +6415,12 @@ impl Host {
         // to know where to put it.
         let unasked: Arc<dyn neosh_provider::drivers::Unasked> =
             Arc::new(UnaskedSink(self.unasked_tx.clone()));
+        let store = self.image_store();
         for d in &drivers {
             d.set_permission_asker(asker.clone());
             d.set_question_asker(questioner.clone());
             d.set_unasked(unasked.clone());
+            d.set_image_store(store.clone());
         }
         self.agent_drivers = drivers;
         self.sync_agent_drivers();
@@ -7998,6 +8003,7 @@ impl Host {
                         virt_text_pos: VirtTextPos::Eol,
                         on_delete: neosh_proto::OnDelete::Invalidate,
                         priority: 50,
+                        image: None,
                     },
                 });
                 left -= 1;
@@ -8910,18 +8916,43 @@ impl Host {
                 virt_text_pos: neosh_proto::VirtTextPos::Eol,
                 on_delete: neosh_proto::OnDelete::Clamp,
                 priority: 0,
+                image: None,
             },
         });
     }
 
     /// Draw a rebuilt transcript's marks, `by` rows down from where they were computed.
     fn draw_marks(&mut self, marks: &[Mark], by: u32) {
-        for m in marks.iter().map(|m| m.shifted(by)) {
-            match m.span {
-                Some((from, to)) => self.chat_mark(m.row, from, to, m.hl),
-                None => self.chat_band(m.row, m.hl),
+        for m in marks.iter().map(|m| m.clone().shifted(by)) {
+            match (m.span, m.image) {
+                (Some((col, _)), Some(image)) => self.chat_image(m.row, col, &image),
+                (Some((from, to)), None) => self.chat_mark(m.row, from, to, m.hl),
+                (None, _) => self.chat_band(m.row, m.hl),
             }
         }
+    }
+
+    /// Say that a transcript row is a picture from `col` on.
+    ///
+    /// A point mark carrying the file, and nothing about colour: what the row *says* is already
+    /// there as text for a terminal that can only show that, and a terminal that can draw the
+    /// picture draws it over the text from this column to its own edge — as many screen rows
+    /// tall as it decides, which is a question about the pixel size of a cell that nothing here
+    /// can answer. `ui.images = false` leaves the mark off, and every terminal sees the name.
+    fn chat_image(&mut self, row: u32, col: usize, image: &neosh_proto::ImageFile) {
+        if !self.option_bool("ui.images") {
+            return;
+        }
+        let _ = self.editor.apply(&PluginId::from(BUILTIN), ApiCall::MarkSet {
+            ns: self.chat_ns,
+            buf: self.v().chat,
+            row,
+            col: col as u32,
+            opts: neosh_proto::ExtmarkOpts {
+                image: Some(image.clone()),
+                ..Default::default()
+            },
+        });
     }
 
     /// Put a band behind a whole transcript row, out to whatever edge it is drawn against.
@@ -8942,6 +8973,7 @@ impl Host {
                 virt_text_pos: neosh_proto::VirtTextPos::Eol,
                 on_delete: neosh_proto::OnDelete::Clamp,
                 priority: 0,
+                image: None,
             },
         });
     }
@@ -8953,6 +8985,9 @@ impl Host {
         }
         if let Some(band) = r.band {
             self.chat_band(row, band);
+        }
+        if let Some((col, image)) = &r.image {
+            self.chat_image(row, *col, image);
         }
     }
 
@@ -9120,7 +9155,7 @@ impl Host {
         // message and a question is easier to read when what it is pointing at is above it.
         for b in &prompt.images {
             if let ContentBlock::Image { path, media_type } = b {
-                rows.push(format!("{glyph} {}", image_row(path, media_type)));
+                rows.push(format!("{glyph} {}", cards::image_row(path, media_type)));
             }
         }
         for line in text.lines() {
@@ -9135,6 +9170,13 @@ impl Host {
         let first = at + u32::from(gap);
         for i in 0..body {
             self.chat_mark(first + i, 0, glyph.len(), "Agent.User");
+        }
+        // The pictures are the first rows of the question, in the order they were pushed.
+        for (i, b) in prompt.images.iter().enumerate() {
+            if let ContentBlock::Image { path, media_type } = b {
+                let image = neosh_proto::ImageFile { path: path.clone(), media_type: media_type.clone() };
+                self.chat_image(first + i as u32, glyph.len() + 1, &image);
+            }
         }
         // Nothing has answered it yet, by definition — this is the last thing in the transcript.
         // Whatever is drawn next clears this; if the turn ends and it is still set, the question
@@ -12781,6 +12823,7 @@ impl Host {
                     virt_text_pos: VirtTextPos::Eol,
                     on_delete: neosh_proto::OnDelete::Clamp,
                     priority: 0,
+                    image: None,
                 },
             });
         }
@@ -12913,6 +12956,7 @@ impl Host {
                     virt_text_pos: VirtTextPos::Eol,
                     on_delete: neosh_proto::OnDelete::Clamp,
                     priority: 0,
+                    image: None,
                 },
             });
         }
@@ -13499,6 +13543,18 @@ impl Host {
                 description: Some(
                     "Use ASCII for glyphs, spinners and provider marks, for terminals without a \
                      decent font."
+                        .into(),
+                ),
+            },
+            OptionSpec {
+                name: "ui.images".into(),
+                ty: OptionType::Bool,
+                default: OptionValue::Bool(true),
+                description: Some(
+                    "Draw pictures in the transcript — an image you attached, or one the agent \
+                     read — on a terminal that can (kitty, Ghostty, WezTerm, Konsole; tmux with \
+                     allow-passthrough). Elsewhere a picture is its name, `[png · shot]`, and \
+                     this setting changes nothing."
                         .into(),
                 ),
             },
@@ -14380,7 +14436,7 @@ fn transcript(
         .iter()
         .flat_map(|m| &m.content)
         .filter_map(|b| match b {
-            ContentBlock::ToolResult { tool_use_id, is_error, content } => Some((
+            ContentBlock::ToolResult { tool_use_id, is_error, content, .. } => Some((
                 tool_use_id,
                 (
                     *is_error,
@@ -14554,8 +14610,10 @@ fn transcript(
                         summarise(&mut lines, &mut marks, &mut changes);
                         gap(&mut lines);
                     }
-                    marks.push(Mark::at(lines.len() as u32, 0, g.bar.len(), "Agent.User"));
-                    lines.push(format!("{} {}", g.bar, image_row(path, media_type)));
+                    let row = lines.len() as u32;
+                    marks.push(Mark::at(row, 0, g.bar.len(), "Agent.User"));
+                    marks.push(Mark::picture(row, g.bar.len() + 1, path, media_type));
+                    lines.push(format!("{} {}", g.bar, cards::image_row(path, media_type)));
                     after_image = true;
                 }
                 ContentBlock::Text { text } if message.role == Role::User => {
@@ -14643,12 +14701,13 @@ fn transcript(
                 ContentBlock::ToolUse { .. } => {}
                 // Errors show even with tool cards off, exactly as they do live: the setting is
                 // about noise, not about hiding failures.
-                ContentBlock::ToolResult { tool_use_id, is_error, content }
+                ContentBlock::ToolResult { tool_use_id, is_error, content, images }
                     if *is_error || show_tools =>
                 {
                     let result = neosh_proto::ToolResult {
                         content: content.clone(),
                         is_error: *is_error,
+                        images: images.clone(),
                     };
                     let found = cards
                         .iter()
@@ -14730,16 +14789,27 @@ fn transcript(
 /// `span` is `None` for a band — a group behind the whole row rather than behind a range of bytes
 /// on it. The two travel in one list because they are written together and have to arrive together:
 /// a diff row whose band was applied on a later pass would be green a frame after it was green.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct Mark {
     row: u32,
     span: Option<(usize, usize)>,
     hl: &'static str,
+    /// The row is a picture from `span.0` on, and this is it. See [`Host::chat_image`].
+    image: Option<neosh_proto::ImageFile>,
 }
 
 impl Mark {
     fn at(row: u32, from: usize, to: usize, hl: &'static str) -> Self {
-        Self { row, span: Some((from, to)), hl }
+        Self { row, span: Some((from, to)), hl, image: None }
+    }
+
+    fn picture(row: u32, col: usize, path: &str, media_type: &str) -> Self {
+        Self {
+            row,
+            span: Some((col, col)),
+            hl: "",
+            image: Some(neosh_proto::ImageFile { path: path.into(), media_type: media_type.into() }),
+        }
     }
 
     /// Every mark a card row carries, ready to be shifted onto whatever row it lands on.
@@ -14747,7 +14817,8 @@ impl Mark {
         r.spans
             .iter()
             .map(|(a, b, h)| Self::at(row, *a, *b, h))
-            .chain(r.band.map(|h| Self { row, span: None, hl: h }))
+            .chain(r.band.map(|h| Self { row, span: None, hl: h, image: None }))
+            .chain(r.image.as_ref().map(|(col, i)| Self::picture(row, *col, &i.path, &i.media_type)))
             .collect()
     }
 
@@ -14847,21 +14918,6 @@ fn project_name(
 
 /// The one row an attached image gets in a transcript.
 ///
-/// A terminal cannot show you the picture, so what it shows instead has to be the two things you
-/// would use to tell one attachment from another: what kind it is, and what it was called. The
-/// name is the file's, which for an image that came off the clipboard is a uuid nobody chose —
-/// so it is only worth saying when somebody did choose it.
-fn image_row(path: &str, media_type: &str) -> String {
-    let kind = media_type.strip_prefix("image/").unwrap_or(media_type);
-    let stem = std::path::Path::new(path).file_stem().and_then(|s| s.to_str()).unwrap_or("");
-    // A uuid is 36 characters of nothing. Anything else is a name somebody gave the file.
-    let named = stem.len() != 36 || !stem.chars().all(|c| c.is_ascii_hexdigit() || c == '-');
-    match named && !stem.is_empty() {
-        true => format!("[{kind} \u{b7} {stem}]"),
-        false => format!("[{kind}]"),
-    }
-}
-
 /// What the API says about an attachment.
 /// A URL as much of itself as fits in a line about it: the host, and the last thing in the path.
 fn short_url(url: &str) -> String {

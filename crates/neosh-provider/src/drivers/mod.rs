@@ -93,6 +93,14 @@ pub trait AgentDriver: Send + Sync {
     /// Defaulted to doing nothing, because most agents only ever answer. See [`Unasked`].
     fn set_unasked(&self, _sink: std::sync::Arc<dyn Unasked>) {}
 
+    /// Tell the driver where the workspace keeps pictures.
+    ///
+    /// A tool that came back with one — `Read` on a screenshot — hands the driver a megabyte of
+    /// base64 that belongs on disk once and in the conversation as a path, exactly as an attached
+    /// picture does. Defaulted to doing nothing: a driver whose tools never return a picture has
+    /// nowhere to put this, and one that was never told reports the picture as `[image]`.
+    fn set_image_store(&self, _dir: std::path::PathBuf) {}
+
     /// The next turn in this conversation has nothing to say and is only there to listen.
     ///
     /// The other half of [`Unasked`]: the workspace opens a turn so there is somewhere to *put*

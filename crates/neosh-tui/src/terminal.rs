@@ -19,6 +19,7 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::layout::Rect;
 use ratatui::Terminal;
 
+use crate::graphics::Graphics;
 use crate::mirror::Mirror;
 use crate::render;
 use crate::theme::{ColorDepth, Theme};
@@ -108,6 +109,10 @@ pub struct TerminalFrontend {
     /// The shape last asked of the terminal, so the escape goes out when it changes and not on
     /// every frame.
     cursor_shape: neosh_proto::CursorShape,
+    /// Pictures, on a terminal that draws them. See [`crate::graphics`].
+    graphics: Graphics,
+    /// The size last drawn at, so the cell size is asked again only when it may have changed.
+    size: (u16, u16),
 }
 
 /// Ask the terminal for unambiguous keys, if it knows how.
@@ -150,6 +155,10 @@ impl TerminalFrontend {
         // never replies, which is exactly the state the host reads as "cannot say" and falls back
         // to idleness for — so there is nothing to detect and nothing to degrade.
         execute!(stdout, EnterAlternateScreen, EnableBracketedPaste, EnableFocusChange)?;
+        // Whether this terminal draws pictures, asked before anything else reads from it: the
+        // reply comes back on stdin, and the keyboard reader started below would take it for
+        // typing.
+        let graphics = Graphics::detect(crate::graphics::probe(&mut stdout));
         // The wheel, and nothing else. Without this a terminal in the alternate screen turns each
         // notch into arrow keys — which are bindings — so scrolling fired `ui.keys.prev` thirty
         // times and the screen jumped everywhere. The cost is that the terminal's own text
@@ -163,6 +172,8 @@ impl TerminalFrontend {
             theme: Theme::new(ColorDepth::detect()),
             enhanced,
             cursor_shape: Default::default(),
+            graphics,
+            size: (0, 0),
         })
     }
 
@@ -181,10 +192,21 @@ impl TerminalFrontend {
         let theme = self.theme.clone();
         let mut drawn = render::Drawn::default();
         let mut geometry = Vec::new();
+        // How big a cell is can change with the window — a font size, a screen — and the only
+        // notice is the terminal's size changing. Asked then, and not on every frame.
+        let size = self.terminal.size().map(|r| (r.width, r.height)).unwrap_or_default();
+        if size != self.size {
+            self.size = size;
+            self.graphics.refresh_cell();
+        }
+        let gfx = &mut self.graphics;
         self.terminal.draw(|f| {
             geometry = render::resolve_layout(mirror, f.area());
-            drawn = render::draw(f, mirror, &theme);
+            drawn = render::draw_with(f, mirror, &theme, gfx);
         })?;
+        // What the frame owes the terminal about pictures, after the cells and before the caret:
+        // a placement moves the cursor to say where it goes, and the caret is put back below.
+        self.flush_graphics(&drawn)?;
         // Placed after the draw, because ratatui hides the cursor for each frame it paints.
         match drawn.caret {
             Some((x, y)) => {
@@ -265,6 +287,29 @@ impl TerminalFrontend {
                 }
             })
             .collect())
+    }
+
+    /// Write the escapes a frame's pictures need.
+    ///
+    /// In the placement vocabulary the pictures are drawn over the cells, so each is first cut
+    /// down to what the windows painted after it leave uncovered — a float over a picture is a
+    /// float, not a picture with a hole in it — and then said only if the set changed.
+    fn flush_graphics(&mut self, drawn: &render::Drawn) -> io::Result<()> {
+        if !self.graphics.enabled() {
+            return Ok(());
+        }
+        let mut placed = Vec::new();
+        for p in &drawn.images {
+            let later: Vec<(u16, u16, u16, u16)> = drawn.layers[p.layer + 1..]
+                .iter()
+                .map(|r| (r.x, r.y, r.width, r.height))
+                .collect();
+            placed.extend(crate::graphics::uncovered(*p, &later));
+        }
+        self.graphics.transmit_pending();
+        self.graphics.commit(&placed);
+        let mut out = io::stdout().lock();
+        self.graphics.flush(&mut out)
     }
 
     /// Put text on the system clipboard, via OSC 52.
@@ -370,6 +415,12 @@ impl TerminalFrontend {
         // The caret shape is the terminal's, not ours: a shell inheriting a block cursor because
         // neosh happened to exit while reading is a terminal that looks broken.
         self.terminal.backend_mut().execute(SetCursorStyle::DefaultUserShape)?;
+        // The pictures go with the screen. A terminal keeps what it was sent until told, and a
+        // shell inheriting every screenshot of the afternoon is a leak with nobody to free it.
+        if let Some(bye) = self.graphics.farewell() {
+            use std::io::Write;
+            let _ = self.terminal.backend_mut().write_all(bye.as_bytes());
+        }
         self.terminal.backend_mut().execute(DisableBracketedPaste)?;
         self.terminal.backend_mut().execute(DisableFocusChange)?;
         // Not `?`: a terminal that never enabled capture has nothing to disable, and failing the
@@ -590,6 +641,12 @@ pub fn restore_terminal() {
     let _ = out.execute(DisableBracketedPaste);
     let _ = out.execute(DisableFocusChange);
     let _ = out.execute(crossterm::event::DisableMouseCapture);
+    // Whatever pictures were sent, freed — said to every terminal, because on this path nothing
+    // remembers which kind this was, and one that draws none discards the escape.
+    {
+        use std::io::Write;
+        let _ = out.write_all(b"\x1b_Ga=d,d=A,q=2\x1b\\");
+    }
     let _ = out.execute(LeaveAlternateScreen);
     let _ = out.execute(crossterm::cursor::Show);
 }

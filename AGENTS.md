@@ -292,6 +292,23 @@ is `docs/releasing.md`.
   about the panel that wrote it down. Derived from live conversations alone it was also a constant:
   every project on the list had one, so `RemoteProject::active` said `true` for all of them and a
   board drawing the flag drew one colour.
+- **A picture is a row that the terminal decides the height of.** The transcript says a row is a
+  picture — `ExtmarkOpts::image`, a path and a media type, the same two facts `ContentBlock::Image`
+  carries — and says nothing about how tall it draws, because the answer is a division by the pixel
+  size of a cell, which the terminal reports to the process attached to it (`TIOCGWINSZ`,
+  `CSI 16 t`) and to nothing above the terminal boundary. So it is one buffer row that becomes
+  several screen rows in `neosh-tui`, exactly as a row that wraps is, and the caret, the scroll
+  and `rows` all read the one list. The row's text is the picture's *name*, which is what every
+  terminal that cannot draw it shows and what `v y` copies. Support is **asked** at startup — the
+  kitty graphics query, read raw off stdin before crossterm's reader exists, because a reply that
+  reader took for keystrokes would be typed into the composer — and answered in one of two
+  vocabularies: **placeholder cells** (kitty, Ghostty, anything under tmux), which is the right
+  shape for a renderer that thinks in cells and the only one tmux can carry, or **placements** over
+  the cells (WezTerm, Konsole), cut down every frame to what the windows painted after leave
+  uncovered, because a float over a picture is a float. A tool that came back with a picture keeps
+  it the way an edit keeps its diff — `ToolResult::images`, written into the store by the driver
+  that read it — since a read of a screenshot is a read whose answer *is* the thing you wanted to
+  see. `ui.images = false` leaves the mark off; `NEOSH_NO_IMAGES` is the terminal's own switch.
 - `Editor::handles` is a **deny-list**. A new API call that is not added to it silently routes to
   the core.
 - **A driver's account of its own loop is not a content block.** Sub-agents, plans, compaction and
@@ -990,7 +1007,7 @@ only way to do anything.
 | `⏎` | Send. While a turn is running, **steer** it: the message is held and taken in at the next gap. |
 | `⇧⏎` | Newline, so a pasted snippet stays one message |
 | `^Y` | Take the last thing you queued back into the composer, to change it or drop it. Readline's yank: `^U`/`^W` kill, `^Y` brings it back |
-| `^V` | Attach the image on the clipboard — the picture itself, or the one it only names: a page's `<img>`, a URL, a file. A key rather than a paste, because a terminal's paste can only ever hand over text |
+| `^V` | Attach the image on the clipboard — the picture itself, or the one it only names: a page's `<img>`, a URL, a file. A key rather than a paste, because a terminal's paste can only ever hand over text. Once sent it is drawn in the transcript on a terminal that draws pictures (kitty, Ghostty, WezTerm, Konsole, tmux with passthrough), and so is any picture the agent reads; elsewhere it is its name |
 | `⌫` | On an empty composer, take the last attached image back off |
 | `^P` | Pick a model. Mid-turn too — the running agent is told, and thinks the rest with it |
 | `^E` | Everything this model can be told, on one panel: effort, thinking, fast mode, context, and whatever a driver invented. `h`/`l` along a row, `j`/`k` between them, arrows too, and it applies as you move. Nothing else reaches the keyboard while it is open; `^E` again closes it |

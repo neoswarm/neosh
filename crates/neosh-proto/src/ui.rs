@@ -737,6 +737,15 @@ pub struct ExtmarkOpts {
     /// Higher priority draws over lower when marks overlap.
     #[serde(default)]
     pub priority: i32,
+    /// The row is a picture, and this is where it is.
+    ///
+    /// From the mark's column to the end of the row, the text is what a terminal that cannot draw
+    /// pictures shows — `[png · shot]` — and a terminal that can draws the picture there instead,
+    /// as many screen rows tall as it decides. How many is the frontend's alone: it depends on the
+    /// pixel size of a cell, which nothing above the terminal boundary knows, so the row is one
+    /// buffer row whatever it turns into on screen, exactly as a row that wraps is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image: Option<crate::agent::ImageFile>,
 }
 
 /// A mark as it appears on the wire, already resolved to a column on a specific line.

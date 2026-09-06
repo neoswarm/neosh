@@ -119,6 +119,7 @@ import type { SurfaceId } from "./generated/SurfaceId";
 import type { ToolCall } from "./generated/ToolCall";
 import type { ToolDef } from "./generated/ToolDef";
 import type { ToolResult } from "./generated/ToolResult";
+import type { ImageFile } from "./generated/ImageFile";
 import type { TurnRequest } from "./generated/TurnRequest";
 import type { Usage } from "./generated/Usage";
 import type { NodeCapabilities } from "./generated/NodeCapabilities";
@@ -158,7 +159,7 @@ export type {
   InstallMethod, UpdateOutcome, UpdateStatus,
   UsageBucket, UsageHistory, UsageResolution, UsageScanSource,
   Rect, RepoInfo, RepoStatus, ScrollAmount, SelectShape, SessionId, SessionInfo, StatusAlign, StatusSegment, StopReason,
-  SurfaceCell, SurfaceId, TextEdit, ToolCall, ToolDef, ToolResult, TurnRequest, Usage,
+  SurfaceCell, SurfaceId, TextEdit, ToolCall, ToolDef, ToolResult, TurnRequest, Usage, ImageFile,
   NodeCapabilities, NodeId, NodeInfo, ProjectKey, RemoteProject, StreamEvent,
   SwarmAgent, SwarmNode, SwarmStranger,
   VarScope, ViewId, ViewInfo, Viewport,
@@ -348,6 +349,16 @@ export interface MarkOptions {
   virtTextPos?: ExtmarkOpts["virt_text_pos"];
   onDelete?: ExtmarkOpts["on_delete"];
   priority?: number;
+  /**
+   * The row is a picture from this column on, and this is where it is.
+   *
+   * The row's text from that column is what a terminal that cannot draw pictures shows — its
+   * name — and one that can (kitty, Ghostty, WezTerm, Konsole, tmux with passthrough) draws the
+   * picture there instead, as many screen rows tall as it decides. Still one row of the buffer
+   * however tall it draws, exactly as a row that wraps is. The path is on the workspace's own
+   * disk; a picture the agent read or you attached is already there, under the state directory.
+   */
+  image?: { path: string; mediaType: string };
 }
 
 /** One mark of a {@link DrawnRow}, positioned on that row. */
@@ -2236,6 +2247,7 @@ function markOpts(o: MarkOptions = {}): ExtmarkOpts {
     virt_text_pos: o.virtTextPos ?? "eol",
     on_delete: o.onDelete ?? "clamp",
     priority: o.priority ?? 0,
+    image: o.image ? { path: o.image.path, media_type: o.image.mediaType } : null,
   };
 }
 

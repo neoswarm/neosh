@@ -97,6 +97,9 @@ include_dir = "0.7"
 # was actually on the clipboard and shrinking a 4K screenshot before it is sent five times.
 base64 = "0.22"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp"] }
+# The terminal's cell size in pixels — `TIOCGWINSZ` — which is what turns a picture's pixels into
+# a number of rows. Nothing in crossterm exposes it.
+libc = "0.2"
 
 # dev
 insta = { version = "1.48", features = ["json", "redactions"] }

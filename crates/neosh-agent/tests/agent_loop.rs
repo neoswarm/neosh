@@ -475,6 +475,7 @@ async fn a_call_the_driver_never_answered_is_closed_out_rather_than_left_running
             id: neosh_proto::ToolCallId("answered".into()),
             content: "ok".into(),
             is_error: false,
+            images: Vec::new(),
         },
         neosh_proto::ProviderEvent::BlockStart {
             index: 1,

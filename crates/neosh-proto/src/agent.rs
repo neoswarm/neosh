@@ -47,6 +47,9 @@ pub enum ContentBlock {
         content: String,
         #[serde(default)]
         is_error: bool,
+        /// Pictures the tool came back with, kept the way an attached one is — see [`ImageFile`].
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        images: Vec<ImageFile>,
     },
     /// A picture, as somewhere to find it rather than as the picture.
     ///
@@ -64,6 +67,21 @@ pub enum ContentBlock {
         /// target accepts. Read off the bytes rather than off the file name, which is a claim.
         media_type: String,
     },
+}
+
+/// A picture on disk, as [`ContentBlock::Image`] names one: where it is and what it is.
+///
+/// The same two facts as the block and for the same reason — the bytes live once in the
+/// workspace's directory and everything else says where — split out so that the other places a
+/// picture turns up can name one without being a message block: a tool that came back with one,
+/// and a row of a buffer that a frontend can draw as the picture rather than as its name.
+#[derive(TS, Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
+#[ts(export)]
+pub struct ImageFile {
+    /// Absolute. Written by the workspace, read by a driver or by a terminal on the same machine.
+    pub path: String,
+    /// `image/png`, `image/jpeg`, `image/gif` or `image/webp`, read off the bytes.
+    pub media_type: String,
 }
 
 #[derive(TS, Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
@@ -326,15 +344,23 @@ pub struct ToolResult {
     pub content: String,
     #[serde(default)]
     pub is_error: bool,
+    /// Pictures the tool came back with.
+    ///
+    /// A `Read` of a screenshot answers with the screenshot, and a driver that flattened that to
+    /// the word `[image]` was reporting a picture nobody could see. They are files rather than
+    /// bytes for the reason [`ContentBlock::Image`] is: this travels on every event bus in the
+    /// workspace and is written into the conversation.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub images: Vec<ImageFile>,
 }
 
 impl ToolResult {
     pub fn ok(content: impl Into<String>) -> Self {
-        Self { content: content.into(), is_error: false }
+        Self { content: content.into(), is_error: false, images: Vec::new() }
     }
 
     pub fn error(content: impl Into<String>) -> Self {
-        Self { content: content.into(), is_error: true }
+        Self { content: content.into(), is_error: true, images: Vec::new() }
     }
 }
 

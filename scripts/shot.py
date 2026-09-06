@@ -112,6 +112,9 @@ def main():
     pid, fd = pty.fork()
     if pid == 0:
         os.environ["TERM"] = "xterm-256color"
+        # The emulator behind a shot prints an APC it does not understand as text, and neosh asks
+        # the terminal whether it draws pictures with one. A shot is of the cells, so no pictures.
+        os.environ.setdefault("NEOSH_NO_IMAGES", "1")
         os.environ["COLUMNS"] = str(a.cols)
         os.environ["LINES"] = str(a.rows)
         os.execvp(a.cmd, [a.cmd] + a.arg)

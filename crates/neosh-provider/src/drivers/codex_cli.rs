@@ -507,7 +507,7 @@ fn item_completed(item: &Value, state: &mut CodexState) -> Vec<ProviderEvent> {
     // A result belongs to the call, whether or not this stream ever mentioned the call — a turn
     // resumed mid-flight can meet the second half of one.
     let result = |content: String, is_error: bool| {
-        vec![ProviderEvent::ToolResult { id: ToolCallId::from(id), content, is_error }]
+        vec![ProviderEvent::ToolResult { id: ToolCallId::from(id), content, is_error, images: Vec::new() }]
     };
     match kind {
         "agentMessage" | "reasoning" => {

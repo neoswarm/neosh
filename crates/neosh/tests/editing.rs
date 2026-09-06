@@ -783,3 +783,48 @@ fn what_is_attached_is_part_of_the_message_that_was_stored() {
         .count();
     assert_eq!(kept, 1, "one attachment, one file");
 }
+
+/// The transcript says the row is a picture, not only what the picture is called: a terminal that
+/// can draw it needs the file, and the name is what every other terminal shows. The mark is what
+/// carries it, on the same row as the name.
+#[test]
+fn a_sent_picture_is_marked_as_one_for_terminals_that_draw_them() {
+    let sb = Sandbox::new("attachmark");
+    let shot = png_at(&sb.root.join("work/shot.png"), 40, 20);
+    let mut s = sb.start();
+    s.ready();
+
+    s.send(&json!({"type": "paste", "text": shot.display().to_string()}));
+    s.type_text("look");
+    s.wait_composer(&["look"]);
+    s.special("enter", &[]);
+    assert!(s.pump(|s| s.chat().iter().any(|l| l.contains("[png"))), "sent\n{:?}", s.chat());
+
+    let chat = s.buffer_named("[chat]").expect("a chat buffer");
+    let marked: Vec<(String, Value)> = s
+        .events
+        .iter()
+        .filter(|e| e["type"] == "buffer_lines" && e["buf"].as_u64() == Some(chat))
+        .flat_map(|e| e["lines"].as_array().cloned().unwrap_or_default())
+        .flat_map(|l| {
+            let text = l["text"].as_str().unwrap_or("").to_string();
+            l["marks"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|m| !m["image"].is_null())
+                .map(move |m| (text.clone(), m["image"].clone()))
+        })
+        .collect();
+    assert!(!marked.is_empty(), "a row of the transcript carries the picture");
+    let (text, image) = &marked[0];
+    assert!(text.contains("[png"), "on the row that names it: {text:?}");
+    assert_eq!(image["media_type"], "image/png");
+    let path = image["path"].as_str().expect("a path");
+    assert!(
+        path.starts_with(&sb.root.join("state").display().to_string()),
+        "the workspace's own copy, not the file that was pasted: {path}"
+    );
+    assert!(Path::new(path).is_file(), "and it is there to be drawn");
+}
