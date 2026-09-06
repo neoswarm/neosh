@@ -4127,7 +4127,7 @@ function hints(opts: DrawOptions): ListRow<Target>[] {
         kind === "project"
           ? "fold"
           : kind === "add"
-          ? "add"
+          ? "add project"
           : kind === "custom"
           ? "run"
           : kind === "remote"
