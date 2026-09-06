@@ -1,0 +1,21 @@
+# How `cargo nextest` runs the suites. `scripts/check.sh` prefers it when it is installed and falls
+# back to `cargo test` when it is not; CI selects the `ci` profile through `NEXTEST_PROFILE`.
+#
+# nextest runs every test in a process of its own, which is what makes it the right tool here: the
+# integration suites each boot a whole neosh — a daemon, a socket, a deno runtime — and one of them
+# wedging must not take a binary's worth of other tests down with it.
+
+[profile.default]
+# Named after a minute, killed after three. `BUDGET` in the suites is thirty seconds, so a test
+# still going at sixty is stuck rather than slow, and a name in the log beats a runner's timeout.
+slow-timeout = { period = "60s", terminate-after = 3 }
+
+[profile.ci]
+# The pty suites are timing-sensitive under load: a starved workspace draws a row late and a
+# `wait_for` on it times out — a different test on every run, none of them a regression. The fix
+# CLAUDE.md prescribes is running the test again alone, which is exactly what one retry is. Once,
+# and reported as FLAKY in the summary rather than hidden: a test that has to be asked twice is
+# still news.
+retries = 1
+fail-fast = false
+slow-timeout = { period = "60s", terminate-after = 3 }
