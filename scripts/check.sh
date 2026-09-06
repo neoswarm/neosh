@@ -2,61 +2,109 @@
 #
 # Everything CI runs. Keep this the single source of truth so "works locally" means something.
 #
-# Run with no argument and it does all of it, which is what a contributor wants. CI passes `rust`
-# or `web` to run one half on each of two runners: the node checks need only committed files, so
-# making them queue behind a nine-minute cargo build was five minutes of wall clock spent on
-# nothing. The split is here rather than in the workflow so the workflow still has exactly one
-# thing to call, and so `./scripts/check.sh` locally still means all of it.
+# Run with no argument and it does all of it, which is what a contributor wants. CI runs the stages
+# below on a runner each, in parallel, so a pull request waits for the slowest of them rather than
+# the sum — and every stage compiles only what it tests, which is why nothing builds the binary to
+# test the crates under it. The split is here rather than in the workflow so the workflow still has
+# exactly one thing to call, and so `./scripts/check.sh` locally still means all of it.
+#
+#   crates          every crate below the binary: unit and integration tests, doctests, the ts-rs
+#                   drift check, and what `cargo package` would ship
+#   binary [N/M]    the neosh binary: its unit tests, every suite that drives it except the one
+#                   below, and the config it scaffolds. N/M runs one slice of the suites
+#   screen [N/M]    tests/builtin_plugins.rs — one whole neosh booted per test, and the longest
+#                   thing here by a factor of three. N/M runs one slice of it
+#   web             the TypeScript: the plugin API, the example, the bundled plugins, what each of
+#                   them publishes, and the bits git stores on the scripts a workflow runs
+#
+# Tests run under `cargo nextest` when it is installed (https://nexte.st — one process per test,
+# and the retry policy CI uses is `.config/nextest.toml`) and under `cargo test` when it is not.
+# Slicing a stage needs nextest.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-want() { [ "${1:-all}" = "$WANT" ] || [ "$WANT" = all ]; }
+usage() { echo "usage: $0 [all | crates | binary [N/M] | screen [N/M] | web]" >&2; exit 2; }
 WANT="${1:-all}"
+SLICE="${2:-}"
 case "$WANT" in
-  all | rust | web) ;;
-  *) echo "usage: $0 [all|rust|web]" >&2; exit 2 ;;
+  all | crates | web) [ -z "$SLICE" ] || usage ;;
+  binary | screen) ;;
+  *) usage ;;
 esac
+want() { [ "$1" = "$WANT" ] || [ "$WANT" = all ]; }
 
 step() { printf '\n\033[1m== %s\033[0m\n' "$1"; }
 
-# The node checks run `tsc` out of `plugins/api/node_modules`, so both halves need it installed —
-# it is the one thing neither half can do without.
+# ts-rs writes the bindings wherever this names, and an exported value beats `.cargo/config.toml`
+# — so in a git worktree an inherited one lands the export in another checkout, and the drift check
+# then compares files nothing wrote to. Pinned to *this* checkout before any cargo runs.
+export TS_RS_EXPORT_DIR="$PWD/plugins/api/src/generated"
+
+TARGET="${CARGO_TARGET_DIR:-target}"
+
+have_nextest() { cargo nextest --version >/dev/null 2>&1; }
+
+# The pty suites start a whole workspace per test, and a machine starting one per core starves
+# them all: a different test timed out on every run. Half the cores is the rate they stay honest
+# at, on a laptop and on a 4-vCPU runner alike. NEOSH_TEST_THREADS overrides it.
+cores() { nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 2; }
+HEAVY="${NEOSH_TEST_THREADS:-$(( $(cores) / 2 ))}"
+[ "$HEAVY" -ge 1 ] || HEAVY=1
+
+# tests THREADS <cargo args> — the same package selection under either runner.
+tests() {
+  local threads="$1"; shift
+  if have_nextest; then
+    cargo nextest run --test-threads "$threads" "$@"
+  else
+    cargo test "$@" -- --test-threads "$threads"
+  fi
+}
+
+# sliced N/M <cargo args> — one slice of a stage, or all of it when N/M is empty. `cargo test`
+# has no partitioning, so a slice is the one thing here that needs nextest.
+sliced() {
+  local slice="$1"; shift
+  if [ -z "$slice" ]; then
+    tests "$HEAVY" "$@"
+  elif have_nextest; then
+    cargo nextest run --test-threads "$HEAVY" --partition "hash:$slice" "$@"
+  else
+    echo "error: running a slice ($slice) needs cargo-nextest — https://nexte.st" >&2
+    exit 2
+  fi
+}
+
+# The node checks run `tsc` out of `plugins/api/node_modules`, so every stage with a `tsc` in it
+# needs this first.
 npm_ready() {
   step "plugin API type-checks against the generated types"
   (cd plugins/api && npm install --silent --no-audit --no-fund && npx tsc --noEmit)
 }
 
-if want rust; then
-  step "cargo test --workspace"
-  cargo test --workspace
+if want crates; then
+  step "the crates below the binary"
+  # Everything but `neosh`, which is the crate that costs half the build and is tested by the two
+  # stages after this one. Light tests, so every core.
+  tests "$(cores)" --workspace --exclude neosh
+
+  # nextest does not run doctests; `cargo test` already did.
+  if have_nextest; then
+    step "the crates below the binary: doctests"
+    cargo test --doc --workspace --exclude neosh
+  fi
 
   # The plugin API's wire types are generated from Rust by ts-rs and committed. If a Rust type
   # changed without the generated TypeScript being regenerated, the plugin ecosystem is now
-  # compiling against a lie — so that is a build failure, not a warning.
+  # compiling against a lie — so that is a build failure, not a warning. The export is a test in
+  # `neosh-proto` and has just run, into the directory pinned at the top.
   step "TypeScript bindings are in sync with the Rust types"
-  # Pinned to *this* checkout. ts-rs reads the directory from the environment, and an exported
-  # `TS_RS_EXPORT_DIR` beats `.cargo/config.toml` — so in a git worktree the export lands in
-  # whichever checkout that variable happens to name, and the diff below then compares files
-  # nothing wrote to. A drift check that passes because it looked at the wrong tree is worse than
-  # no drift check.
-  TS_RS_EXPORT_DIR="$PWD/plugins/api/src/generated" cargo test -p neosh-proto --quiet >/dev/null
   if ! git diff --exit-code -- plugins/api/src/generated; then
     echo
     echo "error: generated TypeScript is out of date with the Rust types."
     echo "       run 'TS_RS_EXPORT_DIR=\"$PWD/plugins/api/src/generated\" cargo test -p neosh-proto'"
     exit 1
   fi
-
-  # `neosh init` writes a starter config *and* the types it is checked against, both emitted from
-  # the binary. If the template drifts from the API, every new user's first experience is a type
-  # error. This one needs both halves — a cargo build and a `tsc` — which is why it is on the rust
-  # runner and why that runner installs npm too.
-  npm_ready
-  step "the scaffolded config type-checks against its own emitted types"
-  scaffold="$(mktemp -d)"
-  trap 'rm -rf "$scaffold"' EXIT
-  cargo run --quiet -p neosh -- --config-dir "$scaffold" init >/dev/null
-  ./plugins/api/node_modules/.bin/tsc --noEmit --project "$scaffold/tsconfig.json"
 
   # The plugin tree is embedded with `include_dir!`, which reads the filesystem — so it embeds
   # whatever is next to the checkout and says nothing about what a *published* crate would carry.
@@ -81,8 +129,37 @@ if want rust; then
   fi
 fi
 
+if want binary; then
+  step "the neosh binary: unit tests, and every suite that drives it but one${SLICE:+ — slice $SLICE}"
+  # Named one by one rather than `--tests`, so that the one suite the `screen` stage owns is not
+  # compiled, linked and run here as well. A new file under tests/ is picked up by the glob.
+  suites=()
+  for f in crates/neosh/tests/*.rs; do
+    name="$(basename "$f" .rs)"
+    [ "$name" = builtin_plugins ] || suites+=(--test "$name")
+  done
+  sliced "$SLICE" -p neosh --bins "${suites[@]}"
+
+  # `neosh init` writes a starter config *and* the types it is checked against, both emitted from
+  # the binary. If the template drifts from the API, every new user's first experience is a type
+  # error. The binary is the one the suites above just drove — `cargo run` would build it again
+  # under the dev profile, which was two minutes of every run spent relinking the largest crate
+  # for no new information.
+  npm_ready
+  step "the scaffolded config type-checks against its own emitted types"
+  scaffold="$(mktemp -d)"
+  trap 'rm -rf "$scaffold"' EXIT
+  "$TARGET/debug/neosh" --config-dir "$scaffold" init >/dev/null
+  ./plugins/api/node_modules/.bin/tsc --noEmit --project "$scaffold/tsconfig.json"
+fi
+
+if want screen; then
+  step "the bundled plugins, on screen, through the binary${SLICE:+ — slice $SLICE}"
+  sliced "$SLICE" -p neosh --test builtin_plugins
+fi
+
 if want web; then
-  # `all` has already done this on its way through the rust half; doing it twice is a wasted
+  # `all` has already done this on its way through the binary stage; doing it twice is a wasted
   # `npm install` rather than a wrong answer, so it is guarded rather than reordered.
   if [ "$WANT" = web ]; then
     npm_ready

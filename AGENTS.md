@@ -895,6 +895,15 @@ is timing-sensitive: under load a handful of unrelated tests fail on a `wait_for
 different handful each run. A failure there is worth re-running alone (`--test-threads 1 <name>`)
 before believing it.
 
+`./scripts/check.sh` is everything CI runs, in four stages — `crates`, `binary`, `screen`, `web` —
+and CI runs each stage on a runner of its own, the two big ones sliced across several
+(`check.sh screen 1/3`). It prefers `cargo nextest` when installed, one process per test with one
+retry under the `ci` profile in `.config/nextest.toml`, and falls back to `cargo test`. The
+`binary` stage runs the scaffold check against the binary the suites just built rather than
+`cargo run`, which rebuilt the largest crate under the dev profile on every run. Nothing caches the
+workspace crates between runs on purpose: cargo decides freshness by mtime, a checkout gives every
+file the same one, and a restored crate that is *believed* stale-or-not is worse than one rebuilt.
+
 **Terminal behaviour is checked by driving the real binary**, not by reading the code. `scripts/shot.py`
 runs neosh under a pty and prints what the screen actually looks like:
 
