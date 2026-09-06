@@ -83,7 +83,8 @@ The last two are the window prefix and how long you have to hold it before it li
 | --- | --- | --- |
 | `sidebar.open` | `true` | Show it at startup |
 | `sidebar.width` | `34` | Also what `>` `<` `=` in the panel adjust, so the key and the file say the same number |
-| `sidebar.hints` | `true` | The contextual key strip at the foot of the panel |
+| `sidebar.hints` | `true` | The main keys, at the foot of the panel |
+| `sidebar.legend` | `true` | While you are in the panel, a card beside it listing every key for the row under the cursor. Appears after `ui.keys.hint_delay` |
 | `sidebar.refresh_ms` | `4000` | A workspace re-read per tick |
 
 ## The repository block

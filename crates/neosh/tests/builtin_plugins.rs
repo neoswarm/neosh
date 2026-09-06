@@ -2634,7 +2634,7 @@ fn a_favourite_sorts_above_a_project_that_was_used_more_recently() {
     s.enter_panel();
     s.down();
     assert!(
-        s.pump(|s| s.sidebar_now().iter().any(|l| l.contains("JK move"))),
+        s.pump(|s| s.sidebar_now().iter().any(|l| l.contains("↵ fold"))),
         "the cursor is on a project\n{:?}",
         s.sidebar_now()
     );
@@ -2968,6 +2968,73 @@ fn a_worktree_is_removed_by_its_path_without_a_picker() {
     assert!(s.pump(|_| !made.exists()), "the checkout is gone from the disk");
 }
 
+/// Deleting the last conversation in a worktree takes the checkout with it.
+///
+/// A worktree is made for the conversations in it — that is what `^N`'s second row does — so
+/// the last of them going is the directory's reason for being on the disk going. The dialog is
+/// off here so the command answers at once; what it would have said is the sidebar's business
+/// and the checkout going is the host's.
+#[test]
+fn deleting_the_last_conversation_in_a_worktree_removes_the_checkout() {
+    let sb = Sandbox::new("wtdelete");
+    sb.git_init();
+    sb.write_config("[options]\n\"ui.confirm_destructive\" = false\n");
+    let mut s = sb.start_letting_config_choose();
+    s.wait_for("PROJECTS");
+
+    s.send(&command("git.worktree.new.inside"));
+    assert!(s.pump(|s| s.saw("branched ")), "the tree was made and entered\n{}", s.transcript());
+    let under = sb.work().join(".worktrees");
+    let made = std::fs::read_dir(&under)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .next()
+        .map(|p| std::fs::canonicalize(&p).unwrap_or(p))
+        .expect("one worktree");
+    // Something uncommitted in it, which is what makes `git worktree remove` refuse unless the
+    // dialog has already said the changes go — and it has.
+    std::fs::write(made.join("draft.txt"), "half done\n").expect("write");
+
+    // The conversation in the tree, found by where it is rather than by being current: closing
+    // the one you are in lands you somewhere else first, and that is the host's to arrange.
+    assert!(
+        s.pump(|_| session_in(&sb, &made).is_some()),
+        "a conversation in the worktree was saved"
+    );
+    let in_tree = session_in(&sb, &made).expect("found above");
+    // Out of the tree, so the removal is not of the checkout the workspace is standing in.
+    s.send(&command_with("project.open", &sb.work().display().to_string()));
+    assert!(s.pump(|s| s.sidebar_rows() >= 2), "back in the repository\n{:?}", s.sidebar_now());
+
+    s.send(&command_with("session.close", &in_tree));
+    assert!(
+        s.pump(|_| !made.exists()),
+        "the checkout went with its last conversation\n{}",
+        s.transcript()
+    );
+    assert!(
+        s.pump(|s| !s.projects_now().iter().any(|l| l.contains("nothing here yet"))),
+        "and its row went too\n{:?}",
+        s.sidebar_now()
+    );
+}
+
+/// The id of a saved conversation whose directory is `dir`, read off the state directory.
+///
+/// Compared canonicalised on both sides: the worktree was found through `$TMPDIR`, which on macOS
+/// is a symlink, and the conversation was created at whatever spelling git handed back.
+fn session_in(sb: &Sandbox, dir: &Path) -> Option<String> {
+    let want = std::fs::canonicalize(dir).ok()?;
+    let files = std::fs::read_dir(sb.root.join("state/sessions")).ok()?;
+    files.filter_map(|e| e.ok()).find_map(|e| {
+        let text = std::fs::read_to_string(e.path()).ok()?;
+        let v: Value = serde_json::from_str(&text).ok()?;
+        let cwd = std::fs::canonicalize(v["cwd"].as_str()?).ok()?;
+        (cwd == want).then(|| v["id"].as_str().map(str::to_string))?
+    })
+}
+
 /// `git.pull` brings the remote's commits into the conversation's checkout, and what git said
 /// about it is the answer rather than silence.
 #[test]
@@ -3147,15 +3214,16 @@ fn the_project_list_is_the_rows_below_the_projects_heading() {
     );
 }
 
-/// And it is still inside it once you have deleted everything you were doing in there.
+/// And it goes when you have deleted everything you were doing in there.
 ///
-/// Which tree belongs to which repository is read off a conversation's `repo_root` — so an emptied
-/// worktree has nobody left to say it, and a project that outlives its conversations would jump out
-/// of the repository it belongs to and land at the top level as a project of its own. A tree does
-/// not become a project by being idle: the relationship is written down (`sidebar.root`) while
-/// something still knows it.
+/// A worktree is made for the conversations in it — that is what `^N`'s second row does — so the
+/// last of them going is the checkout's reason for being on the disk going with it: the directory
+/// is removed, the branch stays, and the row goes rather than sitting under the repository saying
+/// `nothing here yet` about a place that is not there. The repository it was a tree of is untouched.
+/// This used to keep the emptied tree as a project of its own, which was a directory of a full
+/// checkout kept for a row nobody would press.
 #[test]
-fn an_emptied_worktree_is_still_inside_its_repository() {
+fn an_emptied_worktree_goes_from_the_disk_and_the_list() {
     let sb = Sandbox::new("wtempty");
     sb.git_init();
     let root = sb.root.join("trees");
@@ -3172,28 +3240,34 @@ fn an_emptied_worktree_is_still_inside_its_repository() {
         "the worktree is there to begin with\n{:?}",
         s.sidebar_now()
     );
+    let made = root.join("work").join("sideline");
+    assert!(s.pump(|_| made.is_dir()), "and on the disk at {}", made.display());
 
-    // The conversation the worktree was made for is the active one, so this empties the tree. Wait
-    // for it to actually go: every claim below is true of the panel *before* the delete as well, so
-    // a test that only asserted the shape would pass without waiting for anything to happen.
+    // The conversation the worktree was made for is the active one, so this empties the tree.
     s.send(&command("session.close"));
     assert!(
-        s.pump(|s| s.sidebar_now().iter().filter(|l| l.contains("New conversation")).count() == 1),
-        "the tree's only conversation is gone\n{:?}",
+        s.pump(|_| !made.exists()),
+        "the checkout went with its last conversation\n{}",
+        s.transcript()
+    );
+    assert!(
+        s.pump(|s| !s.sidebar_now().iter().any(|l| l.contains("sideline"))),
+        "and its row went too\n{:?}",
         s.sidebar_now()
     );
     assert!(
-        s.pump(|s| {
-            let rows = s.sidebar_now();
-            let repo = rows.iter().position(|l| l.contains("work") && !l.contains("sideline"));
-            let tree = rows.iter().position(|l| l.contains("sideline"));
-            match (repo, tree) {
-                (Some(r), Some(t)) => t > r && rows[t].starts_with(CONVERSATION_INDENT),
-                _ => false,
-            }
-        }),
-        "the emptied tree is still nested under its repository\n{:?}",
+        s.sidebar_now().iter().any(|l| l.contains("work")),
+        "the repository it was a tree of is still there\n{:?}",
         s.sidebar_now()
+    );
+    let branches = Command::new("git")
+        .current_dir(sb.work())
+        .args(["branch", "--list", "sideline"])
+        .output()
+        .expect("git runs");
+    assert!(
+        String::from_utf8_lossy(&branches.stdout).contains("sideline"),
+        "and the branch stays: the checkout was the space, the branch is the work"
     );
 }
 
@@ -3417,7 +3491,7 @@ fn a_second_project_can_be_opened_and_dragged_above_the_first() {
     s.enter_panel();
     s.down();
     assert!(
-        s.pump(|s| s.sidebar_now().iter().any(|l| l.contains("JK move"))),
+        s.pump(|s| s.sidebar_now().iter().any(|l| l.contains("↵ fold"))),
         "the cursor is on a project\n{:?}",
         s.sidebar_now()
     );
@@ -3500,8 +3574,8 @@ fn a_project_is_removed_by_the_key_on_its_heading() {
     s.enter_panel();
     s.down();
     assert!(
-        s.pump(|s| s.sidebar_now().iter().any(|l| l.contains("X remove"))),
-        "the cursor is on a project, and the strip says the verb\n{:?}",
+        s.pump(|s| s.sidebar_now().iter().any(|l| l.contains("↵ fold"))),
+        "the cursor is on a project, and the strip says so\n{:?}",
         s.sidebar_now()
     );
 
@@ -3525,25 +3599,165 @@ fn the_key_hints_follow_what_the_cursor_is_on() {
     let sb = Sandbox::new("hints");
     let mut s = sb.start();
     s.wait_for("PROJECTS");
+    // The way in is on the heading of the thing it opens, and the foot keeps the doors out.
     assert!(
-        s.pump(|s| s.sidebar_now().iter().any(|l| l.contains("^T projects"))),
-        "unfocused, it says how to get in\n{:?}",
-        s.sidebar_now()
+        s.pump(|s| {
+            s.sidebar_virt_now().iter().any(|v| v.trim() == "^T")
+                && s.sidebar_now().iter().any(|l| l.contains("^F archive"))
+        }),
+        "unfocused, the heading says how to get in and the foot says the main keys\n{:?}\n{:?}",
+        s.sidebar_now(),
+        s.sidebar_virt_now()
     );
 
     s.enter_panel();
     assert!(
-        s.pump(|s| s.sidebar_now().iter().any(|l| l.contains("x archive"))),
-        "on a conversation, it offers the conversation verbs\n{:?}",
+        s.pump(|s| s.sidebar_now().iter().any(|l| l.contains("↵ open"))),
+        "on a conversation, the strip says what ↵ does here\n{:?}",
         s.sidebar_now()
+    );
+    assert!(
+        s.pump(|s| s.sidebar_virt_now().iter().any(|v| v.trim() == "esc")),
+        "and the heading now says the way out\n{:?}",
+        s.sidebar_virt_now()
     );
 
     s.special("up");
     assert!(
-        s.pump(|s| s.sidebar_now().iter().any(|l| l.contains("JK move"))),
-        "on a project, it offers the project verbs\n{:?}",
+        s.pump(|s| s.sidebar_now().iter().any(|l| l.contains("↵ fold"))),
+        "on a project, ↵ is a fold\n{:?}",
         s.sidebar_now()
     );
+}
+
+/// The key card: pause on a row and every key for it is beside the panel, level with the row.
+///
+/// Built from the registry, so it is checked the way the sheet is — by the verbs it names — and it
+/// follows the cursor: what it said on the conversation is not what it says on the project.
+#[test]
+fn the_key_card_lists_the_row_under_the_cursor_and_follows_it() {
+    let sb = Sandbox::new("keycard");
+    let mut s = sb.start();
+    s.wait_for("PROJECTS");
+    s.enter_panel();
+    assert!(
+        s.pump(|s| s.key_card().iter().any(|l| l.contains("rename"))),
+        "on a conversation, the card says the conversation's keys\n{:?}",
+        s.key_card()
+    );
+    let card = s.key_card();
+    assert!(
+        card.iter().any(|l| l.contains("archive")) && card.iter().any(|l| l.contains("delete")),
+        "all of them\n{card:?}"
+    );
+    assert!(
+        !card.iter().any(|l| l.contains("fold")),
+        "and not a project's\n{card:?}"
+    );
+
+    s.special("up");
+    assert!(
+        s.pump(|s| s.key_card().iter().any(|l| l.contains("fold or unfold"))),
+        "on a project, the card follows\n{:?}",
+        s.key_card()
+    );
+    assert!(
+        !s.key_card().iter().any(|l| l.contains("rename")),
+        "and stops saying the conversation's\n{:?}",
+        s.key_card()
+    );
+
+    // Leaving takes the card with the keyboard: a card about a row nobody is on is a card that
+    // covers the transcript for no reason.
+    s.special("esc");
+    assert!(
+        s.pump(|s| s.window_closed_for("[sidebar keys]")),
+        "the card closed with the panel\n{:?}",
+        s.key_card()
+    );
+}
+
+/// A pinned project with a git badge is one row under the cursor, not two.
+///
+/// The badge is appended to the row after the star and the unread mark, and it used to be appended
+/// to the row's *unclipped* text as well — which has neither — so the two stopped being prefixes
+/// of each other, and the list, finding nothing to trust, said the whole row again underneath:
+/// name, badge and all, on the one row you had just moved onto.
+#[test]
+fn a_pinned_project_with_a_badge_is_not_said_twice_under_the_cursor() {
+    if !have_git() {
+        return;
+    }
+    let sb = Sandbox::new("badgeonce");
+    sb.git_init();
+    std::fs::write(sb.work().join("scratch.txt"), "untracked\n").expect("write");
+    let mut s = sb.start();
+    s.wait_for("PROJECTS");
+    assert!(
+        s.pump(|s| s.projects_now().iter().any(|l| l.contains("?1"))),
+        "the git plugin has marked the row\n{:?}",
+        s.sidebar_now()
+    );
+
+    s.enter_panel();
+    s.special("up");
+    assert!(
+        s.pump(|s| s.sidebar_cursor().is_some_and(|r| r.contains("work"))),
+        "the cursor is on the project\n{:?}",
+        s.sidebar_now()
+    );
+    s.key("f");
+    assert!(
+        s.pump(|s| s.projects_now().iter().any(|l| l.contains('★'))),
+        "and it is pinned\n{:?}",
+        s.sidebar_now()
+    );
+    s.drain_for(Duration::from_millis(600));
+    let rows = s.projects_now();
+    let badged: Vec<&String> = rows.iter().filter(|l| l.contains("?1")).collect();
+    assert_eq!(badged.len(), 1, "the badge is on one row and nowhere else\n{rows:?}");
+    let named: Vec<&String> = rows.iter().filter(|l| l.contains("work")).collect();
+    assert_eq!(named.len(), 1, "and so is the name\n{rows:?}");
+}
+
+#[test]
+fn the_key_card_can_be_switched_off() {
+    let sb = Sandbox::new("nokeycard");
+    sb.write_config("[options]\n\"sidebar.legend\" = false\n");
+    let mut s = sb.start();
+    s.wait_for("PROJECTS");
+    s.enter_panel();
+    s.drain_for(Duration::from_secs(1));
+    assert!(
+        s.buffer_named("[sidebar keys]").is_none(),
+        "no card\n{:?}",
+        s.key_card()
+    );
+}
+
+impl Session {
+    /// What the key card says right now, or nothing while there is none.
+    fn key_card(&self) -> Vec<String> {
+        match self.buffer_named("[sidebar keys]") {
+            Some(b) => self.lines_of(b),
+            None => Vec::new(),
+        }
+    }
+
+    /// Whether every window that ever showed the named buffer has since closed.
+    fn window_closed_for(&self, name: &str) -> bool {
+        let Some(buf) = self.buffer_named(name) else { return false };
+        let opened: Vec<u64> = self
+            .events
+            .iter()
+            .filter(|e| e["type"] == "window_opened" && e["buf"].as_u64() == Some(buf))
+            .filter_map(|e| e["win"].as_u64())
+            .collect();
+        !opened.is_empty()
+            && opened.iter().all(|w| {
+                self.events.iter().any(|e| e["type"] == "window_closed" && e["win"].as_u64() == Some(*w))
+            })
+    }
 }
 
 #[test]
@@ -3554,7 +3768,7 @@ fn the_hint_strip_can_be_switched_off() {
     s.wait_for("PROJECTS");
     s.drain_for(Duration::from_secs(1));
     assert!(
-        !s.sidebar_now().iter().any(|l| l.contains("^T projects")),
+        !s.sidebar_now().iter().any(|l| l.contains("^F archive")),
         "no hint strip\n{:?}",
         s.sidebar_now()
     );
@@ -3625,8 +3839,8 @@ fn archive_one(s: &mut Session) {
     assert!(s.pump(|s| s.sidebar_now().iter().any(|l| l.contains("keep"))));
     s.down();
     assert!(
-        s.pump(|s| s.sidebar_now().iter().any(|l| l.contains("x archive"))),
-        "the cursor is on a conversation\n{:?}",
+        s.pump(|s| s.sidebar_cursor().is_some_and(|r| r.contains("keep"))),
+        "the cursor is on the conversation\n{:?}",
         s.sidebar_now()
     );
     s.key("x");
@@ -3850,8 +4064,8 @@ fn deleting_a_conversation_with_something_in_it_asks_first() {
     assert!(s.pump(|s| s.sidebar_now().iter().any(|l| l.contains("keep"))));
     s.down();
     assert!(
-        s.pump(|s| s.sidebar_now().iter().any(|l| l.contains("X delete"))),
-        "the cursor is on a conversation\n{:?}",
+        s.pump(|s| s.sidebar_cursor().is_some_and(|r| r.contains("keep"))),
+        "the cursor is on the conversation\n{:?}",
         s.sidebar_now()
     );
     let panel_only = s.open_windows().len();
@@ -3952,7 +4166,7 @@ fn confirmation_can_be_switched_off() {
     s.enter_panel();
     assert!(s.pump(|s| s.sidebar_now().iter().any(|l| l.contains("gone"))));
     s.down();
-    assert!(s.pump(|s| s.sidebar_now().iter().any(|l| l.contains("X delete"))));
+    assert!(s.pump(|s| s.sidebar_cursor().is_some_and(|r| r.contains("gone"))));
     s.key("X");
     assert!(
         s.pump(|s| !s.sidebar_now().iter().any(|l| l.contains("gone"))),
@@ -4196,7 +4410,7 @@ fn escape_leaves_the_thread_list_and_typing_goes_back_to_the_composer() {
     // Leaving is a round trip to the plugin thread as well; the hint strip going back to its
     // out-of-panel form is the signal that the keyboard has been handed back.
     assert!(
-        s.pump(|s| s.sidebar_now().iter().any(|l| l.contains("^T projects"))),
+        s.pump(|s| s.sidebar_now().iter().any(|l| l.contains("^F archive"))),
         "the panel gave the keyboard back\n{:?}",
         s.sidebar_now()
     );
@@ -7565,10 +7779,12 @@ fn the_plan_strip_is_one_row_until_you_ask_for_more() {
     // rather than bound over every conversation in the panel.
     s.enter_panel();
     s.key("G");
+    // On the key card beside the panel, which is where a row's verbs are said now — and only on
+    // the plan row, which is what `custom:plan` means.
     assert!(
-        s.pump(|s| s.sidebar_now().iter().any(|l| l.contains("plan detail"))),
+        s.pump(|s| s.key_card().iter().any(|l| l.contains("plan detail"))),
         "the key is advertised on the rows it applies to\n{:?}",
-        s.sidebar_now()
+        s.key_card()
     );
     s.special("tab");
     assert!(

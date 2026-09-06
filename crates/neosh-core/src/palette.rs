@@ -558,6 +558,10 @@ pub fn groups(variant: Variant) -> Vec<(&'static str, HighlightDef)> {
         ("Sidebar.Dim", link("Comment")),
         ("Sidebar.Selected", link("CursorLine")),
         ("Sidebar.Favorite", spec(fg(r.favorite))),
+        // The keys on the panel — on its heading, on its add row, at its foot and on the card
+        // beside it — wear what every other key in the workspace wears, for the reason the tab
+        // strip's do: a legend whose keys are dimmer than its words is a legend nobody reads twice.
+        ("Sidebar.Key", link("Key")),
         // Work happening on another computer. Linked to `Comment` rather than given a colour of
         // its own: a remote row is still one of your conversations, and painting it a fourth
         // colour would make the panel read as two lists rather than one workspace that happens to
