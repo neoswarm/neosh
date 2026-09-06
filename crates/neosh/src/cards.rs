@@ -18,7 +18,7 @@
 //! arguments too, rather than from `git diff` — which would count work done outside this turn, by
 //! you, or by a turn in another conversation on the same checkout.
 
-use neosh_proto::{PlanState, PlanStep};
+use neosh_proto::{ImageFile, PlanState, PlanStep};
 
 use crate::diff;
 
@@ -38,6 +38,12 @@ pub struct Row {
     pub spans: Vec<Span>,
     /// The group behind the whole row. `None` for everything that is not a changed line of a diff.
     pub band: Option<&'static str>,
+    /// The picture this row stands for, and the byte column its name starts at.
+    ///
+    /// The text is what a terminal that cannot draw pictures shows — `[png · shot]` — and this is
+    /// what one that can draws instead, from that column to the edge. See
+    /// [`neosh_proto::ExtmarkOpts::image`].
+    pub image: Option<(usize, ImageFile)>,
 }
 
 impl Row {
@@ -45,12 +51,20 @@ impl Row {
     pub fn plain(text: impl Into<String>, hl: &'static str) -> Self {
         let text = text.into();
         let len = text.len();
-        Self { text, spans: vec![(0, len, hl)], band: None }
+        Self { text, spans: vec![(0, len, hl)], band: None, image: None }
     }
 
     /// A row whose pieces are coloured separately.
     pub fn new(text: impl Into<String>, spans: Vec<Span>) -> Self {
-        Self { text: text.into(), spans, band: None }
+        Self { text: text.into(), spans, band: None, image: None }
+    }
+
+    /// A row that is a picture: its name after `margin`, for a terminal that can only show that,
+    /// and the picture itself for one that can show more.
+    pub fn picture(margin: &str, image: &ImageFile, hl: &'static str) -> Self {
+        let mut row = Self::plain(format!("{margin}{}", image_row(&image.path, &image.media_type)), hl);
+        row.image = Some((margin.len(), image.clone()));
+        row
     }
 
     fn behind(mut self, band: &'static str) -> Self {
@@ -834,22 +848,31 @@ pub fn group_body(
     if heads.first().is_some_and(|h| runs_a_command(h.input)) {
         return run_body(g, heads, root, limits, open, width);
     }
+    let margin = g.margin();
     // A preview is the same as an opening here, and deliberately: what this fold keeps out of the
     // transcript is the *contents* of the six files, and the names it gives back instead are one
-    // row each however you asked for them.
+    // row each however you asked for them. What it does not keep out is a picture one of them
+    // came back with — the one read whose answer you wanted to see — for the reason
+    // [`body`] keeps one on a card of its own.
     if open == Open::Folded {
-        return Vec::new();
+        let mut rows: Vec<Row> = heads
+            .iter()
+            .filter_map(|h| h.result)
+            .flat_map(|r| picture_rows(r, &margin))
+            .collect();
+        attach(g, &mut rows);
+        return rows;
     }
-    let margin = g.margin();
     let room = width.saturating_sub(margin.chars().count()).max(8);
     let mut rows: Vec<Row> = heads
         .iter()
-        .map(|h| {
+        .flat_map(|h| {
             let (text, spans) = label(h, root, room);
             let at = margin.len();
             let mut all = vec![(0, at, "Agent.Usage")];
             all.extend(spans.into_iter().map(|(a, b, hl)| (at + a, at + b, hl)));
-            Row::new(format!("{margin}{text}"), all)
+            std::iter::once(Row::new(format!("{margin}{text}"), all))
+                .chain(h.result.into_iter().flat_map(|r| picture_rows(r, &margin)))
         })
         .collect();
     attach(g, &mut rows);
@@ -1343,8 +1366,11 @@ pub fn body(
     let mut rows = if !result.is_error && !edits_of(input).is_empty() {
         diff_rows(g, &edits_of(input), limits.diff(open), open == Open::Full, width)
     } else if !result.is_error && open == Open::Folded && looks_at_something(input) {
-        // Folded to the header alone. The count is already on it, and `⇥` opens this.
-        Vec::new()
+        // Folded to the header alone. The count is already on it, and `⇥` opens this. Except
+        // for a picture, which stays the way an edit's diff stays: a read of a screenshot is a
+        // read whose answer *is* the thing you wanted to see, and three lines of it would be
+        // three lines of base64.
+        picture_rows(result, &g.margin())
     } else {
         result_rows(g, result, limits.output(open), width, &g.margin())
     };
@@ -1371,6 +1397,23 @@ fn attach(g: &Glyphs, rows: &mut [Row]) {
     for (a, b, _) in &mut first.spans {
         *a = shift(*a);
         *b = shift(*b);
+    }
+}
+
+/// A picture's name, for a terminal that cannot show the picture.
+///
+/// What it shows instead has to be the two things you would use to tell one attachment from
+/// another: what kind it is, and what it was called. The name is the file's, which for an image
+/// that came off the clipboard or back from a tool is a uuid nobody chose — so it is only worth
+/// saying when somebody did choose it.
+pub fn image_row(path: &str, media_type: &str) -> String {
+    let kind = media_type.strip_prefix("image/").unwrap_or(media_type);
+    let stem = std::path::Path::new(path).file_stem().and_then(|s| s.to_str()).unwrap_or("");
+    // A uuid is 36 characters of nothing. Anything else is a name somebody gave the file.
+    let named = stem.len() != 36 || !stem.chars().all(|c| c.is_ascii_hexdigit() || c == '-');
+    match named && !stem.is_empty() {
+        true => format!("[{kind} \u{b7} {stem}]"),
+        false => format!("[{kind}]"),
     }
 }
 
@@ -1420,11 +1463,39 @@ fn result_rows(
 ) -> Vec<Row> {
     let hl = if result.is_error { "Agent.ToolError" } else { "Agent.Usage" };
 
+    // The pictures first, one row each, before whatever was said about them: that is the order
+    // they arrive in, and a caption reads better under the thing it captions.
+    let pictures = picture_rows(result, margin);
     let body = result.content.trim_end();
     if body.trim().is_empty() {
+        if !pictures.is_empty() {
+            return pictures;
+        }
         let word = if result.is_error { "failed" } else { "done" };
         return vec![Row::plain(format!("{margin}{word}"), hl)];
     }
+    let mut out = pictures;
+    out.extend(text_rows(g, result, limit, width, margin));
+    out
+}
+
+/// One row per picture a result came back with, each naming its file for a terminal that cannot
+/// draw it and carrying the file for one that can. Never elided: a picture is one buffer row
+/// however tall it is drawn, and the budget the limits set is counted in lines of text.
+fn picture_rows(result: &neosh_proto::ToolResult, margin: &str) -> Vec<Row> {
+    result.images.iter().map(|i| Row::picture(margin, i, "Agent.Usage")).collect()
+}
+
+/// The lines a tool wrote, however many of them fit. See [`result_rows`] for the shape.
+fn text_rows(
+    g: &Glyphs,
+    result: &neosh_proto::ToolResult,
+    limit: usize,
+    width: usize,
+    margin: &str,
+) -> Vec<Row> {
+    let hl = if result.is_error { "Agent.ToolError" } else { "Agent.Usage" };
+    let body = result.content.trim_end();
 
     let all: Vec<&str> = body.lines().collect();
     let total = all.len();
@@ -2736,5 +2807,50 @@ mod tests {
         let result = neosh_proto::ToolResult::ok("one\ntwo");
         let rows = body(&g, &json!({}), &result, caps(12, 1), Open::Folded, 80);
         assert_eq!(texts(&rows), vec!["  \\ ... +1 line (^S Tab to expand)", "    two"]);
+    }
+
+    /// A read that came back with a picture keeps the picture the way an edit keeps its diff: a
+    /// read of a screenshot is a read whose answer is the thing you wanted to see.
+    #[test]
+    fn a_look_that_came_back_with_a_picture_shows_it_folded() {
+        let input = json!({"file_path": "/work/shot.png"});
+        let mut result = neosh_proto::ToolResult::ok("");
+        result.images.push(ImageFile { path: "/state/images/shot.png".into(), media_type: "image/png".into() });
+        let rows = body(&g(), &input, &result, caps(12, 3), Open::Folded, 80);
+        assert_eq!(texts(&rows), vec!["  \u{2514} [png \u{b7} shot]"], "its name, for a terminal without pictures");
+        let (col, image) = rows[0].image.as_ref().expect("and the picture itself");
+        assert_eq!(*col, 4, "from where the name starts");
+        assert_eq!(image.path, "/state/images/shot.png");
+        // Opened, the picture stays a picture and nothing is said twice.
+        let open = body(&g(), &input, &result, caps(12, 3), Open::Full, 80);
+        assert_eq!(texts(&open), texts(&rows));
+        // With words beside it, the words fold the way a read's words always do and the picture
+        // stays; opened, the picture comes first and the words under it.
+        result.content = "a screenshot of the login page".into();
+        let folded = body(&g(), &input, &result, caps(12, 3), Open::Folded, 80);
+        assert_eq!(folded.len(), 1, "{:?}", texts(&folded));
+        let both = body(&g(), &input, &result, caps(12, 3), Open::Full, 80);
+        assert_eq!(both.len(), 2, "{:?}", texts(&both));
+        assert!(both[0].image.is_some() && both[1].image.is_none());
+    }
+
+    /// A run of reads folds to its header — except the picture one of them came back with.
+    #[test]
+    fn a_run_of_reads_keeps_the_picture_one_of_them_found() {
+        let a = json!({"file_path": "/work/a.rs"});
+        let b = json!({"file_path": "/work/shot.png"});
+        let plain = neosh_proto::ToolResult::ok("fn main() {}");
+        let mut seen = neosh_proto::ToolResult::ok("");
+        seen.images.push(ImageFile { path: "/state/images/x.png".into(), media_type: "image/png".into() });
+        let heads = [
+            Head { result: Some(&plain), output: Some(1), ..head("Read", &a, ToolState::Done) },
+            Head { result: Some(&seen), output: Some(0), ..head("Read", &b, ToolState::Done) },
+        ];
+        let rows = group_body(&g(), &heads, &root(), caps(12, 3), Open::Folded, 80);
+        assert_eq!(rows.len(), 1, "{:?}", texts(&rows));
+        assert!(rows[0].image.is_some());
+        let open = group_body(&g(), &heads, &root(), caps(12, 3), Open::Full, 80);
+        assert_eq!(open.len(), 3, "two names and one picture: {:?}", texts(&open));
+        assert!(open[2].image.is_some(), "under the read that found it");
     }
 }

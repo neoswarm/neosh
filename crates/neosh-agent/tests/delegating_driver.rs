@@ -48,7 +48,7 @@ fn the_result_the_cli_produced_is_reported_rather_than_dropped() {
     let result = updates
         .iter()
         .find_map(|u| match u {
-            TurnUpdate::ToolResult { id, content, is_error } => Some((id, content, is_error)),
+            TurnUpdate::ToolResult { id, content, is_error, .. } => Some((id, content, is_error)),
             _ => None,
         })
         .expect("the tool result reached the assembler");

@@ -142,7 +142,7 @@ impl GoogleProvider {
                         ContentBlock::ToolUse { name, input, .. } => {
                             Some(json!({"functionCall": {"name": name, "args": input}}))
                         }
-                        ContentBlock::ToolResult { tool_use_id, content, is_error } => {
+                        ContentBlock::ToolResult { tool_use_id, content, is_error, .. } => {
                             Some(json!({
                                 "functionResponse": {
                                     "name": names.get(tool_use_id).copied().unwrap_or("tool"),
@@ -455,6 +455,7 @@ mod tests {
                     tool_use_id: ToolCallId("c".into()),
                     content: "data".into(),
                     is_error: false,
+                    images: Vec::new(),
                 }],
             },
         ]));
@@ -588,6 +589,7 @@ mod tests {
                     tool_use_id: ToolCallId("c".into()),
                     content: "data".into(),
                     is_error: false,
+                    images: Vec::new(),
                 }],
             },
         ]));
@@ -604,6 +606,7 @@ mod tests {
                 tool_use_id: ToolCallId("c".into()),
                 content: "no such file".into(),
                 is_error: true,
+                images: Vec::new(),
             }],
         }]));
         let r = &b["contents"][0]["parts"][0]["functionResponse"]["response"];

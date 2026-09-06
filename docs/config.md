@@ -998,7 +998,25 @@ is "what did it actually say".
 "ui.hints" = false        # a shortcut row under the composer; off, the sidebar says the same keys
 "ui.ascii_only" = false   # for terminals without a decent font
 "ui.nerd_font" = false    # brand glyphs for providers, where the font has them
+"ui.images" = true        # draw pictures in the transcript, where the terminal can
 ```
+
+### Pictures
+
+A picture in the transcript — one you attached with `^V` or dragged in, or one the agent read
+with a tool — is drawn as the picture on a terminal that can draw one, and as its name,
+`[png · shot]`, everywhere else. Nothing is configured: at startup the terminal is asked whether it
+speaks the kitty graphics protocol, which kitty, Ghostty, WezTerm and Konsole do, and tmux passes
+through with `set -g allow-passthrough on`. A terminal that does not answer keeps the name. How big
+the picture draws is the terminal's decision too — it knows how many pixels a cell is and nothing
+above it does — bounded to half the window and never enlarged, so an icon stays an icon. It is one
+row of the transcript however tall it draws, exactly as a row that wraps is: `j` steps over it,
+`v` and `y` copy its name.
+
+`ui.images = false` keeps the names on every terminal. `NEOSH_NO_IMAGES=1` in the terminal's own
+environment does the same for one terminal, which is the switch for "my terminal claims to draw
+pictures and gets it wrong" — a decision the terminal has to make before any configuration has
+loaded, and one a workspace viewed over SSH cannot make for the laptop it is viewed from.
 
 Motion is reserved for one thing: *something is happening and you cannot see it yet*. While a turn
 is in flight the working line sweeps — a band of brightness travelling along the word — because a

@@ -50,7 +50,7 @@ impl AnthropicProvider {
             ContentBlock::ToolUse { id, name, input } => {
                 json!({"type": "tool_use", "id": id.0, "name": name, "input": input})
             }
-            ContentBlock::ToolResult { tool_use_id, content, is_error } => json!({
+            ContentBlock::ToolResult { tool_use_id, content, is_error, .. } => json!({
                 "type": "tool_result",
                 "tool_use_id": tool_use_id.0,
                 "content": content,
@@ -397,6 +397,7 @@ mod tests {
                 tool_use_id: ToolCallId("t1".into()),
                 content: "contents".into(),
                 is_error: false,
+                images: Vec::new(),
             }],
         });
         let b = AnthropicProvider::body(&r, true);

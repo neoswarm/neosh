@@ -24,6 +24,7 @@ use ratatui::Frame;
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
+use crate::graphics::{Graphics, Placed};
 use crate::mirror::Mirror;
 use crate::theme::Theme;
 
@@ -641,11 +642,15 @@ fn carve(
                     // rows a line folds into — only the text and the window's width can.
                     let h = match mirror.windows.get(&win) {
                         Some(w) if w.wraps() => {
+                            // And with no pictures: the composer has none, and a dock's height
+                            // must not depend on what a terminal can draw.
                             let rows = rendered_rows(
                                 mirror,
                                 w,
                                 &Theme::new(crate::theme::ColorDepth::Ansi16),
                                 main.width,
+                                avail,
+                                &mut Graphics::off(),
                             )
                             .len() as u16;
                             rows.clamp(base, (avail / 2).max(base))
@@ -866,8 +871,19 @@ fn resolve_floats(mirror: &Mirror, area: Rect, main: Rect, out: &mut Vec<(Window
 /// The caret is not decoration. Without one the composer gives no sign that typing goes anywhere,
 /// and a terminal program with no visible insertion point reads as frozen.
 pub fn draw(frame: &mut Frame, mirror: &Mirror, theme: &Theme) -> Drawn {
+    draw_with(frame, mirror, theme, &mut Graphics::off())
+}
+
+/// As [`draw`], on a terminal that may draw pictures.
+///
+/// `gfx` is asked where every picture fits and told where each one landed, which is the whole of
+/// what the renderer knows about them: a picture is a row that turned into several, and which
+/// cells those are is decided here like every other cell.
+pub fn draw_with(frame: &mut Frame, mirror: &Mirror, theme: &Theme, gfx: &mut Graphics) -> Drawn {
     let area = frame.area();
     let (rects, rules) = resolve_layout_with_rules(mirror, area);
+    let mut images: Vec<Placed> = Vec::new();
+    let mut layers: Vec<Rect> = Vec::new();
     // Which window the caret belongs to is decided before anything is drawn, because the window it
     // belongs to is also the one whose scroll has to bend to keep it on screen.
     let caret_win = caret_target(mirror, &rects);
@@ -922,6 +938,9 @@ pub fn draw(frame: &mut Frame, mirror: &Mirror, theme: &Theme) -> Drawn {
         if rect.width == 0 || rect.height == 0 {
             continue;
         }
+        // Which layer this window is, for a picture to be asked whether something later covers it.
+        let layer = layers.len();
+        layers.push(rect);
         // A window somebody restyled reads every group name through its own map — border, title,
         // `Normal`, every mark — and the rest of the screen never knows.
         let local;
@@ -970,7 +989,7 @@ pub fn draw(frame: &mut Frame, mirror: &Mirror, theme: &Theme) -> Drawn {
         // Wrapping is per window: the chat has to wrap or a long answer is silently cut off at the
         // right edge, while the sidebar and the status line must clip or one long path would push
         // everything below it off the screen.
-        let rendered = rendered_rows(mirror, w, theme, inner.width);
+        let rendered = rendered_rows(mirror, w, theme, inner.width, inner.height, gfx);
         let here = (caret_win == Some(win)).then(|| caret_in(mirror, w, &rendered, inner.width)).flatten();
 
         // Follow the tail. Taking the *first* n lines shows a long conversation's opening and
@@ -1007,6 +1026,41 @@ pub fn draw(frame: &mut Frame, mirror: &Mirror, theme: &Theme) -> Drawn {
                 Some((first, _)) => (first, row),
                 None => (row, row),
             });
+        }
+        // Where each picture's showing rows are. One entry per picture: its first row on screen,
+        // which of its rows that is, and how many of them follow — a picture whose top has
+        // scrolled off starts from the middle, and one that runs off the bottom stops early.
+        // Only the placement vocabulary reads this; placeholder cells already say all of it.
+        let slack = match &w.layout {
+            WindowLayout::Docked { gravity: neosh_proto::Gravity::End, .. } => {
+                height.saturating_sub(shown.len()) as u16
+            }
+            _ => 0,
+        };
+        for (i, r) in shown.iter().enumerate().filter(|_| !gfx.placeholders()) {
+            let Some(p) = r.picture else { continue };
+            let y = inner.y + slack + i as u16;
+            match images.last_mut() {
+                Some(last)
+                    if last.layer == layer
+                        && last.id == p.id
+                        && last.y + last.rows == y
+                        && last.k0 + last.rows == p.k =>
+                {
+                    last.rows += 1;
+                }
+                _ => images.push(Placed {
+                    id: p.id,
+                    x: inner.x + p.x,
+                    y,
+                    cols: p.cols,
+                    rows: 1,
+                    k0: p.k,
+                    c0: 0,
+                    of: (p.cols, p.rows),
+                    layer,
+                }),
+            }
         }
         tops.push((
             win,
@@ -1101,6 +1155,10 @@ pub fn draw(frame: &mut Frame, mirror: &Mirror, theme: &Theme) -> Drawn {
             .and_then(|id| mirror.windows.get(&id))
             .map(|w| w.cursor_shape == CursorShape::Block),
     ) && let Some(cell) = frame.buffer_mut().cell_mut((x, y))
+        // Not over a picture: a placeholder cell's foreground *is* the image id, and reversing it
+        // would turn one cell of the picture into a hole. The terminal's own caret still goes
+        // there.
+        && !Graphics::is_placeholder(cell.symbol())
     {
         // Reverse video when nothing has said otherwise. A palette entry is how you change what a
         // block cursor looks like, never whether there is one — and a theme that has never heard
@@ -1113,7 +1171,7 @@ pub fn draw(frame: &mut Frame, mirror: &Mirror, theme: &Theme) -> Drawn {
         cell.set_style(cell.style().patch(style));
     }
 
-    Drawn { caret, caret_win: caret.and(caret_win), tops }
+    Drawn { caret, caret_win: caret.and(caret_win), tops, images, layers }
 }
 
 /// A bar down a float's right border, when the float is showing less than it holds.
@@ -1175,6 +1233,10 @@ pub struct Drawn {
     pub caret_win: Option<WindowId>,
     /// Per window: the first buffer row drawn, and how many buffer rows were drawn.
     pub tops: Vec<(WindowId, (u32, u32))>,
+    /// Every picture on screen, for a terminal that places them rather than reading cells.
+    pub images: Vec<Placed>,
+    /// The rectangles of the windows, in paint order, so a picture can be asked what covers it.
+    pub layers: Vec<Rect>,
 }
 
 /// Every screen line a window's visible buffer range turns into, marks and wrapping applied.
@@ -1215,6 +1277,85 @@ struct ScreenRow {
     /// The buffer row this is part of and which wrapped segment of it, or `None` for a virtual
     /// line — a row that exists on the screen and not in the text.
     at: Option<(u32, u16)>,
+    /// The picture this row is a strip of, when it is one.
+    picture: Option<Strip>,
+}
+
+/// One screen row of a picture: which picture, which of its rows, and where it starts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Strip {
+    id: u32,
+    /// Row `k` of `rows`, `cols` wide, starting `x` columns into the window.
+    k: u16,
+    rows: u16,
+    cols: u16,
+    x: u16,
+}
+
+/// The picture a buffer row carries, as its screen rows.
+///
+/// The text before the mark's column — a bar, a margin, a corner — is drawn as it would have been
+/// on the first row and as blank on the rest, and the picture takes the columns after it. `None`
+/// when there is no picture to draw, and the row is then text like any other: its name, which is
+/// what the row says.
+fn picture_rows(
+    l: &LineRender,
+    theme: &Theme,
+    cols: usize,
+    height: u16,
+    gfx: &mut Graphics,
+) -> Option<Vec<(Line<'static>, Strip)>> {
+    if !gfx.enabled() {
+        return None;
+    }
+    let mark = l.marks.iter().find(|m| m.opts.image.is_some())?;
+    let image = mark.opts.image.as_ref()?;
+    let at = (mark.col as usize).min(l.text.len());
+    let at = (0..=at).rev().find(|&i| l.text.is_char_boundary(i)).unwrap_or(0);
+    // The prefix, rendered as the row would have been up to the picture: the same marks, cut
+    // where the picture starts, so the bar down a question keeps its colour.
+    let prefix = LineRender {
+        text: l.text[..at].to_string(),
+        marks: l
+            .marks
+            .iter()
+            .filter(|m| m.opts.hl_group.is_some() && (m.col as usize) < at)
+            .map(|m| {
+                let mut m = m.clone();
+                m.opts.end_col = m.opts.end_col.map(|e| e.min(at as u32));
+                m.opts.virt_text.clear();
+                m.opts.line_hl_group = None;
+                m
+            })
+            .collect(),
+    };
+    let lead = render_line_in(&prefix, theme, None).pop()?;
+    let used: usize = lead.spans.iter().map(|s| width(&s.content)).sum();
+    let room = cols.checked_sub(used)?;
+    if room < 2 {
+        return None;
+    }
+    // Never more than half the window, and never fewer than four rows unless the window is
+    // shorter than that: a picture that took the whole screen would be a screen you could not
+    // read past, and one row of a screenshot is a stripe.
+    let max_rows = (height / 2).max(4.min(height)).max(1);
+    let fit = gfx.fit(&image.path, u16::try_from(room).unwrap_or(u16::MAX), max_rows)?;
+    let blank = Span::raw(" ".repeat(used));
+    let rows = (0..fit.rows)
+        .map(|k| {
+            let mut spans: Vec<Span<'static>> = if k == 0 { lead.spans.clone() } else { vec![blank.clone()] };
+            if gfx.placeholders() {
+                spans.extend((0..fit.cols).map(|c| gfx.cell(fit.id, k, c)));
+            } else {
+                // Placed over the cells afterwards, so the cells only have to be there — and blank,
+                // so nothing shows through before the placement lands.
+                spans.push(Span::raw(" ".repeat(usize::from(fit.cols))));
+            }
+            let strip = Strip { id: fit.id, k, rows: fit.rows, cols: fit.cols, x: used as u16 };
+            (Line::from(spans), strip)
+        })
+        .collect();
+    Some(rows)
 }
 
 fn rendered_rows(
@@ -1222,6 +1363,8 @@ fn rendered_rows(
     w: &crate::mirror::MirrorWindow,
     theme: &Theme,
     width: u16,
+    height: u16,
+    gfx: &mut Graphics,
 ) -> Vec<ScreenRow> {
     // Wrapping is per window: the chat has to wrap or a long answer is silently cut off at the
     // right edge, while the sidebar and the status line must clip or one long path would push
@@ -1231,6 +1374,18 @@ fn rendered_rows(
     let Some(b) = mirror.buffers.get(&w.buf) else { return Vec::new() };
     let mut out: Vec<ScreenRow> = Vec::new();
     for (row, l) in b.lines.iter().enumerate().skip(w.top_line.unwrap_or(0) as usize) {
+        // A picture is its own rows, all of them the buffer row's: the caret on that row lands
+        // on the first of them, and paging counts the row once however tall it drew.
+        if let Some(rows) = picture_rows(l, theme, cols, height, gfx) {
+            for (k, (line, strip)) in rows.into_iter().enumerate() {
+                out.push(ScreenRow {
+                    line: fill_to_edge(line, cols),
+                    at: Some((row as u32, k as u16)),
+                    picture: Some(strip),
+                });
+            }
+            continue;
+        }
         // `render_line_in` emits the virtual lines that go above, then the row's own text, then
         // the ones that go below. Which of them is the text is exactly what the caret needs.
         let above = l
@@ -1244,6 +1399,7 @@ fn rendered_rows(
                 out.push(ScreenRow {
                     line: fill_to_edge(piece, cols),
                     at: (i == above).then_some((row as u32, seg as u16)),
+                    picture: None,
                 });
             }
         }

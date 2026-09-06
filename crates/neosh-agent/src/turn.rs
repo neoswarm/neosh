@@ -17,7 +17,7 @@
 use std::collections::BTreeMap;
 
 use neosh_proto::{
-    Activity, BlockStartKind, ContentBlock, Message, ProviderEvent, Role, StopReason, ToolCallId,
+    Activity, BlockStartKind, ContentBlock, ImageFile, Message, ProviderEvent, Role, StopReason, ToolCallId,
     Usage,
 };
 
@@ -27,7 +27,7 @@ enum Partial {
     Thinking { text: String, signature: Option<String> },
     ToolUse { id: ToolCallId, name: String, json: String },
     /// What a tool came back with, reported by a driver that ran it itself.
-    Result { id: ToolCallId, content: String, is_error: bool },
+    Result { id: ToolCallId, content: String, is_error: bool, images: Vec<ImageFile> },
 }
 
 /// Something the UI or the agent loop should react to as it happens.
@@ -42,7 +42,7 @@ pub enum TurnUpdate {
     /// right response is to tell the model its arguments were malformed.
     ToolMalformed { id: ToolCallId, name: String, raw: String, error: String },
     /// A tool call a delegating driver ran for itself has come back.
-    ToolResult { id: ToolCallId, content: String, is_error: bool },
+    ToolResult { id: ToolCallId, content: String, is_error: bool, images: Vec<ImageFile> },
     /// The driver's own loop said something about itself. Passed straight through: none of it is
     /// part of the message, so the assembler has nothing to fold it into and nothing to decide.
     Activity { activity: Activity },
@@ -165,13 +165,14 @@ impl TurnAssembler {
                 }
                 vec![]
             }
-            ProviderEvent::ToolResult { id, content, is_error } => {
+            ProviderEvent::ToolResult { id, content, is_error, images } => {
                 self.slots.push(Partial::Result {
                     id: id.clone(),
                     content: content.clone(),
                     is_error,
+                    images: images.clone(),
                 });
-                vec![TurnUpdate::ToolResult { id, content, is_error }]
+                vec![TurnUpdate::ToolResult { id, content, is_error, images }]
             }
             ProviderEvent::BlockStop { index } => {
                 // Only now is a tool call's JSON complete.
@@ -236,10 +237,11 @@ impl TurnAssembler {
                     input: serde_json::from_str(if json.trim().is_empty() { "{}" } else { json })
                         .unwrap_or(serde_json::Value::Object(Default::default())),
                 }),
-                Partial::Result { id, content, is_error } => (Role::User, ContentBlock::ToolResult {
+                Partial::Result { id, content, is_error, images } => (Role::User, ContentBlock::ToolResult {
                     tool_use_id: id.clone(),
                     content: content.clone(),
                     is_error: *is_error,
+                    images: images.clone(),
                 }),
             };
             match out.last_mut() {

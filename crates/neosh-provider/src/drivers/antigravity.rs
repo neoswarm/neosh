@@ -375,6 +375,7 @@ fn events(frame: &Value, state: &mut Reading) -> Vec<ProviderEvent> {
                             // `ERROR` is the step's own word for it, and an `error` on `tool_info`
                             // is the same thing said in the payload. Either is enough.
                             is_error: state_of == "ERROR" || error.is_some(),
+                            images: Vec::new(),
                         });
                     }
                 }

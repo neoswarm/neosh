@@ -44,6 +44,7 @@ Plugins declare their own options through the same call the built-ins use, and a
 | `ui.hints` | `false` | A shortcut row under the composer. Off, the sidebar says the same keys |
 | `ui.confirm_destructive` | `true` | Ask before anything irreversible. Turning it off turns off every such dialog, everywhere |
 | `ui.ascii_only` | `false` | For terminals without a decent font |
+| `ui.images` | `true` | Draw pictures in the transcript on a terminal that can — kitty, Ghostty, WezTerm, Konsole, tmux with passthrough. Elsewhere a picture is its name |
 | `ui.nerd_font` | `false` | Brand glyphs for providers, where the font has them. Deliberately not auto-detected |
 
 ## Keys

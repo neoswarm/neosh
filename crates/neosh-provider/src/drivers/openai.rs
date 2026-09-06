@@ -393,6 +393,7 @@ mod tests {
                 tool_use_id: ToolCallId("c1".into()),
                 content: "hello".into(),
                 is_error: false,
+                images: Vec::new(),
             },
         ])]);
         assert_eq!(out.len(), 1);

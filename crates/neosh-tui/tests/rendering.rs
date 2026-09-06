@@ -1904,3 +1904,142 @@ fn the_bar_is_never_the_whole_track_while_anything_is_hidden() {
     assert!(!thumb.is_empty(), "there is a row below the edge, so there is a bar");
     assert!(thumb.len() < 8, "and it does not fill the track\n{thumb:?}");
 }
+
+// ---- pictures ---------------------------------------------------------------
+//
+// A row carrying an image mark is one row of the buffer and as many rows of the screen as the
+// picture needs, decided here from the size of a cell. On a terminal that draws no pictures it is
+// the row it always was.
+
+fn a_png(name: &str, w: u32, h: u32) -> String {
+    let path = std::env::temp_dir().join(format!("neosh-render-{}-{name}.png", std::process::id()));
+    let img = image::RgbaImage::from_pixel(w, h, image::Rgba([9, 9, 9, 255]));
+    let mut bytes = Vec::new();
+    image::DynamicImage::ImageRgba8(img)
+        .write_to(&mut std::io::Cursor::new(&mut bytes), image::ImageFormat::Png)
+        .expect("encode");
+    std::fs::write(&path, bytes).expect("write");
+    path.display().to_string()
+}
+
+fn picture_mirror(path: &str) -> Mirror {
+    let mut m = Mirror::new();
+    m.apply(UiEvent::BufferOpened { buf: BufferId(1), name: "chat".into() });
+    let bar = ExtmarkRender {
+        ns: NamespaceId(1),
+        id: ExtmarkId(1),
+        col: 0,
+        opts: ExtmarkOpts { hl_group: Some("V".into()), end_col: Some(3), ..Default::default() },
+    };
+    let picture = ExtmarkRender {
+        ns: NamespaceId(1),
+        id: ExtmarkId(2),
+        col: 4,
+        opts: ExtmarkOpts {
+            image: Some(neosh_proto::ImageFile { path: path.into(), media_type: "image/png".into() }),
+            ..Default::default()
+        },
+    };
+    m.apply(UiEvent::BufferLines {
+        buf: BufferId(1),
+        start: 0,
+        old_end: 0,
+        lines: vec![
+            line("above", vec![]),
+            line("▌ [png · shot]", vec![bar, picture]),
+            line("▌ what is this", vec![]),
+        ],
+    });
+    m.apply(UiEvent::WindowOpened {
+        win: WindowId(1),
+        buf: BufferId(1),
+        layout: WindowLayout::Docked { pane: None, dock: Dock::Main, size: None, gravity: Gravity::Start, wrap: Some(true) },
+    });
+    m.apply(UiEvent::ScrollTo { win: WindowId(1), top_line: Some(0) });
+    m
+}
+
+fn draw_pictures(m: &Mirror, w: u16, h: u16, gfx: &mut neosh_tui::graphics::Graphics) -> (Vec<Vec<String>>, neosh_tui::render::Drawn) {
+    let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
+    let t = theme();
+    let mut out = neosh_tui::render::Drawn::default();
+    terminal.draw(|f| out = neosh_tui::render::draw_with(f, m, &t, gfx)).unwrap();
+    let cells = terminal
+        .backend()
+        .buffer()
+        .content()
+        .chunks(w as usize)
+        .map(|row| row.iter().map(|c| c.symbol().to_string()).collect())
+        .collect();
+    (cells, out)
+}
+
+#[test]
+fn a_picture_row_becomes_placeholder_cells_behind_its_own_prefix() {
+    use neosh_tui::graphics::{Graphics, Mode};
+    let png = a_png("rows", 200, 100);
+    let m = picture_mirror(&png);
+    let mut gfx = Graphics::new(Mode::Placeholders, false, Some((10, 20)));
+    let (cells, drawn) = draw_pictures(&m, 40, 12, &mut gfx);
+    // 200×100 at 10×20 cells is 20 columns by 5 rows.
+    assert_eq!(cells[0].concat().trim_end(), "above");
+    assert_eq!(&cells[1][0], "▌", "the bar stays on the first row");
+    assert!(Graphics::is_placeholder(&cells[1][2]), "and the picture starts after it: {:?}", cells[1]);
+    assert!(Graphics::is_placeholder(&cells[1][21]), "twenty columns wide");
+    assert_eq!(&cells[1][22], " ", "and no wider");
+    assert_eq!(&cells[2][0], " ", "the rows below it carry no bar");
+    assert!(Graphics::is_placeholder(&cells[2][2]));
+    assert!(Graphics::is_placeholder(&cells[5][2]));
+    assert_eq!(cells[6].concat().trim_end(), "▌ what is this", "the text under it follows");
+    // Three buffer rows on screen, however many screen rows they took.
+    assert_eq!(drawn.tops, vec![(WindowId(1), (0, 3))]);
+    // Nothing placed: the cells say everything in this vocabulary.
+    assert!(drawn.images.is_empty());
+    let _ = std::fs::remove_file(png);
+}
+
+#[test]
+fn a_picture_is_its_name_where_nothing_can_draw_it() {
+    let png = a_png("name", 200, 100);
+    let m = picture_mirror(&png);
+    let rows = rows_of(&m, 40, 12);
+    assert_eq!(rows[1].trim_end(), "▌ [png · shot]");
+    assert_eq!(rows[2].trim_end(), "▌ what is this");
+    let _ = std::fs::remove_file(png);
+}
+
+/// In the placement vocabulary the cells are blank and the frame says where the picture goes —
+/// including which of its rows, when the top has scrolled off the window.
+#[test]
+fn a_placed_picture_reports_where_it_landed_and_which_rows_show() {
+    use neosh_tui::graphics::{Graphics, Mode};
+    let png = a_png("placed", 200, 100);
+    let mut m = picture_mirror(&png);
+    let mut gfx = Graphics::new(Mode::Placements, false, Some((10, 20)));
+    let (cells, drawn) = draw_pictures(&m, 40, 12, &mut gfx);
+    assert_eq!(&cells[1][2], " ", "blank under a placement");
+    assert_eq!(drawn.images.len(), 1);
+    let p = drawn.images[0];
+    assert_eq!((p.x, p.y, p.cols, p.rows, p.k0, p.of), (2, 1, 20, 5, 0, (20, 5)));
+    // A window one row tall showing the picture's middle row.
+    m.apply(UiEvent::ScrollTo { win: WindowId(1), top_line: Some(1) });
+    let (_, drawn) = draw_pictures(&m, 40, 1, &mut gfx);
+    assert_eq!(drawn.images.len(), 1);
+    assert_eq!((drawn.images[0].y, drawn.images[0].rows, drawn.images[0].k0), (0, 1, 0));
+    let _ = std::fs::remove_file(png);
+}
+
+/// The caret on a picture row is on its first screen row, and the block is not painted over a
+/// placeholder — reversing the cell would reverse the image id.
+#[test]
+fn the_caret_on_a_picture_row_lands_on_its_first_screen_row() {
+    use neosh_tui::graphics::{Graphics, Mode};
+    let png = a_png("caret", 200, 100);
+    let mut m = picture_mirror(&png);
+    m.apply(UiEvent::CursorMoved { win: WindowId(1), row: 1, col: 4 });
+    m.apply(UiEvent::FocusChanged { win: Some(WindowId(1)) });
+    let mut gfx = Graphics::new(Mode::Placeholders, false, Some((10, 20)));
+    let (_, drawn) = draw_pictures(&m, 40, 12, &mut gfx);
+    assert_eq!(drawn.caret, Some((2, 1)));
+    let _ = std::fs::remove_file(png);
+}

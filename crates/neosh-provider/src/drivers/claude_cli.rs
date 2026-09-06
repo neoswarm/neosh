@@ -314,6 +314,11 @@ pub struct ClaudeCliProvider {
     questioner: Arc<Mutex<Option<Arc<dyn QuestionAsker>>>>,
     /// Where to say that the CLI has started a turn nobody asked for. See [`super::Unasked`].
     unasked: Arc<Mutex<Option<Arc<dyn super::Unasked>>>>,
+    /// Where a picture a tool came back with is written, so the transcript can name it.
+    ///
+    /// `None` until the workspace says — in a test, or a headless run — and then the picture is
+    /// reported as the word `[image]`, which is what it always was.
+    image_store: Arc<Mutex<Option<std::path::PathBuf>>>,
 }
 
 impl Default for ClaudeCliProvider {
@@ -332,6 +337,7 @@ impl ClaudeCliProvider {
             asker: Arc::default(),
             questioner: Arc::default(),
             unasked: Arc::default(),
+            image_store: Arc::default(),
         }
     }
 
@@ -615,6 +621,7 @@ impl Provider for ClaudeCliProvider {
         let asker = self.asker.lock().expect("asker lock poisoned").clone();
         let questioner = self.questioner.lock().expect("questioner lock poisoned").clone();
         let unasked = self.unasked.lock().expect("unasked lock poisoned").clone();
+        let image_store = self.image_store.lock().expect("image store lock poisoned").clone();
         let here = request.conversation.clone();
 
         tokio::spawn(async move {
@@ -626,7 +633,7 @@ impl Provider for ClaudeCliProvider {
             // Held for the whole turn. Two turns in one conversation share one process and one
             // stdin, so running them at once would interleave two answers down one pipe.
             let mut guard = slot.live.lock().await;
-            let mut turn = Turn { request, mode, asker, questioner, unasked };
+            let mut turn = Turn { request, mode, asker, questioner, unasked, image_store };
             // Retried exactly once, and only for the one failure a retry can fix: the conversation
             // this driver was told to pick up is not there any more — the CLI's own history was
             // cleared, or the project directory moved out from under it. Starting fresh loses what
@@ -669,6 +676,7 @@ struct Turn {
     asker: Option<Arc<dyn PermissionAsker>>,
     questioner: Option<Arc<dyn QuestionAsker>>,
     unasked: Option<Arc<dyn super::Unasked>>,
+    image_store: Option<std::path::PathBuf>,
 }
 
 /// Says a turn is reading this conversation's stdout, for exactly as long as one is.
@@ -719,7 +727,7 @@ async fn run_turn(
     cancel: CancellationToken,
     tx: &mpsc::Sender<ProviderEvent>,
 ) -> Result<Outcome, String> {
-    let Turn { request, mode, asker, questioner, unasked } = turn;
+    let Turn { request, mode, asker, questioner, unasked, image_store } = turn;
     // A turn opened to hold something the agent is already saying. It has nothing of its own to
     // ask, so it says nothing and reads until whatever is running stops. Taken rather than read:
     // it describes this turn and must not stick to the next one.
@@ -768,6 +776,9 @@ async fn run_turn(
         fresh = true;
     }
     let live = slot.as_mut().expect("a session was just put there");
+    // Told on every turn rather than at spawn: the store is a fact about the workspace, and a
+    // process that outlives a turn is one that was spawned before anybody may have said.
+    live.state.image_store = image_store;
 
     // Whatever the CLI said while nobody was reading.
     //
@@ -1641,6 +1652,10 @@ impl super::AgentDriver for ClaudeCliProvider {
 
     fn set_unasked(&self, sink: Arc<dyn super::Unasked>) {
         *self.unasked.lock().expect("unasked lock poisoned") = Some(sink);
+    }
+
+    fn set_image_store(&self, dir: std::path::PathBuf) {
+        *self.image_store.lock().expect("image store lock poisoned") = Some(dir);
     }
 
     fn listen_only(&self, conversation: &SessionId) {

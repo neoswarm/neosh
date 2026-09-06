@@ -249,6 +249,7 @@ pub fn acp_events(
                 id: ToolCallId::from(id),
                 content: content_text(update),
                 is_error: status == "failed",
+                images: Vec::new(),
             }]
         }
 
@@ -1094,6 +1095,7 @@ mod tests {
             id: ToolCallId::from("t1"),
             content: "fn main() {}".into(),
             is_error: false,
+            images: Vec::new(),
         }]);
         assert!(
             !updated.iter().any(|e| matches!(e, ProviderEvent::BlockStart { .. })),
@@ -1128,6 +1130,7 @@ mod tests {
             id: ToolCallId::from("t1"),
             content: "no such file".into(),
             is_error: true,
+            images: Vec::new(),
         }]);
     }
 

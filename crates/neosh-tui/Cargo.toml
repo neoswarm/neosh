@@ -23,6 +23,11 @@ ratatui = { workspace = true }
 crossterm = { workspace = true }
 unicode-width = { workspace = true }
 unicode-segmentation = { workspace = true }
+# Pictures in the transcript: read a file's size, re-encode what kitty will not take as-is, and
+# base64 it down the pty.
+image = { workspace = true }
+base64 = { workspace = true }
+libc = { workspace = true }
 
 [dev-dependencies]
 insta = { workspace = true }

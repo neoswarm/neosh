@@ -984,6 +984,9 @@ pub enum ProviderEvent {
         content: String,
         #[serde(default)]
         is_error: bool,
+        /// Pictures the tool came back with, already written where the workspace keeps them.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        images: Vec<crate::agent::ImageFile>,
     },
     /// Something the driver's loop did that is not part of the message. See [`Activity`].
     ///

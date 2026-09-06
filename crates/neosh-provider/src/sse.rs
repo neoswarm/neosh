@@ -188,7 +188,7 @@ pub fn claude_cli_line(v: &Value, state: &mut ClaudeState) -> Vec<ProviderEvent>
         "user" => {
             let message = v.get("message").unwrap_or(&Value::Null);
             let mut out = state.plan.saw_results(message);
-            out.extend(tool_results(message));
+            out.extend(tool_results(message, state.image_store.as_deref()));
             out
         }
         // Whole assistant messages, which `stream_event` has already said everything about — with
@@ -325,6 +325,8 @@ pub struct ClaudeState {
     /// boundary, and a `result` whose `result` field carries the only sentence anybody wrote. With
     /// nothing watching for that, the turn arrived as a question with no answer under it.
     said: bool,
+    /// Where a picture in a tool result is written. `None` keeps it as the word `[image]`.
+    pub image_store: Option<std::path::PathBuf>,
 }
 
 fn activity(a: Activity) -> ProviderEvent {
@@ -529,7 +531,11 @@ fn task_usage(v: Option<&Value>) -> Usage {
 ///
 /// `content` is a string for most tools and a block array for the ones that return images, so both
 /// are read; a result nobody can render as text still counts as a result that arrived.
-fn tool_results(message: &Value) -> Vec<ProviderEvent> {
+///
+/// A picture in the array is written into `store` and reported as a file, the way an attached one
+/// is. With nowhere to write it, it stays the word `[image]` in the text — which is a result that
+/// arrived, said in the one way that needs no disk.
+fn tool_results(message: &Value, store: Option<&std::path::Path>) -> Vec<ProviderEvent> {
     let Some(blocks) = message.get("content").and_then(Value::as_array) else {
         return Vec::new();
     };
@@ -538,22 +544,30 @@ fn tool_results(message: &Value) -> Vec<ProviderEvent> {
         .filter(|b| b.get("type").and_then(Value::as_str) == Some("tool_result"))
         .filter_map(|b| {
             let id = b.get("tool_use_id").and_then(Value::as_str)?;
+            let images = match store {
+                Some(store) => result_images(b.get("content"), store),
+                None => Vec::new(),
+            };
             Some(ProviderEvent::ToolResult {
                 id: ToolCallId(id.to_string()),
-                content: result_text(b.get("content")),
+                content: result_text(b.get("content"), !images.is_empty()),
                 is_error: b.get("is_error").and_then(Value::as_bool).unwrap_or(false),
+                images,
             })
         })
         .collect()
 }
 
-fn result_text(content: Option<&Value>) -> String {
+/// The text of a result. `kept` says the pictures in it have been written down elsewhere, so
+/// they are not also named here as `[image]`.
+fn result_text(content: Option<&Value>, kept: bool) -> String {
     match content {
         Some(Value::String(s)) => s.clone(),
         Some(Value::Array(blocks)) => blocks
             .iter()
             .filter_map(|b| match b.get("type").and_then(Value::as_str) {
                 Some("text") => b.get("text").and_then(Value::as_str).map(str::to_string),
+                Some("image") if kept => None,
                 Some(other) => Some(format!("[{other}]")),
                 None => None,
             })
@@ -561,6 +575,27 @@ fn result_text(content: Option<&Value>) -> String {
             .join("\n"),
         _ => String::new(),
     }
+}
+
+/// Every picture in a result's block array, written into `store`.
+///
+/// One that cannot be decoded or written is dropped with a log line rather than failing the
+/// result: what the tool said is still the answer, and the picture was only ever a bonus.
+fn result_images(content: Option<&Value>, store: &std::path::Path) -> Vec<neosh_proto::ImageFile> {
+    let Some(Value::Array(blocks)) = content else { return Vec::new() };
+    blocks
+        .iter()
+        .filter(|b| b.get("type").and_then(Value::as_str) == Some("image"))
+        .filter_map(|b| {
+            let source = b.get("source")?;
+            if source.get("type").and_then(Value::as_str) != Some("base64") {
+                return None;
+            }
+            let media_type = source.get("media_type").and_then(Value::as_str)?;
+            let data = source.get("data").and_then(Value::as_str)?;
+            crate::image::keep(store, media_type, data)
+        })
+        .collect()
 }
 
 /// The agent's own checklist, rebuilt from the calls that maintain it.
@@ -668,7 +703,7 @@ impl Plan {
             let Some(text) = self.naming.remove(id) else { continue };
             // `Task #2 created successfully: …`. A create that failed says something else entirely,
             // and a step with no number is a step `TaskUpdate` could never reach again.
-            if let Some(n) = result_text(b.get("content"))
+            if let Some(n) = result_text(b.get("content"), false)
                 .split_once('#')
                 .and_then(|(_, rest)| number(&Value::String(rest.to_string())))
             {
@@ -1064,6 +1099,7 @@ mod tests {
                 id: ToolCallId("toolu_agent".into()),
                 content: "Full listing of /tmp/cwdprobe".into(),
                 is_error: false,
+                images: Vec::new(),
             }],
             "only the `Agent` call's own result belongs to this conversation"
         );
@@ -1586,5 +1622,40 @@ mod tests {
             }
             other => panic!("expected MessageDelta, got {other:?}"),
         }
+    }
+
+    /// A `Read` of a picture answers with the picture. With somewhere to put it, the result names a
+    /// file and says nothing else about it; without, it is the word it always was.
+    #[test]
+    fn a_tool_that_returned_a_picture_has_it_kept_where_the_workspace_says() {
+        const PIXEL: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==";
+        let line = format!(
+            r#"{{"type":"user","message":{{"role":"user","content":[{{"tool_use_id":"toolu_read","type":"tool_result","content":[{{"type":"image","source":{{"type":"base64","media_type":"image/png","data":"{PIXEL}"}}}}]}}]}},"parent_tool_use_id":null,"session_id":"s"}}"#
+        );
+        let v: Value = serde_json::from_str(&line).unwrap();
+
+        let nowhere = claude_cli_line(&v, &mut ClaudeState::default());
+        assert_eq!(
+            nowhere,
+            vec![ProviderEvent::ToolResult {
+                id: ToolCallId("toolu_read".into()),
+                content: "[image]".into(),
+                is_error: false,
+                images: Vec::new(),
+            }],
+            "no store, no file: the word stands"
+        );
+
+        let store = std::env::temp_dir().join(format!("neosh-sse-images-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&store);
+        let mut state = ClaudeState { image_store: Some(store.clone()), ..Default::default() };
+        let kept = claude_cli_line(&v, &mut state);
+        let ProviderEvent::ToolResult { content, images, .. } = &kept[0] else { panic!("{kept:?}") };
+        assert_eq!(content, "", "the picture is not also named in the text");
+        assert_eq!(images.len(), 1);
+        assert_eq!(images[0].media_type, "image/png");
+        assert!(std::path::Path::new(&images[0].path).starts_with(&store));
+        assert!(std::path::Path::new(&images[0].path).is_file());
+        let _ = std::fs::remove_dir_all(&store);
     }
 }

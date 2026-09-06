@@ -2888,6 +2888,7 @@ impl Editor {
                     virt_text_pos: VirtTextPos::Eol,
                     on_delete: OnDelete::Invalidate,
                     priority: 100,
+                    image: None,
                 });
             }
             touched = (touched.0.min(from.0), touched.1.max(to.0 + 1));

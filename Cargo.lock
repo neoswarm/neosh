@@ -2555,9 +2555,12 @@ dependencies = [
 name = "neosh-tui"
 version = "0.4.4"
 dependencies = [
+ "base64",
  "crossterm",
  "futures",
+ "image",
  "insta",
+ "libc",
  "neosh-core",
  "neosh-proto",
  "ratatui",

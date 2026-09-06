@@ -268,6 +268,7 @@ impl Session {
                     tool_use_id: id,
                     content: r.content,
                     is_error: r.is_error,
+                    images: r.images,
                 })
                 .collect(),
         });
