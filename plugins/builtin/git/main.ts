@@ -50,7 +50,7 @@ import {
 } from "@neosh/api/ui";
 import { configureMotion } from "@neosh/api/ui";
 import { installPulls } from "./pulls.ts";
-import { fetchFailed, installGitStatus, pullRepository, statParts } from "./sidebar.ts";
+import { fetchFailed, installGitStatus, pullRepository, repoBusy, statParts } from "./sidebar.ts";
 
 // ---------------------------------------------------------------------------
 // Default prompts
@@ -303,13 +303,21 @@ two-word scratch name it was created with.",
   // directory — which is a worktree's directory too, so a nested tree reports its own branch's
   // divergence rather than its repository's — and withdrawn when there is nothing to say, because
   // a `0` on every row is a column of noise.
-  const decorate = async () => {
+  //
+  // `only` narrows it to one row, and is what every fetch and pull passes: a `git status` per
+  // project is the expensive way to learn that one of them changed, and the row that just pulled
+  // is wrong until this runs. `known` is a status the caller already has — a fetch answers with
+  // one — so that row is drawn from it with no subprocess at all.
+  const decorate = async (only?: string, known: RepoStatus | null = null) => {
     const projects = await neosh.vars
       .get<unknown>({ scope: "global" }, "sidebar.projects")
       .catch(() => null);
-    const cwds = Array.isArray(projects)
+    const all = Array.isArray(projects)
       ? projects.filter((p): p is string => typeof p === "string")
       : [];
+    // A directory that is not a row — a conversation started somewhere off the panel — has no
+    // badge to fix, and narrowing to it would refresh nothing. Everything, then.
+    const cwds = only && all.includes(only) ? [only] : all;
     const ascii = (await neosh.opt.get<boolean>("ui.ascii_only").catch(() => false)) ?? false;
     // `git.sidebar` used to turn off a block. There is no block, so it turns off these marks —
     // which is what somebody setting it always meant: not "stop reading git", which the footer and
@@ -320,7 +328,9 @@ two-word scratch name it was created with.",
         await neosh.ext.remove("sidebar.decoration", `dirty:${cwd}`).catch(() => {});
         continue;
       }
-      const status = await neosh.git.status({ cwd }).catch(() => null);
+      const status = cwd === only && known
+        ? known
+        : await neosh.git.status({ cwd }).catch(() => null);
       const parts = status ? statParts(status, ascii) : [];
       // The one thing the block said that a count cannot: that these numbers are as of a fetch
       // that did not reach the remote. Appended rather than led with, because it qualifies the
@@ -329,6 +339,16 @@ two-word scratch name it was created with.",
       if (fetchFailed(cwd)) {
         if (parts.length > 0) parts.push({ text: " " });
         parts.push({ text: ascii ? "!" : "⚠", hl: "Git.Stale" });
+      }
+      // Talking to the remote right now, and *led* with, because it is about what the stats are
+      // about to become rather than a qualification of what they are. One glyph, which is what
+      // `Git.Fetching` requires: the frontend replaces the run with successive frames and clips
+      // each to the width underneath, so a single column can never shift the numbers after it. It
+      // is also the whole of the short form while it lasts — a narrow row keeps the one mark that
+      // says something is happening rather than the one that says what was true before it started.
+      if (repoBusy(cwd)) {
+        if (parts.length > 0) parts.unshift({ text: " " });
+        parts.unshift({ text: ascii ? "*" : "•", hl: "Git.Fetching" });
       }
       if (parts.length === 0) {
         await neosh.ext.remove("sidebar.decoration", `dirty:${cwd}`).catch(() => {});
@@ -416,12 +436,16 @@ two-word scratch name it was created with.",
     pulls,
     onStatus: (status) => void footer(status),
     // A fetch or a pull moves where this checkout stands, and the project rows carry a badge built
-    // from a different call than the one that just refreshed.
-    onMoved: () => void decorate(),
+    // from a different call than the one that just refreshed. Just that row, from that answer.
+    onMoved: (cwd, status) => void decorate(cwd, status),
   });
   // What anything moving `HEAD` calls. This re-reads and hands the answer on, so the footer follows
-  // without the caller having to know it exists.
-  headMoved = () => void repo.refresh();
+  // without the caller having to know it exists — and the row does too, because a branch switch
+  // or a rename is exactly as much news to `↑2` as a pull is.
+  headMoved = () => {
+    void repo.refresh();
+    void decorate();
+  };
 }
 
 // ---------------------------------------------------------------------------

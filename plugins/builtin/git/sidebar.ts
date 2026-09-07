@@ -113,6 +113,58 @@ export function fetchFailed(cwd: string): boolean {
   return fetchTrouble.has(cwd);
 }
 
+/**
+ * The checkouts with a fetch or a pull out right now, and which.
+ *
+ * The same shape as {@link fetchTrouble} and for the same reason: written by the verb, read by the
+ * badge, on different clocks. What it buys is the one thing a corner notice cannot — the mark is
+ * on the row the operation is *about*, so `p` on a project four rows down spins there rather than
+ * in a corner that says `pulling…` about nothing in particular. Held as a count, not a flag: a
+ * pull's fetch and the pull itself overlap on the same directory, and the first to finish must not
+ * take the spinner off the second.
+ */
+const inFlight = new Map<string, number>();
+
+/** Whether this checkout is talking to its remote right now. */
+export function repoBusy(cwd: string): boolean {
+  return (inFlight.get(cwd) ?? 0) > 0;
+}
+
+/**
+ * What to tell when a checkout's numbers change, and about which one.
+ *
+ * The rows carry a badge built from a `git.status` per project, which nothing in this file draws
+ * — so a pull that just brought three commits in has to say so to whoever does, or the row goes on
+ * saying `↓3` until its own clock comes round. A module-level hook rather than a parameter on every
+ * verb, because {@link pullRepository} and {@link fetchRepository} are called from three doors and
+ * the sidebar's redraw is not something each of them should have to be handed. `status` is passed
+ * along when the operation already has a fresh one, so the badge is drawn from it rather than from
+ * a second subprocess; `null` means go and read.
+ */
+let moved: (cwd: string | undefined, status: RepoStatus | null) => void = () => {};
+
+/** Mark a checkout busy, say so, run `body`, and say so again when it is over. */
+async function whileBusy<T>(cwd: string | undefined, body: () => Promise<T>): Promise<T> {
+  if (cwd) inFlight.set(cwd, (inFlight.get(cwd) ?? 0) + 1);
+  moved(cwd, null);
+  try {
+    return await body();
+  } finally {
+    if (cwd) {
+      const n = (inFlight.get(cwd) ?? 1) - 1;
+      if (n > 0) inFlight.set(cwd, n);
+      else inFlight.delete(cwd);
+    }
+  }
+}
+
+/** The directory a verb with no `cwd` is about: the conversation on screen. */
+async function here(neosh: Neosh, cwd?: string): Promise<string | undefined> {
+  if (cwd) return cwd;
+  const current = await neosh.session.current().catch(() => null);
+  return current?.cwd ?? undefined;
+}
+
 // ---------------------------------------------------------------------------
 // Bringing a branch up to date
 // ---------------------------------------------------------------------------
@@ -140,6 +192,10 @@ export async function pullRepository(
   cwd?: string,
   opts: { fetched?: boolean } = {},
 ): Promise<void> {
+  // Resolved up front rather than left to the host, because everything below that *says* something
+  // about a row — the spinner, the trouble mark, the redraw — is keyed by directory, and a pull
+  // from the palette is about a directory too even though nobody named it.
+  cwd = await here(neosh, cwd);
   const where = cwd ? { cwd } : undefined;
   const status = await neosh.git.status(where).catch(() => null);
   if (!status) {
@@ -214,11 +270,13 @@ export async function pullRepository(
 
   neosh.progress("git.pull", rebase ? "rebasing…" : "pulling…");
   try {
-    const summary = await neosh.git.pull({ ...(where ?? {}), rebase });
-    // A pull *is* a fetch, so it settles the trouble mark too: whatever these numbers are, they
-    // came off the remote a moment ago.
-    if (cwd) fetchTrouble.delete(cwd);
-    neosh.notify(short(summary));
+    await whileBusy(cwd, async () => {
+      const summary = await neosh.git.pull({ ...(where ?? {}), rebase });
+      // A pull *is* a fetch, so it settles the trouble mark too: whatever these numbers are, they
+      // came off the remote a moment ago.
+      if (cwd) fetchTrouble.delete(cwd);
+      neosh.notify(short(summary));
+    });
   } catch (e) {
     // git's own message names it — diverged, no remote, an unresolved rebase — and inventing a
     // friendlier one here would mean guessing which of those it was. Loud: it is the answer to a
@@ -226,6 +284,11 @@ export async function pullRepository(
     neosh.notify(String(e), "error");
   } finally {
     neosh.done("git.pull");
+    // The row, now. `↓3` after a pull that brought three commits in is a row that is wrong until
+    // something unrelated happens to redraw it — moving the cursor, switching conversations — and
+    // what it was wrong about is the one number the key was pressed for. A pull answers with a
+    // summary rather than a status, so this one is a read; it is one local subprocess.
+    moved(cwd, null);
   }
 }
 
@@ -243,16 +306,24 @@ export async function fetchRepository(
   cwd?: string,
   opts: { loud?: boolean } = {},
 ): Promise<RepoStatus | null> {
+  cwd = await here(neosh, cwd);
   const where = cwd ? { cwd } : undefined;
+  // Spinning on the row while it is out, and silent about the *outcome* on a timer — the two are
+  // different rules. Motion means "something is happening you cannot see", which a fetch is, on
+  // every clock it runs on; a toast about a network you know is down is what the trouble mark
+  // replaced.
+  let fresh: RepoStatus | null = null;
   try {
-    const fresh = await neosh.git.fetch(where);
+    fresh = await whileBusy(cwd, () => neosh.git.fetch(where));
     if (cwd) fetchTrouble.delete(cwd);
-    return fresh;
   } catch (e) {
     if (cwd) fetchTrouble.set(cwd, short(String(e)));
     if (opts.loud) neosh.notify(String(e), "error");
-    return null;
   }
+  // Either way the row has news: fresh numbers, or a mark saying these are as of a fetch that did
+  // not get through. Drawn from the answer when there is one, so `↓3` becoming `↓0` costs nothing.
+  moved(cwd, fresh);
+  return fresh;
 }
 
 // ---------------------------------------------------------------------------
@@ -297,9 +368,13 @@ export interface GitStatusHooks {
    *
    * The project rows carry a badge built from a `git.status` per project, which nothing here
    * refreshes — so after a fetch found three commits, the row for that very directory would go on
-   * saying nothing until its own clock came round.
+   * saying nothing until its own clock came round. Called with the directory it is about, and with
+   * the fresh status when the operation produced one, so the row can be drawn from it rather than
+   * from another read; `undefined` for the directory means everything, and `null` for the status
+   * means go and look. It fires **twice** per operation — once when it starts, once when it ends —
+   * because starting is news too: that is when the row grows its spinner.
    */
-  onMoved: () => void;
+  onMoved: (cwd: string | undefined, status: RepoStatus | null) => void;
 }
 
 /**
@@ -323,6 +398,13 @@ export async function installGitStatus(
 ): Promise<GitStatus> {
   const { neosh, subscriptions } = ctx;
   await declareOptions(neosh);
+  // The verbs above say what they did through this; the hook is where the panel is told.
+  moved = hooks.onMoved;
+  subscriptions.push({
+    dispose: () => {
+      moved = () => {};
+    },
+  });
 
   const state: State = { cwd: null, status: null, askedAt: null, busy: false };
 
@@ -362,19 +444,16 @@ export async function installGitStatus(
     // unreachable host and then fails would otherwise be immediately due again.
     state.askedAt = Date.now();
     try {
+      // The project row is told by `fetchRepository` itself — spinner on the way in, numbers or
+      // the trouble mark on the way out — so nothing here has to remember to.
       const fresh = await fetchRepository(neosh, at ?? undefined, opts);
       // The conversation moved while we were out. Its answer is about a checkout nobody is looking
       // at, and applying it would put another repository's numbers under this one's name.
       if (at !== state.cwd || !fresh) return;
       state.status = fresh;
       hooks.onStatus(fresh);
-      // And the project rows, which read it through a call of their own.
-      hooks.onMoved();
     } finally {
       state.busy = false;
-      // A failed fetch is news to the badge too: the mark it grows is the only thing left saying
-      // these numbers are as of whenever the network last worked.
-      hooks.onMoved();
     }
   };
 

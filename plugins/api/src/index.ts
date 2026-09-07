@@ -89,6 +89,7 @@ import type { QuotaSeverity } from "./generated/QuotaSeverity";
 import type { QuotaSnapshot } from "./generated/QuotaSnapshot";
 import type { InstallMethod } from "./generated/InstallMethod";
 import type { UpdateOutcome } from "./generated/UpdateOutcome";
+import type { UpdateProgress } from "./generated/UpdateProgress";
 import type { UpdateStatus } from "./generated/UpdateStatus";
 import type { QuotaSource } from "./generated/QuotaSource";
 import type { QuotaWindow } from "./generated/QuotaWindow";
@@ -156,7 +157,7 @@ export type {
   Message, PermissionDecision, PermissionMode, PermissionOption, PermissionOptionKind, PluginEvent, PluginInfo, PluginManifest, PointInfo, Pricing, ProviderEvent, ProviderOptionDescriptor,
   QuestionAnswer, QuestionOption, UserQuestion,
   CostBasis, QuotaCredits, QuotaSample, QuotaSeverity, QuotaSnapshot, QuotaSource, QuotaWindow,
-  InstallMethod, UpdateOutcome, UpdateStatus,
+  InstallMethod, UpdateOutcome, UpdateProgress, UpdateStatus,
   UsageBucket, UsageHistory, UsageResolution, UsageScanSource,
   Rect, RepoInfo, RepoStatus, ScrollAmount, SelectShape, SessionId, SessionInfo, StatusAlign, StatusSegment, StopReason,
   SurfaceCell, SurfaceId, TextEdit, ToolCall, ToolDef, ToolResult, TurnRequest, Usage, ImageFile,
@@ -1356,6 +1357,15 @@ export interface GitApi {
  */
 export const CLONE_EVENT = "neosh.git.clone";
 
+/**
+ * Where an update says how it is getting on, while {@link UpdateApi.apply} runs.
+ *
+ * On the bus rather than back to the caller, because the caller is not always the thing drawing
+ * — `neosh agent run update` asks and the sidebar's plugin shows it. The payload is
+ * {@link UpdateProgress}; the last one has `done` set, whatever happened.
+ */
+export const UPDATE_EVENT = "neosh.update.progress";
+
 /** One {@link CLONE_EVENT} payload. */
 export interface CloneProgress {
   /** Which clone this is about. The key, since two may be running. */
@@ -1858,11 +1868,17 @@ export interface UpdateApi {
   /**
    * Update, by whichever route this install takes.
    *
-   * Never runs somebody's package manager for them: a managed install comes back as
-   * `delegated` with the command on it. A `standalone` one is downloaded, checked against the
-   * published sha256 and swapped in with a rename — which is atomic and is allowed while the old
-   * binary is still executing, and is why the answer carries `restart_required` rather than the
-   * new version simply being live.
+   * A `standalone` binary is downloaded, checked against the published sha256 and swapped in with
+   * a rename — which is atomic and is allowed while the old binary is still executing, and is why
+   * the answer carries `restart_required` rather than the new version simply being live. A managed
+   * one is updated by **running its manager** — `brew update && brew upgrade neosh`, `npm install
+   * -g`, `cargo install --force` — and then checked: a manager that exited 0 and left the binary
+   * unchanged is `failed` with the command to run by hand, never `applied`.
+   *
+   * **It reports progress while it runs**, on the bus as {@link UPDATE_EVENT}: a `brew upgrade` is
+   * a fetch and a `cargo install` is a compile, and a call that answers once at the end is a
+   * progress row that spins on nothing for minutes. One at a time, workspace-wide — a second call
+   * while one is running comes back `failed` saying so.
    */
   apply(): Promise<UpdateOutcome>;
   /**

@@ -1,12 +1,21 @@
 //! Finding out there is a newer neosh, and becoming it.
 //!
 //! Two halves that look like one feature and are not. *Is there something newer* is a question
-//! about a registry. *May I replace this file* is a question about the machine, and it is the one
-//! that decides everything: a binary under a Homebrew prefix belongs to Homebrew, and writing over
-//! it leaves `brew` describing a version that is not on disk — `brew upgrade` then "succeeds" by
-//! putting back the one we replaced. Same for a binary inside `node_modules`, same for one under
-//! `~/.cargo/bin`. Only a binary nobody else is managing may be swapped, and everything else gets
-//! told the command that would do it.
+//! about a registry. *How does this file get replaced* is a question about the machine, and it is
+//! the one that decides everything: a binary under a Homebrew prefix belongs to Homebrew, and
+//! writing over it leaves `brew` describing a version that is not on disk — `brew upgrade` then
+//! "succeeds" by putting back the one we replaced. Same for a binary inside `node_modules`, same
+//! for one under `~/.cargo/bin`. Only a binary nobody else is managing is swapped by hand; a
+//! managed one is updated by **running its manager** — `brew update && brew upgrade neosh`, `npm
+//! install -g`, `cargo install --force` — with its output streamed onto the bus, and then checked:
+//! a manager that returned success and left the binary unchanged (a tap that has not caught up)
+//! is a failure with the command in it, never an update. It used to stop short of this and print
+//! the command instead, on the theory that driving somebody's package manager is how a machine
+//! ends up in a state its owner cannot explain — and what that meant from the keyboard was that
+//! `/update` on the most common install of all did not update, told you to go and type something
+//! elsewhere, and then wanted a second `/update` to restart into what you had typed. An update is
+//! one verb, and the manager's own log is on screen while it runs, which is more than a shell
+//! would have shown.
 //!
 //! The check is a plain HTTP GET against the releases API and is never done on the loop: it is
 //! network, it can hang, and nothing on screen should wait for it. What it produces is kept, so
@@ -24,11 +33,30 @@
 //! our own rename alike — and needs nothing from the network, so it is still true on a train.
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use neosh_proto::{InstallMethod, UpdateOutcome, UpdateStatus};
+use neosh_proto::{InstallMethod, UpdateOutcome, UpdateProgress, UpdateStatus};
 use tokio::sync::RwLock;
+
+/// Where an update says how it is getting on. The plugin draws a progress row from these.
+pub const UPDATE_EVENT: &str = "neosh.update.progress";
+
+/// A listener for [`UpdateProgress`], handed in by whoever owns the bus.
+///
+/// `Arc<dyn Fn>` rather than a generic because it is shared with the tasks that read a child's
+/// two pipes, and both of them have to be able to say something.
+pub type Progress = Arc<dyn Fn(UpdateProgress) + Send + Sync>;
+
+/// How long one step of a package manager may take before it is killed.
+///
+/// Generous, because `cargo install` is a compile of the whole tree on whatever machine this is,
+/// and a build that was going to finish in twenty-two minutes is not one to stop at twenty. What
+/// this guards against is a step that is *never* going to finish — a prompt on a closed stdin, a
+/// lock held by another `brew` — which without a ceiling is a progress row that spins forever and
+/// an `applying` flag that never clears.
+const STEP_TIMEOUT: Duration = Duration::from_secs(45 * 60);
 
 /// Where releases are published. The API rather than the HTML, and `latest` rather than a list,
 /// because a pre-release is not something to offer somebody who did not ask for one.
@@ -177,6 +205,10 @@ pub struct Updater {
     /// which case nothing here claims anything: an unknown stamp compares equal to everything, and
     /// the failure of guessing is a workspace that offers a restart on every redraw.
     stamp: Option<Stamp>,
+    /// Whether an [`apply`](Self::apply) is in flight. One at a time: two `brew upgrade`s racing
+    /// for one lock is a second one that fails on the lock, and a second download racing the
+    /// first for one rename is worse.
+    applying: Arc<AtomicBool>,
 }
 
 impl Updater {
@@ -195,6 +227,7 @@ impl Updater {
             launch,
             exe,
             current,
+            applying: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -321,7 +354,7 @@ impl Updater {
             behind: false,
             method,
             self_updatable: method.self_updatable(),
-            upgrade_command: method.upgrade_command().map(str::to_string),
+            upgrade_command: method.upgrade_command(),
             error: None,
             restart_pending: false,
             restart_version: None,
@@ -373,8 +406,33 @@ impl Updater {
         self.with_local(status).await
     }
 
-    /// Update, by whichever route this install takes.
-    pub async fn apply(&self) -> UpdateOutcome {
+    /// Update, by whichever route this install takes, saying how it is going on `progress`.
+    ///
+    /// One at a time, workspace-wide. A second caller while one is running — `/update` pressed
+    /// twice, or a script and a person — is told so rather than started, because two package
+    /// managers on one prefix contend for a lock and two downloads contend for one rename.
+    pub async fn apply(&self, progress: Progress) -> UpdateOutcome {
+        if self.applying.swap(true, Ordering::SeqCst) {
+            return UpdateOutcome::Failed { reason: "an update is already running".into() };
+        }
+        let outcome = self.apply_inner(&progress).await;
+        self.applying.store(false, Ordering::SeqCst);
+        // The last event says it is the last, whatever happened, so a row drawn from these has a
+        // moment to stop at. A `Failed` outcome reaches the caller; the row is not the caller.
+        progress(UpdateProgress {
+            phase: match &outcome {
+                UpdateOutcome::Applied { version, .. } => format!("neosh {version} installed"),
+                UpdateOutcome::UpToDate { .. } => "up to date".into(),
+                UpdateOutcome::Failed { .. } => "failed".into(),
+            },
+            line: None,
+            done: true,
+        });
+        outcome
+    }
+
+    async fn apply_inner(&self, progress: &Progress) -> UpdateOutcome {
+        progress(UpdateProgress { phase: "checking".into(), line: None, done: false });
         let status = self.check(true, false).await;
         let method = status.method;
 
@@ -397,22 +455,18 @@ impl Updater {
         if !status.behind {
             return UpdateOutcome::UpToDate { version: self.current.clone() };
         }
-        // A managed install is named, never touched. Running somebody's package manager for them
-        // behind a keypress is how a machine ends up in a state its owner cannot explain.
-        if let Some(command) = method.upgrade_command() {
-            return UpdateOutcome::Delegated {
-                version: latest,
-                command: command.to_string(),
-                method,
-            };
-        }
-        if !method.self_updatable() {
+
+        let result = if method.self_updatable() {
+            self.replace_binary(&latest, progress).await
+        } else if !method.upgrade_steps().is_empty() {
+            self.run_manager(method, &latest, progress).await
+        } else {
             return UpdateOutcome::Failed {
                 reason: "this install is not one neosh can replace".into(),
             };
-        }
+        };
 
-        match self.replace_binary(&latest).await {
+        match result {
             Ok(()) => {
                 let mut c = self.inner.write().await;
                 c.staged = Some(latest.clone());
@@ -421,10 +475,60 @@ impl Updater {
                 // the version of the first.
                 c.found = None;
                 drop(c);
-                UpdateOutcome::Applied { version: latest, restart_required: true }
+                // Asked of the file rather than assumed to be `latest`: a package manager installs
+                // what *its* catalogue has, and a tap can be a release behind the page that said
+                // there was one. The row that follows names what will actually start.
+                let version = match self.replaced() {
+                    Some(path) => self.version_on_disk(&path).await.unwrap_or(latest),
+                    None => latest,
+                };
+                UpdateOutcome::Applied { version, restart_required: true }
             }
             Err(reason) => UpdateOutcome::Failed { reason },
         }
+    }
+
+    /// Update a managed install by running the manager that owns it, then checking it did.
+    ///
+    /// Checked, because a package manager's exit status answers "did the command run" and not
+    /// "is there a new neosh": `brew upgrade` on a tap that has not caught up exits 0 having
+    /// printed `already installed`, and `npm install -g` of a version the registry has not seen
+    /// yet is the same. What this is *for* is a different binary on disk, so that is what is
+    /// asserted — the same `stat` that notices an upgrade run in another terminal.
+    async fn run_manager(
+        &self,
+        method: InstallMethod,
+        latest: &str,
+        progress: &Progress,
+    ) -> Result<(), String> {
+        let by_hand = method.upgrade_command().unwrap_or_default();
+        let steps = method.upgrade_steps();
+        let Some(tool) = steps.first().and_then(|s| s.first()) else {
+            return Err("this install has no package manager to run".into());
+        };
+        let Some(tool_path) = find_tool(tool, &self.exe) else {
+            return Err(format!(
+                "`{tool}` is not on this workspace's PATH — in a shell, run: {by_hand}"
+            ));
+        };
+        for step in steps {
+            let (_, args) = step.split_first().unwrap_or((&"", &[]));
+            let phase = step.join(" ");
+            progress(UpdateProgress { phase: phase.clone(), line: None, done: false });
+            run_step(&tool_path, args, method, &phase, progress).await.map_err(|e| {
+                format!("`{phase}` failed: {e} — in a shell, run: {by_hand}")
+            })?;
+        }
+        // `found` is about the binary this process started under; the manager may have just put
+        // a different one there, and the check below must read that one.
+        self.inner.write().await.found = None;
+        if self.replaced().is_none() {
+            return Err(format!(
+                "{by_hand} finished but the binary did not change — the package index may not \
+                 have {latest} yet; try again later, or in a shell run: {by_hand}"
+            ));
+        }
+        Ok(())
     }
 
     /// Download the release for this platform and swap it in.
@@ -433,14 +537,16 @@ impl Updater {
     /// the old binary is executing — the running process keeps the inode it started with, which is
     /// exactly why the restart is a separate question. A copy-in-place would be the version of
     /// this that can leave a half-written binary behind.
-    async fn replace_binary(&self, version: &str) -> Result<(), String> {
+    async fn replace_binary(&self, version: &str, progress: &Progress) -> Result<(), String> {
         let Some(triple) = target_triple() else {
             return Err("no published binary for this platform".into());
         };
         let name = format!("neosh-{triple}");
         let base = format!("{DOWNLOAD}/v{version}/{name}.tar.gz");
 
+        progress(UpdateProgress { phase: format!("downloading {name}"), line: None, done: false });
         let tar = http_bytes(&base).await.map_err(|e| format!("downloading {name}: {e}"))?;
+        progress(UpdateProgress { phase: "verifying".into(), line: None, done: false });
         let want = http_text(&format!("{base}.sha256"))
             .await
             .map_err(|e| format!("downloading the checksum: {e}"))?;
@@ -453,6 +559,7 @@ impl Updater {
             return Err(format!("checksum mismatch (expected {want}, got {got})"));
         }
 
+        progress(UpdateProgress { phase: "installing".into(), line: None, done: false });
         // Next to the target, because a rename across filesystems is not a rename — and /tmp is
         // very often a different filesystem from a home directory or /usr/local.
         let dir = self.exe.parent().ok_or("the running binary has no directory")?;
@@ -487,6 +594,159 @@ pub fn which_neosh() -> Option<PathBuf> {
 fn is_executable(p: &Path) -> bool {
     use std::os::unix::fs::PermissionsExt;
     std::fs::metadata(p).is_ok_and(|m| m.permissions().mode() & 0o111 != 0)
+}
+
+/// Where a package manager's executable is, or nothing.
+///
+/// `PATH` first, because that is what a shell would run. Then the prefix the *binary* is under:
+/// a workspace started from a launcher, or a shell whose profile never added `/opt/homebrew/bin`,
+/// has a `PATH` without `brew` on it and a neosh that `brew` plainly installed — the prefix is
+/// three directories above the keg, and the tool that owns a keg lives in that prefix's `bin`.
+/// Same shape for npm and cargo: `<prefix>/lib/node_modules/…` and `~/.cargo/bin/neosh` both
+/// keep their tool beside what they installed.
+fn find_tool(tool: &str, exe: &Path) -> Option<PathBuf> {
+    if let Some(path) = std::env::var_os("PATH") {
+        if let Some(p) = std::env::split_paths(&path)
+            .map(|d| d.join(tool))
+            .find(|p| p.is_file() && is_executable(p))
+        {
+            return Some(p);
+        }
+    }
+    let s = exe.to_string_lossy();
+    let prefix = ["/Cellar/", "/lib/node_modules/", "/.cargo/bin/"]
+        .iter()
+        .find_map(|m| s.find(m).map(|i| PathBuf::from(&s[..i])));
+    let candidates = prefix
+        .into_iter()
+        .flat_map(|p| [p.join("bin").join(tool), p.join(tool)])
+        .chain(
+            ["/opt/homebrew/bin", "/usr/local/bin", "/home/linuxbrew/.linuxbrew/bin"]
+                .iter()
+                .map(|d| Path::new(d).join(tool)),
+        );
+    candidates.into_iter().find(|p| p.is_file() && is_executable(p))
+}
+
+/// Run one step of a package manager, streaming what it prints onto `progress`.
+///
+/// Both pipes are read for the life of the child, on tasks of their own, because a manager whose
+/// stderr nobody drains stops mid-download when the pipe fills. `\r` counts as a line ending as
+/// well as `\n` — brew and cargo redraw one status line in place, and a reader that only honours
+/// the second sees one line per step, at the end, having reported nothing anybody could watch.
+///
+/// Stdin is closed and every prompt is turned off up front: a package manager that asks a
+/// question on a pipe nobody answers is a hang with no visible cause, and the answer to *any*
+/// question it might ask is "no, do it the way `neosh` was installed".
+async fn run_step(
+    tool: &Path,
+    args: &[&str],
+    method: InstallMethod,
+    phase: &str,
+    progress: &Progress,
+) -> Result<(), String> {
+    use tokio::io::AsyncReadExt;
+
+    let mut cmd = tokio::process::Command::new(tool);
+    cmd.args(args)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .env("NO_COLOR", "1")
+        .env("TERM", "dumb")
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env_remove("GIT_ASKPASS")
+        .env_remove("SSH_ASKPASS")
+        .env_remove("SUDO_ASKPASS")
+        .kill_on_drop(true);
+    if method == InstallMethod::Homebrew {
+        // The refresh is the step before this one, so a second one inside `upgrade` is a second
+        // clone of the tap for nothing — and it is what puts the "auto-update" sentence in the log.
+        cmd.env("HOMEBREW_NO_AUTO_UPDATE", "1")
+            .env("HOMEBREW_NO_ENV_HINTS", "1")
+            .env("HOMEBREW_NO_EMOJI", "1")
+            .env("HOMEBREW_COLOR", "0")
+            .env("NONINTERACTIVE", "1");
+    }
+    if method == InstallMethod::Npm {
+        cmd.env("npm_config_progress", "false").env("CI", "1");
+    }
+    if method == InstallMethod::Cargo {
+        cmd.env("CARGO_TERM_COLOR", "never").env("CARGO_TERM_PROGRESS_WHEN", "never");
+    }
+
+    let mut child = cmd.spawn().map_err(|e| format!("could not start {}: {e}", tool.display()))?;
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
+
+    /// Everything a pipe said, bounded, and the callback fed one line at a time.
+    async fn drain(
+        mut pipe: impl tokio::io::AsyncRead + Unpin,
+        phase: String,
+        progress: Progress,
+    ) -> String {
+        let mut said = String::new();
+        let mut buf = [0u8; 4096];
+        let mut pending = String::new();
+        loop {
+            let n = match pipe.read(&mut buf).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => n,
+            };
+            pending.push_str(&String::from_utf8_lossy(&buf[..n]));
+            while let Some(at) = pending.find(['\r', '\n']) {
+                let line: String = pending.drain(..=at).collect();
+                let line = line.trim_end_matches(['\r', '\n']).trim();
+                if line.is_empty() {
+                    continue;
+                }
+                if said.len() < 16 * 1024 {
+                    said.push_str(line);
+                    said.push('\n');
+                }
+                progress(UpdateProgress {
+                    phase: phase.clone(),
+                    line: Some(line.to_string()),
+                    done: false,
+                });
+            }
+        }
+        if !pending.trim().is_empty() {
+            said.push_str(pending.trim());
+            said.push('\n');
+        }
+        said
+    }
+
+    let out = stdout.map(|p| tokio::spawn(drain(p, phase.to_string(), progress.clone())));
+    let err = stderr.map(|p| tokio::spawn(drain(p, phase.to_string(), progress.clone())));
+
+    let status = match tokio::time::timeout(STEP_TIMEOUT, child.wait()).await {
+        Ok(Ok(s)) => s,
+        Ok(Err(e)) => return Err(format!("waiting for {phase}: {e}")),
+        Err(_) => {
+            let _ = child.kill().await;
+            return Err(format!("gave up after {} minutes", STEP_TIMEOUT.as_secs() / 60));
+        }
+    };
+    let mut said = String::new();
+    for task in [out, err].into_iter().flatten() {
+        if let Ok(s) = task.await {
+            said.push_str(&s);
+        }
+    }
+    if status.success() {
+        return Ok(());
+    }
+    // The tool's own last word — `Error: neosh not installed`, `EACCES`, `failed to compile` —
+    // is the one that says what to do next. An exit code flattens all of them into "failed".
+    let last = said
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .next_back()
+        .unwrap_or("no output");
+    Err(format!("exit {}: {last}", status.code().unwrap_or(-1)))
 }
 
 #[cfg(not(unix))]
@@ -787,13 +1047,134 @@ mod tests {
     #[test]
     fn only_a_standalone_binary_is_ours_to_replace() {
         assert!(InstallMethod::Standalone.self_updatable());
+        assert!(InstallMethod::Standalone.upgrade_steps().is_empty());
         for m in [InstallMethod::Homebrew, InstallMethod::Npm, InstallMethod::Cargo] {
             assert!(!m.self_updatable(), "{m:?} belongs to something else");
-            assert!(m.upgrade_command().is_some(), "{m:?} must name the command that does it");
+            assert!(!m.upgrade_steps().is_empty(), "{m:?} must have a manager to run");
+            assert!(m.upgrade_command().is_some(), "{m:?} must name the command for a person");
         }
         // A checkout has neither: nothing to run, and nothing to replace.
         assert!(!InstallMethod::Development.self_updatable());
+        assert!(InstallMethod::Development.upgrade_steps().is_empty());
         assert!(InstallMethod::Development.upgrade_command().is_none());
+    }
+
+    /// What a person is told to type is exactly what the host runs — one list, two spellings.
+    #[test]
+    fn the_command_for_a_person_is_the_steps_the_host_runs() {
+        for m in [InstallMethod::Homebrew, InstallMethod::Npm, InstallMethod::Cargo] {
+            let typed = m.upgrade_command().expect("names a command");
+            let ran: Vec<String> = m.upgrade_steps().iter().map(|s| s.join(" ")).collect();
+            assert_eq!(typed, ran.join(" && "), "{m:?}");
+        }
+    }
+
+    /// A tool's own last line is the failure sentence, and its exit code is not.
+    ///
+    /// Through `sh` because that is a package manager as far as `run_step` is concerned: a child
+    /// with two pipes and an exit status. What is asserted is the contract every real one relies
+    /// on — output streamed as it happens, `\r`-redrawn lines counted as lines, and the last thing
+    /// said being what a failure reports.
+    #[tokio::test]
+    async fn a_step_streams_what_it_prints_and_fails_with_its_last_word() {
+        use std::sync::Mutex;
+        let seen: Arc<Mutex<Vec<UpdateProgress>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = seen.clone();
+        let progress: Progress = Arc::new(move |p| sink.lock().expect("no poisoning").push(p));
+
+        let ok = run_step(
+            Path::new("sh"),
+            &["-c", "printf 'one\\ntwo\\rthree\\n'; echo err >&2"],
+            InstallMethod::Standalone,
+            "sh",
+            &progress,
+        )
+        .await;
+        assert_eq!(ok, Ok(()));
+        let mut lines: Vec<String> = seen
+            .lock()
+            .expect("no poisoning")
+            .iter()
+            .filter_map(|p| p.line.clone())
+            .collect();
+        lines.sort();
+        assert_eq!(lines, ["err", "one", "three", "two"], "both pipes, and `\\r` is a line end");
+
+        let failed = run_step(
+            Path::new("sh"),
+            &["-c", "echo starting; echo 'Error: no such formula' >&2; exit 3"],
+            InstallMethod::Standalone,
+            "sh",
+            &progress,
+        )
+        .await;
+        let reason = failed.expect_err("a non-zero exit is a failure");
+        assert!(reason.contains("exit 3"), "{reason}");
+        assert!(reason.contains("no such formula"), "the tool's last word, not ours: {reason}");
+    }
+
+    /// A tool that is not there is a sentence, not a panic and not a hang.
+    #[tokio::test]
+    async fn a_missing_tool_is_reported_by_name() {
+        let progress: Progress = Arc::new(|_| {});
+        let err = run_step(
+            Path::new("/nonexistent/definitely-not-brew"),
+            &["update"],
+            InstallMethod::Homebrew,
+            "brew update",
+            &progress,
+        )
+        .await
+        .expect_err("cannot start");
+        assert!(err.contains("could not start"), "{err}");
+    }
+
+    /// The manager lives in the prefix that owns the binary, and `PATH` is not the only witness.
+    ///
+    /// A workspace started from a launcher, or a shell whose profile never added the prefix, has
+    /// a `PATH` without `brew` on it and a neosh that `brew` plainly installed. The keg names the
+    /// prefix; the tool is in its `bin`.
+    #[test]
+    fn a_manager_is_found_beside_what_it_installed() {
+        let dir = sandbox("prefix");
+        let exe = dir.join("Cellar/neosh/0.4.1/bin/neosh");
+        let brew = dir.join("bin/brew");
+        install(&exe, "a keg");
+        install(&brew, "#!/bin/sh\n");
+        // A tool name nothing on this machine's PATH will have, so only the prefix can answer.
+        let name = brew.file_name().and_then(|n| n.to_str()).expect("a name");
+        let found = find_tool(name, &exe);
+        // `brew` may genuinely be on PATH here; either answer must be an executable file.
+        let found = found.expect("found somewhere");
+        assert!(found.is_file() && is_executable(&found), "{found:?}");
+        if !which_on_path(name) {
+            assert_eq!(found, brew, "the prefix's own bin, derived from the keg");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn which_on_path(tool: &str) -> bool {
+        std::env::var_os("PATH").is_some_and(|p| {
+            std::env::split_paths(&p).any(|d| d.join(tool).is_file())
+        })
+    }
+
+    /// Two updates at once is one update and one refusal.
+    #[tokio::test]
+    async fn a_second_apply_while_one_is_running_is_refused() {
+        let dir = sandbox("twice");
+        let exe = dir.join("bin/neosh");
+        install(&exe, "i am 0.4.1");
+        let u = updater(&exe, &exe);
+        u.applying.store(true, Ordering::SeqCst);
+        let progress: Progress = Arc::new(|_| {});
+        match u.apply(progress).await {
+            UpdateOutcome::Failed { reason } => assert!(reason.contains("already running"), "{reason}"),
+            other => panic!("{other:?}"),
+        }
+        // And the refusal did not clear the flag the running one owns.
+        assert!(u.applying.load(Ordering::SeqCst));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The command we print has to be one that actually updates.

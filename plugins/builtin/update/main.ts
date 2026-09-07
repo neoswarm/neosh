@@ -4,8 +4,9 @@
  * Three things, and the third is the one this was missing. Saying *there is an update* is news you
  * did not ask for and cannot otherwise see, which is the definition of an alert — so it is raised
  * once, and never again for the same version. Saying *what updating means here* is not one sentence:
- * a binary Homebrew owns is updated by `brew`, one inside `node_modules` by npm, and only a
- * standalone one is neosh's to replace. The host works out which; this draws the answer.
+ * a binary Homebrew owns is updated by running `brew`, one inside `node_modules` by running npm,
+ * and a standalone one by a download and a rename. The host works out which and does it; this
+ * draws how it is going and what came of it.
  *
  * And then there is *you are not running what you installed*, which is the state almost everybody
  * ends up in and the one nothing said a word about. Most installs are managed, so most updates
@@ -26,8 +27,9 @@
  * present when there is something to say — an update waiting, or a restart owed — so the column's
  * job stays your conversations.
  */
-import type { Neosh, PluginContext, UpdateStatus } from "@neosh/api";
-import { confirmDestructive } from "@neosh/api/ui";
+import type { Neosh, PluginContext, UpdateProgress, UpdateStatus } from "@neosh/api";
+import { UPDATE_EVENT } from "@neosh/api";
+import { confirmDestructive, onTick, spinnerFrame } from "@neosh/api/ui";
 
 const NS = "update";
 /** The section id, so the row can be taken off again by name. */
@@ -144,11 +146,11 @@ export async function activate({ neosh, subscriptions }: PluginContext) {
       announced = status.latest;
       await neosh.alert(
         `neosh ${status.latest}`,
-        status.self_updatable
-          // The thing to type, in a notification that may well be read on a phone. "Update from the
-          // sidebar" is an instruction to go and find something; this is the instruction.
-          ? "A new version is out. Type /update in the chat."
-          : `A new version is out. Update with: ${status.upgrade_command ?? "your package manager"}`,
+        // The thing to type, in a notification that may well be read on a phone. "Update from the
+        // sidebar" is an instruction to go and find something; this is the instruction — and it is
+        // the same one on every kind of install now that the host runs a package manager itself,
+        // where this used to send a Homebrew user off to a shell to type the command.
+        "A new version is out. Type /update in the chat.",
         { level: "info" },
       ).catch(() => {});
     }
@@ -264,16 +266,39 @@ export async function activate({ neosh, subscriptions }: PluginContext) {
     await neosh.cmd.register(`${NS}.apply`, async () => {
       // Raised and *always* cleared. A progress notice is keyed and replaced in place because it is
       // a **state**, so one that is never `done` is a state with no end: `Updating neosh…` sat
-      // there, and the reply that followed it — including the one naming the command a managed
-      // install needs — never got a look in. From the keyboard that is the whole bug in a sentence:
-      // `/update` says "updating…", the row goes, and nothing has happened or been said.
+      // there, and the reply that followed it never got a look in. From the keyboard that is the
+      // whole bug in a sentence: `/update` says "updating…", the row goes, and nothing has
+      // happened or been said.
+      //
+      // What the row says is the host's own account of the update, off the bus: the step that is
+      // running (`brew update`, `brew upgrade neosh`, `downloading neosh-aarch64-apple-darwin`)
+      // and the last line it printed. A `brew upgrade` is a minute of somebody else's server and
+      // a `cargo install` is a compile, and a row that said `Updating neosh…` for the whole of
+      // either was one you could not tell from a hang. The spinner has its own clock, so a step
+      // that prints nothing for a while still turns.
       //
       // `finally`, not a call per branch. Every arm of the switch below returns, and one added
       // later that forgets would put the hang straight back.
-      neosh.progress(`${NS}`, "Updating neosh…");
+      let phase = "checking";
+      let line: string | null = null;
+      const draw = () => {
+        const tail = line ? `  ${line}` : "";
+        neosh.progress(`${NS}`, `${spinnerFrame()} updating neosh — ${phase}${tail}`);
+      };
+      draw();
+      const watching = neosh.event.on(UPDATE_EVENT, (e) => {
+        const p = e.data as UpdateProgress | undefined;
+        if (!p || p.done) return;
+        phase = p.phase;
+        line = p.line ? clip(p.line, 72) : null;
+        draw();
+      });
+      const ticking = onTick(draw);
       try {
         return await applyUpdate();
       } finally {
+        watching.dispose();
+        ticking.dispose();
         neosh.done(`${NS}`);
       }
     }, { desc: "Update neosh to the newest version" }),
@@ -301,18 +326,11 @@ export async function activate({ neosh, subscriptions }: PluginContext) {
             "info",
           );
         }
-        case "delegated":
-          // Not run for them. A keypress that drives somebody's package manager is how a machine
-          // ends up in a state its owner cannot explain. What *is* now true is that running it is
-          // the whole of the job: the next tick notices the binary changed and offers the restart,
-          // so nobody has to know a workspace needs one.
-          //
-          // The command is the host's and carries whatever that install method actually needs —
-          // for Homebrew that is `brew update` before the upgrade, because brew reads a tap clone
-          // it only refreshes daily, and the bare upgrade spends the first day of a release saying
-          // the old version is the newest one.
-          return neosh.notify(`Update with: ${outcome.command}`, "info");
         default:
+          // The host's sentence, whole. For a managed install it ends with the command to run by
+          // hand — the one thing this used to say *instead* of updating, and now says only when
+          // updating did not work: the tool was not on the workspace's PATH, or it ran and left
+          // the binary as it was because the tap has not caught up with the release yet.
           return neosh.notify(`Update failed: ${outcome.reason}`, "error");
       }
     }
@@ -385,6 +403,12 @@ export async function activate({ neosh, subscriptions }: PluginContext) {
   subscriptions.push({
     dispose: () => void neosh.ext.remove("sidebar.section", ROW).catch(() => {}),
   });
+}
+
+/** The first `n` characters of a tool's line, with an ellipsis when there were more. */
+function clip(text: string, n: number): string {
+  const chars = [...text];
+  return chars.length <= n ? text : `${chars.slice(0, n - 1).join("")}…`;
 }
 
 async function declareOptions(neosh: Neosh) {

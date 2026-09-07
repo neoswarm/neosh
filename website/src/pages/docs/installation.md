@@ -67,7 +67,9 @@ neosh paths    # where config, data and state live on this machine
 
 ## Updating
 
-Re-run the install script, or `brew update && brew upgrade neosh`, or re-run the `cargo install` command. (The `brew update` is not optional: Homebrew reads formulae from a clone of the tap on your disk and only refreshes it once a day, so a bare `brew upgrade` spends the first day of a release insisting the version you have is the newest one.) Each replaces the binary in place. A workspace that is already running keeps executing the old binary until you stop it; the terminal tells you when the two have drifted.
+Type `/update` in the chat. It checks the releases page, updates by whichever route this install takes — a Homebrew install runs `brew update && brew upgrade neosh`, an npm one `npm install -g neosh@latest`, a cargo one `cargo install neosh --force`, and a binary from the install script is downloaded, checked against its published sha256 and swapped in — with the tool's own output on a progress row while it runs, and then restarts the workspace into the new binary once nothing is running. The sidebar says when a newer version is out, and says when a workspace is still running an old binary that has already been replaced under it — by `/update` or by an upgrade you ran in a shell.
+
+Doing it by hand still works: re-run the install script, or `brew update && brew upgrade neosh`, or re-run the `cargo install` command. (The `brew update` is not optional: Homebrew reads formulae from a clone of the tap on your disk and only refreshes it once a day, so a bare `brew upgrade` spends the first day of a release insisting the version you have is the newest one.) Each replaces the binary in place. A workspace that is already running keeps executing the old binary until you stop it; the terminal tells you when the two have drifted, and `/update` finishes the job by restarting into it.
 
 ## Uninstalling
 
