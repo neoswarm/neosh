@@ -2204,33 +2204,47 @@ pub enum InstallMethod {
 }
 
 impl InstallMethod {
-    /// Whether neosh may replace its own binary, or has to name a command instead.
+    /// Whether neosh replaces its own binary — a download and a rename — rather than running the
+    /// package manager that owns it.
     pub fn self_updatable(self) -> bool {
         matches!(self, Self::Standalone)
     }
 
-    /// The command that updates this install, for the kinds neosh will not do itself.
-    pub fn upgrade_command(self) -> Option<&'static str> {
+    /// The commands that update a managed install, in order, as argument vectors.
+    ///
+    /// What [`ApiCall::UpdateApply`] actually runs, and what [`upgrade_command`](Self::upgrade_command)
+    /// prints when it cannot. Argument vectors rather than one shell string because they are
+    /// exec'd, not typed: nothing here goes through a shell, so nothing in a path or a version can
+    /// be read as syntax.
+    ///
+    /// `brew update` first, and it is not politeness — it is the difference between this working
+    /// and this lying. Homebrew reads formulae out of a git clone of the tap on this disk, and it
+    /// only refreshes that clone on its own every `HOMEBREW_AUTO_UPDATE_SECS` — 24 hours by
+    /// default. So for the whole first day of a release, which is exactly when somebody is told
+    /// there is one, `brew upgrade neosh` consults a stale clone and answers that the version they
+    /// already have is the newest there is. Reported from a real machine: the tap had 0.4.3,
+    /// `brew upgrade neosh` said 0.4.2 was current, and the only thing wrong was the command.
+    ///
+    /// The other two do not need it. npm resolves `@latest` against the registry on every install,
+    /// and cargo refreshes its index as part of `install`; only Homebrew keeps metadata on disk
+    /// and ages it.
+    pub fn upgrade_steps(self) -> &'static [&'static [&'static str]] {
         match self {
-            // `brew update` first, and it is not politeness — it is the difference between this
-            // command working and this command lying.
-            //
-            // Homebrew reads formulae out of a git clone of the tap on this disk, and it only
-            // refreshes that clone on its own every `HOMEBREW_AUTO_UPDATE_SECS` — 24 hours by
-            // default. So for the whole first day of a release, which is exactly when somebody is
-            // told there is one, `brew upgrade neosh` consults a stale clone and answers that the
-            // version they already have is the newest there is. Reported from a real machine: the
-            // tap had 0.4.3, `brew upgrade neosh` said 0.4.2 was current, and the only thing wrong
-            // was the command we had printed.
-            //
-            // The other two do not need it. npm resolves `@latest` against the registry on every
-            // install, and cargo refreshes its index as part of `install`; only Homebrew keeps
-            // metadata on disk and ages it.
-            Self::Homebrew => Some("brew update && brew upgrade neosh"),
-            Self::Npm => Some("npm install -g neosh@latest"),
-            Self::Cargo => Some("cargo install neosh --force"),
-            Self::Standalone | Self::Development => None,
+            Self::Homebrew => &[&["brew", "update"], &["brew", "upgrade", "neosh"]],
+            Self::Npm => &[&["npm", "install", "-g", "neosh@latest"]],
+            Self::Cargo => &[&["cargo", "install", "neosh", "--force"]],
+            Self::Standalone | Self::Development => &[],
         }
+    }
+
+    /// The same steps as one line for a person to type, for when neosh could not run them — the
+    /// tool was not on its `PATH`, or it ran and the binary did not change.
+    pub fn upgrade_command(self) -> Option<String> {
+        let steps = self.upgrade_steps();
+        if steps.is_empty() {
+            return None;
+        }
+        Some(steps.iter().map(|s| s.join(" ")).collect::<Vec<_>>().join(" && "))
     }
 }
 
@@ -2248,9 +2262,12 @@ pub struct UpdateStatus {
     /// Whether `latest` is newer than `current`.
     pub behind: bool,
     pub method: InstallMethod,
-    /// Whether [`ApiCall::UpdateApply`] would replace the binary, rather than name a command.
+    /// Whether [`ApiCall::UpdateApply`] replaces the binary itself — a download and a rename —
+    /// rather than running the package manager that owns it.
     pub self_updatable: bool,
-    /// The command to run by hand, when neosh will not do it itself.
+    /// The command that updates a managed install, as [`ApiCall::UpdateApply`] runs it. Kept for
+    /// the failure sentence: when the tool is not there, or ran and changed nothing, this is what
+    /// to type in a shell.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub upgrade_command: Option<String>,
     /// Why the last check failed, when it did. Kept so the UI can say *unknown, and here is why*.
@@ -2287,20 +2304,39 @@ pub enum UpdateOutcome {
     /// Already newest. Not an error, and worth saying rather than doing nothing visible.
     UpToDate { version: String },
     /// The new binary is on disk and takes effect on the next start.
+    ///
+    /// Whichever way it got there: downloaded and renamed in by neosh, or put there by the package
+    /// manager neosh ran. The `version` is what the binary on disk *says it is* when it could be
+    /// asked, because a tap can be behind the release that prompted this.
     Applied {
         version: String,
         /// Always true today, and a field rather than an assumption: a workspace holds running
         /// turns, so what happens next is a question for whoever pressed the key.
         restart_required: bool,
     },
-    /// A managed install. neosh did not touch it, and this is what would.
-    Delegated {
-        version: String,
-        command: String,
-        method: InstallMethod,
-    },
-    /// It did not work, and this is why in a sentence somebody can act on.
+    /// It did not work, and this is why in a sentence somebody can act on. For a managed install
+    /// the sentence ends with the command to run by hand.
     Failed { reason: String },
+}
+
+/// One line of an update in progress, on the bus as `neosh.update.progress`.
+///
+/// Emitted while [`ApiCall::UpdateApply`] runs a package manager or a download, because both take
+/// long enough to watch — `cargo install` is a compile, `brew upgrade` is a fetch — and a call
+/// that answers once at the end is a progress row that spins on nothing for minutes. `line` is the
+/// tool's own last word, which is what a person would be reading if they had typed the command.
+#[derive(TS, Serialize, Deserialize, Clone, PartialEq, Debug)]
+#[ts(export)]
+pub struct UpdateProgress {
+    /// What is happening, in the words of the step: `brew update`, `brew upgrade neosh`,
+    /// `downloading neosh-aarch64-apple-darwin`.
+    pub phase: String,
+    /// The most recent line the step printed, when it printed anything.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub line: Option<String>,
+    /// Set on the last event, success or failure, so a row drawn from these knows to stop.
+    #[serde(default)]
+    pub done: bool,
 }
 
 /// What a refused [`ApiCall::UpdateRestart`] was refused for.

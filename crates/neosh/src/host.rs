@@ -14306,7 +14306,18 @@ async fn run_slow(svc: Services, call: ApiCall) -> ApiResult {
             Ok(ApiOk::Update { update: svc.updater.check(force, local).await })
         }
         ApiCall::UpdateApply => {
-            Ok(ApiOk::UpdateApplied { outcome: svc.updater.apply().await })
+            // Progress goes on the bus rather than back to the caller, because the caller is not
+            // necessarily the thing drawing — `neosh agent run update` asks and the sidebar's
+            // plugin is what shows it — and because a call that answers once at the end is a
+            // progress row spinning on nothing for the length of a `brew upgrade`.
+            let bus = svc.clone();
+            let progress: crate::update::Progress = std::sync::Arc::new(move |p| {
+                bus.emit(
+                    crate::update::UPDATE_EVENT,
+                    serde_json::to_value(p).unwrap_or(serde_json::Value::Null),
+                );
+            });
+            Ok(ApiOk::UpdateApplied { outcome: svc.updater.apply(progress).await })
         }
         ApiCall::GitStatus { cwd } => svc.git_status(cwd).await,
         ApiCall::GitBranches { include_remote, cwd } => {

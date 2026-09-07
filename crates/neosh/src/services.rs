@@ -88,7 +88,7 @@ impl Services {
     /// Both audiences, because they are one bus. A subscriber that has gone is dropped rather than
     /// queued for — the send fails, it leaves the list, and a script walking away mid-clone cannot
     /// cost this workspace memory.
-    fn emit(&self, name: &str, data: serde_json::Value) {
+    pub(crate) fn emit(&self, name: &str, data: serde_json::Value) {
         let event = neosh_proto::PluginEvent::Event {
             name: name.to_string(),
             data: Some(data),

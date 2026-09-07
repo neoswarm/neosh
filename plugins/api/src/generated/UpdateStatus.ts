@@ -21,11 +21,14 @@ export type UpdateStatus = {
   behind: boolean;
   method: InstallMethod;
   /**
-   * Whether [`ApiCall::UpdateApply`] would replace the binary, rather than name a command.
+   * Whether [`ApiCall::UpdateApply`] replaces the binary itself — a download and a rename —
+   * rather than running the package manager that owns it.
    */
   self_updatable: boolean;
   /**
-   * The command to run by hand, when neosh will not do it itself.
+   * The command that updates a managed install, as [`ApiCall::UpdateApply`] runs it. Kept for
+   * the failure sentence: when the tool is not there, or ran and changed nothing, this is what
+   * to type in a shell.
    */
   upgrade_command?: string | null;
   /**

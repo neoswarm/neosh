@@ -534,6 +534,41 @@ is `docs/releasing.md`.
   there. What is said instead is the age beside the numbers: `now`, `12m`, `⚠ offline`. Without it,
   a panel that has not fetched since Tuesday and one that fetched nine seconds ago draw the same
   row.
+- **A row that is talking to a remote says so on the row, and stops lying the moment it is done.**
+  Two halves, both about the badge after a project's name. The git plugin keeps a count of
+  checkouts with a fetch or a pull out (`repoBusy`), and while it is non-zero the badge is *led*
+  with one glyph in `Git.Fetching` — a `Frames` spinner now, because the shimmer it used to be is
+  invisible over a single cell — and that glyph is the whole of the short form, since a narrow row
+  should keep the mark that says something is happening over the one that says what was true
+  before it started. One column, held by the frontend, so `↓3` after it never moves. The other
+  half is that the badge is built from a `git status` per project that nothing in the verbs
+  refreshed: after `p` brought three commits in, the row went on saying `↓3` until a cursor move
+  or a conversation switch happened to redraw it — wrong about the one number the key was pressed
+  for. So the verbs *tell* the badge: `fetchRepository` and `pullRepository` fire the plugin's
+  `onMoved` hook on the way in and on the way out, naming the directory and passing the fresh
+  `RepoStatus` when they have one, and `decorate(only, known)` redraws that row alone, from that
+  answer, with no subprocess. A verb with no `cwd` resolves the conversation's first, because
+  everything said about a row is keyed by directory and `git.pull` from the palette is about a
+  directory too. Corner progress is kept for what has no row; it is not a substitute for the row.
+- **`/update` is the whole job on every kind of install.** It used to stop at `Update with: brew
+  update && brew upgrade neosh` for anything a package manager owned, on the theory that driving
+  somebody's package manager behind a keypress is how a machine ends up in a state its owner
+  cannot explain — and from the keyboard that meant the most common install of all did not
+  update, told you to go and type something elsewhere, and then wanted a second `/update` to
+  restart into what you had typed. So `UpdateApply` **runs the manager**:
+  `InstallMethod::upgrade_steps` is the argv list it execs (no shell), `upgrade_command` is the
+  same list spelled for a person and appears only in the failure sentence, and every line the tool
+  prints goes on the bus as `neosh.update.progress` (`UpdateProgress`, `\r` counted as a line end
+  because brew and cargo redraw in place) so the progress row says `brew upgrade neosh  ==>
+  Downloading …` rather than `Updating neosh…` for a minute. Then it is **checked**: an exit
+  status answers "did the command run", not "is there a new neosh", and `brew upgrade` on a tap
+  that has not caught up exits 0 having printed `already installed` — so the same `stat` that
+  notices an upgrade run in another terminal is what decides between `Applied` and `Failed`, and
+  `Delegated` is gone. The tool is found on `PATH` and then in the prefix that owns the keg,
+  because a workspace started from a launcher has neither `brew` on its `PATH` nor any less of a
+  Homebrew install. Stdin is closed, every askpass unset, `HOMEBREW_NO_AUTO_UPDATE` set because
+  the refresh is the step before, one apply at a time workspace-wide, and a step is killed at
+  forty-five minutes because `cargo install` is a compile and a prompt on a closed pipe is forever.
 - **The verb on a panel row is rebuilt from the state, never fixed.** A `pull` button that is a
   no-op nine times out of ten is a button people learn not to press, and the tenth time is the one
   that mattered. So the sidebar's git row says `pull 3 commits` when there are three, `check for
