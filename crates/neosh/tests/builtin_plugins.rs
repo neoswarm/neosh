@@ -1034,6 +1034,22 @@ fn p_on_a_project_row_pulls_and_reports_what_happened() {
         "upstream 1",
         "and the commits actually arrived"
     );
+    // And the row follows, with no key pressed. `↓2` after a pull that brought both commits in
+    // was a row that stayed wrong until something unrelated redrew it — moving the cursor,
+    // switching conversations, the next turn ending — and what it was wrong about is the one
+    // number the key was pressed for. The verb tells the badge itself, so this is immediate rather
+    // than whenever the next redraw happens to come round.
+    assert!(
+        s.pump(|s| !s.projects_now().iter().any(|l| l.contains("↓2"))),
+        "the row stops saying behind the moment the pull is done\n{:?}",
+        s.sidebar_now()
+    );
+    // And nothing is left spinning on it: the busy mark leaves with the operation.
+    assert!(
+        !s.projects_now().iter().any(|l| l.contains('•') || l.contains('⠋')),
+        "no busy mark once the pull is over\n{:?}",
+        s.sidebar_now()
+    );
 }
 
 // ---------------------------------------------------------------------------

@@ -447,13 +447,15 @@ pub fn groups(variant: Variant) -> Vec<(&'static str, HighlightDef)> {
         ("Git.Diverged", spec(bold(fg(r.danger)))),
         // Talking to the remote, right now.
         //
-        // The one git state that earns motion, and it earns it exactly the way `Status.Streaming`
-        // does: a fetch is seconds of nothing on screen against somebody else's server, which is
-        // the one case where a still panel and a wedged one are indistinguishable. A sweep rather
-        // than a blink for the reason given there — it reads as aliveness at the edge of vision and
-        // costs nothing to ignore — and slightly quicker than the transcript's, because this is one
-        // short row rather than a paragraph and the same period reads as slower over less text.
-        ("Git.Fetching", spec(shimmer(fg(r.active), 1600))),
+        // The one git state that earns motion: a fetch or a pull is seconds of nothing on screen
+        // against somebody else's server, which is the one case where a still panel and a wedged
+        // one are indistinguishable. It was a shimmer, on the theory that a sweep reads as
+        // aliveness at the edge of vision — and over the one glyph a row badge has to spend on it,
+        // a sweep is a cell that goes slightly brighter and slightly dimmer, which nobody saw. So
+        // it is the same answer `Agent.ToolRunning` gives for the same reason: a glyph that changes
+        // *shape* is what every terminal program means by "still going". One column, kept that way
+        // by the frontend, so the stats after it never move.
+        ("Git.Fetching", spec(frames(fg(r.active), neosh_proto::FrameSet::Braille, 800))),
         // In step with the remote, as of the last time we asked. The quietest thing the section can
         // say, because it is the answer you do not need to act on — and a row that says "fine" as
         // loudly as one that says "three waiting" is a row you stop reading.
@@ -840,8 +842,9 @@ mod tests {
             _ => panic!("{name} is missing from the palette"),
         };
         assert!(
-            matches!(animation("Git.Fetching"), Some(neosh_proto::Animation::Shimmer { .. })),
-            "a fetch is the one git state with a server at the other end of it"
+            matches!(animation("Git.Fetching"), Some(neosh_proto::Animation::Frames { .. })),
+            "a fetch is the one git state with a server at the other end of it, and it spins on \
+             the one column a row badge can give it"
         );
         assert!(
             matches!(animation("Forge.ChecksRunning"), Some(neosh_proto::Animation::Frames { .. })),
