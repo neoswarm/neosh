@@ -309,6 +309,7 @@ mod tests {
             messages: vec![Message {
                 role: Role::User,
                 content: vec![ContentBlock::Text { text: "hi".into() }],
+                at: None,
             }],
             tools: vec![],
             max_output_tokens: None,
@@ -367,6 +368,7 @@ mod tests {
                 ContentBlock::Thinking { text: "hm".into(), signature: None },
                 ContentBlock::Text { text: "answer".into() },
             ],
+            at: None,
         });
         let b = AnthropicProvider::body(&r, true);
         let blocks = b["messages"][1]["content"].as_array().unwrap();
@@ -390,6 +392,7 @@ mod tests {
                 name: "read_file".into(),
                 input: json!({"path": "a.txt"}),
             }],
+            at: None,
         });
         r.messages.push(Message {
             role: Role::User,
@@ -399,6 +402,7 @@ mod tests {
                 is_error: false,
                 images: Vec::new(),
             }],
+            at: None,
         });
         let b = AnthropicProvider::body(&r, true);
         assert_eq!(b["tools"][0]["input_schema"]["type"], "object");

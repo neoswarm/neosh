@@ -911,7 +911,7 @@ mod tests {
     fn the_message_sent_is_the_one_shape_agy_accepts() {
         // Every other event name is answered with "ignoring unsupported stream input message
         // event", on stdout, in plain text — so a wrong envelope here is a turn that hangs.
-        let msg = Message { role: Role::User, content: vec![ContentBlock::Text { text: "hi".into() }] };
+        let msg = Message { role: Role::User, content: vec![ContentBlock::Text { text: "hi".into() }], at: None };
         let v = user_frame(&[msg]);
         assert_eq!(v["event"], "user");
         assert_eq!(v["message"]["role"], "user");
@@ -922,9 +922,9 @@ mod tests {
     #[test]
     fn only_the_newest_question_is_sent_because_the_session_holds_the_rest() {
         let msgs = vec![
-            Message { role: Role::User, content: vec![ContentBlock::Text { text: "first".into() }] },
-            Message { role: Role::Assistant, content: vec![ContentBlock::Text { text: "ok".into() }] },
-            Message { role: Role::User, content: vec![ContentBlock::Text { text: "second".into() }] },
+            Message { role: Role::User, content: vec![ContentBlock::Text { text: "first".into() }], at: None },
+            Message { role: Role::Assistant, content: vec![ContentBlock::Text { text: "ok".into() }], at: None },
+            Message { role: Role::User, content: vec![ContentBlock::Text { text: "second".into() }], at: None },
         ];
         let v = user_frame(&msgs);
         let content = v["message"]["content"].as_array().expect("content is an array");

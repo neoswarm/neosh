@@ -415,10 +415,11 @@ mod tests {
     #[test]
     fn assistant_role_is_named_model() {
         let b = GoogleProvider::body(&req(vec![
-            Message { role: Role::User, content: vec![ContentBlock::Text { text: "hi".into() }] },
+            Message { role: Role::User, content: vec![ContentBlock::Text { text: "hi".into() }], at: None },
             Message {
                 role: Role::Assistant,
                 content: vec![ContentBlock::Text { text: "yo".into() }],
+                at: None,
             },
         ]));
         assert_eq!(b["contents"][0]["role"], "user");
@@ -448,6 +449,7 @@ mod tests {
                     name: "read_file".into(),
                     input: json!({"path": "a"}),
                 }],
+                at: None,
             },
             Message {
                 role: Role::User,
@@ -457,6 +459,7 @@ mod tests {
                     is_error: false,
                     images: Vec::new(),
                 }],
+                at: None,
             },
         ]));
         assert_eq!(b["contents"][0]["parts"][0]["functionCall"]["name"], "read_file");
@@ -582,6 +585,7 @@ mod tests {
                     name: "read_file".into(),
                     input: json!({"path": "a"}),
                 }],
+                at: None,
             },
             Message {
                 role: Role::User,
@@ -591,6 +595,7 @@ mod tests {
                     is_error: false,
                     images: Vec::new(),
                 }],
+                at: None,
             },
         ]));
         assert_eq!(b["contents"][1]["parts"][0]["functionResponse"]["name"], "read_file");
@@ -608,6 +613,7 @@ mod tests {
                 is_error: true,
                 images: Vec::new(),
             }],
+            at: None,
         }]));
         let r = &b["contents"][0]["parts"][0]["functionResponse"]["response"];
         assert_eq!(r["error"], "no such file");
@@ -619,6 +625,7 @@ mod tests {
         let b = GoogleProvider::body(&req(vec![Message {
             role: Role::Assistant,
             content: vec![ContentBlock::Thinking { text: "x".into(), signature: None }],
+            at: None,
         }]));
         assert_eq!(b["contents"].as_array().unwrap().len(), 0);
     }

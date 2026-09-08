@@ -1498,6 +1498,7 @@ mod tests {
             messages: vec![Message {
                 role: Role::User,
                 content: vec![ContentBlock::Text { text: "hello".into() }],
+                at: None,
             }],
             tools: vec![],
             max_output_tokens: None,

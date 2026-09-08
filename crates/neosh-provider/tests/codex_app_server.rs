@@ -130,6 +130,7 @@ fn req(dir: &std::path::Path) -> TurnRequest {
         messages: vec![Message {
             role: Role::User,
             content: vec![ContentBlock::Text { text: "run the tests".into() }],
+            at: None,
         }],
         tools: vec![],
         max_output_tokens: None,

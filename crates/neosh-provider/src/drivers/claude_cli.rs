@@ -1706,6 +1706,7 @@ mod tests {
             messages: vec![Message {
                 role: Role::User,
                 content: vec![ContentBlock::Text { text: "hello".into() }],
+                at: None,
             }],
             tools: vec![],
             max_output_tokens: None,
@@ -1715,12 +1716,13 @@ mod tests {
     #[test]
     fn prompt_uses_the_latest_user_message() {
         let msgs = vec![
-            Message { role: Role::User, content: vec![ContentBlock::Text { text: "old".into() }] },
+            Message { role: Role::User, content: vec![ContentBlock::Text { text: "old".into() }], at: None },
             Message {
                 role: Role::Assistant,
                 content: vec![ContentBlock::Text { text: "reply".into() }],
+                at: None,
             },
-            Message { role: Role::User, content: vec![ContentBlock::Text { text: "new".into() }] },
+            Message { role: Role::User, content: vec![ContentBlock::Text { text: "new".into() }], at: None },
         ];
         assert_eq!(ClaudeCliProvider::prompt_from(&msgs), "new");
     }
@@ -1730,7 +1732,7 @@ mod tests {
     #[test]
     fn a_message_with_no_picture_in_it_goes_as_it_always_did() {
         let msgs =
-            vec![Message { role: Role::User, content: vec![ContentBlock::Text { text: "hi".into() }] }];
+            vec![Message { role: Role::User, content: vec![ContentBlock::Text { text: "hi".into() }], at: None }];
         assert!(ClaudeCliProvider::prompt_from(&msgs).is_string());
     }
 
@@ -1750,6 +1752,7 @@ mod tests {
                 },
                 ContentBlock::Text { text: "what is this".into() },
             ],
+            at: None,
         }];
         let v = ClaudeCliProvider::prompt_from(&msgs);
         let blocks = v.as_array().expect("an array once there is more than text in it");
@@ -1776,6 +1779,7 @@ mod tests {
                 },
                 ContentBlock::Text { text: "still a question".into() },
             ],
+            at: None,
         }];
         assert_eq!(
             ClaudeCliProvider::prompt_from(&msgs),

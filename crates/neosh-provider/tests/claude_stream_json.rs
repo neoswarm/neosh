@@ -121,6 +121,7 @@ fn req(dir: &std::path::Path, text: &str) -> TurnRequest {
         messages: vec![Message {
             role: Role::User,
             content: vec![ContentBlock::Text { text: text.into() }],
+            at: None,
         }],
         tools: vec![],
         max_output_tokens: None,

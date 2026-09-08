@@ -1249,12 +1249,13 @@ mod tests {
     #[test]
     fn a_resumed_session_sends_only_the_new_question() {
         let msgs = vec![
-            Message { role: Role::User, content: vec![ContentBlock::Text { text: "old".into() }] },
+            Message { role: Role::User, content: vec![ContentBlock::Text { text: "old".into() }], at: None },
             Message {
                 role: Role::Assistant,
                 content: vec![ContentBlock::Text { text: "reply".into() }],
+                at: None,
             },
-            Message { role: Role::User, content: vec![ContentBlock::Text { text: "new".into() }] },
+            Message { role: Role::User, content: vec![ContentBlock::Text { text: "new".into() }], at: None },
         ];
         let latest = prompt_blocks(&msgs, true);
         assert_eq!(latest.len(), 1);
@@ -1306,6 +1307,7 @@ mod tests {
             messages: vec![Message {
                 role: Role::User,
                 content: vec![ContentBlock::Text { text: "hello".into() }],
+                at: None,
             }],
             tools: vec![],
             max_output_tokens: None,
