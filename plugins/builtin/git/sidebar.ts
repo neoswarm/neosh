@@ -143,18 +143,36 @@ export function repoBusy(cwd: string): boolean {
  */
 let moved: (cwd: string | undefined, status: RepoStatus | null) => void = () => {};
 
-/** Mark a checkout busy, say so, run `body`, and say so again when it is over. */
-async function whileBusy<T>(cwd: string | undefined, body: () => Promise<T>): Promise<T> {
+/**
+ * Mark a checkout busy and say so, answering with the one call that stops it.
+ *
+ * Split out from {@link whileBusy} because a verb is not always one awaited body. `p` reads the
+ * status, may then ask a question, and only then talks to the remote — and the row has to be
+ * spinning across all of that except the question, which is the one part where nothing here is
+ * working. A releaser rather than a second counter: it is idempotent, so a `finally` can call it
+ * over a path that already released, which is what makes the question safe to bail out of.
+ */
+function busy(cwd: string | undefined): () => void {
   if (cwd) inFlight.set(cwd, (inFlight.get(cwd) ?? 0) + 1);
   moved(cwd, null);
+  let released = false;
+  return () => {
+    if (released) return;
+    released = true;
+    if (!cwd) return;
+    const n = (inFlight.get(cwd) ?? 1) - 1;
+    if (n > 0) inFlight.set(cwd, n);
+    else inFlight.delete(cwd);
+  };
+}
+
+/** Mark a checkout busy, say so, run `body`, and say so again when it is over. */
+async function whileBusy<T>(cwd: string | undefined, body: () => Promise<T>): Promise<T> {
+  const idle = busy(cwd);
   try {
     return await body();
   } finally {
-    if (cwd) {
-      const n = (inFlight.get(cwd) ?? 1) - 1;
-      if (n > 0) inFlight.set(cwd, n);
-      else inFlight.delete(cwd);
-    }
+    idle();
   }
 }
 
@@ -197,98 +215,124 @@ export async function pullRepository(
   // from the palette is about a directory too even though nobody named it.
   cwd = await here(neosh, cwd);
   const where = cwd ? { cwd } : undefined;
-  const status = await neosh.git.status(where).catch(() => null);
-  if (!status) {
-    neosh.notify("not a git repository", "warn");
-    return;
+  // The row spins from the keypress, not from the network call three steps down.
+  //
+  // `p` used to do all of its deciding first — a `git status` over the whole tree, then perhaps a
+  // fetch — and only mark the row busy once it had settled on a route. On anything bigger than a
+  // toy checkout that is a second or more in which the key has visibly done nothing at all, which
+  // is indistinguishable from a key that is not bound. What somebody wants to know from `p` is
+  // *that it heard them*; what it is going to turn out to do is the second question.
+  //
+  // Released around the one part of this that is not work — see the question below.
+  let idle = busy(cwd);
+  try {
+    return await pull();
+  } finally {
+    idle();
+    // The row, now, from a fresh read: whatever these numbers are they are not the ones it was
+    // drawn with, and the spinner coming off has to take the stale count with it.
+    moved(cwd, null);
   }
-  if (!status.repo.upstream) {
-    // A statement rather than a verb: a branch tracking nothing is not behind anything, and there
-    // is no route from here to up-to-date that this key could take on its own.
-    neosh.notify("this branch is not tracking a remote branch", "warn");
-    return;
-  }
-  const { ahead, behind } = status.repo;
 
-  let rebase = false;
-  if (ahead > 0 && behind > 0) {
-    const chosen = await picker(
-      neosh,
-      [
-        {
-          label: "Rebase",
-          detail: `replay your ${count(ahead, "commit")} on top of the ${
-            count(behind, "commit")
-          } that arrived`,
-          value: "rebase",
-        },
-        {
-          label: "Merge",
-          detail: "bring them together in a merge commit, keeping both histories as they are",
-          value: "merge",
-        },
-      ],
-      {
-        title: `${status.repo.branch ?? "HEAD"} has gone both ways`,
-        width: 76,
-      },
-    );
-    if (!chosen) return;
-    rebase = chosen === "rebase";
-  } else if (behind === 0) {
-    // "Nothing waiting" is a claim about the remote-tracking ref **on this disk**, so cold — from
-    // the palette, from a script, from a row nobody has fetched for — it does not mean nothing is
-    // waiting. It means nobody has looked.
-    //
-    // The block never had this problem: it drew from a status it had just fetched, so `behind === 0`
-    // there really was "up to date, and the honest verb is go and look". Moved onto a command that
-    // anyone can call at any moment, that same branch turned `git.pull` into a fetch — the remote's
-    // commits stayed on the remote and the caller was told nothing was there.
-    //
-    // So look, and then do what was asked. Once: the second pass carries `fetched` and stops rather
-    // than fetching again, which is what keeps a repository that is genuinely level from bouncing
-    // between the two halves of this branch.
-    if (opts.fetched) {
-      neosh.notify("already up to date");
+  async function pull(): Promise<void> {
+    const status = await neosh.git.status(where).catch(() => null);
+    if (!status) {
+      neosh.notify("not a git repository", "warn");
       return;
     }
-    const fresh = await fetchRepository(neosh, cwd, { loud: true });
-    // Could not reach the remote. `fetchRepository` has already said so and filed it, and guessing
-    // at a pull on top of that would only produce git's version of the same complaint.
-    if (!fresh) return;
-    return await pullRepository(neosh, cwd, { fetched: true });
-  }
+    if (!status.repo.upstream) {
+      // A statement rather than a verb: a branch tracking nothing is not behind anything, and there
+      // is no route from here to up-to-date that this key could take on its own.
+      neosh.notify("this branch is not tracking a remote branch", "warn");
+      return;
+    }
+    const { ahead, behind } = status.repo;
 
-  // A rebase replays commits over a tree that is being edited underneath it. git refuses on a dirty
-  // tree anyway, and saying so before spending the round trip is a better answer than git's, which
-  // arrives after the fetch and names a file rather than the decision.
-  if (rebase && status.changes.some((c) => c.staged || c.unstaged)) {
-    if (
-      !(await confirm(neosh, "This working tree has uncommitted changes. Try to rebase anyway?"))
-    ) return;
-  }
+    let rebase = false;
+    if (ahead > 0 && behind > 0) {
+      // Nothing on this machine is working while a person is reading two options, and a spinner that
+      // keeps turning over a question is a spinner that means nothing anywhere else either.
+      idle();
+      moved(cwd, null);
+      const chosen = await picker(
+        neosh,
+        [
+          {
+            label: "Rebase",
+            detail: `replay your ${count(ahead, "commit")} on top of the ${
+              count(behind, "commit")
+            } that arrived`,
+            value: "rebase",
+          },
+          {
+            label: "Merge",
+            detail: "bring them together in a merge commit, keeping both histories as they are",
+            value: "merge",
+          },
+        ],
+        {
+          title: `${status.repo.branch ?? "HEAD"} has gone both ways`,
+          width: 76,
+        },
+      );
+      if (!chosen) return;
+      rebase = chosen === "rebase";
+      idle = busy(cwd);
+    } else if (behind === 0) {
+      // "Nothing waiting" is a claim about the remote-tracking ref **on this disk**, so cold — from
+      // the palette, from a script, from a row nobody has fetched for — it does not mean nothing is
+      // waiting. It means nobody has looked.
+      //
+      // The block never had this problem: it drew from a status it had just fetched, so `behind === 0`
+      // there really was "up to date, and the honest verb is go and look". Moved onto a command that
+      // anyone can call at any moment, that same branch turned `git.pull` into a fetch — the remote's
+      // commits stayed on the remote and the caller was told nothing was there.
+      //
+      // So look, and then do what was asked. Once: the second pass carries `fetched` and stops rather
+      // than fetching again, which is what keeps a repository that is genuinely level from bouncing
+      // between the two halves of this branch.
+      if (opts.fetched) {
+        neosh.notify("already up to date");
+        return;
+      }
+      const fresh = await fetchRepository(neosh, cwd, { loud: true });
+      // Could not reach the remote. `fetchRepository` has already said so and filed it, and guessing
+      // at a pull on top of that would only produce git's version of the same complaint.
+      if (!fresh) return;
+      return await pullRepository(neosh, cwd, { fetched: true });
+    }
 
-  neosh.progress("git.pull", rebase ? "rebasing…" : "pulling…");
-  try {
-    await whileBusy(cwd, async () => {
-      const summary = await neosh.git.pull({ ...(where ?? {}), rebase });
-      // A pull *is* a fetch, so it settles the trouble mark too: whatever these numbers are, they
-      // came off the remote a moment ago.
-      if (cwd) fetchTrouble.delete(cwd);
-      neosh.notify(short(summary));
-    });
-  } catch (e) {
-    // git's own message names it — diverged, no remote, an unresolved rebase — and inventing a
-    // friendlier one here would mean guessing which of those it was. Loud: it is the answer to a
-    // key somebody just pressed.
-    neosh.notify(String(e), "error");
-  } finally {
-    neosh.done("git.pull");
-    // The row, now. `↓3` after a pull that brought three commits in is a row that is wrong until
-    // something unrelated happens to redraw it — moving the cursor, switching conversations — and
-    // what it was wrong about is the one number the key was pressed for. A pull answers with a
-    // summary rather than a status, so this one is a read; it is one local subprocess.
-    moved(cwd, null);
+    // A rebase replays commits over a tree that is being edited underneath it. git refuses on a dirty
+    // tree anyway, and saying so before spending the round trip is a better answer than git's, which
+    // arrives after the fetch and names a file rather than the decision.
+    if (rebase && status.changes.some((c) => c.staged || c.unstaged)) {
+      idle();
+      moved(cwd, null);
+      const anyway = await confirm(
+        neosh,
+        "This working tree has uncommitted changes. Try to rebase anyway?",
+      );
+      if (!anyway) return;
+      idle = busy(cwd);
+    }
+
+    neosh.progress("git.pull", rebase ? "rebasing…" : "pulling…");
+    try {
+      await whileBusy(cwd, async () => {
+        const summary = await neosh.git.pull({ ...(where ?? {}), rebase });
+        // A pull *is* a fetch, so it settles the trouble mark too: whatever these numbers are, they
+        // came off the remote a moment ago.
+        if (cwd) fetchTrouble.delete(cwd);
+        neosh.notify(short(summary));
+      });
+    } catch (e) {
+      // git's own message names it — diverged, no remote, an unresolved rebase — and inventing a
+      // friendlier one here would mean guessing which of those it was. Loud: it is the answer to a
+      // key somebody just pressed.
+      neosh.notify(String(e), "error");
+    } finally {
+      neosh.done("git.pull");
+    }
   }
 }
 

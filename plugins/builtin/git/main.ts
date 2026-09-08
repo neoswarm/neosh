@@ -308,6 +308,15 @@ two-word scratch name it was created with.",
   // project is the expensive way to learn that one of them changed, and the row that just pulled
   // is wrong until this runs. `known` is a status the caller already has — a fetch answers with
   // one — so that row is drawn from it with no subprocess at all.
+  //
+  // The last answer per directory, so that the redraw a *starting* operation asks for costs
+  // nothing. A pull marks its row busy and calls this immediately — which is the whole point, the
+  // spinner has to be on screen before the network is — and going and running `git status` first
+  // put a subprocess between the key and the only feedback it produces. On a repository with a
+  // large tree that is most of a second of a key looking like it did nothing, which is exactly the
+  // complaint. While a checkout is busy the numbers cannot be trusted anyway: they are what the
+  // operation is about to change, and saying them a moment stale beside a spinner is honest.
+  const lastKnown = new Map<string, RepoStatus | null>();
   const decorate = async (only?: string, known: RepoStatus | null = null) => {
     const projects = await neosh.vars
       .get<unknown>({ scope: "global" }, "sidebar.projects")
@@ -330,7 +339,10 @@ two-word scratch name it was created with.",
       }
       const status = cwd === only && known
         ? known
-        : await neosh.git.status({ cwd }).catch(() => null);
+        : repoBusy(cwd) && lastKnown.has(cwd)
+          ? lastKnown.get(cwd) ?? null
+          : await neosh.git.status({ cwd }).catch(() => null);
+      lastKnown.set(cwd, status);
       const parts = status ? statParts(status, ascii) : [];
       // The one thing the block said that a count cannot: that these numbers are as of a fetch
       // that did not reach the remote. Appended rather than led with, because it qualifies the
