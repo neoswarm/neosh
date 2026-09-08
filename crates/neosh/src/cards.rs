@@ -566,7 +566,14 @@ pub fn took(d: std::time::Duration) -> String {
     if secs < 60 {
         return format!("{:.1}s", d.as_secs_f64());
     }
-    format!("{}m {:02}s", secs / 60, secs % 60)
+    if secs < 3_600 {
+        return format!("{}m {:02}s", secs / 60, secs % 60);
+    }
+    // A call that has been out for two hours reads `120m 03s` without this, which is a number you
+    // have to divide before it means anything — and the seconds on it are three digits of noise
+    // beside the hours. The same shape [`crate::clock::lasted`] and `elapsed` in `@neosh/api`
+    // give, so a duration reads the same wherever the workspace prints one.
+    format!("{}h {:02}m", secs / 3_600, (secs % 3_600) / 60)
 }
 
 /// The status a shell tool reported, when what it handed back opens by saying so.
@@ -1926,7 +1933,9 @@ mod tests {
         assert_eq!(took(Duration::from_millis(1040)), "1.0s");
         assert_eq!(took(Duration::from_millis(59_900)), "59.9s");
         assert_eq!(took(Duration::from_secs(61)), "1m 01s");
-        assert_eq!(took(Duration::from_secs(3661)), "61m 01s");
+        assert_eq!(took(Duration::from_secs(3599)), "59m 59s");
+        assert_eq!(took(Duration::from_secs(3661)), "1h 01m");
+        assert_eq!(took(Duration::from_secs(9000)), "2h 30m");
     }
 
     #[test]

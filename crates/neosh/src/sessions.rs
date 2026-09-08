@@ -434,6 +434,7 @@ mod tests {
                 path: p.display().to_string(),
                 media_type: "image/png".into(),
             }],
+            at: None,
         };
         let mut going = session("look at this");
         going.messages.push(picture(&mine));

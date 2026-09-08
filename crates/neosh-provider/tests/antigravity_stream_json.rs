@@ -51,6 +51,7 @@ fn request(text: &str, dir: &std::path::Path) -> TurnRequest {
         messages: vec![Message {
             role: Role::User,
             content: vec![ContentBlock::Text { text: text.into() }],
+            at: None,
         }],
         tools: Vec::new(),
         max_output_tokens: None,

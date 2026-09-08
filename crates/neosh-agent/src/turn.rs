@@ -246,7 +246,7 @@ impl TurnAssembler {
             };
             match out.last_mut() {
                 Some(m) if m.role == role => m.content.push(block),
-                _ => out.push(Message { role, content: vec![block] }),
+                _ => out.push(Message { role, content: vec![block], at: None }),
             }
         }
         out
@@ -263,7 +263,7 @@ impl TurnAssembler {
             .filter(|m| m.role == Role::Assistant)
             .flat_map(|m| m.content)
             .collect();
-        Message { role: Role::Assistant, content }
+        Message { role: Role::Assistant, content, at: None }
     }
 
     /// Tool calls the model made, in the order it made them.

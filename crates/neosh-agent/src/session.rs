@@ -224,17 +224,21 @@ impl Session {
     }
 
     pub fn push_user_text(&mut self, text: impl Into<String>) {
-        self.push_user(&Prompt::text(text));
+        self.push_user(&Prompt::text(text), None);
     }
 
-    /// What was said, with whatever came with it.
-    pub fn push_user(&mut self, prompt: &Prompt) {
+    /// What was said, with whatever came with it, and when.
+    ///
+    /// `at` is seconds since the epoch and comes from the caller for the reason every other
+    /// timestamp on this type does — see [`crate::now_secs`]. `None` is *unknown*, which is what a
+    /// test's message is and what a conversation written before messages were timed comes back as.
+    pub fn push_user(&mut self, prompt: &Prompt, at: Option<i64>) {
         // Saying something in a placeholder is what makes it a conversation. Here rather than at
         // any of the call sites because there is more than one way to speak into a session — the
         // composer, a steering message taken in mid-turn, a peer on another machine — and the one
         // that forgot would leave a conversation with messages in it that no list ever shows.
         self.ephemeral = false;
-        self.messages.push(Message { role: Role::User, content: prompt.blocks() });
+        self.messages.push(Message { role: Role::User, content: prompt.blocks(), at });
     }
 
     pub fn push_assistant(&mut self, msg: Message) {
@@ -256,7 +260,7 @@ impl Session {
 
     /// Tool results go back as a single user message, matching the wire model of every provider we
     /// target. Splitting them across messages teaches models to stop making parallel calls.
-    pub fn push_tool_results(&mut self, results: Vec<(ToolCallId, ToolResult)>) {
+    pub fn push_tool_results(&mut self, results: Vec<(ToolCallId, ToolResult)>, at: Option<i64>) {
         if results.is_empty() {
             return;
         }
@@ -271,6 +275,7 @@ impl Session {
                     images: r.images,
                 })
                 .collect(),
+            at,
         });
     }
 
@@ -357,7 +362,7 @@ mod tests {
         s.push_tool_results(vec![
             (ToolCallId("a".into()), ToolResult::ok("1")),
             (ToolCallId("b".into()), ToolResult::error("boom")),
-        ]);
+        ], None);
         assert_eq!(s.messages.len(), 1, "splitting these suppresses parallel tool use");
         assert_eq!(s.messages[0].role, Role::User);
         assert_eq!(s.messages[0].content.len(), 2);
@@ -370,7 +375,7 @@ mod tests {
     #[test]
     fn empty_assistant_messages_are_not_recorded() {
         let mut s = Session::new("/tmp");
-        s.push_assistant(Message { role: Role::Assistant, content: vec![] });
+        s.push_assistant(Message { role: Role::Assistant, content: vec![], at: None });
         assert!(s.messages.is_empty());
     }
 

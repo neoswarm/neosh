@@ -2,4 +2,26 @@
 import type { ContentBlock } from "./ContentBlock";
 import type { Role } from "./Role";
 
-export type Message = { role: Role; content: Array<ContentBlock> };
+export type Message = {
+  role: Role;
+  content: Array<ContentBlock>;
+  /**
+   * When this entered the conversation, in seconds since the epoch.
+   *
+   * A transcript is a record of a conversation and a conversation happens *in time*: an answer
+   * that took four minutes and one that took four seconds read identically once they are on
+   * the screen, and a question asked yesterday reads exactly like the one asked a minute ago.
+   * Nothing in the messages said when, so nothing that rebuilds a transcript from them could
+   * say when either — which is why a card restored from a conversation has never carried a
+   * duration while a card drawn live always has.
+   *
+   * Stamped by whoever pushes the message, never by the conversation itself, for the reason
+   * every other timestamp here arrives from the caller: [`crate::SessionInfo::created_at`] and
+   * the rest are set by the layer that has a clock, so the store stays deterministic.
+   *
+   * `None` for a message written before this existed, and for one a test made. Absent is
+   * *unknown*, not the epoch — a transcript that stamped 1970 on every restored conversation
+   * would be worse than one that says nothing.
+   */
+  at?: number | null;
+};

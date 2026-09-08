@@ -20,6 +20,7 @@ mod clients;
 mod control;
 mod daemon;
 mod cards;
+mod clock;
 mod diff;
 mod logo;
 mod config;

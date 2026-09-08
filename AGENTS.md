@@ -962,6 +962,28 @@ is `docs/releasing.md`.
   thirty chances to add another 20 fps of repaints that never go away. The ticker carries a
   generation, claimed on every call whichever way it went, and stops the moment it is not the live
   one.
+- **A row is written once, so what it says has to stay true — which is what a clock is and a
+  relative time is not.** A conversation happens *in* time and the transcript said nothing about
+  it: an answer that took four minutes and one that took four seconds read identically, a question
+  asked yesterday read exactly like the one asked a minute ago, and a card rebuilt from a stored
+  conversation carried no duration at all, because the messages recorded what happened and never
+  when. `Message::at` is the missing fact — stamped by whoever pushes the message, never by
+  `Session`, which has no clock in it precisely so that it and the store stay deterministic, and
+  `None` is *unknown* rather than the epoch. What it buys is one margin per turn, on the blank row
+  above its question: when it was asked, and how long it took. Both fixed, and that is the whole
+  design constraint — the transcript is written once and nothing comes back to it, so *how long
+  ago* is a lie waiting to happen and a clock time never is. The relative reading is therefore
+  offered on **exactly one row**, the newest turn's, which is the one a person walking back to
+  their terminal is actually asking about; it is kept true by a tick that runs at half a minute
+  rather than at a second, because nobody is watching it, and it **settles** — rewritten without
+  the *ago* — the moment another question is drawn below it. It is **virtual text** flush right,
+  not characters in the buffer: a transcript is an artefact you take pieces out of, so `y`, `ym`
+  and `ya` have to copy what was said and not what neosh wrote in the margin about it, and only
+  the frontend knows how wide a window is. And the date leads the margin only when the day changed
+  *since the turn above* — never when it changed since today, which is a fact about when the row
+  was drawn. One vocabulary for a duration everywhere the workspace prints one — `41s`, `4m 12s`,
+  `2h 30m` — because the working line said `123m 4s` about the same turn the sidebar three columns
+  to the left called `2h 03m`.
 - **A flash is one thing happening; a burst is a redraw.** `Animation::Flash` is the only motion
   here that fires once, so it needs a moment to count from — and a highlight group, shared by every
   row using it, cannot hold one. The *mark* does: an extmark is created once, so the frontend keys

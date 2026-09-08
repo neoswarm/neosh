@@ -427,7 +427,7 @@ impl Agent {
         let mut selection = selection;
         let words = neosh_provider::prompt_injections(&instance.models, &mut selection);
         let mut messages =
-            vec![Message { role: Role::User, content: vec![ContentBlock::Text { text: prompt }] }];
+            vec![Message { role: Role::User, content: vec![ContentBlock::Text { text: prompt }], at: None }];
         neosh_provider::inject(&mut messages, &words);
 
         let request = TurnRequest {
@@ -612,7 +612,8 @@ impl Agent {
         // question the driver would go and ask.
         let asking = !text.is_empty() || !images.is_empty();
         if asking {
-            self.with(&session, |s| s.push_user(&Prompt { text: text.clone(), images }));
+            let asked = crate::now_secs();
+            self.with(&session, |s| s.push_user(&Prompt { text: text.clone(), images }, Some(asked)));
         }
 
         // --- turn.route: a plugin may say who answers ---------------------
@@ -862,10 +863,15 @@ impl Agent {
             let (produced, this_stop, usage) = assembler.finish();
             total.merge(&usage);
             let recorded = !produced.is_empty();
+            // Stamped as it enters the conversation, which is the only moment anything knows
+            // when it did: the messages themselves say what happened and, until this, never when.
+            // Good enough to be the turn's ending, because that is what a round boundary is for a
+            // model driver and what the close of the stream is for an agent driver.
+            let landed = crate::now_secs();
             self.with(&session, |s| {
                 s.add_usage(&usage);
                 for m in produced {
-                    s.push_message(m);
+                    s.push_message(m.at(landed));
                 }
             });
             if recorded {
@@ -901,7 +907,8 @@ impl Agent {
                 results.push((id, self.run_tool(bridge, &session, &cwd, call, &cancel).await));
             }
             let recorded = !results.is_empty();
-            self.with(&session, |s| s.push_tool_results(results));
+            let back = crate::now_secs();
+            self.with(&session, |s| s.push_tool_results(results, Some(back)));
             if recorded {
                 self.emit(AgentEvent::Committed {
                     session: session.clone(),
@@ -953,7 +960,8 @@ impl Agent {
             text: queued.iter().map(|p| p.text.as_str()).collect::<Vec<_>>().join("\n\n"),
             images: queued.into_iter().flat_map(|p| p.images).collect(),
         };
-        self.with(session, |s| s.push_user(&prompt));
+        let asked = crate::now_secs();
+        self.with(session, |s| s.push_user(&prompt, Some(asked)));
         // Drawn at the moment it enters the conversation, with whatever came with it — the picture
         // is part of the question, and a transcript showing the sentence without it is showing
         // half of what was asked.

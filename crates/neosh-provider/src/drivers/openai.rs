@@ -369,7 +369,7 @@ mod tests {
     use neosh_proto::{InstanceId, ModelSelection, OptionSelection, ProviderOptionValue, ToolCallId};
 
     fn msg(role: Role, content: Vec<ContentBlock>) -> Message {
-        Message { role, content }
+        Message { role, content, at: None }
     }
 
     #[test]

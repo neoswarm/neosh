@@ -34,6 +34,8 @@ Plugins declare their own options through the same call the built-ins use, and a
 | `chat.tool_output_lines` | `3` | How much of a tool result to show under it. `0` gives the line count and nothing else |
 | `chat.markdown` | `true` | Render answers as they arrive. `false` shows exactly what the model sent |
 | `chat.preview_lines` | | How many rows a tool card opens to while the cursor is in it |
+| `chat.times` | `true` | The time in the transcript's right margin: when each turn was asked, how long it took, and how long ago the newest one finished |
+| `chat.clock` | `"24h"` | Or `"12h"`. Which clock those times are written on |
 
 ## UI
 

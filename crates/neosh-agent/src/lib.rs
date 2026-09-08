@@ -23,6 +23,20 @@ pub use turn::{TurnAssembler, TurnUpdate};
 
 use neosh_proto::{HookName, HookOutcome, HookPayload, PluginEvent, PluginId, ToolResult};
 
+/// Seconds since the epoch.
+///
+/// Here rather than in [`session`] on purpose: a [`Session`] and a [`SessionStore`] are pure data
+/// with no clock in them, so every timestamp they hold arrives from whoever put it there and both
+/// types stay deterministic under test. The [`Agent`] is the layer that has one — it runs turns,
+/// waits on deadlines and talks to the world — so when a message enters a conversation is a
+/// question it can answer and they cannot.
+pub fn now_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
 /// How the agent reaches plugins.
 ///
 /// Implemented by the host. Every method is transport-agnostic on purpose: an implementation that

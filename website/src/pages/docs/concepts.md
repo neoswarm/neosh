@@ -19,6 +19,25 @@ A conversation belongs to a directory, and that directory is where its work happ
 - A turn that finishes while you are elsewhere marks its conversation unread. Arriving clears the mark; there is nothing to dismiss.
 - Switching conversations is never refused. Turns keep running where they are.
 
+### The transcript keeps time
+
+Every turn carries the time in the right margin of the blank row above its question:
+
+```
+                                                     8 Sep 14:32  ·  4m 12s
+▌ why is the composer eating pasted newlines
+
+  Looking at the paste path…
+```
+
+When it was asked, and — once it has ended — how long it took. The newest turn also says how long ago it finished (`·  12m ago`), which is what you want when you walk back to a terminal that has been sitting there; it is kept true while it is the newest, and settles the moment you ask something below it. Every turn above says only things that are true forever, because those rows are written once and nothing comes back to them.
+
+The date leads the margin only when the day changed since the turn above — a whole afternoon's work is one date and a column of clock times — and the year only when that changed too. `chat.clock = "12h"` writes `2:32pm` instead.
+
+It is drawn beside the transcript rather than into it, so `y`, `ym` and `ya` copy what was said and never what neosh wrote in the margin about it. `chat.times = false` turns it off.
+
+Durations read the same wherever the workspace prints one: seconds under a minute, `4m 12s` under an hour, `2h 30m` past that — on the working line while a turn runs, on a tool card, on a conversation's row in the sidebar, and here.
+
 ## Projects and worktrees
 
 The sidebar (`^T`) groups conversations by project. A worktree nests under the repository it belongs to, named by its branch, so four scratch trees of one repository are one project, not four.

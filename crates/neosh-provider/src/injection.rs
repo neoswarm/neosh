@@ -210,9 +210,9 @@ mod tests {
     #[test]
     fn the_word_goes_on_the_question_being_answered() {
         let mut messages = vec![
-            Message { role: Role::User, content: vec![ContentBlock::Text { text: "first".into() }] },
-            Message { role: Role::Assistant, content: vec![ContentBlock::Text { text: "answer".into() }] },
-            Message { role: Role::User, content: vec![ContentBlock::Text { text: "second".into() }] },
+            Message { role: Role::User, content: vec![ContentBlock::Text { text: "first".into() }], at: None },
+            Message { role: Role::Assistant, content: vec![ContentBlock::Text { text: "answer".into() }], at: None },
+            Message { role: Role::User, content: vec![ContentBlock::Text { text: "second".into() }], at: None },
         ];
         inject(&mut messages, &["ultrathink".into()]);
         let ContentBlock::Text { text: first } = &messages[0].content[0] else { panic!() };
@@ -224,7 +224,7 @@ mod tests {
     #[test]
     fn nothing_chosen_rewrites_nothing() {
         let mut messages =
-            vec![Message { role: Role::User, content: vec![ContentBlock::Text { text: "hi".into() }] }];
+            vec![Message { role: Role::User, content: vec![ContentBlock::Text { text: "hi".into() }], at: None }];
         inject(&mut messages, &[]);
         let ContentBlock::Text { text } = &messages[0].content[0] else { panic!() };
         assert_eq!(text, "hi");
