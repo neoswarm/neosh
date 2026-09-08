@@ -212,6 +212,33 @@ impl Session {
         lines
     }
 
+    /// Every piece of virtual text the transcript has ever carried.
+    ///
+    /// The time a turn was asked and how long it took are drawn *beside* the transcript rather
+    /// than into it — a transcript is an artefact you take pieces out of, and `y` must copy what
+    /// was said — so nothing about them is in `chat_now`. Not folded like the lines are: a margin
+    /// is rewritten in place while it is the newest one, and what this asks is whether a shape
+    /// ever appeared at all.
+    fn chat_virt(&self) -> Vec<String> {
+        let chat = self.events.iter().find_map(|e| {
+            (e["type"] == "buffer_opened"
+                && e["name"].as_str().is_some_and(|n| n.starts_with("[chat]")))
+            .then(|| e["buf"].as_u64())?
+        });
+        let Some(chat) = chat else { return Vec::new() };
+        self.events
+            .iter()
+            .filter(|e| e["type"] == "buffer_lines" && e["buf"].as_u64() == Some(chat))
+            .filter_map(|e| e["lines"].as_array())
+            .flatten()
+            .filter_map(|l| l["marks"].as_array())
+            .flatten()
+            .filter_map(|m| m["virt_text"].as_array())
+            .flatten()
+            .filter_map(|c| c["text"].as_str().map(str::to_string))
+            .collect()
+    }
+
     fn transcript(&self) -> String {
         let mut s = String::from("--- text seen ---\n");
         for l in self.texts() {
@@ -840,6 +867,80 @@ fn a_restored_conversation_still_has_its_tool_cards() {
         now.iter().filter(|l| l.contains("Read  src")).count(),
         1,
         "the tool it called came back with it\n{now:?}"
+    );
+}
+
+/// Whether a margin reads as `[<date> ]HH:MM` with, once the turn has ended, a duration after it.
+fn is_a_turn_margin(text: &str) -> bool {
+    let clock = text.split_whitespace().find(|w| {
+        w.len() == 5
+            && w.as_bytes()[2] == b':'
+            && w.bytes().enumerate().all(|(i, b)| if i == 2 { true } else { b.is_ascii_digit() })
+    });
+    clock.is_some()
+}
+
+#[test]
+fn a_turn_says_when_it_was_asked_and_how_long_it_took() {
+    let sb = Sandbox::new("times");
+    install_driver(&sb);
+    let mut s = sb.start();
+    s.wait_for("driver ready");
+    s.type_text("when was this");
+    s.enter();
+    s.wait_for("when was this");
+    assert!(
+        s.pump(|s| s.chat_virt().iter().any(|t| is_a_turn_margin(t))),
+        "the turn carries a clock time in its margin\n{:?}",
+        s.chat_virt()
+    );
+    // And once it has ended, how long it took — which is the fact the transcript could never give
+    // before, because the messages recorded what happened and never when.
+    assert!(
+        s.pump(|s| s.chat_virt().iter().any(|t| is_a_turn_margin(t) && t.contains('\u{b7}'))),
+        "and how long it took, once it has ended\n{:?}",
+        s.chat_virt()
+    );
+    // Never in the buffer: the transcript is what `y` copies.
+    let said = s.chat_now();
+    assert!(
+        !said.iter().any(|l| is_a_turn_margin(l)),
+        "the margin is drawn beside the transcript, not into it\n{said:?}"
+    );
+}
+
+#[test]
+fn a_restored_conversation_still_says_when_its_turns_happened() {
+    // The whole reason a message carries a timestamp. Rebuilt from the conversation's messages, a
+    // transcript used to have no clock on it at all — a record of what happened and never when.
+    let sb = Sandbox::new("times-restart");
+    install_driver(&sb);
+    {
+        let mut s = sb.start();
+        s.wait_for("driver ready");
+        s.type_text("remember when");
+        s.enter();
+        s.wait_for("remember when");
+        assert!(
+            s.pump(|s| s.chat_virt().iter().any(|t| is_a_turn_margin(t))),
+            "drawn live first\n{:?}",
+            s.chat_virt()
+        );
+        s.command("quit");
+        assert!(s.exits_within(Duration::from_secs(10)), "clean exit");
+    }
+
+    let mut s = sb.start();
+    s.wait_for("driver ready");
+    assert!(
+        s.pump(|s| s.chat_now().iter().any(|l| l.contains("remember when"))),
+        "the conversation came back\n{:?}",
+        s.chat_now()
+    );
+    assert!(
+        s.pump(|s| s.chat_virt().iter().any(|t| is_a_turn_margin(t))),
+        "and so did the time it happened at\n{:?}",
+        s.chat_virt()
     );
 }
 

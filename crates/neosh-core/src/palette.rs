@@ -331,6 +331,12 @@ pub fn groups(variant: Variant) -> Vec<(&'static str, HighlightDef)> {
         ("Agent.Tool", spec(fg(r.active))),
         ("Agent.ToolError", spec(bold(fg(r.danger)))),
         ("Agent.Usage", spec(dim(fg(r.muted)))),
+        // When a turn was asked, how long it took, and how long ago it finished — written in the
+        // right margin rather than into the transcript. Its own name and not `Agent.Usage`
+        // directly, because a theme that wants the clock a shade quieter than the token counts
+        // should not have to choose between them; still, they start the same, since both are the
+        // margin talking rather than the conversation.
+        ("Agent.Time", link("Agent.Usage")),
         // The mark beside a tool call, which appears only when the state is news: while the call
         // is out, and if it failed. There is deliberately no group for one that finished, since a
         // finished call is drawn with no mark at all.
@@ -771,6 +777,7 @@ mod tests {
             "Agent.ToolNet",
             "Agent.Tool",
             "Agent.Usage",
+            "Agent.Time",
             "Agent.PlanDone",
             "Agent.PlanActive",
             "Agent.PlanTodo",

@@ -449,6 +449,23 @@ struct PaneState {
     /// to *say*, because a question with nothing under it is indistinguishable from one still
     /// being thought about. See [`Host::close_unanswered`].
     unanswered: Option<u32>,
+    /// The turn whose time is in the right margin and is still moving, when times are on.
+    ///
+    /// Only ever the newest one. Every turn above it says a clock time and a duration, both of
+    /// which are true forever, so they are written once and never looked at again; the newest also
+    /// says *how long ago* it finished, which is the one thing a person walking back to their
+    /// terminal actually wants and the one thing that stops being true a minute later. So exactly
+    /// one row in the transcript is kept up to date, and it settles into the same fixed form as
+    /// the rest the moment another question is asked below it.
+    clocked: Option<Clocked>,
+    /// When the turn before the one being drawn was asked.
+    ///
+    /// What decides whether a turn's margin leads with a date: a clock time on its own is a lie by
+    /// omission the moment two turns are on different days, and repeating the date on every turn
+    /// of an afternoon's work is a column spent saying what the row above it already said.
+    /// Compared against the previous turn rather than against *today*, because "today" is a fact
+    /// about when the row was drawn and these rows outlive their drawing.
+    last_turn_at: Option<i64>,
     /// Set while output is streaming, so chunks append rather than starting a new line.
     streaming: Option<Stream>,
     /// The answer currently being written, and where it sits in the transcript.
@@ -568,6 +585,8 @@ impl PaneState {
             working: false,
             plan_rows: 0,
             unanswered: None,
+            clocked: None,
+            last_turn_at: None,
             streaming: None,
             answer: None,
             draft: String::new(),
@@ -622,6 +641,8 @@ impl PaneState {
             working: false,
             plan_rows: 0,
             unanswered: None,
+            clocked: None,
+            last_turn_at: None,
             streaming: None,
             answer: None,
             draft: String::new(),
@@ -1147,6 +1168,18 @@ struct Round {
     /// Kept after they finish rather than removed, so a late report about one that already ended
     /// lands somewhere instead of resurrecting it.
     tasks: Vec<Task>,
+}
+
+/// A turn's time in the right margin: the mark carrying it, and the instants it is made of.
+///
+/// The row is deliberately not in here. Text is inserted above this all the time — a card, a
+/// diff summary, a plan — and an extmark moves with what it is attached to, so the buffer is
+/// asked where it is rather than a number being kept in step with the buffer. That is the same
+/// mistake [`PaneState::unanswered`] has to work around by hand, and here it does not have to.
+#[derive(Clone, Copy, Debug)]
+struct Clocked {
+    mark: neosh_proto::ExtmarkId,
+    stamp: crate::clock::Stamp,
 }
 
 /// One sub-agent, from the turn's point of view.
@@ -8104,11 +8137,13 @@ impl Host {
         let show_tools = self.option_bool("chat.show_tools");
         let here = self.active_session();
         let running = self.turns.contains_key(&here);
-        let (lines, marks) = {
+        let offset = self.chat_clock().map(|(offset, _)| offset);
+        let (lines, marks, times) = {
             let store = self.agent.sessions();
             let Some(s) = store.get(&here) else { return };
-            let (lines, marks, _) = transcript(s, ascii, limits, width, show_tools, running);
-            (lines, marks)
+            let (lines, marks, _, times) =
+                transcript(s, ascii, limits, width, show_tools, running, offset);
+            (lines, marks, times)
         };
         let plugin = PluginId::from(BUILTIN);
         // Marks first, and all of them: a mark clamps rather than dies when the line under it is
@@ -8127,6 +8162,7 @@ impl Host {
             lines,
         });
         self.draw_marks(&marks, 0);
+        self.draw_turn_times(&times);
     }
 
     fn enter_session(&mut self) {
@@ -8172,12 +8208,13 @@ impl Host {
         let show_tools = self.option_bool("chat.show_tools");
         let here = self.active_session();
         let running = self.turns.contains_key(&here);
-        let Some((lines, marks, cards, label)) = ({
+        let offset = self.chat_clock().map(|(offset, _)| offset);
+        let Some((lines, marks, cards, times, label)) = ({
             let store = self.agent.sessions();
             store.get(&here).map(|s| {
-                let (lines, marks, cards) =
-                    transcript(s, ascii, limits, width, show_tools, running);
-                (lines, marks, cards, s.label())
+                let (lines, marks, cards, times) =
+                    transcript(s, ascii, limits, width, show_tools, running, offset);
+                (lines, marks, cards, times, s.label())
             })
         }) else {
             return;
@@ -8196,6 +8233,7 @@ impl Host {
             lines,
         });
         self.draw_marks(&marks, 0);
+        self.draw_turn_times(&times);
         // Where the window *is*, and not only what this end believes about it. `chat_top = None`
         // says "following the tail"; the window has to be told, because it is still sitting at
         // whatever row the last conversation was scrolled to — and a scroll offset is kept rather
@@ -8921,6 +8959,168 @@ impl Host {
         });
     }
 
+    // ---- the time in the margin -------------------------------------------
+
+    /// Whether the transcript writes the time in its margin, and on which clock.
+    ///
+    /// The offset is asked for here rather than per row: rebuilding a long conversation stamps a
+    /// margin per turn, and a process spawned for each of them would be a switch you could feel.
+    fn chat_clock(&self) -> Option<(i64, bool)> {
+        if !self.option_bool("chat.times") {
+            return None;
+        }
+        let twelve = self.editor.options().str("chat.clock") == Some("12h");
+        Some((crate::clock::local_offset(), twelve))
+    }
+
+    /// Where a mark has ended up, or `None` if it is gone.
+    fn mark_row(&mut self, id: neosh_proto::ExtmarkId) -> Option<u32> {
+        let call = ApiCall::MarkGet { ns: self.chat_ns, buf: self.v().chat, id };
+        let info = self.editor.apply(&PluginId::from(BUILTIN), call);
+        match info {
+            Ok(ApiOk::MarkInfo { info: Some(info) }) if !info.invalid => Some(info.row),
+            _ => None,
+        }
+    }
+
+    /// Put a time in the right margin of `row`, answering with the mark that carries it.
+    ///
+    /// Virtual text rather than characters in the buffer, and that is the whole design: a
+    /// transcript is an artefact you take pieces out of, so `y`, `ym` and `ya` have to copy what
+    /// was said and not what neosh wrote in the margin about it. It is also why the position is
+    /// [`VirtTextPos::Right`] — flush against the window's edge, which is a width only the
+    /// frontend knows, and which therefore survives a resize that a padded string would not.
+    fn set_turn_time(&mut self, row: u32, text: &str) -> Option<neosh_proto::ExtmarkId> {
+        let call = ApiCall::MarkSet {
+            ns: self.chat_ns,
+            buf: self.v().chat,
+            row,
+            col: 0,
+            opts: neosh_proto::ExtmarkOpts {
+                end_col: None,
+                hl_group: None,
+                line_hl_group: None,
+                virt_text: vec![chunk(text, "Agent.Time")],
+                virt_text_pos: neosh_proto::VirtTextPos::Right,
+                on_delete: neosh_proto::OnDelete::Clamp,
+                priority: 0,
+                image: None,
+            },
+        };
+        match self.editor.apply(&PluginId::from(BUILTIN), call) {
+            Ok(ApiOk::Mark { id }) => Some(id),
+            _ => None,
+        }
+    }
+
+    /// Draw the margin for the turn a question at `row` opens, and keep it as the moving one.
+    ///
+    /// `asked` is when the question entered the conversation, which the caller knows and this does
+    /// not: a steered message is drawn when the model is told rather than when it was typed.
+    fn start_turn_time(&mut self, row: u32, asked: i64) {
+        self.settle_turn_time(asked);
+        let Some((offset, twelve)) = self.chat_clock() else { return };
+        let before = self.v().last_turn_at;
+        let dated = before.is_none_or(|b| {
+            crate::clock::day(b, offset) != crate::clock::day(asked, offset)
+        });
+        let year = crate::clock::year(before.unwrap_or_else(now_secs), offset)
+            != crate::clock::year(asked, offset);
+        let stamp = crate::clock::Stamp { asked, ended: None, dated, year };
+        let text = stamp.label(offset, twelve, None);
+        let Some(mark) = self.set_turn_time(row, &text) else { return };
+        self.vm().clocked = Some(Clocked { mark, stamp });
+        self.vm().last_turn_at = Some(asked);
+    }
+
+    /// The turn in the margin has ended, and its margin says how long it took from now on.
+    fn end_turn_time(&mut self, ended: i64) {
+        if self.v().clocked.is_some_and(|c| c.stamp.ended.is_none()) {
+            if let Some(c) = self.vm().clocked.as_mut() {
+                c.stamp.ended = Some(ended);
+            }
+            self.redraw_turn_time();
+        }
+    }
+
+    /// Fix the moving margin at what it will say forever, because something is being drawn below.
+    ///
+    /// `by` is when that something happened, and it stands in for an ending the turn never got:
+    /// a question steered into a running turn closes off the stretch above it as surely as a
+    /// `TurnEnded` would, and a margin left saying only a clock time there would be the one turn
+    /// in the transcript that never says how long it took.
+    fn settle_turn_time(&mut self, by: i64) {
+        let Some(c) = self.v().clocked else { return };
+        if c.stamp.ended.is_none() {
+            if let Some(c) = self.vm().clocked.as_mut() {
+                c.stamp.ended = Some(by.max(c.stamp.asked));
+            }
+        }
+        // Without the *ago*: this row is about to stop being the newest thing in the transcript,
+        // and what it says from here on has to stay true with nothing ever redrawing it.
+        self.write_turn_time(false);
+        self.vm().clocked = None;
+    }
+
+    /// Write the moving margin again: with *how long ago* while it is the newest thing in the
+    /// transcript, and without it once it is not.
+    fn redraw_turn_time(&mut self) {
+        self.write_turn_time(true);
+    }
+
+    /// The half of the above that says whether *how long ago* is part of it.
+    fn write_turn_time(&mut self, with_ago: bool) {
+        let Some(c) = self.v().clocked else { return };
+        let Some((offset, twelve)) = self.chat_clock() else { return };
+        let Some(row) = self.mark_row(c.mark) else {
+            self.vm().clocked = None;
+            return;
+        };
+        let text = c.stamp.label(offset, twelve, with_ago.then(now_secs));
+        let plugin = PluginId::from(BUILTIN);
+        let _ = self.editor.apply(&plugin, ApiCall::MarkDel {
+            ns: self.chat_ns,
+            buf: self.v().chat,
+            id: c.mark,
+        });
+        match self.set_turn_time(row, &text) {
+            Some(mark) => {
+                if let Some(now) = self.vm().clocked.as_mut() {
+                    now.mark = mark;
+                }
+            }
+            None => self.vm().clocked = None,
+        }
+    }
+
+    /// Whether this view has a margin whose *ago* is going stale.
+    ///
+    /// What arms the slow tick. A turn that is still running has a working line counting up
+    /// already, and a margin with no ending on it says nothing that changes.
+    fn ageing(&self) -> bool {
+        self.v().clocked.is_some_and(|c| c.stamp.ended.is_some()) && self.chat_clock().is_some()
+    }
+
+    /// Draw every turn's margin for a transcript that has just been rebuilt.
+    ///
+    /// All of them are fixed except the last, which becomes the moving one — so a conversation
+    /// switched into says how long ago its newest answer arrived, which is very often the question
+    /// somebody switched into it to answer.
+    fn draw_turn_times(&mut self, times: &[TurnTime]) {
+        self.vm().clocked = None;
+        self.vm().last_turn_at = times.last().map(|t| t.stamp.asked);
+        let Some((offset, twelve)) = self.chat_clock() else { return };
+        let Some((last, earlier)) = times.split_last() else { return };
+        for t in earlier {
+            let text = t.stamp.label(offset, twelve, None);
+            self.set_turn_time(t.row, &text);
+        }
+        let text = last.stamp.label(offset, twelve, Some(now_secs()));
+        if let Some(mark) = self.set_turn_time(last.row, &text) {
+            self.vm().clocked = Some(Clocked { mark, stamp: last.stamp });
+        }
+    }
+
     /// Draw a rebuilt transcript's marks, `by` rows down from where they were computed.
     fn draw_marks(&mut self, marks: &[Mark], by: u32) {
         for m in marks.iter().map(|m| m.clone().shifted(by)) {
@@ -9182,6 +9382,13 @@ impl Host {
         // Whatever is drawn next clears this; if the turn ends and it is still set, the question
         // got no reply. See [`Self::unanswered`].
         self.vm().unanswered = Some(at);
+        // And the margin for the turn this question opens. On the blank row above it wherever
+        // there is one: an empty line is the one row a right-aligned annotation can never collide
+        // with what was said, and the question's own first row is where it goes when this question
+        // opens the transcript. Stamped now rather than from the message, because a steered
+        // question is drawn when the model is told about it and not when it was typed.
+        let row = if gap || at == 0 { at } else { at - 1 };
+        self.start_turn_time(row, now_secs());
         at
     }
 
@@ -9414,8 +9621,10 @@ impl Host {
 
         let ascii = self.option_bool("ui.ascii_only");
         let glyph = Glyphs::new(ascii).work;
-        let elapsed =
-            if secs >= 60 { format!("{}m {}s", secs / 60, secs % 60) } else { format!("{secs}s") };
+        // The same shape every other duration in the workspace is written in — the sidebar's
+        // running row, a tool card's tail — because a turn that has been going for two hours read
+        // `123m 4s` here and `2h 03m` three columns to the left, about the same turn.
+        let elapsed = crate::clock::lasted(secs as i64);
 
         let label = note.as_deref().unwrap_or(verb);
         let mut text = format!("{glyph} {label}\u{2026}  {elapsed}");
@@ -9766,6 +9975,11 @@ impl Host {
                     let n = me.draw_summary(&changes, at);
                     at = at.map(|row| row + n);
                     me.close_unanswered(at, &stop_reason);
+                    // The margin above this turn's question stops being a clock time and becomes
+                    // a clock time and a duration. However the turn ended: an interrupt and an
+                    // error both took as long as they took, and a turn that says nothing about
+                    // how long it ran is the one you cannot tell from one that never started.
+                    me.end_turn_time(now_secs());
                 });
                 // Queued after the last gap this turn had. It is a question that was asked and not
                 // yet answered, so it becomes the next turn rather than being quietly dropped.
@@ -11143,6 +11357,10 @@ impl Host {
                             me.draw_working();
                             me.tick_cards();
                             me.tick_footer();
+                            // The one row in the transcript that is not settled: how long ago the
+                            // newest turn finished. Every other margin says a clock time and a
+                            // duration, both of which are true forever and are written once.
+                            me.redraw_turn_time();
                         });
                     }
                     self.report_live();
@@ -11294,9 +11512,28 @@ impl Host {
                     hint.as_mut().reset(Instant::now() + Duration::from_millis(ms));
                 }
             }
-            if self.v().working && !ticking {
-                clock.as_mut().reset(Instant::now() + Duration::from_secs(1));
-                ticking = true;
+            if !ticking {
+                // Two speeds, because they answer two questions. A turn in flight has a clock on
+                // its working line that somebody is watching, so it moves every second. A turn
+                // that has finished has *how long ago* in its margin, which nobody is watching and
+                // which is wrong by a minute at worst — and a workspace nobody is using should not
+                // be waking up once a second to say so. With neither, there is no timer at all.
+                let (mut fast, mut slow) = (false, false);
+                for view in self.view_ids() {
+                    self.in_view(view, |me| {
+                        fast |= me.v().working;
+                        slow |= me.ageing();
+                    });
+                }
+                let every = match (fast, slow) {
+                    (true, _) => Some(Duration::from_secs(1)),
+                    (false, true) => Some(Duration::from_secs(30)),
+                    (false, false) => None,
+                };
+                if let Some(every) = every {
+                    clock.as_mut().reset(Instant::now() + every);
+                    ticking = true;
+                }
             }
             // A turn is the only thing that moves these numbers by an amount worth redrawing for,
             // so the poll that matters is the one just after one ends.
@@ -13246,6 +13483,25 @@ impl Host {
                 description: Some("Show a line in chat when a tool runs. Errors always show.".into()),
             },
             OptionSpec {
+                name: "chat.times".into(),
+                ty: OptionType::Bool,
+                default: OptionValue::Bool(true),
+                description: Some(
+                    "Write the time in the transcript's right margin: when each turn was asked, \
+                     how long it took, and how long ago the newest one finished. Virtual text, so \
+                     it is never part of what `y` copies."
+                        .into(),
+                ),
+            },
+            OptionSpec {
+                name: "chat.clock".into(),
+                ty: OptionType::Enum { values: vec!["24h".into(), "12h".into()] },
+                default: OptionValue::Str("24h".into()),
+                description: Some(
+                    "Which clock the times in the transcript are written on.".into(),
+                ),
+            },
+            OptionSpec {
                 name: "chat.show_plan".into(),
                 ty: OptionType::Bool,
                 default: OptionValue::Bool(true),
@@ -14431,7 +14687,8 @@ fn transcript(
     width: usize,
     show_tools: bool,
     running: bool,
-) -> (Vec<String>, Vec<Mark>, Vec<Card>) {
+    offset: Option<i64>,
+) -> (Vec<String>, Vec<Mark>, Vec<Card>, Vec<TurnTime>) {
     use neosh_proto::{ContentBlock, Role};
 
     let g = Glyphs::new(ascii);
@@ -14458,6 +14715,37 @@ fn transcript(
             _ => None,
         })
         .collect();
+    // When each turn was asked and when the last thing in it landed.
+    //
+    // There is no turn record in a conversation's messages and there does not need to be: a
+    // question is what a turn is *for*, so a turn starts where somebody said something and ends
+    // with the last thing that arrived before the next question. Tool results are user-role
+    // messages and open nothing — what makes a message a question is a block somebody typed.
+    let opens = |m: &neosh_proto::Message| {
+        m.role == Role::User
+            && m.content
+                .iter()
+                .any(|b| matches!(b, ContentBlock::Text { .. } | ContentBlock::Image { .. }))
+    };
+    let mut spans: Vec<(Option<i64>, Option<i64>)> = Vec::new();
+    for m in &session.messages {
+        if opens(m) {
+            spans.push((m.at, None));
+        } else if let (Some(last), Some(at)) = (spans.last_mut(), m.at) {
+            last.1 = Some(at);
+        }
+    }
+    // A turn that is still going has not taken any length of time yet. Its working line is
+    // counting up a few rows below, which is the honest place for a number that is still moving.
+    if running {
+        if let Some(last) = spans.last_mut() {
+            last.1 = None;
+        }
+    }
+    let mut times: Vec<TurnTime> = Vec::new();
+    let mut turn = 0usize;
+    // The turn before the one being drawn, for deciding whether a margin has to lead with a date.
+    let mut before: Option<i64> = None;
     let mut lines: Vec<String> = Vec::new();
     let mut marks: Vec<Mark> = Vec::new();
     let mut cards: Vec<Card> = Vec::new();
@@ -14611,7 +14899,59 @@ fn transcript(
     // under it must *not* get a blank line of its own: the picture and the sentence are one
     // question, and a gap between them reads as two.
     let mut after_image = false;
-    for message in &session.messages {
+    // Which message the margin above has already been drawn for, so a question made of a picture
+    // and a sentence — two blocks, one question — is one turn rather than two.
+    let mut timed: Option<usize> = None;
+    // The margin for the turn a question opens, on the blank row above it wherever there is one:
+    // an empty line always has room for something flush right, and a question that opens the
+    // transcript has no row above to use.
+    let open_turn = |lines: &mut Vec<String>,
+                         times: &mut Vec<TurnTime>,
+                         timed: &mut Option<usize>,
+                         before: &mut Option<i64>,
+                         turn: &mut usize,
+                         mi: usize| {
+        if *timed == Some(mi) {
+            return;
+        }
+        *timed = Some(mi);
+        let here = *turn;
+        *turn += 1;
+        let Some(offset) = offset else { return };
+        let Some((Some(asked), ended)) = spans.get(here).copied() else { return };
+        // A margin goes on the blank line above its question, and the first turn of a rebuilt
+        // conversation has none — `gap` has nothing to separate it from. One is made rather than
+        // the margin falling onto the question's own row: a right-aligned annotation there is
+        // fine until the question is longer than the window, and a first turn that reads
+        // differently from every turn under it is one more thing to learn.
+        if lines.is_empty() {
+            lines.push(String::new());
+        }
+        let row = if lines.last().is_some_and(|l| l.trim().is_empty()) {
+            lines.len() as u32 - 1
+        } else {
+            lines.len() as u32
+        };
+        times.push(TurnTime {
+            row,
+            stamp: crate::clock::Stamp {
+                asked,
+                ended,
+                dated: before.is_none_or(|b| {
+                    crate::clock::day(b, offset) != crate::clock::day(asked, offset)
+                }),
+                // Against *now* when there is nothing above to differ from: a conversation from
+                // this year needs no year on it, and one from two years ago is exactly where
+                // saying so matters. The comparison is re-made every time the transcript is
+                // rebuilt, which is the only moment this row is written, so it cannot go stale
+                // where it is read.
+                year: crate::clock::year(before.unwrap_or_else(now_secs), offset)
+                    != crate::clock::year(asked, offset),
+            },
+        });
+        *before = Some(asked);
+    };
+    for (mi, message) in session.messages.iter().enumerate() {
         for block in &message.content {
             let was_image = std::mem::take(&mut after_image);
             match block {
@@ -14620,6 +14960,7 @@ fn transcript(
                     if !was_image {
                         summarise(&mut lines, &mut marks, &mut changes);
                         gap(&mut lines);
+                        open_turn(&mut lines, &mut times, &mut timed, &mut before, &mut turn, mi);
                     }
                     let row = lines.len() as u32;
                     marks.push(Mark::at(row, 0, g.bar.len(), "Agent.User"));
@@ -14633,6 +14974,7 @@ fn transcript(
                         summarise(&mut lines, &mut marks, &mut changes);
                         gap(&mut lines);
                     }
+                    open_turn(&mut lines, &mut times, &mut timed, &mut before, &mut turn, mi);
                     for line in text.lines() {
                         marks.push(Mark::at(lines.len() as u32, 0, g.bar.len(), "Agent.User"));
                         lines.push(format!("{} {line}", g.bar));
@@ -14792,7 +15134,7 @@ fn transcript(
         marks.extend(Mark::of(row, &r));
         lines.push(r.text);
     }
-    (lines, marks, cards)
+    (lines, marks, cards, times)
 }
 
 /// One highlight in a rebuilt transcript, before it becomes an extmark.
@@ -14838,6 +15180,17 @@ impl Mark {
     }
 }
 
+
+/// Where one turn's margin goes, and what it is made of.
+///
+/// Produced by [`transcript`] while it rebuilds a conversation, because the turn boundaries are
+/// something it already has to find and nothing else does. The row is where the margin is drawn:
+/// the blank line above the question when there is one, which is a line with nothing on it and
+/// therefore always has room, and the question's own first row when the turn opens the transcript.
+struct TurnTime {
+    row: u32,
+    stamp: crate::clock::Stamp,
+}
 
 /// A virtual-text chunk, which is three words of ceremony often enough to be worth a name.
 fn chunk(text: impl Into<String>, hl: &str) -> neosh_proto::VirtChunk {
