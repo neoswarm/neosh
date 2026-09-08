@@ -569,6 +569,39 @@ pub fn groups(variant: Variant) -> Vec<(&'static str, HighlightDef)> {
         // colour would make the panel read as two lists rather than one workspace that happens to
         // span machines. What says where it is running is the host name on the end of the row.
         ("Sidebar.Remote", link("Comment")),
+        // ---- another computer -----------------------------------------------
+        // The cloud on a row that is not on this machine, in the colour of what the link to that
+        // machine is doing. Four states and four answers, because "not here" is not one fact: a
+        // conversation on a machine that is up is one you can open and steer, and the same row on
+        // a machine that is not is a thing you can read about and not touch.
+        //
+        // The glyph is one column and it never moves position, so the colour is the whole of the
+        // message and it has to be readable at a glance beside twenty other rows.
+        //
+        // Connected. The same green everything settled and working wears, and deliberately *still*:
+        // a link that is up is not something happening, it is a condition, and this glyph is on
+        // every remote row in the panel at once. Motion on all of them would be the panel
+        // vibrating.
+        ("Swarm.Up", spec(fg(r.success))),
+        // Being dialled, or dialled again after a drop. The one swarm state that earns motion, by
+        // the rule `Git.Fetching` earns it: something is happening you cannot see, over a network,
+        // and a still glyph cannot be told from a wedged one. A pulse rather than frames — a frame
+        // set says "working through something", and a dial is one thing being waited on — and in
+        // the attention hue, because it is on its way to being fine and is not fine yet.
+        ("Swarm.Linking", spec(pulse(fg(r.attention), 1200))),
+        // Reached, proved who we are, and that machine has not allowed this one yet.
+        //
+        // The colour the workspace already uses for *act now*, because that is what this is — and
+        // the one thing it must not be is a spinner: nothing on this computer is working on it, and
+        // what it is waiting for is a person at the other keyboard. The pulse says "you", the way
+        // it does on a conversation that is asking you something; the shape does not say "us".
+        ("Swarm.Waiting", spec(pulse(fg(r.attention), 1600))),
+        // Nothing is dialling it. Dim, and still, for the reason `Git.Stale` is: it is not an
+        // emergency, it is not going to change on its own, and a panel that draws every machine
+        // you have ever paired in a warning colour is one you stop reading. The rows under it are
+        // still drawn — they were real a moment ago and probably still are — and this is what says
+        // you cannot reach them.
+        ("Swarm.Down", spec(dim(fg(r.faint)))),
         ("Status.Line", link("Comment")),
         // ---- the tab strip --------------------------------------------------
         // One row across the top of the main region, and the only chrome that is *always* there
@@ -822,6 +855,10 @@ mod tests {
             "Git.Diverged",
             "Git.Synced",
             "Diff.Add",
+            "Swarm.Up",
+            "Swarm.Linking",
+            "Swarm.Waiting",
+            "Swarm.Down",
         ] {
             assert!(names.contains(required), "{required} is missing from the palette");
         }
@@ -850,12 +887,26 @@ mod tests {
             matches!(animation("Forge.ChecksRunning"), Some(neosh_proto::Animation::Frames { .. })),
             "checks running is work happening on somebody else's machine"
         );
+        assert!(
+            matches!(animation("Swarm.Linking"), Some(neosh_proto::Animation::Pulse { .. })),
+            "a dial is seconds of nothing on screen against another computer, and a still glyph \
+             cannot be told from a wedged one"
+        );
+        assert!(
+            matches!(animation("Swarm.Waiting"), Some(neosh_proto::Animation::Pulse { .. })),
+            "half a pairing is waiting on a person, which pulses rather than spins: a spinner \
+             would be this machine claiming to be working on something it is not"
+        );
         for still in [
             "Git.Diverged", "Git.Synced", "Git.Behind", "Git.Ahead", "Git.Branch", "Git.Stale",
             // A pull request's *state* is news and never motion: open is true until somebody
             // reviews it, merged is true for ever, and a row that blinks about either charges
             // attention every time it changes with nothing new to say.
             "Forge.Open", "Forge.Draft", "Forge.Merged", "Forge.Closed", "Forge.ChecksFailed",
+            // A link that is up is a condition rather than an event, and this glyph is on every
+            // remote row at once — twenty of them pulsing in step is the panel vibrating. A link
+            // nothing is dialling is not going to change on its own either.
+            "Swarm.Up", "Swarm.Down",
         ] {
             assert!(
                 animation(still).is_none(),

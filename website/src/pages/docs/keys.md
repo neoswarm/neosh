@@ -24,7 +24,7 @@ Every default is a key your terminal already sends: Ctrl with a letter, `⇧⇥`
 | `^T` | Projects and conversations |
 | `^J` | The computers in this workspace |
 | `^F` | The archive |
-| `^N` | New conversation. In a repository it asks where |
+| `^N` | New conversation. With another computer paired it asks which one first; in a repository it then asks where |
 | `^O` | Add a project — a path, another computer, or a repository address to clone |
 | `^B` | Toggle the sidebar |
 | `^K` | Command palette |

@@ -73,9 +73,29 @@ Steering an agent is a message. Approving one is a write to this machine's disk,
 
 ## What you see
 
-Conversations on other machines appear in the sidebar under the same project as yours, dimmed, with the host at the end of the row. Projects are matched by normalised git remote, not by path, so `/Users/me/dev/neosh` here and `/home/me/src/neosh` there are one project.
+Conversations on other machines appear in the sidebar under the same project as yours, in the same place and with the same name, marked with a cloud. Projects are matched by normalised git remote, not by path, so `/Users/me/dev/neosh` here and `/home/me/src/neosh` there are one project. A project that is only on other computers gets an ordinary project row of its own — same arrow, same name, same count — with a cloud after the name, so a repository you have not cloned here is still somewhere you can see and start work.
 
-`↵` on a remote conversation opens it: its history, then everything as it happens. `i` says something to it and `^C` asks its turn to stop. `^N` offers the other machines' checkouts alongside your worktrees, so "start something over there" is one key.
+The cloud is one column and its **colour is the link**:
+
+| | |
+| --- | --- |
+| green | connected — you can open it, steer it, start things on it |
+| amber, pulsing | being dialled, or waiting for somebody to allow this computer over there |
+| dim | nothing is dialling it |
+
+Which computer, and what the link is doing in words, is on the **key card** — pause on the row and it appears beside the panel: `on mac-studio · connected`. The name is not on the row itself, because a block of twenty rows that are all on `mac-studio` does not need to say so twenty times, and the columns it used to take are the ones the conversation's own name needs.
+
+Rows for a machine that has gone quiet stay where they are. They were real a moment ago and probably still are; what changed is that you cannot reach them, and a list that silently shortens is one you cannot tell from a list that never had them.
+
+`↵` on a remote conversation opens it: its history, then everything as it happens. `i` says something to it and `^C` asks its turn to stop.
+
+## Starting something over there
+
+With a machine paired, `^N` asks **which computer** first — this one, or any of them, each with its cloud and the reason it cannot be used when it cannot. `This computer` is the first row and the cursor starts on it, so `^N ⏎` is what it always was. Pick another and you get the path field pointed at that machine, which is the same thing typing `linux-box:` into it would have got you.
+
+With no machine paired the question is not asked at all, and `^N` is the single key it has always been.
+
+`n` on a project that is only on other computers skips straight to it: the row already knows which machines have it and where on each, so with one there is nothing to ask.
 
 ## What moves, and what does not
 
