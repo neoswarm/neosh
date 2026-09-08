@@ -280,6 +280,46 @@ is `docs/releasing.md`.
   connection with it, so a directory picker aimed at an older peer would knock it off the board
   rather than come back empty. It defaults to `false`, which is what an older handshake decodes to,
   so "does not say" and "cannot" are one answer and a version bump was never needed.
+- **A row that is not on this computer says so with one column, and the colour is the link.** The
+  machine's *name* was on every remote row — up to fourteen columns of the narrowest panel in the
+  workspace, on a block of rows that are all on the same machine, taking the column a local row
+  spends on how long its turn has been running and clipping the conversation's own name to make
+  room. What the row has to carry is one bit — not here — and one fact you cannot act without:
+  whether that machine can be reached, because `↵` on a row is *open and steer it* against a peer
+  that is up and nothing at all against one that is not, and the two were drawn identically. So it
+  is a cloud in the gutter, `Swarm.Up` green when the link is up, `Swarm.Linking` pulsing amber
+  while it is being dialled, `Swarm.Waiting` while it is a person at the far end being waited on,
+  `Swarm.Down` dim when nothing is dialling it. Up and down are **still**: a link that is up is a
+  condition rather than an event and the glyph is on every remote row at once, so motion on all of
+  them is the panel vibrating. Which computer, and what the link is doing in words, is the **key
+  card** — it appears beside the row you pause on and a border has room for a sentence. And the
+  panel is built from `swarm.nodes()` rather than `swarm.agents()`, which is the same list minus
+  the machines that are not up: that filter is right for *what can I act on* and wrong for a list,
+  because a machine going quiet does not take its conversations off your screen, it takes them out
+  of reach, and a list that silently shortens is one you cannot tell from a list that never had
+  them.
+- **A project that is only on other computers is a project row.** Same arrow in the same column,
+  same name beside it, same count on the right — because it is the same kind of thing, and a row
+  that reads differently is one you have to learn separately. It was an inert line with a `▹` on it
+  and the machine names where the count goes, which said "not one of yours" three ways at once,
+  none of them the way the panel says anything else. Its own `Target` kind rather than a `project`
+  with somebody else's path in it: every verb bound against a project — fold, rename, archive,
+  delete, remove from the list — is about a directory on *this* disk, and pointing one at a path
+  that is not here is how a key deletes the wrong thing. It folds on the project *key*, since there
+  is no directory to name it by, and that key is also what `same` compares — left to fall through
+  to `kind === kind` every one of them was the same row and the cursor snapped to the first on
+  every redraw.
+- **Which computer is asked before where on it, and only when there is one to ask about.** With no
+  machine paired — which is most workspaces — `^N` draws nothing extra and is the single key it has
+  always been. The moment a second computer exists, which one is the first thing you would have to
+  decide anyway, and asking it *first* is what makes it a decision rather than a path field you
+  have to know scp's spelling to use. This computer is the first row and the cursor starts on it,
+  so `^N ⏎` is unchanged. Every paired machine is a row including the ones that cannot be used,
+  greyed with the reason — the path field's rule, for the path field's argument: skipping them is
+  right about what can be *done* and wrong about what should be *said*. Choosing one hands you the
+  path field seeded `<machine>:`, which is the state typing it would have reached, so the two
+  routes cannot diverge. `n` on a project that is only elsewhere skips the question when one
+  machine has it: the row already knows which machines and where on each.
 - **What another machine knows about this one is a roster, not a snapshot.** `publish_inventory` was
   called when a peer connected and when a peer drove something here, and never once because somebody
   *sitting at this machine* started, renamed, archived or deleted a conversation — so every other
@@ -417,6 +457,18 @@ is `docs/releasing.md`.
   above every driver, on the copy of the message this turn sends — never on the transcript, never on a tool
   round, and always with a sendable value put back in the selection's place. `^E` shows *all* of
   them at once and applies as you move, because a knob you cannot see is a knob you do not have.
+- **`ENOENT` from a spawn is two different sentences, and the wrong one sends people hunting.**
+  `Command::spawn` reports a working directory it cannot `chdir` into exactly as it reports a
+  program it cannot find — "no such file or directory", os error 2 — and every driver wrote that up
+  as `could not run "claude"`. So a conversation whose directory had gone (a worktree removed by
+  hand, a project moved, a volume unmounted) failed with a sentence about `claude`, while every
+  other conversation in the same workspace went on working, because they are the same binary in a
+  directory that still exists. The one thing on screen said the one thing that was not the problem,
+  and the only way through it is to already know this about `posix_spawn`. `drivers::spawn_failed`
+  is the fix and it is shared by every driver: on the failure path only, ask the two questions the
+  kernel answered with one bit — is the directory there, is the program on `PATH` — and name
+  whichever is actually missing. The directory is checked first, because a conversation far more
+  often outlives its checkout than its agent.
 - **Take the transport that can do the most.** `claude` in stream-json mode with the control
   protocol; `codex app-server`, not `codex exec`; `agy -p= --input-format stream-json`, not the
   540 MB ACP runtime Google also ships — a vendor CLI the user already signed into beats a
@@ -550,6 +602,18 @@ is `docs/releasing.md`.
   answer, with no subprocess. A verb with no `cwd` resolves the conversation's first, because
   everything said about a row is keyed by directory and `git.pull` from the palette is about a
   directory too. Corner progress is kept for what has no row; it is not a substitute for the row.
+  **And it spins from the press, not from the network.** `p` used to do all of its deciding first —
+  a `git status` over the whole tree, then perhaps a fetch — and only mark the row busy once it had
+  settled on a route, so on anything bigger than a toy checkout the key visibly did nothing for a
+  second, which is indistinguishable from a key that is not bound. What somebody wants from `p` is
+  *that it heard them*; what it turns out to do is the second question. So `busy(cwd)` is claimed
+  up front and answers with the one call that releases it — a releaser rather than a second
+  counter, so a `finally` can call it over a path that already released — and it is released around
+  the *question*, because nothing on this machine is working while a person reads two options and a
+  spinner over that means nothing anywhere else either. The other half is that the redraw a
+  *starting* operation asks for must cost nothing: `decorate` keeps the last `RepoStatus` per
+  directory and draws from it while the checkout is busy rather than running a `git status` first,
+  since the numbers a spinner is beside are exactly the ones the operation is about to change.
 - **`/update` is the whole job on every kind of install.** It used to stop at `Update with: brew
   update && brew upgrade neosh` for anything a package manager owned, on the theory that driving
   somebody's package manager behind a keypress is how a machine ends up in a state its owner
@@ -742,6 +806,16 @@ is `docs/releasing.md`.
   terminal never notifies. A turn shorter than `notify.min_turn` finished while you were still
   looking at the key that started it. And `unread` stays the *record*: this points at it once and
   gets out of the way.
+- **And it goes in the corner you are not looking at, which is the top one.** A notice *overlays* —
+  reflowing would move the field you are typing into, which is the one thing it must never do — so
+  the only question it has left is what it covers, and the bottom-right corner answered it with the
+  composer and the last rows of the transcript. Those are the line being typed and the newest thing
+  the agent said: the two places somebody is certainly looking, and a notification is by definition
+  about something they are not. The top of a transcript is scrolled-past text during a turn and
+  empty space the rest of it. It stops short of whatever is docked across the top of the screen,
+  which is the tab strip — always drawn, the only place panes and tabs announce themselves, and
+  therefore never coverable — and the block grows *downwards* from there with the newest last, so a
+  row already on screen does not move when another arrives.
 - **A turn that finished while you were elsewhere is news until you go and look.** The panel says
   what is *happening* and stops the moment it stops, so an answer that arrived while you were in
   another conversation looks exactly like an answer you read yesterday. `SessionInfo::unread` is set
@@ -879,6 +953,15 @@ is `docs/releasing.md`.
   message and nothing else, so N queued messages meant N-1 questions drawn as asked and never put to
   anybody — which reads exactly like being ignored. `take_steering_into` joins them, in the order
   they were typed.
+- **A repaint ticker is one ticker, and a flag alone cannot say so.** Motion on screen arms a 20 fps
+  ticker and the first still frame takes it down, which is right — but `follow_motion(false)` then
+  `follow_motion(true)` inside one 50 ms sleep leaves the sleeping ticker waking to a flag that is
+  `true` again, so it carries on *and* a second one has been spawned beside it. Motion stopping and
+  restarting is not an edge case in a workspace watching an agent work: it is what every tool call
+  does, once when its spinner appears and once when it lands, so a turn with thirty of them is
+  thirty chances to add another 20 fps of repaints that never go away. The ticker carries a
+  generation, claimed on every call whichever way it went, and stops the moment it is not the live
+  one.
 - **A flash is one thing happening; a burst is a redraw.** `Animation::Flash` is the only motion
   here that fires once, so it needs a moment to count from — and a highlight group, shared by every
   row using it, cannot hold one. The *mark* does: an extmark is created once, so the frontend keys
@@ -1050,7 +1133,7 @@ only way to do anything.
 | `^T` | Projects and conversations. Switching is never refused — turns keep running where they are |
 | `^J` | The computers in this workspace. Add one by its address, allow one that is asking, rename one (`^E`), or open what it is running. A machine this one has reached that has not allowed it back says so, and says which key to press over there |
 | `^F` | What you have archived — see below. Filter it, put some back, or finally empty it |
-| `^N` | New conversation. In a repository it asks where: here, a worktree you need not name, one kept inside the project, one you do name, an existing one, another machine, elsewhere. A worktree you did not name is named by your first message — `fix/composer-paste-truncation`, not `wily-nimbus-7hq2` |
+| `^N` | New conversation. With another computer paired it asks **which** first — this one, or any of them, each with a cloud saying whether it can be reached; with none paired that question is not asked at all. Then, in a repository, where: here, a worktree you need not name, one kept inside the project, one you do name, an existing one, elsewhere. A worktree you did not name is named by your first message — `fix/composer-paste-truncation`, not `wily-nimbus-7hq2` |
 | `^O` | Add a project. The filter line **is** the path field: `/`, `~` and `./` complete directories from the first keystroke, `⇥` walks into the highlighted one, `↵` takes what you typed. `linux-box:` completes on that computer instead. Paste a repository address — `https://…`, `git@…`, `file://…`, or just `owner/repo` — and it offers to **clone** it: it asks where, remembers the folders you pick, draws git's own progress while it fetches, and leaves you in the new project |
 | `^B` | Toggle the sidebar |
 | `^K` | Command palette |
@@ -1262,7 +1345,7 @@ says how many are asking, `^T` is where you go, and it opens when you get there.
 | `J` `K` | Reorder within a group |
 | `r` | Rename a conversation |
 | `y` | Copy the row's directory — a worktree's path, ready to paste into a shell |
-| `p` | Bring that repository up to date — fast-forwards silently, asks *rebase or merge* when the branch has gone both ways, and goes and looks when nothing is waiting (a git-plugin contribution) |
+| `p` | Bring that repository up to date — fast-forwards silently, asks *rebase or merge* when the branch has gone both ways, and goes and looks when nothing is waiting. The row spins from the press, not from the network call three steps down (a git-plugin contribution) |
 | `d` | Remove a worktree from disk — its branch stays, and it asks first (a git-plugin contribution) |
 | `x` `X` | Archive, delete. Deleting the last conversation in a worktree takes the checkout with it, and the dialog says so — the branch stays. On a repository's heading, `X` takes the project off the list and leaves the directory; on a worktree's, it removes the checkout too |
 | `a` | The archive — the popup below. Nothing archived is ever a row in *this* panel, and by default not even a count. An `archive.action` contribution, not a key this panel owns |
