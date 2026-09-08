@@ -125,6 +125,7 @@ import type { TurnRequest } from "./generated/TurnRequest";
 import type { Usage } from "./generated/Usage";
 import type { NodeCapabilities } from "./generated/NodeCapabilities";
 import type { NodeId } from "./generated/NodeId";
+import type { LinkState } from "./generated/LinkState";
 import type { NodeInfo } from "./generated/NodeInfo";
 import type { ProjectKey } from "./generated/ProjectKey";
 import type { RemoteProject } from "./generated/RemoteProject";
@@ -162,7 +163,7 @@ export type {
   Rect, RepoInfo, RepoStatus, ScrollAmount, SelectShape, SessionId, SessionInfo, StatusAlign, StatusSegment, StopReason,
   SurfaceCell, SurfaceId, TextEdit, ToolCall, ToolDef, ToolResult, TurnRequest, Usage, ImageFile,
   NodeCapabilities, NodeId, NodeInfo, ProjectKey, RemoteProject, StreamEvent,
-  SwarmAgent, SwarmNode, SwarmStranger,
+  LinkState, SwarmAgent, SwarmNode, SwarmStranger,
   VarScope, ViewId, ViewInfo, Viewport,
   WindowId, WindowInfo, WindowLayout,
   ChecksState,

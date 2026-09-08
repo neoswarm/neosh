@@ -808,8 +808,53 @@ fn a_notification_does_not_reflow_the_content_underneath() {
     let mut with = main_window_with(vec!["line one", "line two"]);
     with.apply(notice("hi", neosh_proto::NoticeKind::Reply));
     let after = rows_of(&with, 40, 6);
-    assert_eq!(before[0], after[0], "the first line did not move");
-    assert_eq!(before[1], after[1]);
+    assert!(after[0].starts_with("line one"), "the first line did not move: {after:?}");
+    assert_eq!(before[1], after[1], "and nothing below it moved either");
+    assert_eq!(before.len(), after.len());
+}
+
+#[test]
+fn a_notification_goes_to_the_top_corner_and_not_over_what_is_being_typed() {
+    // The bottom corner covered the composer and the newest rows of the transcript — the two
+    // places somebody is certainly looking, and a notification is by definition about somewhere
+    // else. Six rows of content in an eight-row window: the last of them must survive a message.
+    let mut m = main_window_with(vec!["one", "two", "three", "four", "five", "six"]);
+    m.apply(notice("a message about something else", neosh_proto::NoticeKind::Reply));
+    let rows = rows_of(&m, 46, 6);
+    assert!(rows[0].contains("a message about something else"), "top corner: {rows:?}");
+    assert!(
+        !rows.last().unwrap().contains("a message"),
+        "the last row is the newest thing said, and it is not covered: {rows:?}"
+    );
+}
+
+#[test]
+fn a_notification_never_covers_the_tab_strip() {
+    // The one row that is always drawn, and the only place panes and tabs announce themselves.
+    let mut m = main_window_with(vec!["one", "two", "three", "four"]);
+    m.apply(UiEvent::BufferOpened { buf: BufferId(9), name: "[tabs]".into() });
+    m.apply(UiEvent::BufferLines {
+        buf: BufferId(9),
+        start: 0,
+        old_end: 0,
+        lines: vec![line("1 neosh", vec![])],
+    });
+    m.apply(UiEvent::WindowOpened {
+        win: WindowId(9),
+        buf: BufferId(9),
+        layout: WindowLayout::Docked {
+            pane: None,
+            dock: Dock::Top,
+            size: Some(1),
+            gravity: Gravity::Start,
+            wrap: None,
+        },
+    });
+    m.apply(notice("a message", neosh_proto::NoticeKind::Reply));
+    let rows = rows_of(&m, 40, 6);
+    assert!(rows[0].contains("1 neosh"), "the strip is still there: {rows:?}");
+    assert!(!rows[0].contains("a message"), "and nothing is over it: {rows:?}");
+    assert!(rows[1].contains("a message"), "the notice sits under it: {rows:?}");
 }
 
 #[test]

@@ -1142,7 +1142,31 @@ pub fn draw_with(frame: &mut Frame, mirror: &Mirror, theme: &Theme, gfx: &mut Gr
         }
     }
 
-    draw_notifications(frame, area, mirror, theme);
+    // Under whatever is docked across the top of the screen — which is the tab strip, and is the
+    // one row that must never be covered: it is always drawn, it is how you find out panes and
+    // tabs exist, and a notice over it hides the names of what is open.
+    let below_top = rects
+        .iter()
+        .filter(|(w, _)| {
+            matches!(
+                mirror.windows.get(w).map(|w| &w.layout),
+                Some(WindowLayout::Docked { pane: None, dock: Dock::Top, .. })
+            )
+        })
+        .map(|(_, r)| r.y.saturating_add(r.height))
+        .max()
+        .unwrap_or(area.y)
+        .max(area.y);
+    draw_notifications(
+        frame,
+        Rect {
+            y: below_top,
+            height: area.height.saturating_sub(below_top.saturating_sub(area.y)),
+            ..area
+        },
+        mirror,
+        theme,
+    );
 
     // The block cursor, last of all and over whatever the row under it ended up being.
     //
@@ -1503,11 +1527,21 @@ const ALERT_TTL: std::time::Duration = std::time::Duration::from_secs(20);
 /// crashed between the two — without it, one failed pull leaves `pulling…` on screen until restart.
 const PROGRESS_ABANDONED: std::time::Duration = std::time::Duration::from_secs(60);
 
-/// What is happening and what just happened, above the bottom-most content.
+/// What is happening and what just happened, in the top-right corner.
 ///
 /// Two lists in one corner, because they are two different claims and only one of them is about to
 /// stop being true. Progress sits above — it is what the program is *doing*, and it will change on
-/// its own — and messages below it, nearest the composer, because they are answers to a key.
+/// its own — and messages under it, newest last, so a row that is already there does not move when
+/// another arrives.
+///
+/// **The corner is the top one, and that is the whole point.** A notice is drawn over whatever is
+/// under it rather than reflowing the screen — reflowing would move the thing you are typing into —
+/// so the only question is *what* it is allowed to cover. In the bottom corner the answer was the
+/// composer and the last rows of the transcript: the line being typed, and the newest thing the
+/// agent had said. Both are the two places on screen somebody is certainly looking, and a
+/// notification is by definition about something they are not. The top of the transcript is
+/// scrolled-past text during a turn and empty space the rest of the time, which is the correct
+/// thing for a message to be laid over. It stops short of the tab strip, which is never covered.
 fn draw_notifications(frame: &mut Frame, area: Rect, mirror: &Mirror, theme: &Theme) {
     /// At most one reply and two alerts. The stack used to be three of anything, which meant a
     /// burst of replies could push the one piece of news off the top of it.
@@ -1531,8 +1565,10 @@ fn draw_notifications(frame: &mut Frame, area: Rect, mirror: &Mirror, theme: &Th
         return;
     }
 
-    // Newest at the bottom, older above it and dimmed — the same ordering as the toast stack it
-    // replaces, without the choreography. A repeat is a count on the end rather than a second row.
+    // Newest last, older above it and dimmed. Anchored at the top the block grows *downwards*, so
+    // this is also the order in which nothing already on screen moves when another arrives — the
+    // same "no choreography" the bottom corner had, read the other way up. A repeat is a count on
+    // the end rather than a second row.
     let mut lines: Vec<Line> = Vec::with_capacity(running.len() + live.len());
     for text in &running {
         lines.push(Line::from(Span::styled(
@@ -1558,7 +1594,7 @@ fn draw_notifications(frame: &mut Frame, area: Rect, mirror: &Mirror, theme: &Th
         lines.push(Line::from(Span::styled(text, style)));
     }
 
-    // Right-aligned, hugging the bottom, so it overlays chrome rather than reflowing it: a message
+    // Right-aligned, hugging the top, so it overlays chrome rather than reflowing it: a message
     // that pushed the composer down would move the thing the user is typing into.
     let rows = (lines.len() as u16).min(area.height);
     let widest = lines
@@ -1585,7 +1621,7 @@ fn draw_notifications(frame: &mut Frame, area: Rect, mirror: &Mirror, theme: &Th
     }
     let rect = Rect {
         x: area.x + area.width.saturating_sub(widest),
-        y: area.y + area.height.saturating_sub(rows + 1),
+        y: area.y,
         width: widest,
         height: rows,
     };

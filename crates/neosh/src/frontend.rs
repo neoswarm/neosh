@@ -140,6 +140,16 @@ pub struct TerminalUi {
     input: mpsc::UnboundedSender<InputEvent>,
     /// Whether a repaint ticker is running, and the switch that stops it.
     animating: Arc<AtomicBool>,
+    /// Which ticker is the live one.
+    ///
+    /// A generation and not just the flag above, because the flag alone cannot tell a ticker that
+    /// it has been replaced. `follow_motion(false)` then `follow_motion(true)` inside one 50 ms
+    /// sleep leaves the sleeping ticker waking to a flag that is `true` again — so it carries on,
+    /// *and* a second one has been spawned beside it. Motion stopping and restarting is not an
+    /// edge case in a workspace watching an agent work: it is what every tool call does, once
+    /// when its spinner appears and once when it lands. Thirty calls in a turn is thirty chances
+    /// to add another 20 fps of repaints to a terminal that only ever needed one ticker.
+    generation: Arc<AtomicU64>,
     /// The last geometry we told the core about, per window.
     ///
     /// Only *changes* are sent. Emitting one per window per draw is a feedback loop: the event arms
@@ -205,6 +215,7 @@ impl TerminalUi {
                 input: tx_geometry,
                 reported: Default::default(),
                 animating: Arc::new(AtomicBool::new(false)),
+                generation: Arc::new(AtomicU64::new(0)),
             },
             rx,
         ))
@@ -279,15 +290,20 @@ impl TerminalUi {
             return;
         }
         self.animating.store(moving, Ordering::Relaxed);
+        // Claimed whichever way this went, so a ticker that was asleep across a stop finds itself
+        // superseded rather than finding the flag back on and deciding it is still the one.
+        let mine = self.generation.fetch_add(1, Ordering::Relaxed) + 1;
         if !moving {
             return;
         }
         let flag = self.animating.clone();
+        let generation = self.generation.clone();
         let tx = self.input.clone();
         tokio::spawn(async move {
-            // Re-checked each tick rather than held for the lifetime of the task, so the ticker
-            // stops itself the moment a frame comes back still.
-            while flag.load(Ordering::Relaxed) {
+            // Both re-checked each tick rather than held for the lifetime of the task, so the
+            // ticker stops itself the moment a frame comes back still — and there is never more
+            // than one of them, whatever order the starts and stops arrive in.
+            while flag.load(Ordering::Relaxed) && generation.load(Ordering::Relaxed) == mine {
                 tokio::time::sleep(MOTION_FRAME).await;
                 if tx.send(InputEvent::Repaint).is_err() {
                     return;

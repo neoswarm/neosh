@@ -615,7 +615,7 @@ impl Live {
             .stderr(Stdio::null())
             .kill_on_drop(true)
             .spawn()
-            .map_err(|e| format!("could not run {program:?}: {e}"))?;
+            .map_err(|e| super::spawn_failed(program, Some(&workdir), &e))?;
         let stdin = child.stdin.take().ok_or("agy: stdin was not piped")?;
         let stdout = child.stdout.take().ok_or("agy: stdout was not piped")?;
         Ok(Self {

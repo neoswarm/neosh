@@ -644,7 +644,7 @@ async fn discover(program: &str) -> Result<Vec<ModelInfo>, ProviderError> {
         .stderr(Stdio::null())
         .kill_on_drop(true)
         .spawn()
-        .map_err(|e| ProviderError::Transport(format!("could not run {program} app-server: {e}")))?;
+        .map_err(|e| ProviderError::Transport(super::spawn_failed(program, None, &e)))?;
 
     let mut stdin = child.stdin.take().expect("stdin was piped");
     let stdout = child.stdout.take().expect("stdout was piped");
@@ -1106,7 +1106,7 @@ impl Live {
             .stderr(Stdio::piped())
             .kill_on_drop(true);
         let mut child =
-            cmd.spawn().map_err(|e| format!("could not run {program} app-server: {e}"))?;
+            cmd.spawn().map_err(|e| super::spawn_failed(program, Some(cwd), &e))?;
         let stdout = child.stdout.take().expect("stdout was piped");
         let stderr = child.stderr.take().expect("stderr was piped");
         let stdin = child.stdin.take().expect("stdin was piped");

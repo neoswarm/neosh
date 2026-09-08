@@ -126,6 +126,8 @@ With a relative root, neosh writes the directory into the repository's `.gitigno
 
 On a worktree's sidebar row: `y` copies its path for the shell you are about to `cd` in, `p` pulls its repository from the remote, and `d` removes the checkout from disk. The branch stays, it asks first, and it tells you how many conversations go with it.
 
+`p` marks the row busy from the press rather than from the network call three steps down: the badge is led with a spinner while anything is out to a remote, so a key on a large checkout is never a second of nothing happening. It stops while the *rebase or merge* question is on screen — nothing on this machine is working while you are reading two options.
+
 It works the other way round too. A worktree exists for the conversations in it, so deleting the last one — `X` on the row, `X` or `^X` in the archive, `archive.sweep` — removes the checkout as well, and the dialog says so: which directory, that the branch stays, and how many uncommitted changes go with it. `X` on a worktree's own row does the same. The repository itself is never removed; `X` on its heading only takes the row off the list. Pictures pasted into a conversation go with it as well.
 
 ## Generated branch names and commit messages
