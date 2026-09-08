@@ -1499,7 +1499,7 @@ impl Live {
         cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
 
         let mut child =
-            cmd.spawn().map_err(|e| format!("could not run {program:?}: {e}"))?;
+            cmd.spawn().map_err(|e| super::spawn_failed(program, Some(&launch.cwd), &e))?;
         let stdout = child.stdout.take().expect("stdout was piped");
         let stderr = child.stderr.take().expect("stderr was piped");
         let stdin = child.stdin.take().expect("stdin was piped");

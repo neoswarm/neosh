@@ -771,7 +771,9 @@ impl Provider for AcpProvider {
                 .stderr(Stdio::piped());
             let mut child = match cmd.spawn() {
                 Ok(c) => c,
-                Err(e) => return fail(tx, format!("could not run {program:?}: {e}")).await,
+                Err(e) => {
+                    return fail(tx, super::spawn_failed(&program, Some(&workdir), &e)).await;
+                }
             };
 
             let stdin = child.stdin.take().expect("stdin was piped");

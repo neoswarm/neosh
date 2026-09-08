@@ -560,7 +560,7 @@ pub async fn codex_usage(program: &str) -> Result<Option<Quota>, ProviderError> 
         .stderr(Stdio::null())
         .kill_on_drop(true)
         .spawn()
-        .map_err(|e| ProviderError::Transport(format!("could not run {program} app-server: {e}")))?;
+        .map_err(|e| ProviderError::Transport(crate::drivers::spawn_failed(program, None, &e)))?;
 
     let mut stdin = child.stdin.take().expect("stdin was piped");
     let stdout = child.stdout.take().expect("stdout was piped");

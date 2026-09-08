@@ -142,3 +142,74 @@ pub trait Unasked: Send + Sync + std::fmt::Debug {
         tasks: Vec<neosh_proto::BackgroundTask>,
     );
 }
+
+/// Why spawning a vendor CLI failed, said about the thing that is actually missing.
+///
+/// `Command::spawn` reports a working directory it cannot `chdir` into exactly as it reports a
+/// program it cannot find: `ENOENT`, "no such file or directory". So a conversation whose
+/// directory has been deleted — a worktree removed by hand, a project moved, a checkout on a
+/// volume that is no longer mounted — failed with `could not run "claude": no such file or
+/// directory`, which is a sentence about `claude`. Every other conversation in the same workspace
+/// went on working, because they are the same binary in a directory that still exists, and the
+/// one thing on screen said the one thing that was not the problem.
+///
+/// So the two are told apart before the error is written, by asking the questions the kernel
+/// answered with one bit: is the directory there, and is the program. Both are cheap, both happen
+/// only on the failure path, and either way the sentence names something the reader can go and
+/// look at.
+pub(crate) fn spawn_failed(
+    program: &str,
+    cwd: Option<&std::path::Path>,
+    e: &std::io::Error,
+) -> String {
+    if e.kind() == std::io::ErrorKind::NotFound {
+        // The directory first: it is the half that is invisible from the message, and a
+        // conversation is far more likely to outlive its checkout than its agent.
+        if let Some(dir) = cwd.filter(|d| !d.as_os_str().is_empty() && !d.is_dir()) {
+            return format!(
+                "{program} could not start here: {} no longer exists. \
+                 A conversation runs in its own directory, so put that one back \
+                 or start this work in one that is there.",
+                dir.display()
+            );
+        }
+        if claude_cli::which(program).is_none() {
+            return format!("could not run {program:?}: it is not on PATH");
+        }
+    }
+    format!("could not run {program:?}: {e}")
+}
+
+#[cfg(test)]
+mod spawn_failure_tests {
+    use super::spawn_failed;
+
+    fn enoent() -> std::io::Error {
+        std::io::Error::from_raw_os_error(2)
+    }
+
+    #[test]
+    fn a_conversation_whose_directory_is_gone_says_so_rather_than_blaming_the_agent() {
+        // The bug this exists for: one conversation in a workspace fails with `could not run
+        // "claude": no such file or directory` while every other one works, because the kernel
+        // reports a `chdir` it cannot do and a program it cannot find with the same errno.
+        let missing = std::path::Path::new("/definitely/not/a/directory/anywhere");
+        let said = spawn_failed("claude", Some(missing), &enoent());
+        assert!(said.contains("/definitely/not/a/directory/anywhere"), "got: {said}");
+        assert!(!said.contains("could not run"), "still blaming the program: {said}");
+    }
+
+    #[test]
+    fn a_program_that_is_not_installed_says_which_one_and_where_it_looked() {
+        let here = std::env::temp_dir();
+        let said = spawn_failed("neosh-definitely-not-installed", Some(&here), &enoent());
+        assert!(said.contains("not on PATH"), "got: {said}");
+    }
+
+    #[test]
+    fn anything_else_keeps_the_error_the_os_gave() {
+        let denied = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
+        let said = spawn_failed("claude", None, &denied);
+        assert!(said.contains("could not run"), "got: {said}");
+    }
+}
