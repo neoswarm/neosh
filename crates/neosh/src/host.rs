@@ -6153,8 +6153,19 @@ impl Host {
             say(&mut rows, tag, vec![(2, 2 + "neosh".len(), "Accent"), (2 + "neosh".len(), len, "Comment")]);
         }
         rows.push(String::new());
-        say(&mut rows, format!("  model      {model}"), vec![(0, 13, "Comment")]);
-        say(&mut rows, format!("  directory  {}", tilde(&self.cwd)), vec![(0, 13, "Comment")]);
+        // Fitted, because neither of these is a sentence this file gets to keep short. A model id
+        // is a catalogue's and an account's, and a directory is the user's — `tilde` takes `$HOME`
+        // off the front and there is nothing else to give. Nothing wraps the welcome, so a row
+        // longer than the pane becomes a second line at column zero under an indented one, which
+        // is exactly what the note under the next row is about; the difference is that that one
+        // could be hand-shortened and these cannot.
+        //
+        // The path is cut from the *front*: the end of a directory is the part that says which one
+        // it is, and `…/neosh/work` is an answer where `/Users/you/very/deep/pr…` is not.
+        let room = width.saturating_sub(13);
+        say(&mut rows, format!("  model      {}", elide(&model, room)), vec![(0, 13, "Comment")]);
+        let cwd = tilde(&self.cwd);
+        say(&mut rows, format!("  directory  {}", elide_start(&cwd, room)), vec![(0, 13, "Comment")]);
         rows.push(String::new());
         // Said only when it is true: there is no conversation anywhere, so nothing else on screen
         // is going to tell you that typing is how one starts.
@@ -15229,6 +15240,31 @@ fn elide(s: &str, room: usize) -> String {
         used += w;
     }
     out.push('\u{2026}');
+    out
+}
+
+/// `s`, or as much of its *end* as fits in `room` columns with an `…` where the front went.
+///
+/// [`elide`]'s mirror, and the right one for a path: what a directory is called is the last
+/// segment or two, so cutting the front of `/Users/you/src/neosh/work` leaves `…/neosh/work`
+/// while cutting the back leaves `/Users/you/src/n…`, which names nothing.
+fn elide_start(s: &str, room: usize) -> String {
+    if display_width(s) <= room {
+        return s.to_string();
+    }
+    let Some(budget) = room.checked_sub(1) else { return String::new() };
+    let mut tail: Vec<&str> = Vec::new();
+    let mut used = 0usize;
+    for g in s.graphemes(true).rev() {
+        let w = display_width(g);
+        if used + w > budget {
+            break;
+        }
+        tail.push(g);
+        used += w;
+    }
+    let mut out = String::from("\u{2026}");
+    out.extend(tail.into_iter().rev());
     out
 }
 
