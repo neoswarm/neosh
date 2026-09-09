@@ -12,6 +12,8 @@ use std::time::{Duration, Instant};
 
 use serde_json::Value;
 
+mod support;
+
 const BUDGET: Duration = Duration::from_secs(30);
 
 struct Sandbox {
@@ -26,8 +28,7 @@ impl Drop for Sandbox {
 
 impl Sandbox {
     fn new(name: &str) -> Self {
-        let root = std::env::temp_dir().join(format!("neosh-sess-{}-{name}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
+        let root = support::sandbox_root("ss", name);
         for d in ["config", "state", "work", "other"] {
             std::fs::create_dir_all(root.join(d)).expect("sandbox dirs");
         }

@@ -9,6 +9,8 @@
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
+mod support;
+
 struct Sandbox {
     root: PathBuf,
 }
@@ -21,8 +23,7 @@ impl Drop for Sandbox {
 
 impl Sandbox {
     fn new(name: &str) -> Self {
-        let root = std::env::temp_dir().join(format!("neosh-pm-{}-{name}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
+        let root = support::sandbox_root("pm", name);
         for d in ["config", "data", "state", "src", "work"] {
             std::fs::create_dir_all(root.join(d)).expect("sandbox dirs");
         }
