@@ -15,6 +15,8 @@ use std::time::{Duration, Instant};
 
 use neosh_proto::{ClientMessage, DetachReason, InputEvent, ServerMessage, UiEvent};
 
+mod support;
+
 /// How long any "wait until" in here is allowed to take.
 ///
 /// Generous, because a cold workspace boots deno and discovers plugins before it binds, and CI is
@@ -45,9 +47,7 @@ impl Drop for Sandbox {
 
 impl Sandbox {
     fn new(name: &str) -> Self {
-        let root =
-            std::env::temp_dir().join(format!("neosh-workspace-{}-{name}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
+        let root = support::sandbox_root("ws", name);
         for d in ["config", "state", "work", "run"] {
             std::fs::create_dir_all(root.join(d)).expect("sandbox dirs");
         }

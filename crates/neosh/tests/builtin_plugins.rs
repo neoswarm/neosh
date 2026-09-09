@@ -22,6 +22,8 @@ use std::time::{Duration, Instant};
 
 use serde_json::Value;
 
+mod support;
+
 const BUDGET: Duration = Duration::from_secs(30);
 
 struct Sandbox {
@@ -44,8 +46,7 @@ impl Sandbox {
     /// failure in whichever of the pair happened to be slower, which moves from run to run, which
     /// is exactly what a flaky test looks like from the outside.
     fn new(name: &str) -> Self {
-        let root = std::env::temp_dir().join(format!("neosh-builtin-{}-{name}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
+        let root = support::sandbox_root("bp", name);
         // `claude` and `codex` are the vendors' own homes, empty unless a test fills one. See
         // `Sandbox::write_usage_history`.
         for d in ["config", "state", "work", "claude/projects", "codex/sessions"] {

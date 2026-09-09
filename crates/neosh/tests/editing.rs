@@ -15,6 +15,8 @@ use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
+mod support;
+
 const BUDGET: Duration = Duration::from_secs(20);
 
 struct Sandbox {
@@ -29,8 +31,7 @@ impl Drop for Sandbox {
 
 impl Sandbox {
     fn new(name: &str) -> Self {
-        let root = std::env::temp_dir().join(format!("neosh-edit-{}-{name}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
+        let root = support::sandbox_root("ed", name);
         for d in ["config", "state", "work"] {
             std::fs::create_dir_all(root.join(d)).expect("dirs");
         }
@@ -467,13 +468,21 @@ fn select_all_while_reading_takes_the_whole_transcript() {
     let sb = Sandbox::new("readall");
     let mut s = sb.start();
     s.ready();
-    assert!(s.pump(|s| s.chat().iter().any(|l| l.contains("neosh"))));
+    assert!(s.pump(|s| s.chat().iter().any(|l| l.contains("terminal-first"))));
 
     s.press(json!({"kind": "char", "c": "s"}), &["ctrl"]);
     s.ch("y");
     s.ch("a");
+    // Two rows that are several apart, because one of them is what a *line* copy would also have
+    // got and the claim here is that `ya` took the block. This used to look for `neosh`, which is
+    // not in the welcome at all — the word is drawn as the logo — so what it was really matching
+    // was the sandbox's own directory in the `directory` row, and the test passed or failed on
+    // what the temporary folder had been called.
     assert!(
-        s.pump(|s| s.copied().iter().any(|t| t.contains("neosh"))),
+        s.pump(|s| s
+            .copied()
+            .iter()
+            .any(|t| t.contains("terminal-first") && t.contains("model"))),
         "everything, not just the line under the cursor: {:?}",
         s.copied()
     );
