@@ -63,6 +63,21 @@ impl Sandbox {
         std::fs::write(self.root.join("config/config.toml"), contents).expect("write config");
     }
 
+    /// Give `work/` an origin, so it has an identity other machines can agree with.
+    ///
+    /// A `ProjectKey` is the normalised origin URL, and without one a checkout falls back to
+    /// `dir:<name>` — which is a guess, and here it would be a guess that happened to work, since
+    /// both sides would be guessing from a directory the test named. Setting a remote makes the
+    /// merge test assert the thing that actually happens in a workspace.
+    fn git_remote(&self, url: &str) {
+        let out = Command::new("git")
+            .current_dir(self.work())
+            .args(["remote", "add", "origin", url])
+            .output()
+            .expect("git runs");
+        assert!(out.status.success(), "git remote add: {}", String::from_utf8_lossy(&out.stderr));
+    }
+
     /// Make `work/` a git repository, so the git-dependent plugins have something to report.
     fn git_init(&self) {
         let run = |args: &[&str]| {
@@ -9836,4 +9851,242 @@ fn the_clone_destination_offers_the_configured_root_first() {
         rows.iter().any(|l| l.contains("clone.root")),
         "and it says which setting put it there\n{rows:?}"
     );
+}
+
+/* -------------------------------------------------------------------------- */
+/* Another computer's work, in this computer's tree                           */
+/* -------------------------------------------------------------------------- */
+
+/// A peer, played by a bare swarm node in this process.
+///
+/// The alternative is a second whole neosh — a second process, a second config directory and a
+/// second screen to read — for a machine whose entire contribution to this test is an inventory and
+/// a list of projects. What is under test is what *this* workspace does with those two things.
+///
+/// The runtime is held because the node's tasks live on it: dropped, the peer stops mid-handshake
+/// and the workspace under test correctly reports a machine that went away.
+struct Peer {
+    _rt: tokio::runtime::Runtime,
+    handle: neosh_swarm::SwarmHandle,
+    _events: tokio::sync::mpsc::UnboundedReceiver<neosh_swarm::SwarmEvent>,
+}
+
+impl Peer {
+    /// Stand one up, authorised by and authorising the workspace in `sb`.
+    ///
+    /// The workspace's identity is minted *here*, before it starts, which is the whole trick:
+    /// pairing is mutual and each side has to name the other's key, so somebody has to know both
+    /// before either is running. `Identity::load_or_create` writes it where the workspace will look.
+    fn beside(sb: &Sandbox, name: &str) -> Self {
+        // Bind to learn a port and let go again. A fixed one cannot run twice at once, and this
+        // suite runs several tests at a time.
+        let probe = std::net::TcpListener::bind("127.0.0.1:0").expect("probe");
+        let addr = probe.local_addr().expect("addr");
+        drop(probe);
+
+        let state = sb.root.join("state");
+        std::fs::create_dir_all(&state).expect("state dir");
+        let mine = neosh_swarm::Identity::load_or_create(&neosh_swarm::identity::key_path(&state))
+            .expect("this workspace's key");
+        let theirs = neosh_swarm::Identity::ephemeral();
+
+        sb.write_config(&format!(
+            "[swarm]\nenabled = true\nlisten = \"\"\nheartbeat_secs = 1\n\n\
+             [[swarm.peers]]\naddr = \"{addr}\"\nid = \"{}\"\nname = \"{name}\"\n",
+            theirs.id()
+        ));
+
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("a runtime for the peer");
+        let guard = rt.enter();
+        let allowed = neosh_swarm::Allowed::load(None);
+        allowed.add(mine.id().clone(), neosh_swarm::AllowedPeer {
+            name: "the workspace under test".into(),
+            alias: None,
+            addr: None,
+            source: neosh_swarm::Source::Paired,
+        });
+        let cfg = neosh_swarm::SwarmConfig {
+            name: name.into(),
+            listen: Some(addr),
+            accepts_commands: true,
+            heartbeat: Duration::from_millis(200),
+            ..Default::default()
+        };
+        let (handle, events) =
+            neosh_swarm::node::spawn(std::sync::Arc::new(theirs), allowed, cfg, "0.4.6".into());
+        drop(guard);
+        Self { _rt: rt, handle, _events: events }
+    }
+
+    /// Say what this machine has and what is open in it.
+    fn publish(
+        &self,
+        projects: Vec<neosh_proto::RemoteProject>,
+        agents: Vec<neosh_proto::AgentSummary>,
+    ) {
+        self.handle.send(neosh_swarm::SwarmRequest::Projects { projects });
+        self.handle.send(neosh_swarm::SwarmRequest::Publish { full: true, agents, gone: Vec::new() });
+    }
+}
+
+/// One conversation on the peer, in one of its directories.
+fn there(session: &str, label: &str, key: &str, cwd: &str, root: &str, branch: Option<&str>) -> neosh_proto::AgentSummary {
+    neosh_proto::AgentSummary {
+        session: neosh_proto::SessionId(session.into()),
+        project: neosh_proto::ProjectKey(key.into()),
+        project_name: match branch {
+            Some(b) => format!("work · {b}"),
+            None => "work".into(),
+        },
+        cwd: cwd.into(),
+        repo_root: Some(root.into()),
+        branch: branch.map(str::to_string),
+        label: label.into(),
+        state: neosh_proto::AgentState::Idle,
+        message_count: 1,
+        model: None,
+        turn_started_at: None,
+        updated_at: now_secs(),
+        usage: Default::default(),
+    }
+}
+
+/// One of the peer's checkouts, whether or not anything is open in it.
+fn theirs(key: &str, name: &str, cwd: &str, root: &str, branch: Option<&str>) -> neosh_proto::RemoteProject {
+    neosh_proto::RemoteProject {
+        key: neosh_proto::ProjectKey(key.into()),
+        name: name.into(),
+        cwd: cwd.into(),
+        repo_root: Some(root.into()),
+        branch: branch.map(str::to_string),
+        active: false,
+        sessions: 0,
+        running: 0,
+    }
+}
+
+/// A repository you both have is **one row**, and the other machine's work is inside it.
+///
+/// The bug this pins down drew it as two: local conversations were grouped by directory and matched
+/// against remote ones on a key the local side never had — inferred from the remote agent's `cwd`,
+/// so the two only met when both machines happened to have the repository at the same absolute
+/// path. They never do. The repository you were sitting in appeared once as yours and once again
+/// below as a project you had never heard of, named after whichever remote conversation sorted
+/// first — which for a worktree is `work · fix/thing`, a display string being used as a key.
+#[test]
+fn a_repository_on_two_computers_is_one_row_with_both_lots_of_work_in_it() {
+    const KEY: &str = "git:github.com/neoswarm/work";
+    let sb = Sandbox::new("swarm-one-tree");
+    sb.git_init();
+    sb.git_remote("https://github.com/neoswarm/work.git");
+    let peer = Peer::beside(&sb, "linux-box");
+    // Deliberately nothing like the local path: that difference is the whole point.
+    peer.publish(
+        vec![theirs(KEY, "work", "/srv/checkouts/work", "/srv/checkouts/work", None)],
+        vec![
+            there("r1", "reading the parser", KEY, "/srv/checkouts/work", "/srv/checkouts/work", None),
+            there("r2", "chasing the flake", KEY, "/srv/checkouts/work/.wt/fix", "/srv/checkouts/work", Some("fix/the-thing")),
+        ],
+    );
+
+    let mut s = sb.start();
+    s.wait_for("PROJECTS");
+    assert!(
+        s.pump(|s| s.sidebar_now().iter().any(|l| l.contains("reading the parser"))),
+        "the other machine's conversation arrives at all:\n{:?}",
+        s.sidebar_now()
+    );
+
+    let rows = s.sidebar_now();
+    let named = |needle: &str| rows.iter().position(|l| l.contains(needle));
+
+    // One project row, not two. `work · fix/thing` was the second one, and it is the display string
+    // the old grouping mistook for an identity.
+    assert!(
+        !rows.iter().any(|l| l.contains("work · ") || l.contains("work \u{b7} ")),
+        "a worktree is never a project named after a branch:\n{rows:?}"
+    );
+    let heads = rows.iter().filter(|l| l.contains("work") && !l.contains("\u{2387}")).count();
+    assert_eq!(heads, 1, "one row for one repository:\n{rows:?}");
+
+    // Their main checkout's conversation sits under the repository with ours, and their worktree is
+    // a checkout row one level down — exactly where a local worktree goes.
+    let repo = named("work").expect("the repository row");
+    let mine = named("reading the parser").expect("their main-checkout conversation");
+    let tree = named("fix/the-thing").expect("their worktree, as a checkout row");
+    let inside = named("chasing the flake").expect("the conversation in their worktree");
+    assert!(repo < mine && mine < tree && tree < inside, "nested, in order:\n{rows:?}");
+
+    // And every one of those rows says it is not here. One column, and the colour is the link.
+    for row in [mine, tree, inside] {
+        assert!(rows[row].contains('@'), "row {row} says it is elsewhere:\n{rows:?}");
+    }
+}
+
+/// A checkout on a machine that has not allowed this one is not a row.
+///
+/// Its project list arrived in the handshake — the half of pairing that did happen — so this is not
+/// about what may be shown. `waiting` is the far end explicitly saying no, and a one-sided pairing
+/// filling your column with somebody else's repositories is a list growing on its own.
+#[test]
+fn a_machine_that_has_not_allowed_this_one_contributes_no_rows() {
+    const KEY: &str = "git:github.com/neoswarm/other";
+    let sb = Sandbox::new("swarm-unapproved");
+    sb.git_init();
+    sb.git_remote("https://github.com/neoswarm/work.git");
+    // Authorised *by* us and not authorising us back, which is what leaves the link `waiting`.
+    let probe = std::net::TcpListener::bind("127.0.0.1:0").expect("probe");
+    let addr = probe.local_addr().expect("addr");
+    drop(probe);
+    let state = sb.root.join("state");
+    std::fs::create_dir_all(&state).expect("state dir");
+    let _mine = neosh_swarm::Identity::load_or_create(&neosh_swarm::identity::key_path(&state))
+        .expect("this workspace's key");
+    let theirs_id = neosh_swarm::Identity::ephemeral();
+    sb.write_config(&format!(
+        "[swarm]\nenabled = true\nlisten = \"\"\nheartbeat_secs = 1\n\n\
+         [[swarm.peers]]\naddr = \"{addr}\"\nid = \"{}\"\nname = \"stranger\"\n",
+        theirs_id.id()
+    ));
+    let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build().expect("runtime");
+    let guard = rt.enter();
+    // An empty allow-list: it does not know us, so it hangs up after proving who it is.
+    let cfg = neosh_swarm::SwarmConfig {
+        name: "stranger".into(),
+        listen: Some(addr),
+        accepts_commands: true,
+        heartbeat: Duration::from_millis(200),
+        ..Default::default()
+    };
+    let (handle, _events) = neosh_swarm::node::spawn(
+        std::sync::Arc::new(theirs_id),
+        neosh_swarm::Allowed::load(None),
+        cfg,
+        "0.4.6".into(),
+    );
+    handle.send(neosh_swarm::SwarmRequest::Projects {
+        projects: vec![theirs(KEY, "other", "/srv/other", "/srv/other", None)],
+    });
+    drop(guard);
+
+    let mut s = sb.start();
+    s.wait_for("PROJECTS");
+    // Long enough for a dial, a handshake and the refusal that ends it — the panel redraws on the
+    // swarm change either way, so what is asserted is that nothing arrived rather than that it has
+    // not arrived yet.
+    assert!(
+        s.pump(|s| s.sidebar_now().iter().any(|l| l.contains("work"))),
+        "our own project is drawn:\n{:?}",
+        s.sidebar_now()
+    );
+    let rows = s.sidebar_now();
+    assert!(
+        !rows.iter().any(|l| l.contains("other")),
+        "nothing from a machine that has not allowed this one:\n{rows:?}"
+    );
+    drop(handle);
+    drop(rt);
 }
