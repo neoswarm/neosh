@@ -287,31 +287,83 @@ is `docs/releasing.md`.
   room. What the row has to carry is one bit — not here — and one fact you cannot act without:
   whether that machine can be reached, because `↵` on a row is *open and steer it* against a peer
   that is up and nothing at all against one that is not, and the two were drawn identically. So it
-  is a cloud in the gutter, `Swarm.Up` green when the link is up, `Swarm.Linking` pulsing amber
+  is one column of `@`, `Swarm.Up` green when the link is up, `Swarm.Linking` pulsing amber
   while it is being dialled, `Swarm.Waiting` while it is a person at the far end being waited on,
   `Swarm.Down` dim when nothing is dialling it. Up and down are **still**: a link that is up is a
   condition rather than an event and the glyph is on every remote row at once, so motion on all of
   them is the panel vibrating. Which computer, and what the link is doing in words, is the **key
-  card** — it appears beside the row you pause on and a border has room for a sentence. And the
+  card** — it appears beside the row you pause on and a border has room for a sentence. **`@`
+  rather than a cloud**, because a cloud is the world's mark for "not on this machine" everywhere
+  except a terminal: what it actually reads as there is a cloud *service*, which is precisely the
+  wrong idea about a laptop on the same desk. `ssh you@box` is a thing everybody in a terminal has
+  typed, and it is ASCII, so there is no fallback glyph and no font that draws it at a width
+  nobody expected. And the
   panel is built from `swarm.nodes()` rather than `swarm.agents()`, which is the same list minus
   the machines that are not up: that filter is right for *what can I act on* and wrong for a list,
   because a machine going quiet does not take its conversations off your screen, it takes them out
   of reach, and a list that silently shortens is one you cannot tell from a list that never had
   them.
-- **A project that is only on other computers is a project row.** Same arrow in the same column,
-  same name beside it, same count on the right — because it is the same kind of thing, and a row
-  that reads differently is one you have to learn separately. It was an inert line with a `▹` on it
-  and the machine names where the count goes, which said "not one of yours" three ways at once,
-  none of them the way the panel says anything else. Its own `Target` kind rather than a `project`
-  with somebody else's path in it: every verb bound against a project — fold, rename, archive,
+- **A project is an identity, and a checkout is a machine and a path.** The panel grouped local
+  conversations by directory and drew the other machines' work beside it — matched, in theory, on
+  the project key, and in practice on a key the local side did not have: it was inferred from a
+  remote agent's *cwd*, so the two only ever met when both machines happened to have the repository
+  at the same absolute path. On any real pair of machines — `/Users/me/src/neosh` and
+  `/home/me/neosh` — they never met, so the repository you were sitting in appeared **twice**: once
+  as yours, and once again underneath as a project you had apparently never heard of, named `neosh ·
+  fix/thing` because whichever remote conversation happened to sort first decided the name. That
+  last part is the shape of the whole bug: `project_name` is a display string being used as a
+  grouping key, and a display string parsed back apart is how a worktree ends up as a project with a
+  branch stuck on the end of it, beside the row it belongs *under*. So there is one row per
+  repository and the checkouts hang from it: `SessionInfo::project_key` is what the local side was
+  missing, `AgentSummary::repo_root` and `branch` are what let a peer's tree nest rather than arrive
+  as a project named after a branch, and `RemoteProject` carries both as well so that a tree with
+  nothing open in it does not jump to the top level — a panel that reorganises itself when the last
+  conversation in a directory ends is one you cannot learn. The main checkout's conversations sit
+  directly under the repository, here and over there in **one list**, because they are the same work
+  in different places; everything else is a row one level down named by its branch. Two checkouts of
+  one branch on two machines stay two rows: same name, different disks, different uncommitted work,
+  and merging them would be a claim that is simply false. A repository wears the marker only when it
+  is **not** here as well — on a swarm of two machines nearly every row is partly elsewhere, and
+  what is true of every row does not earn a column on each of them; where it is news is a repository
+  you have no clone of, which is the row you would otherwise press `↵` on expecting your own files.
+  It keeps its own `Target` kind, because every verb bound against a project — fold, rename, archive,
   delete, remove from the list — is about a directory on *this* disk, and pointing one at a path
-  that is not here is how a key deletes the wrong thing. It folds on the project *key*, since there
-  is no directory to name it by, and that key is also what `same` compares — left to fall through
-  to `kind === kind` every one of them was the same row and the cursor snapped to the first on
-  every redraw.
+  that is not here is how a key deletes the wrong thing. It folds on the project *key*, and a remote
+  tree on `<node>:<path>`, since there is no directory here to name either by — and that key is also
+  what `same` compares, or the cursor snaps to the first of them on every redraw.
+- **A verb about a machine goes on a row about that machine.** `^J` is the list of computers and is
+  where one is added, renamed or removed; it is not where you find out that a link has dropped. The
+  row is: a project greyed with a dim `@` is the moment somebody wants to reconnect, and sending
+  them to a panel they have to already know exists is the panel answering a question with a
+  scavenger hunt. So `c` connects and `C` disconnects, on any row that is about another machine, and
+  the message that says it disconnected also says which key takes it back. `t` is the same argument
+  one step further and is why it is not two keys: a terminal in the project under the cursor, on
+  whichever machine that project is on. What a terminal is *for* is running something beside an
+  agent that has just finished, and where that agent is running is exactly where the terminal has to
+  be — a `t` that worked on local rows and not on remote ones would be this panel's own claim, that
+  work over there is not a different kind of thing, contradicted on the one key where it matters.
+- **A shell on another machine is bytes, and the emulator is on the side that draws.** Which is how
+  ssh is arranged and for its three reasons: a full-screen program works, the side doing the drawing
+  is authoritative about its own width, and the owner forwards a file descriptor rather than
+  maintaining a screen whose size it was told about. So `term::Pipe` is the whole of the difference
+  between a local terminal and a remote one and it is four methods wide — write, resize, close, and
+  where the bytes come in — while the parser, the scrollback, the cursor, the cells and the key
+  encoding stay in one copy, because those are the part that is hard to get right and none of it has
+  anything to do with sockets. `accepts_shells` is **both** a compatibility flag and a permission,
+  which is where it parts company with `browse`: that one is not a permission because a node
+  accepting commands has already given away strictly more — `NewSession` takes any `cwd` on its disk
+  — and a pty is not covered by anything, because `NewSession` starts an *agent*, a thing with a
+  permission layer over it and a transcript somebody can read afterwards, and a prompt is a prompt.
+  Off by default, checked on every open regardless of what the handshake advertised, said out loud
+  on the machine it happens on, and **closed when the link closes**: a shell has no timeout and no
+  idea the connection it was opened over has gone, so without that a laptop shutting its lid leaves
+  a login shell running on somebody else's computer with nothing on any screen pointing at it.
 - **Which computer is asked before where on it, and only when there is one to ask about.** With no
   machine paired — which is most workspaces — `^N` draws nothing extra and is the single key it has
-  always been. The moment a second computer exists, which one is the first thing you would have to
+  always been, and nor is it asked when the machines you *do* have are up and none of them has a
+  checkout of the repository you are in: that question has one possible answer, and a panel that
+  appears to confirm it is a keypress and a redraw spent on nothing. The moment a second computer
+  that could take the work exists, which one is the first thing you would have to
   decide anyway, and asking it *first* is what makes it a decision rather than a path field you
   have to know scp's spelling to use. This computer is the first row and the cursor starts on it,
   so `^N ⏎` is unchanged. Every paired machine is a row including the ones that cannot be used,
@@ -1367,6 +1419,8 @@ says how many are asking, `^T` is where you go, and it opens when you get there.
 | `J` `K` | Reorder within a group |
 | `r` | Rename a conversation |
 | `y` | Copy the row's directory — a worktree's path, ready to paste into a shell |
+| `t` | A **terminal** in this project, in a tab of its own — on this computer, or on the machine the row is on |
+| `c` `C` | Connect to that computer, or disconnect from it. Only on a row that is about another machine; `^J` is still where one is added or removed |
 | `p` | Bring that repository up to date — fast-forwards silently, asks *rebase or merge* when the branch has gone both ways, and goes and looks when nothing is waiting. The row spins from the press, not from the network call three steps down (a git-plugin contribution) |
 | `d` | Remove a worktree from disk — its branch stays, and it asks first (a git-plugin contribution) |
 | `x` `X` | Archive, delete. Deleting the last conversation in a worktree takes the checkout with it, and the dialog says so — the branch stays. On a repository's heading, `X` takes the project off the list and leaves the directory; on a worktree's, it removes the checkout too |
@@ -1399,9 +1453,13 @@ each fact is:
 ```
  PROJECTS
 ──────────────────────────────────
- ▾ neosh ↓3 ~1 ?1  #86 ✗2       4
+ ▾ neosh ↓3 ~1 ?1  #86 ✗2       6
+   ▸ Chasing the flake       12m
+   · Rework the tab bar      @
    ▾ ⎇ fix/the-thing ↑2  #91     1
-     ▸ Chasing the flake       12m
+     ▸ Try the grapheme path
+   ▾ ⎇ fix/tab-strip @          1
+     · Nearly there           @
 ```
 
 **There was a `GIT` heading with the branch and a verb under it, and it was saying twice what the

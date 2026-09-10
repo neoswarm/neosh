@@ -4982,8 +4982,13 @@ function legendTitle(target: Target | undefined): string {
       // The name of the machine, and what the link to it is doing — because `↵` on this row does
       // something quite different depending on the answer, and the row cannot say which.
       return `on ${clip(target.host, 24)}${target.link ? ` \u00b7 ${target.link}` : ""}`;
-    case "elsewhere":
-      return `only on ${clip(target.machines.map((m) => m.name).join(", "), 36)}`;
+    case "elsewhere": {
+      // Which machine, and what the link to it is doing — the two facts that came off the row when
+      // the machine's name did, and the two `↵` behaves completely differently on. A border has
+      // room for a sentence; a column of a narrow panel has room for one glyph.
+      const names = clip(target.machines.map((m) => m.name).join(", "), 30);
+      return `on ${names}${target.link ? ` \u00b7 ${target.link}` : ""}`;
+    }
     case "custom":
       return target.section ?? "this row";
     default:
