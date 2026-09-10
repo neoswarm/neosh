@@ -9857,6 +9857,16 @@ fn the_clone_destination_offers_the_configured_root_first() {
 /* Another computer's work, in this computer's tree                           */
 /* -------------------------------------------------------------------------- */
 
+/// Which way round a shell may be opened, for [`Peer::beside_with`].
+#[derive(Clone, Copy, Default)]
+struct Shells {
+    /// Whether the *peer* opens shells — what `t` in this workspace's panel needs.
+    theirs: bool,
+    /// Whether the workspace *under test* opens shells for the peer. Off by default, here as in a
+    /// real config, which is the state the refusal test asserts.
+    ours: bool,
+}
+
 /// A peer, played by a bare swarm node in this process.
 ///
 /// The alternative is a second whole neosh — a second process, a second config directory and a
@@ -9880,11 +9890,16 @@ impl Peer {
     /// pairing is mutual and each side has to name the other's key, so somebody has to know both
     /// before either is running. `Identity::load_or_create` writes it where the workspace will look.
     fn beside(sb: &Sandbox, name: &str) -> Self {
-        Self::beside_with(sb, name, false)
+        Self::beside_with(sb, name, Shells::default())
     }
 
-    /// The same, saying whether this machine opens shells for the one under test.
-    fn beside_with(sb: &Sandbox, name: &str, shells: bool) -> Self {
+    /// The same, saying which of the two machines will open a shell for the other.
+    ///
+    /// Two flags rather than one because they are two different decisions and this branch is about
+    /// both: `theirs` is what a peer advertises, which is what `t` in the panel needs, and `ours` is
+    /// `accepts_shells` in the config of the workspace under test — the direction where a bug means
+    /// somebody else's prompt on your machine.
+    fn beside_with(sb: &Sandbox, name: &str, shells: Shells) -> Self {
         // Bind to learn a port and let go again. A fixed one cannot run twice at once, and this
         // suite runs several tests at a time.
         let probe = std::net::TcpListener::bind("127.0.0.1:0").expect("probe");
@@ -9898,8 +9913,10 @@ impl Peer {
         let theirs = neosh_swarm::Identity::ephemeral();
 
         sb.write_config(&format!(
-            "[swarm]\nenabled = true\nlisten = \"\"\nheartbeat_secs = 1\n\n\
+            "[swarm]\nenabled = true\nlisten = \"\"\nheartbeat_secs = 1\n\
+             accepts_shells = {}\n\n\
              [[swarm.peers]]\naddr = \"{addr}\"\nid = \"{}\"\nname = \"{name}\"\n",
+            shells.ours,
             theirs.id()
         ));
 
@@ -9919,7 +9936,7 @@ impl Peer {
             name: name.into(),
             listen: Some(addr),
             accepts_commands: true,
-            accepts_shells: shells,
+            accepts_shells: shells.theirs,
             heartbeat: Duration::from_millis(200),
             ..Default::default()
         };
@@ -10178,7 +10195,7 @@ fn t_on_another_computers_row_opens_a_terminal_over_there() {
     let sb = Sandbox::new("swarm-shell");
     sb.git_init();
     sb.git_remote("https://github.com/neoswarm/work.git");
-    let mut peer = Peer::beside_with(&sb, "linux-box", true);
+    let mut peer = Peer::beside_with(&sb, "linux-box", Shells { theirs: true, ..Default::default() });
     // A repository this machine has no clone of, so it is a row of its own rather than nested
     // inside `work` — which is also the row somebody is most likely to want a shell on.
     peer.publish(vec![theirs(KEY, "faraway", "/srv/faraway", "/srv/faraway", None)], Vec::new());
@@ -10231,7 +10248,7 @@ fn a_machine_that_does_not_open_shells_says_so_and_says_which_setting() {
     let sb = Sandbox::new("swarm-noshell");
     sb.git_init();
     sb.git_remote("https://github.com/neoswarm/work.git");
-    let peer = Peer::beside_with(&sb, "linux-box", false);
+    let peer = Peer::beside_with(&sb, "linux-box", Shells::default());
     peer.publish(vec![theirs(KEY, "faraway", "/srv/faraway", "/srv/faraway", None)], Vec::new());
 
     let mut s = sb.start();
@@ -10252,5 +10269,221 @@ fn a_machine_that_does_not_open_shells_says_so_and_says_which_setting() {
         s.pump(|s| !s.tabline_now().contains("linux-box")),
         "no tab is left behind: {:?}",
         s.tabline_now()
+    );
+}
+
+impl Peer {
+    /// Ask the workspace under test for a shell, and wait for what it says.
+    ///
+    /// The other direction, and the one where a bug is a stranger's prompt on your machine. The
+    /// connection is symmetric once established, so this goes back down the link the workspace
+    /// dialled — which is also the shape a real peer would use.
+    fn ask_for_shell(&mut self, cwd: &str) -> Result<String, String> {
+        let node = self.wait_up();
+        self.handle.send(neosh_swarm::SwarmRequest::PtyOpen {
+            node,
+            id: "ask".into(),
+            cwd: Some(cwd.into()),
+            cols: 80,
+            rows: 24,
+        });
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        loop {
+            assert!(std::time::Instant::now() < deadline, "the workspace never answered");
+            let Some(event) = self.events.blocking_recv() else { panic!("the peer stopped") };
+            if let neosh_swarm::SwarmEvent::PtyOpened { result, .. } = event {
+                return result.map_err(|r| format!("{r:?}"));
+            }
+        }
+    }
+
+    /// The id of the workspace under test, once the link is up.
+    fn wait_up(&mut self) -> neosh_proto::NodeId {
+        if let Some(id) = &self.asker {
+            return id.clone();
+        }
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        loop {
+            assert!(std::time::Instant::now() < deadline, "the workspace never connected");
+            let Some(event) = self.events.blocking_recv() else { panic!("the peer stopped") };
+            if let neosh_swarm::SwarmEvent::PeerUp { node, .. } = event {
+                self.asker = Some(node.id.clone());
+                return node.id;
+            }
+        }
+    }
+}
+
+/// A workspace told to open shells opens one, and says so on the machine it happens on.
+///
+/// The direction where a mistake is somebody else's prompt on your machine, with your shell, your
+/// environment and your credentials, and nothing above it to say no. Which is why it is announced:
+/// a workspace that let it happen silently would be one where the setting is the only evidence it
+/// ever did.
+#[test]
+fn a_workspace_opens_a_shell_for_a_peer_only_when_told_to() {
+    let sb = Sandbox::new("swarm-serve-shell");
+    sb.git_init();
+    let mut peer = Peer::beside_with(&sb, "linux-box", Shells { ours: true, ..Default::default() });
+
+    let mut s = sb.start();
+    s.wait_for("PROJECTS");
+    let work = sb.work().display().to_string();
+    let pty = peer.ask_for_shell(&work).expect("a workspace that says yes opens one");
+    assert!(!pty.is_empty(), "and mints a handle for it");
+
+    assert!(
+        s.pump(|s| s.texts().iter().any(|t| t.contains("opened a shell here"))),
+        "and says so on the machine it is happening on:\n{}",
+        s.transcript()
+    );
+}
+
+/// And a peer that plays by the rules never asks, because the capability said no.
+///
+/// This is the *sender's* half and it is a courtesy, not the enforcement — which is exactly what
+/// the mutation says: making the owner stop checking leaves this test green, because the frame is
+/// never sent. What it does pin is the other reason the flag exists, which is compatibility: an
+/// unknown message tag fails the frame and takes the connection with it, so a peer that sent one on
+/// spec would knock a machine off the board rather than be told no.
+///
+/// [`a_workspace_refuses_a_shell_from_a_peer_that_asks_anyway`] is the enforcement.
+///
+/// `accepts_commands` is on by default and this is not, deliberately: starting an agent over there
+/// is a thing with a permission layer over it and a transcript somebody can read afterwards, and a
+/// pty is a prompt.
+#[test]
+fn a_well_behaved_peer_does_not_ask_for_a_shell_it_was_told_it_cannot_have() {
+    let sb = Sandbox::new("swarm-refuse-shell");
+    sb.git_init();
+    // The default: nothing in the config says `accepts_shells`.
+    let mut peer = Peer::beside_with(&sb, "linux-box", Shells::default());
+
+    let mut s = sb.start();
+    s.wait_for("PROJECTS");
+    let work = sb.work().display().to_string();
+    let refused = peer.ask_for_shell(&work).expect_err("a workspace that was not told refuses");
+    assert!(
+        refused.contains("NotPermitted"),
+        "and refuses by name rather than failing: {refused}"
+    );
+    assert!(
+        !s.texts().iter().any(|t| t.contains("opened a shell here")),
+        "and nothing was opened:\n{}",
+        s.transcript()
+    );
+}
+
+/// A peer that asks for a shell it was told it cannot have is **refused by the owner**.
+///
+/// The conformance point the well-behaved pair above cannot reach, and the only one that is a
+/// security property rather than a courtesy: `NodeCapabilities` is something the other side could
+/// have lied about or simply not read, so the owner checks on every open regardless of what its own
+/// handshake advertised. Mutating that check away leaves every other test in this file green.
+///
+/// So the peer here is a **raw ASCP client** rather than a `neosh_swarm` node: a node would refuse
+/// to send the frame on the sender's behalf, which is precisely the behaviour under test being
+/// assumed rather than checked. It does the real handshake — the id is proven, and it is on the
+/// workspace's allow-list — and then asks for something it has been told it cannot have, which is
+/// the shape of every peer worth defending against: authorised, and wrong.
+#[test]
+fn a_workspace_refuses_a_shell_from_a_peer_that_asks_anyway() {
+    use neosh_proto::{AscpMessage, NodeCapabilities, NodeInfo};
+
+    let sb = Sandbox::new("swarm-lying-peer");
+    sb.git_init();
+
+    let probe = std::net::TcpListener::bind("127.0.0.1:0").expect("probe");
+    let addr = probe.local_addr().expect("addr");
+    drop(probe);
+    let state = sb.root.join("state");
+    std::fs::create_dir_all(&state).expect("state dir");
+    let mine = neosh_swarm::Identity::load_or_create(&neosh_swarm::identity::key_path(&state))
+        .expect("this workspace's key");
+    let theirs = std::sync::Arc::new(neosh_swarm::Identity::ephemeral());
+    // `accepts_shells` absent, which is the default and the state under test.
+    sb.write_config(&format!(
+        "[swarm]\nenabled = true\nlisten = \"\"\nheartbeat_secs = 1\n\n\
+         [[swarm.peers]]\naddr = \"{addr}\"\nid = \"{}\"\nname = \"liar\"\n",
+        theirs.id()
+    ));
+
+    let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build().expect("runtime");
+    let allowed = neosh_swarm::Allowed::load(None);
+    allowed.add(mine.id().clone(), neosh_swarm::AllowedPeer {
+        name: "the workspace under test".into(),
+        alias: None,
+        addr: None,
+        source: neosh_swarm::Source::Paired,
+    });
+
+    // Listen, handshake, ask anyway, and report what came back.
+    let asked = rt.spawn({
+        let theirs = theirs.clone();
+        async move {
+            let sock = tokio::net::TcpListener::bind(addr).await.expect("listen");
+            let (mut stream, _) = sock.accept().await.expect("the workspace dials");
+            let info = NodeInfo {
+                id: theirs.id().clone(),
+                name: "liar".into(),
+                os: "test".into(),
+                version: "0.4.6".into(),
+            };
+            // Advertising `shells: true` about *itself* changes nothing about what it may ask for,
+            // and is what a peer built to try this would do.
+            let caps = NodeCapabilities {
+                accepts_commands: true,
+                accepts_approvals: false,
+                streams: true,
+                browse: true,
+                shells: true,
+                projects: Vec::new(),
+            };
+            neosh_swarm::accept(&mut stream, &theirs, &allowed, &info, &caps).await.expect("paired");
+            neosh_swarm::wire::write_message(&mut stream, &AscpMessage::PtyOpen {
+                id: "sneaky".into(),
+                cwd: None,
+                cols: 80,
+                rows: 24,
+            })
+            .await
+            .expect("sent regardless");
+            // Read past the heartbeats and the inventory for the answer to that one id.
+            loop {
+                match neosh_swarm::wire::read_message(&mut stream).await {
+                    Ok(Some(AscpMessage::Refused { id, refusal })) if id == "sneaky" => {
+                        return Some(Err(format!("{refusal:?}")));
+                    }
+                    Ok(Some(AscpMessage::PtyOpened { id, pty })) if id == "sneaky" => {
+                        return Some(Ok(pty));
+                    }
+                    Ok(Some(_)) => continue,
+                    _ => return None,
+                }
+            }
+        }
+    });
+
+    let mut s = sb.start();
+    s.wait_for("PROJECTS");
+    let answer = rt
+        .block_on(async {
+            tokio::time::timeout(Duration::from_secs(25), asked).await
+        })
+        .expect("the peer finished")
+        .expect("the peer did not panic");
+
+    match answer {
+        Some(Err(refusal)) => assert!(
+            refusal.contains("NotPermitted"),
+            "refused for the right reason rather than by failing: {refusal}"
+        ),
+        Some(Ok(pty)) => panic!("a shell was opened for a peer that was told it could not: {pty}"),
+        None => panic!("the connection ended without an answer — every request is answered once"),
+    }
+    assert!(
+        !s.texts().iter().any(|t| t.contains("opened a shell here")),
+        "and nothing was opened:\n{}",
+        s.transcript()
     );
 }
