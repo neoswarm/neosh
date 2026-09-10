@@ -13,6 +13,21 @@ export type RemoteProject = {
    */
   cwd: string;
   /**
+   * The main checkout this one is a tree of, on the owning node. See
+   * [`AgentSummary::repo_root`].
+   *
+   * Here as well as on the summary because the two lists answer different questions and a panel
+   * draws both: the summaries are the conversations open over there, and this is the places that
+   * machine *works in* — which includes the worktree you cleared out this morning. A tree that
+   * nests while it has a conversation in it and jumps to the top level when it does not is a
+   * panel that reorganises itself for a reason nobody can see.
+   */
+  repo_root?: string | null;
+  /**
+   * The branch checked out there, for naming the row. See [`AgentSummary::branch`].
+   */
+  branch?: string | null;
+  /**
    * Whether this node has a conversation open in it now.
    *
    * Meant something for exactly as long as this list was derived from live conversations: every

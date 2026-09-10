@@ -2001,6 +2001,24 @@ export interface SwarmApi {
    */
   browse(node: NodeId, prefix?: string): Promise<string[]>;
   /**
+   * Open a **shell** on another machine, in a tab of its own.
+   *
+   * The same terminal `<C-w>T` opens here, with the pty on the other end of a link: the emulator
+   * runs in this workspace, exactly as it does over ssh, and what crosses the wire is bytes. Every
+   * key goes to the child, `^C` interrupts *it*, and the window prefix is the one way out.
+   *
+   * `cwd` is a path on the **owner** — learnt from a conversation over there or from
+   * {@link NodeCapabilities.projects}, never invented — and `undefined` is that user's home
+   * directory.
+   *
+   * Rejects when the peer is not connected, when it is too old to have heard of the question, and,
+   * the one that is a decision rather than a fact, when it has not been told to open shells for
+   * other machines. That is `accepts_shells` under `[swarm]`, off by default and deliberately not
+   * covered by `accepts_commands`: starting an agent over there is a thing with a permission layer
+   * over it, and a prompt is not. The rejection names the setting.
+   */
+  shell(node: NodeId, cwd?: string): Promise<void>;
+  /**
    * Watch a remote conversation: its history now, then everything as it happens, delivered to
    * {@link onStream}.
    *
@@ -2491,6 +2509,9 @@ function build(
       },
       async browse(node, prefix) {
         return expect(await c({ call: "swarm_browse", node, prefix: prefix ?? "" }), "paths").paths;
+      },
+      async shell(node, cwd) {
+        await c({ call: "swarm_shell", node, cwd: cwd ?? null });
       },
       async subscribe(node, session) {
         await c({ call: "swarm_subscribe", node, session });

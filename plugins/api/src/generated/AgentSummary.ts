@@ -20,8 +20,32 @@ export type AgentSummary = {
   project: ProjectKey;
   /**
    * What that node calls the project — `neosh`, or `neosh · fix/thing` for a worktree.
+   *
+   * A label, and deliberately not what a panel groups by. `project` is the key; this is the
+   * sentence. A list that nested on this would be parsing a display format back apart, and
+   * `neosh · fix/thing` is exactly the string that made a remote worktree draw as a project
+   * with a branch name stuck on the end of it — beside the `neosh` row it belongs *under*.
    */
   project_name: string;
+  /**
+   * The main checkout of the repository `cwd` is in, **on the owning node**.
+   *
+   * [`neosh_proto::SessionInfo::repo_root`] over the wire, and here for the same reason: it is
+   * what lets a list *group* rather than merely label. Without it a peer's worktrees and its
+   * main checkout arrive as one undifferentiated run of conversations under one project key,
+   * and the only thing left to tell them apart is `project_name`, which is a display string.
+   *
+   * A path on somebody else's disk: compared against other paths from the same node, never
+   * resolved here. Equal to `cwd` in the main checkout; `None` outside a repository.
+   */
+  repo_root?: string | null;
+  /**
+   * The branch checked out at `cwd` there, `None` on a detached head or outside a repository.
+   *
+   * What a worktree row is *named*, here as locally — so a peer's tree reads `⎇ fix/thing`
+   * rather than repeating the repository's name in front of it.
+   */
+  branch?: string | null;
   /**
    * The working directory **on the owning node**. Shown, never opened: it is a path in somebody
    * else's filesystem and may not exist here at all.

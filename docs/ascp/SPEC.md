@@ -146,6 +146,7 @@ is an accident of who booted first.
 | `Command` / `Ack` / `Refused` | one per meaningful keystroke | on demand |
 | `Browse` / `Browsed` / `Refused` | one per keystroke in a directory field | on demand |
 | `Subscribe` / `Stream` | **one per token** | only while subscribed |
+| `Pty*` | **one per burst of terminal output** | only while a shell is open |
 
 That last row is the whole performance argument. Twenty machines streaming every token to everyone
 is a great deal of traffic to render a board nobody is reading. Inventory is cheap and
@@ -217,6 +218,40 @@ connection with it, so a node built before `Browse` existed cannot simply ignore
 therefore check the flag before sending. It defaults to `false`, which is exactly what an older
 node's handshake decodes to, so "does not say" and "cannot" are the same answer.
 
+### Pty
+
+`PtyOpen { id, cwd, cols, rows }` asks for a shell; `PtyOpened { id, pty }` answers with a handle, or
+`Refused` does. Everything afterwards carries that handle: `PtyData { pty, data }` in **both**
+directions, `PtyResize { pty, cols, rows }` from the drawing side only, `PtyClose { pty }` from
+either, and `PtyExit { pty, status }` from the owner when the shell goes on its own.
+
+**Bytes, not cells.** The shell runs on the owner and the terminal emulator runs on the viewer,
+which is how ssh is arranged and for the same three reasons: a full-screen program works, the side
+that is drawing is authoritative about its own width, and the owner is forwarding a file descriptor
+rather than maintaining a screen whose size it was told about. `data` is base64 because a pty
+carries whatever the program wrote — a lone `0x9b`, half a UTF-8 sequence split across two reads —
+and none of that is representable in a JSON string.
+
+The handle is minted by the **owner**, not taken from the asker's `id`, for the same reason a
+session id is the owner's: two diallers must not be able to collide, and the side that owns the
+process is the side that can guarantee they do not. `PtyClose` is idempotent and safe to send about
+a handle the other side has already forgotten — a close racing a close is the ordinary way a
+terminal ends.
+
+`NodeCapabilities::shells` is **both** a compatibility flag and a permission, which is where it
+parts company with `browse`. The compatibility half is identical: an unknown tag fails the frame, so
+a caller checks before sending and `false` is what an older handshake decodes to. The permission
+half is the difference. `browse` is not a permission because a node accepting commands has already
+given away strictly more — `NewSession` takes any `cwd` on its disk. A shell is not like that:
+`NewSession` starts an *agent*, which is a thing with a permission layer over it, a transcript, and
+somebody who can read afterwards what it did; a pty is a prompt, with that user's shell, environment
+and credentials, and nothing above it to say no. So it is asked for separately, it is off by
+default, and the owner checks it on **every** open regardless of what it once advertised.
+
+An owner is also responsible for the cleanup nothing else would do: a shell has no timeout and no
+idea the link it was opened over has gone, so a peer disconnecting must take its ptys with it. A
+laptop closing its lid otherwise leaves a login shell running until the workspace stops.
+
 ### Stream
 
 What a subscriber sees while watching one agent: `History` once on subscribe, then `Token`,
@@ -256,6 +291,14 @@ Worktrees of one repository share a key. They are the same project checked out t
 lets a board say "neosh: on mac-studio and linux-box" rather than listing four rows that are all
 really one thing.
 
+Which is also why `AgentSummary` and `RemoteProject` both carry `repo_root` and `branch`. Sharing a
+key is what makes four checkouts one project; it is not enough to *draw* them, because a board that
+has only the key gets one undifferentiated run of conversations and has nothing left to tell the
+main checkout from the trees but `project_name` — and that is a display string. Parsing `neosh ·
+fix/thing` back apart is how a remote worktree ends up as a project row with a branch name stuck on
+the end of it, sitting beside the `neosh` row it belongs under. Both are paths and a name on the
+**owner's** disk: compared against other paths from the same node, never resolved by the reader.
+
 ---
 
 ## 7. Conformance
@@ -273,10 +316,15 @@ An implementation is ASCP-0 conformant if it:
 9. Answers every `Browse` exactly once with `Browsed` or `Refused`, and answers none at all unless
    it accepts commands.
 10. Sends `Browse` only to a peer whose handshake said `browse: true`.
+11. Answers every `PtyOpen` exactly once with `PtyOpened` or `Refused`, and answers none at all
+    unless it has been told to open shells — checked on every open, never inferred from the
+    handshake it sent.
+12. Sends `PtyOpen` only to a peer whose handshake said `shells: true`.
+13. Closes every pty it owns for a peer when that peer's connection ends.
 
-Points 1, 2, 6 and 9 are the security-relevant ones. An implementation failing any of them is not a
-degraded ASCP node; it is an open door. Point 10 is the compatibility one: a peer that has never
-heard of the message will drop the connection rather than skip the frame.
+Points 1, 2, 6, 9, 11 and 13 are the security-relevant ones. An implementation failing any of them
+is not a degraded ASCP node; it is an open door. Points 10 and 12 are the compatibility ones: a peer
+that has never heard of the message will drop the connection rather than skip the frame.
 
 ---
 

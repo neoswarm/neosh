@@ -35,6 +35,24 @@ export type NodeCapabilities = {
    */
   browse: boolean;
   /**
+   * Whether [`AscpMessage::PtyOpen`] will be answered with a shell.
+   *
+   * Both a permission and a compatibility flag, and unusually it has to be both. The
+   * compatibility half is `browse`'s argument unchanged — an unknown message tag fails the frame
+   * and takes the connection with it, so a node that sent one on spec would knock an older peer
+   * off the board rather than be told no — and `false` is what an older handshake decodes to.
+   *
+   * The permission half is where it stops resembling `browse`. That one is not a permission
+   * because a node accepting commands has already given away strictly more: `NewSession` takes
+   * any `cwd` on its disk, so naming the directories that exist withholds nothing. A shell is
+   * not like that. `NewSession` starts an *agent*, which is a thing with a permission layer, a
+   * transcript and a person who can read it afterwards; a pty is a prompt, with that user's
+   * shell, environment and credentials, and nothing above it to say no. So it is asked for
+   * separately — `swarm.accept_shells`, off by default — and enforced by the owner on every
+   * open regardless of what it once advertised, which is the rule every capability here follows.
+   */
+  shells: boolean;
+  /**
    * The checkouts this node has, for starting something on it.
    */
   projects: Array<RemoteProject>;

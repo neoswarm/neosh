@@ -21,6 +21,21 @@ export type SessionInfo = {
    */
   project: string;
   /**
+   * What this project is called **across machines**. See [`crate::ProjectKey`].
+   *
+   * The one field that lets a panel say "this is the same project, on another computer". A path
+   * cannot: the repository is `/Users/me/src/neosh` here and `/home/me/neosh` there, and every
+   * other candidate is worse — a directory *name* makes two unrelated `api` checkouts one
+   * project, and a display label like `neosh · fix/thing` is a string made for reading rather
+   * than a key.
+   *
+   * Empty when nothing has looked yet, which is `dir:<name>` a moment later: the host fills it
+   * from the origin remote when it first visits a directory, and a guess from the directory name
+   * until then. A consumer that wants to know whether two machines *really* agree asks
+   * [`crate::ProjectKey::is_certain`] — `git:` is a fact and `dir:` is a coincidence of naming.
+   */
+  project_key: string;
+  /**
    * The main checkout of the repository `cwd` is in, when it is in one.
    *
    * This is what lets a list *group* rather than merely label: `project` says `neosh ·

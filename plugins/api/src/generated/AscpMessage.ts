@@ -72,4 +72,16 @@ export type AscpMessage =
   | { "type": "refused"; id: string; refusal: Refusal }
   | { "type": "browse"; id: string; prefix: string }
   | { "type": "browsed"; id: string; paths: Array<string> }
+  | {
+    "type": "pty_open";
+    id: string;
+    cwd?: string | null;
+    cols: number;
+    rows: number;
+  }
+  | { "type": "pty_opened"; id: string; pty: string }
+  | { "type": "pty_data"; pty: string; data: string }
+  | { "type": "pty_resize"; pty: string; cols: number; rows: number }
+  | { "type": "pty_close"; pty: string }
+  | { "type": "pty_exit"; pty: string; status?: number | null }
   | { "type": "goodbye"; message?: string | null };

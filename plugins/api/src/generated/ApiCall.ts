@@ -422,6 +422,7 @@ export type ApiCall =
   | { "call": "swarm_disconnect"; node: NodeId }
   | { "call": "swarm_strangers" }
   | { "call": "swarm_browse"; node: NodeId; prefix: string }
+  | { "call": "swarm_shell"; node: NodeId; cwd?: string | null }
   | { "call": "quota_list" }
   | { "call": "quota_refresh"; instance?: InstanceId | null }
   | { "call": "quota_report"; snapshot: QuotaSnapshot }
