@@ -56,3 +56,10 @@ vt100 = "0.16.2"
 [dev-dependencies]
 insta = { workspace = true }
 serde_json = { workspace = true }
+# A peer to talk to. The sidebar's whole job is now to merge what another machine has into this
+# one's tree, and the only way to test that from outside is for another machine to exist — so a
+# test stands up a bare `neosh_swarm` node and plays one. A second whole neosh would be a second
+# process, a second config directory and a second screen to read, for a peer whose entire
+# contribution is an inventory.
+neosh-swarm = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

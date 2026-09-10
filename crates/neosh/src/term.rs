@@ -1,9 +1,23 @@
 //! A shell in a pane.
 //!
-//! One `Term` is one pty, one child process and one VT parser. Everything about how a terminal
-//! *behaves* lives here; how it is placed and drawn is the pane's business, and the two meet at
-//! [`Term::cells`], which hands back the screen as [`SurfaceCell`]s — the raw-cell API a plugin
-//! already has.
+//! One `Term` is one VT parser, and one *pipe* to whatever is writing into it. Everything about how
+//! a terminal *behaves* lives here; how it is placed and drawn is the pane's business, and the two
+//! meet at [`Term::cells`], which hands back the screen as [`SurfaceCell`]s — the raw-cell API a
+//! plugin already has.
+//!
+//! # Why the pipe is an enum
+//!
+//! A shell on another computer is the same terminal. The bytes come off a socket instead of a pty
+//! and go back the same way, and *everything above that* — the parser, the scrollback, the cursor,
+//! the cells, how a key becomes a byte, what happens when the width changes — is identical, because
+//! it is the terminal emulator and terminal emulators do not know where their program is running.
+//! That is also how ssh works, and the reason it works: the side that is *drawing* owns the
+//! emulator and the size, and the side that owns the process forwards a file descriptor.
+//!
+//! So [`Pipe`] is the whole of the difference, and it is four methods wide — write, resize, close,
+//! and where the bytes come in. A remote terminal that had been its own type would have been a
+//! second copy of the parser handling, the cell conversion and the key encoding, which is the code
+//! that is actually hard to get right and has nothing to do with sockets.
 //!
 //! # Why a surface rather than a buffer
 //!
@@ -34,12 +48,35 @@ use portable_pty::{CommandBuilder, MasterPty, PtySize, native_pty_system};
 /// is a few bytes and this is per terminal rather than per workspace.
 const SCROLLBACK: usize = 10_000;
 
-/// A pty, the process on the end of it, and what it has drawn.
+/// Where a terminal's bytes come from and go to.
+///
+/// The one thing that differs between a shell on this machine and a shell on another. See the
+/// module docs for why it is an enum here rather than a second `Term`.
+enum Pipe {
+    /// A pty and the process on the end of it, on this machine.
+    Local {
+        /// Kept because resizing goes through it, and because dropping it is what closes the pty.
+        master: Box<dyn MasterPty + Send>,
+        writer: Box<dyn Write + Send>,
+        child: Box<dyn portable_pty::Child + Send + Sync>,
+    },
+    /// A pty on another machine, reached over ASCP.
+    ///
+    /// No handle to a process, because there is not one here: what this holds is an address —
+    /// which machine, and which of that machine's ptys. Every write is a message and every message
+    /// is fire-and-forget, which is why nothing here can fail in a way this end could act on: a
+    /// link that has gone is reported as the link going, on the row that is about the link, rather
+    /// than as a write error inside a terminal.
+    Remote {
+        node: neosh_proto::NodeId,
+        pty: String,
+        swarm: neosh_swarm::SwarmHandle,
+    },
+}
+
+/// A VT parser, what has been drawn into it, and the pipe feeding it.
 pub struct Term {
-    /// Kept because resizing goes through it, and because dropping it is what closes the pty.
-    master: Box<dyn MasterPty + Send>,
-    writer: Box<dyn Write + Send>,
-    child: Box<dyn portable_pty::Child + Send + Sync>,
+    pipe: Pipe,
     parser: Arc<Mutex<vt100::Parser>>,
     /// Set by the reader thread when the screen has changed, cleared by the draw.
     ///
@@ -136,15 +173,79 @@ impl Term {
         }
 
         Ok(Self {
-            master: pair.master,
-            writer,
-            child,
+            pipe: Pipe::Local { master: pair.master, writer, child },
             parser,
             dirty,
             done,
             command: shell,
             size: (rows, cols),
         })
+    }
+
+    /// A terminal whose shell is on another machine.
+    ///
+    /// Made *after* the far end has answered, which is why this takes a `pty` rather than opening
+    /// one: the handle is minted over there, and a terminal that existed before it arrived would be
+    /// a pane you could type into with nowhere for the keystrokes to go.
+    ///
+    /// It starts blank rather than with a banner. What a person wants to see in a new terminal is a
+    /// prompt, and the prompt is one round trip away; a line of our own saying which machine this is
+    /// would be a line their shell then scrolls, and the tab already says it.
+    pub fn attach(
+        swarm: neosh_swarm::SwarmHandle,
+        node: neosh_proto::NodeId,
+        pty: String,
+        machine: &str,
+        rows: u16,
+        cols: u16,
+    ) -> Self {
+        Self {
+            pipe: Pipe::Remote { node, pty, swarm },
+            parser: Arc::new(Mutex::new(vt100::Parser::new(rows.max(1), cols.max(1), SCROLLBACK))),
+            dirty: Arc::new(AtomicBool::new(true)),
+            done: Arc::new(AtomicBool::new(false)),
+            // Where it is, not what it is running: the tab strip reads the last path segment of
+            // this, and `@linux-box` is the fact that distinguishes this tab from the four beside
+            // it. Which shell it happens to be is that machine's business and is on screen in the
+            // prompt anyway.
+            command: format!("@{machine}"),
+            size: (rows, cols),
+        }
+    }
+
+    /// Which remote pty this is, or `None` for a shell on this machine.
+    ///
+    /// Asked when bytes arrive off the wire: they name a machine and a handle, and this is what
+    /// turns that pair back into the pane they belong to.
+    pub fn remote(&self) -> Option<(&neosh_proto::NodeId, &str)> {
+        match &self.pipe {
+            Pipe::Local { .. } => None,
+            Pipe::Remote { node, pty, .. } => Some((node, pty.as_str())),
+        }
+    }
+
+    /// Bytes that arrived from elsewhere, into the parser.
+    ///
+    /// The remote half of what the reader thread does for a local pty, and deliberately the same
+    /// two lines: process, then mark dirty. A remote terminal that drew differently from a local
+    /// one would be a second renderer to keep in step.
+    pub fn feed(&self, bytes: &[u8]) {
+        if let Ok(mut p) = self.parser.lock() {
+            p.process(bytes);
+        }
+        self.dirty.store(true, Ordering::Release);
+    }
+
+    /// The shell on the other end has gone.
+    ///
+    /// Said in the terminal rather than only in the tab going away, because what a person wants to
+    /// know is *why* the prompt stopped answering — and over a link, "it exited 127" and "the
+    /// machine dropped" are the two answers and they are not the same problem. Written into the
+    /// parser so it is on screen above whatever the shell last printed, which is the sentence's
+    /// context.
+    pub fn ended(&self, why: &str) {
+        self.feed(format!("\r\n\x1b[2m[{why}]\x1b[0m\r\n").as_bytes());
+        self.done.store(true, Ordering::Release);
     }
 
     /// Whether the screen has changed since the last draw. Clears the flag.
@@ -163,7 +264,11 @@ impl Term {
         if self.done.load(Ordering::Acquire) {
             return true;
         }
-        if matches!(self.child.try_wait(), Ok(Some(_))) {
+        // Only a local child can be waited on. A remote one is finished when the far end says so
+        // — `ended` — or when the link carrying it goes, and both of those are events rather than
+        // something to poll for here.
+        let Pipe::Local { child, .. } = &mut self.pipe else { return false };
+        if matches!(child.try_wait(), Ok(Some(_))) {
             self.done.store(true, Ordering::Release);
             // So the pane is redrawn once more and can say so.
             self.dirty.store(true, Ordering::Release);
@@ -174,10 +279,24 @@ impl Term {
 
     /// Send bytes to the child.
     pub fn write(&mut self, bytes: &[u8]) {
-        // A write that fails is a child that has gone, which the reader thread is about to report.
-        // Nothing to say here that would not be said twice.
-        let _ = self.writer.write_all(bytes);
-        let _ = self.writer.flush();
+        match &mut self.pipe {
+            Pipe::Local { writer, .. } => {
+                // A write that fails is a child that has gone, which the reader thread is about to
+                // report. Nothing to say here that would not be said twice.
+                let _ = writer.write_all(bytes);
+                let _ = writer.flush();
+            }
+            // One message per press, and deliberately not coalesced. Typing is a few bytes at
+            // human speed, and a keystroke held back to be sent with the next one is a terminal
+            // that feels laggy in the one direction people notice.
+            Pipe::Remote { node, pty, swarm } => {
+                swarm.send(neosh_swarm::SwarmRequest::PtyData {
+                    node: node.clone(),
+                    pty: pty.clone(),
+                    data: bytes.to_vec(),
+                });
+            }
+        }
     }
 
     /// Tell the child how big it is now.
@@ -191,7 +310,19 @@ impl Term {
             return;
         }
         self.size = (rows, cols);
-        let _ = self.master.resize(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 });
+        match &mut self.pipe {
+            Pipe::Local { master, .. } => {
+                let _ = master.resize(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 });
+            }
+            Pipe::Remote { node, pty, swarm } => {
+                swarm.send(neosh_swarm::SwarmRequest::PtyResize {
+                    node: node.clone(),
+                    pty: pty.clone(),
+                    cols,
+                    rows,
+                });
+            }
+        }
         if let Ok(mut p) = self.parser.lock() {
             p.screen_mut().set_size(rows, cols);
         }
@@ -250,8 +381,22 @@ impl Term {
     /// ignoring `SIGHUP` still goes, and the master dropped after, because dropping it while the
     /// child is alive leaves a process reading from a pty nothing will ever write to.
     pub fn close(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        match &mut self.pipe {
+            Pipe::Local { child, .. } => {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+            // Sent every time, including over a link that has already gone: `PtyClose` is
+            // idempotent and a send on a dead peer is dropped by the node, which is strictly better
+            // than the alternative — a shell left running on somebody else's machine because this
+            // end decided the connection looked unhealthy.
+            Pipe::Remote { node, pty, swarm } => {
+                swarm.send(neosh_swarm::SwarmRequest::PtyClose {
+                    node: node.clone(),
+                    pty: pty.clone(),
+                });
+            }
+        }
     }
 }
 
@@ -356,6 +501,108 @@ fn arrow(letter: u8, ctrl: bool) -> &'static [u8] {
         (b'C', true) => b"\x1b[1;5C",
         (b'D', true) => b"\x1b[1;5D",
         _ => b"",
+    }
+}
+
+/// A pty this machine owns on somebody else's behalf.
+///
+/// The far side of [`Pipe::Remote`], and deliberately not a [`Term`]: there is no screen here. The
+/// owner is forwarding a file descriptor, and the terminal emulator — the parser, the scrollback,
+/// the cells, the width — belongs to the machine that is drawing. Building a `vt100::Parser` here
+/// would be emulating a terminal whose size we are told about and whose output nobody reads.
+pub struct Serving {
+    master: Box<dyn MasterPty + Send>,
+    writer: Box<dyn Write + Send>,
+    child: Box<dyn portable_pty::Child + Send + Sync>,
+}
+
+impl Serving {
+    /// Start a shell and pipe it to `node`.
+    ///
+    /// The reader thread writes straight onto the swarm handle rather than through a channel the
+    /// host loop selects on. That is the same shape the local reader thread has — it pokes shared
+    /// state and gets out of the way — and it keeps a shell printing a large file off the loop that
+    /// draws: forwarding bytes is not work the host has any decision to make about.
+    ///
+    /// One frame per read, up to 8 KB. Coalescing further would need a timer per pty to bound the
+    /// latency, and the read itself already blocks until there is something — so a busy program
+    /// produces full frames and an idle one produces none, which is the behaviour a timer would
+    /// have been added to get.
+    pub fn spawn(
+        cwd: &std::path::Path,
+        rows: u16,
+        cols: u16,
+        swarm: neosh_swarm::SwarmHandle,
+        node: neosh_proto::NodeId,
+        pty: String,
+    ) -> std::io::Result<Self> {
+        let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
+        let size = PtySize { rows: rows.max(1), cols: cols.max(1), pixel_width: 0, pixel_height: 0 };
+        let pair = native_pty_system()
+            .openpty(size)
+            .map_err(|e| std::io::Error::other(format!("openpty: {e}")))?;
+
+        let mut cmd = CommandBuilder::new(&shell);
+        cmd.arg("-l");
+        cmd.cwd(cwd);
+        cmd.env("NEOSH", "1");
+        cmd.env("TERM", "xterm-256color");
+        let child = pair
+            .slave
+            .spawn_command(cmd)
+            .map_err(|e| std::io::Error::other(format!("spawn {shell}: {e}")))?;
+        drop(pair.slave);
+
+        let writer =
+            pair.master.take_writer().map_err(|e| std::io::Error::other(format!("pty: {e}")))?;
+        let mut reader =
+            pair.master.try_clone_reader().map_err(|e| std::io::Error::other(format!("pty: {e}")))?;
+
+        std::thread::spawn(move || {
+            let mut buf = [0u8; 8192];
+            loop {
+                match reader.read(&mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => swarm.send(neosh_swarm::SwarmRequest::PtyData {
+                        node: node.clone(),
+                        pty: pty.clone(),
+                        data: buf[..n].to_vec(),
+                    }),
+                }
+            }
+            // The status is not read here: `try_wait` on the child belongs to whoever owns it, and
+            // this thread does not. What the far end needs is that the prompt has gone, which is
+            // what EOF on the pty means.
+            swarm.send(neosh_swarm::SwarmRequest::PtyExit { node, pty, status: None });
+        });
+
+        Ok(Self { master: pair.master, writer, child })
+    }
+
+    pub fn write(&mut self, bytes: &[u8]) {
+        let _ = self.writer.write_all(bytes);
+        let _ = self.writer.flush();
+    }
+
+    pub fn resize(&mut self, rows: u16, cols: u16) {
+        let _ = self.master.resize(PtySize {
+            rows: rows.max(1),
+            cols: cols.max(1),
+            pixel_width: 0,
+            pixel_height: 0,
+        });
+    }
+}
+
+impl Drop for Serving {
+    /// The same two calls [`Term::close`] makes, and for the same reason: a pane closing is not a
+    /// request the shell may decline. Here it also has to be `Drop` rather than a method somebody
+    /// remembers to call — the link going away takes the whole map of these with it, and a shell
+    /// left running on this machine because a laptop closed its lid is exactly the leak a remote
+    /// terminal must not have.
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
     }
 }
 

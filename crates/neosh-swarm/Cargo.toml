@@ -18,6 +18,8 @@ serde_json = { workspace = true }
 ed25519-dalek = { workspace = true }
 rand = { workspace = true }
 hex = { workspace = true }
+# A pty carries whatever the program wrote, and a JSON string cannot hold a lone 0x9b.
+base64 = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 

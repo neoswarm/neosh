@@ -6,13 +6,16 @@
     "projects": [
       {
         "active": true,
+        "branch": "main",
         "cwd": "/home/me/src/neosh",
         "key": "git:github.com/neoswarm/neosh",
         "name": "neosh",
+        "repo_root": "/home/me/src/neosh",
         "running": 1,
         "sessions": 2
       }
     ],
+    "shells": false,
     "streams": true
   },
   "node": {

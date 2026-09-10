@@ -2361,14 +2361,27 @@ export class CursoredList<T = unknown> {
       const eol = byteLength(row.text);
       const onCursor = opts.showCursor !== false && i === this.cursor;
       const marks: DrawnMark[] = [];
+      // The cursor is the row's **band**, not a run over its text — which is the difference
+      // between a selection and a highlight, and the workspace already has a vocabulary for it:
+      // `lineHlGroup` is the thing under everything else on the row, and every ranged group is
+      // patched over it. As a ranged mark at priority 200 it instead *won* every character it
+      // covered, which is right for a colour and wrong for two things it was also swallowing.
+      //
+      // The one that made it a bug rather than a preference is **motion**. A group that animates
+      // animates because it won its run — so a project fetching, whose badge is one cell of
+      // `Git.Fetching`, stopped spinning the moment you put the cursor on it and started again
+      // when you moved off. That is exactly backwards: the row you are standing on is the row you
+      // are asking about, and a spinner is the only thing on it that says the answer is not in
+      // yet. The other is that a git badge, a favourite's star and the marker on a remote row all
+      // went one flat colour under the cursor, which is the row least able to spare them.
       if (onCursor && eol > 0) {
-        marks.push({ col: 0, opts: { hlGroup: cursorHl, endCol: eol, priority: 200 } });
+        marks.push({ col: 0, opts: { lineHlGroup: cursorHl, priority: 200 } });
       }
       if (row.hl && eol > 0) {
         marks.push({ col: 0, opts: { hlGroup: row.hl, endCol: eol } });
       }
-      // Above the row's own highlight, below the cursor's 200: a marker keeps its colour on an
-      // ordinary row and yields to the selection, which is the row the eye is already on.
+      // Above the row's own highlight: a marker keeps its colour on an ordinary row. Nothing to
+      // rank against the cursor any more — it is underneath all of this now.
       for (const s of row.spans ?? []) {
         if (s.to <= s.from || s.from >= eol) continue;
         marks.push({
@@ -2402,7 +2415,7 @@ export class CursoredList<T = unknown> {
         // a separate row that happens to be indented, which is the one thing it must not be. Only
         // where there is a band to run: an always-open row that is not under the cursor gets its
         // own colour and nothing else, or every one of them would look selected.
-        if (onCursor) cont.push({ col: 0, opts: { hlGroup: cursorHl, endCol: end, priority: 200 } });
+        if (onCursor) cont.push({ col: 0, opts: { lineHlGroup: cursorHl, priority: 200 } });
         if (row.hl) cont.push({ col: 0, opts: { hlGroup: row.hl, endCol: end } });
         drawn.push({ text, marks: cont });
       }

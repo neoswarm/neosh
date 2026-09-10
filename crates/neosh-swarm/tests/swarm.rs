@@ -29,6 +29,8 @@ fn summary(id: &str, project: &str) -> AgentSummary {
         session: SessionId(id.into()),
         project: ProjectKey(format!("git:example.com/{project}")),
         project_name: project.into(),
+        repo_root: None,
+        branch: None,
         cwd: format!("/w/{project}"),
         label: format!("working on {id}"),
         state: AgentState::Running,
@@ -67,6 +69,12 @@ struct Pair {
 
 /// Two nodes that have been introduced, `b` listening and `a` dialling it.
 async fn pair(b_accepts_commands: bool) -> Pair {
+    pair_with(b_accepts_commands, false).await
+}
+
+/// The same, saying whether `b` will open a shell for anybody. See
+/// [`neosh_proto::NodeCapabilities::shells`].
+async fn pair_with(b_accepts_commands: bool, b_accepts_shells: bool) -> Pair {
     // Bind first to learn the port, then hand the address to the node, which binds it again — the
     // socket is dropped in between. A fixed port would make these tests unable to run in parallel
     // or alongside a real neosh.
@@ -85,6 +93,7 @@ async fn pair(b_accepts_commands: bool) -> Pair {
         listen: Some(addr),
         accepts_commands: b_accepts_commands,
         accepts_approvals: false,
+        accepts_shells: b_accepts_shells,
         heartbeat: Duration::from_millis(200),
         ..Default::default()
     };
@@ -893,4 +902,143 @@ async fn the_listener_reports_the_address_it_bound() {
     })
     .await;
     assert_eq!(bound, addr);
+}
+
+/// A shell is never *sent* to a machine that has not said it opens them.
+///
+/// Two things at once, and the second is the one that would hurt. An unknown message tag fails the
+/// frame and takes the connection with it, so a `PtyOpen` aimed at a node built before this existed
+/// would knock every conversation on that link off the board rather than come back empty — which is
+/// why this is checked before sending rather than answered by the far end.
+///
+/// And it is *answered*, locally, exactly once. A request that is simply dropped is indistinguishable
+/// from a slow network, and what is waiting on it is a pane somebody just opened.
+#[tokio::test]
+async fn a_shell_is_not_offered_to_a_machine_that_does_not_open_them() {
+    let mut p = pair(true).await;
+    let peer = wait_for_peer(&mut p.a_rx).await;
+    p.a.send(SwarmRequest::PtyOpen {
+        node: peer.clone(),
+        id: "s1".into(),
+        cwd: None,
+        cols: 80,
+        rows: 24,
+    });
+
+    let refusal = wait_for(&mut p.a_rx, |e| match e {
+        SwarmEvent::PtyOpened { id, result, .. } if id == "s1" => Some(result.clone()),
+        _ => None,
+    })
+    .await;
+    let Err(Refusal::NotPermitted { what }) = refusal else {
+        panic!("a machine that does not open shells refuses by name: {refusal:?}");
+    };
+    assert!(
+        what.contains("linux-box") && what.contains("accepts_shells"),
+        "the sentence names the machine and the setting to change: {what}"
+    );
+}
+
+/// The whole of a remote terminal, at the layer that carries it.
+///
+/// Bytes both ways over one handle, because a pty is two pipes and the connection is symmetric —
+/// the same message tag carries a keystroke going one way and a screenful going the other. Resize
+/// only ever goes towards the owner: the side that is *drawing* is the side that knows how wide it
+/// is, which is the arrangement that makes a full-screen program work.
+#[tokio::test]
+async fn a_shell_carries_bytes_both_ways_over_one_handle() {
+    let mut p = pair_with(true, true).await;
+    let peer = wait_for_peer(&mut p.a_rx).await;
+    let asker = wait_for_peer(&mut p.b_rx).await;
+
+    p.a.send(SwarmRequest::PtyOpen {
+        node: peer.clone(),
+        id: "s1".into(),
+        cwd: Some("/w/neosh".into()),
+        cols: 100,
+        rows: 30,
+    });
+    let asked = wait_for(&mut p.b_rx, |e| match e {
+        SwarmEvent::PtyOpen { id, cwd, cols, rows, .. } if id == "s1" => {
+            Some((cwd.clone(), *cols, *rows))
+        }
+        _ => None,
+    })
+    .await;
+    assert_eq!(asked, (Some("/w/neosh".into()), 100, 30), "asked for, as asked for");
+
+    p.b.send(SwarmRequest::PtyOpened {
+        node: asker.clone(),
+        id: "s1".into(),
+        result: Ok("t1".into()),
+    });
+    let handle = wait_for(&mut p.a_rx, |e| match e {
+        SwarmEvent::PtyOpened { id, result: Ok(pty), .. } if id == "s1" => Some(pty.clone()),
+        _ => None,
+    })
+    .await;
+    assert_eq!(handle, "t1", "the handle is the owner's to mint");
+
+    // Towards the owner: a keystroke.
+    p.a.send(SwarmRequest::PtyData {
+        node: peer.clone(),
+        pty: handle.clone(),
+        data: b"ls\r".to_vec(),
+    });
+    let typed = wait_for(&mut p.b_rx, |e| match e {
+        SwarmEvent::PtyData { pty, data, .. } if pty == "t1" => Some(data.clone()),
+        _ => None,
+    })
+    .await;
+    assert_eq!(typed, b"ls\r", "keystrokes arrive as the bytes they were");
+
+    // And back: whatever the program wrote, which is very often not valid UTF-8 at all. This one
+    // is a lone 0x9b and a split sequence — the case a JSON string cannot hold and the reason the
+    // payload is base64 rather than escaped.
+    let printed = vec![0x1b, b'[', b'2', b'J', 0x9b, 0xf0, 0x9f];
+    p.b.send(SwarmRequest::PtyData {
+        node: asker.clone(),
+        pty: handle.clone(),
+        data: printed.clone(),
+    });
+    let drawn = wait_for(&mut p.a_rx, |e| match e {
+        SwarmEvent::PtyData { pty, data, .. } if pty == "t1" => Some(data.clone()),
+        _ => None,
+    })
+    .await;
+    assert_eq!(drawn, printed, "arbitrary bytes survive the round trip");
+
+    p.a.send(SwarmRequest::PtyResize {
+        node: peer.clone(),
+        pty: handle.clone(),
+        cols: 120,
+        rows: 40,
+    });
+    let sized = wait_for(&mut p.b_rx, |e| match e {
+        SwarmEvent::PtyResize { pty, cols, rows, .. } if pty == "t1" => Some((*cols, *rows)),
+        _ => None,
+    })
+    .await;
+    assert_eq!(sized, (120, 40), "the drawing side is what decides how big it is");
+
+    p.b.send(SwarmRequest::PtyExit {
+        node: asker.clone(),
+        pty: handle.clone(),
+        status: Some(127),
+    });
+    let gone = wait_for(&mut p.a_rx, |e| match e {
+        SwarmEvent::PtyExit { pty, status, .. } if pty == "t1" => Some(*status),
+        _ => None,
+    })
+    .await;
+    assert_eq!(gone, Some(127), "why the prompt went away, which is the useful half");
+}
+
+/// The id of whoever is on the other end, once the link is up.
+async fn wait_for_peer(rx: &mut UnboundedReceiver<SwarmEvent>) -> neosh_proto::NodeId {
+    wait_for(rx, |e| match e {
+        SwarmEvent::PeerUp { node, .. } => Some(node.id.clone()),
+        _ => None,
+    })
+    .await
 }

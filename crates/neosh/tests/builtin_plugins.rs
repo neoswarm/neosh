@@ -63,6 +63,21 @@ impl Sandbox {
         std::fs::write(self.root.join("config/config.toml"), contents).expect("write config");
     }
 
+    /// Give `work/` an origin, so it has an identity other machines can agree with.
+    ///
+    /// A `ProjectKey` is the normalised origin URL, and without one a checkout falls back to
+    /// `dir:<name>` — which is a guess, and here it would be a guess that happened to work, since
+    /// both sides would be guessing from a directory the test named. Setting a remote makes the
+    /// merge test assert the thing that actually happens in a workspace.
+    fn git_remote(&self, url: &str) {
+        let out = Command::new("git")
+            .current_dir(self.work())
+            .args(["remote", "add", "origin", url])
+            .output()
+            .expect("git runs");
+        assert!(out.status.success(), "git remote add: {}", String::from_utf8_lossy(&out.stderr));
+    }
+
     /// Make `work/` a git repository, so the git-dependent plugins have something to report.
     fn git_init(&self) {
         let run = |args: &[&str]| {
@@ -120,6 +135,13 @@ impl Sandbox {
             .args(["--mock-script", &fixture().display().to_string()])
             .args(["--model", "mock/mock"])
             .env("NEOSH_STATE_DIR", self.root.join("state"))
+            // `$SHELL` and nothing cleverer is right in the product and useless in a test: it is a
+            // person's own shell with their own configuration in it, and the first run of a shell
+            // test against a real login shell was answered by an `oh-my-zsh` update prompt that ate
+            // a keystroke. A test that depends on whose machine it runs on is a test that will fail
+            // for somebody else. `Term::spawn_shell` exists for this reason one level down; a pty
+            // opened for a *peer* has no such seam, so the environment is where it is said.
+            .env("SHELL", "/bin/sh")
             // The history block reads the *vendors'* transcripts rather than ours — see
             // `crate::usage`. Pointed at this sandbox, because the alternative is a hundred and
             // forty-seven neoshes scanning a real month of somebody's work and asserting on it.
@@ -1080,6 +1102,13 @@ impl Sandbox {
             .arg(self.work())
             .args(["--mock-script", &script.display().to_string()])
             .env("NEOSH_STATE_DIR", self.root.join("state"))
+            // `$SHELL` and nothing cleverer is right in the product and useless in a test: it is a
+            // person's own shell with their own configuration in it, and the first run of a shell
+            // test against a real login shell was answered by an `oh-my-zsh` update prompt that ate
+            // a keystroke. A test that depends on whose machine it runs on is a test that will fail
+            // for somebody else. `Term::spawn_shell` exists for this reason one level down; a pty
+            // opened for a *peer* has no such seam, so the environment is where it is said.
+            .env("SHELL", "/bin/sh")
             // The history block reads the *vendors'* transcripts rather than ours — see
             // `crate::usage`. Pointed at this sandbox, because the alternative is a hundred and
             // forty-seven neoshes scanning a real month of somebody's work and asserting on it.
@@ -2403,8 +2432,22 @@ impl Session {
                             l["marks"]
                                 .as_array()
                                 .map(|ms| {
+                                    // Both, because both are highlight groups on the row and a
+                                    // caller asking what colours a row has does not care which
+                                    // vocabulary put them there. A cursor line is a *band* — it
+                                    // sits under every ranged group rather than winning against
+                                    // them, which is what lets a spinner on the row you are
+                                    // standing on go on spinning — and reading only `hl_group`
+                                    // made the selected row look unhighlighted to this helper.
                                     ms.iter()
-                                        .filter_map(|m| m["hl_group"].as_str().map(str::to_string))
+                                        .flat_map(|m| {
+                                            [
+                                                m["hl_group"].as_str(),
+                                                m["line_hl_group"].as_str(),
+                                            ]
+                                        })
+                                        .flatten()
+                                        .map(str::to_string)
                                         .collect()
                                 })
                                 .unwrap_or_default()
@@ -7638,6 +7681,54 @@ impl Session {
         rows
     }
 
+    /// The marks on the panel row the cursor is on, as `(group, is_band)`.
+    ///
+    /// Both kinds, and which kind each is, because that distinction is the whole question here: a
+    /// band sits under every ranged group on the row and a ranged group wins against them, and the
+    /// marks are otherwise identical.
+    fn sidebar_cursor_marks(&self) -> Vec<(String, bool)> {
+        let Some(buf) = self.buffer_named("[sidebar]") else { return Vec::new() };
+        let mut rows: Vec<Vec<(String, bool)>> = Vec::new();
+        for e in &self.events {
+            if e["type"] != "buffer_lines" || e["buf"].as_u64() != Some(buf) {
+                continue;
+            }
+            let start = e["start"].as_i64().unwrap_or(0);
+            let old_end = e["old_end"].as_i64().unwrap_or(start);
+            let new: Vec<Vec<(String, bool)>> = e["lines"]
+                .as_array()
+                .map(|a| {
+                    a.iter()
+                        .map(|l| {
+                            l["marks"]
+                                .as_array()
+                                .map(|ms| {
+                                    ms.iter()
+                                        .flat_map(|m| {
+                                            [
+                                                m["hl_group"].as_str().map(|g| (g.to_string(), false)),
+                                                m["line_hl_group"]
+                                                    .as_str()
+                                                    .map(|g| (g.to_string(), true)),
+                                            ]
+                                        })
+                                        .flatten()
+                                        .collect()
+                                })
+                                .unwrap_or_default()
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            let st = start.clamp(0, rows.len() as i64) as usize;
+            let en = if old_end < 0 { rows.len() } else { (old_end as usize).clamp(st, rows.len()) };
+            rows.splice(st..en, new);
+        }
+        rows.into_iter()
+            .find(|row| row.iter().any(|(g, _)| g == "Sidebar.Selected"))
+            .unwrap_or_default()
+    }
+
     /// The panel row the cursor is on, read from the highlight rather than from a count.
     ///
     /// A count would be a test that passes for the wrong reason the moment the panel gains a row.
@@ -9821,5 +9912,914 @@ fn the_clone_destination_offers_the_configured_root_first() {
     assert!(
         rows.iter().any(|l| l.contains("clone.root")),
         "and it says which setting put it there\n{rows:?}"
+    );
+}
+
+/* -------------------------------------------------------------------------- */
+/* Another computer's work, in this computer's tree                           */
+/* -------------------------------------------------------------------------- */
+
+/// Which way round a shell may be opened, for [`Peer::beside_with`].
+#[derive(Clone, Copy, Default)]
+struct Shells {
+    /// Whether the *peer* opens shells — what `t` in this workspace's panel needs.
+    theirs: bool,
+    /// Whether the workspace *under test* opens shells for the peer. Off by default, here as in a
+    /// real config, which is the state the refusal test asserts.
+    ours: bool,
+}
+
+/// A peer, played by a bare swarm node in this process.
+///
+/// The alternative is a second whole neosh — a second process, a second config directory and a
+/// second screen to read — for a machine whose entire contribution to this test is an inventory and
+/// a list of projects. What is under test is what *this* workspace does with those two things.
+///
+/// The runtime is held because the node's tasks live on it: dropped, the peer stops mid-handshake
+/// and the workspace under test correctly reports a machine that went away.
+struct Peer {
+    _rt: tokio::runtime::Runtime,
+    handle: neosh_swarm::SwarmHandle,
+    events: tokio::sync::mpsc::UnboundedReceiver<neosh_swarm::SwarmEvent>,
+    /// Whoever dialled us, learnt from the handshake — the address every answer goes back to.
+    asker: Option<neosh_proto::NodeId>,
+}
+
+impl Peer {
+    /// Stand one up, authorised by and authorising the workspace in `sb`.
+    ///
+    /// The workspace's identity is minted *here*, before it starts, which is the whole trick:
+    /// pairing is mutual and each side has to name the other's key, so somebody has to know both
+    /// before either is running. `Identity::load_or_create` writes it where the workspace will look.
+    fn beside(sb: &Sandbox, name: &str) -> Self {
+        Self::beside_with(sb, name, Shells::default())
+    }
+
+    /// The same, saying which of the two machines will open a shell for the other.
+    ///
+    /// Two flags rather than one because they are two different decisions and this branch is about
+    /// both: `theirs` is what a peer advertises, which is what `t` in the panel needs, and `ours` is
+    /// `accepts_shells` in the config of the workspace under test — the direction where a bug means
+    /// somebody else's prompt on your machine.
+    fn beside_with(sb: &Sandbox, name: &str, shells: Shells) -> Self {
+        // Bind to learn a port and let go again. A fixed one cannot run twice at once, and this
+        // suite runs several tests at a time.
+        let probe = std::net::TcpListener::bind("127.0.0.1:0").expect("probe");
+        let addr = probe.local_addr().expect("addr");
+        drop(probe);
+
+        let state = sb.root.join("state");
+        std::fs::create_dir_all(&state).expect("state dir");
+        let mine = neosh_swarm::Identity::load_or_create(&neosh_swarm::identity::key_path(&state))
+            .expect("this workspace's key");
+        let theirs = neosh_swarm::Identity::ephemeral();
+
+        sb.write_config(&format!(
+            "[swarm]\nenabled = true\nlisten = \"\"\nheartbeat_secs = 1\n\
+             accepts_shells = {}\n\n\
+             [[swarm.peers]]\naddr = \"{addr}\"\nid = \"{}\"\nname = \"{name}\"\n",
+            shells.ours,
+            theirs.id()
+        ));
+
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("a runtime for the peer");
+        let guard = rt.enter();
+        let allowed = neosh_swarm::Allowed::load(None);
+        allowed.add(mine.id().clone(), neosh_swarm::AllowedPeer {
+            name: "the workspace under test".into(),
+            alias: None,
+            addr: None,
+            source: neosh_swarm::Source::Paired,
+        });
+        let cfg = neosh_swarm::SwarmConfig {
+            name: name.into(),
+            listen: Some(addr),
+            accepts_commands: true,
+            accepts_shells: shells.theirs,
+            heartbeat: Duration::from_millis(200),
+            ..Default::default()
+        };
+        let (handle, events) =
+            neosh_swarm::node::spawn(std::sync::Arc::new(theirs), allowed, cfg, "0.4.6".into());
+        drop(guard);
+        Self { _rt: rt, handle, events, asker: None }
+    }
+
+    /// Wait for the workspace to ask for a shell, and hand it one.
+    ///
+    /// Standing in for a pty and a login shell, which is the right amount of machinery: what is
+    /// under test is whether this workspace turns an answer into a pane you can see, not whether
+    /// `openpty` works. So the "shell" is one line of output, sent the moment the handle is minted.
+    fn answer_shell(&mut self, say: &str) -> String {
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        loop {
+            assert!(std::time::Instant::now() < deadline, "no shell was ever asked for");
+            let Some(event) = self.events.blocking_recv() else { panic!("the peer stopped") };
+            match event {
+                neosh_swarm::SwarmEvent::PeerUp { node, .. } => self.asker = Some(node.id),
+                neosh_swarm::SwarmEvent::PtyOpen { node, id, .. } => {
+                    self.handle.send(neosh_swarm::SwarmRequest::PtyOpened {
+                        node: node.clone(),
+                        id,
+                        result: Ok("t1".into()),
+                    });
+                    self.handle.send(neosh_swarm::SwarmRequest::PtyData {
+                        node,
+                        pty: "t1".into(),
+                        data: say.as_bytes().to_vec(),
+                    });
+                    return "t1".into();
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// Say what this machine has and what is open in it.
+    fn publish(
+        &self,
+        projects: Vec<neosh_proto::RemoteProject>,
+        agents: Vec<neosh_proto::AgentSummary>,
+    ) {
+        self.handle.send(neosh_swarm::SwarmRequest::Projects { projects });
+        self.handle.send(neosh_swarm::SwarmRequest::Publish { full: true, agents, gone: Vec::new() });
+    }
+}
+
+/// One conversation on the peer, in one of its directories.
+fn there(session: &str, label: &str, key: &str, cwd: &str, root: &str, branch: Option<&str>) -> neosh_proto::AgentSummary {
+    neosh_proto::AgentSummary {
+        session: neosh_proto::SessionId(session.into()),
+        project: neosh_proto::ProjectKey(key.into()),
+        project_name: match branch {
+            Some(b) => format!("work · {b}"),
+            None => "work".into(),
+        },
+        cwd: cwd.into(),
+        repo_root: Some(root.into()),
+        branch: branch.map(str::to_string),
+        label: label.into(),
+        state: neosh_proto::AgentState::Idle,
+        message_count: 1,
+        model: None,
+        turn_started_at: None,
+        updated_at: now_secs(),
+        usage: Default::default(),
+    }
+}
+
+/// One of the peer's checkouts, whether or not anything is open in it.
+fn theirs(key: &str, name: &str, cwd: &str, root: &str, branch: Option<&str>) -> neosh_proto::RemoteProject {
+    neosh_proto::RemoteProject {
+        key: neosh_proto::ProjectKey(key.into()),
+        name: name.into(),
+        cwd: cwd.into(),
+        repo_root: Some(root.into()),
+        branch: branch.map(str::to_string),
+        active: false,
+        sessions: 0,
+        running: 0,
+    }
+}
+
+/// A repository you both have is **one row**, and the other machine's work is inside it.
+///
+/// The bug this pins down drew it as two: local conversations were grouped by directory and matched
+/// against remote ones on a key the local side never had — inferred from the remote agent's `cwd`,
+/// so the two only met when both machines happened to have the repository at the same absolute
+/// path. They never do. The repository you were sitting in appeared once as yours and once again
+/// below as a project you had never heard of, named after whichever remote conversation sorted
+/// first — which for a worktree is `work · fix/thing`, a display string being used as a key.
+#[test]
+fn a_repository_on_two_computers_is_one_row_with_both_lots_of_work_in_it() {
+    const KEY: &str = "git:github.com/neoswarm/work";
+    let sb = Sandbox::new("swarm-one-tree");
+    sb.git_init();
+    sb.git_remote("https://github.com/neoswarm/work.git");
+    let peer = Peer::beside(&sb, "linux-box");
+    // Deliberately nothing like the local path: that difference is the whole point.
+    peer.publish(
+        vec![theirs(KEY, "work", "/srv/checkouts/work", "/srv/checkouts/work", None)],
+        vec![
+            there("r1", "reading the parser", KEY, "/srv/checkouts/work", "/srv/checkouts/work", None),
+            there("r2", "chasing the flake", KEY, "/srv/checkouts/work/.wt/fix", "/srv/checkouts/work", Some("fix/the-thing")),
+        ],
+    );
+
+    let mut s = sb.start();
+    s.wait_for("PROJECTS");
+    assert!(
+        s.pump(|s| s.sidebar_now().iter().any(|l| l.contains("reading the parser"))),
+        "the other machine's conversation arrives at all:\n{:?}",
+        s.sidebar_now()
+    );
+
+    let rows = s.sidebar_now();
+    let named = |needle: &str| rows.iter().position(|l| l.contains(needle));
+
+    // One project row, not two. `work · fix/thing` was the second one, and it is the display string
+    // the old grouping mistook for an identity.
+    assert!(
+        !rows.iter().any(|l| l.contains("work · ") || l.contains("work \u{b7} ")),
+        "a worktree is never a project named after a branch:\n{rows:?}"
+    );
+    let heads = rows.iter().filter(|l| l.contains("work") && !l.contains("\u{2387}")).count();
+    assert_eq!(heads, 1, "one row for one repository:\n{rows:?}");
+
+    // Their main checkout's conversation sits under the repository with ours, and their worktree is
+    // a checkout row one level down — exactly where a local worktree goes.
+    let repo = named("work").expect("the repository row");
+    let mine = named("reading the parser").expect("their main-checkout conversation");
+    let tree = named("fix/the-thing").expect("their worktree, as a checkout row");
+    let inside = named("chasing the flake").expect("the conversation in their worktree");
+    assert!(repo < mine && mine < tree && tree < inside, "nested, in order:\n{rows:?}");
+
+    // And every one of those rows says it is not here. One column, and the colour is the link.
+    for row in [mine, tree, inside] {
+        assert!(rows[row].contains('@'), "row {row} says it is elsewhere:\n{rows:?}");
+    }
+}
+
+/// A checkout on a machine that has not allowed this one is not a row.
+///
+/// Its project list arrived in the handshake — the half of pairing that did happen — so this is not
+/// about what may be shown. `waiting` is the far end explicitly saying no, and a one-sided pairing
+/// filling your column with somebody else's repositories is a list growing on its own.
+#[test]
+fn a_machine_that_has_not_allowed_this_one_contributes_no_rows() {
+    const KEY: &str = "git:github.com/neoswarm/other";
+    let sb = Sandbox::new("swarm-unapproved");
+    sb.git_init();
+    sb.git_remote("https://github.com/neoswarm/work.git");
+    // Authorised *by* us and not authorising us back, which is what leaves the link `waiting`.
+    let probe = std::net::TcpListener::bind("127.0.0.1:0").expect("probe");
+    let addr = probe.local_addr().expect("addr");
+    drop(probe);
+    let state = sb.root.join("state");
+    std::fs::create_dir_all(&state).expect("state dir");
+    let _mine = neosh_swarm::Identity::load_or_create(&neosh_swarm::identity::key_path(&state))
+        .expect("this workspace's key");
+    let theirs_id = neosh_swarm::Identity::ephemeral();
+    sb.write_config(&format!(
+        "[swarm]\nenabled = true\nlisten = \"\"\nheartbeat_secs = 1\n\n\
+         [[swarm.peers]]\naddr = \"{addr}\"\nid = \"{}\"\nname = \"stranger\"\n",
+        theirs_id.id()
+    ));
+    let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build().expect("runtime");
+    let guard = rt.enter();
+    // An empty allow-list: it does not know us, so it hangs up after proving who it is.
+    let cfg = neosh_swarm::SwarmConfig {
+        name: "stranger".into(),
+        listen: Some(addr),
+        accepts_commands: true,
+        heartbeat: Duration::from_millis(200),
+        ..Default::default()
+    };
+    let (handle, _events) = neosh_swarm::node::spawn(
+        std::sync::Arc::new(theirs_id),
+        neosh_swarm::Allowed::load(None),
+        cfg,
+        "0.4.6".into(),
+    );
+    handle.send(neosh_swarm::SwarmRequest::Projects {
+        projects: vec![theirs(KEY, "other", "/srv/other", "/srv/other", None)],
+    });
+    drop(guard);
+
+    let mut s = sb.start();
+    s.wait_for("PROJECTS");
+    // Long enough for a dial, a handshake and the refusal that ends it — the panel redraws on the
+    // swarm change either way, so what is asserted is that nothing arrived rather than that it has
+    // not arrived yet.
+    assert!(
+        s.pump(|s| s.sidebar_now().iter().any(|l| l.contains("work"))),
+        "our own project is drawn:\n{:?}",
+        s.sidebar_now()
+    );
+    let rows = s.sidebar_now();
+    assert!(
+        !rows.iter().any(|l| l.contains("other")),
+        "nothing from a machine that has not allowed this one:\n{rows:?}"
+    );
+    drop(handle);
+    drop(rt);
+}
+
+impl Session {
+    /// Put the panel's cursor on the first row containing `needle`, and say whether it got there.
+    ///
+    /// By moving rather than by counting, because a count is a test that passes for the wrong
+    /// reason the moment the panel gains a row — and this panel gains rows for a living.
+    fn sidebar_seek(&mut self, needle: &str) -> bool {
+        for _ in 0..40 {
+            if self.sidebar_cursor().is_some_and(|r| r.contains(needle)) {
+                return true;
+            }
+            self.down();
+            self.drain_for(Duration::from_millis(60));
+        }
+        false
+    }
+
+    /// Everything painted onto a raw-cell surface so far, row by row.
+    ///
+    /// A terminal pane draws in cells rather than lines — `Term::cells` emits every cell every time
+    /// — so the buffer under it says nothing and this is the only place its contents are.
+    fn surface_text(&self) -> Vec<String> {
+        let mut rows: std::collections::BTreeMap<u64, std::collections::BTreeMap<u64, String>> =
+            Default::default();
+        for e in &self.events {
+            if e["type"] != "surface_cells" {
+                continue;
+            }
+            for c in e["cells"].as_array().into_iter().flatten() {
+                let (Some(r), Some(col)) = (c["row"].as_u64(), c["col"].as_u64()) else { continue };
+                let g = c["grapheme"].as_str().unwrap_or(" ").to_string();
+                rows.entry(r).or_default().insert(col, g);
+            }
+        }
+        rows.values().map(|cols| cols.values().cloned().collect::<String>()).collect()
+    }
+}
+
+/// `t` on a row about another computer opens a terminal **on that computer**.
+///
+/// The half of a remote shell somebody actually presses: a key on a row becomes a pane with a
+/// prompt in it. What is on the far end is a real pty in a real workspace and one line of output
+/// here, which is the right amount of machinery — under test is whether this workspace turns an
+/// answer into a pane you can see, not whether `openpty` works.
+#[test]
+fn t_on_another_computers_row_opens_a_terminal_over_there() {
+    const KEY: &str = "git:github.com/neoswarm/faraway";
+    let sb = Sandbox::new("swarm-shell");
+    sb.git_init();
+    sb.git_remote("https://github.com/neoswarm/work.git");
+    let mut peer = Peer::beside_with(&sb, "linux-box", Shells { theirs: true, ..Default::default() });
+    // A repository this machine has no clone of, so it is a row of its own rather than nested
+    // inside `work` — which is also the row somebody is most likely to want a shell on.
+    peer.publish(vec![theirs(KEY, "faraway", "/srv/faraway", "/srv/faraway", None)], Vec::new());
+
+    let mut s = sb.start();
+    s.wait_for("PROJECTS");
+    assert!(
+        s.pump(|s| s.sidebar_now().iter().any(|l| l.contains("faraway"))),
+        "the other machine's project arrives:\n{:?}",
+        s.sidebar_now()
+    );
+
+    s.enter_panel();
+    assert!(s.sidebar_seek("faraway"), "the cursor reaches it:\n{:?}", s.sidebar_now());
+    s.key("t");
+
+    // The pane exists from the press, not from the answer: a key that does nothing visible until
+    // the network replies is indistinguishable from a key that is not bound.
+    assert!(s.pump(|s| s.buffer_named("[terminal]").is_some()), "a terminal pane was furnished");
+    assert!(
+        s.pump(|s| s.surface_text().iter().any(|r| r.contains("opening a shell on linux-box"))),
+        "and says what it is waiting for:\n{:?}",
+        s.surface_text()
+    );
+
+    let pty = peer.answer_shell("hello from over there\r\n");
+    assert_eq!(pty, "t1");
+    assert!(
+        s.pump(|s| s.surface_text().iter().any(|r| r.contains("hello from over there"))),
+        "what the far end printed is drawn here:\n{:?}",
+        s.surface_text()
+    );
+    // Named for where it is, which is the fact that tells this tab from the four beside it.
+    assert!(
+        s.pump(|s| s.tabline_now().contains("linux-box")),
+        "the tab says which machine: {:?}",
+        s.tabline_now()
+    );
+}
+
+/// A machine that has not been told to open shells refuses, and says which setting to change.
+///
+/// Refused here rather than over there, because both halves of the answer are things this end can
+/// know: the capability arrived in the handshake, and a round trip that cannot succeed should not
+/// be spent finding that out. What matters is that it is *said* — a pane that stays black is the
+/// one outcome somebody cannot act on.
+#[test]
+fn a_machine_that_does_not_open_shells_says_so_and_says_which_setting() {
+    const KEY: &str = "git:github.com/neoswarm/faraway";
+    let sb = Sandbox::new("swarm-noshell");
+    sb.git_init();
+    sb.git_remote("https://github.com/neoswarm/work.git");
+    let peer = Peer::beside_with(&sb, "linux-box", Shells::default());
+    peer.publish(vec![theirs(KEY, "faraway", "/srv/faraway", "/srv/faraway", None)], Vec::new());
+
+    let mut s = sb.start();
+    s.wait_for("PROJECTS");
+    assert!(s.pump(|s| s.sidebar_now().iter().any(|l| l.contains("faraway"))));
+    s.enter_panel();
+    assert!(s.sidebar_seek("faraway"), "the cursor reaches it:\n{:?}", s.sidebar_now());
+    s.key("t");
+
+    assert!(
+        s.pump(|s| s.texts().iter().any(|t| t.contains("accepts_shells"))),
+        "the refusal names the setting to change:\n{}",
+        s.transcript()
+    );
+    // And nothing is left on the bar. A tab you cannot type into is worse than no tab: the keys go
+    // somewhere, and nothing on screen ever says why the prompt never came.
+    assert!(
+        s.pump(|s| !s.tabline_now().contains("linux-box")),
+        "no tab is left behind: {:?}",
+        s.tabline_now()
+    );
+}
+
+impl Peer {
+    /// Ask the workspace under test for a shell, and wait for what it says.
+    ///
+    /// The other direction, and the one where a bug is a stranger's prompt on your machine. The
+    /// connection is symmetric once established, so this goes back down the link the workspace
+    /// dialled — which is also the shape a real peer would use.
+    fn ask_for_shell(&mut self, cwd: &str) -> Result<String, String> {
+        let node = self.wait_up();
+        self.handle.send(neosh_swarm::SwarmRequest::PtyOpen {
+            node,
+            id: "ask".into(),
+            cwd: Some(cwd.into()),
+            cols: 80,
+            rows: 24,
+        });
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        loop {
+            assert!(std::time::Instant::now() < deadline, "the workspace never answered");
+            let Some(event) = self.events.blocking_recv() else { panic!("the peer stopped") };
+            if let neosh_swarm::SwarmEvent::PtyOpened { result, .. } = event {
+                return result.map_err(|r| format!("{r:?}"));
+            }
+        }
+    }
+
+    /// Wait until the workspace has told this machine what project it is in.
+    ///
+    /// The one signal from outside that its key has *settled*. A workspace answers `dir:<name>`
+    /// for the first moments of its life — a guess from the directory, until it has read the
+    /// repository's origin — and everything that compares projects across machines has to tolerate
+    /// that. A test pressing a key in that window is testing the fallback rather than the rule, and
+    /// it is a window narrow enough to catch one run in three, which is the worst width there is.
+    ///
+    /// Nothing on screen says it, because on one machine nothing depends on it. The inventory does:
+    /// it is this workspace saying what it has, to a peer, in the vocabulary the question is asked
+    /// in.
+    fn wait_for_key(&mut self, key: &str) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        loop {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the workspace never settled on {key} for its own project"
+            );
+            let Some(event) = self.events.blocking_recv() else { panic!("the peer stopped") };
+            match event {
+                neosh_swarm::SwarmEvent::PeerUp { node, .. } => self.asker = Some(node.id),
+                neosh_swarm::SwarmEvent::Inventory { agents, .. }
+                    if agents.iter().any(|a| a.project.0 == key) =>
+                {
+                    return;
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// Say goodbye and stop, the way a workspace shutting down does.
+    fn hang_up(&self) {
+        self.handle.send(neosh_swarm::SwarmRequest::Shutdown);
+    }
+
+    /// Type at a shell this peer opened on the workspace under test.
+    fn type_into(&mut self, pty: &str, text: &str) {
+        let node = self.wait_up();
+        self.handle.send(neosh_swarm::SwarmRequest::PtyData {
+            node,
+            pty: pty.into(),
+            data: text.as_bytes().to_vec(),
+        });
+    }
+
+    /// The id of the workspace under test, once the link is up.
+    fn wait_up(&mut self) -> neosh_proto::NodeId {
+        if let Some(id) = &self.asker {
+            return id.clone();
+        }
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        loop {
+            assert!(std::time::Instant::now() < deadline, "the workspace never connected");
+            let Some(event) = self.events.blocking_recv() else { panic!("the peer stopped") };
+            if let neosh_swarm::SwarmEvent::PeerUp { node, .. } = event {
+                self.asker = Some(node.id.clone());
+                return node.id;
+            }
+        }
+    }
+}
+
+/// A workspace told to open shells opens one, and says so on the machine it happens on.
+///
+/// The direction where a mistake is somebody else's prompt on your machine, with your shell, your
+/// environment and your credentials, and nothing above it to say no. Which is why it is announced:
+/// a workspace that let it happen silently would be one where the setting is the only evidence it
+/// ever did.
+#[test]
+fn a_workspace_opens_a_shell_for_a_peer_only_when_told_to() {
+    let sb = Sandbox::new("swarm-serve-shell");
+    sb.git_init();
+    let mut peer = Peer::beside_with(&sb, "linux-box", Shells { ours: true, ..Default::default() });
+
+    let mut s = sb.start();
+    s.wait_for("PROJECTS");
+    let work = sb.work().display().to_string();
+    let pty = peer.ask_for_shell(&work).expect("a workspace that says yes opens one");
+    assert!(!pty.is_empty(), "and mints a handle for it");
+
+    assert!(
+        s.pump(|s| s.texts().iter().any(|t| t.contains("opened a shell here"))),
+        "and says so on the machine it is happening on:\n{}",
+        s.transcript()
+    );
+}
+
+/// And a peer that plays by the rules never asks, because the capability said no.
+///
+/// This is the *sender's* half and it is a courtesy, not the enforcement — which is exactly what
+/// the mutation says: making the owner stop checking leaves this test green, because the frame is
+/// never sent. What it does pin is the other reason the flag exists, which is compatibility: an
+/// unknown message tag fails the frame and takes the connection with it, so a peer that sent one on
+/// spec would knock a machine off the board rather than be told no.
+///
+/// [`a_workspace_refuses_a_shell_from_a_peer_that_asks_anyway`] is the enforcement.
+///
+/// `accepts_commands` is on by default and this is not, deliberately: starting an agent over there
+/// is a thing with a permission layer over it and a transcript somebody can read afterwards, and a
+/// pty is a prompt.
+#[test]
+fn a_well_behaved_peer_does_not_ask_for_a_shell_it_was_told_it_cannot_have() {
+    let sb = Sandbox::new("swarm-refuse-shell");
+    sb.git_init();
+    // The default: nothing in the config says `accepts_shells`.
+    let mut peer = Peer::beside_with(&sb, "linux-box", Shells::default());
+
+    let mut s = sb.start();
+    s.wait_for("PROJECTS");
+    let work = sb.work().display().to_string();
+    let refused = peer.ask_for_shell(&work).expect_err("a workspace that was not told refuses");
+    assert!(
+        refused.contains("NotPermitted"),
+        "and refuses by name rather than failing: {refused}"
+    );
+    assert!(
+        !s.texts().iter().any(|t| t.contains("opened a shell here")),
+        "and nothing was opened:\n{}",
+        s.transcript()
+    );
+}
+
+/// A peer that asks for a shell it was told it cannot have is **refused by the owner**.
+///
+/// The conformance point the well-behaved pair above cannot reach, and the only one that is a
+/// security property rather than a courtesy: `NodeCapabilities` is something the other side could
+/// have lied about or simply not read, so the owner checks on every open regardless of what its own
+/// handshake advertised. Mutating that check away leaves every other test in this file green.
+///
+/// So the peer here is a **raw ASCP client** rather than a `neosh_swarm` node: a node would refuse
+/// to send the frame on the sender's behalf, which is precisely the behaviour under test being
+/// assumed rather than checked. It does the real handshake — the id is proven, and it is on the
+/// workspace's allow-list — and then asks for something it has been told it cannot have, which is
+/// the shape of every peer worth defending against: authorised, and wrong.
+#[test]
+fn a_workspace_refuses_a_shell_from_a_peer_that_asks_anyway() {
+    use neosh_proto::{AscpMessage, NodeCapabilities, NodeInfo};
+
+    let sb = Sandbox::new("swarm-lying-peer");
+    sb.git_init();
+
+    let probe = std::net::TcpListener::bind("127.0.0.1:0").expect("probe");
+    let addr = probe.local_addr().expect("addr");
+    drop(probe);
+    let state = sb.root.join("state");
+    std::fs::create_dir_all(&state).expect("state dir");
+    let mine = neosh_swarm::Identity::load_or_create(&neosh_swarm::identity::key_path(&state))
+        .expect("this workspace's key");
+    let theirs = std::sync::Arc::new(neosh_swarm::Identity::ephemeral());
+    // `accepts_shells` absent, which is the default and the state under test.
+    sb.write_config(&format!(
+        "[swarm]\nenabled = true\nlisten = \"\"\nheartbeat_secs = 1\n\n\
+         [[swarm.peers]]\naddr = \"{addr}\"\nid = \"{}\"\nname = \"liar\"\n",
+        theirs.id()
+    ));
+
+    let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build().expect("runtime");
+    let allowed = neosh_swarm::Allowed::load(None);
+    allowed.add(mine.id().clone(), neosh_swarm::AllowedPeer {
+        name: "the workspace under test".into(),
+        alias: None,
+        addr: None,
+        source: neosh_swarm::Source::Paired,
+    });
+
+    // Listen, handshake, ask anyway, and report what came back.
+    let asked = rt.spawn({
+        let theirs = theirs.clone();
+        async move {
+            let sock = tokio::net::TcpListener::bind(addr).await.expect("listen");
+            let (mut stream, _) = sock.accept().await.expect("the workspace dials");
+            let info = NodeInfo {
+                id: theirs.id().clone(),
+                name: "liar".into(),
+                os: "test".into(),
+                version: "0.4.6".into(),
+            };
+            // Advertising `shells: true` about *itself* changes nothing about what it may ask for,
+            // and is what a peer built to try this would do.
+            let caps = NodeCapabilities {
+                accepts_commands: true,
+                accepts_approvals: false,
+                streams: true,
+                browse: true,
+                shells: true,
+                projects: Vec::new(),
+            };
+            neosh_swarm::accept(&mut stream, &theirs, &allowed, &info, &caps).await.expect("paired");
+            neosh_swarm::wire::write_message(&mut stream, &AscpMessage::PtyOpen {
+                id: "sneaky".into(),
+                cwd: None,
+                cols: 80,
+                rows: 24,
+            })
+            .await
+            .expect("sent regardless");
+            // Read past the heartbeats and the inventory for the answer to that one id.
+            loop {
+                match neosh_swarm::wire::read_message(&mut stream).await {
+                    Ok(Some(AscpMessage::Refused { id, refusal })) if id == "sneaky" => {
+                        return Some(Err(format!("{refusal:?}")));
+                    }
+                    Ok(Some(AscpMessage::PtyOpened { id, pty })) if id == "sneaky" => {
+                        return Some(Ok(pty));
+                    }
+                    Ok(Some(_)) => continue,
+                    _ => return None,
+                }
+            }
+        }
+    });
+
+    let mut s = sb.start();
+    s.wait_for("PROJECTS");
+    let answer = rt
+        .block_on(async {
+            tokio::time::timeout(Duration::from_secs(25), asked).await
+        })
+        .expect("the peer finished")
+        .expect("the peer did not panic");
+
+    match answer {
+        Some(Err(refusal)) => assert!(
+            refusal.contains("NotPermitted"),
+            "refused for the right reason rather than by failing: {refusal}"
+        ),
+        Some(Ok(pty)) => panic!("a shell was opened for a peer that was told it could not: {pty}"),
+        None => panic!("the connection ended without an answer — every request is answered once"),
+    }
+    assert!(
+        !s.texts().iter().any(|t| t.contains("opened a shell here")),
+        "and nothing was opened:\n{}",
+        s.transcript()
+    );
+}
+
+/// A shell does not outlive the link that asked for it.
+///
+/// The cleanup nothing else would do, and conformance point 13. A pty has no timeout and no idea
+/// the connection it was opened over has gone — so without this a machine going away leaves a login
+/// shell running on somebody else's computer, with that user's environment, in one of their
+/// directories, reachable by nothing and visible on no screen. It is the same class of thing as the
+/// permission itself: a leak measured in "until the workspace stops".
+///
+/// Asserted on the child's own pid rather than on anything this workspace reports, because what is
+/// under test is that a **process** is gone.
+///
+/// The peer says goodbye, which is the case a test can make deterministic. Everything after that is
+/// shared with the abrupt one — a lid closing reaches the same `PeerDown` through a read that ends,
+/// and the same `close_shells_for` behind it — so what is *not* covered here is how the link is
+/// noticed, which is the swarm's business and has tests of its own, rather than what is done about
+/// it, which is this.
+#[test]
+fn a_shell_dies_with_the_link_that_asked_for_it() {
+    let sb = Sandbox::new("swarm-shell-cleanup");
+    sb.git_init();
+    let mut peer = Peer::beside_with(&sb, "linux-box", Shells { ours: true, ..Default::default() });
+
+    let mut s = sb.start();
+    s.wait_for("PROJECTS");
+    let work = sb.work();
+    let pty = peer.ask_for_shell(&work.display().to_string()).expect("a shell");
+
+    // The child says who it is. `$$` is POSIX, and `$SHELL` is pinned to `/bin/sh` for this suite
+    // so the answer does not depend on whose dotfiles are installed.
+    let pidfile = work.join("shell.pid");
+    peer.type_into(&pty, &format!("echo $$ > {}\n", pidfile.display()));
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    let pid = loop {
+        assert!(std::time::Instant::now() < deadline, "the shell never reached a prompt");
+        if let Ok(text) = std::fs::read_to_string(&pidfile)
+            && let Ok(pid) = text.trim().parse::<i32>()
+        {
+            break pid;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    assert!(alive(pid), "the shell is running to begin with");
+
+    // The machine goes away. Said out loud with a `Goodbye` rather than by dropping the runtime and
+    // hoping the socket closes underneath it: what is under test is this workspace's cleanup, and a
+    // teardown that races is a test that reports the wrong thing whenever it is slow.
+    peer.hang_up();
+    // Waited for on the workspace's own words rather than on a sleep. Until it has noticed the
+    // machine is gone there is nothing for it to have cleaned up, and a test that started counting
+    // before then would be timing the network.
+    assert!(
+        s.pump(|s| s.texts().iter().any(|t| t.contains("lost linux-box"))),
+        "the workspace noticed the machine go:\n{}",
+        s.transcript()
+    );
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while alive(pid) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "pid {pid} is still running after the link that asked for it went away"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    drop(peer);
+}
+
+/// Whether a process is still there, asked of the OS rather than of anything under test.
+///
+/// Signal 0 is the portable "does this exist and could I signal it" — it delivers nothing. A zombie
+/// answers yes until it is reaped, which is fine here: what is being asserted is that the child was
+/// killed, and `Serving`'s `Drop` waits after killing precisely so there is no zombie to see.
+fn alive(pid: i32) -> bool {
+    Command::new("kill")
+        .args(["-0", &pid.to_string()])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+/// `^N` does not ask which computer when none of them has this repository.
+///
+/// The question is worth asking when it is a decision, and a repository nobody else has a checkout
+/// of has one possible answer. Asking anyway is a panel and a keypress spent confirming something
+/// the workspace already knew — the same rule as not asking at all with no machine paired, one step
+/// finer. The first cut asked the moment a second computer existed, which on a swarm of two made
+/// every `^N` two keys instead of one for the whole time the other machine had nothing to do with
+/// what you were working on.
+#[test]
+fn asking_which_computer_is_skipped_when_none_of_them_has_the_project() {
+    let sb = Sandbox::new("swarm-no-question");
+    sb.git_init();
+    sb.git_remote("https://github.com/neoswarm/work.git");
+    let mut peer = Peer::beside(&sb, "linux-box");
+    // A machine that is up and useful, and has nothing to do with the repository you are in.
+    peer.publish(
+        vec![theirs("git:github.com/neoswarm/faraway", "faraway", "/srv/faraway", "/srv/faraway", None)],
+        Vec::new(),
+    );
+
+    let mut s = sb.start();
+    s.wait_for("PROJECTS");
+    // Wait for the machine itself, not for something it brought: a question that has not been
+    // asked yet looks exactly like one that will not be, so a test that presses the key before the
+    // peer has connected passes for the wrong reason. Its arrival is the one unambiguous signal.
+    assert!(s.pump(|s| s.texts().iter().any(|t| t.contains("linux-box joined"))), "the peer joined");
+    assert!(
+        s.pump(|s| s.sidebar_now().iter().any(|l| l.contains("faraway"))),
+        "and its project is on the panel:\n{:?}",
+        s.sidebar_now()
+    );
+    // And that this workspace has settled on its *own* project key — the origin remote rather than
+    // the `dir:` guess it answers with until it has read the repository. Until then the key is
+    // deliberately not used to withhold the question, so a `^N` pressed in that window would be
+    // testing the fallback rather than the rule.
+    peer.wait_for_key("git:github.com/neoswarm/work");
+
+    s.ctrl("n");
+    // On the picker's own buffer rather than on the words in it: "New conversation" is also what an
+    // unnamed conversation is called in the panel, so a text match passes before anything opens.
+    assert!(
+        s.pump(|s| !s.picker_named("[New conversation]").is_empty()),
+        "the where-question is asked:\n{:?}",
+        s.sidebar_now()
+    );
+    let rows = s.picker_named("[New conversation]");
+    assert!(rows.iter().any(|l| l.contains("Here")), "and it is the one about directories:\n{rows:?}");
+    // `This computer` is the machine picker's first row, and is what must not appear.
+    assert!(
+        !rows.iter().any(|l| l.contains("This computer")),
+        "the which-computer question is not asked:\n{rows:?}"
+    );
+}
+
+/// And it does ask when one of them has it, because then it is a decision.
+#[test]
+fn asking_which_computer_happens_when_one_of_them_has_the_project() {
+    const KEY: &str = "git:github.com/neoswarm/work";
+    let sb = Sandbox::new("swarm-yes-question");
+    sb.git_init();
+    sb.git_remote("https://github.com/neoswarm/work.git");
+    let mut peer = Peer::beside(&sb, "linux-box");
+    // The same repository, at a path of its own — which is the ordinary case and the one the
+    // matching had to be made to see. With a conversation in it, purely so there is something on
+    // screen to wait for: the repository merges into the `work` row that is already there and a
+    // repository that is here as well deliberately wears no marker, so the machine connecting
+    // changes nothing visible about the project itself.
+    peer.publish(
+        vec![theirs(KEY, "work", "/srv/checkouts/work", "/srv/checkouts/work", None)],
+        vec![there("r1", "over there", KEY, "/srv/checkouts/work", "/srv/checkouts/work", None)],
+    );
+
+    let mut s = sb.start();
+    s.wait_for("PROJECTS");
+    // The key first, for the reason the other test waits for it: until this workspace has read its
+    // own origin it answers `dir:work`, and a `^N` pressed then is testing the fallback.
+    peer.wait_for_key(KEY);
+    // And then the merge, which is what makes this the same repository as the peer's.
+    assert!(
+        s.pump(|s| s.sidebar_now().iter().any(|l| l.contains("over there"))),
+        "the peer's work is in our tree:\n{:?}",
+        s.sidebar_now()
+    );
+
+    s.ctrl("n");
+    assert!(
+        s.pump(|s| !s.picker_named("[New conversation — where?]").is_empty()),
+        "which computer is asked first — instead the where-picker opened: {:?}",
+        s.picker_named("[New conversation]")
+    );
+    let rows = s.picker_named("[New conversation — where?]");
+    assert!(
+        rows.iter().any(|l| l.contains("This computer")),
+        "and this one is the row the cursor starts on, so `^N ⏎` is unchanged:\n{rows:?}"
+    );
+    assert!(
+        rows.iter().any(|l| l.contains("linux-box")),
+        "with the machine that has it beside it:\n{rows:?}"
+    );
+}
+
+/// The cursor is a **band**, so what is marked on the row it is on keeps its own colour.
+///
+/// And, the reason this is a bug rather than a preference: keeps its own *motion*. A project being
+/// fetched draws one cell of `Git.Fetching`, which is a `Frames` animation — and a run animates
+/// because its winning highlight group says so. Drawn as a ranged group at priority 200 across the
+/// whole row, the cursor won every character it covered, so the spinner stopped the moment you put
+/// the cursor on the row and started again when you moved off. Exactly backwards: the row you are
+/// standing on is the row you are asking about, and the spinner is the only thing on it saying the
+/// answer is not in yet.
+///
+/// `line_hl_group` is the vocabulary the workspace already had for this and already used for diff
+/// bands — under everything on the row, with every ranged group patched over it. Asserted on the
+/// marks rather than on pixels, because what changed is which kind of mark the cursor is.
+#[test]
+fn a_marked_row_keeps_its_marks_under_the_cursor() {
+    let sb = Sandbox::new("cursor-band");
+    sb.git_init();
+    // Something for the git plugin to put a badge on: an untracked file is the cheapest mark that
+    // survives to the row.
+    std::fs::write(sb.work().join("scratch.txt"), "x\n").expect("write");
+
+    let mut s = sb.start();
+    s.wait_for("PROJECTS");
+    assert!(
+        s.pump(|s| s.sidebar_now().iter().any(|l| l.contains("?1"))),
+        "the project row has a badge:\n{:?}",
+        s.sidebar_now()
+    );
+
+    s.enter_panel();
+    assert!(s.sidebar_seek("work"), "the cursor is on the badged row:\n{:?}", s.sidebar_now());
+    let marks = s.sidebar_cursor_marks();
+    assert!(
+        marks.iter().any(|(g, _)| g.starts_with("Git.")),
+        "the row has a badge on it at all: {marks:?}"
+    );
+    // The mechanism rather than the pixels, because the pixels are the renderer's: both marks are
+    // *present* either way and what changed is which kind the cursor is, so a test that only listed
+    // the groups on the row would pass with the bug in place. It did, which is how this ended up
+    // asserting the shape. Who wins between a band and a run over it — and that a run's own
+    // animation survives — is `render_line`'s, and is tested there.
+    assert!(
+        marks.iter().any(|(g, band)| g == "Sidebar.Selected" && *band),
+        "and the cursor is a band under it, not a run over it: {marks:?}"
     );
 }

@@ -1386,6 +1386,28 @@ pub enum ApiCall {
         #[serde(default)]
         prefix: String,
     },
+    /// Open a **shell** on another machine, in a tab of its own.
+    ///
+    /// The last thing that was still "go and ssh there". A conversation on another computer has a
+    /// directory, a branch and a build running in it, and everything about it was reachable from
+    /// here except the one verb you reach for when an agent has just finished: run something and
+    /// look. `<C-w>T` is the same key it is anywhere else, and the pane it makes is an ordinary
+    /// terminal pane — the emulator runs here, exactly as it does over ssh, and what crosses the
+    /// wire is bytes.
+    ///
+    /// `cwd` is a path on the **owner**, learnt from a conversation over there or from its project
+    /// list rather than invented; `None` is that user's home directory.
+    ///
+    /// Rejects when the peer is not connected, when it is too old to have heard of the question,
+    /// and — the one that is a decision rather than a fact — when it has not been told to open
+    /// shells for other machines. That is `accepts_shells` under `[swarm]`, off by default and
+    /// separate from `accepts_commands`, because starting an agent over there is a thing with a
+    /// permission layer over it and a prompt is not. The message says which, and names the setting.
+    SwarmShell {
+        node: NodeId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cwd: Option<String>,
+    },
 
     // ---- the plan ------------------------------------------------------
     // What the account has left, and what it has already spent. The capability is in the host

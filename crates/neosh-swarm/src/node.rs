@@ -27,6 +27,26 @@ use crate::handshake::{accept, dial};
 use crate::identity::Identity;
 use crate::wire::{read_message, write_message};
 
+/// A pty's bytes, as a JSON string can hold them.
+///
+/// Base64 and not, say, escaping: a pty carries whatever the program wrote, which is arbitrary
+/// bytes — a lone `0x9b`, half a UTF-8 sequence split across two reads, the middle of a sixel — and
+/// none of that is representable in a JSON string at all. The cost is a third more bytes on a
+/// channel that is already a terminal's worth of traffic, which is nothing beside a length-prefixed
+/// JSON frame per burst.
+fn encode(bytes: &[u8]) -> String {
+    use base64::Engine as _;
+    base64::engine::general_purpose::STANDARD.encode(bytes)
+}
+
+/// The other way. A frame that will not decode is dropped rather than failing the connection: it is
+/// one burst of one terminal's output, and taking the link down over it would lose every
+/// conversation on it as well.
+fn decode(data: &str) -> Option<Vec<u8>> {
+    use base64::Engine as _;
+    base64::engine::general_purpose::STANDARD.decode(data).ok()
+}
+
 /// How a node is set up. Everything here comes from `[swarm]` in the user's config.
 #[derive(Debug, Clone)]
 pub struct SwarmConfig {
@@ -39,6 +59,8 @@ pub struct SwarmConfig {
     pub peers: Vec<PeerAddress>,
     pub accepts_commands: bool,
     pub accepts_approvals: bool,
+    /// Whether a peer may open a pty here. See [`neosh_proto::NodeCapabilities::shells`].
+    pub accepts_shells: bool,
     /// How often to say "still here". Also the reconnect interval, which is deliberate: those are
     /// the same number in the sense that matters, which is how long a board may be wrong for.
     pub heartbeat: Duration,
@@ -52,6 +74,7 @@ impl Default for SwarmConfig {
             peers: Vec::new(),
             accepts_commands: true,
             accepts_approvals: false,
+            accepts_shells: false,
             heartbeat: Duration::from_secs(10),
         }
     }
@@ -94,6 +117,20 @@ pub enum SwarmRequest {
     Pair { id: NodeId, name: String, addr: Option<String> },
     /// Withdraw authorisation. The connection, if there is one, goes with it.
     Unpair { id: NodeId },
+    /// Ask a peer to open a shell. Answered once, with [`SwarmEvent::PtyOpened`].
+    PtyOpen { node: NodeId, id: String, cwd: Option<String>, cols: u16, rows: u16 },
+    /// Answer a [`SwarmEvent::PtyOpen`] that came in.
+    PtyOpened { node: NodeId, id: String, result: Result<String, Refusal> },
+    /// Bytes for a pty, in whichever direction this node is going. Keystrokes from the viewer,
+    /// output from the owner — the same message, because the connection is symmetric and a pty is
+    /// two pipes that do not otherwise differ.
+    PtyData { node: NodeId, pty: String, data: Vec<u8> },
+    /// The viewer's window changed size. Only ever travels from the side that is drawing.
+    PtyResize { node: NodeId, pty: String, cols: u16, rows: u16 },
+    /// Close it, from either end.
+    PtyClose { node: NodeId, pty: String },
+    /// The shell exited here. Only ever travels from the owner.
+    PtyExit { node: NodeId, pty: String, status: Option<i32> },
     /// Dial a down peer again now, resetting its backoff, rather than waiting the delay out.
     Redial { id: NodeId },
     /// Close the connection to a peer and stop dialling it, keeping the pairing.
@@ -145,6 +182,18 @@ pub enum SwarmEvent {
     Browse { node: NodeId, id: String, prefix: String },
     /// A browse we sent has been answered. Exactly one of these per browse, ever.
     Browsed { node: NodeId, id: String, result: Result<Vec<String>, Refusal> },
+    /// A peer wants a shell here. The host must answer with [`SwarmRequest::PtyOpened`].
+    PtyOpen { node: NodeId, id: String, cwd: Option<String>, cols: u16, rows: u16 },
+    /// A shell we asked for has been answered. Exactly one of these per open, ever.
+    PtyOpened { node: NodeId, id: String, result: Result<String, Refusal> },
+    /// Bytes for a pty — the shell's output if we asked for it, a viewer's keystrokes if we own it.
+    PtyData { node: NodeId, pty: String, data: Vec<u8> },
+    /// A viewer's window changed size, so `SIGWINCH` on the pty we own.
+    PtyResize { node: NodeId, pty: String, cols: u16, rows: u16 },
+    /// The other end closed it.
+    PtyClose { node: NodeId, pty: String },
+    /// A shell we were watching exited over there.
+    PtyExit { node: NodeId, pty: String, status: Option<i32> },
     /// A machine proved who it is and is not one we have paired with.
     ///
     /// The beginning of pairing rather than the end of a connection. Reported for both directions:
@@ -254,6 +303,12 @@ async fn run(
         // decides whether the message is *answered* is `accepts_commands`, checked when one
         // arrives. A knob here would be a second permission for something already permitted.
         browse: true,
+        // A setting rather than a build fact, which is where this parts company with `browse`
+        // above: that one says "this binary understands the message" because answering it is
+        // already covered by `accepts_commands`. Opening a shell is not covered by anything, so
+        // what is advertised is what was asked for — and it is checked again when one arrives,
+        // because a capability is a courtesy to the other end's UI and never the enforcement.
+        shells: config.accepts_shells,
         projects: Vec::new(),
     };
 
@@ -512,6 +567,68 @@ async fn run(
                             });
                         }
                     }
+                    SwarmRequest::PtyOpen { node, id, cwd, cols, rows } => {
+                        // `browse`'s rule, and one more clause: that flag is only ever a
+                        // compatibility check because answering is already covered by
+                        // `accepts_commands`, and this one is a permission as well. Both failures
+                        // are the same sentence to whoever pressed the key — no shell here — so
+                        // they are one arm with the machine's own words in it.
+                        match peers.get(&node) {
+                            Some(p) if p.capabilities.shells => {
+                                let _ = p.out.send(AscpMessage::PtyOpen { id, cwd, cols, rows });
+                            }
+                            Some(p) => {
+                                let _ = events.send(SwarmEvent::PtyOpened {
+                                    node,
+                                    id,
+                                    result: Err(Refusal::NotPermitted {
+                                        what: format!(
+                                            "{} does not open shells for other machines — set \
+                                             `accepts_shells = true` under `[swarm]` there",
+                                            p.info.name
+                                        ),
+                                    }),
+                                });
+                            }
+                            None => {
+                                let _ = events.send(SwarmEvent::PtyOpened {
+                                    node,
+                                    id,
+                                    result: Err(Refusal::Busy {
+                                        message: "not connected".into(),
+                                    }),
+                                });
+                            }
+                        }
+                    }
+                    SwarmRequest::PtyOpened { node, id, result } => {
+                        if let Some(p) = peers.get(&node) {
+                            let _ = p.out.send(match result {
+                                Ok(pty) => AscpMessage::PtyOpened { id, pty },
+                                Err(refusal) => AscpMessage::Refused { id, refusal },
+                            });
+                        }
+                    }
+                    SwarmRequest::PtyData { node, pty, data } => {
+                        if let Some(p) = peers.get(&node) {
+                            let _ = p.out.send(AscpMessage::PtyData { pty, data: encode(&data) });
+                        }
+                    }
+                    SwarmRequest::PtyResize { node, pty, cols, rows } => {
+                        if let Some(p) = peers.get(&node) {
+                            let _ = p.out.send(AscpMessage::PtyResize { pty, cols, rows });
+                        }
+                    }
+                    SwarmRequest::PtyClose { node, pty } => {
+                        if let Some(p) = peers.get(&node) {
+                            let _ = p.out.send(AscpMessage::PtyClose { pty });
+                        }
+                    }
+                    SwarmRequest::PtyExit { node, pty, status } => {
+                        if let Some(p) = peers.get(&node) {
+                            let _ = p.out.send(AscpMessage::PtyExit { pty, status });
+                        }
+                    }
                     SwarmRequest::Subscribe { node, session } => {
                         if let Some(p) = peers.get(&node) {
                             let _ = p.out.send(AscpMessage::Subscribe { session });
@@ -674,6 +791,43 @@ async fn run(
                     }
                     AscpMessage::Browsed { id, paths } => {
                         let _ = events.send(SwarmEvent::Browsed { node, id, result: Ok(paths) });
+                    }
+                    AscpMessage::PtyOpen { id, cwd, cols, rows } => {
+                        // Refused here rather than passed up, exactly as a `Command` this node does
+                        // not accept is: the host should not have to re-derive a policy it already
+                        // declared, and this is the one policy where the answer being wrong means a
+                        // stranger's shell. Checked on every open regardless of what the handshake
+                        // advertised — a capability is a courtesy to the other end's UI, and the
+                        // owner enforces.
+                        if caps.shells {
+                            let _ = events.send(SwarmEvent::PtyOpen { node, id, cwd, cols, rows });
+                        } else if let Some(p) = peers.get(&node) {
+                            let _ = p.out.send(AscpMessage::Refused {
+                                id,
+                                refusal: Refusal::NotPermitted {
+                                    what: "this node does not open shells for other machines".into(),
+                                },
+                            });
+                        }
+                    }
+                    AscpMessage::PtyOpened { id, pty } => {
+                        let _ = events.send(SwarmEvent::PtyOpened { node, id, result: Ok(pty) });
+                    }
+                    AscpMessage::PtyData { pty, data } => {
+                        if let Some(data) = decode(&data) {
+                            let _ = events.send(SwarmEvent::PtyData { node, pty, data });
+                        } else {
+                            tracing::warn!(%pty, "pty frame was not base64");
+                        }
+                    }
+                    AscpMessage::PtyResize { pty, cols, rows } => {
+                        let _ = events.send(SwarmEvent::PtyResize { node, pty, cols, rows });
+                    }
+                    AscpMessage::PtyClose { pty } => {
+                        let _ = events.send(SwarmEvent::PtyClose { node, pty });
+                    }
+                    AscpMessage::PtyExit { pty, status } => {
+                        let _ = events.send(SwarmEvent::PtyExit { node, pty, status });
                     }
                     AscpMessage::Ack { id, session } => {
                         let _ = events.send(SwarmEvent::Answer {
@@ -985,6 +1139,8 @@ mod tests {
             session: SessionId(id.into()),
             project: ProjectKey("git:example.com/x".into()),
             project_name: "x".into(),
+            repo_root: None,
+            branch: None,
             cwd: "/w/x".into(),
             label: id.into(),
             state: AgentState::Idle,

@@ -327,6 +327,9 @@ impl Session {
                 .file_name()
                 .map(|n| n.to_string_lossy().into_owned())
                 .unwrap_or_else(|| self.cwd.display().to_string()),
+            // Filled in by the host too, and for the same reason: what a project is called across
+            // machines is read off its git remote, which is a repository question.
+            project_key: String::new(),
             repo_root: None,
             branch: None,
             message_count: self.messages.len() as u32,

@@ -1,12 +1,14 @@
 {
   "agents": [
     {
+      "branch": "main",
       "cwd": "/home/me/src/neosh",
       "label": "make the parser faster",
       "message_count": 12,
       "model": "claude-opus-5",
       "project": "git:github.com/neoswarm/neosh",
       "project_name": "neosh",
+      "repo_root": "/home/me/src/neosh",
       "session": "01J8XPQ4",
       "state": "running",
       "turn_started_at": 1770000000,
