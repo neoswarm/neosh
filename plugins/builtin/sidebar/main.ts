@@ -2145,7 +2145,7 @@ async function chooseMachine(
   // *said*, and somebody who has just paired a computer and finds it missing reads that as the
   // feature not existing. What `usable` decided is only whether to ask at all.
   for (const n of all) {
-    const mark = marker(n.link, ascii);
+    const mark = marker(n.link);
     const can = n.up && n.capabilities.accepts_commands;
     const why = !n.up
       ? linkWords(n.link)
@@ -4030,11 +4030,26 @@ function group(
     const fb = newest(b);
     return fa !== fb ? fa - fb : a.name.localeCompare(b.name);
   };
-  // Ours before theirs inside a repository, and each half by name: a tree on this disk is one you
-  // can `↵` into, and the ones you cannot are the tail of the list rather than mixed through it.
-  const byTree = (a: Checkout, b: Checkout) =>
-    Number(Boolean(a.node)) - Number(Boolean(b.node)) ||
-    treeName(a).localeCompare(treeName(b));
+  // Ours before theirs inside a repository: a tree on this disk is one you can `↵` into and start
+  // work in, and the ones you cannot are the tail of the list rather than mixed through it.
+  //
+  // Inside our half it is the order a project's own row uses — the rank you dragged it to, then
+  // the newest conversation in it, then the name — because `J`/`K` reorder a worktree among its
+  // siblings and write exactly that rank. Sorted by name alone, those writes would land on disk
+  // and change nothing on screen, which is a key that does its work and appears not to. Their half
+  // is by name and nothing else: a directory on somebody else's machine has no rank here to read,
+  // and giving it a place in the order would put it between two rows that do.
+  const byTree = (a: Checkout, b: Checkout) => {
+    const side = Number(Boolean(a.node)) - Number(Boolean(b.node));
+    if (side !== 0) return side;
+    if (a.node || b.node) return treeName(a).localeCompare(treeName(b));
+    const ra = arrangement.rank(a.cwd);
+    const rb = arrangement.rank(b.cwd);
+    if (ra !== rb) return ra - rb;
+    const fa = recency.get(a.cwd) ?? NEVER;
+    const fb = recency.get(b.cwd) ?? NEVER;
+    return fa !== fb ? fa - fb : treeName(a).localeCompare(treeName(b));
+  };
 
   const all = [...projects.values()];
   for (const p of all) p.worktrees.sort(byTree);
@@ -4342,7 +4357,7 @@ function projectRow(p: Project, opts: DrawOptions, now: number): ListRow<Target>
   // that what is true of every row does not earn a column on each of them. Where it *is* news is a
   // repository you have not cloned here at all, which is the row you would otherwise press `↵` on
   // expecting your own files. The conversations underneath say which of them are where.
-  const sky = p.cwd === null && p.hosts.length > 0 ? marker(p.link, opts.ascii) : null;
+  const sky = p.cwd === null && p.hosts.length > 0 ? marker(p.link) : null;
 
   // What is finished and unseen inside a project you have folded shut. Only when folded, because
   // folding is the thing that hid it: with the project open the conversation says so on its own
@@ -4504,7 +4519,7 @@ function treeRow(c: Checkout, opts: DrawOptions, now: number): ListRow<Target> {
   // Where it is, in one column, and only on the rows where that is news. Two checkouts of one
   // branch on two machines are two rows and genuinely different directories with different
   // uncommitted work in them — so this is not decoration, it is the only thing telling them apart.
-  const sky = c.node ? marker(c.node.link, opts.ascii) : null;
+  const sky = c.node ? marker(c.node.link) : null;
   // One step in from its repository's arrow, and the step is two columns — the same one a
   // conversation takes from the project it is in. Three, when the star was on the left, made the
   // nesting read as two levels where there is one.
@@ -4581,7 +4596,7 @@ function treeRow(c: Checkout, opts: DrawOptions, now: number): ListRow<Target> {
  * distinction the key card spells out in words would be spending the panel's scarcest resource on
  * something it cannot say.
  */
-function marker(link: LinkState | undefined, _ascii: boolean): { text: string; hl: string } {
+function marker(link: LinkState | undefined): { text: string; hl: string } {
   const glyph = "@";
   switch (link?.state) {
     case "up":
@@ -4638,7 +4653,7 @@ function linkWords(link: LinkState | undefined): string {
 function remoteRow(r: SwarmAgent, opts: DrawOptions, now: number, depth = 0): ListRow<Target> {
   const working = r.agent.state === "running";
   const link = opts.links.get(r.node.id);
-  const mark = marker(link, opts.ascii);
+  const mark = marker(link);
   // The state glyph a local conversation carries, in the same column it carries it in, so a
   // project's conversations read as one list whichever machine each of them is on.
   const glyph = working ? (opts.ascii ? "*" : "◍") : opts.ascii ? "." : "·";
