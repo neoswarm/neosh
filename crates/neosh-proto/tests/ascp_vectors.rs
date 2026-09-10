@@ -75,6 +75,7 @@ fn caps() -> NodeCapabilities {
     NodeCapabilities {
         accepts_commands: true,
         accepts_approvals: false,
+        shells: false,
         streams: true,
         browse: true,
         projects: vec![RemoteProject {

@@ -863,7 +863,12 @@ pub struct Host {
     /// `sync_panes` is what furnishes a pane, and it runs after the fact — it sees a pane the tree
     /// has and this does not, with nothing to say which kind it should be. Set by the command that
     /// created it and taken by the furnishing, which is one turn of the loop later at most.
-    pending_term: Option<neosh_proto::PaneId>,
+    ///
+    /// It carries *which machine* as well, because a remote shell is furnished identically and
+    /// differs only in what the pty is on the end of — see [`crate::term::Pipe`]. Pointing this at
+    /// a node rather than adding a second pending slot keeps the one invariant that matters: at
+    /// most one pane is mid-furnishing, and whichever command set it is the one that gets it.
+    pending_term: Option<(neosh_proto::PaneId, ShellAt)>,
     /// The last terminal to send anything.
     ///
     /// The fallback for work that is nobody's key press and names no window — a plugin drawing on
@@ -978,14 +983,33 @@ pub struct Host {
     /// The last thing said to the peers about what is here, so a poll can say nothing when nothing
     /// has changed. `None` until the first publish.
     published: Option<(Vec<neosh_proto::AgentSummary>, Vec<neosh_proto::RemoteProject>)>,
-    /// Which of those are directory listings rather than commands.
+    /// What each of those questions *was*.
     ///
-    /// One waiting map for both, because a peer that goes away has to fail everything outstanding
-    /// and a second map would be a second place to remember to do it. This set is only consulted on
-    /// the way *back*: a refusal arrives as `Refused { id }` with nothing on it to say what it is
-    /// refusing, so the id is what says whether the answer is `Paths` or a started conversation.
-    swarm_browsing: std::collections::HashSet<String>,
+    /// One waiting map for all of them, because a peer that goes away has to fail everything
+    /// outstanding and a second map would be a second place to remember to do it. This is only
+    /// consulted on the way *back*: a refusal arrives as `Refused { id }` with nothing on it to say
+    /// what it is refusing, so the id is the only thing that tells a directory listing from a
+    /// started conversation from a shell that was not allowed.
+    swarm_asking: std::collections::HashMap<String, SwarmAsk>,
     swarm_next_command: u64,
+    /// Shells this machine is running for other machines, by the handle it minted for each.
+    ///
+    /// The far side of [`crate::term::Pipe::Remote`]. Keyed by handle rather than by peer because
+    /// that is what every message about one carries; the peer is kept beside it so a link going
+    /// away can take its shells with it, which is the one cleanup nothing else would do — a laptop
+    /// closing its lid must not leave a login shell running here for ever.
+    swarm_serving: std::collections::HashMap<String, (neosh_proto::NodeId, crate::term::Serving)>,
+    swarm_next_pty: u64,
+    /// Panes waiting on a peer to answer [`ApiCall::SwarmShell`], by the request id.
+    ///
+    /// A pane exists from the moment the key is pressed and its terminal arrives one round trip
+    /// later — so this is what turns the answer back into the pane it is for. Making the pane
+    /// afterwards would mean a key that does nothing visible until the network answers, which on a
+    /// slow link is indistinguishable from a key that is not bound.
+    swarm_opening: std::collections::HashMap<
+        String,
+        (neosh_proto::ViewId, neosh_proto::PaneId, neosh_proto::NodeId),
+    >,
     /// Local conversations somebody on another machine is watching.
     ///
     /// Kept so the turn path can ask "is anyone looking" with a hash lookup rather than building a
@@ -1371,6 +1395,34 @@ struct SearchPrompt {
     draft: String,
 }
 
+/// Where a shell about to be started actually runs.
+///
+/// A pane is a pane either way — same window, same surface, same keys — so this is the whole of the
+/// difference and it is carried by the one slot that already said "furnish this as a terminal".
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum ShellAt {
+    /// On this machine, in the pane's conversation's directory.
+    Here,
+    /// On a peer, in a directory on *its* disk. `cwd` is `None` for that user's home.
+    There { node: neosh_proto::NodeId, cwd: Option<String> },
+}
+
+/// What a request sent to a peer was, for reading its answer.
+///
+/// A refusal comes back as a bare `Refused { id }` — the far end is saying no to a question, not
+/// describing it — so the id is the only thing left that says which question. See
+/// [`Host::swarm_asking`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SwarmAsk {
+    /// A command aimed at one of that machine's conversations.
+    Command,
+    /// A directory listing.
+    Browse,
+    /// A shell.
+    Shell,
+}
+
+
 /// The panel asking what a new tab should hold — see [`Host::begin_tab_choice`].
 struct TabChooser {
     win: WindowId,
@@ -1510,7 +1562,10 @@ impl Host {
             swarm_node: None,
             swarm_pending: Default::default(),
             published: None,
-            swarm_browsing: Default::default(),
+            swarm_asking: Default::default(),
+            swarm_serving: Default::default(),
+            swarm_next_pty: 0,
+            swarm_opening: Default::default(),
             swarm_next_command: 0,
             swarm_watched: Default::default(),
             swarm_strangers: Default::default(),
@@ -2357,6 +2412,44 @@ impl Host {
                     return Err(ApiError::NotFound { what: "the swarm is not running".into() });
                 };
                 h.send(neosh_swarm::SwarmRequest::Disconnect { id: node });
+                Ok(ApiOk::Unit)
+            }
+            ApiCall::SwarmShell { node, cwd } => {
+                if self.swarm_node.is_none() {
+                    return Err(ApiError::NotFound { what: "the swarm is not running".into() });
+                }
+                let peer = self.swarm.peer(&node);
+                // Checked here as well as at the far end, and for what a person can *do* about it:
+                // "not connected" is fixed from this keyboard and "shells are off over there" is
+                // fixed from the other one, and a round trip that cannot happen should not be
+                // spent finding that out.
+                let Some(peer) = peer else {
+                    return Err(ApiError::NotFound { what: format!("no machine {}", node.short()) });
+                };
+                if !peer.up() {
+                    return Err(ApiError::Denied {
+                        reason: format!("{} is not connected", peer.display_name()),
+                    });
+                }
+                if !peer.capabilities.shells {
+                    return Err(ApiError::Denied {
+                        reason: format!(
+                            "{} does not open shells for other machines — set `accepts_shells = \
+                             true` under `[swarm]` there",
+                            peer.display_name()
+                        ),
+                    });
+                }
+                // A tab rather than a split, which is what `<C-w>T` does locally: a shell on
+                // another computer is a place to work, not a strip beside what you were reading.
+                let view = self.view_now();
+                self.editor.tab_new(view, None, true);
+                self.pending_term = self
+                    .editor
+                    .active_pane_of(view)
+                    .map(|p| (p, ShellAt::There { node, cwd }));
+                self.sync_panes();
+                self.refresh_status();
                 Ok(ApiOk::Unit)
             }
             // Answered off the loop: it opens a socket to somewhere that may not answer.
@@ -4000,19 +4093,22 @@ impl Host {
                     .map(|p| p.session.clone())
                     .unwrap_or_else(|| self.agent.sessions().current_id().clone());
                 for pane in fresh {
-                    let as_term = self.pending_term == Some(pane);
-                    if as_term {
+    let as_term = match &self.pending_term {
+                        Some((p, at)) if *p == pane => Some(at.clone()),
+                        _ => None,
+                    };
+                    if as_term.is_some() {
                         self.pending_term = None;
                     }
-                    let furnished = match as_term {
+                    let furnished = match as_term.is_some() {
                         true => PaneState::furnish_term(&mut self.editor, view, pane, inherit.clone()),
                         false => PaneState::furnish(&mut self.editor, view, pane, inherit.clone()),
                     };
                     if let Some(v) = self.views.get_mut(&view) {
                         v.panes.insert(pane, furnished);
                     }
-                    if as_term {
-                        self.start_terminal(view, pane);
+                    if let Some(at) = as_term {
+                        self.start_terminal(view, pane, at);
                         continue;
                     }
                     // Drawn as an arrival, exactly as a terminal attaching is: the transcript is
@@ -4095,7 +4191,12 @@ impl Host {
     /// Sized from the window's viewport when the frontend has reported one, and from a sane default
     /// when it has not — the first `ViewportChanged` resizes it, which is one frame later and is
     /// exactly the same path a person dragging the terminal's corner takes.
-    fn start_terminal(&mut self, view: neosh_proto::ViewId, pane: neosh_proto::PaneId) {
+    fn start_terminal(
+        &mut self,
+        view: neosh_proto::ViewId,
+        pane: neosh_proto::PaneId,
+        at: ShellAt,
+    ) {
         let Some(state) = self.views.get(&view).and_then(|v| v.panes.get(&pane)) else { return };
         let (win, session) = (state.chat_win, state.session.clone());
         let (cols, rows) = self
@@ -4104,6 +4205,10 @@ impl Host {
             .and_then(|w| w.viewport)
             .map(|v| (v.width, v.height))
             .unwrap_or((80, 24));
+        if let ShellAt::There { node, cwd } = at {
+            self.ask_for_shell(view, pane, win, node, cwd, rows, cols);
+            return;
+        }
         let cwd = self.session_cwd(&session);
 
         match crate::term::Term::spawn(&cwd, rows, cols) {
@@ -4124,6 +4229,200 @@ impl Host {
                 self.editor_message(MessageLevel::Error, format!("could not start a shell: {e}"));
             }
         }
+    }
+
+    /// Ask a peer for a shell, and claim the pane's surface while it answers.
+    ///
+    /// The surface is claimed *now* rather than when the pty arrives, so the pane is a terminal
+    /// from the frame the key was pressed in. What is in it until the far end answers is a
+    /// sentence saying who is being waited on — because the alternative is an empty black
+    /// rectangle, and on a slow link that is indistinguishable from a shell that started and
+    /// printed nothing.
+    #[allow(clippy::too_many_arguments)]
+    fn ask_for_shell(
+        &mut self,
+        view: neosh_proto::ViewId,
+        pane: neosh_proto::PaneId,
+        win: neosh_proto::WindowId,
+        node: neosh_proto::NodeId,
+        cwd: Option<String>,
+        rows: u16,
+        cols: u16,
+    ) {
+        let Some(handle) = self.swarm_node.clone() else {
+            self.editor_message(MessageLevel::Error, "the swarm is not running");
+            self.close_pane_quietly(view, pane);
+            return;
+        };
+        let plugin = PluginId::from(BUILTIN);
+        let _ = self.editor.apply_in(view, &plugin, ApiCall::SurfaceClaim {
+            win,
+            rect: neosh_proto::Rect { row: 0, col: 0, width: cols, height: rows },
+        });
+        self.scaffold_terminal(view, pane, rows, cols);
+        // Shares the counter every other request to a peer uses, so the id spaces cannot collide —
+        // which matters precisely because a refusal is a bare `Refused { id }`.
+        self.swarm_next_command += 1;
+        let id = format!("s{}", self.swarm_next_command);
+        self.swarm_asking.insert(id.clone(), SwarmAsk::Shell);
+        self.swarm_opening.insert(id.clone(), (view, pane, node.clone()));
+        handle.send(neosh_swarm::SwarmRequest::PtyOpen { node, id, cwd, cols, rows });
+    }
+
+    /// A peer answered [`ApiCall::SwarmShell`]: attach the pane's terminal, or say why not.
+    fn shell_answered(&mut self, id: &str, pty: Result<String, String>) {
+        let Some((view, pane, node)) = self.swarm_opening.remove(id) else { return };
+        self.swarm_asking.remove(id);
+        let name = self
+            .swarm
+            .peer(&node)
+            .map(|p| p.display_name())
+            .unwrap_or_else(|| node.short().to_string());
+        let pty = match pty {
+            Ok(pty) => pty,
+            Err(reason) => {
+                // Loud, and the pane goes. A terminal you cannot type into is worse than no
+                // terminal: the tab is on the bar, the keys go somewhere, and nothing on screen
+                // ever says why the prompt never came.
+                self.editor_message(MessageLevel::Error, format!("{name}: {reason}"));
+                self.close_pane_quietly(view, pane);
+                return;
+            }
+        };
+        let Some(handle) = self.swarm_node.clone() else { return };
+        let (cols, rows) = self
+            .views
+            .get(&view)
+            .and_then(|v| v.panes.get(&pane))
+            .and_then(|st| self.editor.window(st.chat_win))
+            .and_then(|w| w.viewport)
+            .map(|v| (v.width, v.height))
+            .unwrap_or((80, 24));
+        let term = crate::term::Term::attach(handle, node, pty, &name, rows, cols);
+        self.terminals.insert(pane, term);
+        self.draw_terminal(view, pane);
+    }
+
+    /// Which pane is drawing a given machine's pty, if any.
+    ///
+    /// A linear walk over the panes rather than a map keyed by handle, because there are as many
+    /// terminals as somebody has opened panes and a second map to keep in step is a second map to
+    /// get wrong when a pane closes. Both halves of the pair are compared: a handle is minted per
+    /// machine and two machines can perfectly well both be on `t3`.
+    fn pane_of_pty(
+        &self,
+        node: &neosh_proto::NodeId,
+        pty: &str,
+    ) -> Option<(neosh_proto::ViewId, neosh_proto::PaneId)> {
+        self.views.iter().find_map(|(view, v)| {
+            v.panes
+                .keys()
+                .find(|pane| {
+                    self.terminals.get(**pane).and_then(|t| t.remote())
+                        == Some((node, pty))
+                })
+                .map(|pane| (*view, *pane))
+        })
+    }
+
+    /// Every pane drawing a shell on `node`. See [`Self::pane_of_pty`] for why this is a walk.
+    fn panes_of_node(
+        &self,
+        node: &neosh_proto::NodeId,
+    ) -> Vec<(neosh_proto::ViewId, neosh_proto::PaneId)> {
+        self.views
+            .iter()
+            .flat_map(|(view, v)| v.panes.keys().map(move |pane| (*view, *pane)))
+            .filter(|(_, pane)| {
+                self.terminals.get(*pane).and_then(|t| t.remote()).is_some_and(|(n, _)| n == node)
+            })
+            .collect()
+    }
+
+    /// Take a pane away without the ceremony closing one usually has.
+    ///
+    /// For the one case that is not somebody closing a pane: a terminal that never started. There
+    /// is nothing in it to lose, nothing to confirm, and the message saying why has already been
+    /// said — what is left is to stop drawing a rectangle that will never have anything in it.
+    fn close_pane_quietly(&mut self, view: neosh_proto::ViewId, pane: neosh_proto::PaneId) {
+        self.terminals.remove(pane);
+        self.editor.pane_close(view, pane);
+        if let Some(v) = self.views.get_mut(&view) {
+            v.panes.remove(&pane);
+        }
+        self.sync_panes();
+        self.refresh_status();
+    }
+
+    /// A peer wants a shell here. Answer exactly once, whatever happens.
+    ///
+    /// The node has already refused this if `accepts_shells` is off — it does that rather than
+    /// waking the host, for the reason it refuses a command to a read-only node — so reaching here
+    /// means the setting says yes and what is left is whether a pty can actually be had.
+    fn run_swarm_pty_open(
+        &mut self,
+        node: neosh_proto::NodeId,
+        id: String,
+        cwd: Option<String>,
+        cols: u16,
+        rows: u16,
+    ) {
+        let Some(handle) = self.swarm_node.clone() else { return };
+        // A directory that is not there is the ordinary failure here — a worktree removed by hand,
+        // a project moved — and it has to be *named*, because `posix_spawn` reports it exactly as
+        // it reports a missing shell. The home directory is the fallback rather than an error:
+        // `None` means "wherever" and a caller that named nowhere should get a prompt.
+        let dir = cwd
+            .map(std::path::PathBuf::from)
+            .filter(|p| p.is_dir())
+            .or_else(|| std::env::var_os("HOME").map(std::path::PathBuf::from))
+            .unwrap_or_else(|| std::path::PathBuf::from("/"));
+        self.swarm_next_pty += 1;
+        let pty = format!("t{}", self.swarm_next_pty);
+        let result = crate::term::Serving::spawn(
+            &dir,
+            rows,
+            cols,
+            handle.clone(),
+            node.clone(),
+            pty.clone(),
+        );
+        match result {
+            Ok(serving) => {
+                let name = self
+                    .swarm
+                    .peer(&node)
+                    .map(|p| p.display_name())
+                    .unwrap_or_else(|| node.short().to_string());
+                // Said out loud on this machine, once per shell. Somebody else has just opened a
+                // prompt here with this user's credentials, and a workspace that let that happen
+                // silently would be one where the setting is the only evidence it ever did.
+                self.editor_message(
+                    MessageLevel::Info,
+                    format!("{name} opened a shell here in {}", dir.display()),
+                );
+                self.swarm_serving.insert(pty.clone(), (node.clone(), serving));
+                handle.send(neosh_swarm::SwarmRequest::PtyOpened { node, id, result: Ok(pty) });
+            }
+            Err(e) => {
+                handle.send(neosh_swarm::SwarmRequest::PtyOpened {
+                    node,
+                    id,
+                    result: Err(neosh_proto::Refusal::Failed { message: e.to_string() }),
+                });
+            }
+        }
+    }
+
+    /// Close every shell this machine is running for `node`.
+    ///
+    /// The cleanup nothing else does. A shell has no timeout and no idea the link it was opened
+    /// over has gone, so without this a laptop closing its lid leaves a login shell running here
+    /// until the workspace stops — with that user's environment, in one of their directories,
+    /// reachable by nothing.
+    fn close_shells_for(&mut self, node: &neosh_proto::NodeId) {
+        // `Serving`'s `Drop` kills the child, so taking them out of the map is the whole of it.
+        self.swarm_serving.retain(|_, (owner, _)| owner != node);
     }
 
     /// Paint whatever the shell has drawn, if it has drawn anything since last time.
@@ -4389,6 +4688,7 @@ impl Host {
             peers,
             accepts_commands: cfg.accepts_commands,
             accepts_approvals: cfg.accepts_approvals,
+            accepts_shells: cfg.accepts_shells,
             heartbeat: Duration::from_secs(cfg.heartbeat_secs.max(1)),
         };
         let (handle, events) = neosh_swarm::spawn(
@@ -4464,6 +4764,7 @@ impl Host {
         self.swarm_next_command += 1;
         let id = format!("c{}", self.swarm_next_command);
         self.swarm_pending.insert(id.clone(), waiting);
+        self.swarm_asking.insert(id.clone(), SwarmAsk::Command);
         handle.send(neosh_swarm::SwarmRequest::Command { node, id, session, command });
     }
 
@@ -4506,7 +4807,7 @@ impl Host {
         self.swarm_next_command += 1;
         let id = format!("b{}", self.swarm_next_command);
         self.swarm_pending.insert(id.clone(), waiting);
-        self.swarm_browsing.insert(id.clone());
+        self.swarm_asking.insert(id.clone(), SwarmAsk::Browse);
         handle.send(neosh_swarm::SwarmRequest::Browse { node, id, prefix });
     }
 
@@ -4561,6 +4862,7 @@ impl Host {
             accepts_approvals: false,
             streams: false,
             browse: false,
+            shells: false,
             projects: Vec::new(),
         };
         let bridge = self.bridge.clone();
@@ -4636,7 +4938,7 @@ impl Host {
     ///
     /// Cached with the repository, because it is one `git remote get-url` and the answer does not
     /// change while a checkout is open.
-    fn project_key(&mut self, cwd: &std::path::Path) -> neosh_proto::ProjectKey {
+    fn project_key(&self, cwd: &std::path::Path) -> neosh_proto::ProjectKey {
         if let Some(key) = self.project_keys.get(cwd) {
             return key.clone();
         }
@@ -4686,6 +4988,8 @@ impl Host {
                     key: a.project.clone(),
                     name: a.project_name.clone(),
                     cwd: a.cwd.clone(),
+                    repo_root: a.repo_root.clone(),
+                    branch: a.branch.clone(),
                     active: true,
                     sessions: 1,
                     running: u32::from(a.state == neosh_proto::AgentState::Running),
@@ -4719,10 +5023,16 @@ impl Host {
                 .unwrap_or_else(|| {
                     path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()
                 });
+            // The same two facts a live conversation carries, out of the same cache: a tree with
+            // nothing open in it is still a tree, and a panel that nests it only while somebody is
+            // working in it is one that rearranges itself for a reason nobody can see.
+            let facts = self.projects.get(path);
             out.push(neosh_proto::RemoteProject {
                 key: self.project_key(path),
                 name,
                 cwd,
+                repo_root: facts.and_then(|f| f.repo_root.clone()),
+                branch: facts.and_then(|f| f.branch.clone()),
                 active: false,
                 sessions: 0,
                 running: 0,
@@ -4822,14 +5132,35 @@ impl Host {
                 if was_up {
                     self.editor_message(MessageLevel::Warn, format!("lost {name}"));
                 }
+                // Every shell that machine opened here. `Serving`'s `Drop` kills the child, so
+                // this is the whole of it — and it is the one cleanup nothing else would do.
+                self.close_shells_for(&node);
+                // And every shell of *theirs* we are drawing. The pane stays: what it last printed
+                // is usually why you were looking, which is the same reason a local shell that
+                // exits leaves its final frame up.
+                for (view, pane) in self.panes_of_node(&node) {
+                    if let Some(t) = self.terminals.get(pane) {
+                        t.ended(&format!("{name} went away"));
+                    }
+                    self.draw_terminal(view, pane);
+                }
                 // Anything still waiting on that machine will never be answered by it.
                 let orphaned: Vec<String> = self.swarm_pending.keys().cloned().collect();
                 for id in orphaned {
-                    self.swarm_browsing.remove(&id);
+                    self.swarm_asking.remove(&id);
                     if let Some(waiting) = self.swarm_pending.remove(&id) {
                         self.answer_swarm(waiting, Err(ApiError::NotFound {
                             what: format!("{name} went away before answering"),
                         }));
+                    }
+                }
+                // A pane opened for a shell the machine will now never send. Settled through the
+                // same path a refusal takes, so there is one place that decides what happens to a
+                // terminal that never arrived.
+                let unanswered: Vec<String> = self.swarm_opening.keys().cloned().collect();
+                for id in unanswered {
+                    if self.swarm_opening.get(&id).is_some_and(|(_, _, n)| *n == node) {
+                        self.shell_answered(&id, Err(format!("{name} went away before answering")));
                     }
                 }
                 self.broadcast(PluginEvent::SwarmChanged);
@@ -4898,11 +5229,73 @@ impl Host {
                 self.broadcast(PluginEvent::SwarmChanged);
             }
             E::Answer { id, result, .. } => {
+                // A shell that was refused arrives here rather than as `PtyOpened`, because a
+                // refusal says no to a question without describing it. The id is what tells them
+                // apart, which is the whole reason `swarm_asking` exists.
+                if self.swarm_asking.get(&id) == Some(&SwarmAsk::Shell) {
+                    let why = match result {
+                        Ok(_) => "answered a shell with an ack".to_string(),
+                        Err(r) => refusal_text(&r),
+                    };
+                    self.shell_answered(&id, Err(why));
+                    return;
+                }
                 let (ok, message, session) = match result {
                     Ok(session) => (true, String::new(), session),
                     Err(r) => (false, refusal_text(&r), None),
                 };
                 self.on_swarm_reply(&id, ok, message, session);
+            }
+            E::PtyOpen { node, id, cwd, cols, rows } => {
+                self.run_swarm_pty_open(node, id, cwd, cols, rows);
+            }
+            E::PtyOpened { id, result, .. } => {
+                self.shell_answered(&id, result.map_err(|r| refusal_text(&r)));
+            }
+            E::PtyData { node, pty, data } => {
+                // Both directions arrive here, and which one this is decided by which map has the
+                // handle: a shell we own is being typed into, and one we are watching has printed.
+                // Never both — a handle is minted by one machine and known to two.
+                if let Some((_, serving)) = self.swarm_serving.get_mut(&pty) {
+                    serving.write(&data);
+                    return;
+                }
+                if let Some((view, pane)) = self.pane_of_pty(&node, &pty) {
+                    if let Some(t) = self.terminals.get(pane) {
+                        t.feed(&data);
+                    }
+                    self.draw_terminal(view, pane);
+                }
+            }
+            E::PtyResize { pty, cols, rows, .. } => {
+                // Only ever about a shell we own: the side that draws is the side that decides how
+                // big it is, so this never travels the other way.
+                if let Some((_, serving)) = self.swarm_serving.get_mut(&pty) {
+                    serving.resize(rows, cols);
+                }
+            }
+            E::PtyClose { node, pty } => {
+                if self.swarm_serving.remove(&pty).is_some() {
+                    return;
+                }
+                if let Some((view, pane)) = self.pane_of_pty(&node, &pty) {
+                    if let Some(t) = self.terminals.get(pane) {
+                        t.ended("the shell was closed");
+                    }
+                    self.draw_terminal(view, pane);
+                }
+            }
+            E::PtyExit { node, pty, status } => {
+                if let Some((view, pane)) = self.pane_of_pty(&node, &pty) {
+                    let why = match status {
+                        Some(0) | None => "the shell exited".to_string(),
+                        Some(code) => format!("the shell exited {code}"),
+                    };
+                    if let Some(t) = self.terminals.get(pane) {
+                        t.ended(&why);
+                    }
+                    self.draw_terminal(view, pane);
+                }
             }
             E::Browse { node, id, prefix } => self.run_swarm_browse(node, id, prefix),
             E::Browsed { id, result, .. } => {
@@ -5075,10 +5468,10 @@ impl Host {
         session: Option<neosh_proto::SessionId>,
     ) {
         let Some(waiting) = self.swarm_pending.remove(id) else { return };
-        let browsing = self.swarm_browsing.remove(id);
+        let asked = self.swarm_asking.remove(id);
         let result = if !ok {
             Err(ApiError::Denied { reason: message })
-        } else if browsing {
+        } else if asked == Some(SwarmAsk::Browse) {
             // A `Browsed` settles through `on_swarm_browsed`; reaching here with `ok` means the
             // peer answered a directory listing with a bare `Ack`, which no version of it does.
             Ok(ApiOk::Paths { paths: Vec::new(), denied: None })
@@ -5091,7 +5484,7 @@ impl Host {
     /// Settle a directory listing we asked a peer for.
     pub fn on_swarm_browsed(&mut self, id: &str, result: Result<Vec<String>, String>) {
         let Some(waiting) = self.swarm_pending.remove(id) else { return };
-        self.swarm_browsing.remove(id);
+        self.swarm_asking.remove(id);
         self.answer_swarm(waiting, match result {
             Ok(paths) => Ok(ApiOk::Paths { paths, denied: None }),
             Err(reason) => Err(ApiError::Denied { reason }),
@@ -6343,7 +6736,10 @@ impl Host {
             }
             ApiCall::SwarmProbe { .. }
             | ApiCall::SwarmCommand { .. }
-            | ApiCall::SwarmBrowse { .. } => Some(
+            | ApiCall::SwarmBrowse { .. }
+            // And this one for a second reason on top of the first: it opens a *pane*, which is a
+            // rectangle on a screen, and a control connection is deliberately not a view.
+            | ApiCall::SwarmShell { .. } => Some(
                 "the swarm is answered by the machine at the other end, which this connection has \
                  no way to wait for. Use `agent.command` for a conversation on this machine, and \
                  `path.complete` for a directory on it",
@@ -11973,11 +12369,16 @@ impl Host {
     /// the repository, which is the host's job — the store holds conversations and knows nothing
     /// about git.
     fn named(&self, mut info: neosh_proto::SessionInfo) -> neosh_proto::SessionInfo {
-        if let Some(facts) = self.projects.get(std::path::Path::new(&info.cwd)) {
+        let cwd = std::path::Path::new(&info.cwd);
+        if let Some(facts) = self.projects.get(cwd) {
             info.project = facts.name.clone();
             info.repo_root = facts.repo_root.clone();
             info.branch = facts.branch.clone();
         }
+        // Stamped here for the same reason the name is, and it is the same call the swarm's own
+        // inventory makes — so what this workspace calls a project and what it tells other machines
+        // it calls one cannot disagree.
+        info.project_key = self.project_key(cwd).0;
         info
     }
 
@@ -12703,7 +13104,8 @@ impl Host {
                 self.editor.tab_new(view, None, true);
                 // Marked *before* the sync that furnishes it: `sync_panes` is what turns a pane the
                 // tree has into a pane with something in it, and it has nothing else to go on.
-                self.pending_term = self.editor.active_pane_of(view);
+                self.pending_term =
+                    self.editor.active_pane_of(view).map(|p| (p, ShellAt::Here));
                 self.sync_panes();
                 self.refresh_status();
             }
@@ -12711,7 +13113,7 @@ impl Host {
                 let view = self.view_now();
                 let from = self.editor.active_pane(view);
                 if let Some(new) = self.editor.pane_split(view, from, Direction::Right) {
-                    self.pending_term = Some(new);
+                    self.pending_term = Some((new, ShellAt::Here));
                     self.sync_panes();
                     self.editor.pane_focus(view, new);
                     self.sync_panes();

@@ -2532,6 +2532,7 @@ dependencies = [
 name = "neosh-swarm"
 version = "0.4.6"
 dependencies = [
+ "base64",
  "ed25519-dalek",
  "hex",
  "neosh-proto",

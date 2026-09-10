@@ -210,7 +210,29 @@ pub struct AgentSummary {
     pub session: SessionId,
     pub project: ProjectKey,
     /// What that node calls the project — `neosh`, or `neosh · fix/thing` for a worktree.
+    ///
+    /// A label, and deliberately not what a panel groups by. `project` is the key; this is the
+    /// sentence. A list that nested on this would be parsing a display format back apart, and
+    /// `neosh · fix/thing` is exactly the string that made a remote worktree draw as a project
+    /// with a branch name stuck on the end of it — beside the `neosh` row it belongs *under*.
     pub project_name: String,
+    /// The main checkout of the repository `cwd` is in, **on the owning node**.
+    ///
+    /// [`neosh_proto::SessionInfo::repo_root`] over the wire, and here for the same reason: it is
+    /// what lets a list *group* rather than merely label. Without it a peer's worktrees and its
+    /// main checkout arrive as one undifferentiated run of conversations under one project key,
+    /// and the only thing left to tell them apart is `project_name`, which is a display string.
+    ///
+    /// A path on somebody else's disk: compared against other paths from the same node, never
+    /// resolved here. Equal to `cwd` in the main checkout; `None` outside a repository.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repo_root: Option<String>,
+    /// The branch checked out at `cwd` there, `None` on a detached head or outside a repository.
+    ///
+    /// What a worktree row is *named*, here as locally — so a peer's tree reads `⎇ fix/thing`
+    /// rather than repeating the repository's name in front of it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch: Option<String>,
     /// The working directory **on the owning node**. Shown, never opened: it is a path in somebody
     /// else's filesystem and may not exist here at all.
     pub cwd: String,
@@ -274,6 +296,19 @@ pub struct RemoteProject {
     /// The path on the owning node. Opaque here: it is what you hand back in
     /// [`AgentCommand::NewSession`], not something to look at locally.
     pub cwd: String,
+    /// The main checkout this one is a tree of, on the owning node. See
+    /// [`AgentSummary::repo_root`].
+    ///
+    /// Here as well as on the summary because the two lists answer different questions and a panel
+    /// draws both: the summaries are the conversations open over there, and this is the places that
+    /// machine *works in* — which includes the worktree you cleared out this morning. A tree that
+    /// nests while it has a conversation in it and jumps to the top level when it does not is a
+    /// panel that reorganises itself for a reason nobody can see.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repo_root: Option<String>,
+    /// The branch checked out there, for naming the row. See [`AgentSummary::branch`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch: Option<String>,
     /// Whether this node has a conversation open in it now.
     ///
     /// Meant something for exactly as long as this list was derived from live conversations: every
@@ -324,6 +359,23 @@ pub struct NodeCapabilities {
     /// older node's handshake decodes to, so "does not say" and "cannot" are the same answer.
     #[serde(default)]
     pub browse: bool,
+    /// Whether [`AscpMessage::PtyOpen`] will be answered with a shell.
+    ///
+    /// Both a permission and a compatibility flag, and unusually it has to be both. The
+    /// compatibility half is `browse`'s argument unchanged — an unknown message tag fails the frame
+    /// and takes the connection with it, so a node that sent one on spec would knock an older peer
+    /// off the board rather than be told no — and `false` is what an older handshake decodes to.
+    ///
+    /// The permission half is where it stops resembling `browse`. That one is not a permission
+    /// because a node accepting commands has already given away strictly more: `NewSession` takes
+    /// any `cwd` on its disk, so naming the directories that exist withholds nothing. A shell is
+    /// not like that. `NewSession` starts an *agent*, which is a thing with a permission layer, a
+    /// transcript and a person who can read it afterwards; a pty is a prompt, with that user's
+    /// shell, environment and credentials, and nothing above it to say no. So it is asked for
+    /// separately — `swarm.accept_shells`, off by default — and enforced by the owner on every
+    /// open regardless of what it once advertised, which is the rule every capability here follows.
+    #[serde(default)]
+    pub shells: bool,
     /// The checkouts this node has, for starting something on it.
     #[serde(default)]
     pub projects: Vec<RemoteProject>,
@@ -463,6 +515,65 @@ pub enum AscpMessage {
     /// The answer to [`Self::Browse`] — each entry as the asker would have typed it, trailing
     /// separator and all, so it can go straight back into a field.
     Browsed { id: String, paths: Vec<String> },
+    /// Open a shell on that machine.
+    ///
+    /// The one thing here that is not about an agent, and it is what "it feels like it is on this
+    /// computer" finally means: a conversation on another machine has a directory, a branch and a
+    /// build running in it, and until this existed the only way to type a command in that directory
+    /// was to leave neosh and ssh there. `<C-w>T` in a remote view is the same key it is anywhere
+    /// else.
+    ///
+    /// **Bytes, not cells.** The shell runs over there and the terminal emulator runs here, exactly
+    /// as it does over ssh — which is the arrangement that makes a full-screen program work, keeps
+    /// the width authoritative on the side that is drawing, and means the owner is forwarding a
+    /// file descriptor rather than maintaining a screen. A cell protocol would need the owner to
+    /// emulate a terminal it cannot see the size of.
+    ///
+    /// `cwd` is a path on the **owner**, learnt from an [`AgentSummary`] or a
+    /// [`RemoteProject`] rather than invented; `None` is that user's home directory. Gated on
+    /// [`NodeCapabilities::shells`], which is a permission as well as a compatibility flag — see
+    /// there for why this one is not `Browse`.
+    ///
+    /// Answered with [`Self::PtyOpened`] or [`Self::Refused`], exactly once.
+    PtyOpen {
+        id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cwd: Option<String>,
+        cols: u16,
+        rows: u16,
+    },
+    /// The answer: it is running, and every message about it from now on carries `pty`.
+    ///
+    /// A handle minted by the owner rather than the `id` the asker sent, for the reason a session
+    /// id is the owner's: two diallers must not be able to collide, and the side that owns the
+    /// process is the side that can guarantee they do not.
+    PtyOpened { id: String, pty: String },
+    /// Bytes, in either direction. Base64, because a pty carries whatever the program wrote and
+    /// almost none of it is valid UTF-8 — a JSON string cannot hold `ESC [ 2 J` and a lone `0x9b`.
+    ///
+    /// Coalesced by the sender rather than sent per read: a shell printing a large file is
+    /// thousands of tiny reads, and one frame each would spend the whole connection on headers.
+    PtyData { pty: String, data: String },
+    /// The window changed size here, so `SIGWINCH` there.
+    ///
+    /// The drawing side is authoritative about its own width, which is why this only ever travels
+    /// this way. A full-screen program that never hears it redraws for the size it was started at
+    /// for as long as it runs.
+    PtyResize { pty: String, cols: u16, rows: u16 },
+    /// Close it. From the viewer this kills the shell; from the owner it says the shell is gone.
+    ///
+    /// Idempotent, and safe to send about a `pty` the other side has already forgotten: a close
+    /// racing a close is the ordinary way a terminal ends.
+    PtyClose { pty: String },
+    /// The shell exited on its own. `status` is `None` when it was signalled.
+    ///
+    /// Distinct from [`Self::PtyClose`] because what a person wants to see is *why* the prompt went
+    /// away, and "it exited 127" is the answer far more often than anything else.
+    PtyExit {
+        pty: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        status: Option<i32>,
+    },
     /// Closing cleanly, so a peer can say "went away" rather than waiting out a timeout.
     Goodbye {
         #[serde(default, skip_serializing_if = "Option::is_none")]

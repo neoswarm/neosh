@@ -86,6 +86,15 @@ pub struct SwarmConfig {
     /// Separate from `accepts_commands`, and off by default, because it is a different kind of
     /// trust: steering an agent is a message, approving one is a write to this machine's disk.
     pub accepts_approvals: bool,
+    /// Whether peers may open a **shell** here.
+    ///
+    /// The third and sharpest of these, and off by default. `accepts_commands` lets somebody start
+    /// an agent on this machine — a thing with a permission layer over it, a transcript, and a
+    /// person who can read afterwards what it did. This is a prompt: that user's shell, that
+    /// user's environment, that user's credentials, and nothing above it to say no. Sound when
+    /// every machine in the swarm is yours and the reason `^J` is a list you wrote by hand, and
+    /// still a separate yes.
+    pub accepts_shells: bool,
     /// Seconds between heartbeats, and the ceiling a reconnect backs off to.
     #[serde(default = "default_heartbeat")]
     pub heartbeat_secs: u64,
@@ -103,6 +112,7 @@ impl Default for SwarmConfig {
             peers: Vec::new(),
             accepts_commands: true,
             accepts_approvals: false,
+            accepts_shells: false,
             heartbeat_secs: default_heartbeat(),
         }
     }

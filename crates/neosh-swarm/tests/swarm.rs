@@ -85,6 +85,7 @@ async fn pair(b_accepts_commands: bool) -> Pair {
         listen: Some(addr),
         accepts_commands: b_accepts_commands,
         accepts_approvals: false,
+        shells: false,
         heartbeat: Duration::from_millis(200),
         ..Default::default()
     };

@@ -94,6 +94,7 @@ impl Swarm {
                 accepts_approvals: false,
                 streams: false,
                 browse: true,
+                shells: false,
                 projects: Vec::new(),
             },
             agents: Vec::new(),
@@ -259,6 +260,10 @@ pub fn summarise(info: &SessionInfo, project: ProjectKey, model: Option<String>)
         project,
         project_name: info.project.clone(),
         cwd: info.cwd.clone(),
+        // What lets a peer's panel nest this the way ours does — a worktree under the repository
+        // it is a tree of, rather than beside it under a name with the branch stuck on the end.
+        repo_root: info.repo_root.clone(),
+        branch: info.branch.clone(),
         label: info.label.clone(),
         state: state_of(info),
         message_count: info.message_count,
@@ -297,6 +302,7 @@ mod tests {
             accepts_approvals: false,
             streams: true,
             browse: true,
+            shells: false,
             projects: Vec::new(),
         }
     }
@@ -307,6 +313,8 @@ mod tests {
             project: ProjectKey(project.into()),
             project_name: project.into(),
             cwd: format!("/w/{session}"),
+            repo_root: None,
+            branch: None,
             label: session.into(),
             state: AgentState::Idle,
             message_count: 0,
