@@ -1401,8 +1401,10 @@ struct SearchPrompt {
 /// difference and it is carried by the one slot that already said "furnish this as a terminal".
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum ShellAt {
-    /// On this machine, in the pane's conversation's directory.
-    Here,
+    /// On this machine. `cwd` overrides the pane's conversation's directory, which is what a key
+    /// pressed on a *row* means: the sidebar's `t` is about the project the cursor is on, and that
+    /// is very often not the conversation the pane is showing.
+    Here { cwd: Option<std::path::PathBuf> },
     /// On a peer, in a directory on *its* disk. `cwd` is `None` for that user's home.
     There { node: neosh_proto::NodeId, cwd: Option<String> },
 }
@@ -4205,11 +4207,13 @@ impl Host {
             .and_then(|w| w.viewport)
             .map(|v| (v.width, v.height))
             .unwrap_or((80, 24));
-        if let ShellAt::There { node, cwd } = at {
-            self.ask_for_shell(view, pane, win, node, cwd, rows, cols);
-            return;
-        }
-        let cwd = self.session_cwd(&session);
+        let cwd = match at {
+            ShellAt::There { node, cwd } => {
+                self.ask_for_shell(view, pane, win, node, cwd, rows, cols);
+                return;
+            }
+            ShellAt::Here { cwd } => cwd.unwrap_or_else(|| self.session_cwd(&session)),
+        };
 
         match crate::term::Term::spawn(&cwd, rows, cols) {
             Ok(t) => {
@@ -13104,8 +13108,16 @@ impl Host {
                 self.editor.tab_new(view, None, true);
                 // Marked *before* the sync that furnishes it: `sync_panes` is what turns a pane the
                 // tree has into a pane with something in it, and it has nothing else to go on.
+                // A directory, when a caller named one. `<C-w>T` names none and gets the
+                // conversation's, which is what it has always done; a key pressed on a row in the
+                // project panel names the row's, because that is what the key was about.
+                let cwd = args
+                    .first()
+                    .filter(|a| !a.is_empty())
+                    .map(std::path::PathBuf::from)
+                    .filter(|p| p.is_dir());
                 self.pending_term =
-                    self.editor.active_pane_of(view).map(|p| (p, ShellAt::Here));
+                    self.editor.active_pane_of(view).map(|p| (p, ShellAt::Here { cwd }));
                 self.sync_panes();
                 self.refresh_status();
             }
@@ -13113,7 +13125,7 @@ impl Host {
                 let view = self.view_now();
                 let from = self.editor.active_pane(view);
                 if let Some(new) = self.editor.pane_split(view, from, Direction::Right) {
-                    self.pending_term = Some((new, ShellAt::Here));
+                    self.pending_term = Some((new, ShellAt::Here { cwd: None }));
                     self.sync_panes();
                     self.editor.pane_focus(view, new);
                     self.sync_panes();
