@@ -514,8 +514,6 @@ pub struct Serving {
     master: Box<dyn MasterPty + Send>,
     writer: Box<dyn Write + Send>,
     child: Box<dyn portable_pty::Child + Send + Sync>,
-    /// Which conversation's directory it was opened in, so the panel can say.
-    pub cwd: std::path::PathBuf,
 }
 
 impl Serving {
@@ -578,7 +576,7 @@ impl Serving {
             swarm.send(neosh_swarm::SwarmRequest::PtyExit { node, pty, status: None });
         });
 
-        Ok(Self { master: pair.master, writer, child, cwd: cwd.to_path_buf() })
+        Ok(Self { master: pair.master, writer, child })
     }
 
     pub fn write(&mut self, bytes: &[u8]) {

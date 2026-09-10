@@ -3869,6 +3869,15 @@ function group(
   for (const n of peers) {
     // The places it works in first, so a directory with a conversation in it is described by the
     // richer of the two answers and one without one still gets a row.
+    //
+    // Not from a machine that has not allowed this one yet. Its project list arrived in the
+    // handshake — the half of pairing that did happen — so this is not about what may be shown; it
+    // is that `waiting` is the far end explicitly saying no, and a one-sided pairing filling your
+    // column with somebody else's repositories is a list growing on its own. Every other state is
+    // the rule this panel already follows in the other direction: a machine that has been up and
+    // has gone quiet keeps its rows, because a list that silently shortens is one you cannot tell
+    // from a list that never had them.
+    if (n.link.state === "waiting") continue;
     for (const p of n.capabilities.projects) {
       const c = at(n, p.cwd);
       c.root = p.repo_root ?? undefined;
