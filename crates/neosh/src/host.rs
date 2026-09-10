@@ -4264,6 +4264,12 @@ impl Host {
             rect: neosh_proto::Rect { row: 0, col: 0, width: cols, height: rows },
         });
         self.scaffold_terminal(view, pane, rows, cols);
+        let name = self
+            .swarm
+            .peer(&node)
+            .map(|p| p.display_name())
+            .unwrap_or_else(|| node.short().to_string());
+        self.say_on_surface(view, pane, &format!("opening a shell on {name}…"));
         // Shares the counter every other request to a peer uses, so the id spaces cannot collide —
         // which matters precisely because a refusal is a bare `Refused { id }`.
         self.swarm_next_command += 1;
@@ -4271,6 +4277,36 @@ impl Host {
         self.swarm_asking.insert(id.clone(), SwarmAsk::Shell);
         self.swarm_opening.insert(id.clone(), (view, pane, node.clone()));
         handle.send(neosh_swarm::SwarmRequest::PtyOpen { node, id, cwd, cols, rows });
+    }
+
+    /// One line of text into a pane's raw-cell surface.
+    ///
+    /// For the gap between a remote shell being asked for and arriving, which is a round trip and
+    /// on a link worth having a shell over can be a noticeable one. The alternative is an empty
+    /// black rectangle, which is exactly what a shell that started and printed nothing looks like —
+    /// so the one thing somebody cannot tell from the pane is whether anything is happening at all.
+    ///
+    /// Not a buffer line: the pane's buffer is a scaffold of spaces *under* the surface, and the
+    /// surface is what is painted. Overwritten wholesale the moment the terminal attaches, because
+    /// `Term::cells` emits every cell every time — which is the same property that stops the last
+    /// frame of one program showing through the next.
+    fn say_on_surface(&mut self, view: neosh_proto::ViewId, pane: neosh_proto::PaneId, text: &str) {
+        let win = self.pane_window(view, pane);
+        let Some(surface) = self.editor.surface_on(win) else { return };
+        let plugin = PluginId::from(BUILTIN);
+        let cells = text
+            .graphemes(true)
+            .enumerate()
+            .map(|(i, g)| neosh_proto::SurfaceCell {
+                row: 0,
+                col: i as u16,
+                grapheme: g.to_string(),
+                fg: None,
+                bg: None,
+                attrs: neosh_proto::Attrs { dim: true, ..Default::default() },
+            })
+            .collect();
+        let _ = self.editor.apply_in(view, &plugin, ApiCall::SurfacePut { surface, cells });
     }
 
     /// A peer answered [`ApiCall::SwarmShell`]: attach the pane's terminal, or say why not.
