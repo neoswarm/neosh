@@ -10311,6 +10311,37 @@ impl Peer {
         }
     }
 
+    /// Wait until the workspace has told this machine what project it is in.
+    ///
+    /// The one signal from outside that its key has *settled*. A workspace answers `dir:<name>`
+    /// for the first moments of its life — a guess from the directory, until it has read the
+    /// repository's origin — and everything that compares projects across machines has to tolerate
+    /// that. A test pressing a key in that window is testing the fallback rather than the rule, and
+    /// it is a window narrow enough to catch one run in three, which is the worst width there is.
+    ///
+    /// Nothing on screen says it, because on one machine nothing depends on it. The inventory does:
+    /// it is this workspace saying what it has, to a peer, in the vocabulary the question is asked
+    /// in.
+    fn wait_for_key(&mut self, key: &str) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        loop {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the workspace never settled on {key} for its own project"
+            );
+            let Some(event) = self.events.blocking_recv() else { panic!("the peer stopped") };
+            match event {
+                neosh_swarm::SwarmEvent::PeerUp { node, .. } => self.asker = Some(node.id),
+                neosh_swarm::SwarmEvent::Inventory { agents, .. }
+                    if agents.iter().any(|a| a.project.0 == key) =>
+                {
+                    return;
+                }
+                _ => {}
+            }
+        }
+    }
+
     /// Say goodbye and stop, the way a workspace shutting down does.
     fn hang_up(&self) {
         self.handle.send(neosh_swarm::SwarmRequest::Shutdown);
@@ -10595,4 +10626,105 @@ fn alive(pid: i32) -> bool {
         .output()
         .map(|o| o.status.success())
         .unwrap_or(false)
+}
+
+/// `^N` does not ask which computer when none of them has this repository.
+///
+/// The question is worth asking when it is a decision, and a repository nobody else has a checkout
+/// of has one possible answer. Asking anyway is a panel and a keypress spent confirming something
+/// the workspace already knew — the same rule as not asking at all with no machine paired, one step
+/// finer. The first cut asked the moment a second computer existed, which on a swarm of two made
+/// every `^N` two keys instead of one for the whole time the other machine had nothing to do with
+/// what you were working on.
+#[test]
+fn asking_which_computer_is_skipped_when_none_of_them_has_the_project() {
+    let sb = Sandbox::new("swarm-no-question");
+    sb.git_init();
+    sb.git_remote("https://github.com/neoswarm/work.git");
+    let mut peer = Peer::beside(&sb, "linux-box");
+    // A machine that is up and useful, and has nothing to do with the repository you are in.
+    peer.publish(
+        vec![theirs("git:github.com/neoswarm/faraway", "faraway", "/srv/faraway", "/srv/faraway", None)],
+        Vec::new(),
+    );
+
+    let mut s = sb.start();
+    s.wait_for("PROJECTS");
+    // Wait for the machine itself, not for something it brought: a question that has not been
+    // asked yet looks exactly like one that will not be, so a test that presses the key before the
+    // peer has connected passes for the wrong reason. Its arrival is the one unambiguous signal.
+    assert!(s.pump(|s| s.texts().iter().any(|t| t.contains("linux-box joined"))), "the peer joined");
+    assert!(
+        s.pump(|s| s.sidebar_now().iter().any(|l| l.contains("faraway"))),
+        "and its project is on the panel:\n{:?}",
+        s.sidebar_now()
+    );
+    // And that this workspace has settled on its *own* project key — the origin remote rather than
+    // the `dir:` guess it answers with until it has read the repository. Until then the key is
+    // deliberately not used to withhold the question, so a `^N` pressed in that window would be
+    // testing the fallback rather than the rule.
+    peer.wait_for_key("git:github.com/neoswarm/work");
+
+    s.ctrl("n");
+    // On the picker's own buffer rather than on the words in it: "New conversation" is also what an
+    // unnamed conversation is called in the panel, so a text match passes before anything opens.
+    assert!(
+        s.pump(|s| !s.picker_named("[New conversation]").is_empty()),
+        "the where-question is asked:\n{:?}",
+        s.sidebar_now()
+    );
+    let rows = s.picker_named("[New conversation]");
+    assert!(rows.iter().any(|l| l.contains("Here")), "and it is the one about directories:\n{rows:?}");
+    // `This computer` is the machine picker's first row, and is what must not appear.
+    assert!(
+        !rows.iter().any(|l| l.contains("This computer")),
+        "the which-computer question is not asked:\n{rows:?}"
+    );
+}
+
+/// And it does ask when one of them has it, because then it is a decision.
+#[test]
+fn asking_which_computer_happens_when_one_of_them_has_the_project() {
+    const KEY: &str = "git:github.com/neoswarm/work";
+    let sb = Sandbox::new("swarm-yes-question");
+    sb.git_init();
+    sb.git_remote("https://github.com/neoswarm/work.git");
+    let mut peer = Peer::beside(&sb, "linux-box");
+    // The same repository, at a path of its own — which is the ordinary case and the one the
+    // matching had to be made to see. With a conversation in it, purely so there is something on
+    // screen to wait for: the repository merges into the `work` row that is already there and a
+    // repository that is here as well deliberately wears no marker, so the machine connecting
+    // changes nothing visible about the project itself.
+    peer.publish(
+        vec![theirs(KEY, "work", "/srv/checkouts/work", "/srv/checkouts/work", None)],
+        vec![there("r1", "over there", KEY, "/srv/checkouts/work", "/srv/checkouts/work", None)],
+    );
+
+    let mut s = sb.start();
+    s.wait_for("PROJECTS");
+    // The key first, for the reason the other test waits for it: until this workspace has read its
+    // own origin it answers `dir:work`, and a `^N` pressed then is testing the fallback.
+    peer.wait_for_key(KEY);
+    // And then the merge, which is what makes this the same repository as the peer's.
+    assert!(
+        s.pump(|s| s.sidebar_now().iter().any(|l| l.contains("over there"))),
+        "the peer's work is in our tree:\n{:?}",
+        s.sidebar_now()
+    );
+
+    s.ctrl("n");
+    assert!(
+        s.pump(|s| !s.picker_named("[New conversation — where?]").is_empty()),
+        "which computer is asked first — instead the where-picker opened: {:?}",
+        s.picker_named("[New conversation]")
+    );
+    let rows = s.picker_named("[New conversation — where?]");
+    assert!(
+        rows.iter().any(|l| l.contains("This computer")),
+        "and this one is the row the cursor starts on, so `^N ⏎` is unchanged:\n{rows:?}"
+    );
+    assert!(
+        rows.iter().any(|l| l.contains("linux-box")),
+        "with the machine that has it beside it:\n{rows:?}"
+    );
 }

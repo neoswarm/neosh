@@ -2137,9 +2137,28 @@ async function chooseMachine(
   // no machine paired, one step finer — the first cut asked the moment a second computer existed,
   // which on a swarm of two made every `^N` two keys instead of one for the whole time the other
   // machine had nothing to do with what you were working on.
-  const usable = about?.key
-    ? peers.filter((n) => n.capabilities.projects.some((p) => p.key === about.key))
-    : peers;
+  // Only on a key that is a *fact*. `git:` is the normalised origin remote and means the same
+  // thing on every machine; `dir:` is a fallback from a directory name, and it is what a repository
+  // answers with for the first moment of a workspace's life — before the host has read its origin
+  // — as well as what a directory that is not a checkout answers with for ever. Filtering on one
+  // compares a guess against other machines' facts, matches nothing, and silently withholds the
+  // question. The asymmetry decides it: a question asked needlessly costs a keypress, and one
+  // silently not asked costs the capability. `ProjectKey::is_certain` is the same distinction on
+  // the Rust side, drawn for the same reason.
+  const certain = about?.key?.startsWith("git:") ? about.key : null;
+  // Both of the things a machine tells you it has, because they arrive by different roads and at
+  // different times. `capabilities.projects` is the places it *works in* and rides on `Presence`,
+  // which is a heartbeat; the conversations ride on `Inventory`, which is sent the moment a link
+  // comes up. So for the first heartbeat of every connection a peer can be visibly running a turn
+  // in this very repository while its project list still says nothing about it — and asking only
+  // the list meant the question was withheld from the machine most obviously able to answer it.
+  //
+  // A conversation open in a directory is also the stronger evidence of the two: the list is what a
+  // machine says it works in, and a conversation is it working there.
+  const has = (n: SwarmNode, key: string) =>
+    n.capabilities.projects.some((p) => p.key === key) ||
+    n.agents.some((a) => a.project === key);
+  const usable = certain ? peers.filter((n) => has(n, certain)) : peers;
   if (usable.length === 0) return { kind: "here" };
   const ascii = (await neosh.opt.get<boolean>("ui.ascii_only").catch(() => false)) ?? false;
 
@@ -2235,8 +2254,16 @@ async function newConversation(
   // Which computer, first — and only when there is one to ask about *and* it could answer. A
   // repository none of the connected machines has a checkout of has one possible answer, and
   // asking is a panel spent confirming it. See {@link chooseMachine}.
+  //
+  // The key comes from a **live conversation** rather than from what the panel wrote down. The var
+  // is filled by the draw, and the draw's own source is `SessionInfo::project_key`, which the host
+  // fills once it has read the repository's origin — so for the first moment of a workspace's life
+  // the written-down answer is the fallback guess, `dir:<name>`. Read from there, `^N` pressed in
+  // that window compared a guess against the real keys other machines advertise, matched nothing,
+  // and silently skipped a question it should have asked. The var is still the fallback, because it
+  // is the only answer for a project with nothing open in it.
   const machine = await chooseMachine(neosh, "New conversation \u2014 where?", {
-    key: here ? arrangement.key(here) : null,
+    key: here ? await projectKey(neosh, arrangement, here) : null,
   });
   if (machine === null) return;
   if (machine.kind === "node") {
@@ -2386,6 +2413,27 @@ async function newConversation(
 // ---------------------------------------------------------------------------
 // Where — one field for every answer to "which directory, on which computer"
 // ---------------------------------------------------------------------------
+
+/**
+ * What a directory is called across machines, asked of the workspace rather than of the panel.
+ *
+ * A conversation in it is the authority — the host stamps `project_key` on every one of them from
+ * the repository's origin — and a project with nothing open falls back to what the panel wrote down
+ * the last time one was. Both, in that order, because only the first is guaranteed current and only
+ * the second survives a project being emptied.
+ *
+ * `repo_root` counts as well as `cwd`: a worktree and its repository are one project, and `n` on
+ * either means a conversation in the same repository.
+ */
+async function projectKey(
+  neosh: Neosh,
+  arrangement: Arrangement,
+  cwd: string,
+): Promise<string | null> {
+  const sessions = await neosh.session.list().catch(() => [] as SessionInfo[]);
+  const live = sessions.find((s) => (s.cwd === cwd || s.repo_root === cwd) && s.project_key);
+  return live?.project_key || arrangement.key(cwd);
+}
 
 /**
  * Every answer `^N` and `^O` accept.
