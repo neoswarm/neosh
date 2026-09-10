@@ -135,6 +135,13 @@ impl Sandbox {
             .args(["--mock-script", &fixture().display().to_string()])
             .args(["--model", "mock/mock"])
             .env("NEOSH_STATE_DIR", self.root.join("state"))
+            // `$SHELL` and nothing cleverer is right in the product and useless in a test: it is a
+            // person's own shell with their own configuration in it, and the first run of a shell
+            // test against a real login shell was answered by an `oh-my-zsh` update prompt that ate
+            // a keystroke. A test that depends on whose machine it runs on is a test that will fail
+            // for somebody else. `Term::spawn_shell` exists for this reason one level down; a pty
+            // opened for a *peer* has no such seam, so the environment is where it is said.
+            .env("SHELL", "/bin/sh")
             // The history block reads the *vendors'* transcripts rather than ours — see
             // `crate::usage`. Pointed at this sandbox, because the alternative is a hundred and
             // forty-seven neoshes scanning a real month of somebody's work and asserting on it.
@@ -1095,6 +1102,13 @@ impl Sandbox {
             .arg(self.work())
             .args(["--mock-script", &script.display().to_string()])
             .env("NEOSH_STATE_DIR", self.root.join("state"))
+            // `$SHELL` and nothing cleverer is right in the product and useless in a test: it is a
+            // person's own shell with their own configuration in it, and the first run of a shell
+            // test against a real login shell was answered by an `oh-my-zsh` update prompt that ate
+            // a keystroke. A test that depends on whose machine it runs on is a test that will fail
+            // for somebody else. `Term::spawn_shell` exists for this reason one level down; a pty
+            // opened for a *peer* has no such seam, so the environment is where it is said.
+            .env("SHELL", "/bin/sh")
             // The history block reads the *vendors'* transcripts rather than ours — see
             // `crate::usage`. Pointed at this sandbox, because the alternative is a hundred and
             // forty-seven neoshes scanning a real month of somebody's work and asserting on it.
@@ -10297,6 +10311,21 @@ impl Peer {
         }
     }
 
+    /// Say goodbye and stop, the way a workspace shutting down does.
+    fn hang_up(&self) {
+        self.handle.send(neosh_swarm::SwarmRequest::Shutdown);
+    }
+
+    /// Type at a shell this peer opened on the workspace under test.
+    fn type_into(&mut self, pty: &str, text: &str) {
+        let node = self.wait_up();
+        self.handle.send(neosh_swarm::SwarmRequest::PtyData {
+            node,
+            pty: pty.into(),
+            data: text.as_bytes().to_vec(),
+        });
+    }
+
     /// The id of the workspace under test, once the link is up.
     fn wait_up(&mut self) -> neosh_proto::NodeId {
         if let Some(id) = &self.asker {
@@ -10486,4 +10515,84 @@ fn a_workspace_refuses_a_shell_from_a_peer_that_asks_anyway() {
         "and nothing was opened:\n{}",
         s.transcript()
     );
+}
+
+/// A shell does not outlive the link that asked for it.
+///
+/// The cleanup nothing else would do, and conformance point 13. A pty has no timeout and no idea
+/// the connection it was opened over has gone — so without this a machine going away leaves a login
+/// shell running on somebody else's computer, with that user's environment, in one of their
+/// directories, reachable by nothing and visible on no screen. It is the same class of thing as the
+/// permission itself: a leak measured in "until the workspace stops".
+///
+/// Asserted on the child's own pid rather than on anything this workspace reports, because what is
+/// under test is that a **process** is gone.
+///
+/// The peer says goodbye, which is the case a test can make deterministic. Everything after that is
+/// shared with the abrupt one — a lid closing reaches the same `PeerDown` through a read that ends,
+/// and the same `close_shells_for` behind it — so what is *not* covered here is how the link is
+/// noticed, which is the swarm's business and has tests of its own, rather than what is done about
+/// it, which is this.
+#[test]
+fn a_shell_dies_with_the_link_that_asked_for_it() {
+    let sb = Sandbox::new("swarm-shell-cleanup");
+    sb.git_init();
+    let mut peer = Peer::beside_with(&sb, "linux-box", Shells { ours: true, ..Default::default() });
+
+    let mut s = sb.start();
+    s.wait_for("PROJECTS");
+    let work = sb.work();
+    let pty = peer.ask_for_shell(&work.display().to_string()).expect("a shell");
+
+    // The child says who it is. `$$` is POSIX, and `$SHELL` is pinned to `/bin/sh` for this suite
+    // so the answer does not depend on whose dotfiles are installed.
+    let pidfile = work.join("shell.pid");
+    peer.type_into(&pty, &format!("echo $$ > {}\n", pidfile.display()));
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    let pid = loop {
+        assert!(std::time::Instant::now() < deadline, "the shell never reached a prompt");
+        if let Ok(text) = std::fs::read_to_string(&pidfile)
+            && let Ok(pid) = text.trim().parse::<i32>()
+        {
+            break pid;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    assert!(alive(pid), "the shell is running to begin with");
+
+    // The machine goes away. Said out loud with a `Goodbye` rather than by dropping the runtime and
+    // hoping the socket closes underneath it: what is under test is this workspace's cleanup, and a
+    // teardown that races is a test that reports the wrong thing whenever it is slow.
+    peer.hang_up();
+    // Waited for on the workspace's own words rather than on a sleep. Until it has noticed the
+    // machine is gone there is nothing for it to have cleaned up, and a test that started counting
+    // before then would be timing the network.
+    assert!(
+        s.pump(|s| s.texts().iter().any(|t| t.contains("lost linux-box"))),
+        "the workspace noticed the machine go:\n{}",
+        s.transcript()
+    );
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while alive(pid) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "pid {pid} is still running after the link that asked for it went away"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    drop(peer);
+}
+
+/// Whether a process is still there, asked of the OS rather than of anything under test.
+///
+/// Signal 0 is the portable "does this exist and could I signal it" — it delivers nothing. A zombie
+/// answers yes until it is reaped, which is fine here: what is being asserted is that the child was
+/// killed, and `Serving`'s `Drop` waits after killing precisely so there is no zombie to see.
+fn alive(pid: i32) -> bool {
+    Command::new("kill")
+        .args(["-0", &pid.to_string()])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
 }
