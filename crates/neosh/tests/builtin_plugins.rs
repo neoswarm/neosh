@@ -2403,8 +2403,22 @@ impl Session {
                             l["marks"]
                                 .as_array()
                                 .map(|ms| {
+                                    // Both, because both are highlight groups on the row and a
+                                    // caller asking what colours a row has does not care which
+                                    // vocabulary put them there. A cursor line is a *band* — it
+                                    // sits under every ranged group rather than winning against
+                                    // them, which is what lets a spinner on the row you are
+                                    // standing on go on spinning — and reading only `hl_group`
+                                    // made the selected row look unhighlighted to this helper.
                                     ms.iter()
-                                        .filter_map(|m| m["hl_group"].as_str().map(str::to_string))
+                                        .flat_map(|m| {
+                                            [
+                                                m["hl_group"].as_str(),
+                                                m["line_hl_group"].as_str(),
+                                            ]
+                                        })
+                                        .flatten()
+                                        .map(str::to_string)
                                         .collect()
                                 })
                                 .unwrap_or_default()

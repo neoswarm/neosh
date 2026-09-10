@@ -29,6 +29,8 @@ fn summary(id: &str, project: &str) -> AgentSummary {
         session: SessionId(id.into()),
         project: ProjectKey(format!("git:example.com/{project}")),
         project_name: project.into(),
+        repo_root: None,
+        branch: None,
         cwd: format!("/w/{project}"),
         label: format!("working on {id}"),
         state: AgentState::Running,
@@ -85,7 +87,7 @@ async fn pair(b_accepts_commands: bool) -> Pair {
         listen: Some(addr),
         accepts_commands: b_accepts_commands,
         accepts_approvals: false,
-        shells: false,
+        accepts_shells: false,
         heartbeat: Duration::from_millis(200),
         ..Default::default()
     };

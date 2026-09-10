@@ -1139,6 +1139,8 @@ mod tests {
             session: SessionId(id.into()),
             project: ProjectKey("git:example.com/x".into()),
             project_name: "x".into(),
+            repo_root: None,
+            branch: None,
             cwd: "/w/x".into(),
             label: id.into(),
             state: AgentState::Idle,
