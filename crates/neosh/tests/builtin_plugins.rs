@@ -9868,7 +9868,9 @@ fn the_clone_destination_offers_the_configured_root_first() {
 struct Peer {
     _rt: tokio::runtime::Runtime,
     handle: neosh_swarm::SwarmHandle,
-    _events: tokio::sync::mpsc::UnboundedReceiver<neosh_swarm::SwarmEvent>,
+    events: tokio::sync::mpsc::UnboundedReceiver<neosh_swarm::SwarmEvent>,
+    /// Whoever dialled us, learnt from the handshake — the address every answer goes back to.
+    asker: Option<neosh_proto::NodeId>,
 }
 
 impl Peer {
@@ -9878,6 +9880,11 @@ impl Peer {
     /// pairing is mutual and each side has to name the other's key, so somebody has to know both
     /// before either is running. `Identity::load_or_create` writes it where the workspace will look.
     fn beside(sb: &Sandbox, name: &str) -> Self {
+        Self::beside_with(sb, name, false)
+    }
+
+    /// The same, saying whether this machine opens shells for the one under test.
+    fn beside_with(sb: &Sandbox, name: &str, shells: bool) -> Self {
         // Bind to learn a port and let go again. A fixed one cannot run twice at once, and this
         // suite runs several tests at a time.
         let probe = std::net::TcpListener::bind("127.0.0.1:0").expect("probe");
@@ -9912,13 +9919,44 @@ impl Peer {
             name: name.into(),
             listen: Some(addr),
             accepts_commands: true,
+            accepts_shells: shells,
             heartbeat: Duration::from_millis(200),
             ..Default::default()
         };
         let (handle, events) =
             neosh_swarm::node::spawn(std::sync::Arc::new(theirs), allowed, cfg, "0.4.6".into());
         drop(guard);
-        Self { _rt: rt, handle, _events: events }
+        Self { _rt: rt, handle, events, asker: None }
+    }
+
+    /// Wait for the workspace to ask for a shell, and hand it one.
+    ///
+    /// Standing in for a pty and a login shell, which is the right amount of machinery: what is
+    /// under test is whether this workspace turns an answer into a pane you can see, not whether
+    /// `openpty` works. So the "shell" is one line of output, sent the moment the handle is minted.
+    fn answer_shell(&mut self, say: &str) -> String {
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        loop {
+            assert!(std::time::Instant::now() < deadline, "no shell was ever asked for");
+            let Some(event) = self.events.blocking_recv() else { panic!("the peer stopped") };
+            match event {
+                neosh_swarm::SwarmEvent::PeerUp { node, .. } => self.asker = Some(node.id),
+                neosh_swarm::SwarmEvent::PtyOpen { node, id, .. } => {
+                    self.handle.send(neosh_swarm::SwarmRequest::PtyOpened {
+                        node: node.clone(),
+                        id,
+                        result: Ok("t1".into()),
+                    });
+                    self.handle.send(neosh_swarm::SwarmRequest::PtyData {
+                        node,
+                        pty: "t1".into(),
+                        data: say.as_bytes().to_vec(),
+                    });
+                    return "t1".into();
+                }
+                _ => {}
+            }
+        }
     }
 
     /// Say what this machine has and what is open in it.
@@ -10089,4 +10127,130 @@ fn a_machine_that_has_not_allowed_this_one_contributes_no_rows() {
     );
     drop(handle);
     drop(rt);
+}
+
+impl Session {
+    /// Put the panel's cursor on the first row containing `needle`, and say whether it got there.
+    ///
+    /// By moving rather than by counting, because a count is a test that passes for the wrong
+    /// reason the moment the panel gains a row — and this panel gains rows for a living.
+    fn sidebar_seek(&mut self, needle: &str) -> bool {
+        for _ in 0..40 {
+            if self.sidebar_cursor().is_some_and(|r| r.contains(needle)) {
+                return true;
+            }
+            self.down();
+            self.drain_for(Duration::from_millis(60));
+        }
+        false
+    }
+
+    /// Everything painted onto a raw-cell surface so far, row by row.
+    ///
+    /// A terminal pane draws in cells rather than lines — `Term::cells` emits every cell every time
+    /// — so the buffer under it says nothing and this is the only place its contents are.
+    fn surface_text(&self) -> Vec<String> {
+        let mut rows: std::collections::BTreeMap<u64, std::collections::BTreeMap<u64, String>> =
+            Default::default();
+        for e in &self.events {
+            if e["type"] != "surface_cells" {
+                continue;
+            }
+            for c in e["cells"].as_array().into_iter().flatten() {
+                let (Some(r), Some(col)) = (c["row"].as_u64(), c["col"].as_u64()) else { continue };
+                let g = c["grapheme"].as_str().unwrap_or(" ").to_string();
+                rows.entry(r).or_default().insert(col, g);
+            }
+        }
+        rows.values().map(|cols| cols.values().cloned().collect::<String>()).collect()
+    }
+}
+
+/// `t` on a row about another computer opens a terminal **on that computer**.
+///
+/// The half of a remote shell somebody actually presses: a key on a row becomes a pane with a
+/// prompt in it. What is on the far end is a real pty in a real workspace and one line of output
+/// here, which is the right amount of machinery — under test is whether this workspace turns an
+/// answer into a pane you can see, not whether `openpty` works.
+#[test]
+fn t_on_another_computers_row_opens_a_terminal_over_there() {
+    const KEY: &str = "git:github.com/neoswarm/faraway";
+    let sb = Sandbox::new("swarm-shell");
+    sb.git_init();
+    sb.git_remote("https://github.com/neoswarm/work.git");
+    let mut peer = Peer::beside_with(&sb, "linux-box", true);
+    // A repository this machine has no clone of, so it is a row of its own rather than nested
+    // inside `work` — which is also the row somebody is most likely to want a shell on.
+    peer.publish(vec![theirs(KEY, "faraway", "/srv/faraway", "/srv/faraway", None)], Vec::new());
+
+    let mut s = sb.start();
+    s.wait_for("PROJECTS");
+    assert!(
+        s.pump(|s| s.sidebar_now().iter().any(|l| l.contains("faraway"))),
+        "the other machine's project arrives:\n{:?}",
+        s.sidebar_now()
+    );
+
+    s.enter_panel();
+    assert!(s.sidebar_seek("faraway"), "the cursor reaches it:\n{:?}", s.sidebar_now());
+    s.key("t");
+
+    // The pane exists from the press, not from the answer: a key that does nothing visible until
+    // the network replies is indistinguishable from a key that is not bound.
+    assert!(s.pump(|s| s.buffer_named("[terminal]").is_some()), "a terminal pane was furnished");
+    assert!(
+        s.pump(|s| s.surface_text().iter().any(|r| r.contains("opening a shell on linux-box"))),
+        "and says what it is waiting for:\n{:?}",
+        s.surface_text()
+    );
+
+    let pty = peer.answer_shell("hello from over there\r\n");
+    assert_eq!(pty, "t1");
+    assert!(
+        s.pump(|s| s.surface_text().iter().any(|r| r.contains("hello from over there"))),
+        "what the far end printed is drawn here:\n{:?}",
+        s.surface_text()
+    );
+    // Named for where it is, which is the fact that tells this tab from the four beside it.
+    assert!(
+        s.pump(|s| s.tabline_now().contains("linux-box")),
+        "the tab says which machine: {:?}",
+        s.tabline_now()
+    );
+}
+
+/// A machine that has not been told to open shells refuses, and says which setting to change.
+///
+/// Refused here rather than over there, because both halves of the answer are things this end can
+/// know: the capability arrived in the handshake, and a round trip that cannot succeed should not
+/// be spent finding that out. What matters is that it is *said* — a pane that stays black is the
+/// one outcome somebody cannot act on.
+#[test]
+fn a_machine_that_does_not_open_shells_says_so_and_says_which_setting() {
+    const KEY: &str = "git:github.com/neoswarm/faraway";
+    let sb = Sandbox::new("swarm-noshell");
+    sb.git_init();
+    sb.git_remote("https://github.com/neoswarm/work.git");
+    let peer = Peer::beside_with(&sb, "linux-box", false);
+    peer.publish(vec![theirs(KEY, "faraway", "/srv/faraway", "/srv/faraway", None)], Vec::new());
+
+    let mut s = sb.start();
+    s.wait_for("PROJECTS");
+    assert!(s.pump(|s| s.sidebar_now().iter().any(|l| l.contains("faraway"))));
+    s.enter_panel();
+    assert!(s.sidebar_seek("faraway"), "the cursor reaches it:\n{:?}", s.sidebar_now());
+    s.key("t");
+
+    assert!(
+        s.pump(|s| s.texts().iter().any(|t| t.contains("accepts_shells"))),
+        "the refusal names the setting to change:\n{}",
+        s.transcript()
+    );
+    // And nothing is left on the bar. A tab you cannot type into is worse than no tab: the keys go
+    // somewhere, and nothing on screen ever says why the prompt never came.
+    assert!(
+        s.pump(|s| !s.tabline_now().contains("linux-box")),
+        "no tab is left behind: {:?}",
+        s.tabline_now()
+    );
 }

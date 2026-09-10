@@ -293,6 +293,18 @@ interface Project {
   /** Conversations in a main checkout somewhere else. Drawn under the repository row, like ours. */
   agents: SwarmAgent[];
   /**
+   * The main checkouts on other machines — the directories themselves, not the work in them.
+   *
+   * Kept as well as {@link agents}, because they answer different questions and only one of them
+   * survives a quiet machine. `agents` is what to *draw*: a flat list of conversations that belong
+   * under the repository row. This is what every verb on the row needs — which machine, and where
+   * on it — and a project advertised with nothing open in it has no conversation to read that from.
+   * Derived from `agents` alone, `n`, `t`, `c` and `C` on such a row all did nothing at all, which
+   * is precisely the row you press them on: the repository over there you have not started work in
+   * yet.
+   */
+  mains: Checkout[];
+  /**
    * Every other checkout of it: worktrees here, and every checkout on another machine that is not
    * that machine's main one.
    *
@@ -3925,6 +3937,7 @@ function group(
         favorite: false,
         sessions: [],
         agents: [],
+        mains: [],
         worktrees: [],
         hosts: [],
       };
@@ -4004,10 +4017,15 @@ function group(
     const host = c.node?.name;
     if (host && !p.hosts.includes(host)) p.hosts.push(host);
     if (rank(c.node?.link) > rank(p.link)) p.link = c.node?.link;
-    if (isTree(c)) p.worktrees.push(c);
-    // A main checkout over there: its conversations belong to the repository row, exactly as ours
-    // do. A row of its own would be a second `neosh` under `neosh`.
-    else p.agents.push(...c.agents);
+    if (isTree(c)) {
+      p.worktrees.push(c);
+    } else {
+      // A main checkout over there: its conversations belong to the repository row, exactly as ours
+      // do. A row of its own would be a second `neosh` under `neosh`. The checkout is kept beside
+      // them, because the row's verbs are about the directory and not about the work in it.
+      p.mains.push(c);
+      p.agents.push(...c.agents);
+    }
   }
   for (const p of projects.values()) p.hosts.sort();
 
@@ -4466,13 +4484,10 @@ function machinesOf(p: Project): Array<{ id: string; name: string; cwd: string }
     if (!c.node || out.some((m) => m.id === c.node?.id)) return;
     out.push({ id: c.node.id, name: c.node.name, cwd: c.cwd });
   };
-  // The main checkouts first: `n` on a repository row means a conversation in the repository, and
-  // a machine that has both offers the one somebody meant.
-  for (const r of p.agents) {
-    if (!out.some((m) => m.id === r.node.id)) {
-      out.push({ id: r.node.id, name: r.node.name, cwd: r.agent.repo_root ?? r.agent.cwd });
-    }
-  }
+  // The main checkouts first, and from the *checkouts* rather than from the conversations in them:
+  // `n` on a repository row means a conversation in the repository, and a repository nobody has
+  // started work in yet is exactly the row that has conversations to read nothing from.
+  for (const c of p.mains) add(c);
   for (const t of p.worktrees) add(t);
   return out;
 }
