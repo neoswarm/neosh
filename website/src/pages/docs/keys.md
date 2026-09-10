@@ -155,6 +155,8 @@ What an agent gets when it asks *you* something. Every key here is bound against
 | `J` `K` | Reorder within a group |
 | `r` | Rename a conversation |
 | `y` | Copy the row's directory |
+| `t` | A **terminal** in this project, in a tab of its own — on this computer, or on the machine the row is on |
+| `c` `C` | Connect to that computer, or disconnect from it. Only on a row about another machine |
 | `p` | Pull that repository (a git-plugin contribution) |
 | `d` | Remove a worktree from disk. It asks first (a git-plugin contribution) |
 | `x` `X` | Archive, delete. Deleting the last conversation in a worktree removes the checkout too, and says so. On a repository's heading, `X` takes the project off the list; on a worktree's, it removes the checkout |

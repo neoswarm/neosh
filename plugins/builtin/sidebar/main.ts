@@ -3970,11 +3970,16 @@ function group(
     // true even when the tree itself was never visited and has no key of its own.
     const key = keyOf.get(cwd) ?? localKey(root);
     const p = project(key, basename(root));
-    if (p.cwd === null && !here.has(root)) {
-      // A tree whose main checkout is not on the list at all — removed from the panel with `X`, or
-      // never added. The repository still needs a row for the tree to hang from, and the honest
-      // name for it is the directory it is a tree of.
-      p.name = basename(root);
+    if (p.cwd === null) {
+      // A tree whose main checkout is not on the panel's list at all — taken off with `X`, or
+      // never added, which is the ordinary state of somebody who only ever works in worktrees. The
+      // repository still needs a row for the tree to hang from, and that row is a **real place**:
+      // the checkout is on this disk, `↵` can start a conversation in it, and `t` can open a
+      // terminal there. Leaving `cwd` null would make it a row whose only verb is folding, about a
+      // directory that is sitting right there.
+      p.cwd = root;
+      p.name = arrangement.name(root) || basename(root);
+      p.favorite = arrangement.isFavorite(root);
     }
     p.worktrees.push({
       cwd,
