@@ -1855,6 +1855,21 @@ async function registerCommands(w: Wiring): Promise<void> {
       desc: "Add a computer by its address",
     }),
   );
+  w.subscriptions.push(
+    // The machine-level verb, so a script or `^K` reaches it without going through a row. `t` in
+    // the panel is this with the cursor's machine and directory filled in, which is the ordinary
+    // way to press it — a name and a path is what you use when you are automating something.
+    await neosh.cmd.register("swarm.shell", async (args) => {
+      const [node, cwd] = args;
+      if (!node) {
+        neosh.notify("swarm.shell needs a computer", "warn");
+        return;
+      }
+      await neosh.swarm
+        .shell(node, cwd === "" ? undefined : cwd)
+        .catch((e: unknown) => neosh.notify(String(e), "warn"));
+    }, { desc: "Open a terminal on another computer" }),
+  );
   // `^J` rather than a letter, because everything in chat mode has to be a chord — the composer is
   // the field, and a bare key would be a character you can no longer type.
   await neosh.keymap.set("chat", "<C-j>", "swarm.nodes", { desc: "Computers" });
