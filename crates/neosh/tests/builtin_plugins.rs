@@ -7681,6 +7681,54 @@ impl Session {
         rows
     }
 
+    /// The marks on the panel row the cursor is on, as `(group, is_band)`.
+    ///
+    /// Both kinds, and which kind each is, because that distinction is the whole question here: a
+    /// band sits under every ranged group on the row and a ranged group wins against them, and the
+    /// marks are otherwise identical.
+    fn sidebar_cursor_marks(&self) -> Vec<(String, bool)> {
+        let Some(buf) = self.buffer_named("[sidebar]") else { return Vec::new() };
+        let mut rows: Vec<Vec<(String, bool)>> = Vec::new();
+        for e in &self.events {
+            if e["type"] != "buffer_lines" || e["buf"].as_u64() != Some(buf) {
+                continue;
+            }
+            let start = e["start"].as_i64().unwrap_or(0);
+            let old_end = e["old_end"].as_i64().unwrap_or(start);
+            let new: Vec<Vec<(String, bool)>> = e["lines"]
+                .as_array()
+                .map(|a| {
+                    a.iter()
+                        .map(|l| {
+                            l["marks"]
+                                .as_array()
+                                .map(|ms| {
+                                    ms.iter()
+                                        .flat_map(|m| {
+                                            [
+                                                m["hl_group"].as_str().map(|g| (g.to_string(), false)),
+                                                m["line_hl_group"]
+                                                    .as_str()
+                                                    .map(|g| (g.to_string(), true)),
+                                            ]
+                                        })
+                                        .flatten()
+                                        .collect()
+                                })
+                                .unwrap_or_default()
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            let st = start.clamp(0, rows.len() as i64) as usize;
+            let en = if old_end < 0 { rows.len() } else { (old_end as usize).clamp(st, rows.len()) };
+            rows.splice(st..en, new);
+        }
+        rows.into_iter()
+            .find(|row| row.iter().any(|(g, _)| g == "Sidebar.Selected"))
+            .unwrap_or_default()
+    }
+
     /// The panel row the cursor is on, read from the highlight rather than from a count.
     ///
     /// A count would be a test that passes for the wrong reason the moment the panel gains a row.
@@ -10726,5 +10774,52 @@ fn asking_which_computer_happens_when_one_of_them_has_the_project() {
     assert!(
         rows.iter().any(|l| l.contains("linux-box")),
         "with the machine that has it beside it:\n{rows:?}"
+    );
+}
+
+/// The cursor is a **band**, so what is marked on the row it is on keeps its own colour.
+///
+/// And, the reason this is a bug rather than a preference: keeps its own *motion*. A project being
+/// fetched draws one cell of `Git.Fetching`, which is a `Frames` animation — and a run animates
+/// because its winning highlight group says so. Drawn as a ranged group at priority 200 across the
+/// whole row, the cursor won every character it covered, so the spinner stopped the moment you put
+/// the cursor on the row and started again when you moved off. Exactly backwards: the row you are
+/// standing on is the row you are asking about, and the spinner is the only thing on it saying the
+/// answer is not in yet.
+///
+/// `line_hl_group` is the vocabulary the workspace already had for this and already used for diff
+/// bands — under everything on the row, with every ranged group patched over it. Asserted on the
+/// marks rather than on pixels, because what changed is which kind of mark the cursor is.
+#[test]
+fn a_marked_row_keeps_its_marks_under_the_cursor() {
+    let sb = Sandbox::new("cursor-band");
+    sb.git_init();
+    // Something for the git plugin to put a badge on: an untracked file is the cheapest mark that
+    // survives to the row.
+    std::fs::write(sb.work().join("scratch.txt"), "x\n").expect("write");
+
+    let mut s = sb.start();
+    s.wait_for("PROJECTS");
+    assert!(
+        s.pump(|s| s.sidebar_now().iter().any(|l| l.contains("?1"))),
+        "the project row has a badge:\n{:?}",
+        s.sidebar_now()
+    );
+
+    s.enter_panel();
+    assert!(s.sidebar_seek("work"), "the cursor is on the badged row:\n{:?}", s.sidebar_now());
+    let marks = s.sidebar_cursor_marks();
+    assert!(
+        marks.iter().any(|(g, _)| g.starts_with("Git.")),
+        "the row has a badge on it at all: {marks:?}"
+    );
+    // The mechanism rather than the pixels, because the pixels are the renderer's: both marks are
+    // *present* either way and what changed is which kind the cursor is, so a test that only listed
+    // the groups on the row would pass with the bug in place. It did, which is how this ended up
+    // asserting the shape. Who wins between a band and a run over it — and that a run's own
+    // animation survives — is `render_line`'s, and is tested there.
+    assert!(
+        marks.iter().any(|(g, band)| g == "Sidebar.Selected" && *band),
+        "and the cursor is a band under it, not a run over it: {marks:?}"
     );
 }
