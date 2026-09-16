@@ -1981,6 +1981,67 @@ fn the_rail_says_what_a_provider_costs_before_you_pick_from_it() {
 }
 
 #[test]
+fn model_speed_is_visible_and_switches_between_standard_and_fast() {
+    let sb = Sandbox::new("model-speed");
+    let dir = sb.root.join("config/plugins/lab");
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    std::fs::write(
+        dir.join("plugin.toml"),
+        "name = \"lab\"\nversion = \"0.1.0\"\nentry = \"main.ts\"\npermissions = [\"providers\"]\n",
+    )
+    .expect("manifest");
+    let plugin = INVENTED_KNOB
+        .replace("vibe", "service_tier")
+        .replace("Vibe", "Speed")
+        .replace("chill", "default")
+        .replace("Chill", "Standard")
+        .replace("intense", "priority")
+        .replace("Intense", "Fast")
+        .replace(
+            r#"neosh.event.on("neosh.ready", () => neosh.notify("lab ready"));"#,
+            r#"neosh.event.on("neosh.ready", async () => {
+              // A stored conversation may not have the newly discovered speed option yet.
+              await neosh.agent.setSelection({ instance: "lab", model: "brainy", options: [] });
+              neosh.notify("lab ready");
+            });"#,
+        );
+    std::fs::write(dir.join("main.ts"), plugin).expect("plugin");
+    sb.write_config("[options]\n\"agent.model\" = \"lab/brainy\"\n");
+    let mut s = sb.start_letting_config_choose();
+    s.wait_for("lab ready");
+    assert!(
+        s.pump(|s| s.status_now().join("").contains("Standard")),
+        "default speed in footer: {:?}",
+        s.status_now()
+    );
+    s.ctrl("e");
+    s.wait_open("[model options]");
+    s.wait_for("Speed");
+    s.special("right");
+    s.special("enter");
+    s.wait_closed("[model options]");
+    assert!(
+        s.pump(|s| s.status_now().join("").contains("Fast")),
+        "fast speed in footer: {:?}",
+        s.status_now()
+    );
+    s.send(&command("lab.report"));
+    s.wait_for(r#"selection: lab/brainy [{"id":"service_tier","value":"priority"}]"#);
+    s.ctrl("e");
+    s.wait_open("[model options]");
+    s.special("left");
+    s.special("enter");
+    s.wait_closed("[model options]");
+    assert!(
+        s.pump(|s| s.status_now().join("").contains("Standard")),
+        "standard speed in footer: {:?}",
+        s.status_now()
+    );
+    s.send(&command("lab.report"));
+    s.wait_for(r#"selection: lab/brainy [{"id":"service_tier","value":"default"}]"#);
+}
+
+#[test]
 fn a_driver_can_invent_an_option_and_the_switcher_renders_it() {
     let sb = Sandbox::new("invented");
     let dir = sb.root.join("config/plugins/lab");

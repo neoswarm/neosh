@@ -191,9 +191,17 @@ function summarise(
   for (const d of descriptors) {
     const value = chosen.find((o) => o.id === d.id)?.value;
     if (d.type === "boolean") {
-      if (value === true) out.push(d.label.toLowerCase());
-    } else if (typeof value === "string") {
-      out.push(d.options.find((o) => o.id === value)?.label ?? value);
+      if ((typeof value === "boolean" ? value : d.current_value) === true) {
+        out.push(d.label.toLowerCase());
+      }
+    } else {
+      // Restored selections can predate a newly discovered option. Use the same
+      // default as the options sheet so the footer still says which speed is set.
+      const current = (typeof value === "string" ? value : undefined) ??
+        d.current_value ?? d.options.find((o) => o.is_default)?.id;
+      if (current !== undefined) {
+        out.push(d.options.find((o) => o.id === current)?.label ?? current);
+      }
     }
   }
   return out.join(" ");
@@ -884,4 +892,3 @@ async function pickProvider(neosh: Neosh): Promise<void> {
   await neosh.agent.forgetCredential(chosen.instance);
   await refreshFooter();
 }
-
