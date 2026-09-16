@@ -736,6 +736,9 @@ pub fn codex_model(v: &serde_json::Value) -> Option<ModelInfo> {
         });
     }
 
+    if let Some(speed) = codex_speed(v) {
+        descriptors.push(speed);
+    }
     let hidden = v.get("hidden").and_then(serde_json::Value::as_bool).unwrap_or(false);
     let mut m = ModelInfo::undescribed(id, name);
     m.capabilities = ModelCapabilities {
@@ -756,6 +759,98 @@ pub fn codex_model(v: &serde_json::Value) -> Option<ModelInfo> {
     m.tagline = v.get("description").and_then(|d| d.as_str()).map(str::to_string);
     m.legacy = hidden;
     Some(m)
+}
+
+/// Speed tiers are model capabilities, including their wire ids and account-specific labels.
+/// Older app-servers advertised only `additionalSpeedTiers`; never invent a fast tier for a
+/// model that advertised neither. Standard must be explicit to clear a previous fast selection.
+fn codex_speed(model: &Value) -> Option<ProviderOptionDescriptor> {
+    let mut choices = vec![OptionChoice {
+        id: "default".into(),
+        label: "Standard".into(),
+        description: Some("Standard speed and usage.".into()),
+        is_default: false,
+    }];
+    if let Some(tiers) = model.get("serviceTiers").and_then(Value::as_array) {
+        for tier in tiers {
+            let Some(id) = str_at(tier, "id").filter(|id| !id.is_empty()) else {
+                continue;
+            };
+            if choices.iter().any(|c| c.id == id) {
+                continue;
+            }
+            choices.push(OptionChoice {
+                id: id.into(),
+                label: str_at(tier, "name").unwrap_or(id).into(),
+                description: str_at(tier, "description").map(str::to_string),
+                is_default: false,
+            });
+        }
+    }
+    if choices.len() == 1
+        && let Some(tiers) = model.get("additionalSpeedTiers").and_then(Value::as_array)
+    {
+        for id in tiers
+            .iter()
+            .filter_map(Value::as_str)
+            .filter(|id| !id.is_empty())
+        {
+            if choices.iter().any(|c| c.id == id) {
+                continue;
+            }
+            choices.push(OptionChoice {
+                id: id.into(),
+                label: if id == "fast" { "Fast" } else { id }.into(),
+                description: None,
+                is_default: false,
+            });
+        }
+    }
+    if choices.len() == 1 {
+        return None;
+    }
+    let default = str_at(model, "defaultServiceTier")
+        .filter(|id| choices.iter().any(|c| c.id == *id))
+        .unwrap_or("default");
+    for choice in &mut choices {
+        choice.is_default = choice.id == default;
+    }
+    Some(ProviderOptionDescriptor::Select {
+        id: "service_tier".into(),
+        label: "Speed".into(),
+        description: Some(
+            "Processing speed for the next turn. Faster tiers can use more of your plan.".into(),
+        ),
+        options: choices,
+        current_value: Some(default.into()),
+        prompt_injected_values: Vec::new(),
+    })
+}
+
+fn service_tier<'a>(
+    instance: &'a InstanceConfig,
+    selection: &'a neosh_proto::ModelSelection,
+) -> &'a str {
+    selection
+        .option_str("service_tier")
+        .or_else(|| {
+            instance
+                .models
+                .iter()
+                .find(|m| m.id == selection.model)
+                .and_then(|m| {
+                    m.capabilities
+                        .option_descriptors
+                        .iter()
+                        .find_map(|d| match d {
+                            ProviderOptionDescriptor::Select {
+                                id, current_value, ..
+                            } if id == "service_tier" => current_value.as_deref(),
+                            _ => None,
+                        })
+                })
+        })
+        .unwrap_or("default")
 }
 
 /// Which rung a codex model sits on.
@@ -801,7 +896,7 @@ impl Provider for CodexCliProvider {
 
     fn stream(
         &self,
-        _instance: &InstanceConfig,
+        instance: &InstanceConfig,
         request: TurnRequest,
         cancel: CancellationToken,
     ) -> ProviderStream {
@@ -817,11 +912,12 @@ impl Provider for CodexCliProvider {
         };
         let mode = *self.mode.lock().expect("mode lock poisoned");
         let asker = self.asker.lock().expect("asker lock poisoned").clone();
+        let tier = service_tier(instance, &request.selection).to_string();
 
         tokio::spawn(async move {
             let mut guard = slot.live.lock().await;
             if let Err(message) =
-                run_turn(&program, &slot, &mut guard, request, mode, asker, cancel, &tx).await
+                run_turn(&program, &slot, &mut guard, request, &tier, mode, asker, cancel, &tx).await
             {
                 // A failure the process cannot recover from leaves nothing worth keeping: the next
                 // turn starts a fresh app-server rather than writing into a pipe whose other end
@@ -849,6 +945,7 @@ async fn run_turn(
     conversation: &Conversation,
     slot: &mut Option<Live>,
     request: TurnRequest,
+    service_tier: &str,
     mode: PermissionMode,
     asker: Option<Arc<dyn PermissionAsker>>,
     cancel: CancellationToken,
@@ -877,6 +974,7 @@ async fn run_turn(
         "threadId": live.thread.clone().unwrap_or_default(),
         "input": CodexCliProvider::input_from(&request.messages),
         "model": request.selection.model.as_ref(),
+        "serviceTier": service_tier,
         "sandboxPolicy": sandbox_policy(mode),
         "approvalPolicy": approval_policy(mode, asking),
     });
@@ -889,6 +987,9 @@ async fn run_turn(
 
     let mut state = CodexState::default();
     let mut turn: Option<String> = None;
+    // Notifications may precede the turn/start reply. That reply, not the first
+    // turn/started on a shared stream, identifies the turn we actually requested.
+    let mut pending = std::collections::VecDeque::new();
     let mut interrupted = false;
     let mut finished = false;
     let giveup = tokio::time::sleep(Duration::from_secs(86_400));
@@ -899,7 +1000,12 @@ async fn run_turn(
             biased;
             // Asked to stop, not killed. A killed server takes the thread with it, and the next
             // turn would resume into a history that never heard of the work it interrupted.
-            () = cancel.cancelled(), if !interrupted => {
+            () = async {
+                tokio::select! {
+                    () = cancel.cancelled() => {},
+                    () = tx.closed() => {},
+                }
+            }, if !interrupted => {
                 interrupted = true;
                 if let Some(id) = &turn {
                     let params = json!({ "threadId": live.thread, "turnId": id });
@@ -927,50 +1033,86 @@ async fn run_turn(
                 };
                 let Ok(v) = serde_json::from_str::<Value>(&line) else { continue };
 
-                // The reply to `turn/start`, which is the only place the turn's own id appears —
-                // and `turn/interrupt` needs it.
+                // Match responses separately from server requests: their id spaces overlap.
                 if v.get("id").and_then(Value::as_u64) == Some(started)
-                    && let Some(id) = v.pointer("/result/turn/id").and_then(Value::as_str)
+                    && v.get("method").is_none()
                 {
+                    if let Some(error) = v.get("error") {
+                        // The prompt was rejected, but the thread still holds the history.
+                        // Keep it so correcting a model or option does not erase the session.
+                        let _ = tx.send(ProviderEvent::Error {
+                            message: format!("codex app-server turn/start: {error}"),
+                            retryable: false,
+                        }).await;
+                        return Ok(());
+                    }
+                    let id = v.pointer("/result/turn/id").and_then(Value::as_str)
+                        .ok_or_else(|| "codex app-server started no turn".to_string())?;
                     turn = Some(id.to_string());
                     conversation.tune.lock().expect("tune lock poisoned").turn = turn.clone();
-                    continue;
-                }
-                // A question codex is blocked on. This is the whole reason `ask` mode means
-                // something here: `codex exec` had nobody to ask and could only refuse.
-                if let Some(ask) = approval_request(&v, &request.cwd) {
-                    // Raced against the cancellation, not awaited on its own. A prompt with
-                    // nobody at the keyboard is exactly when somebody reaches for `<Esc>`, and a
-                    // turn that could only be interrupted between questions could not be
-                    // interrupted at all while one was open.
-                    let answer = match &asker {
-                        Some(a) => tokio::select! {
-                            biased;
-                            () = cancel.cancelled() => PermissionAnswer::Deny,
-                            answer = a.ask(PermissionRequest {
-                                conversation: Some(request.conversation.clone()),
-                                ..ask.request.clone()
-                            }) => answer,
-                        },
-                        None => PermissionAnswer::Deny,
-                    };
-                    let reply = json!({
-                        "jsonrpc": "2.0",
-                        "id": ask.id,
-                        "result": { "decision": decision(&ask, &answer) },
-                    });
-                    if write_line(&mut live.stdin, &reply).await.is_err() {
-                        *slot = None;
-                        break;
+                    if interrupted {
+                        live.notify_request("turn/interrupt", json!({
+                            "threadId": live.thread, "turnId": id,
+                        })).await?;
                     }
+                } else {
+                    pending.push_back(v);
+                }
+                if turn.is_none() {
                     continue;
                 }
-                for ev in app_server_event(&v, &mut state) {
-                    finished |= matches!(ev, ProviderEvent::MessageStop);
-                    if tx.send(ev).await.is_err() {
-                        // The receiver is gone: the turn was abandoned. The process is not — it
-                        // holds the thread, and the next turn is probably about to use it.
-                        return Ok(());
+                while let Some(v) = pending.pop_front() {
+                    // A question codex is blocked on. This is the whole reason `ask` mode means
+                    // something here: `codex exec` had nobody to ask and could only refuse.
+                    // Answer before filtering notifications: children can also need approval.
+                    if let Some(ask) = approval_request(&v, &request.cwd) {
+                        // Raced against the cancellation, not awaited on its own. A prompt with
+                        // nobody at the keyboard is exactly when somebody reaches for `<Esc>`, and a
+                        // turn that could only be interrupted between questions could not be
+                        // interrupted at all while one was open.
+                        let answer = match &asker {
+                            Some(a) if !interrupted => tokio::select! {
+                                biased;
+                                () = cancel.cancelled() => PermissionAnswer::Deny,
+                                () = tx.closed() => PermissionAnswer::Deny,
+                                answer = a.ask(PermissionRequest {
+                                    conversation: Some(request.conversation.clone()),
+                                    ..ask.request.clone()
+                                }) => answer,
+                            },
+                            _ => PermissionAnswer::Deny,
+                        };
+                        let reply = json!({
+                            "jsonrpc": "2.0",
+                            "id": ask.id,
+                            "result": { "decision": decision(&ask, &answer) },
+                        });
+                        if write_line(&mut live.stdin, &reply).await.is_err() {
+                            return Err("could not answer codex approval".into());
+                        }
+                        continue;
+                    }
+                    // The app-server multiplexes parent and child threads. Child messages,
+                    // usage, errors and endings belong to the child, and old parent turns
+                    // must not become this prompt's answer. Parent-owned task items still
+                    // pass through and provide the sub-agent activity UI.
+                    let params = v.get("params").unwrap_or(&Value::Null);
+                    let thread_id = str_at(params, "threadId");
+                    let turn_id = str_at(params, "turnId")
+                        .or_else(|| params.pointer("/turn/id").and_then(Value::as_str));
+                    if thread_id.is_some_and(|id| Some(id) != live.thread.as_deref())
+                        || turn_id.is_some_and(|id| Some(id) != turn.as_deref())
+                    {
+                        continue;
+                    }
+                    for ev in app_server_event(&v, &mut state) {
+                        finished |= matches!(ev, ProviderEvent::MessageStop);
+                        // A dropped receiver triggers interruption above. Keep draining to
+                        // this turn's boundary before handing the process to the next turn.
+                        let _ = tx.send(ev).await;
+                    }
+                    if finished {
+                        break;
                     }
                 }
                 if finished {
@@ -1257,6 +1399,67 @@ impl super::AgentDriver for CodexCliProvider {
 mod tests {
     use super::*;
     use neosh_proto::{AuthRef, InstanceId, ModelSelection};
+
+    #[test]
+    fn discovered_speed_tiers_keep_their_wire_ids_labels_and_defaults() {
+        let mut wire: Value =
+            serde_json::from_str(include_str!("../../tests/fixtures/codex_model_sol.json"))
+                .expect("fixture");
+        let model = codex_model(&wire).expect("model");
+        let speed = model
+            .capabilities
+            .option_descriptors
+            .iter()
+            .find(|d| d.id() == "service_tier")
+            .expect("speed");
+        let ProviderOptionDescriptor::Select {
+            options,
+            current_value,
+            ..
+        } = speed
+        else {
+            panic!("select")
+        };
+        assert_eq!(current_value.as_deref(), Some("default"));
+        assert_eq!(
+            options
+                .iter()
+                .map(|o| (o.id.as_str(), o.label.as_str(), o.is_default))
+                .collect::<Vec<_>>(),
+            vec![("default", "Standard", true), ("priority", "Fast", false)]
+        );
+        assert_eq!(
+            options[1].description.as_deref(),
+            Some("1.5x speed, increased usage")
+        );
+
+        wire["defaultServiceTier"] = json!("priority");
+        let model = codex_model(&wire).expect("model");
+        let defaults = catalog::default_options(&model.capabilities);
+        assert!(defaults.iter().any(|o| o.id == "service_tier"
+            && o.value == neosh_proto::ProviderOptionValue::Text("priority".into())));
+    }
+
+    #[test]
+    fn legacy_speed_tiers_are_supported_but_unavailable_tiers_are_not_invented() {
+        let old = json!({"additionalSpeedTiers": ["fast"], "defaultServiceTier": "unknown"});
+        let Some(ProviderOptionDescriptor::Select {
+            options,
+            current_value,
+            ..
+        }) = codex_speed(&old)
+        else {
+            panic!("speed")
+        };
+        assert_eq!(options[1].id, "fast");
+        assert_eq!(options[1].label, "Fast");
+        assert_eq!(current_value.as_deref(), Some("default"));
+        let mini: Value =
+            serde_json::from_str(include_str!("../../tests/fixtures/codex_model_mini.json"))
+                .expect("fixture");
+        assert!(codex_speed(&mini).is_none());
+        assert!(codex_speed(&json!({"serviceTiers": [null, {"id": ""}]})).is_none());
+    }
 
     /// Every line in order, through one parser state, the way the driver reads them.
     fn replay(lines: &[&str]) -> Vec<ProviderEvent> {
