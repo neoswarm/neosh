@@ -346,7 +346,9 @@ pub fn app_server_event(v: &Value, state: &mut CodexState) -> Vec<ProviderEvent>
             }];
             let window = usage.and_then(|u| u.get("modelContextWindow")).and_then(Value::as_u64);
             if let Some(total) = window.filter(|t| *t > 0) {
-                out.push(activity(Activity::Context { used: n("total", "totalTokens"), total }));
+                // `total` accumulates every request, repeatedly counting the same history.
+                // `last` is the latest context footprint and can shrink after compaction.
+                out.push(activity(Activity::Context { used: n("last", "totalTokens"), total }));
             }
             out
         }
@@ -1564,7 +1566,22 @@ mod tests {
         }));
         // A number nothing else in neosh could have known: how big this model's window is, is the
         // vendor's business and codex is the one being told.
-        assert!(acts.contains(&&Activity::Context { used: 390, total: 272_000 }));
+        assert!(acts.contains(&&Activity::Context { used: 160, total: 272_000 }));
+    }
+
+    #[test]
+    fn codex_context_tracks_the_latest_request_even_when_lifetime_usage_keeps_growing() {
+        let events = replay(&[
+            r#"{"method":"thread/tokenUsage/updated","params":{"tokenUsage":{"last":{"totalTokens":180000},"total":{"totalTokens":950000},"modelContextWindow":272000}}}"#,
+            r#"{"method":"thread/tokenUsage/updated","params":{"tokenUsage":{"last":{"totalTokens":12000},"total":{"totalTokens":962000},"modelContextWindow":272000}}}"#,
+        ]);
+        assert_eq!(
+            only_activity(&events),
+            vec![
+                &Activity::Context { used: 180_000, total: 272_000 },
+                &Activity::Context { used: 12_000, total: 272_000 },
+            ]
+        );
     }
 
     #[test]
