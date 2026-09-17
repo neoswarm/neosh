@@ -536,3 +536,120 @@ async fn speed_can_be_enabled_and_disabled_on_the_same_conversation() {
     assert_eq!(tiers, ["priority", "default", "priority", "default"]);
     p.shutdown(&SessionId::from("c1"));
 }
+
+const CONTEXT_FAKE: &str = r#"#!/bin/sh
+window=258400
+while IFS= read -r line; do
+  printf '%s\n' "$line" >> "$0.requests"
+  id=$(printf '%s\n' "$line" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
+  case "$line" in
+    *'"method":"initialize"'*) printf '{"id":%s,"result":{}}\n' "$id" ;;
+    *'"method":"thread/start"'*|*'"method":"thread/resume"'*)
+      if [ -f "$0.reject" ]; then
+        rm "$0.reject"
+        printf '{"id":%s,"error":{"message":"retry context change"}}\n' "$id"
+        continue
+      fi
+      case "$line" in *'"model_context_window":1000000'*) window=950000 ;; esac
+      printf '{"id":%s,"result":{"thread":{"id":"t1"}}}\n' "$id" ;;
+    *'"method":"turn/start"'*)
+      printf '{"id":%s,"result":{"turn":{"id":"u1"}}}\n' "$id"
+      echo '{"method":"turn/started","params":{"threadId":"t1","turn":{"id":"u1"}}}'
+      printf '{"method":"thread/tokenUsage/updated","params":{"threadId":"t1","turnId":"u1","tokenUsage":{"last":{"totalTokens":12000},"modelContextWindow":%s}}}\n' "$window"
+      echo '{"method":"turn/completed","params":{"threadId":"t1","turn":{"id":"u1","status":"completed"}}}' ;;
+  esac
+done
+"#;
+
+#[tokio::test]
+async fn context_changes_resume_the_same_thread_and_default_clears_overrides() {
+    let fake = Fake::new("context-switch");
+    support::write_executable(&fake.dir.join("codex"), CONTEXT_FAKE);
+    let p = CodexCliProvider::new(fake.program());
+    let mut instance = inst();
+    let mut model = neosh_proto::ModelInfo::undescribed("test-context-model", "Test");
+    model.capabilities.option_descriptors.push(neosh_proto::ProviderOptionDescriptor::Select {
+        id: "context".into(),
+        label: "Context".into(),
+        description: None,
+        options: ["272000", "1000000"]
+            .into_iter()
+            .map(|id| neosh_proto::OptionChoice {
+                id: id.into(),
+                label: id.into(),
+                description: None,
+                is_default: false,
+            })
+            .collect(),
+        current_value: None,
+        prompt_injected_values: vec![],
+    });
+    instance.models.push(model);
+    for (choice, expected) in [
+        (None, 258400),
+        (Some("272000"), 258400),
+        (Some("1000000"), 950000),
+        (Some("1000000"), 950000),
+        (Some("default"), 258400),
+    ] {
+        let mut request = req(&fake.dir);
+        request.selection.model = "test-context-model".into();
+        if let Some(value) = choice {
+            request.selection.options.push(neosh_proto::OptionSelection {
+                id: "context".into(),
+                value: neosh_proto::ProviderOptionValue::Text(value.into()),
+            });
+        }
+        // A rejected resume must retain the thread for a retry, not silently start a new one.
+        if choice == Some("272000") {
+            std::fs::write(fake.dir.join("codex.reject"), "").expect("reject once");
+            let failed: Vec<_> =
+                p.stream(&instance, request.clone(), CancellationToken::new()).collect().await;
+            assert!(failed.iter().any(|e| matches!(e, ProviderEvent::Error { .. })), "{failed:?}");
+        }
+        let events = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            p.stream(&instance, request, CancellationToken::new()).collect::<Vec<_>>(),
+        )
+        .await
+        .expect("turn finishes");
+        assert!(events.contains(&ProviderEvent::MessageStop), "{events:?}");
+        assert!(
+            events.iter().any(|e| matches!(e, ProviderEvent::Activity {
+            activity: neosh_proto::Activity::Context { used: 12000, total }
+        } if *total == expected)),
+            "{events:?}"
+        );
+        assert!(
+            events.iter().any(|e| matches!(e, ProviderEvent::Activity {
+            activity: neosh_proto::Activity::Resume { token }
+        } if token == "t1")),
+            "{events:?}"
+        );
+    }
+    p.shutdown(&SessionId::from("c1"));
+    // A new driver can also resume the saved token after neosh itself restarts.
+    let p = CodexCliProvider::new(fake.program());
+    let mut request = req(&fake.dir);
+    request.resume = Some("t1".into());
+    let events: Vec<_> = p.stream(&instance, request, CancellationToken::new()).collect().await;
+    assert!(events.contains(&ProviderEvent::MessageStop), "{events:?}");
+    let lines = std::fs::read_to_string(fake.dir.join("codex.requests")).expect("wire log");
+    let requests: Vec<serde_json::Value> =
+        lines.lines().map(|s| serde_json::from_str(s).expect("json")).collect();
+    assert_eq!(requests.iter().filter(|r| r["method"] == "thread/start").count(), 1);
+    let resumes: Vec<_> = requests.iter().filter(|r| r["method"] == "thread/resume").collect();
+    assert_eq!(
+        resumes.len(),
+        5,
+        "changes, rejected retry, and saved resume; unchanged context reuses process"
+    );
+    for r in &resumes {
+        assert_eq!(r["params"]["threadId"], "t1");
+    }
+    assert_eq!(resumes[0]["params"]["config"]["model_context_window"], 272000);
+    assert_eq!(resumes[2]["params"]["config"]["model_context_window"], 1000000);
+    assert_eq!(resumes[2]["params"]["config"]["model_auto_compact_token_limit"], 900000);
+    assert!(resumes[3]["params"].get("config").is_none(), "Default restores Codex configuration");
+    p.shutdown(&SessionId::from("c1"));
+}
