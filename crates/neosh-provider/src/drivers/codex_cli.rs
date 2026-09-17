@@ -39,9 +39,8 @@
 //!
 //! Started once and kept, like `claude_cli` — but simpler, because there is nothing here that has
 //! to be said on a command line. The model, the effort, the sandbox, the approval policy and even
-//! the directory are all parameters of `turn/start`, so **nothing ever needs a new process**: a
-//! change to any of them takes effect on the next turn with no relaunch at all. What the process
-//! holds is the thread, and `thread/resume` puts it back if it ever has to be replaced.
+//! the directory are parameters of `turn/start`. Context configuration is thread-scoped instead:
+//! changing it replaces the process between turns and resumes the same persisted thread.
 
 use std::collections::HashMap;
 use std::process::Stdio;
@@ -113,6 +112,8 @@ struct Conversation {
     /// two conversations down one pipe.
     live: tokio::sync::Mutex<Option<Live>>,
     tune: Mutex<Tune>,
+    /// Retained across process/configuration failures, so retrying never starts an empty thread.
+    resume: Mutex<Option<String>>,
 }
 
 /// A `codex app-server` that is still running, between turns as well as during them.
@@ -132,6 +133,7 @@ struct Live {
     cwd: std::path::PathBuf,
     /// Request ids, which have to be unique within the connection.
     next_id: u64,
+    context: Option<u64>,
 }
 
 #[derive(Debug)]
@@ -692,7 +694,96 @@ async fn discover(program: &str) -> Result<Vec<ModelInfo>, ProviderError> {
     if out.is_empty() {
         return Err(ProviderError::BadResponse(format!("{program} listed no models")));
     }
+    add_context_options(&mut out, &context_metadata().await);
     Ok(out)
+}
+
+/// model/list omits context limits. Codex's own cache contains the account/model-specific
+/// default and maximum; an API model's advertised maximum is not necessarily this CLI's limit.
+async fn context_metadata() -> Value {
+    let home = std::env::var_os("CODEX_HOME")
+        .map(std::path::PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|p| std::path::PathBuf::from(p).join(".codex")));
+    let Some(home) = home else { return Value::Null };
+    let path = home.join("models_cache.json");
+    if !tokio::fs::metadata(&path).await.is_ok_and(|m| m.len() <= 8 * 1024 * 1024) {
+        return Value::Null;
+    }
+    tokio::fs::read(path)
+        .await
+        .ok()
+        .and_then(|b| serde_json::from_slice(&b).ok())
+        .unwrap_or(Value::Null)
+}
+
+fn add_context_options(models: &mut [ModelInfo], cache: &Value) {
+    let Some(entries) = cache.get("models").and_then(Value::as_array) else { return };
+    for model in models {
+        let Some(entry) = entries.iter().find(|v| str_at(v, "slug") == Some(model.id.as_ref()))
+        else {
+            continue;
+        };
+        let Some(standard) =
+            entry.get("context_window").and_then(Value::as_u64).filter(|n| *n >= 1000)
+        else {
+            continue;
+        };
+        let Some(maximum) = entry
+            .get("max_context_window")
+            .and_then(Value::as_u64)
+            .filter(|n| *n > standard && *n <= i64::MAX as u64)
+        else {
+            continue;
+        };
+        let label = |n: u64| {
+            if n % 1_000_000 == 0 {
+                format!("{}M", n / 1_000_000)
+            } else if n % 1000 == 0 {
+                format!("{}k", n / 1000)
+            } else {
+                n.to_string()
+            }
+        };
+        model.capabilities.option_descriptors.retain(|d| d.id() != "context");
+        model.capabilities.option_descriptors.push(ProviderOptionDescriptor::Select {
+            id: "context".into(), label: "Context".into(),
+            description: Some("Applies next turn. Codex reserves some space and may compact when shrinking.".into()),
+            options: vec![
+                OptionChoice { id: "default".into(), label: "Default context".into(),
+                    description: Some("Use Codex's own configuration and compaction threshold.".into()), is_default: true },
+                OptionChoice { id: standard.to_string(), label: label(standard),
+                    description: Some("Standard window advertised by Codex.".into()), is_default: false },
+                OptionChoice { id: maximum.to_string(), label: label(maximum),
+                    description: Some("Largest window advertised by Codex. Long requests can consume more allowance.".into()), is_default: false },
+            ],
+            current_value: Some("default".into()), prompt_injected_values: Vec::new(),
+        });
+    }
+}
+
+fn selected_context(
+    models: &[ModelInfo],
+    selection: &neosh_proto::ModelSelection,
+) -> Result<Option<u64>, String> {
+    let Some(value) = selection.option_str("context").filter(|s| *s != "default") else {
+        return Ok(None);
+    };
+    let offered = models.iter().find(|m| m.id == selection.model).is_some_and(|m| {
+        m.capabilities.option_descriptors.iter().any(|d| {
+            matches!(d,
+            ProviderOptionDescriptor::Select { id, options, .. }
+                if id == "context" && options.iter().any(|o| o.id == value))
+        })
+    });
+    if !offered {
+        return Err("Codex no longer advertises this context window; select Default context in model options.".into());
+    }
+    value
+        .parse::<u64>()
+        .ok()
+        .filter(|n| *n >= 1000 && *n <= i64::MAX as u64)
+        .map(Some)
+        .ok_or_else(|| "Invalid Codex context window.".into())
 }
 
 /// One entry of a `model/list` reply.
@@ -887,7 +978,9 @@ impl Provider for CodexCliProvider {
             Ok(models) => Ok(models),
             Err(e) => {
                 tracing::debug!(program = %self.program, "codex model discovery failed: {e}");
-                Ok(instance.models.clone())
+                let mut models = instance.models.clone();
+                add_context_options(&mut models, &context_metadata().await);
+                Ok(models)
             }
         }
     }
@@ -915,11 +1008,30 @@ impl Provider for CodexCliProvider {
         let mode = *self.mode.lock().expect("mode lock poisoned");
         let asker = self.asker.lock().expect("asker lock poisoned").clone();
         let tier = service_tier(instance, &request.selection).to_string();
+        let mut context_models = instance.models.clone();
+        if !context_models.iter().any(|m| m.id == request.selection.model) {
+            context_models.push(ModelInfo::undescribed(
+                request.selection.model.as_ref(),
+                request.selection.model.as_ref(),
+            ));
+        }
 
         tokio::spawn(async move {
+            if request.selection.option_str("context").is_some_and(|v| v != "default") {
+                add_context_options(&mut context_models, &context_metadata().await);
+            }
+            let context = match selected_context(&context_models, &request.selection) {
+                Ok(context) => context,
+                Err(message) => {
+                    let _ = tx.send(ProviderEvent::Error { message, retryable: false }).await;
+                    return;
+                }
+            };
             let mut guard = slot.live.lock().await;
-            if let Err(message) =
-                run_turn(&program, &slot, &mut guard, request, &tier, mode, asker, cancel, &tx).await
+            if let Err(message) = run_turn(
+                &program, &slot, &mut guard, request, &tier, context, mode, asker, cancel, &tx,
+            )
+            .await
             {
                 // A failure the process cannot recover from leaves nothing worth keeping: the next
                 // turn starts a fresh app-server rather than writing into a pipe whose other end
@@ -948,15 +1060,15 @@ async fn run_turn(
     slot: &mut Option<Live>,
     request: TurnRequest,
     service_tier: &str,
+    context: Option<u64>,
     mode: PermissionMode,
     asker: Option<Arc<dyn PermissionAsker>>,
     cancel: CancellationToken,
     tx: &mpsc::Sender<ProviderEvent>,
 ) -> Result<(), String> {
-    // The thread's directory is what the agent's tools resolve against, so a conversation that has
-    // moved needs a new thread — the one thing here that a running server cannot be talked out of.
-    // Even that keeps the process.
-    if slot.as_ref().is_some_and(|l| l.cwd != request.cwd)
+    // Resume in a fresh process: resuming an already loaded thread can ignore config overrides.
+    // This runs under the conversation lock, after the preceding turn was completed/drained.
+    if slot.as_ref().is_some_and(|l| l.cwd != request.cwd || l.context != context)
         && let Some(live) = slot.take()
     {
         live.close().await;
@@ -966,7 +1078,14 @@ async fn run_turn(
     }
     let live = slot.as_mut().expect("a server was just put there");
     if live.thread.is_none() {
-        live.start_thread(&request.cwd, mode).await?;
+        let resume = conversation
+            .resume
+            .lock()
+            .expect("resume lock poisoned")
+            .clone()
+            .or_else(|| request.resume.clone());
+        live.start_thread(&request, mode, context, resume.as_deref()).await?;
+        *conversation.resume.lock().expect("resume lock poisoned") = live.thread.clone();
     }
 
     // Everything that would have been a command-line argument is a parameter of this one call, so
@@ -1109,9 +1228,13 @@ async fn run_turn(
                     }
                     for ev in app_server_event(&v, &mut state) {
                         finished |= matches!(ev, ProviderEvent::MessageStop);
+                        let began = matches!(ev, ProviderEvent::MessageStart { .. });
                         // A dropped receiver triggers interruption above. Keep draining to
                         // this turn's boundary before handing the process to the next turn.
                         let _ = tx.send(ev).await;
+                        if began && let Some(token) = &live.thread {
+                            let _ = tx.send(activity(Activity::Resume { token: token.clone() })).await;
+                        }
                     }
                     if finished {
                         break;
@@ -1276,6 +1399,7 @@ impl Live {
             thread: None,
             cwd: cwd.to_path_buf(),
             next_id: 1,
+            context: None,
         };
         live.handshake().await?;
         Ok(live)
@@ -1300,19 +1424,34 @@ impl Live {
         .map_err(|e| format!("codex app-server: {e}"))
     }
 
-    async fn start_thread(&mut self, cwd: &std::path::Path, mode: PermissionMode) -> Result<(), String> {
+    async fn start_thread(
+        &mut self,
+        request: &TurnRequest,
+        mode: PermissionMode,
+        context: Option<u64>,
+        resume: Option<&str>,
+    ) -> Result<(), String> {
+        let mut params = json!({
+            "cwd": request.cwd.display().to_string(),
+            "model": request.selection.model.as_ref(),
+            "sandbox": match mode {
+                PermissionMode::Deny | PermissionMode::Ask => "read-only",
+                PermissionMode::AllowListed => "workspace-write",
+                PermissionMode::Allow => "danger-full-access",
+            },
+        });
+        if let Some(window) = context {
+            params["config"] = json!({
+                "model_context_window": window,
+                // Leave headroom for the response and Codex's effective-window reservation.
+                "model_auto_compact_token_limit": window / 10 * 9,
+            });
+        }
+        if let Some(thread) = resume {
+            params["threadId"] = json!(thread);
+        }
         let id = self
-            .request(
-                "thread/start",
-                json!({
-                    "cwd": cwd.display().to_string(),
-                    "sandbox": match mode {
-                        PermissionMode::Deny | PermissionMode::Ask => "read-only",
-                        PermissionMode::AllowListed => "workspace-write",
-                        PermissionMode::Allow => "danger-full-access",
-                    },
-                }),
-            )
+            .request(if resume.is_some() { "thread/resume" } else { "thread/start" }, params)
             .await?;
         let reply = self.await_reply(id).await?;
         self.thread = reply
@@ -1321,6 +1460,7 @@ impl Live {
             .map(str::to_string)
             .ok_or_else(|| "codex app-server started no thread".to_string())?
             .into();
+        self.context = context;
         Ok(())
     }
 
@@ -1480,6 +1620,62 @@ mod tests {
                 _ => None,
             })
             .collect()
+    }
+
+    #[test]
+    fn context_choices_follow_codex_limits_and_do_not_invent_one_million() {
+        let mut models = vec![ModelInfo::undescribed("test-model", "Test")];
+        let cache = json!({"models":[{"slug":"test-model","context_window":272000,"max_context_window":872000}]});
+        add_context_options(&mut models, &cache);
+        add_context_options(&mut models, &cache);
+        assert_eq!(models[0].capabilities.option_descriptors.len(), 1);
+        let ProviderOptionDescriptor::Select { options, .. } =
+            &models[0].capabilities.option_descriptors[0]
+        else {
+            panic!("select")
+        };
+        assert_eq!(
+            options.iter().map(|o| o.label.as_str()).collect::<Vec<_>>(),
+            ["Default context", "272k", "872k"]
+        );
+        let mut selection = neosh_proto::ModelSelection {
+            instance: "codex-cli".into(),
+            model: "test-model".into(),
+            options: vec![],
+        };
+        assert_eq!(selected_context(&models, &selection).expect("default"), None);
+        selection.options.push(neosh_proto::OptionSelection {
+            id: "context".into(),
+            value: neosh_proto::ProviderOptionValue::Text("872000".into()),
+        });
+        assert_eq!(selected_context(&models, &selection).expect("extended"), Some(872000));
+        selection.options[0].value = neosh_proto::ProviderOptionValue::Text("1000000".into());
+        assert!(selected_context(&models, &selection).is_err());
+        add_context_options(
+            &mut models,
+            &json!({"models":[{"slug":"test-model","context_window":272000,"max_context_window":1000000}]}),
+        );
+        assert_eq!(selected_context(&models, &selection).expect("advertised 1M"), Some(1000000));
+    }
+
+    #[test]
+    fn absent_or_invalid_context_capabilities_do_not_offer_a_switcher() {
+        for entry in [
+            Value::Null,
+            json!({}),
+            json!({"context_window":272000}),
+            json!({"context_window":272000,"max_context_window":272000}),
+            json!({"context_window":0,"max_context_window":1000000}),
+            json!({"context_window":272000,"max_context_window":-1}),
+        ] {
+            let mut models = vec![ModelInfo::undescribed("test-model", "Test")];
+            let mut entry = entry;
+            if let Some(map) = entry.as_object_mut() {
+                map.insert("slug".into(), json!("test-model"));
+            }
+            add_context_options(&mut models, &json!({"models":[entry]}));
+            assert!(models[0].capabilities.option_descriptors.is_empty());
+        }
     }
 
     /// A turn as the app-server reports it: the handshake shapes are a real capture from
