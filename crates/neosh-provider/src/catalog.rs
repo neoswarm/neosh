@@ -289,7 +289,8 @@ pub fn anthropic_models() -> Vec<ModelInfo> {
     const FABLE: &str = "Deepest reasoning and long-running work";
     vec![
         claude("claude-fable-5-1", "Claude Fable 5.1", "fable", Frontier, FABLE, 1_000_000, 128_000, (10.0, 50.0), Some(EFFORT_5), false, false),
-        claude("claude-opus-5", "Claude Opus 5", "opus", Frontier, OPUS, 1_000_000, 128_000, (5.0, 25.0), Some(EFFORT_5), true, false),
+        claude("claude-opus-5-5", "Claude Opus 5.5", "opus", Frontier, OPUS, 1_000_000, 128_000, (5.0, 25.0), Some(EFFORT_5), true, false),
+        claude("claude-opus-5", "Claude Opus 5", "opus", Frontier, OPUS, 1_000_000, 128_000, (5.0, 25.0), Some(EFFORT_5), true, true),
         claude("claude-sonnet-5", "Claude Sonnet 5", "sonnet", Balanced, SONNET, 1_000_000, 128_000, (2.0, 10.0), Some(EFFORT_5), false, false),
         claude("claude-fable-5", "Claude Fable 5", "fable", Frontier, FABLE, 1_000_000, 128_000, (10.0, 50.0), Some(EFFORT_5), false, true),
         claude("claude-opus-4-8", "Claude Opus 4.8", "opus", Frontier, OPUS, 1_000_000, 128_000, (5.0, 25.0), Some(EFFORT_5), true, true),
@@ -375,7 +376,8 @@ pub fn claude_cli_models() -> Vec<ModelInfo> {
     const FABLE: &str = "Deepest reasoning and long-running work";
     const ENTRIES: &[ClaudeCliEntry] = &[
         ("claude-fable-5-1", "Claude Fable 5.1", "fable", Frontier, FABLE, 1_000_000, Some(EFFORT_5), false, Some(true), false),
-        ("claude-opus-5", "Claude Opus 5", "opus", Frontier, OPUS, 1_000_000, Some(EFFORT_5), true, Some(true), false),
+        ("claude-opus-5-5", "Claude Opus 5.5", "opus", Frontier, OPUS, 1_000_000, Some(EFFORT_5), true, Some(true), false),
+        ("claude-opus-5", "Claude Opus 5", "opus", Frontier, OPUS, 1_000_000, Some(EFFORT_5), true, Some(true), true),
         ("claude-sonnet-5", "Claude Sonnet 5", "sonnet", Balanced, SONNET, 1_000_000, Some(EFFORT_5), false, Some(false), false),
         ("claude-haiku-4-5", "Claude Haiku 4.5", "haiku", Fast, "Fastest, for quick answers", 200_000, None, false, None, false),
         ("claude-fable-5", "Claude Fable 5", "fable", Frontier, FABLE, 1_000_000, Some(EFFORT_5), false, Some(true), true),
