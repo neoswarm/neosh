@@ -80,6 +80,17 @@ struct Roles {
     plan: Color,
     /// The one hue used for emphasis that is not a state.
     accent: Color,
+    /// The other computers, one hue each: the first is the blue every connected machine used to
+    /// share, and the rest are what tells a second machine's block from the first at a glance.
+    ///
+    /// A hue per machine rather than one for "elsewhere", because "elsewhere" was never the
+    /// question — *which* machine is. Six, chosen to be told apart from each other first and from
+    /// the state hues a row already carries as far as six allow; the code beside the colour is
+    /// what says which machine for certain, and colour is how you find its block without reading
+    /// it. The first one is blue on purpose. "Connected" is a condition, not
+    /// something happening, and the green it used to borrow from `success` read as *finished* on a
+    /// row that had not started anything.
+    hosts: [Color; 6],
     /// The favourite marker. Not a state hue: the star glyph carries the whole meaning, and a
     /// favourite is not a condition the workspace is in — it is a thing you said about a project.
     ///
@@ -140,6 +151,14 @@ const DARK: Roles = Roles {
     success: rgb(0x6e, 0xe7, 0xb7),
     plan: rgb(0xc4, 0xb5, 0xfd),
     accent: rgb(0xa5, 0xb4, 0xfc),
+    hosts: [
+        rgb(0x60, 0xa5, 0xfa), // blue
+        rgb(0xc0, 0x84, 0xfc), // violet
+        rgb(0x2d, 0xd4, 0xbf), // teal
+        rgb(0xfb, 0x92, 0x3c), // orange
+        rgb(0xf4, 0x72, 0xb6), // pink
+        rgb(0xa3, 0xe6, 0x35), // lime
+    ],
     favorite: rgb(0xf5, 0x9e, 0x0b),
     logo: [
         rgb(0xf8, 0xfa, 0xfc),
@@ -177,6 +196,14 @@ const LIGHT: Roles = Roles {
     success: rgb(0x05, 0x96, 0x69),
     plan: rgb(0x7c, 0x3a, 0xed),
     accent: rgb(0x4f, 0x46, 0xe5),
+    hosts: [
+        rgb(0x25, 0x63, 0xeb),
+        rgb(0x93, 0x33, 0xea),
+        rgb(0x0d, 0x94, 0x88),
+        rgb(0xea, 0x58, 0x0c),
+        rgb(0xdb, 0x27, 0x77),
+        rgb(0x65, 0xa3, 0x0d),
+    ],
     favorite: rgb(0xb4, 0x53, 0x09),
     // Reversed against a light background: the lit edge is the dark one, as a steel letter on
     // paper is darkest where it stands up.
@@ -570,25 +597,42 @@ pub fn groups(variant: Variant) -> Vec<(&'static str, HighlightDef)> {
         // beside it — wear what every other key in the workspace wears, for the reason the tab
         // strip's do: a legend whose keys are dimmer than its words is a legend nobody reads twice.
         ("Sidebar.Key", link("Key")),
-        // Work happening on another computer. Linked to `Comment` rather than given a colour of
-        // its own: a remote row is still one of your conversations, and painting it a fourth
-        // colour would make the panel read as two lists rather than one workspace that happens to
-        // span machines. What says where it is running is the host name on the end of the row.
+        // Work on another computer that cannot be reached right now. *Only* then: a row on a
+        // machine that is up is drawn exactly as a row here is, because it is one you can open and
+        // steer, and greying every remote row made the whole block read as disabled — which is
+        // precisely the wrong thing to say about the part of it you can use. What says where a row
+        // is, is the machine's code on the end of it.
         ("Sidebar.Remote", link("Comment")),
         // ---- another computer -----------------------------------------------
-        // The cloud on a row that is not on this machine, in the colour of what the link to that
-        // machine is doing. Four states and four answers, because "not here" is not one fact: a
+        // The machine's code on a row that is not on this machine — `@ms` — in the colour of what
+        // the link to that machine is doing. Four states and four answers, because "not here" is not one fact: a
         // conversation on a machine that is up is one you can open and steer, and the same row on
         // a machine that is not is a thing you can read about and not touch.
         //
         // The glyph is one column and it never moves position, so the colour is the whole of the
         // message and it has to be readable at a glance beside twenty other rows.
         //
-        // Connected. The same green everything settled and working wears, and deliberately *still*:
-        // a link that is up is not something happening, it is a condition, and this glyph is on
-        // every remote row in the panel at once. Motion on all of them would be the panel
-        // vibrating.
-        ("Swarm.Up", spec(fg(r.success))),
+        // Connected. Blue — `remote`, a hue of its own — and deliberately *still*: a link that is
+        // up is not something happening, it is a condition, and this mark is on every remote row
+        // in the panel at once. Motion on all of them would be the panel vibrating. It used to be
+        // the green everything *finished* wears, which put the colour of "done" on rows where
+        // nothing had started.
+        ("Swarm.Up", spec(fg(r.hosts[0]))),
+        // Which machine: the code after its `@`, the `⎇` on its checkouts and the rail down the
+        // left of its block, one hue per machine. Said only while the link is up — a machine you
+        // cannot reach wears `Swarm.Down` instead, because the colour of a place you can go is the
+        // wrong thing to draw on one you cannot. Still, like `Swarm.Up`, for the same reason.
+        ("Swarm.Host1", spec(fg(r.hosts[0]))),
+        ("Swarm.Host2", spec(fg(r.hosts[1]))),
+        ("Swarm.Host3", spec(fg(r.hosts[2]))),
+        ("Swarm.Host4", spec(fg(r.hosts[3]))),
+        ("Swarm.Host5", spec(fg(r.hosts[4]))),
+        ("Swarm.Host6", spec(fg(r.hosts[5]))),
+        // Another machine's checkout is on a different commit from this one's: the `≠ 4f3a1c2` on
+        // its block row. Amber and plain — *look at this* rather than *something broke*, because a
+        // build box one release behind is ordinary, and a bold red there would be crying wolf on a
+        // row you see all day.
+        ("Swarm.Version", spec(fg(r.attention))),
         // Being dialled, or dialled again after a drop. The one swarm state that earns motion, by
         // the rule `Git.Fetching` earns it: something is happening you cannot see, over a network,
         // and a still glyph cannot be told from a wedged one. A pulse rather than frames — a frame
@@ -914,12 +958,47 @@ mod tests {
             // remote row at once — twenty of them pulsing in step is the panel vibrating. A link
             // nothing is dialling is not going to change on its own either.
             "Swarm.Up", "Swarm.Down",
+            "Swarm.Host1", "Swarm.Host2", "Swarm.Host3", "Swarm.Host4", "Swarm.Host5", "Swarm.Host6",
+            "Swarm.Version",
         ] {
             assert!(
                 animation(still).is_none(),
                 "{still} is news, not something happening — a row that blinks about it charges \
                  attention every time it changes with nothing new to say"
             );
+        }
+    }
+
+    /// Connected is blue in both themes — its own hue, and never the green of something finished.
+    #[test]
+    fn a_computer_you_can_reach_is_blue_rather_than_the_colour_of_done() {
+        for variant in [Variant::Dark, Variant::Light] {
+            let by_name: std::collections::HashMap<_, _> = groups(variant).into_iter().collect();
+            let Some(HighlightDef::Spec { spec }) = by_name.get("Swarm.Up") else {
+                panic!("Swarm.Up is missing from the palette");
+            };
+            let Some(Color::Rgb { r, g, b }) = spec.fg else {
+                panic!("Swarm.Up has no colour of its own in {variant:?}");
+            };
+            assert!(b > r && b > g, "Swarm.Up should read as blue in {variant:?}, got #{r:02x}{g:02x}{b:02x}");
+        }
+    }
+
+    /// Two machines are two colours, in both themes — the whole point of having more than one.
+    #[test]
+    fn every_machine_colour_is_its_own() {
+        for variant in [Variant::Dark, Variant::Light] {
+            let by_name: std::collections::HashMap<_, _> = groups(variant).into_iter().collect();
+            let mut seen = Vec::new();
+            for i in 1..=6 {
+                let name = format!("Swarm.Host{i}");
+                let Some(HighlightDef::Spec { spec }) = by_name.get(name.as_str()) else {
+                    panic!("{name} is missing from the palette");
+                };
+                let fg = spec.fg.clone().expect("a machine colour has a foreground");
+                assert!(!seen.contains(&fg), "{name} repeats a colour in {variant:?}");
+                seen.push(fg);
+            }
         }
     }
 

@@ -3,6 +3,7 @@
     "accepts_approvals": false,
     "accepts_commands": true,
     "browse": true,
+    "catalogue": false,
     "projects": [
       {
         "active": true,
@@ -15,6 +16,7 @@
         "sessions": 2
       }
     ],
+    "rich_stream": false,
     "shells": false,
     "streams": true
   },

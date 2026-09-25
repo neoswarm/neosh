@@ -453,9 +453,10 @@ export async function installGitStatus(
   const state: State = { cwd: null, status: null, askedAt: null, busy: false };
 
   /** Settings, in memory. Read once and kept current from `opt.onChange`. */
-  const settings = { interval: 180 };
+  const settings = { interval: 180, autopull: false };
   const reload = async () => {
     settings.interval = (await neosh.opt.get<number>("git.fetch.interval").catch(() => 180)) ?? 180;
+    settings.autopull = (await neosh.opt.get<boolean>("git.pull.auto").catch(() => false)) ?? false;
   };
   await reload();
 
@@ -539,7 +540,12 @@ export async function installGitStatus(
   // ---- keeping it true ----------------------------------------------------
 
   subscriptions.push(neosh.opt.onChange((e) => {
-    if (e.name === "git.fetch.interval") void reload();
+    if (e.name === "git.fetch.interval" || e.name === "git.pull.auto") {
+      void reload().then(() => {
+        // Turned on is the moment somebody wants to see it work, not three minutes later.
+        if (e.name === "git.pull.auto" && settings.autopull) void keepMainsCurrent(true);
+      });
+    }
   }));
   // Arriving somewhere is the moment its numbers matter and the moment they are most likely stale.
   subscriptions.push(neosh.session.onChange(() =>
@@ -558,12 +564,85 @@ export async function installGitStatus(
     settings.interval > 0 &&
     (state.askedAt === null || Date.now() - state.askedAt >= settings.interval * 1000);
 
+  // ---- keeping every main checkout current -------------------------------
+  //
+  // `git.pull.auto`: the main checkout of every repository on the panel's list is fast-forwarded
+  // from its remote on the fetch clock, so the place new work starts from — the checkout a worktree
+  // is cut from, the one a conversation opens in — is the version everybody else has, rather than
+  // whatever it was the last time somebody remembered to press `p`.
+  //
+  // Only what can never surprise anybody: a **fast-forward** of a branch that tracks one, is behind
+  // and not ahead, with nothing conflicted — the one route that adds commits and rewrites none —
+  // and never under a running turn, because an agent halfway through editing files is the one
+  // reader a checkout changing underneath would lie to. A tree git itself would refuse to move (a
+  // local edit to a file the commits touch) is refused by git and filed, not forced. Worktrees are
+  // left alone: a worktree is somebody's branch, and moving it is theirs to decide.
+  const pulledAt = new Map<string, number>();
+  /** Whether a directory is a main checkout, asked of git once per directory. */
+  const isMain = new Map<string, boolean>();
+  let sweeping = false;
+  const keepMainsCurrent = async (now = false) => {
+    if (!settings.autopull || settings.interval <= 0 || sweeping) return;
+    sweeping = true;
+    try {
+      const listed = await neosh.vars.get<string[]>({ scope: "global" }, "sidebar.projects")
+        .catch(() => null);
+      const cwds = Array.isArray(listed) ? listed.filter((c) => typeof c === "string") : [];
+      const sessions = await neosh.session.list().catch(() => []);
+      for (const cwd of cwds) {
+        const last = pulledAt.get(cwd);
+        if (!now && last !== undefined && Date.now() - last < settings.interval * 1000) continue;
+        if (sessions.some((x) => x.cwd === cwd && x.active_turn)) continue;
+        if (!isMain.has(cwd)) {
+          const trees = await neosh.git.worktrees({ cwd }).catch(() => null);
+          // Not a repository at all is "not a main checkout", and asked once.
+          isMain.set(cwd, trees?.some((t) => t.is_main && t.path === cwd) ?? false);
+        }
+        if (!isMain.get(cwd)) continue;
+        pulledAt.set(cwd, Date.now());
+        const fresh = await fetchRepository(neosh, cwd);
+        const repo = fresh?.repo;
+        if (!fresh || !repo?.upstream || repo.behind === 0 || repo.ahead > 0) continue;
+        if (fresh.changes.some((c) => c.staged === "conflicted" || c.unstaged === "conflicted")) {
+          continue;
+        }
+        // Asked again right before the pull: the fetch took seconds, and a turn that started in
+        // them is exactly what this must not move files under.
+        const busyNow = (await neosh.session.list().catch(() => []))
+          .some((x) => x.cwd === cwd && x.active_turn);
+        if (busyNow) continue;
+        try {
+          await whileBusy(cwd, () => neosh.git.pull({ cwd, rebase: false }));
+          // One line, because it is news you did not ask for — and it is about a directory, so it
+          // says which one. The row's `↓3` going away is the rest of the answer.
+          neosh.notify(
+            `pulled ${count(repo.behind, "commit")} into ${basename(cwd)} (${repo.branch ?? "HEAD"})`,
+          );
+        } catch (e) {
+          // Filed, not announced: this runs on a timer, and "your tree has a local change git will
+          // not overwrite" every three minutes is noise about something you are in the middle of.
+          neosh.log.info(`git.pull.auto: ${cwd}: ${short(String(e))}`);
+        } finally {
+          moved(cwd, null);
+        }
+      }
+    } finally {
+      sweeping = false;
+    }
+  };
+
   // Checked every half minute rather than scheduled at the interval, so changing the setting takes
   // effect without restarting a timer, and so a machine that was asleep for an hour asks once when
   // it wakes rather than banking up the fetches it missed.
   subscriptions.push(neosh.timer.every(30_000, () => {
     if (due()) void fetch();
+    void keepMainsCurrent();
   }));
+  subscriptions.push(
+    await neosh.cmd.register("git.pull.mains", () => keepMainsCurrent(true), {
+      desc: "Fast-forward the main checkout of every project now (what git.pull.auto does)",
+    }),
+  );
 
   await refresh();
   // Not at `activate`: the first thing a workspace does on opening is start a conversation and load
@@ -571,12 +650,28 @@ export async function installGitStatus(
   // for a number nobody has looked at yet.
   neosh.event.on("neosh.ready", () => {
     if (due()) void fetch();
+    void keepMainsCurrent();
   });
 
   return { refresh, fetch };
 }
 
+/** The last segment of a path, for saying which checkout a line is about. */
+function basename(path: string): string {
+  return path.replace(/\/+$/, "").split("/").pop() || path;
+}
+
 async function declareOptions(neosh: Neosh) {
+  await neosh.opt.declare({
+    name: "git.pull.auto",
+    type: { type: "bool" },
+    default: false,
+    description:
+      "Keep the main checkout of every project on your list up to date: on the fetch clock " +
+      "(`git.fetch.interval`), fast-forward it from its remote. Only ever a fast-forward — a " +
+      "branch that is behind and not ahead, with nothing conflicted — never under a running turn, " +
+      "and never a worktree. A change git would have to overwrite is left alone.",
+  });
   await neosh.opt.declare({
     name: "git.sidebar",
     type: { type: "bool" },

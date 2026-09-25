@@ -216,13 +216,13 @@ pub fn save(state: &Path, session: &Session) -> std::io::Result<()> {
 /// nothing to restore, which is the state it stands for.
 pub fn save_all(state: &Path, store: &SessionStore) -> std::io::Result<()> {
     std::fs::create_dir_all(dir(state))?;
-    for s in store.iter().filter(|s| !s.ephemeral) {
+    for s in store.iter().filter(|s| !s.hidden()) {
         save(state, s)?;
     }
     let order: Vec<SessionId> = store
         .order()
         .iter()
-        .filter(|id| store.get(id).is_some_and(|s| !s.ephemeral))
+        .filter(|id| store.get(id).is_some_and(|s| !s.hidden()))
         .cloned()
         .collect();
     let order = Order {
@@ -231,7 +231,7 @@ pub fn save_all(state: &Path, store: &SessionStore) -> std::io::Result<()> {
         // terminals there is no single conversation to save, and saving one per view would mean a
         // workspace reopened with one terminal had to pick anyway.
         active: Some(store.current_id().clone())
-            .filter(|id| store.get(id).is_some_and(|s| !s.ephemeral)),
+            .filter(|id| store.get(id).is_some_and(|s| !s.hidden())),
     };
     let path = order_path(state);
     let tmp = path.with_extension("json.tmp");

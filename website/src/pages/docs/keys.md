@@ -157,13 +157,33 @@ What an agent gets when it asks *you* something. Every key here is bound against
 | `y` | Copy the row's directory |
 | `t` | A **terminal** in this project, in a tab of its own — on this computer, or on the machine the row is on |
 | `c` `C` | Connect to that computer, or disconnect from it. Only on a row about another machine |
+| `@` | Choose the short code that computer is drawn with — the `ms` in `@ms` |
 | `p` | Pull that repository (a git-plugin contribution) |
 | `d` | Remove a worktree from disk. It asks first (a git-plugin contribution) |
 | `x` `X` | Archive, delete. Deleting the last conversation in a worktree removes the checkout too, and says so. On a repository's heading, `X` takes the project off the list; on a worktree's, it removes the checkout |
 | `a` | The archive |
+| `,` | Settings |
 | `⇥` | On the plan rows: how much of it to show |
 | `?` | The keys for whatever row you are on |
 | `Esc` | Back to the composer |
+
+## Settings — `,` in the project panel, or `/settings`
+
+Every option in the workspace on one screen: a curated **General** page first — the prompt appended to every message, keeping main checkouts up to date, the model, the theme — then a section per namespace, the other computers and their codes, and the live keymap. Built from the option registry, so a plugin's own settings have a section here with nobody writing glue. A change is applied and **written into `[options]` in `config.toml`** as you make it, leaving every comment and every other line in that file alone; putting a value back to its default takes its line back out.
+
+No Ctrl-letter is left to give it, so it is `,` in the project panel (as `⌘,` is on a Mac), `/settings` in the composer, and `settings.open` in `^K`.
+
+| Key | Does |
+| --- | --- |
+| `⇥` `⇧⇥`, `]` `[` | Next / previous section |
+| `j` `k`, `^D` `^U`, `gg` `G` | Move |
+| `h` `l`, `←` `→` | Along a switch or a list of values, or nudge a number |
+| `<Space>` | The next value along |
+| `↵` | Change it: toggle, cycle, or open a field to type in. Prose — the appended prompt, the system prompt — gets a field several lines tall: `⏎` is a new line, `esc` keeps it, `^C` throws it away |
+| `r` | Back to the default, and out of `config.toml` |
+| `/` | Find a setting — every word, in any order, over names and descriptions |
+| `y` | Copy the option's name |
+| `Esc` `q` | One thing per press: the search, then the panel |
 
 ## The archive — `^F`, or `a` in the project panel
 

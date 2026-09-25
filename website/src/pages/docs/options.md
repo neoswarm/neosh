@@ -15,6 +15,8 @@ await neosh.opt.all();                    // everything declared, with types and
 neosh.opt.onChange((e) => { /* fires for every option, not just yours */ });
 ```
 
+Or on the settings screen — `,` in the project panel, or `/settings` — which is built from the same registry and saves what you change into `[options]` in `config.toml`, leaving the rest of the file as you wrote it. From code, `neosh.opt.save(name, value)` is that verb: set, and write down; `opt.set` is only for now.
+
 Plugins declare their own options through the same call the built-ins use, and a declared option is settable from `config.toml` like any other, including by a user who set it before the plugin loaded. `opt.all()` is always the complete, current list; the tables below are the ones that ship.
 
 ## Agent
@@ -23,6 +25,7 @@ Plugins declare their own options through the same call the built-ins use, and a
 | --- | --- | --- |
 | `agent.model` | `""` | `instance/model`. Empty picks the first that works |
 | `agent.system_prompt` | `""` | Replaces the built-in prompt when set |
+| `agent.append_prompt` | `""` | Said at the end of every message you send — *run the tests before you say you are done*. Added to the copy that is sent, never to the transcript, so what you typed is what stays on screen |
 | `gen.model` | `""` | Model for branch names, commit messages and titles. Empty uses the conversation's model. Separate on purpose: naming a branch does not need a frontier model |
 
 ## Chat
@@ -94,6 +97,7 @@ The last two are the window prefix and how long you have to hold it before it li
 | Option | Default | Effect |
 | --- | --- | --- |
 | `git.sidebar` | `true` | Mark each project row with what has drifted from the remote, what is dirty, and which pull request its branch is |
+| `git.pull.auto` | `false` | Keep the main checkout of every project on your list up to date: on the fetch clock, fast-forward it from its remote. Only ever a fast-forward of a branch that is behind and not ahead, never under a running turn, never a worktree, and a change git would have to overwrite is left alone |
 | `git.fetch.interval` | `180` | Seconds between asking the remote what is new, so `↓3` means three waiting for you rather than three as of whenever this checkout last spoke to a server. `0` never asks on its own, and the block then says how old its numbers are. Only the repository of the conversation you are in, and only when its branch tracks one |
 
 | `git.pulls` | `true` | The pull request on a project or worktree row: its number, its state, and its checks when they are failing or still running. Asks `gh`, so it needs the GitHub CLI signed in |

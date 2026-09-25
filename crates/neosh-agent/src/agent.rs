@@ -172,6 +172,9 @@ pub struct Agent {
     /// Swappable, because a config reload can tighten permissions and a layer fixed at launch
     /// would report success while changing nothing.
     permissions: Arc<std::sync::RwLock<Arc<PermissionLayer>>>,
+    /// Said at the end of every question this workspace sends — `agent.append_prompt`. See
+    /// [`neosh_provider::append`] for where it goes and why never into the transcript.
+    appended: Arc<std::sync::RwLock<String>>,
     events: Fanout,
 }
 
@@ -192,6 +195,7 @@ impl Agent {
                 hooks: Arc::new(std::sync::RwLock::new(HookRegistry::new())),
                 providers: Arc::new(std::sync::RwLock::new(providers)),
                 permissions: Arc::new(std::sync::RwLock::new(permissions)),
+                appended: Arc::new(std::sync::RwLock::new(String::new())),
                 events,
             },
             rx,
@@ -263,6 +267,18 @@ impl Agent {
     /// is already running.
     pub fn set_permissions(&self, layer: PermissionLayer) {
         *self.permissions.write().expect("permission lock poisoned") = Arc::new(layer);
+    }
+
+    /// What to say at the end of every question from now on. Empty says nothing.
+    ///
+    /// Read when a turn starts, so a change takes effect on the next question and never halfway
+    /// through a tool loop that has already been told something else.
+    pub fn set_appended_prompt(&self, text: impl Into<String>) {
+        *self.appended.write().expect("appended prompt lock poisoned") = text.into();
+    }
+
+    pub fn appended_prompt(&self) -> String {
+        self.appended.read().expect("appended prompt lock poisoned").clone()
     }
 
     pub fn remove_plugin(&self, plugin: &neosh_proto::PluginId) {
@@ -674,6 +690,11 @@ impl Agent {
 
         let mut total = Usage::default();
         let mut stop = StopReason::EndTurn;
+        // Taken once, for the whole turn: a setting changed while a tool loop runs applies to the
+        // next question rather than to some of this one's rounds. Only when this turn asked
+        // something — one opened to hold what the agent is already saying has no question for it
+        // to end, and the last user message in the history is somebody else's.
+        let appended = if asking { self.appended_prompt() } else { String::new() };
 
         for round in 0..MAX_TOOL_ROUNDS {
             if cancel.is_cancelled() {
@@ -721,6 +742,9 @@ impl Agent {
             // say it again after every tool call, each time as a fresh instruction.
             if round == 0 {
                 neosh_provider::inject(&mut messages, &words);
+                // And whatever you asked to have said every time, at the other end of the same
+                // copy — the transcript still holds only what you typed.
+                neosh_provider::append(&mut messages, &appended);
             }
 
             let request = TurnRequest {
@@ -1308,17 +1332,44 @@ impl neosh_provider::approval::PermissionAsker for DriverAsker {
         &self,
         request: neosh_provider::approval::PermissionRequest,
     ) -> neosh_provider::approval::PermissionAnswer {
-        use neosh_provider::approval::PermissionAnswer;
+        if let Some(decided) = self.policy(&request) {
+            return decided;
+        }
+        self.prompt(request).await
+    }
+}
 
+impl DriverAsker {
+    /// What policy answers without a person, or `None` when it says to ask one.
+    ///
+    /// Its own step so that something standing in front of this asker — the relay that offers a
+    /// prompt to a machine watching the conversation — can tell a request somebody will be asked
+    /// about from one that is decided in a microsecond, and offer only the first.
+    pub fn policy(
+        &self,
+        request: &neosh_provider::approval::PermissionRequest,
+    ) -> Option<neosh_provider::approval::PermissionAnswer> {
+        use neosh_provider::approval::PermissionAnswer;
         let layer = {
             let guard = self.permissions.read().expect("permission lock poisoned");
             guard.rooted_at(&request.cwd)
         };
         match layer.check(&request.capability) {
-            neosh_proto::PermissionDecision::Allow => return PermissionAnswer::Allow,
-            neosh_proto::PermissionDecision::Deny { .. } => return PermissionAnswer::Deny,
-            neosh_proto::PermissionDecision::Prompt => {}
+            neosh_proto::PermissionDecision::Allow => Some(PermissionAnswer::Allow),
+            neosh_proto::PermissionDecision::Deny { .. } => Some(PermissionAnswer::Deny),
+            neosh_proto::PermissionDecision::Prompt => None,
         }
+    }
+
+    /// Put a request in front of a person — the `permission_pre` hooks — with no policy first.
+    ///
+    /// What a machine *watching* a conversation calls: the owner's policy already said to ask, and
+    /// this machine's permission mode is about this machine's conversations, not that one.
+    pub async fn prompt(
+        &self,
+        request: neosh_provider::approval::PermissionRequest,
+    ) -> neosh_provider::approval::PermissionAnswer {
+        use neosh_provider::approval::PermissionAnswer;
 
         let regs: Vec<_> = {
             let guard = self.hooks.read().expect("hook lock poisoned");

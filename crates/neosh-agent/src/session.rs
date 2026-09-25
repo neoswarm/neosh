@@ -159,6 +159,13 @@ pub struct Session {
     /// conversation a conversation. From then on it is an ordinary session: it appears in the
     /// panel, in its project, and is saved with the rest.
     pub ephemeral: bool,
+    /// Another machine's conversation, opened here. See [`neosh_proto::MirrorOf`].
+    ///
+    /// Treated like a placeholder by everything that keeps or lists conversations — never in
+    /// [`list`](crate::store::SessionStore::list), never written to disk, never somewhere a view is
+    /// sent when it leaves another conversation — because it is not this workspace's: the machine
+    /// it lives on lists it, keeps it and runs it, and this is a window onto that.
+    pub mirror: Option<neosh_proto::MirrorOf>,
 }
 
 impl Session {
@@ -188,7 +195,14 @@ impl Session {
             permission_mode: None,
             resume: None,
             ephemeral: false,
+            mirror: None,
         }
+    }
+
+    /// Whether this is only somewhere to type or somebody else's conversation — either way, not one
+    /// of this workspace's to list or keep. See [`Self::ephemeral`] and [`Self::mirror`].
+    pub fn hidden(&self) -> bool {
+        self.ephemeral || self.mirror.is_some()
     }
 
     /// A label for a list: the title if there is one, else the opening of the first thing the user
@@ -351,6 +365,7 @@ impl Session {
             archived: self.archived,
             archived_at: self.archived_at,
             permission_mode: self.permission_mode,
+            mirror: self.mirror.clone(),
         }
     }
 }

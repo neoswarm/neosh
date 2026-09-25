@@ -379,6 +379,7 @@ export type ApiCall =
   | { "call": "opt_get"; name: string }
   | { "call": "opt_reset"; name: string }
   | { "call": "opt_all" }
+  | { "call": "opt_persist"; name: string; value?: OptionValue | null }
   | { "call": "state_get"; key: string }
   | { "call": "state_set"; key: string; value: unknown }
   | { "call": "state_delete"; key: string }
@@ -411,6 +412,12 @@ export type ApiCall =
     node: NodeId;
     session: SessionId;
     command: AgentCommand;
+  }
+  | {
+    "call": "swarm_mirror";
+    node: NodeId;
+    session: SessionId;
+    view?: ViewId | null;
   }
   | { "call": "swarm_subscribe"; node: NodeId; session: SessionId }
   | { "call": "swarm_unsubscribe"; node: NodeId; session: SessionId }
@@ -478,6 +485,7 @@ export type ApiCall =
     stat: boolean;
   }
   | { "call": "git_default_branch" }
+  | { "call": "git_heads"; cwds: Array<string> }
   | { "call": "git_create_branch"; name: string; from?: string | null }
   | { "call": "git_checkout"; rev: string }
   | {

@@ -41,6 +41,7 @@ import { CLONE_EVENT } from "@neosh/api";
 import type {
   AgentSummary,
   CloneProgress,
+  GitHead,
   Contribution,
   Disposable,
   DrawnRow,
@@ -169,12 +170,44 @@ interface Checkout {
   root?: string;
   /** The branch, which is what a tree's row is named. */
   branch?: string;
+  /**
+   * The commit it is on, when the machine that owns it said — see `RemoteProject.head`. What
+   * decides whether another machine's main checkout is the same version as this one's.
+   */
+  head?: string;
   /** Conversations in it, on this machine. */
   sessions: SessionInfo[];
   /** Conversations in it, on another. Never both — a checkout is on one machine. */
   agents: SwarmAgent[];
   /** How this checkout's fold is remembered. A local path, or `<node>:<path>`. */
   fold: string;
+}
+
+/**
+ * Everything one other computer has of a repository: its main checkout, and its worktrees.
+ *
+ * **Its own block, always, and never folded into ours.** The first cut put another machine's main
+ * checkout into the repository row whenever it looked like the same thing — and "looked like" was
+ * the whole problem: what a machine is on is only as fresh as the last thing it said, an older
+ * neosh says nothing about its commit at all, and a conversation over there written against code
+ * this machine does not have sat in the list beside yours as though it were about your files. So a
+ * machine is a row like a worktree, named by its code and its branch, in *its* colour, with its
+ * conversations and its worktrees under it and a rail of that colour down the left of the block —
+ * so that wherever the cursor is, which computer it is on is the colour of the line beside it.
+ */
+interface MachineBlock {
+  node: { id: string; name: string; link?: LinkState };
+  /** Its main checkout of this repository, when it has one — its conversations are the block's. */
+  main?: Checkout;
+  /** Its worktrees of this repository, nested under the block. */
+  trees: Checkout[];
+  /** How the block's fold is remembered: `machine:<node>:<project key>`. */
+  fold: string;
+  /**
+   * Whether its main checkout is on a different commit from ours: `true`, `false`, or `undefined`
+   * when either side cannot say. Only ever news — drawn when it is `true`.
+   */
+  differs?: boolean;
 }
 
 /**
@@ -204,7 +237,7 @@ const POINT_DECORATION = "sidebar.decoration";
  * Published rather than implied: `above`/`below` gave a contributor two slots and no way to land
  * between two of anybody else's sections. A section may also name another section's id.
  */
-const SLOTS = ["projects", "add"] as const;
+const SLOTS = ["projects", "add", "machines"] as const;
 type Slot = (typeof SLOTS)[number];
 
 /** The key a decoration is filed under: what the row is *about*. */
@@ -272,8 +305,8 @@ interface BoundAction extends ActionItem {
  * decided the name.
  *
  * So there is one row per repository, and the checkouts hang under it: the local main checkout's
- * conversations directly, and everything else — a worktree here, the main checkout over there, a
- * worktree over there — as its own row. Which machine each is on is one column on the row.
+ * conversations directly, a worktree here as a row one level down, and every other machine as a
+ * block of its own — see {@link MachineBlock}.
  */
 interface Project {
   /** The cross-machine identity. This is what a project *is*. */
@@ -290,32 +323,30 @@ interface Project {
   favorite: boolean;
   /** Conversations in the main checkout, here. */
   sessions: SessionInfo[];
-  /** Conversations in a main checkout somewhere else. Drawn under the repository row, like ours. */
-  agents: SwarmAgent[];
   /**
    * The main checkouts on other machines — the directories themselves, not the work in them.
    *
-   * Kept as well as {@link agents}, because they answer different questions and only one of them
-   * survives a quiet machine. `agents` is what to *draw*: a flat list of conversations that belong
-   * under the repository row. This is what every verb on the row needs — which machine, and where
-   * on it — and a project advertised with nothing open in it has no conversation to read that from.
-   * Derived from `agents` alone, `n`, `t`, `c` and `C` on such a row all did nothing at all, which
-   * is precisely the row you press them on: the repository over there you have not started work in
+   * What every verb on the repository row needs — which machine, and where on it — and a project
+   * advertised with nothing open in it has no conversation to read that from. Derived from
+   * conversations alone, `n`, `t`, `c` and `C` on such a row all did nothing at all, which is
+   * precisely the row you press them on: the repository over there you have not started work in
    * yet.
    */
   mains: Checkout[];
   /**
-   * Every other checkout of it: worktrees here, and every checkout on another machine that is not
-   * that machine's main one.
+   * Every worktree of it on **this** machine.
    *
    * A worktree used to be a top-level project — correct by the old rule that a worktree is a
    * project, and wrong as a *list*: four scratch trees of one repository read as four unrelated
-   * projects, and the thing they have in common is the thing the column no longer said. The name
-   * carried the relationship (`neosh · brisk-otter`) precisely because the structure did not.
+   * projects, and the thing they have in common is the thing the column no longer said.
    */
   worktrees: Checkout[];
+  /** Every other machine that has it, one block each. See {@link MachineBlock}. */
+  machines: MachineBlock[];
   /** Which other computers have it, by name — display only, for the key card. */
   hosts: string[];
+  /** The same computers by id, for looking up the short code each one is drawn with. */
+  nodes: string[];
   /** The best link any machine holding it has, which is what the marker on the row is coloured by. */
   link?: LinkState;
 }
@@ -376,6 +407,13 @@ export const api = {
 const VAR_FAVORITE = "sidebar.favorite";
 const VAR_RANK = "sidebar.rank";
 const VAR_FOLDED = "sidebar.folded";
+/**
+ * The folded rows that are not a directory here — a machine's section, its block, a repository only
+ * over there — as a workspace var holding their keys. Not `sidebar.folded`, which is a *project*
+ * var: a project var is keyed by a directory, and one keyed by anything else was read back as a
+ * directory somebody had mentioned.
+ */
+const VAR_FOLDED_AWAY = "sidebar.folded.elsewhere";
 /**
  * The projects, in workspace scope. This list *is* what the panel shows.
  *
@@ -442,6 +480,14 @@ const VAR_ASKING = "question.asking";
  * was read.
  */
 const VAR_PERMITTING = "permission.asking";
+/**
+ * The short code each other computer is drawn with, where you chose one: `{ "<node id>": "gpu" }`.
+ *
+ * A workspace var rather than this panel's state, because a code is what you call a machine and
+ * every panel that names one should say the same thing. Anything not in it is worked out from the
+ * machine's name — see {@link machineCodes}.
+ */
+const VAR_CODES = "swarm.codes";
 
 export async function activate({ neosh, subscriptions }: PluginContext) {
   await declareOptions(neosh);
@@ -551,6 +597,8 @@ export async function activate({ neosh, subscriptions }: PluginContext) {
             // Filled in by `collect`, which is what reads the swarm and the decorations.
             decorations: new Map(),
             links: new Map(),
+            codes: new Map(),
+            colors: new Map(),
             folded: (key) => arrangement.isFolded(key),
           });
           running = built.running;
@@ -673,7 +721,12 @@ export async function activate({ neosh, subscriptions }: PluginContext) {
       // Land on the conversation you are in, not wherever the cursor happened to be — and *this*
       // terminal's, which is the whole reason the panel is per view.
       const current = await here.session.current().catch(() => null);
-      if (current) {
+      if (current?.mirror) {
+        // Another machine's conversation: its row is the remote one, under that machine's section.
+        const m = current.mirror;
+        arrangement.unfold(`host:${m.node}`);
+        list.select((t) => t.kind === "remote" && t.node === m.node && t.session === m.session);
+      } else if (current) {
         // Unfold the project it lives in, or "go to where I am" lands on a collapsed heading. For
         // a conversation in a worktree that is two folds: the repository's, then the worktree's.
         if (current.repo_root) arrangement.unfold(current.repo_root);
@@ -769,6 +822,8 @@ export async function activate({ neosh, subscriptions }: PluginContext) {
   subscriptions.push(
     neosh.vars.onChange((e) => {
       if (arrangement.observe(e.scope, e.key, e.value)) drawAll();
+      // A machine's code changed — `@` on a row, `^T` in `^J`, or anybody's plugin.
+      if (e.scope.scope === "global" && e.key === VAR_CODES) drawAll();
       // Somebody started waiting on an answer, or stopped. Deleting the var is how "nobody is
       // asking" arrives, and it comes through here with `value` unset rather than as an empty list.
       if (e.scope.scope === "global" && (e.key === VAR_ASKING || e.key === VAR_PERMITTING)) {
@@ -986,6 +1041,11 @@ class Arrangement {
   /** Every project we know of, and its vars. The cache is the read path; vars are the truth. */
   private cache = new Map<string, Record<string, unknown>>();
   private known: string[] = [];
+  /**
+   * Which rows that are *not* a directory here are folded — a machine's section, its block inside
+   * one of your projects, a repository that is only over there. See {@link VAR_FOLDED_AWAY}.
+   */
+  private away = new Set<string>();
 
   constructor(private readonly neosh: Neosh) {}
 
@@ -993,7 +1053,15 @@ class Arrangement {
     const stored = await this.neosh.vars
       .get<string[]>({ scope: "global" }, VAR_KNOWN)
       .catch(() => null);
-    this.known = unique([...strings(stored), ...cwds]);
+    this.away = new Set(strings(
+      await this.neosh.vars.get<string[]>({ scope: "global" }, VAR_FOLDED_AWAY).catch(() => null),
+    ));
+    // Only directories. A fold of a row about another machine used to be written as a project var
+    // keyed by that row's name — `host:…`, `git:github.com/…` — and `observe` then took the name for
+    // a directory somebody had mentioned and put it on this list, where it came back as a project
+    // of yours called whatever the name ended in: the row you had just folded jumped into your own
+    // section and the machine's lost it. Anything like that already written down is dropped here.
+    this.known = unique([...strings(stored), ...cwds]).filter(isDirectory);
     const all = await Promise.all(
       this.known.map((cwd) =>
         this.neosh.vars.all(projectScope(cwd)).catch(() => ({} as Record<string, unknown>))
@@ -1046,7 +1114,13 @@ class Arrangement {
    * nothing to do with this panel.
    */
   observe(scope: VarScope, key: string, value: unknown): boolean {
+    if (scope.scope === "global" && key === VAR_FOLDED_AWAY) {
+      this.away = new Set(strings(value));
+      return true;
+    }
     if (scope.scope !== "project") return false;
+    // A project var about something that is not a directory is not a project arriving.
+    if (!isDirectory(scope.cwd)) return false;
     const entry = this.cache.get(scope.cwd) ?? {};
     if (value === null || value === undefined) delete entry[key];
     else entry[key] = value;
@@ -1065,7 +1139,7 @@ class Arrangement {
 
   /** Remember directories that turned up in the conversation list. */
   async note(cwds: string[]): Promise<void> {
-    const fresh = cwds.filter((c) => !this.known.includes(c));
+    const fresh = cwds.filter((c) => isDirectory(c) && !this.known.includes(c));
     if (fresh.length === 0) return;
     this.known.push(...fresh);
     await Promise.all(
@@ -1175,6 +1249,7 @@ class Arrangement {
   }
 
   isFolded(cwd: string): boolean {
+    if (!isDirectory(cwd)) return this.away.has(cwd);
     return this.cache.get(cwd)?.[VAR_FOLDED] === true;
   }
 
@@ -1191,12 +1266,23 @@ class Arrangement {
   }
 
   async toggleFold(cwd: string): Promise<void> {
+    if (!isDirectory(cwd)) {
+      // Straight through the set so the next frame is right without waiting for the event.
+      if (this.away.has(cwd)) this.away.delete(cwd);
+      else this.away.add(cwd);
+      await this.neosh.vars.set({ scope: "global" }, VAR_FOLDED_AWAY, [...this.away]);
+      return;
+    }
     await this.set(cwd, VAR_FOLDED, this.isFolded(cwd) ? null : true);
   }
 
   /** Open a project without a keystroke — used when jumping to the conversation you are in. */
   unfold(cwd: string): void {
     if (!this.isFolded(cwd)) return;
+    if (!isDirectory(cwd)) {
+      void this.toggleFold(cwd);
+      return;
+    }
     void this.set(cwd, VAR_FOLDED, null);
   }
 
@@ -1251,6 +1337,15 @@ class Arrangement {
     this.cache.set(cwd, entry);
     await this.neosh.vars.set(projectScope(cwd), key, value);
   }
+}
+
+/**
+ * Whether a key names a directory on this disk — an absolute path — rather than a row about another
+ * machine (`host:<node>`, `machine:<node>:<key>`, `<node>:<path>`) or a repository's identity
+ * (`git:github.com/…`, `dir:<name>`). Only the first kind may become a project var or a project.
+ */
+function isDirectory(key: string): boolean {
+  return key.startsWith("/") || /^[A-Za-z]:[\\/]/.test(key);
 }
 
 function strings(v: unknown): string[] {
@@ -1627,8 +1722,9 @@ async function registerCommands(w: Wiring): Promise<void> {
     const there = machineFor(target);
     await p.leave();
     if (there) {
+      // A machine's heading names no directory, which is its home — where `ssh box` lands too.
       await neosh.swarm
-        .shell(there.id, there.cwd)
+        .shell(there.id, there.cwd === "" ? undefined : there.cwd)
         .catch((e: unknown) => neosh.notify(String(e), "warn"));
       return;
     }
@@ -1674,6 +1770,27 @@ async function registerCommands(w: Wiring): Promise<void> {
     redraw: false,
     on: { elsewhere: "disconnect that computer", remote: "disconnect that computer" },
   });
+  // `@`, because it is the character the code is drawn after — the key is the mark it changes.
+  await verb(`${NS}.machine.code`, "@", "Choose this computer's short code", async (p, target) => {
+    const there = machineFor(target);
+    if (!there) return;
+    const [nodes, chosen] = await Promise.all([
+      neosh.swarm.nodes().catch(() => [] as SwarmNode[]),
+      neosh.vars.get({ scope: "global" }, VAR_CODES).catch(() => null),
+    ]);
+    await chooseCode(neosh, there.id, there.name, machineCodes(nodes, chosen).get(there.id));
+  }, {
+    on: { elsewhere: "that computer's @code", remote: "that computer's @code" },
+  });
+  // The workspace's settings, from the panel that is about the workspace. `,` because it is the
+  // key every Mac application opens its settings with (`⌘,`), without the `⌘` a terminal never
+  // receives — and there is no Ctrl-letter left to give it. `/settings` and `^K` reach it too.
+  await verb(`${NS}.settings`, ",", "Settings", async (p) => {
+    await p.leave();
+    await neosh.cmd.exec("settings.open").catch(() =>
+      neosh.notify("the settings plugin is not loaded — see `plugins.disabled`", "warn")
+    );
+  }, { redraw: false });
   await verb(`${NS}.add`, "o", "Add a project", async (p) => {
     await p.leave();
     await neosh.cmd.exec("project.open").catch(() => {});
@@ -1848,14 +1965,17 @@ async function registerCommands(w: Wiring): Promise<void> {
   // it was started on and always will. Subscribing is what makes it read like a local one: history
   // first, then everything as it happens.
   w.subscriptions.push(
-    await neosh.cmd.register("swarm.open", async (args) => {
+    await neosh.cmd.register("swarm.open", async (args, key, here) => {
       const [node, session] = args;
       if (!node || !session) {
         neosh.notify("swarm.open needs a node and a conversation", "warn");
         return;
       }
-      await openRemote(neosh, w.subscriptions, node, session);
-    }, { desc: "Watch a conversation on another computer" }),
+      // Into the terminal the key was pressed in, and the panel lets go of the keyboard if it had
+      // it: somebody who opened a conversation is about to type into it.
+      if (!(await openRemote(here ?? neosh, node, session))) return;
+      await w.panel(key?.view)?.leave();
+    }, { desc: "Open a conversation on another computer" }),
   );
   w.subscriptions.push(
     await neosh.cmd.register("swarm.nodes", () => showNodes(neosh), {
@@ -1866,6 +1986,42 @@ async function registerCommands(w: Wiring): Promise<void> {
     await neosh.cmd.register("swarm.add", () => addComputer(neosh), {
       desc: "Add a computer by its address",
     }),
+  );
+  // The short codes, as an answer for anybody else who names a machine — a settings page, a status
+  // segment — so every panel says `@ms` about the same computer. `{ "<node id>": "ms" }`.
+  w.subscriptions.push(
+    await neosh.cmd.register("swarm.codes", async () => {
+      const [nodes, chosen] = await Promise.all([
+        neosh.swarm.nodes().catch(() => [] as SwarmNode[]),
+        neosh.vars.get({ scope: "global" }, VAR_CODES).catch(() => null),
+      ]);
+      const me = (await neosh.swarm.self().catch(() => null))?.id;
+      return Object.fromEntries(machineCodes(nodes.filter((n) => n.info.id !== me), chosen));
+    }, { desc: "Each other computer's short code, by id" }),
+  );
+  // And their colours, as the palette group each is drawn in: `{ "<node id>": "Swarm.Host2" }`.
+  w.subscriptions.push(
+    await neosh.cmd.register("swarm.colors", async () => {
+      const nodes = await neosh.swarm.nodes().catch(() => [] as SwarmNode[]);
+      const me = (await neosh.swarm.self().catch(() => null))?.id;
+      return Object.fromEntries(machineColors(nodes.filter((n) => n.info.id !== me)));
+    }, { desc: "Each other computer's colour, as a highlight group, by id" }),
+  );
+  w.subscriptions.push(
+    await neosh.cmd.register("swarm.code", async (args, key) => {
+      // A machine named outright, or the one under the cursor in the panel the key came from.
+      const [nodes, chosen] = await Promise.all([
+        neosh.swarm.nodes().catch(() => [] as SwarmNode[]),
+        neosh.vars.get({ scope: "global" }, VAR_CODES).catch(() => null),
+      ]);
+      const id = args[0] ?? machineFor(w.panel(key?.view)?.list.value)?.id;
+      const node = nodes.find((n) => n.info.id === id || n.info.name === id);
+      if (!node) {
+        neosh.notify("swarm.code needs a computer", "warn");
+        return false;
+      }
+      return await chooseCode(neosh, node.info.id, node.info.name, machineCodes(nodes, chosen).get(node.info.id));
+    }, { desc: "Choose the short code a computer is drawn with" }),
   );
   w.subscriptions.push(
     // The machine-level verb, so a script or `^K` reaches it without going through a row. `t` in
@@ -2237,6 +2393,17 @@ async function newRemoteConversation(
     pick = chosen;
   }
   if (!pick) return;
+  if (pick.cwd === "") {
+    // A machine rather than a directory on it — its section heading. Where on it is the question,
+    // asked the way `^N` asks it once a machine is chosen: the path field, pointed over there.
+    const prefix = /[:\s]/.test(pick.name) ? pick.id.slice(0, 8) : pick.name;
+    const chosen = await whereTo(neosh, [], {
+      title: `New conversation on ${pick.name}`,
+      seed: `${prefix}:`,
+    });
+    if (chosen?.kind === "host") await startThere(neosh, chosen);
+    return;
+  }
   await startThere(neosh, {
     node: pick.id,
     cwd: pick.cwd,
@@ -2250,6 +2417,23 @@ async function newConversation(
   base?: string,
 ): Promise<void> {
   const current = await neosh.session.current().catch(() => null);
+  // In another machine's conversation, *here* is a directory on that machine — so the question is
+  // the one `^N` asks after choosing it, the path field pointed over there, and it starts on the
+  // directory you are in: `^N ↵` is a new conversation beside this one, as it is on your own.
+  if (!base && current?.mirror) {
+    const there = (await neosh.swarm.nodes().catch(() => [] as SwarmNode[]))
+      .find((n) => n.info.id === current.mirror?.node);
+    if (!there?.up) {
+      neosh.notify(`${current.mirror.machine} is not connected — c on its row in ^T reconnects`, "warn");
+      return;
+    }
+    const chosen = await whereTo(neosh, [], {
+      title: `New conversation on ${there.info.name}`,
+      seed: `${hostPrefix(there)}:${current.cwd}`,
+    });
+    if (chosen?.kind === "host") await startThere(neosh, chosen);
+    return;
+  }
   const here = base ?? current?.cwd;
   // Which computer, first — and only when there is one to ask about *and* it could answer. A
   // repository none of the connected machines has a checkout of has one possible answer, and
@@ -2618,6 +2802,9 @@ function hostPrefix(node: SwarmNode): string {
  */
 function machineRows(nodes: SwarmNode[], ascii: boolean): PickerItem<Where>[] {
   const out: PickerItem<Where>[] = [];
+  // The colour each machine wears in the project panel, so the row you pick here is the colour of
+  // the block the conversation will appear in.
+  const colors = machineColors(nodes);
   for (const n of nodes) {
     const usable = n.up && n.capabilities.accepts_commands;
     const projects = n.capabilities.projects;
@@ -2636,7 +2823,9 @@ function machineRows(nodes: SwarmNode[], ascii: boolean): PickerItem<Where>[] {
           ? "disconnected — ^J to reconnect"
           : "connecting…";
     const [icon, hl] = n.link.state === "up"
-      ? usable ? [ascii ? "*" : "●", "Diagnostic.Ok"] : [ascii ? "-" : "◐", "Sidebar.Dim"]
+      ? usable
+        ? [ascii ? "*" : "●", colors.get(n.info.id) ?? "Swarm.Up"]
+        : [ascii ? "-" : "◐", "Sidebar.Dim"]
       : n.link.state === "waiting"
         ? [ascii ? "!" : "◍", pulseHl("Status.Pending")]
         : n.link.state === "down"
@@ -2921,12 +3110,11 @@ async function activateTarget(
     await p.draw();
     return;
   }
-  // A conversation on another computer. There is nothing to switch to here — it belongs to that
-  // machine — so opening it means watching it, which is what `swarm.open` does.
+  // A conversation on another computer, opened as a conversation: the pane arrives in a mirror of
+  // it and the keyboard goes to its composer, exactly as `↵` on one of yours does. Leaving the panel
+  // only once the mirror is there, so a machine that has gone keeps you on the row that says so.
   if (target.kind === "remote") {
-    await neosh.cmd.exec("swarm.open", [target.node, target.session]).catch((e: unknown) => {
-      neosh.notify(String(e), "warn");
-    });
+    if (await openRemote(p.here, target.node, target.session)) await p.leave();
     return;
   }
   if (target.kind === "add") {
@@ -3256,6 +3444,10 @@ async function showNodes(neosh: Neosh): Promise<void> {
   // workspace, to animate one glyph.
   let nodes: SwarmNode[] = [];
   let strangers: SwarmStranger[] = [];
+  // The short code each machine is drawn with in the project panel, so this list says the same
+  // thing: the `@ms` you see on a row there is the `@ms` beside its name here.
+  let codes = new Map<string, string>();
+  let colors = new Map<string, string>();
 
   /** Whether anything on screen is mid-dial, and therefore whether the tick has any work. */
   const spinning = () =>
@@ -3308,14 +3500,14 @@ async function showNodes(neosh: Neosh): Promise<void> {
       // only ever means "this machine is working on it" — never over `waiting`, where nothing on
       // this computer is trying and the motion would be a promise nobody is keeping.
       const [icon, hl] = n.link.state === "up"
-        ? [ascii ? "*" : "●", "Diagnostic.Ok"]
+        ? [ascii ? "*" : "●", colors.get(n.info.id) ?? "Swarm.Up"]
         : n.link.state === "waiting"
           ? [ascii ? "!" : "◍", pulseHl("Status.Pending")]
           : n.link.state === "down"
             ? [ascii ? "-" : "○", "Sidebar.Dim"]
             : [spinnerFrame(), "Status.Streaming"];
       rows.push({
-        label: n.info.name,
+        label: `${n.info.name}  @${codes.get(n.info.id) ?? ""}`,
         detail: [
           state,
           running > 0 ? `${running} working` : "",
@@ -3362,10 +3554,15 @@ async function showNodes(neosh: Neosh): Promise<void> {
 
   /** Ask the host again. Everything else here draws from what this last brought back. */
   const fetch = async () => {
-    [nodes, strangers] = await Promise.all([
+    let chosen: unknown;
+    [nodes, strangers, chosen] = await Promise.all([
       neosh.swarm.nodes().catch(() => []),
       neosh.swarm.strangers().catch(() => []),
+      neosh.vars.get({ scope: "global" }, VAR_CODES).catch(() => null),
     ]);
+    nodes = nodes.filter((n) => n.info.id !== me.id);
+    codes = machineCodes(nodes, chosen);
+    colors = machineColors(nodes);
   };
 
   const redraw = () => {
@@ -3383,7 +3580,7 @@ async function showNodes(neosh: Neosh): Promise<void> {
     title: "Computers",
     width: 84,
     height: 14,
-    hints: "↵ open   ^E rename   ^R reconnect   ^D disconnect   ^X remove   ^Y my id",
+    hints: "↵ open   ^E rename   ^T code   ^R reconnect   ^D disconnect   ^X remove   ^Y my id",
     // The list keeps up while it is open: a machine connecting, dropping, or moving from
     // "connecting" to a row of conversations changes under the cursor rather than on reopen.
     subscribe: (reload) => {
@@ -3408,7 +3605,7 @@ async function showNodes(neosh: Neosh): Promise<void> {
       };
     },
     // Chords, because every bare letter a picker takes is a letter its filter can never contain.
-    ownKeys: ["<C-y>", "<C-x>", "<C-r>", "<C-d>", "<C-e>"],
+    ownKeys: ["<C-y>", "<C-x>", "<C-r>", "<C-d>", "<C-e>", "<C-t>"],
     async onKey(key, ctx) {
       if (key.key.code.kind !== "char" || !key.key.mods.ctrl) return;
       switch (key.key.code.c.toLowerCase()) {
@@ -3452,6 +3649,17 @@ async function showNodes(neosh: Neosh): Promise<void> {
             neosh.notify(String(e), "warn");
             return "handled";
           }
+        }
+        case "t": {
+          // The code after the `@` on every row that is on this machine. Asked here, beside the
+          // rename, because it is the other half of what a machine is called.
+          const row = ctx.item;
+          if (row?.kind !== "node") return "handled";
+          if (await chooseCode(neosh, row.node.info.id, row.node.info.name, codes.get(row.node.info.id))) {
+            await refill();
+            return "reload";
+          }
+          return "handled";
         }
         case "x": {
           const row = ctx.item;
@@ -3528,240 +3736,32 @@ async function showNodes(neosh: Neosh): Promise<void> {
 }
 
 // ---------------------------------------------------------------------------
-// Watching a conversation on another computer
+// A conversation on another computer
 // ---------------------------------------------------------------------------
 
-/** The buffer kind the remote view publishes, so its keys are ordinary bindings. */
-const VIEW_KIND = "neosh.swarm.view";
-
-/** At most one open at a time, because there is one screen. */
-let openView: { close: () => Promise<void>; node: string; session: string } | null = null;
-
 /**
- * Watch a conversation on another machine.
+ * Open a conversation on another machine, as a conversation.
  *
- * A float rather than the chat pane, and that is a decision rather than a shortcut. The chat pane
- * is *your* conversation: it is where your composer sends, what `^S` reads, and what the permission
- * mode belongs to. Putting somebody else's conversation there would mean every one of those
- * questions has two answers, and the one you get depends on what you last pressed. A window that is
- * plainly a window onto another machine cannot be confused for the thing you are working in.
+ * It used to be a float: a plain-text window onto the other machine's words, `i` for a one-line
+ * prompt and no cards, no markdown, no working line — somewhere you could watch and could barely
+ * talk to. The reasoning was that the chat pane is *yours*, and somebody else's conversation there
+ * would give its composer two meanings. What it turned out to mean in practice is that the part of
+ * the workspace on another machine was a second-class citizen of it.
  *
- * What it is *not* is read-only. `i` steers it, `^C` interrupts it — because "feels like it is on
- * this computer" is a claim about what you can do, not only about what you can see.
+ * So the workspace mirrors it (`swarm.mirror`): a conversation in the pane, drawn by the very code
+ * that draws yours — the same transcript, the same cards, the same composer — whose turns run on the
+ * machine they belong to. What you type goes there, `Esc` asks it to stop, and nothing about it is
+ * saved or listed here, because that machine lists and keeps it. The project panel says where you
+ * are: its row is lit, and the status line names the machine.
  */
-async function openRemote(
-  neosh: Neosh,
-  subscriptions: PluginContext["subscriptions"],
-  node: string,
-  session: string,
-): Promise<void> {
-  // Switching from one remote conversation to another drops the first subscription. Otherwise a
-  // morning of looking at machines leaves every one of them streaming every token here.
-  if (openView) await openView.close();
-
-  const who = (await neosh.swarm.nodes().catch(() => []))
-    .find((n) => n.info.id === node);
-  const agent = who?.agents.find((a) => a.session === session);
-  const name = who?.info.name ?? node.slice(0, 8);
-
-  const buf = await neosh.buf.create({
-    name: `[${name}] ${agent?.label ?? "conversation"}`,
-    scratch: true,
-    kind: VIEW_KIND,
-  });
-  const ns = await neosh.ns.create("neosh.swarm.view");
-  const lines: string[] = [
-    `  watching ${name}${agent ? `  ·  ${agent.project_name}` : ""}`,
-    `  ${agent?.cwd ?? ""}`,
-    "",
-    "  waiting for this machine to say what has happened so far…",
-  ];
-  await neosh.buf.setLines(buf, 0, -1, lines);
-
-  const win = await neosh.float.open(buf, {
-    anchor: { kind: "screen" },
-    width: { kind: "max", n: 96 },
-    height: { kind: "max", n: 28 },
-    border: "rounded",
-    title: ` ${name} `,
-    footer: " j k move   ^D ^U half   gg G ends   esc close ",
-    focusable: true,
-    // Somebody else's conversation, which is as long as it is. Twenty-eight rows was the most this
-    // panel would ever draw and everything above them was unreachable — on a short terminal, most
-    // of it. `G` puts you back on the end when you have finished reading up.
-    scroll: true,
-  });
-  await neosh.focus.push(win);
-
-  const header = lines.slice(0, 3);
-  let body: string[] = [];
-  /** Whether the last thing appended is an assistant turn still being written into. */
-  let streaming = false;
-
-  const redraw = async () => {
-    const all = [...header, ...body];
-    // Whether you are reading the end of it. Asked *before* the rows change, because afterwards
-    // "the end" is a different row and every panel is behind it. Parked on the last screenful you
-    // are carried along with what arrives; anywhere else you stay exactly where you are — the rule
-    // the transcript already follows, and the one thing that makes a live panel readable now that
-    // it can be scrolled at all.
-    const before = await neosh.win.viewport(win).catch(() => null);
-    const following = before === null ||
-      before.top_line + before.rows >= before.line_count;
-    // One call. This redraws per token, so a repaint the frontend could draw halfway through — text
-    // written, marks not yet — would be a transcript strobing white for the whole of an answer.
-    const drawn: DrawnRow[] = all.map((text) => ({ text, marks: [] }));
-    const mark = (line: number, hl: string, text: string) => {
-      drawn[line]?.marks!.push({ col: 0, opts: { hlGroup: hl, endCol: byteLength(text) } });
-    };
-
-    mark(0, "Title", all[0] ?? "");
-    if (all[1]) mark(1, "Comment", all[1]);
-    for (let i = header.length; i < all.length; i++) {
-      const text = all[i] ?? "";
-      if (text.startsWith("  › ")) {
-        mark(i, "Accent", text);
-      } else if (text.startsWith("  · ")) {
-        mark(i, "Comment", text);
-      }
-    }
-    await neosh.buf.render(buf, ns, 0, -1, drawn);
-    // The newest line, not the oldest: a transcript you have just opened should be showing the end
-    // of the conversation, which is the part that is still happening. Measured rather than the flat
-    // 24 this used to subtract — that number was the height the panel *asked* for, so on any screen
-    // shorter than it the tail was scrolled past and the panel sat on rows nobody had written yet.
-    if (following) await neosh.win.scroll(win, { kind: "bottom" });
-  };
-
-  const sub = neosh.swarm.onStream(async (e) => {
-    if (e.node !== node || e.session !== session) return;
-    const ev = e.event;
-    switch (ev.event) {
-      case "history":
-        body = renderMessages(ev.messages);
-        streaming = false;
-        break;
-      case "turn_started":
-        streaming = false;
-        break;
-      case "token": {
-        if (!streaming) {
-          body.push("");
-          streaming = true;
-        }
-        // Appended to the last row, and split on newlines, because tokens are provider-sized rather
-        // than line-sized and a naive push makes one row per chunk.
-        const last = body.pop() ?? "";
-        const merged = (last + ev.text).split("\n");
-        body.push(...merged);
-        break;
-      }
-      case "thinking":
-        break;
-      case "activity":
-        break;
-      case "turn_ended":
-        streaming = false;
-        body.push("");
-        break;
-      case "blocked":
-        body.push(`  · waiting for somebody at ${name}: ${ev.prompt}`);
-        break;
-    }
-    await redraw();
-  });
-
-  const close = async () => {
-    if (openView?.session !== session) return;
-    openView = null;
-    sub.dispose();
-    await neosh.swarm.unsubscribe(node, session).catch(() => {});
-    await neosh.focus.pop().catch(() => {});
-    await neosh.win.close(win).catch(() => {});
-  };
-  openView = { close, node, session };
-  subscriptions.push({ dispose: () => void close() });
-
-  await installViewKeys(neosh, subscriptions, () => openView);
+async function openRemote(neosh: Neosh, node: string, session: string): Promise<boolean> {
   try {
-    await neosh.swarm.subscribe(node, session);
+    await neosh.swarm.mirror(node, session);
+    return true;
   } catch (e) {
-    neosh.notify(String(e), "warn");
-    await close();
+    neosh.notify(String(e).replace(/^Error:\s*/, ""), "warn");
+    return false;
   }
-}
-
-/**
- * The keys inside a remote view.
- *
- * Registered once and bound at buffer-kind scope, so `^Z` lists them and `init.ts` can move them —
- * the same deal every other panel key gets. Registered lazily rather than at activation because
- * most workspaces never open one.
- */
-let viewKeysInstalled = false;
-async function installViewKeys(
-  neosh: Neosh,
-  subscriptions: PluginContext["subscriptions"],
-  current: () => { node: string; session: string; close: () => Promise<void> } | null,
-): Promise<void> {
-  if (viewKeysInstalled) return;
-  viewKeysInstalled = true;
-  const scope = { kind: "buf_kind", name: VIEW_KIND } as const;
-
-  const bind = async (name: string, key: string, desc: string, fn: () => Promise<void>) => {
-    subscriptions.push(await neosh.cmd.register(name, fn, { desc }));
-    await neosh.keymap.set("chat", key, name, { scope, desc });
-  };
-
-  await bind("swarm.view.close", "<Esc>", "Stop watching", async () => {
-    await current()?.close();
-  });
-  await neosh.keymap.set("chat", "q", "swarm.view.close", { scope });
-
-  await bind("swarm.view.steer", "i", "Say something to this agent", async () => {
-    const view = current();
-    if (!view) return;
-    const text = await prompt(neosh, "Say something", { width: 72 });
-    if (text === null || text.trim() === "") return;
-    try {
-      await neosh.swarm.command(view.node, view.session, { command: "send", text });
-    } catch (e) {
-      // The owner refused — read-only, or the conversation went away. Its words, not ours.
-      neosh.notify(String(e), "warn");
-    }
-  });
-
-  await bind("swarm.view.interrupt", "<C-c>", "Ask this turn to stop", async () => {
-    const view = current();
-    if (!view) return;
-    try {
-      await neosh.swarm.command(view.node, view.session, { command: "interrupt" });
-      neosh.notify("asked it to stop");
-    } catch (e) {
-      neosh.notify(String(e), "warn");
-    }
-  });
-}
-
-/** Messages as rows. Deliberately plain: this is a window onto somewhere else, not a transcript. */
-function renderMessages(messages: Message[]): string[] {
-  const out: string[] = [];
-  for (const m of messages) {
-    for (const block of m.content) {
-      if (block.type === "text") {
-        if (m.role === "user") {
-          out.push(`  › ${block.text.split("\n")[0] ?? ""}`);
-          for (const rest of block.text.split("\n").slice(1)) out.push(`    ${rest}`);
-        } else {
-          for (const line of block.text.split("\n")) out.push(`  ${line}`);
-        }
-      } else if (block.type === "tool_use") {
-        out.push(`  · ${block.name}`);
-      }
-    }
-    out.push("");
-  }
-  return out;
 }
 
 /**
@@ -3957,6 +3957,7 @@ function group(
       const c = at(n, p.cwd);
       c.root = p.repo_root ?? undefined;
       c.branch = p.branch ?? undefined;
+      c.head = p.head ?? undefined;
       keyThere.set(c.fold, p.key);
       nameThere.set(c.fold, p.name);
     }
@@ -3984,10 +3985,11 @@ function group(
         name,
         favorite: false,
         sessions: [],
-        agents: [],
         mains: [],
         worktrees: [],
+        machines: [],
         hosts: [],
+        nodes: [],
       };
       projects.set(key, found);
     }
@@ -4052,9 +4054,30 @@ function group(
     });
   }
 
-  // And everything on another machine, into the very same rows.
+  // A key that is only a guess on one side — `dir:<name>`, which is what a machine answers until it
+  // has read the repository's origin, and what a directory with no remote always answers — meets
+  // the one project on the other side with that name. Only when exactly one does: two local
+  // `neosh` checkouts is a question this cannot answer, and a wrong merge is worse than two rows.
+  // Without it the repository you are sitting in appeared a second time, underneath, as a project
+  // on the other machine called the same thing.
+  const leaf = (k: string) => k.replace(/\/+$/, "").split(/[/:]/).pop() ?? k;
+  const ours = [...projects.values()].filter((p) => p.cwd !== null);
+  const alias = (key: string): string => {
+    if (projects.has(key)) return key;
+    const guessed = key.startsWith("dir:");
+    const hits = ours.filter((p) =>
+      guessed
+        ? leaf(p.key) === key.slice(4) || basename(p.cwd as string) === key.slice(4)
+        : p.key.startsWith("dir:") && p.key.slice(4) === leaf(key)
+    );
+    return hits.length === 1 ? hits[0]!.key : key;
+  };
+
+  // And everything on another machine, one block per machine under the same repository row.
   for (const c of over.values()) {
-    const key = keyThere.get(c.fold) ?? `dir:${basename(c.cwd)}`;
+    const node = c.node;
+    if (!node) continue;
+    const key = alias(keyThere.get(c.fold) ?? `dir:${basename(c.cwd)}`);
     const name = nameThere.get(c.fold) ?? basename(c.cwd);
     // `project_name` is `neosh · fix/thing` for a tree, and a tree never names its repository — so
     // the leading segment is dropped rather than becoming a project called after a branch. The
@@ -4062,20 +4085,30 @@ function group(
     // them somewhere.
     const p = project(key, isTree(c) ? basename(c.root ?? c.cwd) : name);
     if (p.name === "") p.name = isTree(c) ? basename(c.root ?? c.cwd) : name;
-    const host = c.node?.name;
-    if (host && !p.hosts.includes(host)) p.hosts.push(host);
-    if (rank(c.node?.link) > rank(p.link)) p.link = c.node?.link;
-    if (isTree(c)) {
-      p.worktrees.push(c);
-    } else {
-      // A main checkout over there: its conversations belong to the repository row, exactly as ours
-      // do. A row of its own would be a second `neosh` under `neosh`. The checkout is kept beside
-      // them, because the row's verbs are about the directory and not about the work in it.
+    if (!p.hosts.includes(node.name)) p.hosts.push(node.name);
+    if (!p.nodes.includes(node.id)) p.nodes.push(node.id);
+    if (rank(node.link) > rank(p.link)) p.link = node.link;
+    let block = p.machines.find((b) => b.node.id === node.id);
+    if (!block) {
+      block = { node, trees: [], fold: `machine:${node.id}:${key}` };
+      p.machines.push(block);
+    }
+    // Its main checkout is the block's own row; anything else it has is a tree under it — including
+    // a second clone of the repository on the same disk, which is at least true about sharing one.
+    if (!isTree(c) && !block.main) {
+      block.main = c;
       p.mains.push(c);
-      p.agents.push(...c.agents);
+    } else {
+      block.trees.push(c);
     }
   }
-  for (const p of projects.values()) p.hosts.sort();
+  for (const p of projects.values()) {
+    p.hosts.sort();
+    // By machine name, and each machine's trees by branch: a list you can find a computer in, in
+    // the same place every time.
+    p.machines.sort((a, b) => a.node.name.localeCompare(b.node.name) || a.node.id.localeCompare(b.node.id));
+    for (const b of p.machines) b.trees.sort((x, y) => treeName(x).localeCompare(treeName(y)));
+  }
 
   // ---- order --------------------------------------------------------------
   // A project's recency is its newest conversation *anywhere in it* — a repository whose only
@@ -4089,8 +4122,10 @@ function group(
     );
 
   const sort = (a: Project, b: Project) => {
-    const ra = a.cwd === null ? 0 : arrangement.rank(a.cwd);
-    const rb = b.cwd === null ? 0 : arrangement.rank(b.cwd);
+    // A repository that is only on other computers has no rank here to read — and ranking it `0`
+    // put every one of them above every project of yours you had never dragged.
+    const ra = a.cwd === null ? Number.MAX_SAFE_INTEGER : arrangement.rank(a.cwd);
+    const rb = b.cwd === null ? Number.MAX_SAFE_INTEGER : arrangement.rank(b.cwd);
     if (ra !== rb) return ra - rb;
     const fa = newest(a);
     const fb = newest(b);
@@ -4120,6 +4155,152 @@ function group(
   const all = [...projects.values()];
   for (const p of all) p.worktrees.sort(byTree);
   return [all.filter((p) => p.favorite).sort(sort), all.filter((p) => !p.favorite).sort(sort)];
+}
+
+/**
+ * Whether each machine's main checkout is the version this one is: the commit HEAD resolves to on
+ * each side, read off the files (`git.heads` here, `RemoteProject.head` there).
+ *
+ * The block is its own row whatever the answer — this only decides whether the row *says* so, and
+ * it says so only when it is news: a machine on a different commit shows it beside the branch, and
+ * the same commit or a side that cannot tell (an older neosh sends no commit) shows nothing.
+ */
+function compareVersions(p: Project, mine: GitHead | null | undefined): void {
+  const ours = mine?.commit ?? undefined;
+  for (const b of p.machines) {
+    const theirs = b.main?.head;
+    b.differs = ours && theirs ? !(ours.startsWith(theirs) || theirs.startsWith(ours)) : undefined;
+  }
+}
+
+/**
+ * A colour for every other computer, as the palette group it is drawn in — `Swarm.Host1`…`6`.
+ *
+ * Stable: a machine's preferred colour is a hash of its id, so it does not change when another
+ * machine is paired, and only a clash moves one — to the next colour nobody has, in id order. The
+ * first colour is the blue, so a workspace with one other computer draws it blue.
+ */
+function machineColors(peers: SwarmNode[]): Map<string, string> {
+  const out = new Map<string, string>();
+  const taken = new Set<number>();
+  const sorted = [...peers].sort((a, b) => a.info.id.localeCompare(b.info.id));
+  // One machine is the blue, whatever its id hashes to: that is the colour a person who has paired
+  // one computer was told "connected" is.
+  if (sorted.length === 1) {
+    out.set(sorted[0]!.info.id, "Swarm.Host1");
+    return out;
+  }
+  for (const n of sorted) {
+    let h = 0;
+    for (const ch of n.info.id) h = (h * 31 + ch.charCodeAt(0)) >>> 0;
+    let i = h % HOST_COLORS;
+    for (let tries = 0; tries < HOST_COLORS && taken.has(i); tries++) i = (i + 1) % HOST_COLORS;
+    taken.add(i);
+    out.set(n.info.id, `Swarm.Host${i + 1}`);
+  }
+  return out;
+}
+
+/** How many machine colours the palette defines. More machines than this share them. */
+const HOST_COLORS = 6;
+
+/**
+ * A short code for every other computer — `ms` for `mac-studio`, `lb` for `linux-box` — so a row
+ * that is somewhere else can say *where* in three columns rather than fourteen.
+ *
+ * The code is what goes after the `@` on every remote row. The first cut drew a bare `@`, which
+ * said "not here" and nothing else: with two machines paired, every remote row looked the same and
+ * which computer a conversation was running on was a fact you had to pause on the row to read off
+ * the key card. Two letters is the most a row that narrow can spend and the least that tells two
+ * machines apart at a glance.
+ *
+ * Worked out from the name you see — the one `^J` renames — as the initials of its first two words
+ * (`MacBook-Pro` counts as three), or the first two letters of a one-word name; a clash takes the
+ * next candidate, then a digit. Assigned in a fixed order so a redraw never shuffles them. **Yours
+ * wins**: the `swarm.codes` workspace var maps a node id to the code you chose, and those are
+ * claimed before anything is worked out.
+ */
+function machineCodes(peers: SwarmNode[], chosen: unknown): Map<string, string> {
+  const out = new Map<string, string>();
+  const taken = new Set<string>();
+  const wanted = chosen && typeof chosen === "object" ? chosen as Record<string, unknown> : {};
+  for (const n of peers) {
+    const code = wanted[n.info.id];
+    if (typeof code === "string" && /^[A-Za-z0-9]{1,4}$/.test(code)) {
+      out.set(n.info.id, code.toLowerCase());
+      taken.add(code.toLowerCase());
+    }
+  }
+  const rest = peers
+    .filter((n) => !out.has(n.info.id))
+    .sort((a, b) => a.info.id.localeCompare(b.info.id));
+  for (const n of rest) {
+    const code = codeCandidates(n.info.name).find((c) => !taken.has(c)) ??
+      // Nine machines called the same thing is somebody testing this function.
+      `${n.info.id.slice(0, 2).toLowerCase()}`;
+    out.set(n.info.id, code);
+    taken.add(code);
+  }
+  return out;
+}
+
+/** What a machine could be called in two columns, best first. */
+function codeCandidates(name: string): string[] {
+  const words = name
+    .replace(/([a-z])([A-Z])/g, "$1 $2")
+    .split(/[^A-Za-z0-9]+/)
+    .filter((w) => w !== "")
+    .map((w) => w.toLowerCase());
+  if (words.length === 0) return ["pc"];
+  const first = words[0]!;
+  const out: string[] = [];
+  const add = (c: string) => {
+    if (c !== "" && !out.includes(c)) out.push(c);
+  };
+  // `box2` is `b2`, not `bo`: the number is usually the only thing telling it from `box1`.
+  const numbered = /^([a-z]+)(\d+)$/.exec(first);
+  if (words.length === 1 && numbered) add(`${numbered[1]![0]}${numbered[2]}`.slice(0, 3));
+  if (words.length >= 2) {
+    add(`${first[0]}${words[1]![0]}`);
+    add(`${first[0]}${words[words.length - 1]![0]}`);
+    if (words.length >= 3) add(`${words[1]![0]}${words[2]![0]}`);
+  }
+  add(first.slice(0, 2));
+  for (const w of words.slice(1)) add(`${first[0]}${w.slice(0, 2)}`);
+  for (let i = 2; i <= 9; i++) add(`${first[0]}${i}`);
+  return out;
+}
+
+/**
+ * Ask what to call a machine in two or three columns, and write it into `swarm.codes`.
+ *
+ * Answers whether anything changed. Empty goes back to the worked-out code; anything that is not
+ * one to four letters or digits is refused with the reason rather than silently trimmed.
+ */
+async function chooseCode(
+  neosh: Neosh,
+  id: string,
+  name: string,
+  current: string | undefined,
+): Promise<boolean> {
+  const next = await prompt(neosh, `Code for ${name} — shown as @code on its rows`, {
+    initial: current ?? "",
+    width: 60,
+  });
+  if (next === null) return false;
+  const code = next.trim().toLowerCase();
+  if (code !== "" && !/^[a-z0-9]{1,4}$/.test(code)) {
+    neosh.notify("a code is one to four letters or digits", "warn");
+    return false;
+  }
+  const all = await neosh.vars.get<Record<string, string>>({ scope: "global" }, VAR_CODES)
+    .catch(() => null);
+  const codes: Record<string, string> = { ...(all && typeof all === "object" ? all : {}) };
+  if (code === "") delete codes[id];
+  else codes[id] = code;
+  await neosh.vars.set({ scope: "global" }, VAR_CODES, codes);
+  neosh.notify(code === "" ? `${name} is back to its own code` : `${name} is @${code}`);
+  return true;
 }
 
 /** Whether a checkout is a worktree rather than the main one on its machine. */
@@ -4174,6 +4355,12 @@ interface DrawOptions {
    * panel drew both identically, which meant `↵` on a row was a coin toss you could not see.
    */
   links: Map<string, LinkState>;
+  /** Each other computer's short code, by node id — what follows the `@`. See {@link machineCodes}. */
+  codes: Map<string, string>;
+  /** Each other computer's colour, as a palette group, by node id. See {@link machineColors}. */
+  colors: Map<string, string>;
+  /** The conversation on another machine this terminal is in, when it is in one. */
+  mirrored?: { node: string; session: string };
 }
 
 /** How a project's fold is remembered: its directory here, or its identity when it is only there. */
@@ -4229,8 +4416,38 @@ async function collect(
     await neosh.ext.list<DecorationItem>(POINT_DECORATION).catch(() => []),
   );
   const links = new Map(peers.map((n) => [n.info.id, n.link] as const));
-  opts = { ...opts, decorations, links, folded: (key) => arrangement.isFolded(key) };
+  const codes = machineCodes(
+    peers,
+    await neosh.vars.get({ scope: "global" }, VAR_CODES).catch(() => null),
+  );
+  const colors = machineColors(peers);
+  // Which remote conversation is on screen here, so its row is lit the way yours is when you are in
+  // it: where you are is the one thing the panel must never leave you to work out.
+  const current = await neosh.session.current().catch(() => null);
+  const mirrored = current?.mirror
+    ? { node: current.mirror.node, session: current.mirror.session }
+    : undefined;
+  opts = {
+    ...opts,
+    decorations,
+    links,
+    codes,
+    colors,
+    mirrored,
+    folded: (key) => arrangement.isFolded(key),
+  };
   const projects = group(sessions, arrangement, peers).flat();
+  // Which version of each repository this machine has, for the ones another machine also has a
+  // main checkout of — one call for all of them, answered off the disk with no `git` process, and
+  // nothing at all on a workspace with no peers.
+  const local = projects
+    .filter((p) => p.cwd !== null && p.mains.length > 0)
+    .map((p) => p.cwd as string);
+  const heads = await neosh.git.heads(local).catch(() => [] as Array<GitHead | null>);
+  const mine = new Map(local.map((cwd, i) => [cwd, heads[i] ?? null] as const));
+  for (const p of projects) {
+    if (p.cwd !== null && p.mains.length > 0) compareVersions(p, mine.get(p.cwd));
+  }
 
   // A directory that turned up in the conversation list and we had not seen before. Noted rather
   // than fetched inline: the draw runs on a tick and must not wait on a round trip per project.
@@ -4263,6 +4480,19 @@ async function collect(
       custom: (command, args, id) => ({ kind: "custom", command, args, section: id }),
     }));
 
+  /** One machine's block under a repository: its row, then its conversations and its worktrees. */
+  const pushBlock = (b: MachineBlock) => {
+    rows.push(machineRow(b, opts, now));
+    if (arrangement.isFolded(b.fold)) return;
+    const rail = { hl: railOf(b.node.id, opts), at: 3 };
+    for (const r of b.main?.agents ?? []) rows.push(remoteRow(r, opts, now, 1, rail));
+    for (const t of b.trees) {
+      rows.push(treeRow(t, opts, now, 1, rail));
+      if (arrangement.isFolded(t.fold)) continue;
+      for (const r of t.agents) rows.push(remoteRow(r, opts, now, 2, rail));
+    }
+  };
+
   // The blocks this panel draws, each the same shape: so that a section can sit before or after
   // any of them by name, and the foot is whatever lands after the last one.
   const blocks: Record<Slot, () => void> = {
@@ -4276,7 +4506,9 @@ async function collect(
       // The key on the heading is the one that gets you in, and then the one that gets you out:
       // a key beside the thing it acts on, which is where a key is found rather than learned.
       rows.push(...heading("PROJECTS", opts.width, opts.focused ? "esc" : "^T"));
-      for (const p of projects) {
+      // Yours, and only yours: a repository with a checkout on this disk. What is only on another
+      // computer is in that computer's section, below — see `machines`.
+      for (const p of projects.filter((p) => p.cwd !== null)) {
         rows.push(projectRow(p, opts, now));
         if (arrangement.isFolded(foldOf(p))) continue;
         // Its own conversations, then the ones in a main checkout somewhere else. Under the same
@@ -4284,19 +4516,17 @@ async function collect(
         // separate block would make you check two places for one repository, and that is the whole
         // complaint this answers.
         for (const s of p.sessions) rows.push(sessionRow(s, now, opts));
-        for (const r of p.agents) rows.push(remoteRow(r, opts, now, 0));
-        // Its worktrees, inside it — here and elsewhere, in one list. Each is a checkout row one
-        // level down, because a worktree of a repository is not a neighbour of the repository and
-        // the column should say so.
+        // Its worktrees on this machine, inside it. Each is a checkout row one level down, because a
+        // worktree of a repository is not a neighbour of the repository and the column should say so.
         for (const t of p.worktrees) {
           rows.push(treeRow(t, opts, now));
           if (arrangement.isFolded(t.fold)) continue;
           for (const s of t.sessions) rows.push(sessionRow(s, now, opts, 1));
-          for (const r of t.agents) rows.push(remoteRow(r, opts, now, 1));
         }
-        if (
-          p.sessions.length === 0 && p.agents.length === 0 && p.worktrees.length === 0
-        ) {
+        // Every other machine that has it, as a block of its own: its row, then its conversations
+        // and its worktrees under a rail in its colour — see {@link MachineBlock}.
+        for (const b of p.machines) pushBlock(b);
+        if (p.sessions.length === 0 && p.worktrees.length === 0 && p.machines.length === 0) {
           rows.push({ text: "     nothing here yet", hl: "Sidebar.Dim", inert: true });
         }
       }
@@ -4311,6 +4541,46 @@ async function collect(
         right: { text: `${opts.focused ? "o" : "^O"} `, hl: "Sidebar.Key" },
         value: { kind: "add" },
       });
+    },
+    // Every other computer, one section each, in its own colour: a heading that says which machine
+    // and whether it can be reached, and under it the repositories that are only over there.
+    //
+    // They used to be mixed in with yours — ranked above them, even, since a project with no rank
+    // here sorted as `0` — each carrying `@st` on its row and then again on a block row under it
+    // that said the same thing. What it looked like was a column where you could not tell at a
+    // glance which rows were yours. So yours are yours, up top, and a machine is a place: its name,
+    // its colour, and what is there.
+    machines: () => {
+      const elsewhere = projects.filter((p) => p.cwd === null);
+      for (const node of [...peers].sort((a, b) => a.info.name.localeCompare(b.info.name))) {
+        const id = node.info.id;
+        const mine = elsewhere
+          .filter((p) => bestMachine(p, opts)?.node.id === id)
+          .sort((a, b) => lastMoved(b) - lastMoved(a) || a.name.localeCompare(b.name));
+        const fold = `host:${id}`;
+        rows.push(blank());
+        rows.push(...machineHeading(node, mine.length, opts));
+        if (arrangement.isFolded(fold)) continue;
+        for (const p of mine) {
+          rows.push(projectRow(p, opts, now, id));
+          if (arrangement.isFolded(foldOf(p))) continue;
+          if (p.machines.length === 1) {
+            // One machine: the project row *is* the machine's checkout, so its conversations and
+            // worktrees hang straight off it, on a rail under its arrow.
+            const b = p.machines[0]!;
+            const rail = { hl: railOf(b.node.id, opts), at: 1 };
+            for (const r of b.main?.agents ?? []) rows.push(remoteRow(r, opts, now, 0, rail));
+            for (const t of b.trees) {
+              rows.push(treeRow(t, opts, now, 0, rail));
+              if (arrangement.isFolded(t.fold)) continue;
+              for (const r of t.agents) rows.push(remoteRow(r, opts, now, 1, rail));
+            }
+          } else {
+            // Several: one block each, exactly as under a project of yours.
+            for (const b of p.machines) pushBlock(b);
+          }
+        }
+      }
     },
     // No `archived` block any more: what you have put away is the archive plugin's panel, and its
     // row in this column arrives as a `sidebar.section` contribution like any third party's.
@@ -4363,7 +4633,13 @@ function blank(): ListRow<Target> {
  * they were always one repository and the panel was matching them on a path that is different on
  * every computer.
  */
-function projectRow(p: Project, opts: DrawOptions, now: number): ListRow<Target> {
+function projectRow(
+  p: Project,
+  opts: DrawOptions,
+  now: number,
+  /** The machine whose section this is drawn in, which therefore goes without saying on the row. */
+  under?: string,
+): ListRow<Target> {
   const fold = foldOf(p);
   const folded = opts.folded(fold);
   const arrow = opts.ascii ? (folded ? ">" : "v") : folded ? "▸" : "▾";
@@ -4371,7 +4647,7 @@ function projectRow(p: Project, opts: DrawOptions, now: number): ListRow<Target>
   // turn is in a scratch tree on the build box is still a repository where something is happening,
   // and the folded count has to count what folding hid.
   const within = [...p.sessions, ...p.worktrees.flatMap((t) => t.sessions)];
-  const outside = [...p.agents, ...p.worktrees.flatMap((t) => t.agents)];
+  const outside = p.machines.flatMap(blockAgents);
   const busy = within.find((s) => s.active_turn);
   const busyThere = outside.find((r) => r.agent.state === "running");
   const here = p.sessions.some((s) => s.is_active);
@@ -4423,7 +4699,23 @@ function projectRow(p: Project, opts: DrawOptions, now: number): ListRow<Target>
   // that what is true of every row does not earn a column on each of them. Where it *is* news is a
   // repository you have not cloned here at all, which is the row you would otherwise press `↵` on
   // expecting your own files. The conversations underneath say which of them are where.
-  const sky = p.cwd === null && p.hosts.length > 0 ? marker(p.link) : null;
+  // Which computer, by its code, and how many more when it is on several: the best-connected one
+  // is named because that is the one `↵` and `n` would reach.
+  // In a machine's own section that machine goes without saying; what is still news is any *other*
+  // machine that has it too.
+  const others = p.nodes
+    .filter((id) => id !== under)
+    .map((id) => ({ id, link: opts.links.get(id) }))
+    .sort((a, b) => rank(b.link) - rank(a.link) || a.id.localeCompare(b.id));
+  const best = others[0];
+  const sky = p.cwd === null && best
+    ? marker(best.link, opts.codes.get(best.id), others.length - 1, opts.colors.get(best.id))
+    : null;
+  // A repository that is only on one other machine says which branch that checkout is on, dim,
+  // after its name — the one fact about it the block row used to carry. Only when it is not the
+  // name again, which for a checkout named after its branch it would be.
+  const only = p.cwd === null && p.machines.length === 1 ? p.machines[0]?.main?.branch : undefined;
+  const on = only && only !== p.name ? `${opts.ascii ? " " : " ⎇ "}${only}` : "";
 
   // What is finished and unseen inside a project you have folded shut. Only when folded, because
   // folding is the thing that hid it: with the project open the conversation says so on its own
@@ -4488,29 +4780,36 @@ function projectRow(p: Project, opts: DrawOptions, now: number): ListRow<Target>
   // Everything the name and the badge have to share. The badge gives up its least important parts
   // before a single character comes off the name — a project you cannot read the name of is not a
   // row you can use, and how far behind the remote it is keeps until you widen the panel with `>`.
-  const room = opts.width - 8 - byteLength(mark) - byteLength(star) - (sky ? 2 : 0);
+  const room = opts.width - 8 - byteLength(mark) - byteLength(star) - (sky ? 1 + width(sky.text) : 0);
+  // The branch is the first thing to give way — it is context, and the name is the row.
+  const branchFits = on !== "" && Array.from(p.name).length + width(on) <= room;
+  const on_ = branchFits ? on : "";
   const decoration = fitBadge(
     opts.decorations.get(targetKey(target) ?? ""),
     room,
     Array.from(p.name).length,
   );
-  const name = clip(p.name, Math.max(6, room - badgeColumns(decoration)));
+  const name = clip(p.name, Math.max(6, room - badgeColumns(decoration) - width(on_)));
   const spans: Array<{ from: number; to: number; hl: string }> = [];
   if (star !== "") {
     const from = byteLength(` ${arrow} ${name}`);
     spans.push({ from, to: from + byteLength(star), hl: "Sidebar.Favorite" });
   }
-  if (mark !== "") {
+  if (on_ !== "") {
     const from = byteLength(` ${arrow} ${name}${star}`);
+    spans.push({ from, to: from + byteLength(on_), hl: "Sidebar.Dim" });
+  }
+  if (mark !== "") {
+    const from = byteLength(` ${arrow} ${name}${star}${on_}`);
     spans.push({ from, to: from + byteLength(mark), hl: markHl });
   }
   const sky_ = sky ? ` ${sky.text}` : "";
   if (sky) {
-    const from = byteLength(` ${arrow} ${name}${star}${mark} `);
+    const from = byteLength(` ${arrow} ${name}${star}${on_}${mark} `);
     spans.push({ from, to: from + byteLength(sky.text), hl: sky.hl });
   }
   return decorateRow({
-    text: ` ${arrow} ${name}${star}${mark}${sky_}`,
+    text: ` ${arrow} ${name}${star}${on_}${mark}${sky_}`,
     // A project's name is a directory name, and directory names are long. Clipped it is the same
     // eight characters as the three others you have open beside it, which is the panel failing at
     // the one thing it is for. The star and the unread dot are left off deliberately: they
@@ -4535,20 +4834,29 @@ function machinesOf(p: Project): Array<{ id: string; name: string; cwd: string }
   // The main checkouts first, and from the *checkouts* rather than from the conversations in them:
   // `n` on a repository row means a conversation in the repository, and a repository nobody has
   // started work in yet is exactly the row that has conversations to read nothing from.
-  for (const c of p.mains) add(c);
-  for (const t of p.worktrees) add(t);
+  for (const b of p.machines) {
+    const c = b.main ?? b.trees[0];
+    if (c) add(c);
+  }
   return out;
 }
 
 /**
- * A checkout that is not the main one here: a worktree, or anything on another machine.
+ * A checkout that is not the main one here: a worktree on this machine, or one on another machine
+ * inside that machine's block.
  *
- * One level inside the repository it belongs to, and the same row whichever machine it is on —
- * same arrow, same branch glyph, same name, same count — because it is the same kind of thing.
- * What marks a remote one out is the one column after the name, and that its verbs are about a
- * repository rather than about a directory on this disk.
+ * One level inside what it belongs to, and the same row whichever machine it is on — same arrow,
+ * same branch glyph, same name, same count — because it is the same kind of thing. `rail` is the
+ * group of the machine's block when it is inside one: the `│` down the left and the `⎇` wear it, so
+ * a worktree over there is the colour of the computer it is on.
  */
-function treeRow(c: Checkout, opts: DrawOptions, now: number): ListRow<Target> {
+function treeRow(
+  c: Checkout,
+  opts: DrawOptions,
+  now: number,
+  depth = 0,
+  rail?: Rail,
+): ListRow<Target> {
   const folded = opts.folded(c.fold);
   const arrow = opts.ascii ? (folded ? ">" : "v") : folded ? "▸" : "▾";
   const busy = c.sessions.find((s) => s.active_turn);
@@ -4576,17 +4884,15 @@ function treeRow(c: Checkout, opts: DrawOptions, now: number): ListRow<Target> {
     : unseen === 0 ? "" : unseen === 1
     ? opts.ascii ? " !" : " ●"
     : opts.ascii ? ` !${unseen}` : ` ●${unseen}`;
-  // The branch glyph, in the branch colour — what says "this row is a checkout" at a glance, so
-  // the name can be just the branch. No ASCII stand-in earns its column, so ASCII goes without.
+  // The branch glyph — what says "this row is a checkout" at a glance, so the name can be just the
+  // branch. In the branch colour here, and in the machine's inside another machine's block. No
+  // ASCII stand-in earns its column, so ASCII goes without.
   const glyph = opts.ascii ? "" : "⎇ ";
-  // Where it is, in one column, and only on the rows where that is news. Two checkouts of one
-  // branch on two machines are two rows and genuinely different directories with different
-  // uncommitted work in them — so this is not decoration, it is the only thing telling them apart.
-  const sky = c.node ? marker(c.node.link) : null;
-  // One step in from its repository's arrow, and the step is two columns — the same one a
-  // conversation takes from the project it is in. Three, when the star was on the left, made the
-  // nesting read as two levels where there is one.
-  const pad = "   ";
+  const link = c.node ? opts.links.get(c.node.id) ?? c.node.link : undefined;
+  // A tree over there that is somehow not inside a block still says where it is. Inside one, the
+  // block's row already has, and the rail says it on every row after.
+  const sky = c.node && !rail ? marker(link, opts.codes.get(c.node.id), 0, opts.colors.get(c.node.id)) : null;
+  const pad = indentFor(depth, rail);
   const label = treeName(c);
   const target: Target = c.node
     ? {
@@ -4594,22 +4900,23 @@ function treeRow(c: Checkout, opts: DrawOptions, now: number): ListRow<Target> {
       key: c.fold,
       name: label,
       machines: [{ id: c.node.id, name: c.node.name, cwd: c.cwd }],
-      link: linkWords(c.node.link),
+      link: linkWords(link),
     }
     : { kind: "project", cwd: c.cwd };
   // As on a project row, and two columns tighter: the branch name is what this row is, so the
   // badge is what gives way. See `projectRow`.
-  const room = opts.width - 8 - byteLength(glyph) - byteLength(mark) - (sky ? 2 : 0);
+  const room = opts.width - 8 - (width(pad) - 3) - byteLength(glyph) - byteLength(mark) -
+    (sky ? 1 + width(sky.text) : 0);
   const decoration = fitBadge(
     opts.decorations.get(targetKey(target) ?? ""),
     room,
     Array.from(label).length,
   );
   const name = clip(label, Math.max(6, room - badgeColumns(decoration)));
-  const spans: Array<{ from: number; to: number; hl: string }> = [];
+  const spans: Array<{ from: number; to: number; hl: string }> = [...railSpan(pad, rail)];
   if (glyph !== "") {
     const at = byteLength(`${pad}${arrow} `);
-    spans.push({ from: at, to: at + byteLength(glyph), hl: "Git.Branch" });
+    spans.push({ from: at, to: at + byteLength(glyph), hl: rail?.hl ?? "Git.Branch" });
   }
   if (mark !== "") {
     const at = byteLength(`${pad}${arrow} ${glyph}${name}`);
@@ -4631,7 +4938,13 @@ function treeRow(c: Checkout, opts: DrawOptions, now: number): ListRow<Target> {
     // already on the row.
     full: `${pad}${arrow} ${glyph}${label}`,
     indent: byteLength(`${pad}${arrow} `),
-    hl: here ? "Directory" : c.node ? "Sidebar.Remote" : decoration?.hl ?? "Sidebar.Dim",
+    // A checkout you can reach reads like one of ours; only one on a machine that cannot be reached
+    // right now is greyed, because that is the one you cannot act on.
+    hl: here
+      ? "Directory"
+      : c.node
+      ? link?.state === "up" ? "Sidebar.Dim" : "Sidebar.Remote"
+      : decoration?.hl ?? "Sidebar.Dim",
     spans: spans.length > 0 ? spans : undefined,
     right,
     value: target,
@@ -4639,42 +4952,216 @@ function treeRow(c: Checkout, opts: DrawOptions, now: number): ListRow<Target> {
 }
 
 /**
- * The one column that says a row is on another computer, and how that computer is reachable.
- *
- * `@`, because in a terminal that is already the word for it: every person who has typed
- * `ssh you@box` or read a shell prompt knows `@` means *over there, on that host*. A cloud was the
- * first answer and it is the world's mark for "not on this machine" everywhere except a terminal —
- * where what it actually reads as is a cloud *service*, which is precisely the wrong idea about a
- * laptop on the same desk. It is also ASCII, so there is nothing to fall back to and no terminal
- * that draws it at a width nobody expected.
- *
- * The *colour* carries the rest: green for a link that is up, a pulsing amber for one being
- * dialled or waiting on somebody over there, dim for one nothing is dialling. Which matters because
- * "not here" is not one fact — a conversation on a machine that is up is one you can open and
- * steer, and the same row on a machine that is down is one you can read about and not touch, and
- * those were drawn identically.
- *
- * `waiting` and the two dialling states share a hue and differ in what the row says about them
- * elsewhere: they are both "on its way, not there yet", and inventing a fourth colour for a
- * distinction the key card spells out in words would be spending the panel's scarcest resource on
- * something it cannot say.
+ * The machine a repository that is only elsewhere belongs to in the column — the one `↵` and `n`
+ * would reach: connected before not, then by name, so it does not move between sections as links
+ * come and go on the others.
  */
-function marker(link: LinkState | undefined): { text: string; hl: string } {
-  const glyph = "@";
+function bestMachine(p: Project, opts: DrawOptions): MachineBlock | undefined {
+  return [...p.machines].sort((a, b) =>
+    rank(opts.links.get(b.node.id)) - rank(opts.links.get(a.node.id)) ||
+    a.node.name.localeCompare(b.node.name)
+  )[0];
+}
+
+/** When anything in a repository over there last moved, for ordering a machine's section. */
+function lastMoved(p: Project): number {
+  return Math.max(0, ...p.machines.flatMap(blockAgents).map((r) => r.agent.updated_at));
+}
+
+/**
+ * A machine's section heading: `@st STARFIGHTER`, and a rule under it in the machine's colour.
+ *
+ * The same shape as `PROJECTS` above it — a heading and a rule — because it is the same kind of
+ * thing: a place, and what is there. The code and the rule wear the machine's colour, so the
+ * section is found by colour before it is read, and they go dim together when it cannot be reached;
+ * the right-hand column says why in a word. It is a row you can stand on: `↵` folds the whole
+ * section, and `c`, `C`, `t` and `n` act on the machine.
+ */
+function machineHeading(node: SwarmNode, projects: number, opts: DrawOptions): ListRow<Target>[] {
+  const id = node.info.id;
+  const link = opts.links.get(id) ?? node.link;
+  const code = marker(link, opts.codes.get(id), 0, opts.colors.get(id));
+  const folded = opts.folded(`host:${id}`);
+  const state = link?.state === "up"
+    ? folded && projects > 0 ? `${projects}` : ""
+    : link?.state === "waiting"
+    ? "not allowed yet"
+    : link?.state === "connecting" || link?.state === "retrying"
+    ? "connecting"
+    : "offline";
+  const lead = ` ${code.text} `;
+  const room = Math.max(4, opts.width - width(lead) - (state === "" ? 1 : width(state) + 2));
+  const name = clip(node.info.name.toUpperCase(), room);
+  return [
+    {
+      text: `${lead}${name}`,
+      full: `${lead}${node.info.name.toUpperCase()}`,
+      indent: 1,
+      hl: "Sidebar.Heading",
+      spans: [{ from: 1, to: 1 + byteLength(code.text), hl: code.hl }],
+      right: { text: state === "" ? "" : `${state} `, hl: link?.state === "up" ? "Sidebar.Dim" : code.hl },
+      value: {
+        kind: "elsewhere",
+        key: `host:${id}`,
+        name: node.info.name,
+        machines: [{ id, name: node.info.name, cwd: "" }],
+        link: linkWords(link),
+      },
+    },
+    { text: "─".repeat(Math.max(1, opts.width)), hl: railOf(id, opts), inert: true },
+  ];
+}
+
+/**
+ * The row a machine's block hangs from: `@ms ⎇ main`, in that machine's colour.
+ *
+ * Named like a worktree — by its branch — with the machine's code in front, because *which
+ * computer* is the first thing to know about everything under it. When its main checkout is on a
+ * different commit from ours the commit goes beside the branch, after a `≠`, since the branch
+ * alone would leave you assuming they are the same; when they match, or either side cannot say,
+ * nothing is added — a mark that is always there is a mark you stop seeing. The machine's full name
+ * follows when the column has room for it. A machine with only worktrees of the repository is named
+ * by its name rather than a branch.
+ */
+function machineRow(b: MachineBlock, opts: DrawOptions, now: number): ListRow<Target> {
+  const folded = opts.folded(b.fold);
+  const arrow = opts.ascii ? (folded ? ">" : "v") : folded ? "▸" : "▾";
+  const link = opts.links.get(b.node.id) ?? b.node.link;
+  const up = link?.state === "up";
+  const code = marker(link, opts.codes.get(b.node.id), 0, opts.colors.get(b.node.id));
+  const railHl = railOf(b.node.id, opts);
+  const agents = blockAgents(b);
+  const busy = agents.find((r) => r.agent.state === "running");
+  const right = busy?.agent.turn_started_at
+    ? {
+      text: `${elapsed(Math.max(0, now - busy.agent.turn_started_at * 1000))} `,
+      hl: "Status.Working",
+    }
+    : agents.length > 0
+    ? { text: `${agents.length} `, hl: "Sidebar.Dim" }
+    : { text: "" };
+  // Named by its branch when it said one. Its directory's name is not a branch, and put where a
+  // branch goes it read as one — `⎇ neosh` for a checkout nobody had asked the branch of.
+  const branch = b.main?.branch;
+  const glyph = branch && !opts.ascii ? "⎇ " : "";
+  const what = branch ?? b.node.name;
+  const commit = b.differs && b.main?.head
+    ? `${opts.ascii ? " != " : " ≠ "}${b.main.head.slice(0, 7)}`
+    : "";
+  const lead = `   ${arrow} `;
+  const head = `${lead}${code.text} ${glyph}`;
+  const room = Math.max(
+    6,
+    opts.width - width(head) - width(commit) - (right.text === "" ? 1 : width(right.text) + 1),
+  );
+  const name = clip(what, room);
+  // The machine's own name, when it is not already the label and there is room for all of it.
+  const left = room - width(name);
+  const named = branch && left >= width(b.node.name) + 2 ? `  ${b.node.name}` : "";
+  const spans: Array<{ from: number; to: number; hl: string }> = [];
+  let at = byteLength(lead);
+  spans.push({ from: at, to: at + byteLength(code.text), hl: code.hl });
+  at = byteLength(`${head}`) - byteLength(glyph);
+  if (glyph !== "") spans.push({ from: at, to: at + byteLength(glyph), hl: railHl });
+  at = byteLength(`${head}${name}`);
+  if (commit !== "") {
+    spans.push({ from: at, to: at + byteLength(commit), hl: "Swarm.Version" });
+    at += byteLength(commit);
+  }
+  if (named !== "") spans.push({ from: at, to: at + byteLength(named), hl: "Sidebar.Dim" });
+  return {
+    text: `${head}${name}${commit}${named}`,
+    full: `${head}${what}${commit}  ${b.node.name}`,
+    indent: byteLength(lead),
+    hl: up ? undefined : "Sidebar.Remote",
+    spans,
+    right,
+    value: {
+      kind: "elsewhere",
+      key: b.fold,
+      name: branch ? `${what} on ${b.node.name}` : b.node.name,
+      machines: [{ id: b.node.id, name: b.node.name, cwd: (b.main ?? b.trees[0])?.cwd ?? "" }],
+      link: linkWords(link),
+    },
+  };
+}
+
+/** Every conversation in a machine's block: its main checkout's, then its worktrees'. */
+function blockAgents(b: MachineBlock): SwarmAgent[] {
+  return [...(b.main?.agents ?? []), ...b.trees.flatMap((t) => t.agents)];
+}
+
+/**
+ * The `│` down the left of everything on one machine, and where it stands: `hl` is the machine's
+ * group, `at` the column — under the arrow of the row it hangs from, which is column 3 for a block
+ * inside one of your projects and column 1 for a project in that machine's own section.
+ */
+interface Rail {
+  hl: string;
+  at: number;
+}
+
+/**
+ * The group a machine is drawn in — its rail, its `⎇`, its section's rule — which is its colour
+ * while it can be reached and `Swarm.Down` while it cannot. Still in both cases: the rail is on every
+ * row of the block, and a block that pulsed while a link was being dialled would be the whole panel
+ * moving.
+ */
+function railOf(id: string, opts: DrawOptions): string {
+  return opts.links.get(id)?.state === "up" ? opts.colors.get(id) ?? "Swarm.Up" : "Swarm.Down";
+}
+
+/**
+ * The indent a row at `depth` starts with.
+ *
+ * Plain spaces. There was a `│` drawn into it down the left of everything on one machine, and it
+ * read as a border — a column of lines beside every block that made the panel look boxed in rather
+ * than grouped. The indent already says what hangs off what; the machine's colour is carried by the
+ * marks each row already has (the `·` of a conversation, the `⎇` of a checkout) instead.
+ */
+function indentFor(depth: number, _rail?: Rail): string {
+  return "   " + "  ".repeat(depth);
+}
+
+/** Nothing now: see {@link indentFor}. Kept as the one place a rail would be coloured. */
+function railSpan(_pad: string, _rail?: Rail): Array<{ from: number; to: number; hl: string }> {
+  return [];
+}
+
+/**
+ * Where a row is when it is not here: `@` and the machine's code, in the machine's colour.
+ *
+ * `@`, because in a terminal that is already the word for it: anyone who has typed `ssh you@box`
+ * reads it as *over there, on that host*. A cloud was the first answer and it is the world's mark
+ * for "not on this machine" everywhere except a terminal — where what it actually reads as is a
+ * cloud *service*, which is precisely the wrong idea about a laptop on the same desk.
+ *
+ * **The code says which host and the colour says it again**: `@ms` in that machine's own colour
+ * (`color`, a `Swarm.Host*` group) while it can be reached, a pulsing amber while it is being
+ * dialled or waiting on somebody over there, dim when nothing is dialling it. `more` counts the
+ * other computers a repository is also on, as `+1` — the code named is the one `↵` would reach.
+ */
+function marker(
+  link: LinkState | undefined,
+  code?: string,
+  more = 0,
+  color?: string,
+): { text: string; hl: string } {
+  const text = `@${code ?? ""}${more > 0 ? `+${more}` : ""}`;
   switch (link?.state) {
     case "up":
-      return { text: glyph, hl: "Swarm.Up" };
+      return { text, hl: color ?? "Swarm.Up" };
     case "connecting":
     case "retrying":
-      return { text: glyph, hl: "Swarm.Linking" };
+      return { text, hl: "Swarm.Linking" };
     case "waiting":
-      return { text: glyph, hl: "Swarm.Waiting" };
+      return { text, hl: "Swarm.Waiting" };
     default:
       // No entry at all is a machine the panel has a conversation from and no link row for, which
       // is a peer that went away between the two reads. Down is the honest reading of that, and it
       // is also the quietest — a row that shouts about a race is worse than one that under-reports
       // for a tick.
-      return { text: glyph, hl: "Swarm.Down" };
+      return { text, hl: "Swarm.Down" };
   }
 }
 
@@ -4697,53 +5184,87 @@ function linkWords(link: LinkState | undefined): string {
 /**
  * A conversation on another computer.
  *
- * Indented exactly as a local one, at the same depth, in the same list — because that is the
- * claim: it is the same project, being worked on somewhere else. Every column means what it means
- * on a conversation row here, including the right-hand one: how long the turn that is running has
- * been running, and nothing when none is.
+ * Inside that machine's block, one level down, with the block's rail beside it — the rail and the
+ * block row above say which computer, so the row itself spends its columns on the conversation.
+ * Every column means what it means on a conversation row here, including the right-hand one: how
+ * long the turn that is running has been running, and when it last moved otherwise.
  *
- * **The machine's name is not on the row.** It used to take the right-hand column — up to twelve
- * of them, permanently, on every remote row — which is the column a local row spends on how long
- * its turn has been running and how many conversations are folded inside it. That is a lot of a
- * narrow panel to spend saying `mac-studio` twenty times about twenty rows that are all on
- * `mac-studio`, and it clipped the one thing the row is for, which is what the conversation is
- * called. What replaces it is one column of `@` — which says *not here*, the fact you actually need
- * at a glance, and says in its colour whether the machine can be reached — and the name itself
- * moves to the key card, which appears beside the row you pause on and has room for a sentence. The
- * rule this follows is the panel's own: what is true of every row in a block does not earn a column
- * on each of them.
+ * **Drawn like one of yours while it can be reached.** It used to be grey whatever the link was
+ * doing, which made a block of conversations you could open and steer look disabled — the one thing
+ * the row must not say about the part of the panel you can use. Grey is kept for a machine that is
+ * not connected, where it is true.
  */
-function remoteRow(r: SwarmAgent, opts: DrawOptions, now: number, depth = 0): ListRow<Target> {
+function remoteRow(
+  r: SwarmAgent,
+  opts: DrawOptions,
+  now: number,
+  depth = 0,
+  /** The machine's rail, when the row is under something that already says which machine. */
+  rail?: Rail,
+): ListRow<Target> {
   const working = r.agent.state === "running";
   const link = opts.links.get(r.node.id);
-  const mark = marker(link);
+  // The one you are in, over there. Lit like a conversation of yours you are in: the same `▸`, the
+  // same colour, the whole title.
+  const here = opts.mirrored?.node === r.node.id && opts.mirrored.session === r.agent.session;
+  const mark = rail
+    ? { text: "", hl: "" }
+    : marker(link, opts.codes.get(r.node.id), 0, opts.colors.get(r.node.id));
   // The state glyph a local conversation carries, in the same column it carries it in, so a
   // project's conversations read as one list whichever machine each of them is on.
-  const glyph = working ? (opts.ascii ? "*" : "◍") : opts.ascii ? "." : "·";
-  const pad = "   " + "  ".repeat(depth);
+  const glyph = working
+    ? (here ? spinnerFrame() : opts.ascii ? "*" : "◍")
+    : here
+    ? (opts.ascii ? ">" : "▸")
+    : opts.ascii ? "." : "·";
+  const pad = indentFor(depth, rail);
   const lead = `${pad}${glyph} `;
-  const width = Math.max(8, opts.width - byteLength(lead) - 8);
-  const label = clip(r.agent.label, width);
-  const spans = [{
-    from: byteLength(`${lead}${label} `),
-    to: byteLength(`${lead}${label} ${mark.text}`),
-    hl: mark.hl,
-  }];
+  // The same clock a local row uses, in the same column: how long the turn that is running has
+  // been running — `ago` is for "last touched" and rounds a whole minute away, which on a turn that
+  // has been going twenty seconds reads as `now` for ever — and otherwise when it last moved, like
+  // a conversation here: a list where only some rows say how old they are looks half-drawn.
+  const age = working && r.agent.turn_started_at
+    ? elapsed(Math.max(0, now - r.agent.turn_started_at * 1000))
+    : r.agent.updated_at > 0
+    ? ago(now / 1000 - r.agent.updated_at)
+    : "";
+  const tail = mark.text === "" ? "" : ` ${mark.text}`;
+  // Counted rather than guessed, as `sessionRow` does: the lead, the code after the title, and the
+  // age column with a column of air either side of it.
+  const room = Math.max(
+    8,
+    opts.width - width(lead) - width(tail) - (age === "" ? 1 : width(age) + 2),
+  );
+  const label = clip(r.agent.label, room);
+  const spans = [...railSpan(pad, rail)];
+  // Under something that already named the machine, the conversation's own mark wears its colour —
+  // the one column every conversation row has, so a block reads as one machine's without a line
+  // drawn down beside it. Not while it is working: then the mark is the working colour's.
+  if (rail && !working && !here) {
+    const from = byteLength(pad);
+    spans.push({ from, to: from + byteLength(glyph), hl: rail.hl });
+  }
+  if (mark.text !== "") {
+    spans.push({
+      from: byteLength(`${lead}${label} `),
+      to: byteLength(`${lead}${label}${tail}`),
+      hl: mark.hl,
+    });
+  }
   return {
-    text: `${lead}${label} ${mark.text}`,
-    full: `${lead}${r.agent.label} ${mark.text}`,
+    text: `${lead}${label}${tail}`,
+    full: `${lead}${r.agent.label}${tail}`,
     indent: byteLength(lead),
-    hl: working ? "Status.Monitoring" : "Sidebar.Remote",
-    spans,
-    right: working && r.agent.turn_started_at
-      // The same clock a local row uses, in the same column: how long the turn that is running has
-      // been running. `ago` is for "last touched" and rounds a whole minute away, which on a turn
-      // that has been going twenty seconds reads as `now` for ever.
-      ? {
-        text: `${elapsed(Math.max(0, now - r.agent.turn_started_at * 1000))} `,
-        hl: "Status.Working",
-      }
-      : { text: "" },
+    expand: here,
+    hl: here
+      ? working && pulseBright() ? "Status.Working" : "Accent"
+      : working
+      ? "Status.Monitoring"
+      : link?.state === "up"
+      ? undefined
+      : "Sidebar.Remote",
+    spans: spans.length > 0 ? spans : undefined,
+    right: { text: age === "" ? "" : `${age} `, hl: working ? "Status.Working" : "Sidebar.Dim" },
     value: {
       kind: "remote",
       node: r.node.id,
@@ -4918,7 +5439,15 @@ function hints(opts: DrawOptions): ListRow<Target>[] {
   const cells: Array<[string, string]> = !opts.focused
     // `^T` is on the heading and `^O` on the add row, beside what they act on. What is left is
     // what has no row of its own.
-    ? [["^N", "new"], ["^F", "archive"], ["^K", "palette"], ["^B", "hide"], ["^Z", "keys"]]
+    ? [
+      ["^N", "new"],
+      ["^F", "archive"],
+      ["^K", "palette"],
+      ["^B", "hide"],
+      // How to reach settings from the composer, which has no key of its own to give it.
+      ["/settings", ""],
+      ["^Z", "keys"],
+    ]
     : [
       // What `↵` does *here*, because a strip that says `open` over a project is a strip you
       // learn to distrust.
@@ -4937,9 +5466,10 @@ function hints(opts: DrawOptions): ListRow<Target>[] {
           : "open",
       ],
       ["?", "keys"],
+      [",", "settings"],
       ["esc", "back"],
     ];
-  const lines = grid(cells, opts.width);
+  const lines = grid(cells, opts.width, 3);
   return [
     blank(),
     { text: "─".repeat(Math.max(1, opts.width)), hl: "Separator", inert: true },
@@ -4969,15 +5499,18 @@ function hints(opts: DrawOptions): ListRow<Target>[] {
 function grid(
   cells: Array<[string, string]>,
   width: number,
+  maxLines = 2,
 ): Array<{ text: string; spans: Array<{ from: number; to: number; hl: string }> }> {
   const cols = (t: string) => Array.from(t).length;
   const room = Math.max(1, width - 1);
-  const cell = Math.max(...cells.map(([k, l]) => cols(k) + 1 + cols(l)));
+  // A cell with no words is a key that says what it is on its own — `/settings` — so it has no
+  // space after it to pad.
+  const cell = Math.max(...cells.map(([k, l]) => cols(k) + (l === "" ? 0 : 1 + cols(l))));
   const perLine = Math.max(1, Math.floor((room + 2) / (cell + 2)));
   let shown = cells;
-  if (cells.length > perLine * 2) {
+  if (cells.length > perLine * maxLines) {
     const last = cells[cells.length - 1];
-    shown = cells.slice(0, perLine * 2 - 1);
+    shown = cells.slice(0, perLine * maxLines - 1);
     if (last) shown.push(last);
   }
   const lines: Array<{ text: string; spans: Array<{ from: number; to: number; hl: string }> }> =
@@ -4990,10 +5523,11 @@ function grid(
       const from = byteLength(text);
       text += key;
       spans.push({ from, to: byteLength(text), hl: "Sidebar.Key" });
-      text += ` ${label}`;
+      if (label !== "") text += ` ${label}`;
       // Pad to the column, except the last cell on the line — trailing spaces are what a
       // flush-right count would have to sit on top of.
-      if (j < perLine - 1) text += " ".repeat(Math.max(0, cell - cols(key) - 1 - cols(label)));
+      const used = cols(key) + (label === "" ? 0 : 1 + cols(label));
+      if (j < perLine - 1) text += " ".repeat(Math.max(0, cell - used));
     }
     lines.push({ text: text.trimEnd(), spans });
   }
@@ -5234,6 +5768,29 @@ async function installFooter(neosh: Neosh, subscriptions: PluginContext["subscri
       neosh.agent.selection().catch(() => null),
     ]);
     if (!current) return;
+
+    // Where you are, when it is not here: `@lb linux-box` on the strip, in that machine's colour,
+    // for as long as the conversation on screen is one of its. The composer looks exactly like the
+    // one for a conversation of yours — that is the point — so something on screen has to say which
+    // computer a message typed into it goes to.
+    if (current.mirror) {
+      const [codes, colors, nodes] = await Promise.all([
+        neosh.cmd.call<Record<string, string> | null>("swarm.codes").catch(() => null),
+        neosh.cmd.call<Record<string, string> | null>("swarm.colors").catch(() => null),
+        neosh.swarm.nodes().catch(() => [] as SwarmNode[]),
+      ]);
+      const id = current.mirror.node;
+      const up = nodes.find((n) => n.info.id === id)?.link.state === "up";
+      const code = codes?.[id] ?? "";
+      await neosh.status.set("swarm.here", {
+        text: `@${code} ${current.mirror.machine}${up ? "" : " · offline"}`,
+        short: `@${code}`,
+        hl: up ? colors?.[id] ?? "Swarm.Up" : "Swarm.Down",
+        priority: 3,
+      });
+    } else {
+      await neosh.status.clear("swarm.here");
+    }
 
     if (current.active_turn) {
       await neosh.status.set("turn", {

@@ -418,6 +418,29 @@ export async function activate({ neosh, subscriptions }: PluginContext) {
     }),
   );
 
+  // Answered somewhere else. A conversation on another machine offers its questions to the
+  // machines watching it as well as to its own screen, and whichever answers first is the answer —
+  // so the others are told, and a panel still up over a question that has gone would be `↵`
+  // answering nothing. Matched on the question text, which is the key the agent itself uses.
+  subscriptions.push(
+    neosh.event.on("neosh.prompt.withdrawn", (e) => {
+      const d = e.data as { session?: string; kind?: string; questions?: string[] } | null;
+      if (d?.kind !== "question" || !Array.isArray(d.questions)) return;
+      const texts = d.questions;
+      let moved = false;
+      for (const ask of [...queue]) {
+        if (ask.session !== (d.session ?? null)) continue;
+        if (ask.questions.length !== texts.length) continue;
+        if (!ask.questions.every((q, i) => q.question === texts[i])) continue;
+        finish(ask, null);
+        const i = queue.indexOf(ask);
+        if (i >= 0) queue.splice(i, 1);
+        moved = true;
+      }
+      if (moved) void sync();
+    }),
+  );
+
   subscriptions.push({
     dispose() {
       // Unloading with a question on screen must not leave a turn blocked on a panel that no

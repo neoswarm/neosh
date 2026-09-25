@@ -86,6 +86,18 @@ impl RepoStatus {
     }
 }
 
+/// Where a checkout's HEAD is, and nothing else. See [`crate::ApiCall::GitHeads`].
+#[derive(TS, Serialize, Deserialize, Clone, PartialEq, Eq, Debug, Default)]
+#[ts(export)]
+pub struct GitHead {
+    /// `None` on a detached HEAD.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch: Option<String>,
+    /// The full hash HEAD resolves to. `None` in a repository with no commits yet.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub commit: Option<String>,
+}
+
 #[derive(TS, Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
 #[ts(export)]
 pub struct BranchInfo {

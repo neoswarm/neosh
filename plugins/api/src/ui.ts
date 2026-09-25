@@ -500,6 +500,13 @@ export interface PickerOptions<T> {
    * ```
    */
   subscribe?(reload: () => void): Disposable;
+  /**
+   * Close as dismissed when this settles, if nobody has chosen yet.
+   *
+   * For a list that asks something another party can answer first — a permission prompt that the
+   * machine it belongs to has already answered is a picker whose `↵` would answer nothing.
+   */
+  until?: Promise<unknown>;
 }
 
 const NS = "neosh.ui.picker";
@@ -813,6 +820,11 @@ export async function picker<T>(
     opts.onQuery?.(query);
   };
 
+  if (opts.until) {
+    const gone = () => void close(null);
+    opts.until.then(gone, gone);
+  }
+
   if (opts.subscribe) {
     disposers.push(
       opts.subscribe(() => {
@@ -948,9 +960,22 @@ export async function picker<T>(
   }
   disposers.push(
     neosh.event.on("neosh.viewport", (e) => {
-      if ((e as { win?: WindowId }).win === win) void measure();
+      // The payload is `data`; reading `win` off the envelope matched nothing, so a panel never
+      // learnt it had been resized and went on paging by the height it opened at.
+      if ((e.data as { win?: WindowId } | null)?.win === win) void measure();
     }),
   );
+  // A paste is the filter too — one line of it, since a filter is one line.
+  if (filtering) {
+    disposers.push(onPaste(neosh, win, (text) => {
+      if (closed) return;
+      void (async () => {
+        cursor = 0;
+        await retype(query + oneLine(text));
+        if (!closed) await render();
+      })().catch(() => {});
+    }));
+  }
 
   await neosh.focus.push(win);
   disposers.push(await neosh.keymap.capture(win, command));
@@ -1362,7 +1387,9 @@ export async function confirm(
   };
   disposers.push(
     neosh.event.on("neosh.viewport", (e) => {
-      if ((e as { win?: WindowId }).win === win) void measure();
+      // The payload is `data`; reading `win` off the envelope matched nothing, so a panel never
+      // learnt it had been resized and went on paging by the height it opened at.
+      if ((e.data as { win?: WindowId } | null)?.win === win) void measure();
     }),
   );
   await measure();
@@ -1814,11 +1841,38 @@ export async function prompt(
     }, { desc: "prompt key" }),
   );
 
+  disposers.push(onPaste(neosh, win, (pasted) => {
+    if (closed) return;
+    text += oneLine(pasted);
+    void render().catch(() => {});
+  }));
+
   await neosh.focus.push(win);
   disposers.push(await neosh.keymap.capture(win, command));
   await bindWidgetKeys(neosh, win, command, keys);
   await render();
   return done;
+}
+
+/**
+ * What was pasted while `win` had the keyboard.
+ *
+ * A paste used to go into the composer whatever was focused — so pasting a model's name into the
+ * picker's filter typed it, invisibly, into the message behind the picker, which is exactly what a
+ * modal panel promises never happens to a keystroke. The workspace now hands it to the panel that
+ * has the keyboard, as the `neosh.paste` event, and this is how a panel takes it. Bracketed paste
+ * arrives whole, newlines and all: a field decides for itself whether it is one line.
+ */
+export function onPaste(neosh: Neosh, win: WindowId, cb: (text: string) => void): Disposable {
+  return neosh.event.on("neosh.paste", (e) => {
+    const data = e.data as { win?: WindowId; text?: unknown } | null;
+    if (data?.win === win && typeof data.text === "string") cb(data.text);
+  });
+}
+
+/** A paste as one line: a field that is one line has nowhere to put the rest. */
+function oneLine(text: string): string {
+  return text.replace(/\r?\n/g, " ").trim();
 }
 
 /**

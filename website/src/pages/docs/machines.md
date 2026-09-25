@@ -70,47 +70,84 @@ accepts_approvals = false  # may peers answer permission prompts here
 accepts_shells    = false  # may peers open a shell here
 ```
 
-Steering an agent is a message. Approving one is a write to this machine's disk. Opening a shell is a prompt with your credentials at it and nothing above it to say no. Each is a different kind of yes, so each is asked for separately and the last two are off by default. A build machine that should be watched and not touched sets `accepts_commands = false` and is visible, read-only, to everyone.
+Steering an agent is a message — and answering its *questions* is one too. Approving one, or changing what it may do without asking, is a write to this machine's disk. Opening a shell is a prompt with your credentials at it and nothing above it to say no. Each is a different kind of yes, so each is asked for separately and the last two are off by default. A build machine that should be watched and not touched sets `accepts_commands = false` and is visible, read-only, to everyone.
 
 Whatever a machine advertises, it checks again every time: a capability list is a courtesy to the other end's menus, never the enforcement.
 
 ## What you see
 
-**A project is one row, wherever its checkouts are.** Projects are matched by their normalised git remote rather than by path, so `/Users/me/dev/neosh` here and `/home/me/src/neosh` there are one repository — one row, with everything under it:
+**A project is one row, wherever its checkouts are**, and every other computer that has it is a **block** inside it. Projects are matched by their normalised git remote rather than by path, so `/Users/me/dev/neosh` here and `/home/me/src/neosh` there are one repository:
 
 ```
- PROJECTS
+ PROJECTS                       ^T
 ──────────────────────────────────
  ▾ neosh                         6
    ▸ Chasing the flake         12m
-   · Rework the tab bar        @
    ▾ ⎇ fix/composer-paste        2
      · Try the grapheme path
-   ▾ ⎇ fix/tab-strip @           1
-     · Nearly there            @
- ▾ api @                         3
-   · Rate limiting             @
+   ▾ @lb ⎇ main ≠ 4f3a1c2        2
+     · Rework the tab bar       3m
+     ▾ ⎇ fix/tab-strip           1
+       · Nearly there           1h
+
+ + Add project                  ^O
+
+ @lb LINUX-BOX
+──────────────────────────────────
+ ▾ api ⎇ main                    2
+   · Rate limiting              2h
+   ▾ ⎇ fix/burst                 1
+     · Try a token bucket      now
+ ▸ infra                         4
+
+ @ms MAC-STUDIO            offline
+──────────────────────────────────
+ ▸ design-site                   1
 ```
 
-Its conversations here and its conversations over there sit in the same list under it. Every other checkout — a worktree here, a worktree there, the main checkout there — is a row one level down, named by its branch. `api` is a repository this machine has no clone of at all, which is still somewhere you can see and start work.
+**Yours first, then one section per computer.** `PROJECTS` is what has a checkout on this disk. After it, every paired machine has a section of its own — its code and name, and a rule under them in its colour — holding the repositories that are **only** over there: `api` and `infra` are on `linux-box` and nowhere here. In a machine's section the machine goes without saying, so those rows are just the name and the branch its checkout is on, with its conversations and worktrees indented beneath it. The heading is a row you can stand on: `↵` folds the whole machine away, `c` and `C` connect and disconnect, `t` opens a shell in its home, and `n` starts a conversation somewhere on it. When a machine cannot be reached its heading says so — `offline`, `connecting`, `not allowed yet` — and its colour goes dim.
 
-The marker is one column of **`@`**, and its **colour is the link**:
+Inside one of your own projects, your own conversations and worktrees come first. Then each other machine that also has it is a row like a worktree — its **code**, its branch, and its name when there is room — with its conversations and its worktrees indented under it, the `·` of each conversation and the `⎇` of each worktree **in that machine's colour**, so wherever the cursor is, which computer the row is on is the colour of its mark. Another machine's work is never mixed into your own list: what it is working on was written against the code *it* has, and a row beside yours would say otherwise. `api` is a repository this machine has no clone of at all, which is still somewhere you can see and start work.
+
+**When its checkout is on a different commit from yours**, its row says so: `≠ 4f3a1c2`, in amber. When they match, or the other machine runs a neosh too old to say, nothing is added. Both sides read their commit straight off the repository's files, with no `git` process behind it.
+
+**Every machine has a colour of its own** — blue for the first, then violet, teal, orange, pink and lime — and it is the same colour in `^J`, in `^N`'s "which computer" and on the settings page. The colour follows the machine, not the order you paired them in, so adding a third computer never repaints the first two.
+
+The code in front of it says the rest, and **its colour says whether you can reach it**:
 
 | | |
 | --- | --- |
-| green | connected — you can open it, steer it, start things on it |
+| the machine's colour | connected — you can open it, steer it, start things on it |
 | amber, pulsing | being dialled, or waiting for somebody to allow this computer over there |
-| dim | nothing is dialling it |
+| dim | nothing is dialling it — everything of that machine's dims with it |
 
-`@` rather than a cloud, because in a terminal that is already the word for it: anyone who has typed `ssh you@box` reads `@` as *over there, on that host*, while a cloud reads as a cloud *service*, which is the wrong idea about a laptop on the same desk.
+The code is worked out from the machine's name — `ms` for `mac-studio`, `lb` for `linux-box`, the next candidate when two would clash — and `@` on a row about that machine, `^T` in `^J`, or the *Computers* page in settings changes it to one of your own (up to four letters or digits, kept in the `swarm.codes` workspace var). `@` because in a terminal that is already the word for *over there, on that host*: anyone who has typed `ssh you@box` reads it that way.
 
-A repository row wears one only when the repository is **not** here as well. What is true of nearly every row in a swarm of two machines does not earn a column on each of them; where it is news is a repository you have not cloned, which is the row you would otherwise press `↵` on expecting your own files.
+**A row on a machine you can reach is drawn like one of yours.** Only a machine that is not connected greys its rows, because that is the one case where the row is something you can read about and not act on.
 
-Which computer, and what the link is doing in words, is on the **key card** — pause on the row and it appears beside the panel: `on mac-studio · connected`. The name is not on the row itself, because a block of twenty rows that are all on `mac-studio` does not need to say so twenty times, and the columns it used to take are the ones the conversation's own name needs.
+Which computer by its full name, and what the link is doing in words, is on the **key card** — pause on the row and it appears beside the panel: `on mac-studio · connected`.
 
 Rows for a machine that has gone quiet stay where they are. They were real a moment ago and probably still are; what changed is that you cannot reach them, and a list that silently shortens is one you cannot tell from a list that never had them.
 
-`↵` on a remote conversation opens it: its history, then everything as it happens. `i` says something to it and `^C` asks its turn to stop.
+**`↵` on a conversation over there opens it as a conversation** — in the pane, drawn exactly as one of yours is: its history as a transcript with the same cards, then its turns live, tool calls and all. **The composer is the ordinary composer**: what you type is sent to that machine and answered by the agent running there, `Esc` asks its turn to stop, and a message typed at that machine's own keyboard appears here as it is asked. The row stays lit in the project panel while you are in it, and the status line says `@lb linux-box` in that machine's colour, because the composer looks the same either way and something on screen has to say which computer your message goes to.
+
+It is still that machine's conversation. It runs there, with that machine's files, model and permissions; nothing about it is saved here, and it does not appear among your own conversations — its row is in the machine's section, where it always was. Pictures you attach stay on this computer (the words are sent). If the machine is not connected, sending says so and leaves what you wrote in the field. An older neosh on the other end streams the words but not the tool calls; those appear when its turn ends, when the whole conversation is fetched again.
+
+**And the rest of the keyboard works on it too**, each key doing to that conversation what it does to one of yours — over there:
+
+| Key | In another machine's conversation |
+| --- | --- |
+| `⏎` `Esc` | Send, steer, and interrupt, as above |
+| `^P` | Pick the model **that machine** uses for it — from **its** providers and **its** models, the list its own `^P` shows, not this machine's. The footer shows the model it is using, and follows if somebody changes it at that keyboard |
+| `^E` | That model's settings — effort, thinking and the rest — as that machine offers them, applied over there |
+| `⇧⇥` | Its permission mode — only when that machine sets `accepts_approvals`, since full access is every future prompt answered yes. Otherwise it says so and changes nothing |
+| `^N` | A new conversation **on that machine**, starting from this one's directory: `^N ⏎` is a conversation beside this one, as it is on yours |
+| `<C-w>T` `<C-w>S` | A shell **on that machine**, in this conversation's directory. Needs `accepts_shells` there, like `t` |
+| rename, archive | Renamed or archived there. Deleting is refused: it is that machine's to do |
+
+The footer's context meter is that conversation's too, read off the machine it runs on. Signing in to a provider (`^S` in the picker) is refused here, because the providers in the list are that machine's and so is the key: sign in there. All of this needs a current neosh at both ends; an older one on the other machine still shows the name of its model, but `^P` lists this machine's.
+
+**When its agent asks you something, it asks you here.** A question — *which database?* — opens the same panel a question from one of your own agents does, in the pane that is showing the conversation, and the answer goes back to the agent that asked. It is offered to that machine's own screen at the same moment; whichever is answered first is the answer, and the other panel takes itself down. A **permission prompt** comes across the same way when that machine sets `accepts_approvals`, because a yes is a write to its disk. When it does not, the prompt is named in the corner — `linux-box is asking: Run cargo publish?` — and answered there.
 
 Three more keys work on any row that is about another machine, so the verbs are beside the thing they act on rather than behind `^J`:
 
@@ -119,6 +156,7 @@ Three more keys work on any row that is about another machine, so the verbs are 
 | `t` | A **terminal** in this project — here, or on the machine the row is on. See below |
 | `c` | Connect, or reconnect, to that machine |
 | `C` | Disconnect from it. `c` takes it back |
+| `@` | Choose the short code that machine is drawn with |
 
 `^J` is still where a machine is added, renamed or removed.
 

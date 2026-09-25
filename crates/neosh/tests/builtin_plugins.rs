@@ -10065,6 +10065,9 @@ struct Peer {
     events: tokio::sync::mpsc::UnboundedReceiver<neosh_swarm::SwarmEvent>,
     /// Whoever dialled us, learnt from the handshake — the address every answer goes back to.
     asker: Option<neosh_proto::NodeId>,
+    /// What this machine says it can run, whenever the workspace asks. Answered from inside
+    /// [`Peer::wait_event`], because the workspace asks the moment a conversation opens.
+    catalogue: neosh_proto::ModelCatalogue,
 }
 
 impl Peer {
@@ -10127,7 +10130,7 @@ impl Peer {
         let (handle, events) =
             neosh_swarm::node::spawn(std::sync::Arc::new(theirs), allowed, cfg, "0.4.6".into());
         drop(guard);
-        Self { _rt: rt, handle, events, asker: None }
+        Self { _rt: rt, handle, events, asker: None, catalogue: Default::default() }
     }
 
     /// Wait for the workspace to ask for a shell, and hand it one.
@@ -10187,6 +10190,11 @@ fn there(session: &str, label: &str, key: &str, cwd: &str, root: &str, branch: O
         state: neosh_proto::AgentState::Idle,
         message_count: 1,
         model: None,
+        instance: None,
+        mode: None,
+        options: Vec::new(),
+        context_tokens: 0,
+        context_window: None,
         turn_started_at: None,
         updated_at: now_secs(),
         usage: Default::default(),
@@ -10201,6 +10209,7 @@ fn theirs(key: &str, name: &str, cwd: &str, root: &str, branch: Option<&str>) ->
         cwd: cwd.into(),
         repo_root: Some(root.into()),
         branch: branch.map(str::to_string),
+        head: None,
         active: false,
         sessions: 0,
         running: 0,
@@ -10251,17 +10260,26 @@ fn a_repository_on_two_computers_is_one_row_with_both_lots_of_work_in_it() {
     let heads = rows.iter().filter(|l| l.contains("work") && !l.contains("\u{2387}")).count();
     assert_eq!(heads, 1, "one row for one repository:\n{rows:?}");
 
-    // Their main checkout's conversation sits under the repository with ours, and their worktree is
-    // a checkout row one level down — exactly where a local worktree goes.
+    // The other machine is a block of its own under the repository: its row, then its main
+    // checkout's conversation, then its worktree and the conversation in that — never folded in
+    // with ours, whatever it is on.
     let repo = named("work").expect("the repository row");
-    let mine = named("reading the parser").expect("their main-checkout conversation");
+    let block = named("@lb").expect("the machine's block row");
+    let mine = named("reading the").expect("their main-checkout conversation");
     let tree = named("fix/the-thing").expect("their worktree, as a checkout row");
-    let inside = named("chasing the flake").expect("the conversation in their worktree");
-    assert!(repo < mine && mine < tree && tree < inside, "nested, in order:\n{rows:?}");
+    let inside = named("chasing the").expect("the conversation in their worktree");
+    assert!(
+        repo < block && block < mine && mine < tree && tree < inside,
+        "nested, in order:\n{rows:?}"
+    );
 
-    // And every one of those rows says it is not here. One column, and the colour is the link.
+    // The block row says which machine, once; everything under it is indented under it, with no
+    // line drawn down the side.
+    let indent = |row: usize| rows[row].len() - rows[row].trim_start().len();
     for row in [mine, tree, inside] {
-        assert!(rows[row].contains('@'), "row {row} says it is elsewhere:\n{rows:?}");
+        assert!(!rows[row].contains('@'), "said once, on the block:\n{rows:?}");
+        assert!(!rows[row].contains('\u{2502}'), "no rail down the side:\n{rows:?}");
+        assert!(indent(row) > indent(block), "row {row} hangs off the block:\n{rows:?}");
     }
 }
 
@@ -10667,6 +10685,8 @@ fn a_workspace_refuses_a_shell_from_a_peer_that_asks_anyway() {
                 streams: true,
                 browse: true,
                 shells: true,
+                rich_stream: false,
+                catalogue: false,
                 projects: Vec::new(),
             };
             neosh_swarm::accept(&mut stream, &theirs, &allowed, &info, &caps).await.expect("paired");
@@ -10944,4 +10964,609 @@ fn a_marked_row_keeps_its_marks_under_the_cursor() {
         marks.iter().any(|(g, band)| g == "Sidebar.Selected" && *band),
         "and the cursor is a band under it, not a run over it: {marks:?}"
     );
+}
+
+/// `agent.append_prompt` is said at the end of the message that is sent — and only there.
+///
+/// The driver echoes the last user message it was handed, so the answer is the proof of what went
+/// over the wire; the transcript's own row for the question is the proof of what did not.
+#[test]
+fn standing_instructions_end_every_question_and_never_reach_the_transcript() {
+    let sb = Sandbox::new("append-prompt");
+    let dir = sb.root.join("config/plugins/lab");
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    std::fs::write(
+        dir.join("plugin.toml"),
+        "name = \"lab\"\nversion = \"0.1.0\"\nentry = \"main.ts\"\npermissions = [\"providers\"]\n",
+    )
+    .expect("write manifest");
+    std::fs::write(dir.join("main.ts"), SPOKEN_KNOB).expect("write plugin");
+    sb.write_config(
+        "[options]\n\"agent.model\" = \"lab/wordy\"\n\"agent.append_prompt\" = \"Be brief.\"\n",
+    );
+
+    let mut s = sb.start_letting_config_choose();
+    s.wait_for("spoken ready");
+    for c in ["h", "e", "l", "l", "o"] {
+        s.key(c);
+    }
+    s.special("enter");
+    s.wait_for("got[hello||Be brief.]");
+    assert!(
+        !s.chat_now().iter().any(|l| l.trim() == "Be brief."),
+        "the instruction is on the wire, not in the transcript:\n{:?}",
+        s.chat_now()
+    );
+}
+
+/// A setting changed on the settings screen is in effect and in `config.toml`, and `r` takes it
+/// back out of the file.
+#[test]
+fn the_settings_screen_saves_what_you_change_into_the_config_file() {
+    let sb = Sandbox::new("settings-save");
+    sb.write_config("# mine, keep this\n[options]\n\"sidebar.width\" = 40\n");
+    let file = sb.root.join("config/config.toml");
+    let read = || std::fs::read_to_string(&file).unwrap_or_default();
+
+    let mut s = sb.start();
+    s.wait_for("PROJECTS");
+    s.send(&command("settings.open"));
+    s.wait_open("[settings]");
+    assert!(
+        s.pump(|s| s.float_named("[settings]").iter().any(|l| l.contains("Keep main checkouts up to date"))),
+        "the General page names the setting people come for:\n{:?}",
+        s.float_named("[settings]")
+    );
+    // The second row of General, one step along.
+    s.key("j");
+    s.key("l");
+    s.drain_for(Duration::from_millis(1500));
+    let text = read();
+    assert!(text.contains("\"git.pull.auto\" = true"), "saved:\n{text}");
+    assert!(text.starts_with("# mine, keep this\n"), "the rest of the file is left alone:\n{text}");
+    assert!(text.contains("\"sidebar.width\" = 40"), "{text}");
+
+    s.key("r");
+    s.drain_for(Duration::from_millis(1500));
+    let text = read();
+    assert!(!text.contains("git.pull.auto"), "back to the default is the line coming out:\n{text}");
+    assert!(text.contains("\"sidebar.width\" = 40"), "{text}");
+}
+
+/// A paste into a panel that has the keyboard goes to the panel, not into the composer behind it.
+#[test]
+fn a_paste_goes_to_the_panel_with_the_keyboard_rather_than_behind_it() {
+    let sb = Sandbox::new("paste-panel");
+    let mut s = sb.start();
+    s.wait_for("PROJECTS");
+    s.send(&command("settings.open"));
+    s.wait_open("[settings]");
+    s.key("/");
+    assert!(s.pump(|s| !s.prompt_now().is_empty()), "the find field opened");
+    s.send(r#"{"type":"paste","text":"auto pull"}"#);
+    assert!(
+        s.pump(|s| s.prompt_now().iter().any(|l| l.contains("auto pull"))),
+        "the paste landed in the field:\n{:?}",
+        s.prompt_now()
+    );
+    assert!(
+        !s.composer_now().iter().any(|l| l.contains("auto pull")),
+        "and not in the composer behind it:\n{:?}",
+        s.composer_now()
+    );
+}
+
+/// Another machine's checkout is always a block of its own, in its colour, with its worktrees
+/// inside it — and when its commit is not ours, the block row says so.
+#[test]
+fn another_machine_is_a_block_of_its_own_and_says_when_it_is_on_another_commit() {
+    const KEY: &str = "git:github.com/neoswarm/work";
+    let sb = Sandbox::new("swarm-versions");
+    sb.git_init();
+    sb.git_remote("https://github.com/neoswarm/work.git");
+    let peer = Peer::beside(&sb, "linux-box");
+    // Same branch as ours, a commit we do not have.
+    let mut main = theirs(KEY, "work", "/srv/checkouts/work", "/srv/checkouts/work", Some("trunk"));
+    main.head = Some("deadbeef00000000000000000000000000000000".into());
+    peer.publish(
+        vec![
+            main,
+            theirs(KEY, "work", "/srv/checkouts/work/.wt/fix", "/srv/checkouts/work", Some("fix/the-thing")),
+        ],
+        vec![
+            there("r1", "reading the parser", KEY, "/srv/checkouts/work", "/srv/checkouts/work", Some("trunk")),
+            there("r2", "chasing the flake", KEY, "/srv/checkouts/work/.wt/fix", "/srv/checkouts/work", Some("fix/the-thing")),
+        ],
+    );
+
+    let mut s = sb.start();
+    s.wait_for("PROJECTS");
+    // Titles are clipped to the panel, so the needles are short. The commit travels with the
+    // project list, which arrives on the peer's heartbeat rather than with its conversations — so
+    // the wait is on the `≠` itself, not on the rows that happen to come first.
+    assert!(
+        s.pump(|s| {
+            let rows = s.sidebar_now();
+            ["@lb", "reading", "chasing", "fix/the-thing", "\u{2260} deadbee"]
+                .iter()
+                .all(|n| rows.iter().any(|l| l.contains(n)))
+        }),
+        "the machine's block arrives:\n{:?}",
+        s.sidebar_now()
+    );
+    let rows = s.sidebar_now();
+    let named = |needle: &str| rows.iter().position(|l| l.contains(needle));
+    let block = named("@lb").expect("the block row");
+    assert!(rows[block].contains("\u{2387} trunk"), "named by its branch:\n{rows:?}");
+    assert!(rows[block].contains("\u{2260} deadbee"), "and its commit, which is not ours:\n{rows:?}");
+    let conv = named("reading").expect("their conversation");
+    let tree = named("fix/the-thing").expect("their worktree");
+    let inside = named("chasing").expect("the conversation in it");
+    assert!(block < conv && conv < tree && tree < inside, "nested, in order:\n{rows:?}");
+    let indent = |row: usize| rows[row].chars().take_while(|c| *c == ' ' || *c == '\u{2502}').count();
+    assert!(indent(inside) > indent(tree), "their worktree's conversation is inside it:\n{rows:?}");
+    // And it is drawn in the machine's colour — the block row, and the rail down every row in it.
+    // One machine is the blue, `Swarm.Host1`, and nothing about it is a local worktree's colour.
+    let sidebar = s.buffer_named("[sidebar]").expect("the sidebar buffer");
+    let groups = s.groups_of(sidebar);
+    for row in [block, conv, tree, inside] {
+        assert!(
+            groups.get(row).is_some_and(|g| g.iter().any(|g| g == "Swarm.Host1")),
+            "row {row} wears the machine's colour: {:?}",
+            groups.get(row)
+        );
+    }
+    assert!(
+        groups.get(block).is_some_and(|g| g.iter().any(|g| g == "Swarm.Version")),
+        "the commit that is not ours is marked: {:?}",
+        groups.get(block)
+    );
+}
+
+/// Yours first, then a section per other computer: a repository only over there is under that
+/// machine's heading and nowhere else, and a checkout whose key is only a guess joins yours.
+#[test]
+fn another_computers_projects_are_in_its_own_section_under_yours() {
+    let sb = Sandbox::new("swarm-sections");
+    sb.git_init();
+    sb.git_remote("https://github.com/neoswarm/work.git");
+    let peer = Peer::beside(&sb, "linux-box");
+    peer.publish(
+        vec![
+            // Theirs of *this* repository, before that machine has read its origin: a guess.
+            theirs("dir:work", "work", "/srv/work", "/srv/work", Some("trunk")),
+            // And one this machine has no clone of.
+            theirs("git:github.com/neoswarm/faraway", "faraway", "/srv/faraway", "/srv/faraway", Some("main")),
+        ],
+        vec![there("r1", "over there", "git:github.com/neoswarm/faraway", "/srv/faraway", "/srv/faraway", Some("main"))],
+    );
+
+    let mut s = sb.start();
+    s.wait_for("PROJECTS");
+    assert!(
+        s.pump(|s| {
+            let rows = s.sidebar_now();
+            ["LINUX-BOX", "faraway", "over there", "\u{2387} trunk"]
+                .iter()
+                .all(|n| rows.iter().any(|l| l.contains(n)))
+        }),
+        "the machine's section arrives:\n{:?}",
+        s.sidebar_now()
+    );
+    let rows = s.sidebar_now();
+    let named = |needle: &str| rows.iter().position(|l| l.contains(needle));
+    let work = named(" \u{25be} work").or_else(|| named(" \u{25b8} work")).expect("our project");
+    let block = named("\u{2387} trunk").expect("their checkout of it, as a block inside ours");
+    let add = named("+ Add project").expect("the add row");
+    let heading = named("LINUX-BOX").expect("the machine's heading");
+    let faraway = named("faraway").expect("their project");
+    let conv = named("over there").expect("the conversation in it");
+    assert!(work < block && block < add, "the guessed key joined ours:\n{rows:?}");
+    assert!(add < heading && heading < faraway && faraway < conv, "theirs is under its heading:\n{rows:?}");
+    assert_eq!(
+        rows.iter().filter(|l| l.contains("faraway")).count(),
+        1,
+        "one row for their project — no block row repeating it:\n{rows:?}"
+    );
+    assert!(!rows[faraway].contains('@'), "the heading already says which machine:\n{rows:?}");
+    assert!(rows[faraway].contains("\u{2387} main"), "and which branch it is on:\n{rows:?}");
+    assert!(!rows[conv].contains('\u{2502}'), "no rail down the side:\n{rows:?}");
+}
+
+/// Folding a row about another machine folds it — it does not turn it into a project of yours.
+///
+/// The bug: the fold was written as a *project* var keyed by the row's name (`git:github.com/…`),
+/// and the panel reads a project var about a name it has not seen as a directory arriving — so the
+/// repository you had just folded jumped out of the machine's section and into yours.
+#[test]
+fn folding_a_row_about_another_machine_folds_it_and_moves_nothing() {
+    let sb = Sandbox::new("swarm-fold");
+    sb.git_init();
+    sb.git_remote("https://github.com/neoswarm/work.git");
+    let peer = Peer::beside(&sb, "linux-box");
+    peer.publish(
+        vec![theirs("git:github.com/neoswarm/faraway", "faraway", "/srv/faraway", "/srv/faraway", Some("main"))],
+        vec![there("r1", "over there", "git:github.com/neoswarm/faraway", "/srv/faraway", "/srv/faraway", Some("main"))],
+    );
+
+    let mut s = sb.start();
+    s.wait_for("PROJECTS");
+    assert!(
+        s.pump(|s| s.sidebar_now().iter().any(|l| l.contains("over there"))),
+        "their project arrives:\n{:?}",
+        s.sidebar_now()
+    );
+    s.enter_panel();
+    assert!(s.sidebar_seek("faraway"), "the cursor reaches it:\n{:?}", s.sidebar_now());
+    s.special("enter");
+    assert!(
+        s.pump(|s| !s.sidebar_now().iter().any(|l| l.contains("over there"))),
+        "folded:\n{:?}",
+        s.sidebar_now()
+    );
+    s.drain_for(Duration::from_millis(1500));
+    let rows = s.sidebar_now();
+    let add = rows.iter().position(|l| l.contains("+ Add project")).expect("the add row");
+    let faraway = rows.iter().position(|l| l.contains("faraway")).expect("still there");
+    assert!(add < faraway, "still in the machine's section, not among ours:\n{rows:?}");
+    assert_eq!(rows.iter().filter(|l| l.contains("faraway")).count(), 1, "and only once:\n{rows:?}");
+
+    // And back, with the same key.
+    s.special("enter");
+    assert!(
+        s.pump(|s| s.sidebar_now().iter().any(|l| l.contains("over there"))),
+        "unfolded:\n{:?}",
+        s.sidebar_now()
+    );
+}
+
+impl Peer {
+    /// Wait for something from the workspace under test, keeping track of who it is.
+    fn wait_event(
+        &mut self,
+        what: &str,
+        want: impl Fn(&neosh_swarm::SwarmEvent) -> bool,
+    ) -> neosh_swarm::SwarmEvent {
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        loop {
+            assert!(std::time::Instant::now() < deadline, "never saw {what}");
+            let Some(event) = self.events.blocking_recv() else { panic!("the peer stopped") };
+            if let neosh_swarm::SwarmEvent::PeerUp { node, .. } = &event {
+                self.asker = Some(node.id.clone());
+            }
+            if let neosh_swarm::SwarmEvent::Catalogue { node, id, .. } = &event {
+                self.handle.send(neosh_swarm::SwarmRequest::Catalogued {
+                    node: node.clone(),
+                    id: id.clone(),
+                    result: Ok(self.catalogue.clone()),
+                });
+            }
+            if want(&event) {
+                return event;
+            }
+        }
+    }
+
+    /// Say something about one of this machine's conversations to whoever is watching it.
+    fn stream(&self, session: &str, event: neosh_proto::StreamEvent) {
+        self.handle.send(neosh_swarm::SwarmRequest::Stream {
+            session: neosh_proto::SessionId(session.into()),
+            event,
+        });
+    }
+}
+
+/// A conversation on another computer opens as a conversation: the real transcript in the pane, and
+/// the composer sending to that machine.
+///
+/// It used to be a float of plain text with a one-line prompt behind `i`. What this pins is the
+/// whole loop: the history arrives and is drawn as a transcript, what is typed and sent goes over as
+/// a command, and what that machine's agent then does — the question, a tool call, the answer — is
+/// drawn as the same cards and text a turn here would draw.
+#[test]
+fn another_computers_conversation_opens_as_one_you_can_talk_to() {
+    use neosh_proto::{ContentBlock, Message, Role, StreamEvent};
+    const KEY: &str = "git:github.com/neoswarm/faraway";
+    let sb = Sandbox::new("swarm-mirror");
+    sb.git_init();
+    let mut peer = Peer::beside(&sb, "linux-box");
+    peer.publish(
+        vec![theirs(KEY, "faraway", "/srv/faraway", "/srv/faraway", Some("main"))],
+        vec![there("r1", "over there", KEY, "/srv/faraway", "/srv/faraway", Some("main"))],
+    );
+
+    let mut s = sb.start();
+    s.wait_for("PROJECTS");
+    assert!(
+        s.pump(|s| s.sidebar_now().iter().any(|l| l.contains("over there"))),
+        "their conversation arrives:\n{:?}",
+        s.sidebar_now()
+    );
+    let theirs_id = peer.handle.id().0.clone();
+    s.send(&format!(r#"{{"type":"command","name":"swarm.open","args":["{theirs_id}","r1"]}}"#));
+
+    // Opening it asks for it.
+    peer.wait_event("a subscription", |e| {
+        matches!(e, neosh_swarm::SwarmEvent::Subscribed { session, .. } if session.0 == "r1")
+    });
+    let said = |role: Role, text: &str| Message {
+        role,
+        content: vec![ContentBlock::Text { text: text.into() }],
+        at: None,
+    };
+    peer.stream("r1", StreamEvent::History {
+        messages: vec![
+            said(Role::User, "what is in here?"),
+            said(Role::Assistant, "a parser and a flaky test"),
+        ],
+    });
+    assert!(
+        s.pump(|s| s.chat_now().iter().any(|l| l.contains("a parser and a flaky test"))),
+        "the history is drawn as a transcript:\n{:?}",
+        s.chat_now()
+    );
+    assert!(
+        s.chat_now().iter().any(|l| l.contains("what is in here?")),
+        "questions and answers both:\n{:?}",
+        s.chat_now()
+    );
+
+    // What is typed here goes over there.
+    s.type_text("run the tests");
+    s.special("enter");
+    let asked = peer.wait_event("the message", |e| {
+        matches!(e, neosh_swarm::SwarmEvent::Command { .. })
+    });
+    let neosh_swarm::SwarmEvent::Command { command, session, .. } = asked else { unreachable!() };
+    assert_eq!(session.0, "r1");
+    assert_eq!(command, neosh_proto::AgentCommand::Send { text: "run the tests".into() });
+
+    // And what that machine's agent does with it is drawn as a turn here would be.
+    let call = neosh_proto::ToolCall {
+        id: neosh_proto::ToolCallId("c1".into()),
+        turn: neosh_proto::TurnId("t1".into()),
+        name: "Bash".into(),
+        input: serde_json::json!({ "command": "cargo test" }),
+    };
+    peer.stream("r1", StreamEvent::Asked { text: "run the tests".into(), images: 0 });
+    peer.stream("r1", StreamEvent::TurnStarted { turn: "t1".into() });
+    peer.stream("r1", StreamEvent::ToolStarted { turn: "t1".into(), call: call.clone() });
+    peer.stream("r1", StreamEvent::ToolFinished {
+        turn: "t1".into(),
+        call,
+        result: neosh_proto::ToolResult::ok("test result: ok. 12 passed"),
+    });
+    peer.stream("r1", StreamEvent::Token { turn: "t1".into(), text: "all twelve pass".into() });
+    peer.stream("r1", StreamEvent::TurnEnded {
+        turn: "t1".into(),
+        stop_reason: neosh_proto::StopReason::EndTurn,
+        usage: Default::default(),
+    });
+    assert!(
+        s.pump(|s| {
+            let chat = s.chat_now();
+            chat.iter().any(|l| l.contains("run the tests"))
+                && chat.iter().any(|l| l.contains("cargo test"))
+                && chat.iter().any(|l| l.contains("all twelve pass"))
+        }),
+        "the question, the tool card and the answer:\n{:?}",
+        s.chat_now()
+    );
+    // And the project panel says where you are: its row is lit.
+    assert!(
+        s.pump(|s| s.sidebar_now().iter().any(|l| l.contains("\u{25b8} over there"))),
+        "the remote row is the one you are in:\n{:?}",
+        s.sidebar_now()
+    );
+}
+
+/// Open another machine's conversation on the panel's own row, and a peer that has it ready.
+///
+/// What every test below starts from: the conversation `r1` on `linux-box`, open in this workspace's
+/// pane, its history drawn.
+fn opened_over_there(sb: &Sandbox, shells: Shells) -> (Session, Peer) {
+    opened_over_there_with(sb, shells, |_, _| {})
+}
+
+/// [`opened_over_there`], with the conversation and the peer's catalogue set up first.
+fn opened_over_there_with(
+    sb: &Sandbox,
+    shells: Shells,
+    setup: impl FnOnce(&mut neosh_proto::AgentSummary, &mut Peer),
+) -> (Session, Peer) {
+    const KEY: &str = "git:github.com/neoswarm/faraway";
+    sb.git_init();
+    let mut peer = Peer::beside_with(sb, "linux-box", shells);
+    let mut conversation = there("r1", "over there", KEY, "/srv/faraway", "/srv/faraway", Some("main"));
+    setup(&mut conversation, &mut peer);
+    peer.publish(
+        vec![theirs(KEY, "faraway", "/srv/faraway", "/srv/faraway", Some("main"))],
+        vec![conversation],
+    );
+    let mut s = sb.start();
+    s.wait_for("PROJECTS");
+    assert!(
+        s.pump(|s| s.sidebar_now().iter().any(|l| l.contains("over there"))),
+        "their conversation arrives:\n{:?}",
+        s.sidebar_now()
+    );
+    // By the row, with the keyboard, which is how anybody opens one.
+    s.enter_panel();
+    assert!(s.sidebar_seek("over there"), "the cursor reaches it:\n{:?}", s.sidebar_now());
+    s.special("enter");
+    peer.wait_event("a subscription", |e| {
+        matches!(e, neosh_swarm::SwarmEvent::Subscribed { session, .. } if session.0 == "r1")
+    });
+    peer.stream("r1", neosh_proto::StreamEvent::History {
+        messages: vec![neosh_proto::Message {
+            role: neosh_proto::Role::Assistant,
+            content: vec![neosh_proto::ContentBlock::Text { text: "ready when you are".into() }],
+            at: None,
+        }],
+    });
+    assert!(
+        s.pump(|s| s.chat_now().iter().any(|l| l.contains("ready when you are"))),
+        "the history is drawn:\n{:?}",
+        s.chat_now()
+    );
+    (s, peer)
+}
+
+/// `↵` on another machine's conversation leaves the panel, exactly as it does on one of yours.
+///
+/// It opened the conversation and kept the keyboard in the sidebar, so the first thing typed after
+/// choosing a conversation to talk to went into the panel's keys instead of into the conversation.
+#[test]
+fn opening_another_computers_conversation_puts_the_keyboard_in_it() {
+    let sb = Sandbox::new("swarm-mirror-focus");
+    let (mut s, mut peer) = opened_over_there(&sb, Shells::default());
+    s.type_text("hello there");
+    s.special("enter");
+    let sent = peer.wait_event("the message", |e| matches!(e, neosh_swarm::SwarmEvent::Command { .. }));
+    let neosh_swarm::SwarmEvent::Command { command, .. } = sent else { unreachable!() };
+    assert_eq!(command, neosh_proto::AgentCommand::Send { text: "hello there".into() });
+}
+
+/// A question the agent over there asks is asked here, and answered from here.
+///
+/// A conversation on a machine nobody is sitting at used to sit under a spinner until its question
+/// timed out — in front of the one person who could answer it. And when it is answered anywhere
+/// else first, the panel here comes down rather than staying up over a question that has gone.
+#[test]
+fn another_computers_agent_can_be_answered_from_here() {
+    let sb = Sandbox::new("swarm-mirror-ask");
+    let (mut s, mut peer) = opened_over_there(&sb, Shells::default());
+    let question = |text: &str| neosh_proto::UserQuestion {
+        question: text.into(),
+        header: "DB".into(),
+        options: vec![
+            neosh_proto::QuestionOption { label: "Postgres".into(), description: String::new() },
+            neosh_proto::QuestionOption { label: "SQLite".into(), description: String::new() },
+        ],
+        multi_select: false,
+    };
+    peer.stream("r1", neosh_proto::StreamEvent::Question {
+        id: "q1".into(),
+        questions: vec![question("Which database?")],
+    });
+    s.wait_for("Which database?");
+    s.type_text("2");
+    let answered = peer.wait_event("the answer", |e| matches!(e, neosh_swarm::SwarmEvent::Command { .. }));
+    let neosh_swarm::SwarmEvent::Command { command, session, .. } = answered else { unreachable!() };
+    assert_eq!(session.0, "r1");
+    let neosh_proto::AgentCommand::Answer { id, answers } = command else {
+        panic!("an answer, not {command:?}")
+    };
+    assert_eq!(id, "q1");
+    let answers = answers.expect("answered, not dismissed");
+    assert_eq!(answers[0].question, "Which database?");
+    assert_eq!(answers[0].answers, vec!["SQLite".to_string()]);
+
+    // Answered at the other keyboard first: the panel here goes.
+    peer.stream("r1", neosh_proto::StreamEvent::Question {
+        id: "q2".into(),
+        questions: vec![question("Which cache?")],
+    });
+    s.wait_for("Which cache?");
+    peer.stream("r1", neosh_proto::StreamEvent::Settled { id: "q2".into() });
+    assert!(
+        s.pump(|s| s.window_closed_for("[question]")),
+        "the panel comes down when the question is settled elsewhere"
+    );
+}
+
+/// A shell opened in another machine's conversation opens on that machine, in its directory.
+#[test]
+fn a_shell_in_another_computers_conversation_is_a_shell_over_there() {
+    let sb = Sandbox::new("swarm-mirror-shell");
+    let (mut s, mut peer) =
+        opened_over_there(&sb, Shells { theirs: true, ours: false });
+    s.send(r#"{"type":"command","name":"tab.new.term","args":[]}"#);
+    let asked = peer.wait_event("a shell", |e| matches!(e, neosh_swarm::SwarmEvent::PtyOpen { .. }));
+    let neosh_swarm::SwarmEvent::PtyOpen { cwd, .. } = asked else { unreachable!() };
+    assert_eq!(cwd.as_deref(), Some("/srv/faraway"), "in the conversation's directory, over there");
+}
+
+/// An answer to a question nothing here is waiting on is refused by name, not taken silently.
+#[test]
+fn an_answer_to_nothing_is_refused() {
+    let sb = Sandbox::new("swarm-answer-nothing");
+    sb.git_init();
+    let mut peer = Peer::beside(&sb, "linux-box");
+    let mut s = sb.start();
+    s.wait_for("PROJECTS");
+    let node = peer.wait_up();
+    let here = peer.wait_event("this workspace's conversations", |e| {
+        matches!(e, neosh_swarm::SwarmEvent::Inventory { agents, .. } if !agents.is_empty())
+    });
+    let neosh_swarm::SwarmEvent::Inventory { agents, .. } = here else { unreachable!() };
+    let session = agents[0].session.clone();
+    assert!(agents[0].mode.is_some(), "a summary says which mode the conversation is in");
+    peer.handle.send(neosh_swarm::SwarmRequest::Command {
+        node,
+        id: "a1".into(),
+        session,
+        command: neosh_proto::AgentCommand::Answer { id: "nope".into(), answers: None },
+    });
+    let answer = peer.wait_event("the refusal", |e| matches!(e, neosh_swarm::SwarmEvent::Answer { .. }));
+    let neosh_swarm::SwarmEvent::Answer { result, .. } = answer else { unreachable!() };
+    assert!(
+        matches!(&result, Err(neosh_proto::Refusal::Failed { message }) if message.contains("already")),
+        "refused by name: {result:?}"
+    );
+    drop(s);
+}
+
+/// Another machine's conversation shows *that* machine's models: in the footer, in `^P`, and in
+/// what choosing one sends.
+///
+/// The footer read this machine's catalogue for a model this machine may not serve, so it said
+/// nothing useful, and `^P` listed this machine's providers — every choice in it a model the
+/// conversation could not run on.
+#[test]
+fn another_computers_conversation_shows_its_own_models() {
+    let sb = Sandbox::new("swarm-mirror-models");
+    let (mut s, mut peer) = opened_over_there_with(&sb, Shells::default(), |conversation, peer| {
+        conversation.model = Some("far-opus".into());
+        conversation.instance = Some("far-cli".into());
+        let credential: neosh_proto::CredentialInfo = serde_json::from_value(serde_json::json!({
+            "instance": "far-cli",
+            "display_name": "Far Away CLI",
+            "driver": "claude-cli",
+            "source": { "kind": "plan", "via": "far" },
+            "account": "plan",
+            "driver_available": true,
+            "accepts_key": false,
+        }))
+        .expect("a credential");
+        let model = |id: &str, name: &str, family: &str| {
+            let mut info = neosh_proto::ModelInfo::undescribed(id, name);
+            info.family = Some(family.into());
+            neosh_proto::ModelEntry { instance: neosh_proto::InstanceId("far-cli".into()), model: info }
+        };
+        peer.catalogue = neosh_proto::ModelCatalogue {
+            credentials: vec![credential],
+            models: vec![model("far-opus", "Far Opus", "opus"), model("far-haiku", "Far Haiku", "haiku")],
+        };
+    });
+    assert!(
+        s.pump(|s| s.status_now().iter().any(|l| l.contains("far-opus"))),
+        "the footer names the model that machine is using:\n{:?}",
+        s.status_now()
+    );
+
+    // `^P` lists that machine's providers and models.
+    s.send(r#"{"type":"command","name":"model.pick","args":[]}"#);
+    s.wait_for("Far Away CLI");
+    s.wait_for("Far Haiku");
+    s.special("esc");
+
+    // And choosing one tells that machine.
+    s.send(r#"{"type":"command","name":"model.line","args":["haiku"]}"#);
+    let chosen = peer.wait_event("the model", |e| matches!(e, neosh_swarm::SwarmEvent::Command { .. }));
+    let neosh_swarm::SwarmEvent::Command { command, .. } = chosen else { unreachable!() };
+    let neosh_proto::AgentCommand::SetModel { instance, model, .. } = command else {
+        panic!("a model, not {command:?}")
+    };
+    assert_eq!((instance.as_str(), model.as_str()), ("far-cli", "far-haiku"));
 }

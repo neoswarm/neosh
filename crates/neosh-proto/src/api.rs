@@ -30,7 +30,9 @@ use crate::ui::{
     KeyPress, LineDraw, MessageLevel, NoticeKind, Rect, ScrollAmount, SelectShape, SurfaceCell,
     TabInfo, TextEdit, WindowLayout,
 };
-use crate::vcs::{BranchInfo, CommitInfo, DiffTarget, PullRequest, RepoStatus, WorktreeInfo};
+use crate::vcs::{
+    BranchInfo, CommitInfo, DiffTarget, GitHead, PullRequest, RepoStatus, WorktreeInfo,
+};
 
 /// Enough history for a commit-message prompt without turning one keystroke into a full `git log`.
 fn default_log_limit() -> u32 {
@@ -1170,6 +1172,21 @@ pub enum ApiCall {
         name: String,
     },
     OptAll,
+    /// Set an option **and write it down**: into `[options]` in the user's `config.toml`, so it is
+    /// still the value after a restart. `None` restores the default and takes the line out again.
+    ///
+    /// Separate from [`Self::OptSet`] because the two are different promises. A plugin setting an
+    /// option at runtime — `init.ts` choosing a width, a panel resizing itself with `>` — is saying
+    /// what the value is *now*, and an editor that rewrote your config file every time one of them
+    /// did would be one you stopped trusting with the file. This is the settings screen's verb: a
+    /// person chose a value, on a screen that says it is saved, and the file is where a chosen value
+    /// lives. The rest of the file is left exactly as it was — comments, order, blank lines — since
+    /// it is still yours.
+    OptPersist {
+        name: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        value: Option<OptionValue>,
+    },
 
     // ---- plugin state --------------------------------------------------
     // Small facts a plugin needs to remember across restarts: which projects are pinned, what order
@@ -1308,6 +1325,16 @@ pub enum ApiCall {
     /// Delivered as [`crate::plugin::PluginEvent::SwarmStream`]. Idempotent, and worth dropping
     /// when you stop looking — a subscription is the difference between a quiet swarm and one where
     /// every machine sends every token to everyone.
+    /// Open another machine's conversation here, as one of yours: the same transcript, composer and
+    /// keys, with what you send and `Esc` going to that machine. Answers with the local
+    /// conversation it made — or found, when the same one is already open — after moving the
+    /// terminal that asked (or `view`) into it. See [`crate::MirrorOf`].
+    SwarmMirror {
+        node: NodeId,
+        session: SessionId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        view: Option<ViewId>,
+    },
     SwarmSubscribe {
         node: NodeId,
         session: SessionId,
@@ -1533,6 +1560,18 @@ pub enum ApiCall {
     },
     /// What this branch would merge into: `origin/HEAD`, else `main`/`master`.
     GitDefaultBranch,
+    /// Where HEAD is in each of these directories: the branch, and the commit it points at.
+    ///
+    /// Read off the repository's files rather than out of a `git` subprocess, which is what makes
+    /// it cheap enough to ask on every redraw of a panel: a handful of small reads per directory,
+    /// answered on the host loop. What it is for is comparing checkouts — whether the copy of a
+    /// repository on another machine is the version this one has — and that question is asked for
+    /// every project row, every few seconds, which a `git status` apiece could never afford.
+    ///
+    /// One answer per directory, in order; `None` for one that is not a repository at all.
+    GitHeads {
+        cwds: Vec<String>,
+    },
     GitCreateBranch {
         name: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1921,6 +1960,8 @@ pub enum ApiOk {
     Messages { messages: Vec<Message> },
     // ---- version control ----
     Status { status: RepoStatus },
+    /// Answers [`ApiCall::GitHeads`], one entry per directory asked about.
+    Heads { heads: Vec<Option<GitHead>> },
     Branches { branches: Vec<BranchInfo> },
     Worktrees { worktrees: Vec<WorktreeInfo> },
     Pulls { pulls: Vec<PullRequest> },

@@ -1,0 +1,21 @@
+{
+  "name": "@neosh/settings",
+  "version": "0.4.11",
+  "description": "Every setting in the workspace on one screen, saved to config.toml as you change it.",
+  "license": "MIT",
+  "type": "module",
+  "keywords": [
+    "neosh",
+    "neosh-plugin"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/neoswarm/neosh.git",
+    "directory": "plugins/builtin/settings"
+  },
+  "files": [
+    "*.ts",
+    "plugin.toml",
+    "!._*"
+  ]
+}

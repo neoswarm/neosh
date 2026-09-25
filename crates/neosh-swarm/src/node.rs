@@ -15,7 +15,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use neosh_proto::{
-    AgentCommand, AgentSummary, AscpMessage, NodeCapabilities, NodeId, NodeInfo, Refusal,
+    AgentCommand, AgentSummary, AscpMessage, ModelCatalogue, NodeCapabilities, NodeId, NodeInfo,
+    Refusal,
     RemoteProject, SessionId, StreamEvent,
 };
 use tokio::io::AsyncWriteExt;
@@ -106,6 +107,10 @@ pub enum SwarmRequest {
     Browse { node: NodeId, id: String, prefix: String },
     /// Answer a [`SwarmEvent::Browse`] that came in.
     Browsed { node: NodeId, id: String, result: Result<Vec<String>, Refusal> },
+    /// Ask a peer which models it can run a conversation with.
+    Catalogue { node: NodeId, id: String, refresh: bool },
+    /// Answer a [`SwarmEvent::Catalogue`] that came in.
+    Catalogued { node: NodeId, id: String, result: Result<ModelCatalogue, Refusal> },
     Subscribe { node: NodeId, session: SessionId },
     Unsubscribe { node: NodeId, session: SessionId },
     /// Something happened in a local session. Sent only to peers that subscribed to it.
@@ -182,6 +187,10 @@ pub enum SwarmEvent {
     Browse { node: NodeId, id: String, prefix: String },
     /// A browse we sent has been answered. Exactly one of these per browse, ever.
     Browsed { node: NodeId, id: String, result: Result<Vec<String>, Refusal> },
+    /// A peer wants our model catalogue. The host must answer with [`SwarmRequest::Catalogued`].
+    Catalogue { node: NodeId, id: String, refresh: bool },
+    /// A catalogue we asked for. A refusal arrives as [`Self::Answer`], as every refusal does.
+    Catalogued { node: NodeId, id: String, catalogue: ModelCatalogue },
     /// A peer wants a shell here. The host must answer with [`SwarmRequest::PtyOpened`].
     PtyOpen { node: NodeId, id: String, cwd: Option<String>, cols: u16, rows: u16 },
     /// A shell we asked for has been answered. Exactly one of these per open, ever.
@@ -309,6 +318,10 @@ async fn run(
         // what is advertised is what was asked for — and it is checked again when one arrives,
         // because a capability is a courtesy to the other end's UI and never the enforcement.
         shells: config.accepts_shells,
+        // A build fact, like `browse`: this binary reads the tool and question events that make a
+        // watched conversation a whole transcript.
+        rich_stream: true,
+        catalogue: true,
         projects: Vec::new(),
     };
 
@@ -559,6 +572,40 @@ async fn run(
                             }
                         }
                     }
+                    SwarmRequest::Catalogue { node, id, refresh } => match peers.get(&node) {
+                        // `browse`'s rule: never a message the far end cannot parse.
+                        Some(p) if p.capabilities.catalogue => {
+                            let _ = p.out.send(AscpMessage::Catalogue { id, refresh });
+                        }
+                        Some(p) => {
+                            let _ = events.send(SwarmEvent::Answer {
+                                node,
+                                id,
+                                result: Err(Refusal::NotPermitted {
+                                    what: format!(
+                                        "{} is running neosh {}, which cannot list its models for \
+                                         another machine",
+                                        p.info.name, p.info.version
+                                    ),
+                                }),
+                            });
+                        }
+                        None => {
+                            let _ = events.send(SwarmEvent::Answer {
+                                node,
+                                id,
+                                result: Err(Refusal::Busy { message: "not connected".into() }),
+                            });
+                        }
+                    },
+                    SwarmRequest::Catalogued { node, id, result } => {
+                        if let Some(p) = peers.get(&node) {
+                            let _ = p.out.send(match result {
+                                Ok(catalogue) => AscpMessage::Catalogued { id, catalogue },
+                                Err(refusal) => AscpMessage::Refused { id, refusal },
+                            });
+                        }
+                    }
                     SwarmRequest::Browsed { node, id, result } => {
                         if let Some(p) = peers.get(&node) {
                             let _ = p.out.send(match result {
@@ -643,7 +690,14 @@ async fn run(
                         // Only to peers that asked. This is the message family that would otherwise
                         // be one per token per peer, and the subscription is the whole of what
                         // keeps a twenty-machine swarm quiet.
+                        //
+                        // And only what each of them can read: a tool or question event to a peer
+                        // built before they existed is a frame it cannot parse, which drops the
+                        // link. It goes on getting the words, as it always did.
                         for p in peers.values() {
+                            if event.is_rich() && !p.capabilities.rich_stream {
+                                continue;
+                            }
                             if p.watching.contains(&session) {
                                 let _ = p.out.send(AscpMessage::Stream {
                                     session: session.clone(),
@@ -755,7 +809,12 @@ async fn run(
                         // Refused here rather than passed up when this node does not accept them
                         // at all: the host should not have to re-derive a policy it already
                         // declared, and a refusal that never reaches the caller is a hang.
-                        let allowed = if matches!(command, AgentCommand::Approve { .. }) {
+                        // A mode is every future prompt answered in advance, so it is held to
+                        // the rule a single answer is.
+                        let allowed = if matches!(
+                            command,
+                            AgentCommand::Approve { .. } | AgentCommand::SetMode { .. }
+                        ) {
                             caps.accepts_commands && caps.accepts_approvals
                         } else {
                             caps.accepts_commands
@@ -788,6 +847,23 @@ async fn run(
                                 },
                             });
                         }
+                    }
+                    AscpMessage::Catalogue { id, refresh } => {
+                        // Browse's gate, for Browse's reason: only somebody who may steer a
+                        // conversation here has any use for the list of what it could run on.
+                        if caps.accepts_commands {
+                            let _ = events.send(SwarmEvent::Catalogue { node, id, refresh });
+                        } else if let Some(p) = peers.get(&node) {
+                            let _ = p.out.send(AscpMessage::Refused {
+                                id,
+                                refusal: Refusal::NotPermitted {
+                                    what: "this node does not accept commands".into(),
+                                },
+                            });
+                        }
+                    }
+                    AscpMessage::Catalogued { id, catalogue } => {
+                        let _ = events.send(SwarmEvent::Catalogued { node, id, catalogue });
                     }
                     AscpMessage::Browsed { id, paths } => {
                         let _ = events.send(SwarmEvent::Browsed { node, id, result: Ok(paths) });
@@ -1146,6 +1222,11 @@ mod tests {
             state: AgentState::Idle,
             message_count: 0,
             model: None,
+            instance: None,
+            mode: None,
+            options: Vec::new(),
+            context_tokens: 0,
+            context_window: None,
             turn_started_at: None,
             updated_at: 0,
             usage: Default::default(),

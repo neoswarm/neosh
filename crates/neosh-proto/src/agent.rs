@@ -354,6 +354,27 @@ pub struct SessionInfo {
     /// says.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub permission_mode: Option<PermissionMode>,
+    /// Set when this conversation is **another machine's**, opened here: the agent runs over there
+    /// and everything this one shows arrived on that machine's stream. See [`MirrorOf`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mirror: Option<MirrorOf>,
+}
+
+/// Which conversation on which machine a local one is a window onto.
+///
+/// A conversation on another computer opened here is an ordinary conversation to everything that
+/// draws one — the same transcript, the same cards, the same composer — and this is the one fact
+/// that says otherwise: what you send goes to that machine, and `Esc` asks *it* to stop. It is never
+/// saved and never in a list, because the conversation it describes lives over there and is
+/// already listed as that machine's.
+#[derive(TS, Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
+#[ts(export)]
+pub struct MirrorOf {
+    pub node: crate::NodeId,
+    /// Its id on its own machine.
+    pub session: SessionId,
+    /// What that machine is called, for saying where you are.
+    pub machine: String,
 }
 
 // ---------------------------------------------------------------------------

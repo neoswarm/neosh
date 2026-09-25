@@ -118,6 +118,34 @@ pub fn inject(messages: &mut [Message], words: &[String]) {
     last.content.insert(0, neosh_proto::ContentBlock::Text { text: words.join("\n") });
 }
 
+/// Put standing instructions at the end of the message this turn is about to send.
+///
+/// What `agent.append_prompt` is: something you want said every time — *run the tests before you
+/// say you are done*, *answer in British English* — without typing it every time. It goes where the
+/// words above go and for the same three reasons: every driver gets it, the transcript never does
+/// (what you typed is what stays on screen and what the next turn replays, so it is said once per
+/// question rather than once more for every question before it), and a tool result handed back
+/// mid-loop is not a message anybody sent. At the **end** rather than the top, because it qualifies
+/// the question rather than introducing it, and a model reads the last thing it was told as the
+/// thing that most recently applies.
+///
+/// Blank is nothing at all, so the default costs no request a single byte.
+pub fn append(messages: &mut [Message], text: &str) {
+    let text = text.trim();
+    if text.is_empty() {
+        return;
+    }
+    let Some(last) = messages.iter_mut().rfind(|m| m.role == Role::User) else { return };
+    // The last text block, so a question with a picture after it still ends with the instruction.
+    for block in last.content.iter_mut().rev() {
+        if let neosh_proto::ContentBlock::Text { text: body } = block {
+            *body = format!("{body}\n\n{text}");
+            return;
+        }
+    }
+    last.content.push(neosh_proto::ContentBlock::Text { text: text.to_string() });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -219,6 +247,33 @@ mod tests {
         let ContentBlock::Text { text: last } = &messages[2].content[0] else { panic!() };
         assert_eq!(first, "first", "history is what was actually said");
         assert_eq!(last, "ultrathink\n\nsecond");
+    }
+
+    #[test]
+    fn standing_instructions_end_the_question_and_only_that_one() {
+        let mut messages = vec![
+            Message { role: Role::User, content: vec![ContentBlock::Text { text: "first".into() }], at: None },
+            Message { role: Role::Assistant, content: vec![ContentBlock::Text { text: "answer".into() }], at: None },
+            Message {
+                role: Role::User,
+                content: vec![
+                    ContentBlock::Text { text: "look at this".into() },
+                    ContentBlock::Image { path: "/tmp/x.png".into(), media_type: "image/png".into() },
+                ],
+                at: None,
+            },
+        ];
+        append(&mut messages, "  Run the tests before you say you are done.\n");
+        let ContentBlock::Text { text: first } = &messages[0].content[0] else { panic!() };
+        let ContentBlock::Text { text: last } = &messages[2].content[0] else { panic!() };
+        assert_eq!(first, "first", "history is what was actually said");
+        assert_eq!(last, "look at this\n\nRun the tests before you say you are done.");
+        assert_eq!(messages[2].content.len(), 2, "the picture is still there, and nothing was added");
+
+        // Blank is nothing, not a trailing pair of newlines on every question.
+        let before = messages.clone();
+        append(&mut messages, "   ");
+        assert_eq!(messages, before);
     }
 
     #[test]

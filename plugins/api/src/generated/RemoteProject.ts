@@ -28,6 +28,16 @@ export type RemoteProject = {
    */
   branch?: string | null;
   /**
+   * The commit that checkout is on — the full hash HEAD resolves to.
+   *
+   * What says whether this machine's copy of a repository is the *same version* as another's.
+   * A branch name does not: `main` here and `main` over there are the same row only while they
+   * point at the same commit, and a build box sitting four commits behind is a different place
+   * to start work from, which a panel should draw as one. Absent from an older node, and from a
+   * checkout with no commits — both read as "cannot tell", which a panel treats as the same.
+   */
+  head?: string | null;
+  /**
    * Whether this node has a conversation open in it now.
    *
    * Meant something for exactly as long as this list was derived from live conversations: every

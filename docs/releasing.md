@@ -20,7 +20,7 @@ once.
 | Where | What | How many |
 |---|---|---|
 | crates.io | `neosh`, `neosh-proto`, `neosh-core`, `neosh-provider`, `neosh-vcs`, `neosh-swarm`, `neosh-agent`, `neosh-script`, `neosh-syntax`, `neosh-tui`, `neosh-plugins` | 11 |
-| npm | `@neosh/api`, and `@neosh/<name>` for each of the ten bundled plugins | 11 |
+| npm | `@neosh/api`, and `@neosh/<name>` for each bundled plugin | 12 |
 | npm | `neosh` — the launcher, and `@neosh/cli-<os>-<cpu>` carrying the binary for each of four platforms | 5 |
 | GitHub Releases | `neosh-<target>.tar.gz` plus a `.sha256` for four macOS and Linux targets | 8 |
 | Homebrew | `Formula/neosh.rb` in `neoswarm/homebrew-tap`, generated from the release | 1 |
@@ -28,8 +28,12 @@ once.
 Not PyPI: the name is taken by an unrelated Python shell, and a Rust binary has no business there.
 Not Windows: the workspace talks to its terminals over a Unix socket, so there is nothing to ship.
 
-Every version is the one number in `[workspace.package]` in the root `Cargo.toml`, and the npm
-packages carry it too.
+**Two kinds of version.** The crates, the `neosh` launcher and the four `@neosh/cli-*` packages
+are one number — `[workspace.package]` in the root `Cargo.toml` — and move together every release.
+`@neosh/api` and each `@neosh/<plugin>` have a number **of their own** and move only when their
+directory changed, because nothing depends on them: not each other, not the crates, and not the
+binary, which embeds the plugin tree at build time. `scripts/bump.sh` does both halves; see
+[every release after that](#every-release-after-that).
 
 ---
 
@@ -175,34 +179,47 @@ checksum somebody typed is a formula that installs whatever is at that URL now.
 ## Every release after that
 
 ```sh
-# 1. Bump the version — in both halves of the root manifest.
-$EDITOR Cargo.toml                       # [workspace.package] version
-                                         # AND the ten internal pins in [workspace.dependencies]
-$EDITOR npm/neosh/package.json           # version AND the four optionalDependencies
-$EDITOR plugins/api/package.json plugins/builtin/*/package.json
-cargo update -w                          # so Cargo.lock agrees before anything is committed
-
-# 2. Prove it.
-./scripts/check.sh
-
-# 3. Push a tag. That is the whole release.
-git commit -am "release: v0.4.2" && git tag -a v0.4.2 -m v0.4.2 && git push --follow-tags
+scripts/bump.sh --dry-run     # what would move: the crates, and which npm packages changed
+scripts/bump.sh               # write it — a patch; `minor`, `major` or an exact `0.6.0` for more
+./scripts/check.sh            # prove it
+git commit -am "release: v0.4.12" && git tag -a v0.4.12 -m v0.4.12 && git push --follow-tags
 ```
 
-There is no step 4. The tag push runs `tag.yml`, which checks the tag against the manifest and
-creates the release page, and it runs `release.yml`, `publish-crates.yml` and `publish-npm.yml`
-straight from the tag — four binaries onto the release, eleven crates onto crates.io, sixteen
-packages onto npm, and then the Homebrew formula, which waits for the checksums it is written from.
+Or, on a clean tree, all of it but the checks in one line: `scripts/bump.sh --push` bumps, commits
+`release: vX.Y.Z`, makes the annotated tag and pushes it. `--tag` stops short of the push.
 
-Write `docs/release-notes/v0.4.2.md` first if you want prose on the release page; without one the
+What it moves:
+
+- **The crates and the binary packages, always**, by the level asked for: `[workspace.package]`
+  version, the ten internal pins in `[workspace.dependencies]` (both halves — see below),
+  `npm/neosh/package.json` and the four `@neosh/cli-*` versions it pins, and `Cargo.lock` through
+  `cargo update -w`.
+- **Each npm package, only if its directory changed** since the last `v*` tag — committed,
+  uncommitted, or a file git has not seen yet — by a patch (or `--packages minor`; the level you
+  asked for when you asked for a level). The rest keep their number and `publish-npm.yml` skips
+  them, because npm already has it. `--all` moves every one of them; `--since <ref>` compares against
+  something other than the last tag.
+- **Nothing for a package that is new** since then. Its first version is whatever its `package.json`
+  says, and the script tells you it needs the first publish by hand — which is the step below that
+  used to surface only as a red job.
+
+There is no step after the push. The tag runs `tag.yml`, which checks the tag against the manifest,
+checks **that every npm package that changed was bumped** (`scripts/bump.sh --verify`, against the
+tag before — a plugin that changed and kept its number would otherwise be skipped by npm, green,
+and never published), and creates the release page. The same push runs `release.yml`,
+`publish-crates.yml` and `publish-npm.yml` straight from the tag — four binaries onto the release,
+eleven crates onto crates.io, the launcher, the binary packages and whichever npm packages moved,
+and then the Homebrew formula, which waits for the checksums it is written from.
+
+Write `docs/release-notes/v0.4.12.md` first if you want prose on the release page; without one the
 notes are generated from the commit log, because not having written them is not a reason to stop.
 
 **Annotated tags.** `--follow-tags` silently skips a lightweight one, so `git tag v0.4.2` alone
 pushes the commit and leaves the tag behind — and here that means nothing publishes at all.
 
-**Both halves of the root manifest**, and this is the one that bites. Every internal dependency in
-`[workspace.dependencies]` carries a `version` beside its `path` — it has to, or `cargo package`
-refuses — so bumping `[workspace.package]` alone leaves ten pins asking for the version that no
+**Both halves of the root manifest** — which `scripts/bump.sh` does, and this is why it has to.
+Every internal dependency in `[workspace.dependencies]` carries a `version` beside its `path` — it
+has to, or `cargo package` refuses — so bumping `[workspace.package]` alone leaves ten pins asking for the version that no
 longer exists, and the workspace stops resolving at all:
 
 ```

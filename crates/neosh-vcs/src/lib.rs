@@ -20,9 +20,11 @@ use neosh_proto::{
 use tokio::process::Command;
 
 mod forge;
+mod head;
 mod parse;
 
 pub use forge::pulls;
+pub use head::read_head;
 pub use parse::{parse_porcelain_v2, parse_worktree_list};
 
 #[derive(Debug, thiserror::Error)]

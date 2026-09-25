@@ -1001,6 +1001,8 @@ impl Editor {
                 | ApiCall::GitLog { .. }
                 | ApiCall::GitDiff { .. }
                 | ApiCall::GitDefaultBranch
+                // Files on disk, which the core does not read.
+                | ApiCall::GitHeads { .. }
                 | ApiCall::GitCreateBranch { .. }
                 | ApiCall::GitCheckout { .. }
                 | ApiCall::GitRenameBranch { .. }
@@ -1057,6 +1059,7 @@ impl Editor {
                 | ApiCall::SwarmAgents
                 | ApiCall::SwarmHostsOf { .. }
                 | ApiCall::SwarmCommand { .. }
+                | ApiCall::SwarmMirror { .. }
                 | ApiCall::SwarmSubscribe { .. }
                 | ApiCall::SwarmUnsubscribe { .. }
                 | ApiCall::SwarmProbe { .. }
@@ -1080,6 +1083,9 @@ impl Editor {
                 // knows none of those: a view is a socket and focus is a fact about somebody
                 // else's window manager. It draws the corner and the host decides the rest.
                 | ApiCall::Alert { .. }
+                // Writes `config.toml`, which is the host's file. The value itself is still the
+                // core's — the host sets it through `OptSet` before it writes anything down.
+                | ApiCall::OptPersist { .. }
         )
     }
 
@@ -2951,6 +2957,8 @@ fn call_name(call: &ApiCall) -> &'static str {
         ApiCall::GitLog { .. } => "git.log",
         ApiCall::GitDiff { .. } => "git.diff",
         ApiCall::GitDefaultBranch => "git.defaultBranch",
+        ApiCall::GitHeads { .. } => "git.heads",
+        ApiCall::OptPersist { .. } => "opt.save",
         ApiCall::GitCreateBranch { .. } => "git.createBranch",
         ApiCall::GitRenameBranch { .. } => "git.renameBranch",
         ApiCall::GitCheckout { .. } => "git.checkout",
