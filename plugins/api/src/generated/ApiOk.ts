@@ -9,6 +9,7 @@ import type { CredentialInfo } from "./CredentialInfo";
 import type { DriverCommand } from "./DriverCommand";
 import type { ExtmarkId } from "./ExtmarkId";
 import type { ExtmarkInfo } from "./ExtmarkInfo";
+import type { GitHead } from "./GitHead";
 import type { HighlightDef } from "./HighlightDef";
 import type { HighlightEntry } from "./HighlightEntry";
 import type { HighlightSpec } from "./HighlightSpec";
@@ -91,6 +92,7 @@ export type ApiOk =
   | { "ok": "maybe_session"; session: SessionId | null }
   | { "ok": "messages"; messages: Array<Message> }
   | { "ok": "status"; status: RepoStatus }
+  | { "ok": "heads"; heads: Array<GitHead | null> }
   | { "ok": "branches"; branches: Array<BranchInfo> }
   | { "ok": "worktrees"; worktrees: Array<WorktreeInfo> }
   | { "ok": "pulls"; pulls: Array<PullRequest> }

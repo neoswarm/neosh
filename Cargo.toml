@@ -49,6 +49,8 @@ async-trait = "0.1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "0.9"
+# Rewriting `config.toml` from the settings screen without losing a comment somebody wrote in it.
+toml_edit = "0.23"
 ts-rs = { version = "12", features = ["format", "serde-compat", "no-serde-warnings"] }
 
 # text

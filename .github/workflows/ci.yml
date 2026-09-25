@@ -51,7 +51,10 @@ jobs:
           # without the static library it downloads — every build of that job failed at
           # "could not find native static library `rusty_v8`" and, with nothing saved on failure,
           # kept restoring the same broken cache. A new name is a fresh shelf.
-          shared-key: crates-2
+          #
+          # And again (2026-09-25, all three keys): `toml_edit` joined the lockfile and every Rust
+          # job hit the same wall, twice in a row.
+          shared-key: crates-3
       - run: ./scripts/check.sh crates
 
   binary:
@@ -72,7 +75,7 @@ jobs:
           node-version: 22
       - uses: Swatinem/rust-cache@v2
         with:
-          shared-key: binary
+          shared-key: binary-2
       - run: ./scripts/check.sh binary ${{ matrix.slice }}/2
 
   screen:
@@ -91,7 +94,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           # The same compile as `binary`, so the same cache.
-          shared-key: binary
+          shared-key: binary-2
       - run: ./scripts/check.sh screen ${{ matrix.slice }}/3
 
   web:

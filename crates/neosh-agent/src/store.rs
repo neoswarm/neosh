@@ -131,7 +131,9 @@ impl SessionStore {
             s.unread = false;
         }
         if let Some(left) = leaving.filter(|l| *l != id) {
-            let drop = self.sessions.get(left).is_some_and(|s| s.ephemeral);
+            // A placeholder, or another machine's conversation — neither is kept once nobody is in
+            // it: one was only somewhere to type, and the other is that machine's to keep.
+            let drop = self.sessions.get(left).is_some_and(|s| s.hidden());
             if drop {
                 self.sessions.remove(left);
                 self.order.retain(|x| x != left);
@@ -213,8 +215,10 @@ impl SessionStore {
     /// whole of what it is for, and refusing to land there would mean a workspace you have cleared
     /// out cannot archive its last real conversation.
     pub fn next_after(&self, id: &SessionId) -> Option<SessionId> {
+        // Never another machine's: it is a window that closes when nobody is looking through it,
+        // and landing a view in one is landing it somewhere about to disappear.
         let usable = |c: &&SessionId| {
-            *c != id && self.sessions.get(*c).is_some_and(|s| !s.archived)
+            *c != id && self.sessions.get(*c).is_some_and(|s| !s.archived && s.mirror.is_none())
         };
         let real = |c: &&SessionId| usable(c) && self.sessions.get(*c).is_some_and(|s| !s.ephemeral);
         self.order
@@ -253,7 +257,7 @@ impl SessionStore {
         let current = self.current_id().clone();
         let mut seen: Vec<SessionInfo> = Vec::with_capacity(self.len());
         for id in &self.order {
-            if let Some(s) = self.get(id).filter(|s| !s.ephemeral) {
+            if let Some(s) = self.get(id).filter(|s| !s.hidden()) {
                 let mut info = s.info();
                 info.is_active = s.id == current;
                 seen.push(info);
@@ -262,7 +266,7 @@ impl SessionStore {
         // Anything inserted without touching `order` still has to appear; a session you cannot see
         // is a session you cannot get back to.
         for (id, s) in &self.sessions {
-            if !self.order.contains(id) && !s.ephemeral {
+            if !self.order.contains(id) && !s.hidden() {
                 let mut info = s.info();
                 info.is_active = s.id == current;
                 seen.push(info);
@@ -282,7 +286,7 @@ impl SessionStore {
     /// of the things an empty workspace has to say. A placeholder does not count either, which is
     /// the whole of what a placeholder is.
     pub fn any_open(&self) -> bool {
-        self.sessions.values().any(|s| !s.ephemeral && !s.archived)
+        self.sessions.values().any(|s| !s.hidden() && !s.archived)
     }
 
     /// Every session, for persistence.

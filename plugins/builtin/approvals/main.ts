@@ -19,6 +19,7 @@
 
 import type {
   Capability,
+  Disposable,
   HookOutcome,
   HookPayload,
   Neosh,
@@ -150,14 +151,25 @@ export async function activate({ neosh, subscriptions }: PluginContext) {
           waiting.set(asking, (waiting.get(asking) ?? 0) + 1);
           await announce();
         }
+        // Answered somewhere else — the conversation belongs to another machine, or another
+        // machine is watching this one — and the prompt has gone out from under the picker.
+        let withdraw: Disposable | undefined;
+        const gone = new Promise<void>((resolve) => {
+          withdraw = neosh.event.on("neosh.prompt.withdrawn", (e) => {
+            const d = e.data as { session?: string; kind?: string; title?: string } | null;
+            if (d?.kind === "permission" && d.session === asking && d.title === key) resolve();
+          });
+        });
         let answer: Choice["value"] | null;
         try {
           answer = await picker(neosh, choices, {
             title: key,
             width: Math.max(40, Math.min(88, key.length + 8)),
             height: choices.length,
+            until: gone,
           });
         } finally {
+          withdraw?.dispose();
           if (asking) {
             waiting.set(asking, Math.max(0, (waiting.get(asking) ?? 1) - 1));
             await announce();

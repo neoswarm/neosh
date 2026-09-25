@@ -3,9 +3,9 @@ name: tag
 # A release is one `git push --follow-tags`, and nothing after it.
 #
 # What this file does is small on purpose: it checks the tag against the version in the manifest,
-# and it creates the GitHub release page. Everything that *publishes* — the four binaries, the
-# eleven crates, the sixteen npm packages, the Homebrew formula — is triggered by the same tag push
-# in its own file, in parallel with this one.
+# checks that every npm package that changed was bumped, and it creates the GitHub release page.
+# Everything that *publishes* — the four binaries, the eleven crates, the npm packages, the
+# Homebrew formula — is triggered by the same tag push in its own file, in parallel with this one.
 #
 # **The publishing jobs are not moved into here, and that is deliberate.** crates.io and npm bind a
 # trusted publisher to a repository *and a workflow filename*: `publish-crates.yml` and
@@ -51,11 +51,19 @@ jobs:
             | jq -r '.packages[] | select(.name=="neosh") | .version')
           if [ "$tag" != "$manifest" ]; then
             echo "::error::tag v$tag does not match [workspace.package] version $manifest"
-            echo "Bump the version, commit, and re-tag. Both halves of the root manifest:"
-            echo "  [workspace.package] version, and the ten pins in [workspace.dependencies]."
+            echo "Bump it with scripts/bump.sh (both halves of the root manifest, the launcher, and"
+            echo "every npm package that changed), commit, and re-tag."
             exit 1
           fi
           echo "v$tag matches the manifest"
+
+      # The failure that bumping only what changed makes possible. The npm packages carry versions
+      # of their own and `publish-npm.yml` skips every version npm already has — so a plugin whose
+      # directory changed since the last release and whose `package.json` still says the old number
+      # is skipped, green, and the change never reaches npm. `scripts/bump.sh` moves exactly the
+      # packages that changed; this is the check that it was run, against the tag before this one.
+      - name: Every npm package that changed carries a new version
+        run: ./scripts/bump.sh --verify
 
       # A file if you wrote one, generated notes if you did not. Writing them is the one part of a
       # release a person is better at than a script, and not writing them must not be a reason to

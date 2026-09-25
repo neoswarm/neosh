@@ -95,6 +95,8 @@ impl Swarm {
                 streams: false,
                 browse: true,
                 shells: false,
+                rich_stream: false,
+                catalogue: false,
                 projects: Vec::new(),
             },
             agents: Vec::new(),
@@ -254,7 +256,12 @@ impl Swarm {
 /// can agree they have the same project. `cwd` goes across as well, but only so the other end can
 /// *show* it and hand it back in a `NewSession` — it is a path in this machine's filesystem and
 /// means nothing over there.
-pub fn summarise(info: &SessionInfo, project: ProjectKey, model: Option<String>) -> AgentSummary {
+pub fn summarise(
+    info: &SessionInfo,
+    project: ProjectKey,
+    selection: Option<&neosh_proto::ModelSelection>,
+    mode: Option<neosh_proto::PermissionMode>,
+) -> AgentSummary {
     AgentSummary {
         session: info.id.clone(),
         project,
@@ -267,7 +274,12 @@ pub fn summarise(info: &SessionInfo, project: ProjectKey, model: Option<String>)
         label: info.label.clone(),
         state: state_of(info),
         message_count: info.message_count,
-        model,
+        model: selection.map(|s| s.model.to_string()),
+        instance: selection.map(|s| s.instance.to_string()),
+        mode,
+        options: selection.map(|s| s.options.clone()).unwrap_or_default(),
+        context_tokens: info.context_tokens,
+        context_window: info.context_window,
         turn_started_at: info.turn_started_at,
         updated_at: info.updated_at,
         usage: info.usage.clone(),
@@ -303,6 +315,8 @@ mod tests {
             streams: true,
             browse: true,
             shells: false,
+            rich_stream: true,
+            catalogue: true,
             projects: Vec::new(),
         }
     }
@@ -319,6 +333,11 @@ mod tests {
             state: AgentState::Idle,
             message_count: 0,
             model: None,
+            instance: None,
+            mode: None,
+            options: Vec::new(),
+            context_tokens: 0,
+            context_window: None,
             turn_started_at: None,
             updated_at: updated,
             usage: Default::default(),

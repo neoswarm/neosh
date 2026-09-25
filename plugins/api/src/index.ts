@@ -108,6 +108,7 @@ import type { ProviderOptionDescriptor } from "./generated/ProviderOptionDescrip
 import type { Message } from "./generated/Message";
 import type { Rect } from "./generated/Rect";
 import type { RepoInfo } from "./generated/RepoInfo";
+import type { GitHead } from "./generated/GitHead";
 import type { RepoStatus } from "./generated/RepoStatus";
 import type { SessionId } from "./generated/SessionId";
 import type { SessionInfo } from "./generated/SessionInfo";
@@ -160,7 +161,7 @@ export type {
   CostBasis, QuotaCredits, QuotaSample, QuotaSeverity, QuotaSnapshot, QuotaSource, QuotaWindow,
   InstallMethod, UpdateOutcome, UpdateProgress, UpdateStatus,
   UsageBucket, UsageHistory, UsageResolution, UsageScanSource,
-  Rect, RepoInfo, RepoStatus, ScrollAmount, SelectShape, SessionId, SessionInfo, StatusAlign, StatusSegment, StopReason,
+  Rect, RepoInfo, GitHead, RepoStatus, ScrollAmount, SelectShape, SessionId, SessionInfo, StatusAlign, StatusSegment, StopReason,
   SurfaceCell, SurfaceId, TextEdit, ToolCall, ToolDef, ToolResult, TurnRequest, Usage, ImageFile,
   NodeCapabilities, NodeId, NodeInfo, ProjectKey, RemoteProject, StreamEvent,
   LinkState, SwarmAgent, SwarmNode, SwarmStranger,
@@ -926,7 +927,15 @@ export interface RawCellApi {
 }
 
 /** What a command handler is given and what it may give back. */
-export type CommandHandler = (args: string[], key?: KeyContext) => unknown | Promise<unknown>;
+/**
+ * What runs when a command does. `here` is the whole namespace bound to the terminal the key was
+ * pressed in — absent when nothing pressed a key — so a window it opens lands where the person is.
+ */
+export type CommandHandler = (
+  args: string[],
+  key?: KeyContext,
+  here?: Neosh,
+) => unknown | Promise<unknown>;
 
 export interface CommandApi {
   /**
@@ -1237,6 +1246,15 @@ export interface GitApi {
   diff(target?: DiffTarget, opts?: { stat?: boolean }): Promise<string>;
   /** What this branch would merge into: `origin/HEAD`, else `main`/`master`. */
   defaultBranch(): Promise<string | null>;
+  /**
+   * Where HEAD is in each of these directories — the branch, and the commit it resolves to — or
+   * `null` for one that is not a repository.
+   *
+   * Read off the repository's files, with no `git` process behind it, so it is cheap enough to ask
+   * on every redraw of a panel. What it is for is comparing checkouts: whether the copy of a
+   * repository on another machine ([`RemoteProject.head`]) is the version this one has.
+   */
+  heads(cwds: string[]): Promise<Array<GitHead | null>>;
   createBranch(name: string, opts?: { from?: string }): Promise<void>;
   /**
    * Move a branch to another name — `git branch -m`.
@@ -1626,6 +1644,19 @@ export interface OptionApi {
   set(name: string, value: OptionValue): Promise<void>;
   /** Restore the declared default. */
   reset(name: string): Promise<void>;
+  /**
+   * Set an option **and write it down** — into `[options]` in the user's `config.toml`, so it is
+   * still the value after a restart. `undefined` puts the default back and takes the line out.
+   *
+   * The settings screen's verb, and deliberately not what `set` does: a plugin choosing a value at
+   * runtime is saying what it is *now*, and an editor that rewrote your config file every time one
+   * did would be one you stopped trusting with the file. Use this where a person picked a value on
+   * a screen that says it is saved. The rest of the file is left exactly as it was.
+   *
+   * Rejects for a value of the wrong type before anything is written, and under `--clean`, which
+   * has no file to write into.
+   */
+  save(name: string, value?: OptionValue): Promise<void>;
   all(): Promise<OptionEntry[]>;
   /** Fires for every option, not just your own: a setting is shared state. */
   onChange(cb: (e: { name: string; value: OptionValue }) => void): Disposable;
@@ -2028,6 +2059,15 @@ export interface SwarmApi {
   subscribe(node: NodeId, session: string): Promise<void>;
   unsubscribe(node: NodeId, session: string): Promise<void>;
   /**
+   * Open a conversation on another machine **as a conversation** — in the pane, with the same
+   * transcript, cards and composer as one of yours, what you send going to that machine and `Esc`
+   * asking it to stop. Answers with the local conversation that shows it (its `mirror` says whose it
+   * is), after moving the terminal that asked into it. Opening the same one again finds it rather
+   * than making a second. It is never listed and never saved, and it is let go of when nothing
+   * shows it.
+   */
+  mirror(node: NodeId, session: string, opts?: { view?: ViewId }): Promise<SessionInfo>;
+  /**
    * Ask what machine is at an address, without joining it.
    *
    * The first half of pairing. A node presents its identity to anything that connects — as an SSH
@@ -2363,6 +2403,9 @@ function build(
       async reset(name) {
         await c({ call: "opt_reset", name });
       },
+      async save(name, value) {
+        await c({ call: "opt_persist", name, value: value ?? null });
+      },
       async all() {
         return expect(await c({ call: "opt_all" }), "options").options;
       },
@@ -2518,6 +2561,12 @@ function build(
       },
       async unsubscribe(node, session) {
         await c({ call: "swarm_unsubscribe", node, session });
+      },
+      async mirror(node, session, opts) {
+        return expect(
+          await c({ call: "swarm_mirror", node, session, view: opts?.view ?? null }),
+          "session",
+        ).session;
       },
       onChange(cb) {
         return listener(r.swarmListeners, cb);
@@ -3108,6 +3157,10 @@ function build(
       },
       async defaultBranch() {
         return expect(await c({ call: "git_default_branch" }), "maybe_text").text ?? null;
+      },
+      async heads(cwds) {
+        if (cwds.length === 0) return [];
+        return expect(await c({ call: "git_heads", cwds }), "heads").heads;
       },
       async createBranch(name, opts) {
         await c({ call: "git_create_branch", name, from: opts?.from ?? null });

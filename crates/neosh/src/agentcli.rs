@@ -330,6 +330,7 @@ pub async fn run(
             let command = AgentCommand::SetModel {
                 instance: selection.instance.0.clone(),
                 model: selection.model.0.clone(),
+            options: selection.options.clone(),
             };
             one(&mut c, &id, command).await?;
             say!("{} is now on {}/{}", short(&id), selection.instance, selection.model);
@@ -410,6 +411,7 @@ async fn start(c: &mut Control, cwd: &std::path::Path, a: &StartArgs) -> anyhow:
         let command = AgentCommand::SetModel {
             instance: selection.instance.0.clone(),
             model: selection.model.0.clone(),
+            options: selection.options.clone(),
         };
         one(c, &info.id, command).await?;
     }

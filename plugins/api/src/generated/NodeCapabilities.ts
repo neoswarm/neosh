@@ -53,6 +53,29 @@ export type NodeCapabilities = {
    */
   shells: boolean;
   /**
+   * Whether this node understands what makes a watched conversation one you can *work in*
+   * rather than read: the stream events that carry the whole transcript
+   * ([`StreamEvent::ToolStarted`], [`StreamEvent::ToolFinished`], [`StreamEvent::Asked`]) and the
+   * ones that hand a waiting question or permission prompt to whoever is watching
+   * ([`StreamEvent::Question`], [`StreamEvent::Permission`], [`StreamEvent::Settled`]) — and, in
+   * the other direction, the commands that answer them ([`AgentCommand::Answer`], an
+   * [`AgentCommand::Approve`] naming its prompt) and [`AgentCommand::SetMode`].
+   *
+   * A compatibility flag in `browse`'s sense: an unknown tag fails the frame and takes the
+   * connection with it, so none of those is sent to a node that does not say it can read them,
+   * and `false` is what an older handshake decodes to. What such a subscriber still gets is the
+   * conversation as it always did — its words live, and its history when it opens.
+   */
+  rich_stream: boolean;
+  /**
+   * Whether [`AscpMessage::Catalogue`] will be answered — the providers this machine is signed
+   * into and the models each serves, which is what `^P`, `^E` and the footer read when the
+   * conversation on screen is one of this machine's. A compatibility flag in `browse`'s sense,
+   * and gated the way `Browse` is: on `accepts_commands`, since the list is only ever wanted by
+   * somebody about to choose from it.
+   */
+  catalogue: boolean;
+  /**
    * The checkouts this node has, for starting something on it.
    */
   projects: Array<RemoteProject>;

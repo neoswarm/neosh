@@ -41,9 +41,12 @@
 use serde::{Deserialize, Serialize};
 use ts_rs::TS;
 
-use crate::agent::{Message, PermissionDecision, StopReason, Usage};
+use crate::agent::{
+    Capability, Message, PermissionDecision, PermissionMode, PermissionOption, QuestionAnswer,
+    StopReason, ToolCall, ToolResult, Usage, UserQuestion,
+};
 use crate::ids::SessionId;
-use crate::provider::Activity;
+use crate::provider::{Activity, CredentialInfo, ModelEntry, OptionSelection};
 
 /// The version of these message types.
 ///
@@ -243,6 +246,26 @@ pub struct AgentSummary {
     /// The model the owner will use for the next turn, for a board that says so.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    /// The provider instance that model is served by — the other half of a `ModelSelection`, so a
+    /// machine watching this conversation can say which model is answering exactly as the owner
+    /// would, rather than a bare id its own catalogue may know under another instance.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instance: Option<String>,
+    /// What the agent may do without asking, in this conversation — the footer's mode, from the
+    /// other machine. Absent from an older node, and read as "cannot tell".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<PermissionMode>,
+    /// The settings chosen for that model — effort and the rest — so the footer over there says
+    /// what the footer here says.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub options: Vec<OptionSelection>,
+    /// How full the conversation's context is, and of how much — the footer's meter, from the
+    /// machine that knows. Zero and absent from an older node, which the meter reads as unknown.
+    #[serde(default)]
+    pub context_tokens: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(type = "number | null")]
+    pub context_window: Option<u64>,
     /// Seconds since the epoch, when the running turn began. Only meaningful while `Running`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(type = "number | null")]
@@ -272,9 +295,40 @@ pub enum AgentCommand {
     /// The sharpest thing in this protocol, and the reason [`NodeCapabilities::accepts_approvals`]
     /// exists: approving a tool call on another machine authorises a write to *that machine's*
     /// filesystem. Sound when the machines are all yours, and something to be able to say no to.
-    Approve { decision: PermissionDecision },
+    ///
+    /// `id` names the [`StreamEvent::Permission`] being answered, and `option` which of its
+    /// options was taken when it offered some. Absent from an older node's `Approve`, which named
+    /// no prompt and was refused for it.
+    Approve {
+        decision: PermissionDecision,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        option: Option<String>,
+    },
+    /// Answer a [`StreamEvent::Question`]. `None` is "dismissed without answering", which the agent
+    /// is told in those words — the same as `Esc` on the owner's own panel. Only to a node whose
+    /// [`NodeCapabilities::rich_stream`] is set.
+    Answer {
+        id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        answers: Option<Vec<QuestionAnswer>>,
+    },
+    /// Change what the agent may do without asking, in this conversation. Gated like
+    /// [`Self::Approve`] and for the same reason: full access is every future prompt answered yes
+    /// in advance. Only to a node whose [`NodeCapabilities::rich_stream`] is set.
+    SetMode { mode: PermissionMode },
     /// Change the model for the next turn, and tell a running one.
-    SetModel { instance: String, model: String },
+    ///
+    /// `options` are the settings chosen for it — effort, thinking and the rest — and are taken
+    /// only when they were chosen against *this* machine's catalogue ([`AscpMessage::Catalogue`]),
+    /// which is the one catalogue that can say what they mean. Absent from an older node.
+    SetModel {
+        instance: String,
+        model: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        options: Vec<OptionSelection>,
+    },
     Rename { title: Option<String> },
     Archive { archived: bool },
     /// Start a conversation on that node. `cwd` is a path **on the owner**, which the caller learnt
@@ -285,6 +339,17 @@ pub enum AgentCommand {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         title: Option<String>,
     },
+}
+
+/// Which models a machine can run a conversation with, as its own model picker lists them.
+///
+/// The credentials are *where* each provider's key comes from — an environment variable's name, a
+/// plan's program — never a key: [`CredentialInfo`] has no field that could hold one.
+#[derive(TS, Serialize, Deserialize, Clone, PartialEq, Debug, Default)]
+#[ts(export)]
+pub struct ModelCatalogue {
+    pub credentials: Vec<CredentialInfo>,
+    pub models: Vec<ModelEntry>,
 }
 
 /// One checkout a node has, for "start something over there".
@@ -309,6 +374,15 @@ pub struct RemoteProject {
     /// The branch checked out there, for naming the row. See [`AgentSummary::branch`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub branch: Option<String>,
+    /// The commit that checkout is on — the full hash HEAD resolves to.
+    ///
+    /// What says whether this machine's copy of a repository is the *same version* as another's.
+    /// A branch name does not: `main` here and `main` over there are the same row only while they
+    /// point at the same commit, and a build box sitting four commits behind is a different place
+    /// to start work from, which a panel should draw as one. Absent from an older node, and from a
+    /// checkout with no commits — both read as "cannot tell", which a panel treats as the same.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub head: Option<String>,
     /// Whether this node has a conversation open in it now.
     ///
     /// Meant something for exactly as long as this list was derived from live conversations: every
@@ -376,6 +450,27 @@ pub struct NodeCapabilities {
     /// open regardless of what it once advertised, which is the rule every capability here follows.
     #[serde(default)]
     pub shells: bool,
+    /// Whether this node understands what makes a watched conversation one you can *work in*
+    /// rather than read: the stream events that carry the whole transcript
+    /// ([`StreamEvent::ToolStarted`], [`StreamEvent::ToolFinished`], [`StreamEvent::Asked`]) and the
+    /// ones that hand a waiting question or permission prompt to whoever is watching
+    /// ([`StreamEvent::Question`], [`StreamEvent::Permission`], [`StreamEvent::Settled`]) — and, in
+    /// the other direction, the commands that answer them ([`AgentCommand::Answer`], an
+    /// [`AgentCommand::Approve`] naming its prompt) and [`AgentCommand::SetMode`].
+    ///
+    /// A compatibility flag in `browse`'s sense: an unknown tag fails the frame and takes the
+    /// connection with it, so none of those is sent to a node that does not say it can read them,
+    /// and `false` is what an older handshake decodes to. What such a subscriber still gets is the
+    /// conversation as it always did — its words live, and its history when it opens.
+    #[serde(default)]
+    pub rich_stream: bool,
+    /// Whether [`AscpMessage::Catalogue`] will be answered — the providers this machine is signed
+    /// into and the models each serves, which is what `^P`, `^E` and the footer read when the
+    /// conversation on screen is one of this machine's. A compatibility flag in `browse`'s sense,
+    /// and gated the way `Browse` is: on `accepts_commands`, since the list is only ever wanted by
+    /// somebody about to choose from it.
+    #[serde(default)]
+    pub catalogue: bool,
     /// The checkouts this node has, for starting something on it.
     #[serde(default)]
     pub projects: Vec<RemoteProject>,
@@ -405,6 +500,57 @@ pub enum StreamEvent {
     /// The agent is waiting for a person. Carries what is being asked so a remote viewer can answer
     /// it, if the owner accepts approvals.
     Blocked { turn: String, prompt: String },
+    /// A tool call began — the card a watcher draws while it runs. Only to a subscriber whose
+    /// [`NodeCapabilities::rich_stream`] is set.
+    ToolStarted { turn: String, call: ToolCall },
+    /// A tool call came back, with what it said. As [`Self::ToolStarted`].
+    ToolFinished { turn: String, call: ToolCall, result: ToolResult },
+    /// Somebody asked the agent something — at that machine's keyboard, from a script, or from a
+    /// watcher on another machine — and it is about to be answered or steered in. Without it a
+    /// watcher saw answers under questions nobody had shown it. `images` counts the pictures that
+    /// came with it, which do not travel. As [`Self::ToolStarted`].
+    Asked {
+        text: String,
+        #[serde(default)]
+        images: u32,
+    },
+    /// The agent asked a question and is waiting for an answer — offered to whoever is watching as
+    /// well as to the owner's own screen, and settled by whichever answers first
+    /// ([`AgentCommand::Answer`]). Without it a conversation on a machine nobody is sitting at sat
+    /// under a spinner until the question timed out, in front of the one person who could answer
+    /// it. `id` is the owner's, and means nothing but itself. As [`Self::ToolStarted`].
+    Question { id: String, questions: Vec<UserQuestion> },
+    /// The agent wants to do something the owner's permission mode says to ask about. Offered like
+    /// [`Self::Question`] and answered with an [`AgentCommand::Approve`] naming `id` — which the
+    /// owner takes only if it [`NodeCapabilities::accepts_approvals`], because a yes here is a
+    /// write to *that* machine's disk. As [`Self::ToolStarted`].
+    Permission {
+        id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        title: Option<String>,
+        capability: Capability,
+        #[serde(default)]
+        options: Vec<PermissionOption>,
+    },
+    /// A [`Self::Question`] or [`Self::Permission`] was answered — here, there, or by nobody — and
+    /// is not waiting any more. A watcher takes its panel down: a prompt still on screen after it
+    /// was answered is a key that answers nothing. As [`Self::ToolStarted`].
+    Settled { id: String },
+}
+
+impl StreamEvent {
+    /// Whether this is one of the events only a [`NodeCapabilities::rich_stream`] subscriber reads.
+    pub fn is_rich(&self) -> bool {
+        matches!(
+            self,
+            Self::ToolStarted { .. }
+                | Self::ToolFinished { .. }
+                | Self::Asked { .. }
+                | Self::Question { .. }
+                | Self::Permission { .. }
+                | Self::Settled { .. }
+        )
+    }
 }
 
 /// Why a command was not carried out.
@@ -515,6 +661,17 @@ pub enum AscpMessage {
     /// The answer to [`Self::Browse`] — each entry as the asker would have typed it, trailing
     /// separator and all, so it can go straight back into a field.
     Browsed { id: String, paths: Vec<String> },
+    /// What this machine can be asked to use: its providers and their models. Only to a node whose
+    /// [`NodeCapabilities::catalogue`] is set; `refresh` asks it to ask its endpoints again, which
+    /// is what `^R` in the model picker means. Answered with [`Self::Catalogued`] or
+    /// [`Self::Refused`].
+    Catalogue {
+        id: String,
+        #[serde(default)]
+        refresh: bool,
+    },
+    /// The answer to [`Self::Catalogue`].
+    Catalogued { id: String, catalogue: ModelCatalogue },
     /// Open a shell on that machine.
     ///
     /// The one thing here that is not about an agent, and it is what "it feels like it is on this

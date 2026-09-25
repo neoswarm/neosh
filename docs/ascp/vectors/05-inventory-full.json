@@ -2,6 +2,7 @@
   "agents": [
     {
       "branch": "main",
+      "context_tokens": 0,
       "cwd": "/home/me/src/neosh",
       "label": "make the parser faster",
       "message_count": 12,

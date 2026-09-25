@@ -258,6 +258,8 @@ struct Startup {
     /// Re-reads every config layer from disk. Owned by the caller, because the trust store and the
     /// XDG paths are not the host's business.
     reload: Option<Box<dyn Fn() -> anyhow::Result<Resolved>>>,
+    /// Where `opt.save` writes. See [`Bootstrap::config_file`].
+    config_file: Option<std::path::PathBuf>,
     /// An `agent.model` naming an instance nothing serves *yet*.
     ///
     /// Provider instances can come from plugins, and plugins load after configuration is applied.
@@ -301,6 +303,9 @@ pub struct Bootstrap {
     pub reload: Box<dyn Fn() -> anyhow::Result<Resolved>>,
     pub cli_model: Option<String>,
     pub cli_plugin_dirs: Vec<std::path::PathBuf>,
+    /// The `config.toml` a setting chosen on screen is written into. `None` under `--clean`,
+    /// which reads and writes nothing.
+    pub config_file: Option<std::path::PathBuf>,
     /// Say this as soon as there is something that can answer it.
     ///
     /// `neosh "a prompt"` in a process that *is* its own workspace — `--no-daemon`, the stdio
@@ -1049,6 +1054,21 @@ pub struct Host {
     /// [`neosh_provider::drivers::Unasked`].
     unasked_rx: Option<tokio::sync::mpsc::UnboundedReceiver<Unheard>>,
     unasked_tx: tokio::sync::mpsc::UnboundedSender<Unheard>,
+    /// Questions and permission prompts on their way to or from another machine. See
+    /// [`crate::relay`].
+    relay_rx: Option<tokio::sync::mpsc::UnboundedReceiver<crate::relay::Relay>>,
+    relay_tx: tokio::sync::mpsc::UnboundedSender<crate::relay::Relay>,
+    /// Prompts open on this machine that a watcher could answer, by the id they went out under.
+    offered: std::collections::HashMap<String, Offered>,
+    /// Prompts from another machine's conversation that are up on this one, by the owner's id.
+    relayed: std::collections::HashMap<String, Relayed>,
+    /// What each paired machine can run a conversation with, as it last said. Read by the model
+    /// picker, `^E` and the footer while a conversation of that machine's is on screen, so they
+    /// show *its* models rather than this machine's.
+    catalogues: std::collections::HashMap<neosh_proto::NodeId, neosh_proto::ModelCatalogue>,
+    /// Calls waiting on a catalogue that is on its way, by the machine it is coming from.
+    catalogue_waiting:
+        std::collections::HashMap<neosh_proto::NodeId, Vec<(PluginId, RequestId, ApiCall)>>,
     /// Conversations that reported one of those while the turn it interrupted was still winding
     /// down, and which therefore still have to be heard out.
     ///
@@ -1422,6 +1442,31 @@ enum SwarmAsk {
     Browse,
     /// A shell.
     Shell,
+    /// Something typed into another machine's conversation opened here, or `Esc` in it. Nobody is
+    /// waiting on the answer except the person who pressed the key, so a refusal is said to them.
+    Mirror,
+    /// An answer to a question or prompt that machine offered. Refused only when somebody else
+    /// answered first, which is not news — except a refusal on principle, which is.
+    Relay,
+    /// That machine's providers and models, for a mirror's model picker and footer.
+    Catalogue,
+}
+
+/// A prompt open here that the machines watching its conversation were offered.
+struct Offered {
+    session: neosh_proto::SessionId,
+    reply: tokio::sync::oneshot::Sender<crate::relay::Reply>,
+    /// Kept so a machine that starts watching while it waits is offered it too.
+    offer: crate::relay::Offer,
+}
+
+/// Another machine's prompt, up on this one.
+struct Relayed {
+    /// The mirror it is shown in.
+    local: neosh_proto::SessionId,
+    offer: crate::relay::Offer,
+    /// Asking the person here. Aborted when the prompt is settled somewhere else.
+    task: Option<tokio::task::AbortHandle>,
 }
 
 
@@ -1483,6 +1528,7 @@ impl Host {
         let here = agent.sessions().current_id().clone();
         let (quota_tx, quota_rx) = tokio::sync::mpsc::unbounded_channel();
         let (unasked_tx, unasked_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (relay_tx, relay_rx) = tokio::sync::mpsc::unbounded_channel();
         let (image_tx, image_rx) = tokio::sync::mpsc::unbounded_channel();
 
         let screen = ViewState::furnish(&mut editor, neosh_proto::ViewId::LOCAL, here);
@@ -1579,6 +1625,12 @@ impl Host {
             quota_rx: Some(quota_rx),
             unasked_rx: Some(unasked_rx),
             unasked_tx,
+            relay_rx: Some(relay_rx),
+            relay_tx,
+            offered: Default::default(),
+            relayed: Default::default(),
+            catalogues: Default::default(),
+            catalogue_waiting: Default::default(),
             unheard: std::collections::HashSet::new(),
             quota_due: false,
             asking: Vec::new(),
@@ -2113,6 +2165,23 @@ impl Host {
                 Ok(ApiOk::Selection { selection: self.agent.selection() })
             }
             ApiCall::AgentSetSelection { selection } => {
+                // Another machine's conversation takes the model over there, which is where it is
+                // checked: this machine not having a provider says nothing about that one.
+                let here = self.active_session();
+                if let Some(m) = self.mirror_meta(&here) {
+                    self.agent.set_selection(selection.clone());
+                    // The options too, when they were chosen off that machine's own catalogue —
+                    // which is the only catalogue `^E` reads in a mirror that has one.
+                    let knows = self.swarm.peer(&m.node).is_some_and(|p| p.capabilities.catalogue);
+                    self.command_mirror(&m, neosh_proto::AgentCommand::SetModel {
+                        instance: selection.instance.to_string(),
+                        model: selection.model.to_string(),
+                        options: if knows { selection.options.clone() } else { Vec::new() },
+                    });
+                    self.broadcast(PluginEvent::SelectionChanged { selection });
+                    self.refresh_status();
+                    return Ok(ApiOk::Unit);
+                }
                 if self.agent.providers().resolve(&selection).is_none() {
                     return Err(ApiError::NotFound {
                         what: format!("no driver serves instance {}", selection.instance),
@@ -2235,6 +2304,35 @@ impl Host {
                 Ok(ApiOk::Unit)
             }
             ApiCall::VarAll { scope } => Ok(ApiOk::Vars { vars: self.vars.all(&scope) }),
+            // ---- where HEAD is -------------------------------------------
+            // Three small reads per directory and no subprocess, which is what makes it an answer
+            // a panel can ask for on every redraw. See `neosh_vcs::read_head`.
+            ApiCall::GitHeads { cwds } => Ok(ApiOk::Heads {
+                heads: cwds.iter().map(|c| neosh_vcs::read_head(std::path::Path::new(c))).collect(),
+            }),
+            // ---- the settings screen's verb ---------------------------------
+            // Set first, through the same call anybody else would make, so a wrong type is refused
+            // *before* anything is written — a file with a value the registry would reject is a
+            // workspace that complains on its next start about something nobody typed. Then
+            // written, so the value is still the value tomorrow.
+            ApiCall::OptPersist { name, value } => {
+                let Some(file) = self.startup.config_file.clone() else {
+                    return Err(ApiError::Denied {
+                        reason: "this workspace reads no config file (--clean), so there is \
+                                 nowhere to save a setting; it is set for this run only"
+                            .into(),
+                    });
+                };
+                let set = match &value {
+                    Some(v) => ApiCall::OptSet { name: name.clone(), value: v.clone() },
+                    None => ApiCall::OptReset { name: name.clone() },
+                };
+                self.editor.apply(&plugin, set)?;
+                self.drain_effects();
+                crate::config::write_option(&file, &name, value.as_ref())
+                    .map_err(|e| ApiError::Internal { message: e.to_string() })?;
+                Ok(ApiOk::Unit)
+            }
             // ---- the swarm ----------------------------------------------
             ApiCall::SwarmSelf => Ok(ApiOk::SwarmSelf { node: self.swarm_self() }),
             ApiCall::SwarmNodes => Ok(ApiOk::SwarmNodes {
@@ -2271,6 +2369,27 @@ impl Host {
             ApiCall::SwarmHostsOf { project } => Ok(ApiOk::Names {
                 names: self.swarm.hosts_of(&project).into_iter().map(str::to_string).collect(),
             }),
+            ApiCall::SwarmMirror { node, session, view } => {
+                let local = self.open_mirror(&node, &session)?;
+                let view = view.unwrap_or_else(|| self.serving());
+                let moved = self.in_view(view, |me| {
+                    me.arrive_in(&local).map_err(|e| ApiError::NotFound { what: e.to_string() })
+                });
+                moved?;
+                // No `work_in`: the directory is on the other machine, and there is nothing here
+                // to read a repository out of.
+                self.in_view(view, |me| me.enter_session());
+                // Asked every time, found or made: subscribing is what sends the history, and a
+                // conversation opened again after a while should be what it is now.
+                if let Some(h) = &self.swarm_node {
+                    h.send(neosh_swarm::SwarmRequest::Subscribe { node, session });
+                }
+                let info = self.agent.sessions().get(&local).map(|s| s.info());
+                match info {
+                    Some(info) => Ok(ApiOk::Session { session: self.named(info) }),
+                    None => Err(ApiError::NotFound { what: "that conversation went away".into() }),
+                }
+            }
             ApiCall::SwarmSubscribe { node, session } => {
                 match &self.swarm_node {
                     Some(h) => {
@@ -2607,6 +2726,18 @@ impl Host {
                         .collect(),
                 })
             }
+            // Deleting is that machine's to do, at that machine: a conversation there is its files,
+            // its history and very possibly somebody's afternoon, and nothing over the swarm is
+            // allowed to destroy what it cannot put back. Archiving is, and says so.
+            ApiCall::SessionClose { session } if self.mirror_meta(&session).is_some() => {
+                let machine =
+                    self.mirror_meta(&session).map(|m| m.machine).unwrap_or_default();
+                Err(ApiError::Denied {
+                    reason: format!(
+                        "that conversation is on {machine} — archive it from here, or delete it there"
+                    ),
+                })
+            }
             ApiCall::SessionClose { session } => {
                 // A conversation this workspace never loaded is still a conversation.
                 //
@@ -2689,6 +2820,18 @@ impl Host {
             // Archiving does not stop a turn. Putting a conversation away is about the list you
             // read, not about the work: it keeps its messages, and it keeps whatever it was in the
             // middle of saying.
+            ApiCall::SessionArchive { session, archived } if self.mirror_meta(&session).is_some() => {
+                let Some(m) = self.mirror_meta(&session) else { return Ok(ApiOk::Unit) };
+                self.command_mirror(&m, neosh_proto::AgentCommand::Archive { archived });
+                // Put away over there, so there is nothing left to look at here: the same step out
+                // archiving one of yours takes, and the mirror is let go once no pane shows it.
+                if archived && self.step_out_of(&session) {
+                    let here = self.session_cwd(&self.active_session());
+                    self.work_in(here).await;
+                    self.enter_session();
+                }
+                Ok(ApiOk::Unit)
+            }
             ApiCall::SessionArchive { session, archived } => {
                 // Putting one *back* is the commonest thing done to a conversation the store has
                 // never held: everything past the cap is, by definition, something nobody has
@@ -2790,6 +2933,14 @@ impl Host {
                 Ok(ApiOk::Unit)
             }
             ApiCall::SessionRename { session, title } => {
+                // Named there, because that is where it is listed and kept; the copy here follows
+                // at once so the footer does not wait for the roster.
+                if let Some(m) = self.mirror_meta(&session) {
+                    let _ = self.agent.sessions().rename(&session, title.clone());
+                    self.command_mirror(&m, neosh_proto::AgentCommand::Rename { title });
+                    self.refresh_status();
+                    return Ok(ApiOk::Unit);
+                }
                 self.agent
                     .sessions()
                     .rename(&session, title)
@@ -2818,6 +2969,27 @@ impl Host {
 
             ApiCall::PermissionGetMode => {
                 Ok(ApiOk::PermissionMode { mode: self.agent.permission_mode(&self.active_session()) })
+            }
+            ApiCall::PermissionSetMode { mode } if self.mirror_meta(&self.active_session()).is_some() => {
+                // Refused *before* the footer changes, rather than by the far end afterwards: a
+                // mode is every future prompt answered in advance, and one that said "full
+                // access" here while that machine went on asking would be the footer lying about
+                // the one thing it exists to say.
+                let here = self.active_session();
+                let Some(m) = self.mirror_meta(&here) else { return Ok(ApiOk::Unit) };
+                if !self.swarm.peer(&m.node).is_some_and(|p| p.capabilities.accepts_approvals) {
+                    return Err(ApiError::Denied {
+                        reason: format!(
+                            "{} decides its own permissions — set `accepts_approvals = true` \
+                             under `[swarm]` there to change them from here",
+                            m.machine
+                        ),
+                    });
+                }
+                self.agent.set_permission_mode(&here, mode);
+                self.command_mirror(&m, neosh_proto::AgentCommand::SetMode { mode });
+                self.refresh_status();
+                Ok(ApiOk::PermissionMode { mode })
             }
             ApiCall::PermissionSetMode { mode } => {
                 // The conversation's, and saved with it. A mode is a property of what you are
@@ -3256,7 +3428,14 @@ impl Host {
     ) -> Result<(), neosh_agent::StoreError> {
         let leaving = self.abandoning(session);
         let switching = self.v().session != *session;
+        // Another machine's conversation nobody is looking at any more stops being streamed here.
+        let left_mirror = leaving
+            .as_ref()
+            .and_then(|l| self.agent.sessions().get(l).and_then(|s| s.mirror.clone()));
         self.agent.sessions().enter(session, leaving.as_ref())?;
+        if let Some(m) = left_mirror {
+            self.let_go_of_mirror(&m);
+        }
         self.vm().session = session.clone();
         if switching {
             self.file_tab(session.clone());
@@ -3565,6 +3744,12 @@ impl Host {
     /// with something still queued starts the next one, and by then you may be reading something
     /// else entirely — or somebody at the terminal next door may be reading it instead.
     fn start_turn_in(&mut self, session: neosh_proto::SessionId, prompt: Prompt) {
+        // Another machine's conversation: the turn is that machine's to run.
+        let mirror = self.agent.sessions().get(&session).and_then(|s| s.mirror.clone());
+        if let Some(mirror) = mirror {
+            self.send_to_mirror(&session, &mirror, prompt);
+            return;
+        }
         // Typing while it works is steering, not an error. The old behaviour — refuse, and make you
         // wait with the sentence already written — is the one moment in the program where you know
         // exactly what you want to say and cannot say it.
@@ -3585,6 +3770,14 @@ impl Host {
                 me.refresh_composer();
             });
             return;
+        }
+        // Asked here, so asked for anybody watching from another machine — before the turn starts,
+        // which is the order the question and its answer are drawn in.
+        if self.watched(&session) && (!prompt.text.is_empty() || !prompt.images.is_empty()) {
+            self.stream_out(&session, neosh_proto::StreamEvent::Asked {
+                text: prompt.text.clone(),
+                images: prompt.images.len() as u32,
+            });
         }
         let token = CancellationToken::new();
         self.turns
@@ -3639,6 +3832,17 @@ impl Host {
     /// of them is news worth saying out loud.
     fn cancel_turn_here(&mut self) -> Option<bool> {
         let here = self.active_session();
+        // Another machine's conversation: asking it to stop is asking that machine.
+        let mirror = self.agent.sessions().get(&here).and_then(|s| s.mirror.clone());
+        if let Some(m) = mirror {
+            let t = self.turns.get_mut(&here)?;
+            if t.cancelling {
+                return Some(false);
+            }
+            t.cancelling = true;
+            self.command_mirror(&m, neosh_proto::AgentCommand::Interrupt);
+            return Some(true);
+        }
         let t = self.turns.get_mut(&here)?;
         if t.cancelling {
             return Some(false);
@@ -4207,6 +4411,15 @@ impl Host {
             .and_then(|w| w.viewport)
             .map(|v| (v.width, v.height))
             .unwrap_or((80, 24));
+        // A shell *in the conversation's directory* is on the machine the conversation is on: the
+        // directory is a path on that disk, and the reason for a shell beside an agent is to run
+        // something where it has just been working.
+        let at = match (at, self.mirror_meta(&session)) {
+            (ShellAt::Here { cwd: None }, Some(m)) => {
+                ShellAt::There { node: m.node, cwd: Some(self.session_cwd(&session).display().to_string()) }
+            }
+            (at, _) => at,
+        };
         let cwd = match at {
             ShellAt::There { node, cwd } => {
                 self.ask_for_shell(view, pane, win, node, cwd, rows, cols);
@@ -4258,6 +4471,26 @@ impl Host {
             self.close_pane_quietly(view, pane);
             return;
         };
+        // What `swarm.shell` checks before it makes a pane, checked here too for the panes made
+        // some other way — `<C-w>T` in another machine's conversation is one. A request to a
+        // machine that is not there waits for an answer nothing will send.
+        let refused = match self.swarm.peer(&node) {
+            None => Some(format!("no machine {}", node.short())),
+            Some(p) if !p.up() => {
+                Some(format!("{} is not connected — c on its row in ^T reconnects", p.display_name()))
+            }
+            Some(p) if !p.capabilities.shells => Some(format!(
+                "{} does not open shells for other machines — set `accepts_shells = true` under \
+                 `[swarm]` there",
+                p.display_name()
+            )),
+            Some(_) => None,
+        };
+        if let Some(why) = refused {
+            self.editor_message(MessageLevel::Warn, why);
+            self.close_pane_quietly(view, pane);
+            return;
+        }
         let plugin = PluginId::from(BUILTIN);
         let _ = self.editor.apply_in(view, &plugin, ApiCall::SurfaceClaim {
             win,
@@ -4773,6 +5006,769 @@ impl Host {
         })
     }
 
+    /// Whose conversation this is, when it is another machine's.
+    fn mirror_meta(&self, session: &neosh_proto::SessionId) -> Option<neosh_proto::MirrorOf> {
+        self.agent.sessions().get(session).and_then(|s| s.mirror.clone())
+    }
+
+    /// The conversation here that is a window onto `(node, remote)`, if one is open.
+    fn mirror_of(
+        &self,
+        node: &neosh_proto::NodeId,
+        remote: &neosh_proto::SessionId,
+    ) -> Option<neosh_proto::SessionId> {
+        self.agent
+            .sessions()
+            .iter()
+            .find(|s| s.mirror.as_ref().is_some_and(|m| &m.node == node && &m.session == remote))
+            .map(|s| s.id.clone())
+    }
+
+    /// Find or make the local conversation that shows another machine's.
+    ///
+    /// Made from what that machine last said about it — its title and its directory, which is a
+    /// path on *that* disk and is only ever shown — with no messages: those arrive as the history
+    /// the subscription sends, and a guess drawn first would be replaced in front of you.
+    fn open_mirror(
+        &mut self,
+        node: &neosh_proto::NodeId,
+        remote: &neosh_proto::SessionId,
+    ) -> Result<neosh_proto::SessionId, ApiError> {
+        if let Some(local) = self.mirror_of(node, remote) {
+            return Ok(local);
+        }
+        let Some(peer) = self.swarm.peer(node) else {
+            return Err(ApiError::NotFound { what: "that computer is not paired".into() });
+        };
+        let Some(agent) = peer.agents.iter().find(|a| &a.session == remote) else {
+            return Err(ApiError::NotFound {
+                what: format!("no such conversation on {}", peer.display_name()),
+            });
+        };
+        let machine = peer.display_name();
+        let mut s = neosh_agent::Session::new(std::path::PathBuf::from(&agent.cwd));
+        s.title = Some(agent.label.clone());
+        s.created_at = now_secs();
+        s.updated_at = agent.updated_at;
+        // What that machine says the conversation is using, so the footer, `^P` and `⇧⇥` open on
+        // the answer over there rather than on whatever this machine would have chosen.
+        s.selection = remote_selection(agent);
+        s.permission_mode = agent.mode;
+        s.usage = agent.usage.clone();
+        s.context_tokens = agent.context_tokens;
+        s.context_window = agent.context_window;
+        s.mirror = Some(neosh_proto::MirrorOf {
+            node: node.clone(),
+            session: remote.clone(),
+            machine,
+        });
+        let id = s.id.clone();
+        self.agent.sessions().insert(s);
+        // Asked as the conversation opens rather than when `^P` is pressed, so the footer is right
+        // on the first frame after it arrives and the picker opens on a list already here.
+        self.ask_catalogue(node, false);
+        Ok(id)
+    }
+
+    /// Ask a machine for its catalogue. One at a time per machine, unless it is a refresh.
+    fn ask_catalogue(&mut self, node: &neosh_proto::NodeId, refresh: bool) {
+        if !self.swarm.peer(node).is_some_and(|p| p.up() && p.capabilities.catalogue) {
+            return;
+        }
+        let Some(handle) = self.swarm_node.clone() else { return };
+        self.swarm_next_command += 1;
+        let id = format!("m{}", self.swarm_next_command);
+        self.swarm_asking.insert(id.clone(), SwarmAsk::Catalogue);
+        handle.send(neosh_swarm::SwarmRequest::Catalogue { node: node.clone(), id, refresh });
+    }
+
+    /// Answer a model-picker call from the catalogue of the machine whose conversation is on
+    /// screen, when it is another machine's and that machine can say. `true` when it was taken.
+    ///
+    /// The whole of "`^P` in another machine's conversation looks like `^P` in one of yours": the
+    /// model plugin asks what it always asks — the providers, their models, the selection — and is
+    /// answered about the machine the conversation runs on. No plugin had to learn what a mirror
+    /// is, and nothing it draws can come to disagree with the machine it is drawing.
+    fn answer_from_catalogue(&mut self, plugin: &PluginId, id: &RequestId, call: &ApiCall) -> bool {
+        let refresh = match call {
+            ApiCall::AgentListModels { refresh, .. } => *refresh,
+            ApiCall::ProviderCredentials => false,
+            _ => return false,
+        };
+        let Some(m) = self.mirror_meta(&self.active_session()) else { return false };
+        // An older neosh cannot say, and a disconnected one cannot be asked: what this machine
+        // has is the answer it always gave.
+        if !self.swarm.peer(&m.node).is_some_and(|p| p.capabilities.catalogue) {
+            return false;
+        }
+        if !refresh
+            && let Some(catalogue) = self.catalogues.get(&m.node)
+        {
+            let answer = catalogue_answer(catalogue, call);
+            self.respond_plugin(plugin.clone(), id.clone(), answer);
+            return true;
+        }
+        if !self.swarm.peer(&m.node).is_some_and(|p| p.up()) {
+            return false;
+        }
+        let waiting = self.catalogue_waiting.entry(m.node.clone()).or_default();
+        let first = waiting.is_empty();
+        waiting.push((plugin.clone(), id.clone(), call.clone()));
+        if first || refresh {
+            self.ask_catalogue(&m.node, refresh);
+        }
+        true
+    }
+
+    /// A catalogue arrived — or will not, which is `None`.
+    fn took_catalogue(
+        &mut self,
+        node: neosh_proto::NodeId,
+        catalogue: Option<neosh_proto::ModelCatalogue>,
+    ) {
+        let waiting = self.catalogue_waiting.remove(&node).unwrap_or_default();
+        match catalogue {
+            Some(catalogue) => {
+                self.catalogues.insert(node.clone(), catalogue);
+                // A mirror whose owner never said which provider serves its model — an older one,
+                // or a conversation that has not chosen — is named from the list it serves now.
+                self.name_mirror_instances(&node);
+                let catalogue = self.catalogues.get(&node).cloned().unwrap_or_default();
+                for (plugin, id, call) in waiting {
+                    let answer = catalogue_answer(&catalogue, &call);
+                    self.respond_plugin(plugin, id, answer);
+                }
+                // The footer drew before this was here; it redraws on a selection changing.
+                if let Some(selection) = self.agent.selection() {
+                    self.broadcast(PluginEvent::SelectionChanged { selection });
+                }
+            }
+            None => {
+                for (plugin, id, call) in waiting {
+                    if !self.spawn_slow(&plugin, Some(id.clone()), &call) {
+                        let services = self.services(&plugin);
+                        let bridge = self.bridge.clone();
+                        tokio::spawn(async move {
+                            let response: ApiResponse = run_slow(services, call).await.into();
+                            let _ = bridge.script().send(ScriptInbound::Plugin {
+                                plugin,
+                                msg: PluginInbound::Response { id, response },
+                            });
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    /// Fill in the provider of any mirror of `node` that only knows its model's name.
+    fn name_mirror_instances(&mut self, node: &neosh_proto::NodeId) {
+        let Some(catalogue) = self.catalogues.get(node) else { return };
+        let mut store = self.agent.sessions();
+        let ids: Vec<neosh_proto::SessionId> = store
+            .iter()
+            .filter(|s| s.mirror.as_ref().is_some_and(|m| &m.node == node))
+            .map(|s| s.id.clone())
+            .collect();
+        for id in ids {
+            let Some(s) = store.get_mut(&id) else { continue };
+            let Some(sel) = s.selection.as_mut() else { continue };
+            if !sel.instance.0.is_empty() {
+                continue;
+            }
+            if let Some(e) = catalogue.models.iter().find(|e| e.model.id == sel.model) {
+                sel.instance = e.instance.clone();
+            }
+        }
+    }
+
+    /// Another machine wants our catalogue: its model picker is about to show it.
+    fn serve_catalogue(&mut self, node: neosh_proto::NodeId, id: String, refresh: bool) {
+        let credentials = self.agent.providers().credentials();
+        let services = self.services(&PluginId::from(BUILTIN));
+        let Some(handle) = self.swarm_node.clone() else { return };
+        tokio::spawn(async move {
+            // Off the loop: an endpoint that has never been asked what it serves is a network
+            // round trip, and every one after that is this machine's cache.
+            let models = match services.list_models(None, refresh).await {
+                Ok(ApiOk::Models { models }) => models,
+                _ => Vec::new(),
+            };
+            handle.send(neosh_swarm::SwarmRequest::Catalogued {
+                node,
+                id,
+                result: Ok(neosh_proto::ModelCatalogue { credentials, models }),
+            });
+        });
+    }
+
+    /// Answer a plugin's call, from the loop.
+    fn respond_plugin(&self, plugin: PluginId, id: RequestId, answer: Result<ApiOk, ApiError>) {
+        let response: ApiResponse = answer.into();
+        let _ = self.bridge.script().send(ScriptInbound::Plugin {
+            plugin,
+            msg: PluginInbound::Response { id, response },
+        });
+    }
+
+    /// Keep every mirror of `node`'s conversations saying what that machine says about them: the
+    /// title, the model and the mode, which can each be changed at either end. A roster rather than
+    /// a message, so a rename at that keyboard reaches this footer on the next inventory.
+    fn follow_mirrors(&mut self, node: &neosh_proto::NodeId) {
+        let Some(peer) = self.swarm.peer(node) else { return };
+        let agents = peer.agents.clone();
+        let mut moved = false;
+        let mut reselected = false;
+        {
+            let mut store = self.agent.sessions();
+            let mirrors: Vec<(neosh_proto::SessionId, neosh_proto::SessionId)> = store
+                .iter()
+                .filter_map(|s| {
+                    s.mirror.as_ref().filter(|m| &m.node == node).map(|m| (s.id.clone(), m.session.clone()))
+                })
+                .collect();
+            for (local, remote) in mirrors {
+                let Some(agent) = agents.iter().find(|a| a.session == remote) else { continue };
+                let Some(s) = store.get_mut(&local) else { continue };
+                let title = Some(agent.label.clone());
+                let mut selection = remote_selection(agent).or_else(|| s.selection.clone());
+                // An older owner names no provider; keep the one its catalogue told us.
+                if let (Some(new), Some(old)) = (selection.as_mut(), s.selection.as_ref())
+                    && new.instance.0.is_empty()
+                    && new.model == old.model
+                {
+                    new.instance = old.instance.clone();
+                }
+                let mode = agent.mode.or(s.permission_mode);
+                if s.selection != selection {
+                    reselected = true;
+                }
+                if s.title != title || s.selection != selection || s.permission_mode != mode {
+                    s.title = title;
+                    s.selection = selection;
+                    s.permission_mode = mode;
+                    moved = true;
+                }
+                // The meter, when that machine can say — never over a turn streaming here, which
+                // is moving it already.
+                if agent.context_tokens > 0 && s.active_turn.is_none() {
+                    if s.context_tokens != agent.context_tokens || s.context_window != agent.context_window {
+                        s.context_tokens = agent.context_tokens;
+                        if agent.context_window.is_some() {
+                            s.context_window = agent.context_window;
+                        }
+                        moved = true;
+                    }
+                }
+            }
+        }
+        if moved {
+            self.refresh_status();
+        }
+        // Chosen at that keyboard, or by `^P` here coming back as that machine's answer: either
+        // way the footer and the picker read the selection, and redraw when it changes.
+        if reselected && let Some(selection) = self.agent.selection() {
+            self.broadcast(PluginEvent::SelectionChanged { selection });
+        }
+    }
+
+    /// Stop streaming a mirror nothing shows, and forget it. It is that machine's conversation, and
+    /// opening it again asks for it afresh.
+    fn let_go_of_mirror(&mut self, m: &neosh_proto::MirrorOf) {
+        if let Some(h) = &self.swarm_node {
+            h.send(neosh_swarm::SwarmRequest::Unsubscribe {
+                node: m.node.clone(),
+                session: m.session.clone(),
+            });
+        }
+        if let Some(local) = self.mirror_of(&m.node, &m.session) {
+            // Only when nothing shows it: `enter` drops a mirror the pane left, and a pane closed
+            // some other way is caught by `prune_mirrors`.
+            if self.panes_showing(&local).is_empty() {
+                let up: Vec<String> = self
+                    .relayed
+                    .iter()
+                    .filter(|(_, r)| r.local == local)
+                    .map(|(id, _)| id.clone())
+                    .collect();
+                for id in up {
+                    self.unrelay(&id);
+                }
+                let _ = self.agent.sessions().remove(&local);
+                self.turns.remove(&local);
+                self.rounds.remove(&local);
+            }
+        }
+    }
+
+    /// Every mirror no pane is showing, let go. On the roster clock, so a pane closed by anything
+    /// at all — `<C-w>q`, a tab, a terminal going away — stops its stream within seconds.
+    fn prune_mirrors(&mut self) {
+        let unseen: Vec<neosh_proto::MirrorOf> = self
+            .agent
+            .sessions()
+            .iter()
+            .filter_map(|s| s.mirror.clone().map(|m| (s.id.clone(), m)))
+            .collect::<Vec<_>>()
+            .into_iter()
+            .filter(|(id, _)| self.panes_showing(id).is_empty())
+            .map(|(_, m)| m)
+            .collect();
+        for m in unseen {
+            self.let_go_of_mirror(&m);
+        }
+    }
+
+    /// Send a command to the machine a mirror belongs to, and say so if it refuses.
+    fn command_mirror(&mut self, m: &neosh_proto::MirrorOf, command: neosh_proto::AgentCommand) {
+        self.command_mirror_as(m, command, SwarmAsk::Mirror);
+    }
+
+    /// [`Self::command_mirror`], filed under `ask` so the answer is read the right way.
+    fn command_mirror_as(
+        &mut self,
+        m: &neosh_proto::MirrorOf,
+        command: neosh_proto::AgentCommand,
+        ask: SwarmAsk,
+    ) {
+        // A command only a newer neosh can parse, to one that cannot: an unknown tag fails the
+        // frame and takes the link with it, which is a worse answer than this sentence.
+        let newer = matches!(
+            command,
+            neosh_proto::AgentCommand::Answer { .. } | neosh_proto::AgentCommand::SetMode { .. }
+        );
+        if newer && !self.swarm.peer(&m.node).is_some_and(|p| p.capabilities.rich_stream) {
+            self.editor_message(
+                MessageLevel::Warn,
+                format!("{} runs an older neosh that cannot take that — update it there", m.machine),
+            );
+            return;
+        }
+        // A machine that is not connected drops a command on the floor rather than refusing it, and
+        // a message that went nowhere without a word is the worst answer there is.
+        if !self.swarm.peer(&m.node).is_some_and(|p| p.up()) {
+            self.editor_message(
+                MessageLevel::Warn,
+                format!("{} is not connected — c on its row in ^T reconnects", m.machine),
+            );
+            return;
+        }
+        let Some(handle) = &self.swarm_node else {
+            self.editor_message(MessageLevel::Warn, "the swarm is not running");
+            return;
+        };
+        self.swarm_next_command += 1;
+        let id = format!("c{}", self.swarm_next_command);
+        self.swarm_asking.insert(id.clone(), ask);
+        handle.send(neosh_swarm::SwarmRequest::Command {
+            node: m.node.clone(),
+            id,
+            session: m.session.clone(),
+            command,
+        });
+    }
+
+    /// What you typed into another machine's conversation, sent there.
+    ///
+    /// The question is drawn when that machine says it was asked (`StreamEvent::Asked`), which is
+    /// the one order everybody watching sees it in — mid-turn it is steered in at the next gap, and
+    /// drawing it here first would put it above an answer it was never part of. A machine too old to
+    /// say so has it drawn here straight away instead, since it never will.
+    fn send_to_mirror(
+        &mut self,
+        local: &neosh_proto::SessionId,
+        m: &neosh_proto::MirrorOf,
+        prompt: Prompt,
+    ) {
+        if !prompt.images.is_empty() {
+            self.editor_message(
+                MessageLevel::Warn,
+                format!("pictures stay on this computer — sent {} the words only", m.machine),
+            );
+        }
+        if prompt.text.trim().is_empty() {
+            return;
+        }
+        // Nothing drawn for a message that is not going anywhere; `command_mirror` says why, and
+        // what you wrote goes back in the field rather than into the void.
+        if !self.swarm.peer(&m.node).is_some_and(|p| p.up()) {
+            self.command_mirror(m, neosh_proto::AgentCommand::Send { text: prompt.text.clone() });
+            if *local == self.active_session() {
+                self.set_composer(&prompt.text);
+                self.refresh_composer();
+            }
+            return;
+        }
+        let rich = self.swarm.peer(&m.node).is_some_and(|p| p.capabilities.rich_stream);
+        if !rich {
+            let text = prompt.text.clone();
+            if let Some(s) = self.agent.sessions().get_mut(local) {
+                s.push_user(&Prompt::text(text), Some(now_secs()));
+            }
+            let shown = Prompt::text(prompt.text.clone());
+            self.each_view_showing(local, |me| {
+                me.scroll_chat(0);
+                me.chat_question(&shown);
+            });
+        }
+        self.each_view_showing(local, |me| me.refresh_composer());
+        self.command_mirror(m, neosh_proto::AgentCommand::Send { text: prompt.text });
+    }
+
+    /// A turn over there, begun here: the round the working line and the cards are drawn from.
+    ///
+    /// Called by the first event of a turn rather than only by `TurnStarted`, because a
+    /// conversation opened mid-turn joins it at a token.
+    fn mirror_turn(&mut self, local: &neosh_proto::SessionId, turn: neosh_proto::TurnId) {
+        if self.turns.contains_key(local) {
+            return;
+        }
+        self.turns
+            .insert(local.clone(), Running { cancel: CancellationToken::new(), cancelling: false });
+        self.rounds.insert(local.clone(), Round {
+            verb: a_verb(),
+            started: std::time::Instant::now(),
+            note: None,
+            note_is_wait: false,
+            said: Vec::new(),
+            changes: Vec::new(),
+            plan: Vec::new(),
+            tasks: Vec::new(),
+        });
+        if let Some(s) = self.agent.sessions().get_mut(local) {
+            s.active_turn = Some(turn.clone());
+            s.turn_started_at = Some(now_secs());
+        }
+        self.each_view_showing(local, |me| {
+            me.scroll_chat(0);
+            me.begin_working();
+            me.refresh_composer();
+        });
+        self.on_agent_event(AgentEvent::TurnStarted { session: local.clone(), turn });
+    }
+
+    /// One event of another machine's conversation, drawn in the one here that mirrors it.
+    ///
+    /// Translated into the agent's own events and handed to the same handler a turn here goes
+    /// through, which is the whole design: the transcript, the cards, the working line, the timing
+    /// and the notifications are drawn by one piece of code whichever machine the agent is on, so a
+    /// conversation over there cannot come to look different from one here.
+    fn on_mirror_stream(
+        &mut self,
+        node: &neosh_proto::NodeId,
+        remote: &neosh_proto::SessionId,
+        event: &neosh_proto::StreamEvent,
+    ) {
+        use neosh_proto::StreamEvent as S;
+        let Some(local) = self.mirror_of(node, remote) else { return };
+        let turn = |t: &str| neosh_proto::TurnId(t.to_string());
+        match event.clone() {
+            S::History { messages } => {
+                if let Some(s) = self.agent.sessions().get_mut(&local) {
+                    s.messages = messages;
+                }
+                // Not over a turn in flight: that is being drawn live, and rebuilding under it
+                // would draw its answer twice. The re-sync at its end puts the rest right.
+                if !self.turns.contains_key(&local) {
+                    self.each_view_showing(&local, |me| me.redraw_transcript());
+                }
+            }
+            S::TurnStarted { turn: t } => self.mirror_turn(&local, turn(&t)),
+            S::Token { turn: t, text } => {
+                self.mirror_turn(&local, turn(&t));
+                self.on_agent_event(AgentEvent::Token { session: local, turn: turn(&t), text });
+            }
+            S::Thinking { turn: t, text } => {
+                self.mirror_turn(&local, turn(&t));
+                self.on_agent_event(AgentEvent::Thinking { session: local, turn: turn(&t), text });
+            }
+            S::Activity { turn: t, activity } => {
+                self.mirror_turn(&local, turn(&t));
+                self.on_agent_event(AgentEvent::Activity {
+                    session: local,
+                    turn: turn(&t),
+                    activity,
+                });
+            }
+            S::ToolStarted { turn: t, call } => {
+                self.mirror_turn(&local, turn(&t));
+                self.on_agent_event(AgentEvent::ToolStarted { session: local, turn: turn(&t), call });
+            }
+            S::ToolFinished { turn: t, call, result } => {
+                self.mirror_turn(&local, turn(&t));
+                self.on_agent_event(AgentEvent::ToolFinished {
+                    session: local,
+                    turn: turn(&t),
+                    call,
+                    result,
+                });
+            }
+            S::Asked { text, images } => {
+                let shown = match images {
+                    0 => text.clone(),
+                    1 => format!("{text}\n[a picture, on the other computer]"),
+                    n => format!("{text}\n[{n} pictures, on the other computer]"),
+                };
+                if let Some(s) = self.agent.sessions().get_mut(&local) {
+                    s.push_user(&Prompt::text(shown.clone()), Some(now_secs()));
+                }
+                let prompt = Prompt::text(shown);
+                let running = self.turns.contains_key(&local);
+                self.each_view_showing(&local, |me| {
+                    me.scroll_chat(0);
+                    me.chat_question(&prompt);
+                    if running {
+                        me.draw_working();
+                    }
+                    me.refresh_composer();
+                });
+            }
+            S::TurnEnded { turn: t, stop_reason, usage } => {
+                if self.turns.contains_key(&local) {
+                    if let Some(s) = self.agent.sessions().get_mut(&local) {
+                        s.active_turn = None;
+                        s.turn_started_at = None;
+                    }
+                    self.on_agent_event(AgentEvent::TurnEnded {
+                        session: local,
+                        turn: turn(&t),
+                        stop_reason,
+                        usage,
+                    });
+                }
+                // And ask for the whole conversation again, which is what makes the copy here the
+                // same as the one over there: what was drawn live is what happened, and the history
+                // is what it was *recorded* as — the thing a redraw, a resize or a switch rebuilds
+                // from. An older machine that sends no tool events is put right by exactly this.
+                if let Some(h) = &self.swarm_node {
+                    h.send(neosh_swarm::SwarmRequest::Subscribe {
+                        node: node.clone(),
+                        session: remote.clone(),
+                    });
+                }
+            }
+            S::Question { id, questions } => {
+                self.relay_here(&local, node, id, crate::relay::Offer::Question(questions));
+            }
+            S::Permission { id, title, capability, options } => {
+                let offer = crate::relay::Offer::Permission { title, capability, options };
+                self.relay_here(&local, node, id, offer);
+            }
+            S::Settled { id } => self.unrelay(&id),
+            S::Blocked { prompt, .. } => {
+                let machine = self
+                    .agent
+                    .sessions()
+                    .get(&local)
+                    .and_then(|s| s.mirror.as_ref().map(|m| m.machine.clone()))
+                    .unwrap_or_default();
+                self.editor_message(
+                    MessageLevel::Info,
+                    format!("waiting for somebody at {machine}: {prompt}"),
+                );
+            }
+        }
+    }
+
+    /// A prompt from another machine's conversation, put in front of the person here.
+    ///
+    /// Through the very hooks a prompt of this machine's own goes through — the questions panel,
+    /// the approvals picker — raised for the mirror, so it opens in the terminal reading it and
+    /// looks exactly like one from an agent on this computer. Nothing is decided here: that
+    /// machine's policy already said to ask, and this machine's mode is about its own
+    /// conversations.
+    fn relay_here(
+        &mut self,
+        local: &neosh_proto::SessionId,
+        node: &neosh_proto::NodeId,
+        id: String,
+        offer: crate::relay::Offer,
+    ) {
+        use crate::relay::{Offer, Relay, Reply};
+        // Offered again to every watcher when another one subscribes.
+        if self.relayed.contains_key(&id) {
+            return;
+        }
+        let machine = self
+            .agent
+            .sessions()
+            .get(local)
+            .and_then(|s| s.mirror.as_ref().map(|m| m.machine.clone()))
+            .unwrap_or_default();
+        let cwd = self.session_cwd(local);
+        let tx = self.relay_tx.clone();
+        let task = match &offer {
+            Offer::Question(questions) => {
+                // Nothing here to show it with. Said, and left to that machine to answer: sending
+                // back "nobody answered" would be this machine answering for a person it never
+                // asked.
+                if self.agent.hooks().blocking(neosh_proto::HookName::AskUser).next().is_none() {
+                    let first = questions.first().map(|q| q.question.clone()).unwrap_or_default();
+                    self.editor_message(
+                        MessageLevel::Info,
+                        format!("{machine} is asking: {first} — answer it there"),
+                    );
+                    None
+                } else {
+                    let asker = neosh_agent::DriverQuestioner::new(&self.agent, self.bridge.clone());
+                    let request = neosh_provider::ask::QuestionRequest {
+                        questions: questions.clone(),
+                        conversation: local.clone(),
+                        cwd,
+                    };
+                    let id = id.clone();
+                    Some(tokio::spawn(async move {
+                        use neosh_provider::ask::QuestionAnswers as A;
+                        let answers = match neosh_provider::ask::QuestionAsker::ask(&asker, request)
+                            .await
+                        {
+                            A::Answered(a) => Some(a),
+                            // Dismissed is an answer — `Esc` there would have said the same.
+                            A::Cancelled { reason } if reason == A::dismissed_reason() => None,
+                            // Timed out, or the panel went away: nobody here answered, which is
+                            // not the same as answering "nobody".
+                            A::Cancelled { .. } => return,
+                        };
+                        let _ = tx.send(Relay::Answered { id, reply: Reply::Answers(answers) });
+                    }))
+                }
+            }
+            Offer::Permission { title, capability, options } => {
+                let sentence = title.clone().unwrap_or_else(|| crate::relay::describe(capability));
+                // Asked of the *capability* the owner advertised, before a picker is drawn whose
+                // answer would be refused: a yes is a write to that machine's disk, and it has to
+                // have said it takes them from here.
+                let approves = self.swarm.peer(node).is_some_and(|p| p.capabilities.accepts_approvals);
+                let hooked =
+                    self.agent.hooks().blocking(neosh_proto::HookName::PermissionPre).next().is_some();
+                if !approves || !hooked {
+                    let why = if approves { "answer it there" } else {
+                        "answer it there, or set `accepts_approvals = true` under `[swarm]` on it"
+                    };
+                    self.editor_message(
+                        MessageLevel::Info,
+                        format!("{machine} is asking: {sentence} — {why}"),
+                    );
+                    None
+                } else {
+                    let asker = neosh_agent::DriverAsker::new(&self.agent, self.bridge.clone());
+                    let request = neosh_provider::approval::PermissionRequest {
+                        title: sentence,
+                        capability: capability.clone(),
+                        options: options.clone(),
+                        cwd,
+                        conversation: Some(local.clone()),
+                    };
+                    let id = id.clone();
+                    Some(tokio::spawn(async move {
+                        let answer = asker.prompt(request).await;
+                        let _ = tx.send(Relay::Answered { id, reply: Reply::Approve(answer) });
+                    }))
+                }
+            }
+        };
+        self.relayed.insert(id, Relayed {
+            local: local.clone(),
+            offer,
+            task: task.map(|t| t.abort_handle()),
+        });
+    }
+
+    /// Another machine's prompt was settled, wherever it was: take it down here.
+    fn unrelay(&mut self, id: &str) {
+        let Some(r) = self.relayed.remove(id) else { return };
+        if let Some(task) = r.task {
+            task.abort();
+            self.broadcast(PluginEvent::Event {
+                name: "neosh.prompt.withdrawn".to_string(),
+                data: Some(crate::relay::withdrawn(&r.local, &r.offer)),
+                from: BUILTIN.to_string(),
+            });
+        }
+    }
+
+    /// News from the relay. See [`crate::relay`].
+    fn on_relay(&mut self, relay: crate::relay::Relay) {
+        use crate::relay::{Relay, Reply};
+        match relay {
+            Relay::Opened { id, session, offer, reply } => {
+                self.stream_out(&session, offer_event(&id, &offer));
+                self.offered.insert(id, Offered { session, reply, offer });
+            }
+            Relay::Closed { id, session, offer, elsewhere } => {
+                self.offered.remove(&id);
+                self.stream_out(&session, neosh_proto::StreamEvent::Settled { id });
+                // Answered on another machine, so the panel here is still up over a prompt that
+                // has gone — and a key pressed in it would answer nothing.
+                if elsewhere {
+                    self.broadcast(PluginEvent::Event {
+                        name: "neosh.prompt.withdrawn".to_string(),
+                        data: Some(crate::relay::withdrawn(&session, &offer)),
+                        from: BUILTIN.to_string(),
+                    });
+                }
+            }
+            Relay::Answered { id, reply } => {
+                // Settled while the person here was answering: nothing is waiting for it.
+                let Some(r) = self.relayed.remove(&id) else { return };
+                let mirror = self.agent.sessions().get(&r.local).and_then(|s| s.mirror.clone());
+                let Some(m) = mirror else { return };
+                let command = match reply {
+                    Reply::Answers(answers) => neosh_proto::AgentCommand::Answer { id, answers },
+                    Reply::Approve(answer) => {
+                        use neosh_provider::approval::PermissionAnswer as P;
+                        let (decision, option) = match answer {
+                            P::Option(o) => (neosh_proto::PermissionDecision::Allow, Some(o)),
+                            P::Allow => (neosh_proto::PermissionDecision::Allow, None),
+                            P::Deny => (
+                                neosh_proto::PermissionDecision::Deny { reason: "denied".into() },
+                                None,
+                            ),
+                        };
+                        neosh_proto::AgentCommand::Approve { decision, id: Some(id), option }
+                    }
+                };
+                self.command_mirror_as(&m, command, SwarmAsk::Relay);
+            }
+        }
+    }
+
+    /// A watcher's answer to a prompt this machine offered.
+    fn settle_offer(
+        &mut self,
+        session: &neosh_proto::SessionId,
+        id: &str,
+        reply: crate::relay::Reply,
+    ) -> Result<Option<neosh_proto::SessionId>, neosh_proto::Refusal> {
+        let fits = |o: &Offered| {
+            &o.session == session
+                && matches!(
+                    (&o.offer, &reply),
+                    (crate::relay::Offer::Question(_), crate::relay::Reply::Answers(_))
+                        | (crate::relay::Offer::Permission { .. }, crate::relay::Reply::Approve(_))
+                )
+        };
+        match self.offered.get(id) {
+            Some(o) if fits(o) => {}
+            Some(_) => {
+                return Err(neosh_proto::Refusal::Failed {
+                    message: "that is not what this conversation is waiting on".into(),
+                });
+            }
+            None => {
+                return Err(neosh_proto::Refusal::Failed {
+                    message: "that has already been answered".into(),
+                });
+            }
+        }
+        // Removed here, so a second watcher answering in the same instant is told it was late.
+        // `Closed` still arrives from the relay and says `Settled` to everybody.
+        if let Some(o) = self.offered.remove(id) {
+            let _ = o.reply.send(reply);
+        }
+        Ok(None)
+    }
+
     /// Send a command to a peer and remember who is waiting for the answer.
     fn begin_swarm_command(
         &mut self,
@@ -4903,6 +5899,8 @@ impl Host {
             streams: false,
             browse: false,
             shells: false,
+            rich_stream: false,
+            catalogue: false,
             projects: Vec::new(),
         };
         let bridge = self.bridge.clone();
@@ -4968,8 +5966,16 @@ impl Host {
             .map(|s| {
                 let info = self.named(s);
                 let key = self.project_key(std::path::Path::new(&info.cwd));
-                let model = self.model_for(&info.id);
-                crate::swarm::summarise(&info, key, model)
+                // This conversation's own, not the one on screen: every summary used to carry the
+                // model of whatever this machine happened to be looking at.
+                let selection = self
+                    .agent
+                    .sessions()
+                    .get(&info.id)
+                    .and_then(|s| s.selection.clone())
+                    .or_else(|| self.agent.selection());
+                let mode = self.agent.permission_mode(&info.id);
+                crate::swarm::summarise(&info, key, selection.as_ref(), Some(mode))
             })
             .collect()
     }
@@ -4989,9 +5995,6 @@ impl Host {
         )
     }
 
-    fn model_for(&self, _session: &neosh_proto::SessionId) -> Option<String> {
-        self.agent.selection().map(|s| s.model.to_string())
-    }
 
     /// The checkouts this machine can start something in, for a peer's "new conversation over
     /// there" menu.
@@ -5030,6 +6033,11 @@ impl Host {
                     cwd: a.cwd.clone(),
                     repo_root: a.repo_root.clone(),
                     branch: a.branch.clone(),
+                    // Which version of the repository this is, so a machine with the same checkout
+                    // four commits behind can be told apart from one that is level. Off the files,
+                    // not out of `git`: this runs on the inventory timer. See `neosh_vcs::read_head`.
+                    head: neosh_vcs::read_head(std::path::Path::new(&a.cwd))
+                        .and_then(|h| h.commit),
                     active: true,
                     sessions: 1,
                     running: u32::from(a.state == neosh_proto::AgentState::Running),
@@ -5067,12 +6075,20 @@ impl Host {
             // nothing open in it is still a tree, and a panel that nests it only while somebody is
             // working in it is one that rearranges itself for a reason nobody can see.
             let facts = self.projects.get(path);
+            // Read now rather than remembered: the branch in `facts` is the one this directory was
+            // on the first time the host looked, and a checkout nobody is working in is exactly the
+            // one somebody switched in a shell last week.
+            let head = neosh_vcs::read_head(path);
             out.push(neosh_proto::RemoteProject {
                 key: self.project_key(path),
                 name,
                 cwd,
                 repo_root: facts.and_then(|f| f.repo_root.clone()),
-                branch: facts.and_then(|f| f.branch.clone()),
+                branch: match &head {
+                    Some(h) => h.branch.clone(),
+                    None => facts.and_then(|f| f.branch.clone()),
+                },
+                head: head.and_then(|h| h.commit),
                 active: false,
                 sessions: 0,
                 running: 0,
@@ -5240,9 +6256,11 @@ impl Host {
             }
             E::Inventory { node, full, agents, gone } => {
                 self.swarm.inventory(&node, full, agents, gone);
+                self.follow_mirrors(&node);
                 self.broadcast(PluginEvent::SwarmChanged);
             }
             E::Stream { node, session, event } => {
+                self.on_mirror_stream(&node, &session, &event);
                 self.broadcast(PluginEvent::SwarmStream { node, session, event });
             }
             E::Stranger { node, dialled } => {
@@ -5268,7 +6286,39 @@ impl Host {
                 }
                 self.broadcast(PluginEvent::SwarmChanged);
             }
-            E::Answer { id, result, .. } => {
+            E::Answer { id, result, node } => {
+                // A catalogue refused or unreachable: whoever was waiting on it is answered from
+                // this machine's own, which is what a mirror of an older neosh has always shown.
+                if self.swarm_asking.get(&id) == Some(&SwarmAsk::Catalogue) {
+                    self.swarm_asking.remove(&id);
+                    let _ = result;
+                    self.took_catalogue(node, None);
+                    return;
+                }
+                if self.swarm_asking.get(&id) == Some(&SwarmAsk::Relay) {
+                    self.swarm_asking.remove(&id);
+                    // Somebody over there answered first, or the turn moved on: the prompt is
+                    // gone either way and the panel has already come down. A refusal on
+                    // *principle* is the one worth saying, because the next prompt will be
+                    // refused as well.
+                    if let Err(neosh_proto::Refusal::NotPermitted { what }) = result {
+                        self.editor_message(
+                            MessageLevel::Warn,
+                            format!("the other computer did not take the answer: {what}"),
+                        );
+                    }
+                    return;
+                }
+                if self.swarm_asking.get(&id) == Some(&SwarmAsk::Mirror) {
+                    self.swarm_asking.remove(&id);
+                    if let Err(r) = result {
+                        self.editor_message(
+                            MessageLevel::Warn,
+                            format!("the other computer did not take it: {}", refusal_text(&r)),
+                        );
+                    }
+                    return;
+                }
                 // A shell that was refused arrives here rather than as `PtyOpened`, because a
                 // refusal says no to a question without describing it. The id is what tells them
                 // apart, which is the whole reason `swarm_asking` exists.
@@ -5338,21 +6388,39 @@ impl Host {
                 }
             }
             E::Browse { node, id, prefix } => self.run_swarm_browse(node, id, prefix),
+            E::Catalogue { node, id, refresh } => self.serve_catalogue(node, id, refresh),
+            E::Catalogued { node, id, catalogue } => {
+                self.swarm_asking.remove(&id);
+                self.took_catalogue(node, Some(catalogue));
+            }
             E::Browsed { id, result, .. } => {
                 self.on_swarm_browsed(&id, result.map_err(|r| refusal_text(&r)));
             }
             E::Subscribed { session, .. } => {
-                let fresh = self.swarm_watched.insert(session.clone());
-                // Everything said so far, once. A watcher that only received deltas would show an
-                // empty conversation until the next token — which for an idle agent is never.
-                if fresh {
-                    let messages = self
-                        .agent
-                        .sessions()
-                        .get(&session)
-                        .map(|s| s.messages.clone())
-                        .unwrap_or_default();
-                    self.stream_out(&session, neosh_proto::StreamEvent::History { messages });
+                self.swarm_watched.insert(session.clone());
+                // Everything said so far — on **every** subscribe, not only the first. A watcher
+                // that only received deltas would show an empty conversation until the next token,
+                // which for an idle agent is never; and "only the first" meant the second machine
+                // to open a conversation, and every re-sync after a turn, got nothing at all. It
+                // goes to everybody watching, who each take it as the truth about the whole
+                // conversation, which it is.
+                let messages = self
+                    .agent
+                    .sessions()
+                    .get(&session)
+                    .map(|s| s.messages.clone())
+                    .unwrap_or_default();
+                self.stream_out(&session, neosh_proto::StreamEvent::History { messages });
+                // And anything it is waiting on. A machine that opens a conversation mid-question
+                // is very often opening it *because* of the question.
+                let waiting: Vec<neosh_proto::StreamEvent> = self
+                    .offered
+                    .iter()
+                    .filter(|(_, o)| o.session == session)
+                    .map(|(id, o)| offer_event(id, &o.offer))
+                    .collect();
+                for event in waiting {
+                    self.stream_out(&session, event);
                 }
             }
             E::Unsubscribed { session, .. } => {
@@ -5447,15 +6515,15 @@ impl Host {
                 self.publish_inventory();
                 Ok(None)
             }
-            C::SetModel { instance, model } => {
+            C::SetModel { instance, model, options } => {
                 let selection = neosh_proto::ModelSelection {
                     instance: neosh_proto::InstanceId(instance),
                     model: neosh_proto::ModelId(model),
-                    // Not carried across. Reasoning effort and the rest are per-model settings the
-                    // far end chose against *its* catalogue, and applying them to a model this
-                    // machine resolved separately is how a remote switch quietly changes something
-                    // nobody asked it to.
-                    options: Default::default(),
+                    // Only ever sent by a machine that chose them from *this* machine's catalogue
+                    // (`AscpMessage::Catalogue`) — `^E` over there drew this machine's knobs — so
+                    // they mean here what they meant there. An older node sends none, and the
+                    // model's own defaults apply, which is what used to happen to every switch.
+                    options,
                 };
                 // Checked here rather than taken on trust: the far end is naming a model from *its*
                 // catalogue, and this machine may not have that provider configured at all. A
@@ -5487,9 +6555,32 @@ impl Host {
             // this properly means a plugin registering as the swarm's approver, which is a surface
             // that does not exist yet. A silent success would be a remote machine believing it had
             // authorised a write to this filesystem when it had not, so it says no instead.
-            C::Approve { .. } => Err(neosh_proto::Refusal::NotPermitted {
-                what: "approvals are answered by a plugin on this machine, not over the swarm"
-                    .into(),
+            // One that names the prompt it answers: a watcher answering what this machine offered
+            // it, which is the only kind of approval that has anything here waiting for it. The
+            // node has already checked `accepts_approvals`.
+            C::Approve { decision, id: Some(id), option } => {
+                let answer = match (decision, option) {
+                    (neosh_proto::PermissionDecision::Deny { .. }, _) => {
+                        neosh_provider::approval::PermissionAnswer::Deny
+                    }
+                    (_, Some(o)) => neosh_provider::approval::PermissionAnswer::Option(o),
+                    _ => neosh_provider::approval::PermissionAnswer::Allow,
+                };
+                self.settle_offer(&session, &id, crate::relay::Reply::Approve(answer))
+            }
+            C::Answer { id, answers } => {
+                self.settle_offer(&session, &id, crate::relay::Reply::Answers(answers))
+            }
+            C::SetMode { mode } => {
+                self.set_permission_mode_of(&session, mode);
+                self.publish_inventory();
+                Ok(None)
+            }
+            // The older form, which names no prompt. Nothing here is waiting on an answer that is
+            // not about anything, and a silent success would be a remote machine believing it had
+            // authorised a write to this filesystem when it had not.
+            C::Approve { id: None, .. } => Err(neosh_proto::Refusal::NotPermitted {
+                what: "an approval has to name the prompt it answers".into(),
             }),
         }
     }
@@ -5615,6 +6706,9 @@ impl Host {
                 let text = value.as_str().unwrap_or_default();
                 self.agent.session().system =
                     if text.is_empty() { None } else { Some(text.to_string()) };
+            }
+            "agent.append_prompt" => {
+                self.agent.set_appended_prompt(value.as_str().unwrap_or_default());
             }
             // Re-read whole rather than patched field by field: they are eight settings describing
             // one behaviour, they are all cheap to read, and a partial update is how two of them
@@ -6703,7 +7797,15 @@ impl Host {
     /// for the ordinary reason: it is how anybody knows.
     fn set_permission_mode(&mut self, mode: neosh_proto::PermissionMode) {
         let here = self.active_session();
-        self.agent.set_permission_mode(&here, mode);
+        self.set_permission_mode_of(&here, mode);
+    }
+
+    fn set_permission_mode_of(
+        &mut self,
+        session: &neosh_proto::SessionId,
+        mode: neosh_proto::PermissionMode,
+    ) {
+        self.agent.set_permission_mode(session, mode);
         self.sync_agent_drivers();
         self.refresh_status();
         self.persist_sessions();
@@ -6883,13 +7985,21 @@ impl Host {
         &mut self,
         drivers: Vec<Arc<dyn neosh_provider::drivers::AgentDriver>>,
     ) {
+        // Both stand behind a relay, so a prompt that would reach a person here is offered to the
+        // machines watching its conversation as well. See [`crate::relay`].
         let asker: Arc<dyn neosh_provider::approval::PermissionAsker> =
-            Arc::new(neosh_agent::DriverAsker::new(&self.agent, self.bridge.clone()));
+            Arc::new(crate::relay::RelayAsker {
+                inner: Arc::new(neosh_agent::DriverAsker::new(&self.agent, self.bridge.clone())),
+                tx: self.relay_tx.clone(),
+            });
         // The other half of "a request one of them cannot answer alone": not whether something may
         // happen, but which of several things you want. Policy has no answer to that one, so it
         // goes somewhere else entirely — see [`neosh_agent::DriverQuestioner`].
         let questioner: Arc<dyn neosh_provider::ask::QuestionAsker> =
-            Arc::new(neosh_agent::DriverQuestioner::new(&self.agent, self.bridge.clone()));
+            Arc::new(crate::relay::RelayQuestioner {
+                inner: Arc::new(neosh_agent::DriverQuestioner::new(&self.agent, self.bridge.clone())),
+                tx: self.relay_tx.clone(),
+            });
         // Where an agent that speaks unprompted is heard. One per workspace rather than one per
         // driver: what comes back is the conversation it happened in, which is all the host needs
         // to know where to put it.
@@ -10355,6 +11465,13 @@ impl Host {
                     // rather than keep claiming the model is thinking.
                     me.draw_working();
                 });
+                // The card a watcher on another machine draws — the same card.
+                if self.watched(&session) {
+                    self.stream_out(&session, neosh_proto::StreamEvent::ToolStarted {
+                        turn: turn.0.clone(),
+                        call: call.clone(),
+                    });
+                }
                 self.broadcast(PluginEvent::ToolStarted { session, turn, call });
             }
             AgentEvent::ToolFinished { session, turn, call, result } => {
@@ -10383,6 +11500,13 @@ impl Host {
                     me.finish_card(&call.id, &result);
                     me.draw_working();
                 });
+                if self.watched(&session) {
+                    self.stream_out(&session, neosh_proto::StreamEvent::ToolFinished {
+                        turn: turn.0.clone(),
+                        call: call.clone(),
+                        result: result.clone(),
+                    });
+                }
                 self.broadcast(PluginEvent::ToolFinished { session, turn, call, result });
             }
             AgentEvent::TurnEnded { session, turn, stop_reason, usage } => {
@@ -10518,6 +11642,13 @@ impl Host {
                 self.persist_session(&session);
             }
             AgentEvent::Steered { session, prompt, .. } => {
+                // Taken in over here, so asked over there too — see `StreamEvent::Asked`.
+                if self.watched(&session) {
+                    self.stream_out(&session, neosh_proto::StreamEvent::Asked {
+                        text: prompt.text.clone(),
+                        images: prompt.images.len() as u32,
+                    });
+                }
                 // A turn opened to hear the agent out has just been handed a question, so it is not
                 // a report any more. Left alone, the line went on saying `Reporting back` over the
                 // answer to the thing you had typed — which is the same lie as the one that label
@@ -10935,9 +12066,25 @@ impl Host {
     /// One plugin call, answered. Split out so the terminal it is about can be set for the whole
     /// of it and put back afterwards, however many ways out of it there are.
     async fn plugin_call(&mut self, plugin: PluginId, id: RequestId, call: ApiCall) {
+        // In another machine's conversation, what can answer it is that machine's list.
+        if self.answer_from_catalogue(&plugin, &id, &call) {
+            return;
+        }
         // Answered when the prompt closes rather than now: the host has to read the
         // keyboard before it knows whether a key was entered, and the plugin is
         // waiting to hear exactly that.
+        // Signing in is to a provider on *this* machine, and the picker in another machine's
+        // conversation is listing that machine's providers. Said, rather than asking for a key
+        // this machine would then keep for a provider it is not using.
+        if let ApiCall::ProviderSetCredential { .. } = &call
+            && let Some(m) = self.mirror_meta(&self.active_session())
+        {
+            let answer = Err(ApiError::Denied {
+                reason: format!("sign in on {} — its providers are its own", m.machine),
+            });
+            self.respond_plugin(plugin, id, answer);
+            return;
+        }
         if let ApiCall::ProviderSetCredential { instance, replace } = &call {
             let waiting = Some((plugin.clone(), id.clone()));
             if let Err(e) =
@@ -11139,6 +12286,27 @@ impl Host {
                 self.drain_effects();
             }
             InputEvent::Paste { text } => {
+                // A panel with the keyboard gets what was pasted into it. Pasted anywhere else, the
+                // text went into the composer *behind* the panel — a field you cannot see, from a
+                // key you pressed at something else — which is the one thing a modal promises not
+                // to do with a keystroke and was doing with a paste. The panel is told rather than
+                // typed at: it is a plugin's, and only it knows whether it is a field, a filter, or
+                // a sheet that has nothing to do with text.
+                let view = self.view_now();
+                if let Some(win) = self.editor.focused(view).filter(|w| {
+                    *w != self.v().composer_win
+                        && self
+                            .editor
+                            .window(*w)
+                            .is_some_and(|w| matches!(w.layout, WindowLayout::Float { .. }))
+                }) {
+                    self.broadcast(PluginEvent::Event {
+                        name: "neosh.paste".to_string(),
+                        data: Some(serde_json::json!({ "win": win, "text": text })),
+                        from: BUILTIN.to_string(),
+                    });
+                    return true;
+                }
                 // At the cursor, replacing whatever is selected — the same edit typing performs,
                 // because a paste that always lands at the end is not a paste.
                 if self.v().reading {
@@ -11714,6 +12882,7 @@ impl Host {
         // sitting there is one nobody knows exists.
         let mut quota_rx = self.quota_rx.take();
         let mut unasked_rx = self.unasked_rx.take();
+        let mut relay_rx = self.relay_rx.take();
         let mut image_rx = self.image_rx.take();
         // `None` unless something is serving, in which case a `recv` on it is never ready — the
         // same shape as the swarm channel above, and for the same reason.
@@ -11843,6 +13012,12 @@ impl Host {
                     Unheard::Began(session) => self.hear_out(session),
                     Unheard::Background(session, tasks) => self.heard_background(session, tasks),
                 },
+                Some(relay) = async {
+                    match relay_rx.as_mut() {
+                        Some(rx) => rx.recv().await,
+                        None => std::future::pending().await,
+                    }
+                } => self.on_relay(relay),
                 Some(polled) = async {
                     match quota_rx.as_mut() {
                         Some(rx) => rx.recv().await,
@@ -11899,6 +13074,7 @@ impl Host {
                 }
                 () = &mut roster, if self.swarm_node.is_some() => {
                     self.publish_inventory_if_changed();
+                    self.prune_mirrors();
                     roster.as_mut().reset(Instant::now() + ROSTER_INTERVAL);
                 }
                 () = &mut plan => {
@@ -12168,7 +13344,7 @@ impl Host {
     fn persist_session(&self, id: &neosh_proto::SessionId) {
         let Some(dir) = &self.state_dir else { return };
         let store = self.agent.sessions();
-        let Some(s) = store.get(id).filter(|s| !s.ephemeral) else { return };
+        let Some(s) = store.get(id).filter(|s| !s.hidden()) else { return };
         if let Err(e) = crate::sessions::save(dir, s) {
             tracing::warn!("could not save conversation {}: {e}", id.0);
         }
@@ -12428,6 +13604,7 @@ impl Host {
         self.refresh_status();
         self.refresh_composer();
         self.startup.reload = Some(boot.reload);
+        self.startup.config_file = boot.config_file;
         // Set here and not in `apply_config`, which `config.reload` also runs: a `^R` must not
         // re-ask the question this process was started with.
         self.startup.first_prompt = boot.first_prompt;
@@ -13922,6 +15099,17 @@ impl Host {
                 description: Some("Replaces the built-in system prompt when set.".into()),
             },
             OptionSpec {
+                name: "agent.append_prompt".into(),
+                ty: OptionType::Str,
+                default: OptionValue::Str(String::new()),
+                description: Some(
+                    "Said at the end of every message you send — \"run the tests before you say \
+                     you are done\", \"answer briefly\". Added to what is sent, never to the \
+                     transcript, so what you typed is what stays on screen. Empty says nothing."
+                        .into(),
+                ),
+            },
+            OptionSpec {
                 name: "chat.markdown".into(),
                 ty: OptionType::Bool,
                 default: OptionValue::Bool(true),
@@ -14978,6 +16166,51 @@ pub fn install_builtin_providers(
 
 /// The workspace, as somewhere a driver can say its agent started talking on its own.
 ///
+/// The model another machine says a conversation of its is using, as a selection here.
+///
+/// An older machine names the model and not the provider serving it; the provider is filled in
+/// from that machine's catalogue when it arrives, and until then the footer still says the model.
+fn remote_selection(agent: &neosh_proto::AgentSummary) -> Option<neosh_proto::ModelSelection> {
+    Some(neosh_proto::ModelSelection {
+        instance: neosh_proto::InstanceId(agent.instance.clone().unwrap_or_default()),
+        model: neosh_proto::ModelId(agent.model.clone()?),
+        options: agent.options.clone(),
+    })
+}
+
+/// A model-picker call, answered from another machine's catalogue.
+fn catalogue_answer(
+    catalogue: &neosh_proto::ModelCatalogue,
+    call: &ApiCall,
+) -> Result<ApiOk, ApiError> {
+    match call {
+        ApiCall::AgentListModels { instance, .. } => Ok(ApiOk::Models {
+            models: catalogue
+                .models
+                .iter()
+                .filter(|e| instance.as_ref().is_none_or(|i| &e.instance == i))
+                .cloned()
+                .collect(),
+        }),
+        ApiCall::ProviderCredentials => {
+            Ok(ApiOk::Credentials { credentials: catalogue.credentials.clone() })
+        }
+        _ => Err(ApiError::Internal { message: "not a catalogue question".into() }),
+    }
+}
+
+/// A prompt as it goes out on a conversation's stream.
+fn offer_event(id: &str, offer: &crate::relay::Offer) -> neosh_proto::StreamEvent {
+    match offer.clone() {
+        crate::relay::Offer::Question(questions) => {
+            neosh_proto::StreamEvent::Question { id: id.to_string(), questions }
+        }
+        crate::relay::Offer::Permission { title, capability, options } => {
+            neosh_proto::StreamEvent::Permission { id: id.to_string(), title, capability, options }
+        }
+    }
+}
+
 /// A channel rather than a call into the host: this arrives from a reader task on a driver's own
 /// thread, and the host is a single writer that owns everything it would have to touch.
 #[derive(Debug)]

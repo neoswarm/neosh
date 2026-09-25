@@ -93,6 +93,9 @@ async function retitle(neosh: Neosh, attempted: Set<SessionId>, forced: boolean)
 
   const current = await neosh.session.current().catch(() => null);
   if (!current) return;
+  // Another machine's conversation is named over there, by that machine — and naming it here would
+  // spend a model call on a title nothing would ever keep.
+  if (current.mirror) return;
   if (!forced) {
     // A title someone set by hand is theirs. And one exchange is the earliest point at which there
     // is anything to name.

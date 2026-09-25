@@ -7,5 +7,5 @@ description = "A docked panel: where you are, what changed, and what is answerin
 # contribution to a point nobody reads is reported rather than silently ignored.
 [provides]
 points = ["sidebar.section", "sidebar.action", "sidebar.decoration"]
-kinds = ["neosh.sidebar", "neosh.swarm.view"]
-vars = ["sidebar.projects", "sidebar.favorite", "sidebar.rank", "sidebar.folded", "sidebar.name", "sidebar.root"]
+kinds = ["neosh.sidebar"]
+vars = ["sidebar.projects", "sidebar.favorite", "sidebar.rank", "sidebar.folded", "sidebar.name", "sidebar.root", "swarm.codes"]

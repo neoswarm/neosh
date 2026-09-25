@@ -280,29 +280,122 @@ is `docs/releasing.md`.
   connection with it, so a directory picker aimed at an older peer would knock it off the board
   rather than come back empty. It defaults to `false`, which is what an older handshake decodes to,
   so "does not say" and "cannot" are one answer and a version bump was never needed.
-- **A row that is not on this computer says so with one column, and the colour is the link.** The
-  machine's *name* was on every remote row — up to fourteen columns of the narrowest panel in the
-  workspace, on a block of rows that are all on the same machine, taking the column a local row
-  spends on how long its turn has been running and clipping the conversation's own name to make
-  room. What the row has to carry is one bit — not here — and one fact you cannot act without:
-  whether that machine can be reached, because `↵` on a row is *open and steer it* against a peer
-  that is up and nothing at all against one that is not, and the two were drawn identically. So it
-  is one column of `@`, `Swarm.Up` green when the link is up, `Swarm.Linking` pulsing amber
+- **A row that is not on this computer says which one, and the colour is the link.** The machine's
+  *name* was on every remote row — up to fourteen columns of the narrowest panel in the workspace —
+  and then it came off for a bare `@`, which said *not here* and nothing else: with two machines
+  paired every remote row looked alike and which computer a conversation was on was a pause on the
+  row and a read of the key card. So it is `@` and the machine's **short code** — `@ms` for
+  `mac-studio` — three columns, worked out from the name (`machineCodes`: initials, the next
+  candidate on a clash, assigned in a fixed order so a redraw never shuffles them) and yours to
+  change: `@` on the row, `^T` in `^J`, the *Computers* page in settings, all writing the
+  `swarm.codes` workspace var, because what you call a machine is a fact every panel should agree
+  on. The code is said **once per block**, on the block's own row, and every row under it carries
+  the block's colour instead. **And each machine has a colour of its own** — `Swarm.Host1`…`6`,
+  `machineColors`, a hash of the node id so pairing a third machine does not repaint the first two,
+  and the blue for the first — worn by its code, its `⎇` and the `·` of every conversation in its block, and by its
+  rows in `^J`, in `^N`'s "which computer" and on the settings page, so the colour you learn in one
+  panel is the machine in every other. The first cut had one blue for every machine, which said
+  *not here* and never *where*. While a link is not up the code is `Swarm.Linking` pulsing amber
   while it is being dialled, `Swarm.Waiting` while it is a person at the far end being waited on,
-  `Swarm.Down` dim when nothing is dialling it. Up and down are **still**: a link that is up is a
-  condition rather than an event and the glyph is on every remote row at once, so motion on all of
-  them is the panel vibrating. Which computer, and what the link is doing in words, is the **key
-  card** — it appears beside the row you pause on and a border has room for a sentence. **`@`
-  rather than a cloud**, because a cloud is the world's mark for "not on this machine" everywhere
-  except a terminal: what it actually reads as there is a cloud *service*, which is precisely the
-  wrong idea about a laptop on the same desk. `ssh you@box` is a thing everybody in a terminal has
-  typed, and it is ASCII, so there is no fallback glyph and no font that draws it at a width
-  nobody expected. And the
-  panel is built from `swarm.nodes()` rather than `swarm.agents()`, which is the same list minus
-  the machines that are not up: that filter is right for *what can I act on* and wrong for a list,
-  because a machine going quiet does not take its conversations off your screen, it takes them out
-  of reach, and a list that silently shortens is one you cannot tell from a list that never had
-  them.
+  and `Swarm.Down` dim when nothing is dialling it — and its marks go to `Swarm.Down` too, because
+  the colour of a place you can go is the wrong thing to draw on one you cannot. Connected is never
+  the green of *finished*, which put the colour of done on rows where nothing had started. Up and down are **still**: a link that is up is a
+  condition rather than an event and the mark is on every remote row at once, so motion on all of
+  them is the panel vibrating. **And a row you can reach is drawn like one of yours.** Remote rows
+  were grey whatever the link was doing, which made a block of conversations you could open and
+  steer look disabled — the one thing the row must not say about the part of the panel you can use.
+  `Sidebar.Remote` is for a machine that is *not* connected, where grey is true. Which computer by
+  its full name, and what the link is doing in words, is the **key card**. **`@` rather than a
+  cloud**, because a cloud is the world's mark for "not on this machine" everywhere except a
+  terminal: what it actually reads as there is a cloud *service*, which is precisely the wrong idea
+  about a laptop on the same desk. `ssh you@box` is a thing everybody in a terminal has typed, and
+  it is ASCII, so there is no fallback glyph. And the panel is built from `swarm.nodes()` rather than
+  `swarm.agents()`, which is the same list minus the machines that are not up: that filter is right
+  for *what can I act on* and wrong for a list, because a machine going quiet does not take its
+  conversations off your screen, it takes them out of reach.
+- **Another machine is a block of its own, and never folded into ours.** The first cut put another
+  machine's main checkout into the repository row, then split it out when its version differed —
+  and "differed" was only ever as good as what that machine last said: an older neosh says nothing
+  about its commit, a heartbeat can be late, and a conversation over there written against code this
+  machine does not have sat in the list beside yours as though it were about your files. So a
+  machine is always a `MachineBlock`: one row like a worktree — `@lb ⎇ trunk`, its code, its branch,
+  and its full name when the column has room — with its main checkout's conversations and then its
+  worktrees indented under it, their marks in its colour, and its own fold
+  (`machine:<node>:<project key>`). Which version it is still matters and is still said, but only
+  as news: `≠ 4f3a1c2` in `Swarm.Version` when its commit is not ours — amber, not the bold red of a
+  diverged branch, because a build box one release behind is ordinary — and nothing when it matches
+  or either side cannot say. Both commits come off the **files**, not out of `git`:
+  `neosh_vcs::read_head` reads `HEAD`, the ref and `packed-refs`, cheap enough for
+  `RemoteProject::head` on the inventory timer and for `git.heads` on every redraw.
+- **Yours first, and then each other machine is a place.** `PROJECTS` is the repositories with a
+  checkout on this disk and nothing else; after `+ Add project` comes one section per paired
+  machine (the `machines` slot) — `@st STARFIGHTER` and a rule under it in its colour, the right
+  column saying `offline`, `connecting` or `not allowed yet` when it cannot be reached — and under
+  it the repositories that are **only** over there. They used to be mixed in with yours and ranked
+  *above* them, because a project with no directory here sorted as rank `0`; each also said `@st`
+  on its row and then again on a block row beneath it. In a machine's own section the machine goes
+  without saying: the row is the name and the branch its checkout is on (`faraway ⎇ main`), and
+  its conversations and worktrees hang straight off it, indented. A repository only
+  elsewhere but on several machines sits under the best-connected one, with a block per machine
+  inside. The heading is a row you can stand on — `↵` folds the section (`host:<node>`), `c`/`C`
+  connect and disconnect, `t` is a shell in that machine's home, `n` is the path field pointed at
+  it. And **a key that is only a guess joins the one project it names**: a machine that has not
+  read its origin yet answers `dir:<name>`, which never matched your real key, so the repository
+  you were sitting in appeared again as somebody else's — now `dir:neosh` meets the single local
+  project called `neosh`, and only a single one, because a wrong merge is worse than two rows.
+  **No line down the side**: a `│` rail beside every block read as a border and boxed the panel in;
+  the indent says what hangs off what and the machine's colour rides on marks the rows already
+  have. And **a fold of a row that is not a directory is not a project var** — `host:…`,
+  `machine:…`, `git:…` go in the `sidebar.folded.elsewhere` workspace var, because a project var
+  keyed by a name that is not a path was read back as a directory arriving, and the row you had just
+  folded jumped into your own section as a project of yours. `sidebar.projects` holds absolute
+  paths and nothing else, and anything else found there is dropped on load.
+- **Another machine's conversation opens as a conversation, not as a window onto one.** It was a
+  float of plain text with a one-line prompt behind `i` — no cards, no markdown, no working line —
+  on the argument that the chat pane is *yours* and somebody else's conversation there would give
+  the composer two meanings. What it meant in practice was that half the workspace was a
+  second-class citizen of it. So `swarm.mirror` makes a **mirror**: a local `Session` with
+  `mirror: Some(MirrorOf { node, session, machine })`, hidden like a placeholder (never listed,
+  never saved, never where a view lands when it leaves another, dropped by `enter` when its pane
+  leaves it and by `prune_mirrors` on the roster clock when a pane closes some other way), whose
+  events are the other machine's stream **translated into `AgentEvent`s and handed to the same
+  `on_agent_event`** a turn here goes through — so the transcript, the cards, the working line, the
+  timing and the notifications are one piece of code whichever machine the agent is on, and a
+  conversation over there cannot come to look different from one here. What you send goes through
+  `start_turn_in`, which forwards `AgentCommand::Send` for a mirror; `Esc` forwards `Interrupt`.
+  The question is drawn when the owner says it was asked (`StreamEvent::Asked`), which is the one
+  order every watcher sees it in; every turn's end re-subscribes, and **the owner sends the
+  history on every subscribe** (it used to be only the first, so a second viewer got nothing), so
+  the copy here is re-synced to what was recorded. `ToolStarted`, `ToolFinished` and `Asked` are
+  **rich** stream events and only go to a peer whose `NodeCapabilities::rich_stream` says it can
+  parse them — an unknown tag fails the frame and drops the link — so an older neosh on either end
+  degrades to the words live and the rest at the turn's end rather than to a dropped connection.
+  Where you are is said twice: the remote row is lit `▸` in the project panel, and the status line
+  carries `@lb linux-box` in that machine's colour, because the composer looks the same either way.
+  **Opening one is arriving in it**: `↵` on the row leaves the panel exactly as it does on a row of
+  yours, because a conversation you chose to talk to that left the keyboard in the sidebar sent
+  your first sentence to the panel's keys. **And every key does to it what it does to yours, over
+  there** — the mirror is intercepted at the host rather than taught to each plugin, so `^P` is
+  `SetModel`, a rename is `Rename`, archiving is `Archive`, `<C-w>T` is a shell on that machine in
+  its directory, `^N` starts on that machine, and the footer's model, options, mode and context
+  are read off the owner's `AgentSummary` on every inventory, since either end can change them.
+  **`^P` in a mirror is the owner's `^P`**: the model plugin asks what it always asks —
+  `ProviderCredentials`, `AgentListModels` — and the host answers from the owner's
+  `ModelCatalogue` (`AscpMessage::Catalogue`, asked as the mirror opens, cached per machine, parked
+  calls answered when it lands), so the picker, `^E` and the footer's "no key" all describe the
+  machine the turn runs on and no plugin learnt what a mirror is. Options travel on `SetModel`
+  only when they were chosen off that catalogue, which is the one place they mean the same thing
+  at both ends; signing in is refused, because a key belongs to the machine whose provider it is.
+  Deleting is refused by name: nothing over the swarm destroys what it cannot put back. **A
+  question is asked wherever somebody is watching** (`crate::relay`): the owner's asker is wrapped,
+  a prompt that would reach a person here is also sent as `StreamEvent::Question`/`Permission`, the
+  watcher raises it through its *own* `ask_user`/`permission_pre` hooks for the mirror, and the
+  first answer from anywhere wins — `Settled` takes the others down through `neosh.prompt.withdrawn`,
+  which the questions and approvals panels listen for. Policy runs first, so full access never puts
+  a prompt on another screen; a permission answer and `SetMode` need `accepts_approvals`, because
+  either is a write to that disk, and the watcher checks before drawing a picker whose answer would
+  be refused. A watcher with nobody to ask sends *nothing* — answering "nobody answered" for a
+  person it never asked would be the worst answer available.
 - **A project is an identity, and a checkout is a machine and a path.** The panel grouped local
   conversations by directory and drew the other machines' work beside it — matched, in theory, on
   the project key, and in practice on a key the local side did not have: it was inferred from a
@@ -318,11 +411,11 @@ is `docs/releasing.md`.
   missing, `AgentSummary::repo_root` and `branch` are what let a peer's tree nest rather than arrive
   as a project named after a branch, and `RemoteProject` carries both as well so that a tree with
   nothing open in it does not jump to the top level — a panel that reorganises itself when the last
-  conversation in a directory ends is one you cannot learn. The main checkout's conversations sit
-  directly under the repository, here and over there in **one list**, because they are the same work
-  in different places; everything else is a row one level down named by its branch. Two checkouts of
-  one branch on two machines stay two rows: same name, different disks, different uncommitted work,
-  and merging them would be a claim that is simply false. A repository wears the marker only when it
+  conversation in a directory ends is one you cannot learn. This machine's conversations sit directly
+  under the repository and its worktrees one level down, named by their branch; every other machine
+  is a block of its own beside them (see above). Two checkouts of one branch on two machines stay
+  two rows: same name, different disks, different uncommitted work, and merging them would be a
+  claim that is simply false. A repository wears the marker only when it
   is **not** here as well — on a swarm of two machines nearly every row is partly elsewhere, and
   what is true of every row does not earn a column on each of them; where it is news is a repository
   you have no clone of, which is the row you would otherwise press `↵` on expecting your own files.
@@ -403,6 +496,38 @@ is `docs/releasing.md`.
   see. `ui.images = false` leaves the mark off; `NEOSH_NO_IMAGES` is the terminal's own switch.
 - `Editor::handles` is a **deny-list**. A new API call that is not added to it silently routes to
   the core.
+- **A setting chosen on a screen is written down, in the file that is yours.** `opt.set` says what
+  a value is *now* — `init.ts` choosing a width, `>` resizing the panel — and an editor that rewrote
+  the config file every time a plugin did would be one you stopped trusting with the file. So
+  saving is its own verb: `ApiCall::OptPersist` (`opt.save`) sets the value through `OptSet` first,
+  so a wrong type is refused before anything is written, and then edits `[options]` in `config.toml`
+  as a **document** (`toml_edit`) — every comment, section and blank line left as it was — writing
+  the default as *no line at all*, checking the edited text still loads as a `Config`, and renaming
+  a temporary file over the old one. Under `--clean` there is no file, and it says so rather than
+  pretending. The **settings panel** is a plugin over exactly that: built from `opt.all()`, so a
+  plugin's options have a section with nobody writing glue; curated `settings.page` contributions on
+  top (`General` is ours); a control per declared type; and it applies and saves as you move,
+  because nothing reversible asks. No Ctrl-letter is left, so it is `,` in the project panel,
+  `/settings` and `^K` — and the panel's foot says `/settings`, because a capability with no key
+  still has to be findable from the composer.
+- **Standing instructions are said on the wire and never in the transcript.** `agent.append_prompt`
+  goes on the end of the copy of the message a turn sends — `neosh_provider::append`, beside the
+  spoken-option words and for their three reasons: every driver gets it, the transcript keeps what
+  you typed (so it is said once per question rather than again for every question before it), and a
+  tool result handed back mid-loop is nobody's message. Taken once per turn, and only when the turn
+  asked something — a listening turn has no question for it to end.
+- **A paste goes to the panel that has the keyboard.** It always went to the composer, so pasting a
+  model's name into the picker's filter typed it, invisibly, into the message behind the picker —
+  the one thing a modal promises never happens to a keystroke. A focused float is handed the text as
+  `neosh.paste` (`{ win, text }`) and `onPaste` in `@neosh/api/ui` is how a panel takes it; the
+  picker's filter and `prompt` take one line of it, a multi-line field takes it whole.
+- **A main checkout can keep itself current, and only by a fast-forward.** `git.pull.auto` walks
+  the panel's list on the fetch clock and fast-forwards each *main* checkout that tracks a branch,
+  is behind and not ahead, and has nothing conflicted — the one route that adds commits and rewrites
+  none — and never under a running turn, asked again after the fetch because a turn can start in
+  the seconds it took. Worktrees are somebody's branch and are left alone. A tree git refuses to
+  move is filed, not announced; a pull that brought something is one line, because it is news you
+  did not ask for.
 - **A driver's account of its own loop is not a content block.** Sub-agents, plans, compaction and
   the commands a driver accepts go in `ProviderEvent::Activity`; `TurnAssembler` never reads it. If
   something new has to be squeezed into `TextDelta` to be seen, the family is what to extend.
@@ -1121,6 +1246,12 @@ is timing-sensitive: under load a handful of unrelated tests fail on a `wait_for
 different handful each run. A failure there is worth re-running alone (`--test-threads 1 <name>`)
 before believing it.
 
+Releasing is `scripts/bump.sh` — see `docs/releasing.md`. The crates and the binary packages share
+one version and move together; `@neosh/api` and each `@neosh/<plugin>` have their own and move
+only when their directory changed, because nothing depends on them and `publish-npm.yml` skips a
+version npm already has. `tag.yml` runs `scripts/bump.sh --verify`, which fails a release tag on a
+package that changed and kept its number — the one way that policy can lose a change.
+
 `./scripts/check.sh` is everything CI runs, in four stages — `crates`, `binary`, `screen`, `web` —
 and CI runs each stage on a runner of its own, the two big ones sliced across several
 (`check.sh screen 1/3`). It prefers `cargo nextest` when installed, one process per test with one
@@ -1207,7 +1338,7 @@ only way to do anything.
 | `^T` | Projects and conversations. Switching is never refused — turns keep running where they are |
 | `^J` | The computers in this workspace. Add one by its address, allow one that is asking, rename one (`^E`), or open what it is running. A machine this one has reached that has not allowed it back says so, and says which key to press over there |
 | `^F` | What you have archived — see below. Filter it, put some back, or finally empty it |
-| `^N` | New conversation. With another computer paired it asks **which** first — this one, or any of them, each with a cloud saying whether it can be reached; with none paired that question is not asked at all. Then, in a repository, where: here, a worktree you need not name, one kept inside the project, one you do name, an existing one, elsewhere. A worktree you did not name is named by your first message — `fix/composer-paste-truncation`, not `wily-nimbus-7hq2` |
+| `^N` | New conversation. With another computer paired it asks **which** first — this one, or any of them, each marked with whether it can be reached; with none paired that question is not asked at all. Then, in a repository, where: here, a worktree you need not name, one kept inside the project, one you do name, an existing one, elsewhere. A worktree you did not name is named by your first message — `fix/composer-paste-truncation`, not `wily-nimbus-7hq2` |
 | `^O` | Add a project. The filter line **is** the path field: `/`, `~` and `./` complete directories from the first keystroke, `⇥` walks into the highlighted one, `↵` takes what you typed. `linux-box:` completes on that computer instead. Paste a repository address — `https://…`, `git@…`, `file://…`, or just `owner/repo` — and it offers to **clone** it: it asks where, remembers the folders you pick, draws git's own progress while it fetches, and leaves you in the new project |
 | `^B` | Toggle the sidebar |
 | `^K` | Command palette |
@@ -1421,9 +1552,11 @@ says how many are asking, `^T` is where you go, and it opens when you get there.
 | `y` | Copy the row's directory — a worktree's path, ready to paste into a shell |
 | `t` | A **terminal** in this project, in a tab of its own — on this computer, or on the machine the row is on |
 | `c` `C` | Connect to that computer, or disconnect from it. Only on a row that is about another machine; `^J` is still where one is added or removed |
+| `@` | Choose the short code that computer is drawn with — the `ms` in `@ms` |
 | `p` | Bring that repository up to date — fast-forwards silently, asks *rebase or merge* when the branch has gone both ways, and goes and looks when nothing is waiting. The row spins from the press, not from the network call three steps down (a git-plugin contribution) |
 | `d` | Remove a worktree from disk — its branch stays, and it asks first (a git-plugin contribution) |
 | `x` `X` | Archive, delete. Deleting the last conversation in a worktree takes the checkout with it, and the dialog says so — the branch stays. On a repository's heading, `X` takes the project off the list and leaves the directory; on a worktree's, it removes the checkout too |
+| `,` | Settings — the panel below. `,` because it is what `⌘,` is on a Mac, without the key a terminal never receives |
 | `a` | The archive — the popup below. Nothing archived is ever a row in *this* panel, and by default not even a count. An `archive.action` contribution, not a key this panel owns |
 | `⇥` | On the plan rows: how much of it to show — the limit that binds, every limit, or all of it with the account and the sentence. `usage.sidebar.style` is where it starts, `usage.sidebar` turns it off. A key on a contributed row is named down to the section (`custom:plan`), so the panel sends the press to whichever block the cursor is over rather than to whoever registered it first |
 | `?` | The keys for whatever row you are on, as a sheet |
@@ -1455,11 +1588,12 @@ each fact is:
 ──────────────────────────────────
  ▾ neosh ↓3 ~1 ?1  #86 ✗2       6
    ▸ Chasing the flake       12m
-   · Rework the tab bar      @
    ▾ ⎇ fix/the-thing ↑2  #91     1
      ▸ Try the grapheme path
-   ▾ ⎇ fix/tab-strip @          1
-     · Nearly there           @
+   ▾ @lb ⎇ main ≠ 4f3a1c2        3
+     · Rework the tab bar      8m
+     ▾ ⎇ fix/tab-strip           1
+       · Nearly there          now
 ```
 
 **There was a `GIT` heading with the branch and a verb under it, and it was saying twice what the
@@ -1501,6 +1635,26 @@ appended to the stats — it *qualifies* them rather than replacing them, `↓3 
 waiting, just three as of whenever the network last worked — and it appears only when the last fetch
 did not reach the remote. `now` and `12m` were not worth a column: a fetch every three minutes is
 fresh enough that saying so is noise. Being unreachable is not.
+
+## Settings — `,` in the project panel, `/settings`, or `^K`
+
+Every option in the workspace on one screen, **saved into `config.toml` as you change it** — see the
+rule above. A rail of sections on the left (the curated `General` page, a section per namespace,
+*Computers* with each machine's code, and *Keys*, the live keymap), the settings on the right with a
+control for each declared type, and what the row under the cursor is, its default and whether you
+changed it, at the foot. Every key is an ordinary binding on the `neosh.settings` kind.
+
+| Key | Does |
+|---|---|
+| `⇥` `⇧⇥`, `]` `[`, `J` `K` | Next / previous section |
+| `j` `k`, `^D` `^U`, `gg` `G` | Move |
+| `h` `l`, `←` `→` | Along a switch or a ladder of values, or nudge a number |
+| `<Space>` | The next value along |
+| `↵` | Change it: toggle, cycle, or a field to type in. Prose (`agent.append_prompt`, `agent.system_prompt`) gets a field several lines tall — `⏎` is a new line, `esc` keeps it, `^C` throws it away. On *Keys*, runs the command; on *Computers*, changes the code |
+| `r` | Back to the default, and the line out of `config.toml` |
+| `/` | Find — every word, in any order, over names and descriptions |
+| `y` | Copy the option's name |
+| `Esc` `q` `^C` | One thing per press: the search, then the panel |
 
 ## The archive — `^F`, or `a` in the project panel
 

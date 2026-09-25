@@ -36,6 +36,7 @@ mod sessions;
 mod skill;
 mod update;
 mod quota;
+mod relay;
 mod swarm;
 mod term;
 mod trust;
@@ -471,6 +472,7 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
         }),
         cli_model: cli.model.clone(),
         cli_plugin_dirs: cli.plugin_dirs.clone(),
+        config_file: (!paths.clean).then(|| paths.config_file()),
         // Only ever reached by a process that is its own workspace: `--no-daemon`, the stdio
         // protocol, a test. Everything else went through `run_client` above, which starts a
         // conversation of its own rather than talking into whichever one this process began with.

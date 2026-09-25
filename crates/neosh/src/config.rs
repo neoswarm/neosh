@@ -269,6 +269,114 @@ impl Config {
     }
 }
 
+/// Write one option's value into `[options]` in a `config.toml`, or take it out with `None`.
+///
+/// The settings screen's half of the file. Everything else in it is left exactly as it was —
+/// comments, the order of sections, blank lines, the providers somebody spent an afternoon on —
+/// because the file is still theirs and a screen that reformatted it on every toggle is one that
+/// teaches people to stop using the screen. So it is edited as a document rather than parsed into
+/// [`Config`] and serialised back out, which would keep the values and lose everything else.
+///
+/// Checked before it is written: the edited text has to load as a [`Config`], or nothing is
+/// written at all. A value this cannot spell in TOML — a JSON `null` somewhere inside an object —
+/// is an error rather than a line that stops the workspace starting next time.
+pub fn write_option(path: &Path, name: &str, value: Option<&OptionValue>) -> anyhow::Result<()> {
+    let text = match std::fs::read_to_string(path) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => return Err(anyhow::anyhow!("{}: {e}", path.display())),
+    };
+    let mut doc: toml_edit::DocumentMut =
+        text.parse().map_err(|e| anyhow::anyhow!("{}: {e}", path.display()))?;
+    match value {
+        Some(v) => {
+            let item = doc
+                .entry("options")
+                .or_insert_with(|| toml_edit::Item::Table(toml_edit::Table::new()));
+            let Some(table) = item.as_table_like_mut() else {
+                anyhow::bail!("{}: `options` is not a table", path.display());
+            };
+            table.insert(name, toml_edit::Item::Value(toml_value(v)?));
+        }
+        None => {
+            let empty = match doc.get_mut("options").and_then(|i| i.as_table_like_mut()) {
+                Some(table) => {
+                    table.remove(name);
+                    table.is_empty()
+                }
+                None => false,
+            };
+            // A heading with nothing under it is a line somebody has to wonder about. Only when
+            // this is what emptied it — and only when it carries no comment of its own.
+            if empty
+                && doc
+                    .get("options")
+                    .and_then(|i| i.as_table())
+                    .is_some_and(|t| t.decor().prefix().and_then(|p| p.as_str()).is_none_or(|p| !p.contains('#')))
+            {
+                doc.remove("options");
+            }
+        }
+    }
+    let out = doc.to_string();
+    toml::from_str::<Config>(&out)
+        .map_err(|e| anyhow::anyhow!("{name}: the edited file would not load: {e}"))?;
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).map_err(|e| anyhow::anyhow!("{}: {e}", dir.display()))?;
+    }
+    // Beside the file and then renamed over it, so a workspace killed half-way through a write
+    // leaves the old file rather than half of a new one.
+    let tmp = path.with_extension("toml.tmp");
+    std::fs::write(&tmp, out).map_err(|e| anyhow::anyhow!("{}: {e}", tmp.display()))?;
+    std::fs::rename(&tmp, path).map_err(|e| anyhow::anyhow!("{}: {e}", path.display()))?;
+    Ok(())
+}
+
+/// An option's value as TOML spells it.
+fn toml_value(v: &OptionValue) -> anyhow::Result<toml_edit::Value> {
+    Ok(match v {
+        OptionValue::Bool(b) => (*b).into(),
+        OptionValue::Int(i) => (*i).into(),
+        OptionValue::Float(f) => (*f).into(),
+        OptionValue::Str(s) => s.as_str().into(),
+        OptionValue::List(items) => {
+            let mut array = toml_edit::Array::new();
+            for item in items {
+                array.push(item.as_str());
+            }
+            toml_edit::Value::Array(array)
+        }
+        OptionValue::Json(json) => json_value(json)?,
+    })
+}
+
+fn json_value(v: &serde_json::Value) -> anyhow::Result<toml_edit::Value> {
+    Ok(match v {
+        serde_json::Value::Null => anyhow::bail!("TOML has no way to write null"),
+        serde_json::Value::Bool(b) => (*b).into(),
+        serde_json::Value::Number(n) => match (n.as_i64(), n.as_f64()) {
+            (Some(i), _) => i.into(),
+            (None, Some(f)) => f.into(),
+            _ => anyhow::bail!("{n} does not fit in TOML"),
+        },
+        serde_json::Value::String(s) => s.as_str().into(),
+        serde_json::Value::Array(items) => {
+            let mut array = toml_edit::Array::new();
+            for item in items {
+                array.push(json_value(item)?);
+            }
+            toml_edit::Value::Array(array)
+        }
+        serde_json::Value::Object(map) => {
+            let mut table = toml_edit::InlineTable::new();
+            for (k, item) in map {
+                table.insert(k, json_value(item)?);
+            }
+            toml_edit::Value::InlineTable(table)
+        }
+    })
+}
+
 fn load_toml<T: serde::de::DeserializeOwned + Default>(path: &Path) -> anyhow::Result<T> {
     match std::fs::read_to_string(path) {
         Ok(text) => toml::from_str(&text).map_err(|e| anyhow::anyhow!("{}: {e}", path.display())),
@@ -542,6 +650,60 @@ mod tests {
         assert_eq!(got["agent.model"], OptionValue::Str("anthropic/x".into()));
         assert_eq!(got["chat.show_thinking"], OptionValue::Bool(true));
         assert_eq!(got["a.n"], OptionValue::Int(7));
+    }
+
+    #[test]
+    fn a_saved_option_goes_into_the_file_and_leaves_the_rest_of_it_alone() {
+        let t = tmp("save");
+        let file = t.0.join("config/config.toml");
+        let mine = "# my model, do not touch\n[agent]\nmodel = \"work/fast\"\n\n[options]\n# wide, \
+                    please\n\"sidebar.width\" = 40\n";
+        write(&file, mine);
+
+        write_option(&file, "agent.append_prompt", Some(&OptionValue::Str("Run the tests.\nThen stop.".into())))
+            .unwrap();
+        write_option(&file, "git.pull.auto", Some(&OptionValue::Bool(true))).unwrap();
+        let text = std::fs::read_to_string(&file).unwrap();
+        assert!(text.starts_with("# my model, do not touch\n"), "comment kept:\n{text}");
+        assert!(text.contains("# wide, please\n\"sidebar.width\" = 40"), "neighbour kept:\n{text}");
+
+        let r = resolve(&paths(&t), &t.0.join("work"), Status::NoProjectConfig).unwrap();
+        let got: BTreeMap<_, _> = r.options.into_iter().collect();
+        assert_eq!(got["agent.append_prompt"], OptionValue::Str("Run the tests.\nThen stop.".into()));
+        assert_eq!(got["git.pull.auto"], OptionValue::Bool(true));
+        assert_eq!(got["sidebar.width"], OptionValue::Int(40));
+        assert_eq!(r.model.as_deref(), Some("work/fast"));
+
+        // Back to the default is the line coming out again, and nothing else moving.
+        write_option(&file, "git.pull.auto", None).unwrap();
+        let text = std::fs::read_to_string(&file).unwrap();
+        assert!(!text.contains("git.pull.auto"), "{text}");
+        assert!(text.contains("\"sidebar.width\" = 40"), "{text}");
+    }
+
+    #[test]
+    fn a_first_saved_option_makes_the_file_and_the_last_one_out_takes_the_heading() {
+        let t = tmp("fresh");
+        let file = t.0.join("config/config.toml");
+        write_option(&file, "ui.theme", Some(&OptionValue::Str("light".into()))).unwrap();
+        write_option(&file, "plugins.disabled", Some(&OptionValue::List(vec!["usage".into()])))
+            .unwrap();
+        let r = resolve(&paths(&t), &t.0.join("work"), Status::NoProjectConfig).unwrap();
+        let got: BTreeMap<_, _> = r.options.into_iter().collect();
+        assert_eq!(got["plugins.disabled"], OptionValue::List(vec!["usage".into()]));
+
+        write_option(&file, "ui.theme", None).unwrap();
+        write_option(&file, "plugins.disabled", None).unwrap();
+        assert_eq!(std::fs::read_to_string(&file).unwrap().trim(), "");
+    }
+
+    #[test]
+    fn a_file_that_does_not_parse_is_left_alone_rather_than_rewritten() {
+        let t = tmp("unparsed");
+        let file = t.0.join("config/config.toml");
+        write(&file, "this is not = = toml");
+        assert!(write_option(&file, "ui.theme", Some(&OptionValue::Str("light".into()))).is_err());
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "this is not = = toml");
     }
 
     #[test]
