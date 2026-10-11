@@ -2236,6 +2236,13 @@ export class CursoredList<T = unknown> {
   private cursor = 0;
   /** Where the last render put the cursor's row: its buffer line, and the window's top line. */
   private placed: { line: number; top: number } | null = null;
+  /**
+   * What the buffer holds, as last written — one JSON string per line — so a render sends only the
+   * lines that changed. A panel redraws on every key and, while anything runs, ten times a second;
+   * almost all of those differ from the last in a row or two, and sending every row anyway was the
+   * whole panel replaced, every mark cleared and re-set, and every row shipped to every terminal.
+   */
+  private written: string[] | null = null;
 
   constructor(
     private readonly neosh: Neosh,
@@ -2399,6 +2406,14 @@ export class CursoredList<T = unknown> {
    * to, and the rows go back to being the end of the list, which is where scrolling will find
    * them.
    */
+  /**
+   * Forget what the buffer holds, so the next render writes all of it. For a caller that wrote to
+   * the list's buffer some other way — nothing in the bundled panels does.
+   */
+  invalidate(): void {
+    this.written = null;
+  }
+
   async render(
     opts: { showCursor?: boolean; win?: WindowId; pinned?: number } = {},
   ): Promise<void> {
@@ -2501,7 +2516,32 @@ export class CursoredList<T = unknown> {
     // its marks a call at a time was observable halfway through — and a frame landing after the
     // clear drew every row unmarked, which is `Normal`, which is near-white. That is what a sidebar
     // full of running agents was flashing.
-    await this.neosh.buf.render(this.buf, this.ns, 0, -1, drawn);
+    //
+    // And only the lines that differ from what is already there: everything between the first
+    // changed line and the last, as one ranged render — the same single call, smaller.
+    const next = drawn.map((d) => JSON.stringify(d));
+    const prev = this.written;
+    if (prev === null) {
+      await this.neosh.buf.render(this.buf, this.ns, 0, -1, drawn);
+    } else {
+      let head = 0;
+      while (head < next.length && head < prev.length && next[head] === prev[head]) head++;
+      let tail = 0;
+      while (
+        tail < next.length - head && tail < prev.length - head &&
+        next[next.length - 1 - tail] === prev[prev.length - 1 - tail]
+      ) tail++;
+      if (head < next.length || head < prev.length) {
+        await this.neosh.buf.render(
+          this.buf,
+          this.ns,
+          head,
+          prev.length - tail,
+          drawn.slice(head, drawn.length - tail),
+        );
+      }
+    }
+    this.written = next;
 
     // Keep the cursor on screen without recentring on every keystroke. In buffer lines, not row
     // indices: an unfolded row is several lines tall and the two stopped agreeing the moment one

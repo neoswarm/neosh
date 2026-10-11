@@ -35,14 +35,21 @@ impl PluginState {
         self.entry(plugin).get(key).cloned().unwrap_or(Value::Null)
     }
 
+    /// A value that is already there is not written again: the file is the whole plugin's state,
+    /// rewritten on every change, and a plugin saving its state on a refresh would otherwise be a
+    /// file rewritten per refresh for nothing.
     pub fn set(&mut self, plugin: &str, key: String, value: Value) {
+        if self.entry(plugin).get(&key) == Some(&value) {
+            return;
+        }
         self.entry(plugin).insert(key, value);
         self.flush(plugin);
     }
 
     pub fn delete(&mut self, plugin: &str, key: &str) {
-        self.entry(plugin).remove(key);
-        self.flush(plugin);
+        if self.entry(plugin).remove(key).is_some() {
+            self.flush(plugin);
+        }
     }
 
     fn entry(&mut self, plugin: &str) -> &mut Map<String, Value> {

@@ -650,6 +650,7 @@ fn carve(
                                 &Theme::new(crate::theme::ColorDepth::Ansi16),
                                 main.width,
                                 avail,
+                                None,
                                 &mut Graphics::off(),
                             )
                             .len() as u16;
@@ -989,7 +990,8 @@ pub fn draw_with(frame: &mut Frame, mirror: &Mirror, theme: &Theme, gfx: &mut Gr
         // Wrapping is per window: the chat has to wrap or a long answer is silently cut off at the
         // right edge, while the sidebar and the status line must clip or one long path would push
         // everything below it off the screen.
-        let rendered = rendered_rows(mirror, w, theme, inner.width, inner.height, gfx);
+        let need = (caret_win == Some(win)).then_some(w.cursor.0);
+        let rendered = rendered_rows(mirror, w, theme, inner.width, inner.height, need, gfx);
         let here = (caret_win == Some(win)).then(|| caret_in(mirror, w, &rendered, inner.width)).flatten();
 
         // Follow the tail. Taking the *first* n lines shows a long conversation's opening and
@@ -1388,6 +1390,7 @@ fn rendered_rows(
     theme: &Theme,
     width: u16,
     height: u16,
+    need: Option<u32>,
     gfx: &mut Graphics,
 ) -> Vec<ScreenRow> {
     // Wrapping is per window: the chat has to wrap or a long answer is silently cut off at the
@@ -1396,8 +1399,7 @@ fn rendered_rows(
     let wraps = w.wraps();
     let cols = (width as usize).max(1);
     let Some(b) = mirror.buffers.get(&w.buf) else { return Vec::new() };
-    let mut out: Vec<ScreenRow> = Vec::new();
-    for (row, l) in b.lines.iter().enumerate().skip(w.top_line.unwrap_or(0) as usize) {
+    let one = |row: usize, l: &LineRender, gfx: &mut Graphics, out: &mut Vec<ScreenRow>| {
         // A picture is its own rows, all of them the buffer row's: the caret on that row lands
         // on the first of them, and paging counts the row once however tall it drew.
         if let Some(rows) = picture_rows(l, theme, cols, height, gfx) {
@@ -1408,7 +1410,7 @@ fn rendered_rows(
                     picture: Some(strip),
                 });
             }
-            continue;
+            return;
         }
         // `render_line_in` emits the virtual lines that go above, then the row's own text, then
         // the ones that go below. Which of them is the text is exactly what the caret needs.
@@ -1427,6 +1429,51 @@ fn rendered_rows(
                 });
             }
         }
+    };
+    let height = height as usize;
+    let mut out: Vec<ScreenRow> = Vec::new();
+
+    // A float renders all of itself: its scrollbar is drawn from how many rows it has in total,
+    // and a float is a panel's worth of rows rather than a conversation's.
+    if w.layout_is_float() {
+        for (row, l) in b.lines.iter().enumerate().skip(w.top_line.unwrap_or(0) as usize) {
+            one(row, l, gfx, &mut out);
+        }
+        return out;
+    }
+
+    // Everything else renders what can be on screen and not a row more. Rendering is the marks,
+    // the wrapping and the padding of every row, so a window that built all of them and kept the
+    // last screenful did work in proportion to the length of the conversation — on every frame,
+    // and a frame is every flush of a streaming answer. What can be on screen is a screenful from
+    // where drawing starts, plus whatever it takes to reach the row the caret is on, since the
+    // window bends its scroll to keep that one visible.
+    if w.follows_tail() && w.top_line.is_none() {
+        // Following the tail: from the end backwards, until a screenful is built and the caret's
+        // row is in it. Built in reverse and turned round once, so each row is rendered once.
+        let mut chunks: Vec<Vec<ScreenRow>> = Vec::new();
+        let mut built = 0usize;
+        for (row, l) in b.lines.iter().enumerate().rev() {
+            if built >= height && need.is_none_or(|n| (n as usize) >= row + 1) {
+                break;
+            }
+            let mut rows = Vec::new();
+            one(row, l, gfx, &mut rows);
+            built += rows.len();
+            chunks.push(rows);
+        }
+        out.reserve(built);
+        for rows in chunks.into_iter().rev() {
+            out.extend(rows);
+        }
+        return out;
+    }
+
+    for (row, l) in b.lines.iter().enumerate().skip(w.top_line.unwrap_or(0) as usize) {
+        if out.len() >= height && need.is_none_or(|n| (n as usize) < row) {
+            break;
+        }
+        one(row, l, gfx, &mut out);
     }
     out
 }

@@ -67,13 +67,22 @@ impl Vars {
         self.table(scope).get(&id).cloned().unwrap_or_default()
     }
 
-    pub fn set(&mut self, scope: &VarScope, key: String, value: Value) {
+    /// A var set to what it already holds writes nothing: `vars.json` is every scope at once,
+    /// rewritten whole, and panels set vars on their own refreshes.
+    ///
+    /// Answers whether anything changed, so a caller announcing the change can stay quiet too.
+    pub fn set(&mut self, scope: &VarScope, key: String, value: Value) -> bool {
         self.load();
         let id = Self::key(scope);
-        self.table(scope).entry(id).or_default().insert(key, value);
+        let map = self.table(scope).entry(id).or_default();
+        if map.get(&key) == Some(&value) {
+            return false;
+        }
+        map.insert(key, value);
         if !Self::is_transient(scope) {
             self.flush();
         }
+        true
     }
 
     pub fn delete(&mut self, scope: &VarScope, key: &str) {

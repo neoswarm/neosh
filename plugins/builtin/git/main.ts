@@ -50,6 +50,7 @@ import {
 } from "@neosh/api/ui";
 import { configureMotion } from "@neosh/api/ui";
 import { installPulls } from "./pulls.ts";
+import { forgetOnTurnEnd, forgetStatus, SHARED_MS, statusOf } from "./status.ts";
 import { fetchFailed, installGitStatus, pullRepository, repoBusy, statParts } from "./sidebar.ts";
 
 // ---------------------------------------------------------------------------
@@ -85,6 +86,8 @@ Rules:
 
 export async function activate(ctx: PluginContext) {
   const { neosh, subscriptions } = ctx;
+  // First, so it runs before every other turn-end listener here. See `forgetOnTurnEnd`.
+  subscriptions.push(forgetOnTurnEnd(neosh));
   await defineHighlights(neosh);
 
   // The shared clock is module-global *per plugin*, so a spinner drawn here has to be told what
@@ -332,6 +335,17 @@ two-word scratch name it was created with.",
     // which is what somebody setting it always meant: not "stop reading git", which the footer and
     // the branch segment still need, but "keep git out of my project list".
     const on = (await neosh.opt.get<boolean>("git.sidebar").catch(() => true)) ?? true;
+    // Every project's status read at once rather than in turn, and through the shared reader, so a
+    // turn ending — which the branch segment and the pull-request badges also answer — is one
+    // `git status` per project. Narrowed to one row it is fresh: that is a row that just moved.
+    const read = new Map<string, Promise<RepoStatus | null>>();
+    if (on) {
+      for (const cwd of cwds) {
+        if (cwd === only && known) continue;
+        if (repoBusy(cwd) && lastKnown.has(cwd)) continue;
+        read.set(cwd, statusOf(neosh, cwd, only ? 0 : SHARED_MS));
+      }
+    }
     for (const cwd of cwds) {
       if (!on) {
         await neosh.ext.remove("sidebar.decoration", `dirty:${cwd}`).catch(() => {});
@@ -341,7 +355,7 @@ two-word scratch name it was created with.",
         ? known
         : repoBusy(cwd) && lastKnown.has(cwd)
           ? lastKnown.get(cwd) ?? null
-          : await neosh.git.status({ cwd }).catch(() => null);
+          : await (read.get(cwd) ?? statusOf(neosh, cwd, 0));
       lastKnown.set(cwd, status);
       const parts = status ? statParts(status, ascii) : [];
       // The one thing the block said that a count cannot: that these numbers are as of a fetch
@@ -455,6 +469,8 @@ two-word scratch name it was created with.",
   // without the caller having to know it exists — and the row does too, because a branch switch
   // or a rename is exactly as much news to `↑2` as a pull is.
   headMoved = () => {
+    // Whatever was read about any checkout is from before the move.
+    forgetStatus();
     void repo.refresh();
     void decorate();
   };

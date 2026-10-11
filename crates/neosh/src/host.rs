@@ -37,8 +37,36 @@ use crate::frontend::Frontend;
 use crate::services::{Services, Subscribers};
 use crate::vim;
 
-/// How long mutations accumulate before a frame is emitted.
+/// The longest mutations accumulate before a frame is emitted.
 const COALESCE: Duration = Duration::from_millis(16);
+
+/// How long the loop has to have heard nothing before a frame goes out early.
+///
+/// A burst is a stream or a plugin's run of calls answering one key, and the frame is held so the
+/// burst draws once. A stream keeps arriving and so still waits out [`COALESCE`]; a plugin that
+/// made its three calls in a millisecond and stopped had the rest of the window added to the key
+/// that asked for them — most of the time between `j` in a panel and the row moving.
+const QUIET: Duration = Duration::from_millis(2);
+
+/// How long a change to a conversation waits before it is written. Long enough that the several
+/// things a turn ending changes at once are one write, short enough that a crash loses nothing
+/// anybody would notice.
+const SAVE_AFTER: Duration = Duration::from_millis(500);
+
+/// What is waiting to be written, and what was written last.
+#[derive(Default)]
+struct Saving {
+    /// Conversations changed since the last save.
+    dirty: std::collections::HashSet<neosh_proto::SessionId>,
+    /// Something changed that may touch every conversation or the ordering.
+    everything: bool,
+    /// When the save is due, once something is waiting.
+    due: Option<Instant>,
+    /// A hash of what was last queued for each file, so an unchanged one is not written again.
+    written: std::collections::HashMap<std::path::PathBuf, u64>,
+    /// The thread that writes, started the first time there is something to write.
+    writer: Option<crate::sessions::Writer>,
+}
 
 /// How often to check whether the other machines have been told something out of date.
 ///
@@ -799,6 +827,10 @@ pub struct Host {
     /// stable base ordering is what stops two segments with equal priority swapping places between
     /// redraws.
     status_segments: std::collections::BTreeMap<String, neosh_proto::StatusSegment>,
+    /// What each status buffer was last written with, so a refresh that would write the same row
+    /// writes nothing. The footer is refreshed by plugins on a clock, and an unchanged row rewritten
+    /// is a buffer replaced, every mark cleared and re-set, and a frame sent to every terminal.
+    status_drawn: std::collections::HashMap<BufferId, (String, Vec<(usize, usize, String)>)>,
 
     /// One entry per conversation with a turn in flight.
     ///
@@ -962,6 +994,8 @@ pub struct Host {
     model_cache: crate::services::ModelCache,
     /// Where conversations are saved. `None` under `--clean`, which reads and writes nothing.
     state_dir: Option<std::path::PathBuf>,
+    /// Conversations are written behind, by a thread of their own: see [`Self::flush_sessions`].
+    saving: Saving,
     /// Pictures attached to a message that has not been sent yet, per conversation.
     ///
     /// Per conversation for the reason the draft is: `^T` away mid-sentence and back again has to
@@ -1696,6 +1730,7 @@ impl Host {
             search_ns,
             tabline_ns,
             status_segments: Default::default(),
+            status_drawn: Default::default(),
             hints: Default::default(),
             selection_pinned: false,
             agent_drivers: Vec::new(),
@@ -1735,6 +1770,7 @@ impl Host {
             last_mode: Default::default(),
             model_cache: Default::default(),
             state_dir: None,
+            saving: Saving::default(),
             attached: Default::default(),
             pstate: crate::pstate::PluginState::new(None),
             // From the build identity captured at startup: a workspace outlives the file it was
@@ -2288,6 +2324,10 @@ impl Host {
                 self.refresh_composer();
                 Ok(ApiOk::Attachments { attachments: gone.iter().map(info_of).collect() })
             }
+            ApiCall::AgentWatchTokens { on } => {
+                self.bridge.watch_tokens(plugin, on);
+                Ok(ApiOk::Unit)
+            }
             ApiCall::AgentCancel => {
                 self.cancel_turn_here();
                 Ok(ApiOk::Unit)
@@ -2413,7 +2453,11 @@ impl Host {
                 Ok(ApiOk::Json { value: self.vars.get(&scope, &key) })
             }
             ApiCall::VarSet { scope, key, value } => {
-                self.vars.set(&scope, key.clone(), value.clone());
+                // Set to what it already held: nothing to tell anybody. Every panel listening to
+                // vars rebuilds on the event, and panels set vars on their own refreshes.
+                if !self.vars.set(&scope, key.clone(), value.clone()) {
+                    return Ok(ApiOk::Unit);
+                }
                 // Which conversations are blocked on a person already travels this way — it was
                 // put on a var precisely because it is a fact about them rather than about
                 // whichever panel happened to learn it — so this is where the host learns it too,
@@ -2898,7 +2942,7 @@ impl Host {
                     if !crate::sessions::stored(&dir, &session) {
                         return Err(ApiError::NotFound { what: format!("session {}", session.0) });
                     }
-                    crate::sessions::forget(&dir, &session);
+                    self.forget_session_file(&session);
                     self.vars.forget_session(&session);
                     return Ok(ApiOk::Unit);
                 }
@@ -2934,9 +2978,7 @@ impl Host {
                     }
                     other => ApiError::NotFound { what: other.to_string() },
                 })?;
-                if let Some(dir) = &self.state_dir {
-                    crate::sessions::forget(dir, &session);
-                }
+                self.forget_session_file(&session);
                 // Whatever anybody tagged this conversation with goes too. Left behind it is a row
                 // in `vars.json` per conversation ever deleted, and a future id collision inherits
                 // somebody's stale colour.
@@ -3088,7 +3130,7 @@ impl Host {
                     .rename(&session, title)
                     .map_err(|e| ApiError::NotFound { what: e.to_string() })?;
                 self.refresh_status();
-                self.persist_sessions();
+                self.persist_session(&session);
                 Ok(ApiOk::Unit)
             }
             ApiCall::SessionMessages { session } => {
@@ -3187,13 +3229,17 @@ impl Host {
             ApiCall::StatusSet { key, segment } => {
                 // Namespaced by plugin, so two plugins choosing the same key cannot fight and
                 // unloading one takes only its own segments.
-                self.status_segments.insert(format!("{plugin}:{key}"), segment);
-                self.refresh_status();
+                let key = format!("{plugin}:{key}");
+                if self.status_segments.get(&key) != Some(&segment) {
+                    self.status_segments.insert(key, segment);
+                    self.refresh_status();
+                }
                 Ok(ApiOk::Unit)
             }
             ApiCall::StatusClear { key } => {
-                self.status_segments.remove(&format!("{plugin}:{key}"));
-                self.refresh_status();
+                if self.status_segments.remove(&format!("{plugin}:{key}")).is_some() {
+                    self.refresh_status();
+                }
                 Ok(ApiOk::Unit)
             }
 
@@ -3525,7 +3571,9 @@ impl Host {
             self.orphan = Some(view);
         } else {
             self.editor.close_view(view);
-            self.views.remove(&view);
+            if let Some(gone) = self.views.remove(&view) {
+                self.status_drawn.remove(&gone.status);
+            }
             self.orphan = self.orphan.filter(|o| *o != view);
         }
         // So a plugin can let go of whatever it was keeping about that panel.
@@ -5187,7 +5235,9 @@ impl Host {
     /// workspace, not about whichever panel happened to learn it.
     fn set_global_var(&mut self, key: &str, value: serde_json::Value) {
         let scope = neosh_proto::VarScope::Global;
-        self.vars.set(&scope, key.to_string(), value.clone());
+        if !self.vars.set(&scope, key.to_string(), value.clone()) {
+            return;
+        }
         self.broadcast(PluginEvent::VarChanged {
             scope,
             key: key.to_string(),
@@ -6750,12 +6800,22 @@ impl Host {
             return;
         }
         let agents = self.local_inventory();
+        let projects = self.local_projects(&agents);
+        self.send_inventory(agents, projects);
+    }
+
+    /// Say an inventory already worked out — the half of [`Self::publish_inventory`] after the
+    /// building, so the timer that built one to compare does not build it a second time to send.
+    fn send_inventory(
+        &mut self,
+        agents: Vec<neosh_proto::AgentSummary>,
+        projects: Vec<neosh_proto::RemoteProject>,
+    ) {
         let mut keys = std::collections::HashMap::new();
         for a in &agents {
             keys.insert(a.project.clone(), a.project_name.clone());
         }
         self.swarm.set_local_projects(keys);
-        let projects = self.local_projects(&agents);
         self.published = Some((agents.clone(), projects.clone()));
         if let Some(h) = &self.swarm_node {
             h.send(neosh_swarm::SwarmRequest::Publish { full: true, agents, gone: Vec::new() });
@@ -6779,7 +6839,7 @@ impl Host {
         if self.published.as_ref().is_some_and(|(a, p)| a == &agents && p == &projects) {
             return;
         }
-        self.publish_inventory();
+        self.send_inventory(agents, projects);
     }
 
     /// One event from the swarm.
@@ -8000,6 +8060,11 @@ impl Host {
         }
         text.push(' ');
 
+        let status = self.vs().status;
+        if self.status_drawn.get(&status).is_some_and(|(t, m)| *t == text && *m == marks) {
+            return;
+        }
+        self.status_drawn.insert(status, (text.clone(), marks.clone()));
         let plugin = PluginId::from(BUILTIN);
         let _ = self.editor.apply(&plugin, ApiCall::BufSetLines {
             buf: self.vs().status,
@@ -8552,7 +8617,7 @@ impl Host {
         self.agent.set_permission_mode(session, mode);
         self.sync_agent_drivers();
         self.refresh_status();
-        self.persist_sessions();
+        self.persist_session(session);
     }
 
     /// Serve a terminal rather than be one: `quit` sends the viewer away, and what this workspace
@@ -9682,8 +9747,21 @@ impl Host {
     /// to stay exactly where it is, which is what makes a jump take the text it jumped over. The
     /// core repaints the highlight either way — it did not always, and every jump the reader makes
     /// extended a selection that could not be seen until the next `hjkl`.
+    /// [`vim::clamp`] against the transcript, reading only the row it lands on rather than copying
+    /// every row of the conversation to look at one.
+    fn chat_clamp(&self, at: (u32, u32)) -> (u32, u32) {
+        let Some(b) = self.editor.buffer(self.v().chat) else { return (0, 0) };
+        let lines = b.lines();
+        if lines.is_empty() {
+            return (0, 0);
+        }
+        let row = at.0.min(lines.len() as u32 - 1);
+        let text = lines.get(row as usize).map(|l| l.text.clone()).unwrap_or_default();
+        (row, vim::clamp(std::slice::from_ref(&text), (0, at.1)).1)
+    }
+
     fn place_cursor(&mut self, at: (u32, u32)) {
-        let at = vim::clamp(&self.chat_lines(), at);
+        let at = self.chat_clamp(at);
         let _ = self.editor.apply(&PluginId::from(BUILTIN), ApiCall::WinSetCursor {
             win: self.v().chat_win,
             row: at.0,
@@ -10485,12 +10563,10 @@ impl Host {
         // one, the one you land on after closing or archiving, and the one a restored workspace
         // opens on — so this is the one place that has to clear the mark, and a flag left set on
         // the conversation you are sitting in would say "new" about the answer on screen.
-        let arrived = {
-            let here = self.active_session();
-            self.agent.sessions().mark_read(&here)
-        };
+        let here = self.active_session();
+        let arrived = self.agent.sessions().mark_read(&here);
         if arrived {
-            self.persist_sessions();
+            self.persist_session(&here);
         }
         // Not closed: the buffer is about to be replaced wholesale, so settling an answer into rows
         // that are on their way out would write into the conversation being left behind.
@@ -12098,13 +12174,24 @@ impl Host {
     /// second, each one settling the answer streaming above it. Arriving somewhere by yourself is
     /// what asks a card to open.
     fn reading_follow(&mut self) {
-        let lines = self.chat_lines();
-        let last = lines.len().saturating_sub(1) as u32;
+        // The last row and nothing else: this runs on every event of a turn being read, and the
+        // copy of the whole transcript it used to start with grew with the conversation.
+        let Some((last, tail)) = self.editor.buffer(self.v().chat).map(|b| {
+            let lines = b.lines();
+            (
+                lines.len().saturating_sub(1) as u32,
+                lines.last().map(|l| l.text.clone()).unwrap_or_default(),
+            )
+        }) else {
+            return;
+        };
         if self.chat_cursor().0 == last {
             return;
         }
-        let col = vim::first_non_blank(lines.last().map(String::as_str).unwrap_or(""));
-        let at = vim::clamp(&lines, (last, col));
+        let col = vim::first_non_blank(&tail);
+        // Clamped against the one row it lands on, which is all `clamp` reads of the list.
+        let at = vim::clamp(std::slice::from_ref(&tail), (0, col));
+        let at = (last, at.1);
         self.vm().reading_goal = None;
         let win = self.v().chat_win;
         let _ = self.editor.apply(&PluginId::from(BUILTIN), ApiCall::WinSetCursor {
@@ -12329,7 +12416,7 @@ impl Host {
                 if let Some((label, took)) = ended {
                     self.alert_turn_ended(&session, &stop_reason, &label, took);
                 }
-                self.persist_sessions();
+                self.persist_session(&session);
                 if self.watched(&session) {
                     self.stream_out(&session, neosh_proto::StreamEvent::TurnEnded {
                         turn: turn.0.clone(),
@@ -12612,7 +12699,7 @@ impl Host {
                     if let Some(s) = self.agent.sessions().get_mut(&session) {
                         s.set_context(used, 0);
                     }
-                    self.persist_sessions();
+                    self.persist_soon(&session);
                 }
                 self.each_view_showing(&session, |me| {
                     let r = cards::compaction(&me.glyphs(), before, after);
@@ -12638,7 +12725,7 @@ impl Host {
                     _ => false,
                 };
                 if changed {
-                    self.persist_sessions();
+                    self.persist_session(&session);
                 }
             }
             // The driver's own answer to "how full is it", which beats anything derived. A prompt
@@ -12649,7 +12736,7 @@ impl Host {
                 if let Some(s) = self.agent.sessions().get_mut(&session) {
                     s.set_context(used, total);
                 }
-                self.persist_sessions();
+                self.persist_soon(&session);
             }
             // Attributed to the *conversation's* instance, not to whatever the picker is showing.
             // A workspace runs several conversations at once and they need not be on the same
@@ -13605,12 +13692,18 @@ impl Host {
     ) -> anyhow::Result<()> {
         // Send the initial state before anything else, so the frontend has a screen immediately.
         self.flush().await?;
+        // The grammars, loaded beside this loop rather than on it the first time something wants
+        // colouring. See `neosh_syntax::warm`.
+        neosh_syntax::warm();
 
         // A single long sleep, reset on demand. Creating a new one per iteration would restart the
         // window on every mutation and a fast stream would never reach its deadline.
         let idle = tokio::time::sleep(Duration::from_secs(86_400));
         tokio::pin!(idle);
         let mut armed = false;
+        // When the window opened, which is what caps how long a burst that never pauses can hold
+        // a frame back.
+        let mut armed_at = Instant::now();
 
         // The other deadline: a half-typed binding that never gets its second key. Separate from
         // the redraw window because the two answer different questions and share no timing.
@@ -13685,7 +13778,15 @@ impl Host {
         });
         tokio::pin!(roster);
 
+        // When the conversations that changed are written. A day away when nothing is waiting, the
+        // shape of every optional timer above.
+        let save = tokio::time::sleep(Duration::from_secs(86_400));
+        tokio::pin!(save);
+        let mut saving = false;
+
         loop {
+            // Whether this pass handled a key. See the flush at the bottom.
+            let mut keyed = false;
             tokio::select! {
                 Some(out) = script_rx.recv() => self.handle_script_out(out).await,
                 Some(ev) = async {
@@ -13714,6 +13815,7 @@ impl Host {
                     // Set for the whole of handling, so anything this key reaches — a command, a
                     // keymap, a plugin — can be answered in the terminal it was pressed in.
                     self.from = from;
+                    keyed = true;
                     let carry_on = self.handle_input(input);
                     // The fallback for anything that is nobody's key press and names no window.
                     // See `Host::view_for`. Written down *after* handling, because the event that
@@ -13840,6 +13942,10 @@ impl Host {
                     bursting = false;
                     self.deliver_alerts().await?;
                 }
+                () = &mut save, if saving => {
+                    saving = false;
+                    self.flush_sessions();
+                }
                 () = &mut roster, if self.swarm_node.is_some() => {
                     self.publish_inventory_if_changed();
                     self.prune_mirrors();
@@ -13931,15 +14037,36 @@ impl Host {
             if std::mem::take(&mut self.quota_due) {
                 plan.as_mut().reset(Instant::now() + crate::quota::AFTER_TURN);
             }
-            if self.editor.has_pending_ui() && !armed {
-                idle.as_mut().reset(Instant::now() + COALESCE);
-                armed = true;
+            // What a key changed is drawn now. The window exists so a burst — a stream, a plugin's
+            // run of calls — becomes one frame; what a key the host handled itself changed is
+            // already whole by the end of this pass, and holding it for the window was up to 16 ms
+            // between every keystroke and the screen. A plugin answering the same key still
+            // arrives as calls on later passes, and those still wait for the window.
+            //
+            // Anything else waits until the loop has been quiet for a moment or the window is up,
+            // whichever is first — every pass that has something waiting pushes the quiet deadline
+            // on, because a pass is the loop hearing from somebody still in the middle of it.
+            if keyed && self.editor.has_pending_ui() {
+                self.flush().await?;
+            } else if self.editor.has_pending_ui() {
+                let now = Instant::now();
+                if !armed {
+                    armed_at = now;
+                    armed = true;
+                }
+                idle.as_mut().reset((armed_at + COALESCE).min(now + QUIET));
             }
             if let Some(wait) = self.notifier.due_in()
                 && !bursting
             {
                 burst.as_mut().reset(Instant::now() + wait);
                 bursting = true;
+            }
+            if let Some(at) = self.saving.due
+                && !saving
+            {
+                save.as_mut().reset(at);
+                saving = true;
             }
         }
 
@@ -13953,6 +14080,7 @@ impl Host {
         tokio::time::sleep(Duration::from_millis(150)).await;
         // Last thing before the screen goes: whatever was said this session is on disk.
         self.persist_sessions();
+        self.flush_sessions_now();
         // Anything gathered and not yet spoken. Waiting out the burst window here means never —
         // and a workspace stopping with a question unanswered in it is exactly the case somebody
         // needs telling about.
@@ -14099,32 +14227,116 @@ impl Host {
         serde_json::from_value(self.pstate.get(BUILTIN, &key)).unwrap_or_default()
     }
 
-    /// Write one conversation, now.
+    /// Write one conversation now — queued to the save thread at once rather than after the delay.
     ///
     /// The cheap half of [`Self::persist_sessions`], for the places that fire *inside* a turn.
     /// Ordering is not at stake — `order.json` records which conversations exist and which one you
-    /// were in, and neither changes because a tool round finished.
+    /// were in, and neither changes because a tool round finished. Not delayed, because these are
+    /// the writes a crash has to find: a turn starting is what marks it as running, and a workspace
+    /// killed the moment after must come back knowing the turn never finished.
+    fn persist_session(&mut self, id: &neosh_proto::SessionId) {
+        self.saving.dirty.insert(id.clone());
+        let everything = std::mem::take(&mut self.saving.everything);
+        let due = self.saving.due.take();
+        let others: Vec<neosh_proto::SessionId> =
+            self.saving.dirty.iter().filter(|d| *d != id).cloned().collect();
+        self.saving.dirty.retain(|d| d == id);
+        self.flush_sessions();
+        // Whatever else was waiting keeps waiting: this wrote one conversation, not the store.
+        self.saving.dirty.extend(others);
+        self.saving.everything = everything;
+        self.saving.due = due.or_else(|| {
+            (everything || !self.saving.dirty.is_empty()).then(|| Instant::now() + SAVE_AFTER)
+        });
+    }
+
+    /// Note that one conversation changed, to be written after the delay with whatever else
+    /// changes meanwhile — for what changes often and matters little if a crash loses it: how full
+    /// the context is, which a vendor CLI says every five seconds of a turn.
+    fn persist_soon(&mut self, id: &neosh_proto::SessionId) {
+        self.saving.dirty.insert(id.clone());
+        self.saving.due.get_or_insert_with(|| Instant::now() + SAVE_AFTER);
+    }
+
+    /// Note that conversations changed in ways that may touch the ordering, to be written shortly.
     ///
-    /// A [placeholder](neosh_agent::Session::ephemeral) is skipped, the same as in `save_all`: no
-    /// caller can reach here with one today, because saying anything is what stops a session being
-    /// one and a turn cannot start before that — but the rule is about what may be written down,
-    /// not about who happens to be calling.
-    fn persist_session(&self, id: &neosh_proto::SessionId) {
-        let Some(dir) = &self.state_dir else { return };
+    /// Every one of them is *looked at* when the save comes due, and only those whose bytes differ
+    /// from what was last written are written. This used to write all of them, there and then, on
+    /// the host loop and under the session lock — and it is called every five seconds of a turn,
+    /// because that is how often a vendor CLI says how full its context is.
+    fn persist_sessions(&mut self) {
+        self.saving.everything = true;
+        self.saving.due.get_or_insert_with(|| Instant::now() + SAVE_AFTER);
+    }
+
+    /// Put what changed on disk: encoded here, written by the save thread.
+    ///
+    /// Encoding stays on the loop because it reads the store, and is the cheap part: no copies of
+    /// the messages, and nothing encoded for a conversation nobody marked. Each file is compared by
+    /// a hash of its bytes with what was last queued for it, so a conversation whose meter moved
+    /// by nothing is not written at all.
+    fn flush_sessions(&mut self) {
+        self.saving.due = None;
+        let everything = std::mem::take(&mut self.saving.everything);
+        let dirty = std::mem::take(&mut self.saving.dirty);
+        let Some(dir) = self.state_dir.clone() else { return };
+        let writer = self.saving.writer.get_or_insert_with(crate::sessions::Writer::spawn);
         let store = self.agent.sessions();
-        let Some(s) = store.get(id).filter(|s| !s.hidden()) else { return };
-        if let Err(e) = crate::sessions::save(dir, s) {
-            tracing::warn!("could not save conversation {}: {e}", id.0);
+        let hash = |bytes: &[u8]| {
+            use std::hash::{Hash, Hasher};
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            bytes.hash(&mut h);
+            h.finish()
+        };
+        let queue = |path: std::path::PathBuf, bytes: Vec<u8>, last: &mut std::collections::HashMap<std::path::PathBuf, u64>| {
+            let h = hash(&bytes);
+            if last.get(&path) != Some(&h) {
+                last.insert(path.clone(), h);
+                writer.write(path, bytes);
+            }
+        };
+        let ids: Vec<neosh_proto::SessionId> = if everything {
+            store.iter().map(|s| s.id.clone()).collect()
+        } else {
+            dirty.into_iter().collect()
+        };
+        for id in ids {
+            let Some(session) = store.get(&id).filter(|s| !s.hidden()) else { continue };
+            match crate::sessions::file_for(&dir, &id).and_then(|p| Ok((p, crate::sessions::encode(session)?))) {
+                Ok((path, bytes)) => queue(path, bytes, &mut self.saving.written),
+                Err(e) => tracing::warn!("could not save conversation {}: {e}", id.0),
+            }
+        }
+        if everything {
+            match crate::sessions::encode_order(&store) {
+                Ok(bytes) => queue(crate::sessions::order_file(&dir), bytes, &mut self.saving.written),
+                Err(e) => tracing::warn!("could not save the conversation order: {e}"),
+            }
         }
     }
 
-    fn persist_sessions(&self) {
-        let Some(dir) = &self.state_dir else { return };
-        if let Err(e) = crate::sessions::save_all(dir, &self.agent.sessions()) {
-            // Reported once, not per turn: a full disk should not turn into a message on every
-            // keystroke, and losing history is not a reason to stop working.
-            tracing::warn!("could not save conversations: {e}");
+    /// Everything noted is on disk when this returns.
+    ///
+    /// For the two moments that cannot be behind: the workspace stopping, and a conversation's file
+    /// about to be deleted — a write still in the queue would otherwise put it back.
+    fn flush_sessions_now(&mut self) {
+        self.flush_sessions();
+        if let Some(w) = &self.saving.writer {
+            w.sync();
         }
+    }
+
+    /// Delete a conversation's file, after anything queued for it has landed.
+    fn forget_session_file(&mut self, id: &neosh_proto::SessionId) {
+        let Some(dir) = self.state_dir.clone() else { return };
+        self.saving.dirty.remove(id);
+        if let Some(w) = &self.saving.writer {
+            w.sync();
+        }
+        if let Ok(path) = crate::sessions::file_for(&dir, id) {
+            self.saving.written.remove(&path);
+        }
+        crate::sessions::forget(&dir, id);
     }
 
     pub async fn discover_repo(&mut self, cwd: &std::path::Path) {
@@ -14161,7 +14373,10 @@ impl Host {
             tracing::info!(dir = %dir.display(), root = %g.root().display(), "git repository");
             // Asked once, when the directory is first seen, and remembered. A label is read on
             // every redraw of the panel and is not worth a `rev-parse` each time.
-            let (branch, main) = g.identity().await;
+            //
+            // Both asked at once: they are independent subprocesses, and this is awaited on the
+            // host loop the first time a directory is seen — the switch into a new project.
+            let ((branch, main), origin) = tokio::join!(g.identity(), g.origin_url());
             self.projects.insert(
                 dir.clone(),
                 ProjectFacts {
@@ -14172,7 +14387,7 @@ impl Host {
             );
             // Asked here for the same reason and at the same time as the name: once per directory,
             // and the answer does not change while a checkout is open.
-            if let Some(key) = g.origin_url().await.and_then(|u| neosh_proto::ProjectKey::from_remote(&u)) {
+            if let Some(key) = origin.and_then(|u| neosh_proto::ProjectKey::from_remote(&u)) {
                 self.project_keys.insert(dir.clone(), key);
             }
         }

@@ -108,6 +108,18 @@ fn syntaxes() -> &'static SyntaxSet {
     SET.get_or_init(two_face::syntax::extra_newlines)
 }
 
+/// Load the grammars now, on a thread of their own.
+///
+/// They are loaded the first time anything asks, which left the cost — a large deserialisation —
+/// on whatever happened to ask first: the first code block of an answer, or the first switch into
+/// a conversation with a diff in it, on the loop that answers keys. A caller asking while this is
+/// still loading waits for it rather than loading a second copy.
+pub fn warm() {
+    let _ = std::thread::Builder::new().name("neosh-syntax".into()).spawn(|| {
+        let _ = syntaxes();
+    });
+}
+
 /// The language a file of this name is written in.
 ///
 /// Extension first and then the whole file name, so `Cargo.toml` resolves by its extension and
@@ -154,8 +166,61 @@ pub fn spans(lang: Language, text: &str) -> Option<Vec<Spans>> {
     {
         return None;
     }
+    let key = memo_key(lang, text);
+    if let Some(hit) = MEMO.lock().ok().and_then(|m| m.get(key)) {
+        return Some(hit);
+    }
     let mut h = Incremental::new(lang);
-    Some(lines.iter().map(|line| h.line(line)).collect())
+    let out: Vec<Spans> = lines.iter().map(|line| h.line(line)).collect();
+    if let Ok(mut m) = MEMO.lock() {
+        m.put(key, out.clone());
+    }
+    Some(out)
+}
+
+/// What [`spans`] answered recently, by language and text.
+///
+/// A transcript is rebuilt from its messages whenever a conversation is arrived in or the window
+/// changes width, and every diff in it is highlighted again each time — the same text, the same
+/// answer. Bounded by count, oldest out first: a few hundred diffs is a long session's worth, and
+/// the spans for one are a few small tuples a line.
+static MEMO: std::sync::Mutex<Memo> = std::sync::Mutex::new(Memo::new());
+
+const MEMO_ENTRIES: usize = 512;
+
+struct Memo {
+    map: Option<std::collections::HashMap<u64, Vec<Spans>>>,
+    order: std::collections::VecDeque<u64>,
+}
+
+impl Memo {
+    const fn new() -> Self {
+        Self { map: None, order: std::collections::VecDeque::new() }
+    }
+
+    fn get(&self, key: u64) -> Option<Vec<Spans>> {
+        self.map.as_ref()?.get(&key).cloned()
+    }
+
+    fn put(&mut self, key: u64, value: Vec<Spans>) {
+        let map = self.map.get_or_insert_with(Default::default);
+        if map.insert(key, value).is_none() {
+            self.order.push_back(key);
+        }
+        while self.order.len() > MEMO_ENTRIES {
+            if let Some(old) = self.order.pop_front() {
+                map.remove(&old);
+            }
+        }
+    }
+}
+
+fn memo_key(lang: Language, text: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    lang.0.name.hash(&mut h);
+    text.hash(&mut h);
+    h.finish()
 }
 
 /// A highlighter part-way through a piece of code.
@@ -164,9 +229,20 @@ pub fn spans(lang: Language, text: &str) -> Option<Vec<Spans>> {
 /// at a time — a fenced block in an answer that is still streaming. Keeping the parser between
 /// lines is the whole of it: a fence is drawn as it arrives, and a highlighter restarted per line
 /// would forget it was inside a string every time a newline went past.
+///
+/// `Clone`, because a streaming caller keeps one for the lines it has banked and highlights the
+/// half-arrived line after them on a copy: a partial line fed to the real one would leave it parsed
+/// past text that is about to change.
+#[derive(Clone)]
 pub struct Incremental {
     state: ParseState,
     stack: ScopeStack,
+}
+
+impl std::fmt::Debug for Incremental {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Incremental").finish_non_exhaustive()
+    }
 }
 
 impl Incremental {

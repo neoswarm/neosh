@@ -1370,8 +1370,9 @@ pub fn body(
     open: Open,
     width: usize,
 ) -> Vec<Row> {
-    let mut rows = if !result.is_error && !edits_of(input).is_empty() {
-        diff_rows(g, &edits_of(input), limits.diff(open), open == Open::Full, width)
+    let edits = if result.is_error { Vec::new() } else { edits_of(input) };
+    let mut rows = if !edits.is_empty() {
+        diff_rows(g, &edits, limits.diff(open), open == Open::Full, width)
     } else if !result.is_error && open == Open::Folded && looks_at_something(input) {
         // Folded to the header alone. The count is already on it, and `⇥` opens this. Except
         // for a picture, which stays the way an edit's diff stays: a read of a screenshot is a
@@ -1625,7 +1626,18 @@ fn diff_rows(
     }
     let shown = limit.min(pieces.len());
 
-    let painted: Vec<Option<Vec<neosh_syntax::Spans>>> = changes.iter().map(paint).collect();
+    // How far into each change the shown rows reach. Highlighting runs forwards, so the lines up to
+    // the last one drawn colour exactly as they would in a pass over all of them — and a folded
+    // card over a new file draws a dozen rows of what may be thousands, every one of which was
+    // being parsed on every switch into the conversation.
+    let mut reach = vec![0usize; changes.len()];
+    for piece in pieces.iter().take(shown) {
+        if let Piece::Line { change, at } = piece {
+            reach[*change] = reach[*change].max(at + 1);
+        }
+    }
+    let painted: Vec<Option<Vec<neosh_syntax::Spans>>> =
+        changes.iter().zip(&reach).map(|(c, &upto)| paint(c, upto)).collect();
     // One width for the whole card, from every change in it, so the sign column does not step
     // sideways halfway down. Zero when nothing knew its line number, and then the column is not
     // there at all rather than being a stripe of blanks.
@@ -1679,15 +1691,21 @@ fn diff_rows(
 /// closed after it is still open in between. The alternative, parsing the old lines and the new
 /// lines as two files, needs two passes to say the same thing and gets the interleaving wrong at
 /// every boundary.
-fn paint(change: &Change) -> Option<Vec<neosh_syntax::Spans>> {
+///
+/// Only the first `upto` lines: the ones the card will draw. See [`diff_rows`].
+fn paint(change: &Change, upto: usize) -> Option<Vec<neosh_syntax::Spans>> {
+    let upto = upto.min(change.diff.lines.len());
+    if upto == 0 {
+        return None;
+    }
     let lang = neosh_syntax::of_path(&change.path)?;
     let mut text = String::new();
-    for line in &change.diff.lines {
+    for line in &change.diff.lines[..upto] {
         text.push_str(&tabs(&line.text));
         text.push('\n');
     }
     let rows = neosh_syntax::spans(lang, &text)?;
-    (rows.len() == change.diff.lines.len()).then_some(rows)
+    (rows.len() == upto).then_some(rows)
 }
 
 /// One line of a diff, as however many screen rows it takes.

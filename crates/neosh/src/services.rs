@@ -974,25 +974,46 @@ pub fn utc_offset(time_zone: Option<&str>) -> i64 {
     }
 }
 
-/// What `localtime` makes of now, minus `gmtime` of the same instant.
+/// How far local time is from UTC right now, in seconds.
 ///
-/// Derived from the difference rather than read out of a field, because that is the one thing the
-/// standard library will tell us without a dependency: formatting the same instant twice and
-/// subtracting is exact, including through a DST change.
+/// Asked of the C library, which keeps the answer in `tm_gmtoff` and gets daylight saving right
+/// for the instant asked about. This used to fork `date +%z` — a process, on the host loop, every
+/// few minutes for as long as a workspace ran — to learn one number the process already had.
 fn local_offset() -> i64 {
-    use std::process::Command;
-    // `date` is on every unix and answers in seconds of offset directly. A failure here is an
-    // offset of zero, which is a chart bucketed in UTC — visibly a little off for some, rather
-    // than absent.
-    let out = Command::new("date").arg("+%z").output().ok();
-    let Some(out) = out.filter(|o| o.status.success()) else { return 0 };
-    let text = String::from_utf8_lossy(&out.stdout);
-    let text = text.trim();
-    if text.len() < 5 {
-        return 0;
+    // SAFETY: `tzset` and `localtime_r` are thread-safe on every platform this ships for, `now` and
+    // `tm` are valid for the duration of the call, and a null return is checked before `tm` is read.
+    // `tzset` is POSIX and in every libc this links against; the `libc` crate just does not bind
+    // it everywhere. Called so a zone change (daylight saving, a moved laptop) is picked up rather
+    // than whatever the process read the first time.
+    unsafe extern "C" {
+        fn tzset();
     }
-    let sign = if text.starts_with('-') { -1 } else { 1 };
-    let hours: i64 = text[1..3].parse().unwrap_or(0);
-    let minutes: i64 = text[3..5].parse().unwrap_or(0);
-    sign * (hours * 3_600 + minutes * 60)
+    unsafe {
+        tzset();
+        let now = libc::time(std::ptr::null_mut());
+        let mut tm: libc::tm = std::mem::zeroed();
+        if libc::localtime_r(&now, &mut tm).is_null() {
+            // A failure here is an offset of zero, which is a chart bucketed in UTC — visibly a
+            // little off for some, rather than absent.
+            return 0;
+        }
+        tm.tm_gmtoff as i64
+    }
+}
+
+#[cfg(test)]
+mod offset_tests {
+    /// The C library's offset is the one `date` prints — which is what this used to fork to ask.
+    #[test]
+    fn the_local_offset_agrees_with_date() {
+        let Ok(out) = std::process::Command::new("date").arg("+%z").output() else { return };
+        let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        if text.len() < 5 {
+            return;
+        }
+        let sign = if text.starts_with('-') { -1 } else { 1 };
+        let hours: i64 = text[1..3].parse().expect("hours");
+        let minutes: i64 = text[3..5].parse().expect("minutes");
+        assert_eq!(super::local_offset(), sign * (hours * 3_600 + minutes * 60));
+    }
 }

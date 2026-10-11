@@ -51,6 +51,7 @@
 
 import type { Neosh, PluginContext, RepoStatus } from "@neosh/api";
 import type { Pulls } from "./pulls.ts";
+import { noteStatus, statusOf } from "./status.ts";
 import { confirm, picker } from "@neosh/api/ui";
 
 // ---------------------------------------------------------------------------
@@ -469,7 +470,11 @@ export async function installGitStatus(
       state.status = null;
       state.askedAt = null;
     }
-    state.status = await neosh.git.status().catch(() => null);
+    // Through the shared reader, so the read a turn ending asks for here is the same one the
+    // project badges and the pull-request badges are drawn from.
+    state.status = cwd !== null
+      ? await statusOf(neosh, cwd)
+      : await neosh.git.status().catch(() => null);
     // Everything else that draws a branch name, off the same read. See {@link GitStatusHooks}.
     hooks.onStatus(state.status);
   };
@@ -495,6 +500,7 @@ export async function installGitStatus(
       // The conversation moved while we were out. Its answer is about a checkout nobody is looking
       // at, and applying it would put another repository's numbers under this one's name.
       if (at !== state.cwd || !fresh) return;
+      if (at) noteStatus(at, fresh);
       state.status = fresh;
       hooks.onStatus(fresh);
     } finally {

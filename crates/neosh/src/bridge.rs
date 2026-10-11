@@ -44,11 +44,20 @@ pub struct ScriptBridge {
     script: ScriptRuntime,
     pending: Mutex<Pending>,
     loaded: Mutex<Vec<PluginId>>,
+    /// The plugins that asked for per-token events. See [`ApiCall::AgentWatchTokens`].
+    ///
+    /// [`ApiCall::AgentWatchTokens`]: neosh_proto::ApiCall::AgentWatchTokens
+    watching_tokens: Mutex<std::collections::HashSet<PluginId>>,
 }
 
 impl ScriptBridge {
     pub fn new(script: ScriptRuntime) -> Self {
-        Self { script, pending: Mutex::new(Pending::default()), loaded: Mutex::new(Vec::new()) }
+        Self {
+            script,
+            pending: Mutex::new(Pending::default()),
+            loaded: Mutex::new(Vec::new()),
+            watching_tokens: Mutex::new(Default::default()),
+        }
     }
 
     pub fn script(&self) -> &ScriptRuntime {
@@ -71,6 +80,17 @@ impl ScriptBridge {
     /// Without this, a reloaded plugin would be listed twice and receive every event twice.
     pub fn forget(&self, plugin: &PluginId) {
         self.loaded.lock().expect("bridge lock poisoned").retain(|p| p != plugin);
+        self.watching_tokens.lock().expect("bridge lock poisoned").remove(plugin);
+    }
+
+    /// Start or stop sending this plugin the per-token events.
+    pub fn watch_tokens(&self, plugin: &PluginId, on: bool) {
+        let mut w = self.watching_tokens.lock().expect("bridge lock poisoned");
+        if on {
+            w.insert(plugin.clone());
+        } else {
+            w.remove(plugin);
+        }
     }
 
     fn send(&self, plugin: &PluginId, msg: PluginInbound) {
@@ -218,6 +238,17 @@ impl PluginBridge for ScriptBridge {
     }
 
     fn broadcast(&self, event: PluginEvent) {
+        // Per-token events go only to the plugins that asked for them: they are the one kind that
+        // arrives many times a second, and each delivery is a crossing into JavaScript.
+        if matches!(event, PluginEvent::Token { .. } | PluginEvent::ThinkingToken { .. }) {
+            let watching: Vec<PluginId> =
+                self.watching_tokens.lock().expect("bridge lock poisoned").iter().cloned().collect();
+            let loaded = self.loaded();
+            for p in watching.iter().filter(|p| loaded.contains(p)) {
+                self.send(p, PluginInbound::Event { event: event.clone() });
+            }
+            return;
+        }
         for p in self.loaded() {
             self.send(&p, PluginInbound::Event { event: event.clone() });
         }

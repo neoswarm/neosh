@@ -971,6 +971,7 @@ impl Editor {
                 | ApiCall::AgentSend { .. }
                 | ApiCall::AgentCommand { .. }
                 | ApiCall::AgentCancel
+                | ApiCall::AgentWatchTokens { .. }
                 | ApiCall::AgentGetSelection
                 | ApiCall::AgentSetSelection { .. }
                 | ApiCall::AgentListModels { .. }
@@ -2731,6 +2732,10 @@ impl Editor {
                 // than a duplicate row — the same rule `status.set` follows, and for the same
                 // reason: a panel refreshing what it offers must not have to withdraw first.
                 match list.iter_mut().find(|c| c.plugin == entry.plugin && c.id == entry.id) {
+                    // The same thing again is not a change. Plugins re-contribute on their own
+                    // refreshes — a badge per project after every turn — and every change event
+                    // is every panel reading this point rebuilding itself.
+                    Some(existing) if *existing == entry => return Ok(ApiOk::Unit),
                     Some(existing) => *existing = entry,
                     None => list.push(entry),
                 }

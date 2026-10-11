@@ -53,8 +53,12 @@ is `docs/releasing.md`.
   `secrecy::SecretString`, read at request time, and structurally absent from `UiEvent`.
 - **Every public API has a TS type generated from or checked against the Rust side.** Drift fails
   the build.
-- **Streaming markdown caches to the last *complete* block boundary** and re-parses only the
-  trailing partial block.
+- **Streaming markdown settles every *complete line* and re-renders only the partial one.** A row
+  is a function of its own line plus two things carried across lines — whether a fence is open,
+  and its highlighter — so both are kept on `Md` and a code block streams in a line at a time. The
+  one construct that looks ahead is a table, so a line with a pipe in it holds the boundary until
+  a blank line. Settling per *block* re-highlighted an open fence from its first line on every
+  token: a few hundred lines of code in an answer pinned a core for minutes.
 - **Which way a diff line went is a background; what the code says is the foreground.**
   `ExtmarkOpts::line_hl_group` bands the whole row and every ranged group is patched over it. A
   `Diff.*Line` group that sets a foreground silently un-highlights the code on it. Colours for code

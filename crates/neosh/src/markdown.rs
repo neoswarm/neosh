@@ -7,10 +7,13 @@
 //! which is fine for a paragraph and hopeless for the thousand-line one somebody actually cares
 //! about — the tail of a long answer is exactly where it would start stuttering.
 //!
-//! So: **a block is settled once it cannot change.** A paragraph followed by a blank line, a
-//! heading with its newline, a fence with its closing back-ticks. Settled blocks are rendered once
-//! and never looked at again. Only the trailing partial block is re-rendered per tick, and it is
-//! bounded by the size of one block rather than by the size of the answer.
+//! So: **a line is settled once it cannot change** — once its newline has arrived. Every row is a
+//! function of its own line and of two things carried from the lines before it, whether a fence is
+//! open and that fence's highlighter, and both are kept across ticks; the one construct that looks
+//! *ahead* is a table, so a line with a pipe in it holds the boundary until the block ends. Settled
+//! lines are rendered once and never looked at again, and what is re-rendered per tick is the line
+//! still arriving. It used to be the block still arriving, which for an open code fence was every
+//! line of it since the opening marker, highlighted again on every token.
 //!
 //! # What it renders, and what it does not
 //!
@@ -77,8 +80,13 @@ pub struct Md {
     /// Rows those settled blocks produced.
     settled_rows: usize,
     /// Whether an odd number of fence markers have been seen in the settled region. Carried, not
-    /// recomputed: it is the one piece of parser state that spans a block boundary.
+    /// recomputed: it is one of the two pieces of parser state that span a settled boundary.
     in_fence: bool,
+    /// And the other: the highlighter of the fence that is open across it, parsed up to the last
+    /// settled line. Carried so that a code block streams in a line at a time instead of being
+    /// highlighted again from its opening marker on every token — which made a long block in an
+    /// answer quadratic, and a few hundred lines of it pinned a core for minutes.
+    code: Option<neosh_syntax::Incremental>,
 }
 
 impl Md {
@@ -107,14 +115,16 @@ impl Md {
         let mut lines = Vec::new();
         let mut marks = Vec::new();
         let mut fence = self.in_fence;
-        render_into(&tail[..done], &mut fence, &mut lines, &mut marks);
+        render_into(&tail[..done], &mut fence, &mut self.code, &mut lines, &mut marks);
         let settled_rows = lines.len();
 
         // The unfinished remainder, drawn but not banked. Rendered with the same function as
         // everything else — a separate "partial" renderer is how the last paragraph of an answer
-        // ends up looking different from the rest of it.
+        // ends up looking different from the rest of it. On a copy of the highlighter, so a line
+        // still arriving does not move the one the settled lines are parsed with.
         let mut tail_fence = fence;
-        render_into(&tail[done..], &mut tail_fence, &mut lines, &mut marks);
+        let mut tail_code = self.code.clone();
+        render_into(&tail[done..], &mut tail_fence, &mut tail_code, &mut lines, &mut marks);
 
         self.settled_bytes += done;
         self.settled_rows += settled_rows;
@@ -124,14 +134,24 @@ impl Md {
     }
 }
 
-/// How many bytes from the start of `tail` belong to blocks that can no longer change.
+/// How many bytes from the start of `tail` belong to rows that can no longer change.
 ///
-/// A block ends at a blank line outside a fence, or at a fence's closing marker. Nothing else
-/// counts: a heading is only settled once its newline has arrived, because until then the next
-/// character could still be part of it.
+/// Every row here is a function of its own line and of two things carried across lines — whether a
+/// fence is open, and its highlighter — with one exception: a table, which is only a table once the
+/// line *after* its header has arrived. So a complete line is settled the moment its newline lands,
+/// unless it has a pipe in it outside a fence, in which case it and everything after it wait for a
+/// blank line. A partial line is never settled: until its newline, the next character could still
+/// be part of it.
+///
+/// Settling per line rather than per block is what keeps the trailing re-render small. Per block,
+/// a fence settled only at its closing marker and a list only at the blank line after it, so the
+/// longest thing in an answer was exactly the thing redrawn from its first line on every token.
 fn settled_len(tail: &str, mut in_fence: bool) -> usize {
     let mut boundary = 0;
     let mut at = 0;
+    // A pipe outside a fence may be a table's header, which is drawn differently once its
+    // delimiter row arrives — so nothing from it on settles until a blank line ends the block.
+    let mut held = false;
     for line in tail.split_inclusive('\n') {
         let complete = line.ends_with('\n');
         at += line.len();
@@ -141,12 +161,21 @@ fn settled_len(tail: &str, mut in_fence: bool) -> usize {
         let trimmed = line.trim_end_matches(['\n', '\r']);
         if is_fence(trimmed) {
             in_fence = !in_fence;
-            if !in_fence {
+            if !held {
                 boundary = at;
             }
             continue;
         }
-        if !in_fence && trimmed.trim().is_empty() {
+        if in_fence {
+            if !held {
+                boundary = at;
+            }
+        } else if trimmed.trim().is_empty() {
+            held = false;
+            boundary = at;
+        } else if trimmed.contains('|') {
+            held = true;
+        } else if !held {
             boundary = at;
         }
     }
@@ -159,15 +188,19 @@ fn is_fence(line: &str) -> bool {
 }
 
 /// Render markdown into rows, carrying fence state in and out.
-fn render_into(text: &str, in_fence: &mut bool, lines: &mut Vec<String>, marks: &mut Vec<Mark>) {
+fn render_into(
+    text: &str,
+    in_fence: &mut bool,
+    code: &mut Option<neosh_syntax::Incremental>,
+    lines: &mut Vec<String>,
+    marks: &mut Vec<Mark>,
+) {
     if text.is_empty() {
         return;
     }
-    // The highlighter for the fence currently open, if its language resolved. Local to this call
-    // and not carried on [`Md`], because a fence is only ever *settled* by its closing marker —
-    // so an open one is re-rendered whole on every tick, from its opening marker, and the state to
-    // carry across ticks is exactly none.
-    let mut code: Option<neosh_syntax::Incremental> = None;
+    // `code` is the highlighter for the fence currently open, if its language resolved — carried
+    // in and out, because a fence settles a line at a time and its parse has to pick up where the
+    // last settled line left it.
     // `split_inclusive` keeps a trailing partial line, which is exactly what a streaming tail is.
     let raw: Vec<&str> = text.split_inclusive('\n').collect();
     let mut at = 0;
@@ -192,12 +225,12 @@ fn render_into(text: &str, in_fence: &mut bool, lines: &mut Vec<String>, marks: 
             let language = line.trim_start().trim_start_matches(['`', '~']).trim();
             if *in_fence {
                 *in_fence = false;
-                code = None;
+                *code = None;
                 // The closing marker is not drawn: it was punctuation for the parser.
                 continue;
             }
             *in_fence = true;
-            code = neosh_syntax::of_token(language).map(neosh_syntax::Incremental::new);
+            *code = neosh_syntax::of_token(language).map(neosh_syntax::Incremental::new);
             if language.is_empty() {
                 continue;
             }
@@ -594,11 +627,11 @@ mod tests {
         }
     }
 
+    /// The whole text rendered in one pass with nothing carried — the reference every incremental
+    /// path is held to, deliberately not going through [`Md`] so it cannot share a bug with it.
     fn all(text: &str) -> Rendered {
-        let mut md = Md::new();
         let mut out = Rendered::default();
-        out.apply(md.push(text));
-        out.apply(md.finish());
+        render_into(text, &mut false, &mut None, &mut out.lines, &mut out.marks);
         out
     }
 
@@ -827,15 +860,64 @@ mod tests {
     }
 
     #[test]
-    fn an_open_fence_holds_the_boundary_until_it_closes() {
-        // A blank line inside a fence is not a block boundary. Settling there would let the rest of
-        // the code block be re-parsed as prose.
+    fn a_blank_line_inside_a_fence_does_not_end_it() {
+        // A blank line inside a fence is not a block boundary. Treating it as one would let the
+        // rest of the code block be re-parsed as prose.
+        let source = "```\nfirst\n\n- second\n# third\n```\n";
         let mut md = Md::new();
-        md.push("```\nfirst\n\nsecond\n");
-        let p = md.push("third\n");
-        assert_eq!(p.from, 0, "nothing has been settled yet");
-        assert!(p.lines.iter().any(|l| l.contains("third")));
-        assert!(p.lines.iter().all(|l| l.starts_with("  ")), "all of it is still code: {:?}", p.lines);
+        let mut got = Rendered::default();
+        for c in source.chars() {
+            got.apply(md.push(&c.to_string()));
+        }
+        got.apply(md.finish());
+        assert_eq!(got.lines, all(source).lines);
+        assert!(got.lines.iter().all(|l| l.is_empty() || l.starts_with("  ")), "all code: {:?}", got.lines);
+    }
+
+    #[test]
+    fn a_fence_settles_a_line_at_a_time() {
+        // The tail redrawn per token is the half-arrived line, not the block from its opening
+        // marker: that was quadratic in the length of the block.
+        let mut md = Md::new();
+        md.push("```rust\n");
+        for i in 0..50 {
+            md.push(&format!("let x{i} = {i};\n"));
+        }
+        let p = md.push("let y");
+        assert_eq!(p.lines, vec!["  let y"], "only the partial line is redrawn");
+        assert_eq!(p.from, 51, "the language row and fifty settled lines are behind it");
+    }
+
+    #[test]
+    fn a_highlighted_fence_streamed_by_the_character_matches_one_shot() {
+        // The carried highlighter has to end up exactly where a fresh one would: a string opened
+        // on one line and closed on another is the case that breaks a parser restarted per line.
+        let source = "Text\n\n```rust\nlet s = \"a\n b\";\nfn f() -> u32 { 1 }\n```\n\nAfter **bold**.\n";
+        let mut md = Md::new();
+        let mut got = Rendered::default();
+        for c in source.chars() {
+            got.apply(md.push(&c.to_string()));
+        }
+        got.apply(md.finish());
+        let want = all(source);
+        assert_eq!(got.lines, want.lines);
+        assert_eq!(got.marks, want.marks);
+    }
+
+    #[test]
+    fn a_table_header_waits_for_its_delimiter_row() {
+        // The one construct that looks ahead: a line with a pipe is held until the block ends, or
+        // its header would be banked as prose a moment before the delimiter made it a table.
+        let source = "Intro line\n| a | b |\n|---|---|\n| 1 | 2 |\n\nDone\n";
+        let mut md = Md::new();
+        let mut got = Rendered::default();
+        for c in source.chars() {
+            got.apply(md.push(&c.to_string()));
+        }
+        got.apply(md.finish());
+        let want = all(source);
+        assert_eq!(got.lines, want.lines);
+        assert_eq!(got.marks, want.marks);
     }
 
     #[test]

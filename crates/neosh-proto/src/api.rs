@@ -914,6 +914,18 @@ pub enum ApiCall {
         command: AgentCommand,
     },
     AgentCancel,
+    /// Whether this plugin is sent [`crate::plugin::PluginEvent::Token`] and
+    /// [`crate::plugin::PluginEvent::ThinkingToken`] — off until it asks, like
+    /// [`ApiCall::BufAttach`] for a buffer's changes.
+    ///
+    /// The two events that arrive per token, and the only ones that do. Sent to every plugin they
+    /// were a copy and a crossing into JavaScript each, many times a second, for plugins that had
+    /// never registered a listener — on the one thread every plugin's panels are also drawn on.
+    /// `onToken` and `onThinking` in `@neosh/api` ask for them as their first listener arrives
+    /// and let go after the last, so no plugin calls this itself.
+    AgentWatchTokens {
+        on: bool,
+    },
     AgentGetSelection,
     /// Hot-swap the model mid-session. Takes effect on the next turn.
     AgentSetSelection {
