@@ -127,6 +127,9 @@ fn is_safe_id(id: &str) -> bool {
         && id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
 }
 
+// The owned form is what loading reads; writing goes through `StoredRef`, and this is kept so a test
+// can hold the two to the same output.
+#[cfg(test)]
 impl From<&Session> for Stored {
     fn from(s: &Session) -> Self {
         Self {
@@ -186,39 +189,82 @@ impl Stored {
     }
 }
 
-/// Write one session.
+/// A session as it is written, borrowed rather than copied.
 ///
-/// Written to a temporary file and renamed, so a crash mid-write leaves the previous version rather
-/// than half of the new one. A conversation you can no longer open is worse than one that is a
-/// minute out of date.
-pub fn save(state: &Path, session: &Session) -> std::io::Result<()> {
-    if !is_safe_id(&session.id.0) {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            format!("refusing to write a session id that is not a plain identifier: {:?}", session.id.0),
-        ));
-    }
-    std::fs::create_dir_all(dir(state))?;
-    let path = session_path(state, &session.id);
-    let tmp = path.with_extension("json.tmp");
-    let json = serde_json::to_vec_pretty(&Stored::from(session))
-        .map_err(|e| std::io::Error::other(e.to_string()))?;
-    std::fs::write(&tmp, json)?;
-    std::fs::rename(&tmp, &path)
+/// [`Stored`] owns its fields because loading needs it to; writing does not, and building one meant
+/// cloning every message of a conversation to serialise it and throw the copy away. Field for field
+/// the same names, order and skips as `Stored`, which a test holds it to.
+#[derive(Serialize)]
+struct StoredRef<'a> {
+    id: &'a SessionId,
+    cwd: std::borrow::Cow<'a, str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    title: &'a Option<String>,
+    created_at: i64,
+    updated_at: i64,
+    messages: &'a [Message],
+    #[serde(skip_serializing_if = "Option::is_none")]
+    selection: &'a Option<ModelSelection>,
+    usage: Usage,
+    context_tokens: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    context_window: Option<u64>,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    context_counted: bool,
+    unread: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    running_since: Option<i64>,
+    interrupted: bool,
+    archived: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    archived_at: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    permission_mode: Option<neosh_proto::PermissionMode>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    resume: &'a Option<String>,
 }
 
-/// Write every session plus the ordering.
+impl<'a> From<&'a Session> for StoredRef<'a> {
+    fn from(s: &'a Session) -> Self {
+        Self {
+            id: &s.id,
+            cwd: s.cwd.to_string_lossy(),
+            title: &s.title,
+            created_at: s.created_at,
+            updated_at: s.updated_at,
+            messages: &s.messages,
+            selection: &s.selection,
+            usage: s.usage,
+            context_tokens: s.context_tokens,
+            context_window: s.context_window,
+            context_counted: s.context_counted,
+            unread: s.unread,
+            running_since: s.running_since,
+            interrupted: s.interrupted,
+            archived: s.archived,
+            archived_at: s.archived_at,
+            permission_mode: s.permission_mode,
+            resume: &s.resume,
+        }
+    }
+}
+
+/// What one session's file holds.
+///
+/// Compact rather than pretty: nothing reads these but this module, and the indentation was a
+/// third of every file — on a conversation with a few long tool outputs, megabytes of spaces.
+pub fn encode(session: &Session) -> std::io::Result<Vec<u8>> {
+    serde_json::to_vec(&StoredRef::from(session)).map_err(|e| std::io::Error::other(e.to_string()))
+}
+
+/// What `order.json` holds: which conversations exist, most recent first, and which one you were in.
 ///
 /// Every session that is one: a [placeholder](neosh_agent::Session::ephemeral) is somewhere to
 /// type that was minted because the workspace had nowhere else, and writing it down would mean an
 /// emptied workspace came back with a conversation in it that nobody had started. It is left out
 /// of the order too, and is never what `active` names — restarting into it happens by there being
 /// nothing to restore, which is the state it stands for.
-pub fn save_all(state: &Path, store: &SessionStore) -> std::io::Result<()> {
-    std::fs::create_dir_all(dir(state))?;
-    for s in store.iter().filter(|s| !s.hidden()) {
-        save(state, s)?;
-    }
+pub fn encode_order(store: &SessionStore) -> std::io::Result<Vec<u8>> {
     let order: Vec<SessionId> = store
         .order()
         .iter()
@@ -233,12 +279,108 @@ pub fn save_all(state: &Path, store: &SessionStore) -> std::io::Result<()> {
         active: Some(store.current_id().clone())
             .filter(|id| store.get(id).is_some_and(|s| !s.hidden())),
     };
-    let path = order_path(state);
+    serde_json::to_vec(&order).map_err(|e| std::io::Error::other(e.to_string()))
+}
+
+/// Where one session's file goes, refusing an id that is not a plain identifier.
+pub fn file_for(state: &Path, id: &SessionId) -> std::io::Result<PathBuf> {
+    if !is_safe_id(&id.0) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("refusing to write a session id that is not a plain identifier: {:?}", id.0),
+        ));
+    }
+    Ok(session_path(state, id))
+}
+
+/// Where the ordering goes.
+pub fn order_file(state: &Path) -> PathBuf {
+    order_path(state)
+}
+
+/// Write bytes to a file by way of a temporary one and a rename.
+///
+/// So a crash mid-write leaves the previous version rather than half of the new one. A
+/// conversation you can no longer open is worse than one that is a minute out of date.
+fn write_atomically(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
     let tmp = path.with_extension("json.tmp");
-    let json =
-        serde_json::to_vec_pretty(&order).map_err(|e| std::io::Error::other(e.to_string()))?;
-    std::fs::write(&tmp, json)?;
-    std::fs::rename(&tmp, &path)
+    std::fs::write(&tmp, bytes)?;
+    std::fs::rename(&tmp, path)
+}
+
+/// Write one session, now. The host writes through [`Writer`]; this is for tests.
+#[cfg(test)]
+pub fn save(state: &Path, session: &Session) -> std::io::Result<()> {
+    let path = file_for(state, &session.id)?;
+    write_atomically(&path, &encode(session)?)
+}
+
+/// Write every session plus the ordering, now. The host writes through [`Writer`]; this is for tests.
+#[cfg(test)]
+pub fn save_all(state: &Path, store: &SessionStore) -> std::io::Result<()> {
+    std::fs::create_dir_all(dir(state))?;
+    for s in store.iter().filter(|s| !s.hidden()) {
+        save(state, s)?;
+    }
+    write_atomically(&order_path(state), &encode_order(store)?)
+}
+
+/// The thread that puts conversations on disk, so the host loop never waits on a write.
+///
+/// One thread and one queue rather than a task per write: two writes of the same file racing each
+/// other is how an older copy lands last, and a queue is the order they were asked for in. A
+/// delete waits for the queue to drain first ([`Writer::sync`]), or a write queued a moment before
+/// it would put the file back.
+pub struct Writer {
+    tx: std::sync::mpsc::Sender<Job>,
+}
+
+enum Job {
+    Write(PathBuf, Vec<u8>),
+    Sync(std::sync::mpsc::Sender<()>),
+}
+
+impl Writer {
+    pub fn spawn() -> Self {
+        let (tx, rx) = std::sync::mpsc::channel::<Job>();
+        let spawned = std::thread::Builder::new().name("neosh-save".into()).spawn(move || {
+            while let Ok(job) = rx.recv() {
+                match job {
+                    Job::Write(path, bytes) => {
+                        if let Err(e) = write_atomically(&path, &bytes) {
+                            // Reported once per write, not per turn: a full disk should not turn
+                            // into a message on every keystroke, and losing history is not a
+                            // reason to stop working.
+                            tracing::warn!("could not save {}: {e}", path.display());
+                        }
+                    }
+                    Job::Sync(done) => {
+                        let _ = done.send(());
+                    }
+                }
+            }
+        });
+        if let Err(e) = spawned {
+            tracing::warn!("could not start the save thread: {e}");
+        }
+        Self { tx }
+    }
+
+    /// Queue a write. Written in the order queued.
+    pub fn write(&self, path: PathBuf, bytes: Vec<u8>) {
+        let _ = self.tx.send(Job::Write(path, bytes));
+    }
+
+    /// Wait until everything queued so far is on disk.
+    pub fn sync(&self) {
+        let (done, wait) = std::sync::mpsc::channel();
+        if self.tx.send(Job::Sync(done)).is_ok() {
+            let _ = wait.recv();
+        }
+    }
 }
 
 /// Everything on disk, described rather than restored — newest first.
@@ -414,6 +556,44 @@ mod tests {
         s.created_at = 100;
         s.updated_at = 100;
         s
+    }
+
+    /// What is written is what `Stored` would have written, field for field — both with every
+    /// optional field absent and with every one of them set, so a skip that differs shows up.
+    #[test]
+    fn the_borrowed_form_writes_exactly_what_the_owned_one_did() {
+        let bare = session("hello");
+        let mut full = session("hello");
+        full.title = Some("a title".into());
+        full.context_tokens = 1234;
+        full.context_window = Some(200_000);
+        full.context_counted = true;
+        full.unread = true;
+        full.running_since = Some(5);
+        full.interrupted = true;
+        full.archived = true;
+        full.archived_at = Some(9);
+        full.permission_mode = Some(neosh_proto::PermissionMode::Ask);
+        full.resume = Some("handle".into());
+        for s in [&bare, &full] {
+            let borrowed: serde_json::Value =
+                serde_json::from_slice(&encode(s).expect("encode")).expect("json");
+            let owned = serde_json::to_value(Stored::from(s)).expect("json");
+            assert_eq!(borrowed, owned);
+            let back: Stored = serde_json::from_value(borrowed).expect("loads");
+            assert_eq!(back.into_session().messages, s.messages);
+        }
+    }
+
+    #[test]
+    fn the_writer_writes_in_order_and_sync_waits_for_it() {
+        let t = tmp("writer");
+        let w = Writer::spawn();
+        let path = dir(&t.0).join("x.json");
+        w.write(path.clone(), b"first".to_vec());
+        w.write(path.clone(), b"second".to_vec());
+        w.sync();
+        assert_eq!(std::fs::read(&path).expect("written"), b"second");
     }
 
     /// The pictures pasted into a conversation go with it — and only those.

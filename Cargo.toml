@@ -106,6 +106,17 @@ libc = "0.2"
 # dev
 insta = { version = "1.48", features = ["json", "redactions"] }
 
+# What ships. A quarter of the default build was the symbol table — 102 MB with it, 77 MB without —
+# and a backtrace in a released binary was never going to be read against it. Thin LTO with one
+# codegen unit lets the Rust half inline across crates; V8 is a prebuilt archive and is the same
+# size either way. Not `panic = "abort"`: a panic in one plugin op would take the whole workspace,
+# and every turn running in it, down with it. Not `opt-level = "z"` either — this is the build
+# whose speed people feel.
+[profile.release]
+strip = true
+lto = "thin"
+codegen-units = 1
+
 [profile.dev]
 opt-level = 1
 # Enough debug info to read a backtrace, and none of the rest.

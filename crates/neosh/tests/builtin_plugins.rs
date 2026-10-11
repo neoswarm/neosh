@@ -5352,6 +5352,46 @@ fn a_turn_in_flight_says_so_and_says_for_how_long() {
     assert!(rows[last].contains("esc to interrupt"), "pinned to the bottom\n{rows:?}");
 }
 
+/// Per-token events reach a plugin that listens for them — including one that stopped listening
+/// and started again.
+///
+/// They are the one event that arrives many times a second, so the host sends them only to a
+/// plugin that has asked, which `onToken` and `onThinking` do by themselves as the first listener
+/// arrives and undo after the last one goes. What that must never cost is a listener: letting go of
+/// every listener and then adding one is the sequence that would leave a plugin unsubscribed.
+#[test]
+fn tokens_reach_a_plugin_that_listens_even_after_it_let_go() {
+    let sb = Sandbox::new("tokenwatch");
+    let dir = sb.root.join("config/plugins/listens");
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    std::fs::write(
+        dir.join("plugin.toml"),
+        "name = \"listens\"\nversion = \"0.1.0\"\nentry = \"main.ts\"\n",
+    )
+    .expect("manifest");
+    std::fs::write(
+        dir.join("main.ts"),
+        r#"
+import type { PluginContext } from "@neosh/api";
+export async function activate({ neosh, subscriptions }: PluginContext) {
+  // Both streams taken and both let go: the host is told to stop, and then to start again.
+  neosh.agent.onToken(() => {}).dispose();
+  neosh.agent.onThinking(() => {}).dispose();
+  let said = "";
+  subscriptions.push(neosh.agent.onToken((e) => { said += e.text; }));
+  subscriptions.push(neosh.agent.onTurnEnd(() => neosh.notify(`listener heard [${said}]`)));
+}
+"#,
+    )
+    .expect("plugin");
+    let mut s = sb.start();
+    s.wait_for("PROJECTS");
+    s.key("h");
+    s.enter();
+    s.wait_for("All done.");
+    s.wait_for("listener heard [All done.]");
+}
+
 #[test]
 fn the_working_line_is_gone_the_moment_there_is_an_answer() {
     // Leaving it above the reply would say a turn is in flight while you are reading its result.
@@ -8827,8 +8867,10 @@ fn a_third_party_decorates_a_conversation_and_anchors_a_section_by_name() {
     s.wait_for("anchored here");
     s.wait_for("cursor=");
     // The section sits between the project list and the `+ Add project` row, where `before:
-    // "add"` put it — not at the foot, where `at: "below"` would have.
-    let texts = s.texts();
+    // "add"` put it — not at the foot, where `at: "below"` would have. Read off the buffer as it
+    // stands, not off every line ever sent: a redraw sends only the rows that changed, so the
+    // order of the updates is not the order of the rows.
+    let texts = s.sidebar_now();
     let between = texts.iter().rposition(|t| t.contains("anchored here")).expect("drawn");
     let add = texts.iter().rposition(|t| t.contains("+ Add project")).expect("drawn");
     let projects = texts.iter().rposition(|t| t.contains("PROJECTS")).expect("drawn");

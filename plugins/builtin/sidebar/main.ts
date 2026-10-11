@@ -51,6 +51,7 @@ import type {
   NodeInfo,
   SessionInfo,
   Message,
+  ModelEntry,
   LinkState,
   SwarmAgent,
   SwarmNode,
@@ -555,6 +556,27 @@ export async function activate({ neosh, subscriptions }: PluginContext) {
   // cursor and the unfolded row are drawn into its text.
   const panels = new Map<ViewId, Panel>();
 
+  // The clock, held only while some panel has something moving on it. A subscription that lived
+  // for the life of the plugin kept the shared clock ticking ten times a second in a workspace
+  // where nothing was running, waking every other subscriber on it for no frame anybody could see.
+  let clock: Disposable | null = null;
+  const holdClock = () => {
+    let moving = false;
+    for (const p of panels.values()) {
+      if (p.isOpen() && p.isRunning()) moving = true;
+    }
+    if (moving && clock === null) {
+      clock = onTick(() => {
+        each((p) => {
+          if (p.isOpen() && p.isRunning()) void p.tick();
+        });
+      });
+    } else if (!moving && clock !== null) {
+      clock.dispose();
+      clock = null;
+    }
+  };
+
   const makePanel = async (view: ViewId): Promise<Panel> => {
     // The kind is what makes this panel something other plugins can act on: it is the scope their
     // keymaps bind at and the handle `win.ofKind` finds it by. One argument, and the difference
@@ -591,9 +613,23 @@ export async function activate({ neosh, subscriptions }: PluginContext) {
     // and leave highlights pointing at rows that have already been replaced.
     let drawing = false;
     let again = false;
+    // What the last draw read, for a tick to draw from, and whether the next draw may use it: only
+    // a tick may, only within a second of the last read, and never when a full draw was asked for
+    // while one was already running.
+    const fetched: Fetched = new Map();
+    let fetchedAt = 0;
+    let fresh = true;
 
-    const draw = async () => {
+    // How old a read each kind of draw may be handed: an event is a change and reads everything
+    // again; a tick and a cursor move change nothing the host knows, only what is drawn from it.
+    const MAX_AGE = { full: 0, tick: 1000, move: 5000 } as const;
+    let allowed: number = MAX_AGE.full;
+    const paint = async (kind: keyof typeof MAX_AGE) => {
       if (win === null) return;
+      // The strictest of everything asked for while a draw was running, so a full draw that
+      // arrives during a tick is not served from the tick's cache.
+      allowed = drawing ? Math.min(allowed, MAX_AGE[kind]) : MAX_AGE[kind];
+      if (kind === "full") fresh = true;
       if (drawing) {
         again = true;
         return;
@@ -602,14 +638,25 @@ export async function activate({ neosh, subscriptions }: PluginContext) {
       try {
         do {
           again = false;
+          const reuse = !fresh && Date.now() - fetchedAt < allowed;
+          if (!reuse) {
+            fetched.clear();
+            fetchedAt = Date.now();
+          }
+          fresh = false;
           // Read per frame rather than cached at load: a setting arrives from `config.toml` after
           // this plugin has declared it, and a value captured at activation would be the default
           // forever.
-          const [width, ascii, hints] = await Promise.all([
-            neosh.opt.get<number>("sidebar.width").catch(() => null),
-            neosh.opt.get<boolean>("ui.ascii_only").catch(() => null),
-            neosh.opt.get<boolean>("sidebar.hints").catch(() => null),
-          ]);
+          // A tick reuses them too: a setting changing is `opt.onChange`, which is a full draw.
+          const settings = reuse && fetched.has("settings")
+            ? fetched.get("settings") as [number | null, boolean | null, boolean | null]
+            : await Promise.all([
+              neosh.opt.get<number>("sidebar.width").catch(() => null),
+              neosh.opt.get<boolean>("ui.ascii_only").catch(() => null),
+              neosh.opt.get<boolean>("sidebar.hints").catch(() => null),
+            ]);
+          fetched.set("settings", settings);
+          const [width, ascii, hints] = settings;
           panelWidth = width ?? 34;
           const built = await collect(here, arrangement, {
             width: panelWidth,
@@ -626,8 +673,9 @@ export async function activate({ neosh, subscriptions }: PluginContext) {
             codes: new Map(),
             colors: new Map(),
             folded: (key) => arrangement.isFolded(key),
-          });
+          }, { reuse, values: fetched });
           running = built.running;
+          holdClock();
           list.setRows(built.rows, same);
           await list.render({
             showCursor: focused,
@@ -645,6 +693,12 @@ export async function activate({ neosh, subscriptions }: PluginContext) {
         drawing = false;
       }
     };
+    /** Everything read again and drawn — what every event that changes a row asks for. */
+    const draw = () => paint("full");
+    /** Drawn again for what moves on its own, from what the last draw read. */
+    const tick = () => paint("tick");
+    /** Drawn again because the cursor moved, from what the last draw read. */
+    const moved = () => paint("move");
 
     /**
      * The open in flight, so two callers cannot each make a window.
@@ -732,6 +786,7 @@ export async function activate({ neosh, subscriptions }: PluginContext) {
       if (win === null) return;
       const w = win;
       win = null;
+      holdClock();
       await leave();
       await neosh.win.close(w).catch(() => {});
     };
@@ -770,6 +825,8 @@ export async function activate({ neosh, subscriptions }: PluginContext) {
       list,
       count,
       draw,
+      tick,
+      moved,
       open,
       close,
       enter,
@@ -894,15 +951,15 @@ export async function activate({ neosh, subscriptions }: PluginContext) {
     }),
   );
 
-  // Attributes change: the shared 100 ms clock, and only while a turn is in flight. An idle
-  // workspace has no timer at all.
-  subscriptions.push(
-    onTick(() => {
-      each((p) => {
-        if (p.isOpen() && p.isRunning()) void p.draw();
-      });
-    }),
-  );
+  // Attributes change: the shared 100 ms clock, and only while a turn is in flight — `holdClock`
+  // takes it after a draw that found something running and lets it go after one that did not, so
+  // an idle workspace has no timer at all.
+  subscriptions.push({
+    dispose: () => {
+      clock?.dispose();
+      clock = null;
+    },
+  });
 
   await installFooter(neosh, subscriptions);
 
@@ -948,6 +1005,7 @@ export async function activate({ neosh, subscriptions }: PluginContext) {
       // would otherwise be a capture pointed at a window that no longer exists.
       panels.get(view)?.dispose();
       panels.delete(view);
+      holdClock();
     }),
   );
   // And when *we* are the ones going away, which is not the same thing and is the one this panel
@@ -1409,6 +1467,13 @@ interface Panel {
    */
   readonly count: { pending: string };
   draw(): Promise<void>;
+  /** A redraw for what animates, reusing what the last draw read from the host. */
+  tick(): Promise<void>;
+  /**
+   * A redraw after the cursor moved, reusing what the last draw read. A move changes which row is
+   * lit and nothing the host knows; anything that does change a row arrives as an event.
+   */
+  moved(): Promise<void>;
   open(): Promise<void>;
   close(): Promise<void>;
   enter(): Promise<void>;
@@ -1469,7 +1534,12 @@ async function registerCommands(w: Wiring): Promise<void> {
     key: string | null,
     desc: string,
     fn: (p: Panel, target: Target | undefined, args: string[]) => Promise<void> | void,
-    opts: { redraw?: boolean; on?: Partial<Record<Target["kind"], string>> } = {},
+    opts: {
+      redraw?: boolean;
+      on?: Partial<Record<Target["kind"], string>>;
+      /** A motion: redrawn from what the panel already read rather than reading it all again. */
+      moves?: boolean;
+    } = {},
   ): Promise<void> => {
     // What the card beside the panel says for it, per kind of row it applies to. `desc` is the
     // sentence `^Z` prints for every row at once; this is the short form for the one row you are
@@ -1487,7 +1557,7 @@ async function registerCommands(w: Wiring): Promise<void> {
         // A count belongs to the motion typed straight after it. Anything else ends it — otherwise
         // a `5` you thought better of sits there and turns the next `j` into five.
         p.count.pending = "";
-        if (opts.redraw !== false) await p.draw();
+        if (opts.redraw !== false) await (opts.moves ? p.moved() : p.draw());
       }, { desc }),
     );
     if (key !== null) {
@@ -1518,8 +1588,9 @@ async function registerCommands(w: Wiring): Promise<void> {
     return Number.isFinite(n) && n > 0 ? Math.min(n, 999) : fallback;
   };
 
-  await verb(`${NS}.down`, "j", "Next row", (p) => void p.list.move(take(p)));
-  await verb(`${NS}.up`, "k", "Previous row", (p) => void p.list.move(-take(p)));
+  const motion = { moves: true } as const;
+  await verb(`${NS}.down`, "j", "Next row", (p) => void p.list.move(take(p)), motion);
+  await verb(`${NS}.up`, "k", "Previous row", (p) => void p.list.move(-take(p)), motion);
   await also("<Down>", `${NS}.down`, "Next row");
   await also("<Up>", `${NS}.up`, "Previous row");
   await also("<C-n>", `${NS}.down`, "Next row");
@@ -1535,14 +1606,14 @@ async function registerCommands(w: Wiring): Promise<void> {
     // cursor that reappears at the top has thrown away the place you were reading from.
     p.list.move(sign * step, { wrap: false });
   };
-  await verb(`${NS}.half.down`, "<C-d>", "Half a screen down", by(0.5, 1));
-  await verb(`${NS}.half.up`, "<C-u>", "Half a screen up", by(0.5, -1));
+  await verb(`${NS}.half.down`, "<C-d>", "Half a screen down", by(0.5, 1), motion);
+  await verb(`${NS}.half.up`, "<C-u>", "Half a screen up", by(0.5, -1), motion);
   // A whole screen is `PgUp`/`PgDn` and deliberately *not* `^F`/`^B`. Those two are `^F` archive
   // and `^B` hide the panel — both of which somebody in this panel is more likely to want than a
   // page step in a column that is rarely taller than one screen, and a key that means something
   // else only while the cursor happens to be here is the worst kind of key.
-  await verb(`${NS}.page.down`, "<PageDown>", "A screen down", by(1, 1));
-  await verb(`${NS}.page.up`, "<PageUp>", "A screen up", by(1, -1));
+  await verb(`${NS}.page.down`, "<PageDown>", "A screen down", by(1, 1), motion);
+  await verb(`${NS}.page.up`, "<PageUp>", "A screen up", by(1, -1), motion);
 
   /** The count, when a verb wants the number itself rather than a repetition. */
   const typed = (p: Panel): number | null => {
@@ -1556,12 +1627,12 @@ async function registerCommands(w: Wiring): Promise<void> {
     const n = typed(p);
     if (n === null) p.list.toEnd("first");
     else p.list.nth(n);
-  });
+  }, motion);
   await verb(`${NS}.bottom`, "G", "The last row, or the n-th with a count", (p) => {
     const n = typed(p);
     if (n === null) p.list.toEnd("last");
     else p.list.nth(n);
-  });
+  }, motion);
 
   /**
    * A digit, before a motion.
@@ -1580,7 +1651,7 @@ async function registerCommands(w: Wiring): Promise<void> {
       // this panel will ever have, and it stops a leant-on key growing a string forever.
       if (p.count.pending.length < 3) p.count.pending += code.c;
       // Drawn straight away — the strip is the only thing saying the digit landed anywhere.
-      await p.draw();
+      await p.moved();
     }, { desc: "Begin a count for the next motion" }),
   );
   for (const digit of "0123456789") {
@@ -4407,18 +4478,44 @@ function asked(value: unknown): Set<string> {
   return new Set(value.filter((v): v is string => typeof v === "string"));
 }
 
+/**
+ * What one draw read from the host, kept so a tick can draw again without reading it all again.
+ *
+ * A tick redraws for what moves on its own — a spinner, a pulse, a clock — and none of that is in
+ * what these calls return. Everything that *does* change them arrives as an event, and an event is
+ * a full draw; the tick is the only caller that reuses this, and it still reads afresh once a
+ * second so nothing an event did not announce is wrong for longer than that.
+ */
+type Fetched = Map<string, unknown>;
+
 async function collect(
   neosh: Neosh,
   arrangement: Arrangement,
   opts: DrawOptions,
+  cache?: { reuse: boolean; values: Fetched },
 ): Promise<{ rows: ListRow<Target>[]; running: boolean; pinned: number }> {
   const rows: ListRow<Target>[] = [];
+  const ask = async <T>(key: string, f: () => Promise<T>): Promise<T> => {
+    if (cache?.reuse && cache.values.has(key)) return cache.values.get(key) as T;
+    const v = await f();
+    cache?.values.set(key, v);
+    return v;
+  };
 
   // Failures absorbed: a panel that renders an exception instead of your conversations is worse
-  // than one showing less.
-  const all = await neosh.session
-    .list({ includeArchived: true })
-    .catch(() => [] as SessionInfo[]);
+  // than one showing less. All at once rather than one after another: none of them depends on
+  // another, and in sequence they were the whole of a keypress's wait.
+  const [all, self, nodes, rawDecorations, codeVar, current, sections] = await Promise.all([
+    ask("sessions", () =>
+      neosh.session.list({ includeArchived: true }).catch(() => [] as SessionInfo[])),
+    ask("self", () => neosh.swarm.self().catch(() => null)),
+    ask("nodes", () => neosh.swarm.nodes().catch(() => [] as SwarmNode[])),
+    ask("decorations", () =>
+      neosh.ext.list<DecorationItem>(POINT_DECORATION).catch(() => [])),
+    ask("codes", () => neosh.vars.get({ scope: "global" }, VAR_CODES).catch(() => null)),
+    ask("current", () => neosh.session.current().catch(() => null)),
+    ask("sections", () => neosh.ext.list<SectionItem>(POINT_SECTION).catch(() => [])),
+  ]);
   const sessions = all.filter((s) => !s.archived);
   let running = sessions.some((s) => s.active_turn);
   const now = Date.now();
@@ -4433,27 +4530,20 @@ async function collect(
   // list that never had them. Now every one of them is drawn and the marker beside it says which.
   //
   // One call; empty and harmless on a single machine.
-  const me = (await neosh.swarm.self().catch(() => null))?.id ?? null;
-  const peers = (await neosh.swarm.nodes().catch(() => [] as SwarmNode[]))
-    .filter((n) => n.info.id !== me);
+  const me = self?.id ?? null;
+  const peers = nodes.filter((n) => n.info.id !== me);
   // A turn over there has a clock on its row too, and a clock that moves every few seconds is one
   // that looks stuck.
   running ||= peers.some((n) => n.link.state === "up" && n.agents.some(turning));
 
   // Marks other plugins put on our rows. Read every frame for the reason sections are: a
   // decorator re-contributes in place when its data changes, and the read is one call.
-  const decorations = mergeDecorations(
-    await neosh.ext.list<DecorationItem>(POINT_DECORATION).catch(() => []),
-  );
+  const decorations = mergeDecorations(rawDecorations);
   const links = new Map(peers.map((n) => [n.info.id, n.link] as const));
-  const codes = machineCodes(
-    peers,
-    await neosh.vars.get({ scope: "global" }, VAR_CODES).catch(() => null),
-  );
+  const codes = machineCodes(peers, codeVar);
   const colors = machineColors(peers);
   // Which remote conversation is on screen here, so its row is lit the way yours is when you are in
   // it: where you are is the one thing the panel must never leave you to work out.
-  const current = await neosh.session.current().catch(() => null);
   const mirrored = current?.mirror
     ? { node: current.mirror.node, session: current.mirror.session }
     : undefined;
@@ -4473,7 +4563,8 @@ async function collect(
   const local = projects
     .filter((p) => p.cwd !== null && p.mains.length > 0)
     .map((p) => p.cwd as string);
-  const heads = await neosh.git.heads(local).catch(() => [] as Array<GitHead | null>);
+  const heads = await ask(`heads:${JSON.stringify(local)}`, () =>
+    neosh.git.heads(local).catch(() => [] as Array<GitHead | null>));
   const mine = new Map(local.map((cwd, i) => [cwd, heads[i] ?? null] as const));
   for (const p of projects) {
     if (p.cwd !== null && p.mains.length > 0) compareVersions(p, mine.get(p.cwd));
@@ -4500,9 +4591,8 @@ async function collect(
     ),
   ]);
 
-  // Rows other plugins own. Read every frame rather than cached, because a contribution is replaced
-  // in place when its author's data changes and re-reading is one call.
-  const sections = await neosh.ext.list<SectionItem>(POINT_SECTION).catch(() => []);
+  // Rows other plugins own, read with everything else above: a contribution is replaced in place
+  // when its author's data changes, and that change is an event, which is a full draw.
   const order = placeSections(SLOTS, sections);
   const section = (c: Contribution & { item: SectionItem }) =>
     rows.push(...contributedRows<Target>(c, {
@@ -5883,11 +5973,27 @@ class KeyCard {
  * usage block — one home per number.
  */
 async function installFooter(neosh: Neosh, subscriptions: PluginContext["subscriptions"]) {
+  // The clock, held only while the conversation on screen has a turn running — which is the only
+  // time anything here moves. Subscribed for the life of the plugin, it kept the shared clock
+  // ticking ten times a second at rest, and every tick was a round of calls into the host.
+  let clock: Disposable | null = null;
+  const holdClock = (moving: boolean) => {
+    if (moving && clock === null) clock = onTick(() => void refresh());
+    else if (!moving && clock !== null) {
+      clock.dispose();
+      clock = null;
+    }
+  };
+  // The model's prices, by instance and id. The catalogue changes when somebody signs in or adds a
+  // model, which is a selection change, and asking for all of it on every tick to price one
+  // conversation was the most expensive thing on the clock.
+  let priced: { key: string; model: ModelEntry["model"] | undefined } | null = null;
   const refresh = async () => {
     const [current, selection] = await Promise.all([
       neosh.session.current().catch(() => null),
       neosh.agent.selection().catch(() => null),
     ]);
+    holdClock(Boolean(current?.active_turn));
     if (!current) return;
 
     // Where you are, when it is not here: `@lb linux-box` on the strip, in that machine's colour,
@@ -5926,10 +6032,17 @@ async function installFooter(neosh: Neosh, subscriptions: PluginContext["subscri
       await neosh.status.clear("turn");
     }
 
-    const model = selection
-      ? (await neosh.agent.listModels(selection.instance).catch(() => []))
-          .find((e) => e.model.id === selection.model)?.model
-      : undefined;
+    const key = selection ? `${selection.instance}\u0000${selection.model}` : "";
+    if (priced?.key !== key) {
+      priced = {
+        key,
+        model: selection
+          ? (await neosh.agent.listModels(selection.instance).catch(() => []))
+              .find((e) => e.model.id === selection.model)?.model
+          : undefined,
+      };
+    }
+    const model = priced.model;
     const u = current.usage;
     // The context meter is *not* here. It was, and so was one in the usage plugin, and for as long
     // as no model in the catalogue reported a window only one of them ever drew — so two gauges of
@@ -5963,10 +6076,13 @@ async function installFooter(neosh: Neosh, subscriptions: PluginContext["subscri
   subscriptions.push(neosh.agent.onTurnStart(() => void refresh()));
   subscriptions.push(neosh.agent.onTurnEnd(() => void refresh()));
   subscriptions.push(neosh.session.onChange(() => void refresh()));
-  // The cost depends on the model's prices, so a switch changes it without a turn happening.
-  subscriptions.push(neosh.agent.onSelectionChange(() => void refresh()));
-  // The clock only ticks while something is running, so this costs nothing at rest.
-  subscriptions.push(onTick(() => void refresh()));
+  // The cost depends on the model's prices, so a switch changes it without a turn happening — and
+  // a sign-in can change the catalogue under the same selection, so the prices are asked again.
+  subscriptions.push(neosh.agent.onSelectionChange(() => {
+    priced = null;
+    void refresh();
+  }));
+  subscriptions.push({ dispose: () => holdClock(false) });
 }
 
 function basename(cwd: string): string {

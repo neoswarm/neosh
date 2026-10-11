@@ -773,9 +773,10 @@ fn what_is_attached_is_part_of_the_message_that_was_stored() {
             .filter_map(|e| std::fs::read_to_string(e.path()).ok())
             .collect::<String>()
     };
-    let saved = stored(&mut s);
+    // Compact or pretty, it is the same claim.
+    let saved = stored(&mut s).replace("\": ", "\":");
     assert!(
-        saved.contains("\"type\": \"image\""),
+        saved.contains("\"type\":\"image\""),
         "the conversation on disk carries the picture, not just the words\n{saved}"
     );
     assert!(

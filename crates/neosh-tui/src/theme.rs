@@ -40,7 +40,9 @@ const MAX_LINK_DEPTH: usize = 16;
 
 #[derive(Debug, Clone)]
 pub struct Theme {
-    groups: BTreeMap<String, HighlightDef>,
+    /// Shared, because a window with a `winhighlight` map draws through a copy of the theme with
+    /// its own remap — every frame, for every such window — and the groups are the same table.
+    groups: std::sync::Arc<BTreeMap<String, HighlightDef>>,
     depth: ColorDepth,
     /// Whether animated groups actually animate. Follows `ui.motion`.
     ///
@@ -55,7 +57,7 @@ pub struct Theme {
 
 impl Theme {
     pub fn new(depth: ColorDepth) -> Self {
-        Self { groups: BTreeMap::new(), depth, motion: true, remap: BTreeMap::new() }
+        Self { groups: Default::default(), depth, motion: true, remap: BTreeMap::new() }
     }
 
     /// This theme as one window sees it, with its group names remapped.
@@ -82,11 +84,11 @@ impl Theme {
     }
 
     pub fn set(&mut self, name: impl Into<String>, def: HighlightDef) {
-        self.groups.insert(name.into(), def);
+        std::sync::Arc::make_mut(&mut self.groups).insert(name.into(), def);
     }
 
     pub fn sync(&mut self, groups: &BTreeMap<String, HighlightDef>) {
-        self.groups = groups.clone();
+        self.groups = std::sync::Arc::new(groups.clone());
     }
 
     pub fn depth(&self) -> ColorDepth {

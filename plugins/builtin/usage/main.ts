@@ -49,7 +49,6 @@ import {
   type ListRow,
   meter,
   money,
-  onTick,
 } from "@neosh/api/ui";
 
 const NS = "usage";
@@ -234,9 +233,11 @@ async function installStrip({ neosh, subscriptions }: PluginContext) {
   // instance it cannot name, so a sign-in nobody selected after is caught within a tick either way.
   subscriptions.push(neosh.agent.onSelectionChange(() => void reload().then(refresh)));
   // A countdown is the only thing here that moves without anything happening, and it moves once a
-  // minute. The tick is already running for the working line; `refresh` bails on an unchanged
-  // render, so this costs a string compare.
-  subscriptions.push(onTick(() => void refresh()));
+  // minute — so it is redrawn on a clock of its own at that rate rather than on the shared 100 ms
+  // one, where it was seven calls into the host ten times a second and kept that clock running in
+  // a workspace where nothing else was. Everything else this draws arrives with an event above.
+  const countdown = setInterval(() => void refresh(), 30_000) as unknown as number;
+  subscriptions.push({ dispose: () => clearInterval(countdown) });
 }
 
 /** A contributed sidebar row, in the shape `sidebar.section` takes. */

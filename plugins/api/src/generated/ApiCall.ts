@@ -273,6 +273,7 @@ export type ApiCall =
     command: AgentCommand;
   }
   | { "call": "agent_cancel" }
+  | { "call": "agent_watch_tokens"; on: boolean }
   | { "call": "agent_get_selection" }
   | { "call": "agent_set_selection"; selection: ModelSelection }
   | {

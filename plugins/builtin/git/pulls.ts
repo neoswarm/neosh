@@ -36,6 +36,7 @@
  */
 
 import type { PluginContext, PullRequest } from "@neosh/api";
+import { statusOf } from "./status.ts";
 
 const POINT_DECORATION = "sidebar.decoration";
 /** The badge id, per project. Namespaced so it merges beside the dirty strip rather than replacing it. */
@@ -132,10 +133,15 @@ export async function installPulls({ neosh, subscriptions }: PluginContext): Pro
     /** Repository root to the checkouts under it. */
     const byRoot = new Map<string, string[]>();
     for (const cwd of cwds) {
-      const trees = await neosh.git.worktrees({ cwd }).catch(() => []);
-      const root = trees.find((t) => t.is_main)?.path ?? trees[0]?.path;
-      if (!root) continue;
-      rootOf.set(cwd, root);
+      // Which repository a checkout belongs to does not change while it exists, so it is asked
+      // once rather than on every draw — a `git worktree list` per project per turn ending.
+      let root = rootOf.get(cwd);
+      if (root === undefined) {
+        const trees = await neosh.git.worktrees({ cwd }).catch(() => []);
+        root = trees.find((t) => t.is_main)?.path ?? trees[0]?.path;
+        if (!root) continue;
+        rootOf.set(cwd, root);
+      }
       const under = byRoot.get(root);
       if (under) under.push(cwd);
       else byRoot.set(root, [cwd]);
@@ -145,7 +151,7 @@ export async function installPulls({ neosh, subscriptions }: PluginContext): Pro
 
   /** What each checkout has checked out, so a pull request can be matched to a row. */
   const branchOf = async (cwd: string): Promise<string | null> => {
-    const status = await neosh.git.status({ cwd }).catch(() => null);
+    const status = await statusOf(neosh, cwd);
     return status?.repo.branch ?? null;
   };
 

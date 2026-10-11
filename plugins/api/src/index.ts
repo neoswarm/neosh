@@ -2288,6 +2288,30 @@ function eventListener(
   return listener(list, cb);
 }
 
+/**
+ * A listener on one of the per-token streams, which the host sends only to a plugin that asked for
+ * them: asked for as the first listener of either kind arrives, and given up after the last goes.
+ */
+function watchTokens<T>(
+  plugin: string,
+  r: ReturnType<typeof reg>,
+  list: Array<(e: T) => void>,
+  cb: (e: T) => void,
+): Disposable {
+  const count = () => r.agentListeners.token.length + r.agentListeners.thinking.length;
+  if (count() === 0) notify(plugin, { call: "agent_watch_tokens", on: true });
+  const inner = listener(list, cb);
+  let live = true;
+  return {
+    dispose() {
+      if (!live) return;
+      live = false;
+      inner.dispose();
+      if (count() === 0) notify(plugin, { call: "agent_watch_tokens", on: false });
+    },
+  };
+}
+
 function listener<T>(list: Array<(e: T) => void>, cb: (e: T) => void): Disposable {
   list.push(cb as (e: never) => void as (e: T) => void);
   return {
@@ -3071,10 +3095,12 @@ function build(
       onActivity: (cb) => listener(r.activityListeners, cb),
       onTurnStart: (cb) =>
         listener(r.agentListeners.turnStart as Array<(e: { session: string; turn: string }) => void>, cb),
+      // The host sends per-token events only to a plugin that has asked, so the first listener of
+      // either kind asks and the last one to leave lets go.
       onToken: (cb) =>
-        listener(r.agentListeners.token as Array<(e: { session: string; turn: string; text: string }) => void>, cb),
+        watchTokens(plugin, r, r.agentListeners.token as Array<(e: { session: string; turn: string; text: string }) => void>, cb),
       onThinking: (cb) =>
-        listener(r.agentListeners.thinking as Array<(e: { session: string; turn: string; text: string }) => void>, cb),
+        watchTokens(plugin, r, r.agentListeners.thinking as Array<(e: { session: string; turn: string; text: string }) => void>, cb),
       onTurnEnd: (cb) =>
         listener(
           r.agentListeners.turnEnd as Array<
