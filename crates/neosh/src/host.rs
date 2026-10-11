@@ -964,10 +964,12 @@ pub struct Host {
     live: Option<std::sync::Arc<crate::daemon::Live>>,
     /// When that report was last made, so a streaming turn does not remake it per frame.
     live_at: Option<std::time::Instant>,
-    /// How many turns were running when it was made. A change here skips the rate limit: whether
-    /// something is running is the one thing a status query is actually about, and answering it a
-    /// second late is answering the wrong question.
-    live_turns: usize,
+    /// Which turns were running when it was made, and what each was called. A change here skips
+    /// the rate limit: what is running is the one thing a status query is actually about, and
+    /// answering it a second late is answering the wrong question. The label is part of it because
+    /// a key is drawn the moment it is handled — before the conversation it started has the words
+    /// that name it — so a report keyed on the count alone said `New conversation` for a second.
+    live_said: Vec<(neosh_proto::SessionId, String)>,
     /// Driver kinds each plugin registered, so unloading takes them with it.
     plugin_drivers: std::collections::HashMap<PluginId, Vec<neosh_proto::DriverKind>>,
     /// What each loaded plugin declared in its manifest.
@@ -1759,7 +1761,7 @@ impl Host {
             pending_term: None,
             live: None,
             live_at: None,
-            live_turns: 0,
+            live_said: Vec::new(),
             plugin_drivers: Default::default(),
             plugin_permissions: Default::default(),
             plugin_provides: Default::default(),
@@ -8754,12 +8756,22 @@ impl Host {
         if self.live.is_none() {
             return;
         }
+        let said = {
+            let store = self.agent.sessions();
+            let mut said: Vec<_> = self
+                .rounds
+                .keys()
+                .filter_map(|id| Some((id.clone(), store.get(id)?.label())))
+                .collect();
+            said.sort();
+            said
+        };
         let fresh = self.live_at.is_some_and(|at| at.elapsed() < Duration::from_secs(1));
-        if fresh && self.rounds.len() == self.live_turns {
+        if fresh && said == self.live_said {
             return;
         }
         self.live_at = Some(std::time::Instant::now());
-        self.live_turns = self.rounds.len();
+        self.live_said = said;
         self.report_live_now();
     }
 
@@ -9991,11 +10003,14 @@ impl Host {
         self.set_shape(shape);
     }
 
+    /// The strip is redrawn here because it names the shape, and nothing else is going to: the
+    /// shape is the host's own fact, and no event a plugin answers follows from it.
     fn set_shape(&mut self, shape: SelectShape) {
         self.vm().reading_shape = shape;
         let _ = self
             .editor
             .apply(&PluginId::from(BUILTIN), ApiCall::WinSelectShape { win: self.v().chat_win, shape });
+        self.refresh_status();
     }
 
     /// Give up the selection, keeping it for `gv`.
@@ -10013,6 +10028,7 @@ impl Host {
             .editor
             .apply(&PluginId::from(BUILTIN), ApiCall::WinSelect { win: self.v().chat_win, on: false });
         self.refresh_composer();
+        self.refresh_status();
     }
 
     /// `gv`: the selection you last gave up, back where it was.
