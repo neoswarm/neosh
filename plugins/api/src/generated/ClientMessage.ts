@@ -3,6 +3,7 @@ import type { ApiCall } from "./ApiCall";
 import type { BuildId } from "./BuildId";
 import type { KeyPress } from "./KeyPress";
 import type { SessionId } from "./SessionId";
+import type { ViewDevice } from "./ViewDevice";
 import type { WindowId } from "./WindowId";
 
 /**
@@ -38,6 +39,10 @@ export type ClientMessage =
      * Open in this conversation. See [`InputEvent::Attached::session`].
      */
     session?: SessionId | null;
+    /**
+     * For this computer. See [`InputEvent::Attached::device`].
+     */
+    device?: ViewDevice | null;
   }
   | { "kind": "input" }
     & (
@@ -60,6 +65,11 @@ export type ClientMessage =
          * arrival gets the ordinary placement rather than an error nobody can act on.
          */
         session?: SessionId | null;
+        /**
+         * Which computer this terminal is for — `neosh connect <name>`. See
+         * [`crate::ViewDevice`]; `None` leaves it to the `swarm.device` setting.
+         */
+        device?: ViewDevice | null;
       }
       | { "type": "detached" }
       | { "type": "key"; key: KeyPress }

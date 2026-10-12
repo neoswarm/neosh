@@ -19,6 +19,8 @@ mod client;
 mod clients;
 mod control;
 mod daemon;
+mod devices;
+mod models;
 mod cards;
 mod clock;
 mod diff;
@@ -65,18 +67,6 @@ enum UiProtocol {
 struct Cli {
     #[command(subcommand)]
     command: Option<Cmd>,
-
-    /// Say this in a new conversation here, and open a terminal on it.
-    ///
-    /// The shortest way in: `neosh "why is the composer eating my paste"` starts a conversation in
-    /// this directory, sends that, and draws the answer arriving. It is the terminal — bare
-    /// `neosh` with a sentence in front of it — and not a headless run; that is `neosh agent
-    /// start`, which prints an id instead of taking the screen.
-    ///
-    /// Everything after the flags, joined with spaces, so quoting is optional for anything a shell
-    /// would not eat.
-    #[arg(trailing_var_arg = true)]
-    prompt: Vec<String>,
 
     #[arg(long, value_enum, default_value_t = UiProtocol::Terminal)]
     ui_protocol: UiProtocol,
@@ -131,6 +121,31 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Cmd {
+    /// Ask something in a new conversation here, and open a terminal on it.
+    ///
+    /// `neosh prompt why is the composer eating my paste` starts a conversation in this directory,
+    /// sends that, and draws the answer arriving. It is the terminal with the first question
+    /// already asked, not a headless run — that is `neosh agent start`, which prints an id instead
+    /// of taking the screen.
+    ///
+    /// A word of its own rather than whatever follows `neosh`, because that was a trap: a typo'd
+    /// subcommand, or a word somebody meant for a shell, became a question sent to a model.
+    ///
+    /// Everything after the flags, joined with spaces, so quoting is optional for anything a shell
+    /// would not eat.
+    #[command(visible_alias = "p")]
+    Prompt(PromptArgs),
+    /// Open a terminal on one computer: this one, another one you have paired, or all of them.
+    ///
+    /// `neosh connect lb` — by its code, its name, the start of its name, or its id — opens a
+    /// terminal whose project panel, landing conversation and `^N` are about that machine, and
+    /// waits for the link first, so a computer that cannot be reached is a sentence here rather
+    /// than an empty window. `all` is every computer at once, `here` is this one, and no name at all
+    /// asks, whatever `swarm.device` says. `neosh ls` lists what there is.
+    Connect(ConnectArgs),
+    /// List the computers this workspace can reach, and which one `neosh` opens on.
+    #[command(visible_alias = "devices")]
+    Ls(LsArgs),
     /// Say what the workspace is holding: how long it has been up, and what is running in it.
     Status,
     /// Stop the workspace, and everything running in it.
@@ -204,6 +219,26 @@ enum PluginCmd {
 }
 
 #[derive(Args, Debug)]
+struct PromptArgs {
+    /// What to ask.
+    #[arg(trailing_var_arg = true, required = true, value_name = "WORDS")]
+    words: Vec<String>,
+}
+
+#[derive(Args, Debug)]
+struct ConnectArgs {
+    /// A computer's code (`lb`), name, the start of its name, or id — or `all`, or `here`. Omit to
+    /// be asked.
+    device: Option<String>,
+}
+
+#[derive(Args, Debug)]
+struct LsArgs {
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Args, Debug)]
 struct InitArgs {
     /// Scaffold `.neosh/` in the current directory instead of your config directory.
     #[arg(long)]
@@ -239,7 +274,10 @@ macro_rules! say {
 }
 
 fn main() -> anyhow::Result<()> {
-    let cli = Cli::parse();
+    let cli = match Cli::try_parse() {
+        Ok(cli) => cli,
+        Err(e) => not_a_command(e),
+    };
 
     // Logs go to a file, never to a screen. stdout is the UI protocol, so a stray line there
     // corrupts the stream a frontend is parsing — and **stderr is the terminal the UI is drawn on**,
@@ -262,6 +300,39 @@ fn main() -> anyhow::Result<()> {
     // teardown, restoring the terminal — has already happened by the time `run` returns.
     runtime.shutdown_background();
     result
+}
+
+/// Say why the command line did not parse — and, when the first word was not a command, how to ask
+/// it instead.
+///
+/// `neosh why is this slow` used to *be* the question. It is `neosh prompt why is this slow` now,
+/// because the old shape turned every mistyped subcommand into a message to a model; and the
+/// people who reach for the old shape are exactly the people this sentence is for, so the refusal
+/// carries the line they meant.
+fn not_a_command(e: clap::Error) -> ! {
+    use clap::error::{ContextKind, ContextValue, ErrorKind};
+    let word = match (e.kind(), e.get(ContextKind::InvalidSubcommand)) {
+        (ErrorKind::InvalidSubcommand, Some(ContextValue::String(w))) => Some(w.clone()),
+        _ => None,
+    };
+    let Some(word) = word else { e.exit() };
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let rest = match args.iter().position(|a| *a == word) {
+        Some(at) => args[at..].to_vec(),
+        None => vec![word.clone()],
+    };
+    // One word that clap already recognised as a typo — `neosh stauts` — is a command somebody
+    // misspelt, and offering to send it to a model would be the very trap this is about.
+    let typo = e.get(ContextKind::SuggestedSubcommand).is_some();
+    if rest.len() == 1 && typo {
+        e.exit();
+    }
+    let words = rest.join(" ");
+    let _ = e.print();
+    let quoted = if words.contains('"') { format!("'{words}'") } else { format!("\"{words}\"") };
+    eprintln!();
+    eprintln!("To ask it:  neosh prompt {quoted}");
+    std::process::exit(2);
 }
 
 /// Where logs go when nobody said, and `None` when stderr is safe to use.
@@ -328,6 +399,17 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
     let cwd = cli.cwd.clone().unwrap_or(std::env::current_dir()?);
     let cwd = std::fs::canonicalize(&cwd).unwrap_or(cwd);
 
+    // The two subcommands that are the terminal with something said first, rather than a verb
+    // that prints and exits: they fall through to the attach below.
+    let opening = match &cli.command {
+        Some(Cmd::Prompt(p)) => match sentence(&p.words) {
+            Some(text) => Opening::Prompt(text),
+            None => anyhow::bail!("say what to ask: neosh prompt \"why is this slow\""),
+        },
+        Some(Cmd::Connect(c)) => Opening::Connect(c.device.clone()),
+        _ => Opening::Plain,
+    };
+
     match &cli.command {
         Some(Cmd::Agent(cmd)) => {
             let outcome = agentcli::run(&paths, &cwd, &cli.config_dir, cmd).await?;
@@ -347,7 +429,17 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
         Some(Cmd::SwarmId) => return run_swarm_id(&paths),
         Some(Cmd::Status) => return run_status(&paths).await,
         Some(Cmd::Stop) => return run_stop(&paths).await,
-        None => {}
+        Some(Cmd::Ls(a)) => {
+            let args = client::workspace_args(
+                &cli.config_dir,
+                &cwd,
+                &cli.model,
+                &cli.plugin_dirs,
+                &cli.mock_script,
+            );
+            return devices::run_ls(&paths.socket(), &args, a.json).await;
+        }
+        Some(Cmd::Prompt(_)) | Some(Cmd::Connect(_)) | None => {}
     }
 
     // The ordinary case: be a terminal looking at a workspace, starting one if there is not one
@@ -360,7 +452,15 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
         && cli.mock_script.is_none()
         && !cli.list_models
     {
-        return run_client(&cli, &paths, &cwd).await;
+        return run_client(&cli, &paths, &cwd, opening).await;
+    }
+    // Which computer a terminal is for is a fact about a terminal attaching to a workspace, and a
+    // process that is its own workspace has no other computer's terminal to be.
+    if let Opening::Connect(_) = opening {
+        anyhow::bail!(
+            "`neosh connect` opens a terminal on the running workspace, and this one is in-process \
+             — drop --no-daemon, --clean, --mock-script or --ui-protocol"
+        );
     }
 
     // Keep the config directory's API types in step with this binary, so `tsc` in someone's
@@ -403,6 +503,10 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
     match &cli.mock_script {
         Some(path) => install_mock_provider(&agent, path)?,
         None => {
+            // Before the providers are built, which read the catalogue as they are made.
+            if !paths.clean {
+                models::load_cached(&paths.cache);
+            }
             agent_drivers = host::install_builtin_providers(&agent);
             for i in resolved.providers.clone() {
                 agent.providers_mut().add_instance(i);
@@ -455,6 +559,10 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
         host.serve(d.live(), control);
     }
     host.adopt_agent_drivers(agent_drivers);
+    // A mock has no catalogue worth keeping current, and a test that asked GitHub is a flaky test.
+    if cli.mock_script.is_none() {
+        host.watch_models((!paths.clean).then(|| paths.cache.clone()));
+    }
     host.discover_repo(&cwd).await;
     // `--clean` reads and writes nothing, which has to include conversations.
     host.restore_sessions((!paths.clean).then(|| paths.state.clone())).await;
@@ -476,7 +584,10 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
         // Only ever reached by a process that is its own workspace: `--no-daemon`, the stdio
         // protocol, a test. Everything else went through `run_client` above, which starts a
         // conversation of its own rather than talking into whichever one this process began with.
-        first_prompt: sentence(&cli.prompt),
+        first_prompt: match &opening {
+            Opening::Prompt(text) => Some(text.clone()),
+            _ => None,
+        },
     });
 
     // Accepting terminals runs alongside the host, not instead of it: clients come and go while
@@ -583,12 +694,27 @@ fn with_signals(
     rx
 }
 
+/// What a terminal says first, as it attaches.
+enum Opening {
+    /// Nothing: `neosh`.
+    Plain,
+    /// `neosh prompt …` — a new conversation here, already asked.
+    Prompt(String),
+    /// `neosh connect [name]` — a terminal on one computer, or the question when there is no name.
+    Connect(Option<String>),
+}
+
 /// Be a terminal looking at a workspace, starting one if there is not one already.
 ///
 /// The whole of the client is here and in [`crate::client`]: connect, draw, send keys. It builds no
 /// config, loads no plugins and holds no conversation — which is why a second terminal costs a
 /// socket rather than a second copy of everything.
-async fn run_client(cli: &Cli, paths: &Paths, cwd: &std::path::Path) -> anyhow::Result<()> {
+async fn run_client(
+    cli: &Cli,
+    paths: &Paths,
+    cwd: &std::path::Path,
+    opening: Opening,
+) -> anyhow::Result<()> {
     let socket = paths.socket();
     let args = client::workspace_args(
         &cli.config_dir,
@@ -598,7 +724,16 @@ async fn run_client(cli: &Cli, paths: &Paths, cwd: &std::path::Path) -> anyhow::
         &cli.mock_script,
     );
 
-    // `neosh "a prompt"`. Done over the control socket, before the screen is taken, so that a
+    // `neosh connect <name>`, settled the same way and for the same reason: a name that matches
+    // nothing, or a machine that will not answer, is a sentence here rather than an empty window.
+    let mut device = match &opening {
+        Opening::Connect(query) => {
+            Some(devices::connect(&socket, &args, query.as_deref()).await?)
+        }
+        _ => None,
+    };
+
+    // `neosh prompt …`. Done over the control socket, before the screen is taken, so that a
     // failure — an unreadable directory, a workspace that is too old — is a sentence in the
     // terminal you typed in rather than an error drawn on the alternate screen and then wiped by
     // the restore on the way out.
@@ -608,10 +743,23 @@ async fn run_client(cli: &Cli, paths: &Paths, cwd: &std::path::Path) -> anyhow::
     // which is somebody else's screen; and simply trusting "the newest conversation is where an
     // arriving terminal lands" is wrong in the one case that matters, a workspace that has been
     // sitting detached and is keeping a screen for whoever comes back. See `Host::open_view`.
-    let opening = match sentence(&cli.prompt) {
-        None => None,
-        Some(text) => {
+    let into = match opening {
+        Opening::Plain | Opening::Connect(_) => None,
+        Opening::Prompt(text) => {
             let mut control = control::Control::connect(&socket, &args).await?;
+            // A question asked here is about this computer, and a picker asking which one over
+            // the answer arriving would be asking something already answered — unless the
+            // setting says every terminal shows every computer, which is still true of this one.
+            let everything = matches!(
+                control.call(neosh_proto::ApiCall::OptGet { name: devices::OPTION.into() }).await,
+                Ok(neosh_proto::ApiOk::Option { entry: Some(neosh_proto::OptionEntry {
+                    value: neosh_proto::OptionValue::Str(ref v), ..
+                }) }) if v.trim().eq_ignore_ascii_case("all")
+            );
+            device = Some(match everything {
+                true => neosh_proto::ViewDevice::All,
+                false => neosh_proto::ViewDevice::Here,
+            });
             let info = match control
                 .call(neosh_proto::ApiCall::SessionNew {
                     cwd: Some(cwd.display().to_string()),
@@ -634,7 +782,14 @@ async fn run_client(cli: &Cli, paths: &Paths, cwd: &std::path::Path) -> anyhow::
     };
 
     let stream = client::connect_or_start(&socket, &args).await?;
-    match client::attach(stream, opening).await? {
+    // Kept for the restart below: a terminal that was for one computer comes back for it.
+    let again_on = match &device {
+        Some(neosh_proto::ViewDevice::Node { node }) => Some(node.0.clone()),
+        Some(neosh_proto::ViewDevice::All) => Some("all".to_string()),
+        Some(neosh_proto::ViewDevice::Here) => Some("here".to_string()),
+        _ => None,
+    };
+    match client::attach(stream, into, device).await? {
         // Nothing to say. The terminal is back and the work carries on without it, which is what
         // was asked for — announcing it every time would be a program congratulating itself.
         client::Ended::Detached(neosh_proto::DetachReason::Asked) => {}
@@ -649,13 +804,16 @@ async fn run_client(cli: &Cli, paths: &Paths, cwd: &std::path::Path) -> anyhow::
         // a shell prompt with a job half done and nothing saying what the other half is.
         client::Ended::Restarting => {
             client::wait_gone(&socket).await;
-            let again = client::terminal_args(
+            let mut again = client::terminal_args(
                 &cli.config_dir,
                 cwd,
                 &cli.model,
                 &cli.plugin_dirs,
                 &cli.mock_script,
             );
+            if let Some(on) = again_on {
+                again.extend(["connect".to_string(), on]);
+            }
             // Only ever reached when `exec` failed, which is a `neosh` that has moved out from
             // under us. The update itself is done and the sentence has to say so, or the fix looks
             // bigger than typing one word.

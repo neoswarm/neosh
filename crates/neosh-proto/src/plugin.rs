@@ -148,6 +148,15 @@ pub enum PluginEvent {
     /// keeping about that panel, or it holds a window id that names nothing for as long as the
     /// workspace runs.
     ViewClosed { view: ViewId },
+    /// A terminal was pointed at a different computer — see [`crate::ViewDevice`].
+    ///
+    /// Not sent for the answer a terminal arrives with: that is on [`crate::ViewInfo::device`] by
+    /// the time [`Self::ViewAttached`] is, which is when a plugin reads it.
+    ViewDevice {
+        view: ViewId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        device: Option<crate::ViewDevice>,
+    },
     /// A buffer the plugin attached to changed. Mirrors the splice the core performed.
     BufferChanged {
         buf: BufferId,

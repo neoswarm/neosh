@@ -279,6 +279,41 @@ pub struct ViewInfo {
     /// turn it is to be drawn into.
     #[serde(default)]
     pub current: bool,
+    /// Which computer this terminal is for. See [`ViewDevice`].
+    ///
+    /// `None` is *nobody has said*: the terminal attached without naming one, and the
+    /// `swarm.device` setting is what decides — which is a plugin's job, not the host's, because
+    /// asking is a picker and a picker is something a plugin draws.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device: Option<ViewDevice>,
+}
+
+/// Which computer a terminal is looking at.
+///
+/// A swarm is several machines in one workspace, and most of the time a window is *for* one of
+/// them: a terminal on the laptop with the build box in it, another beside it with the laptop's own
+/// work. The workspace shows everything to everyone, which is right for a list and wrong for a
+/// window you opened to work on one computer — its sidebar, where it lands and where `^N` starts
+/// were all about every machine at once. So a view carries the answer, it is set by
+/// `neosh connect <name>` or by the question a plugin asks when a terminal arrives, and everything
+/// that draws or starts conversations reads it.
+///
+/// Per **view**, because that is what a window is: two terminals on one workspace are two answers.
+/// It narrows what is *shown* and where things *start*, and never what exists — a turn on a machine
+/// this window is not for keeps running, and `All` is one `/device` away.
+#[derive(TS, Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+#[ts(export)]
+pub enum ViewDevice {
+    /// Every computer, as the workspace always drew it.
+    All,
+    /// This computer, and nothing paired with it.
+    Here,
+    /// One other computer, by its id.
+    Node { node: NodeId },
+    /// Not decided, and to be *asked* whatever `swarm.device` says — what `neosh connect` with no
+    /// name means. Drawn as `All` until somebody answers.
+    Ask,
 }
 
 #[derive(TS, Serialize, Deserialize, Clone, PartialEq, Debug)]
@@ -1041,6 +1076,17 @@ pub enum ApiCall {
     /// A plugin that owns a dock needs this: it opens one panel per view, and a plugin loaded
     /// after the terminals were is a plugin that missed their arrival.
     ViewList,
+    /// Say which computer a terminal is for. See [`ViewDevice`].
+    ///
+    /// Announced as [`crate::PluginEvent::ViewDevice`], so a panel drawn per terminal redraws for
+    /// the one that changed. `None` puts it back to *nobody has said*.
+    ViewSetDevice {
+        /// Defaults to the terminal being served.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        view: Option<ViewId>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        device: Option<ViewDevice>,
+    },
     /// Close a conversation. Closing the active one moves to the most recently used other; closing
     /// the last one is an error, because there is always somewhere for the next thing you type.
     SessionClose {

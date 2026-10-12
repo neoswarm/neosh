@@ -159,7 +159,7 @@ impl OpenAiCompatProvider {
     /// `supported_parameters` on every row, and that list is the only place in this entire family of
     /// endpoints where "does this model take a reasoning effort" is a question with a real answer.
     ///
-    /// So this is discovery where discovery exists, and [`catalog::seed_models`] is the written-down
+    /// So this is discovery where discovery exists, and `models.json` is the written-down
     /// answer for the endpoints that will not say. Four hundred OpenRouter models arrive with the
     /// right ladder each and no catalogue entry between them.
     ///

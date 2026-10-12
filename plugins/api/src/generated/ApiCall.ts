@@ -45,6 +45,7 @@ import type { ToolDef } from "./ToolDef";
 import type { UsageResolution } from "./UsageResolution";
 import type { UserQuestion } from "./UserQuestion";
 import type { VarScope } from "./VarScope";
+import type { ViewDevice } from "./ViewDevice";
 import type { ViewId } from "./ViewId";
 import type { WindowId } from "./WindowId";
 import type { WindowLayout } from "./WindowLayout";
@@ -335,6 +336,14 @@ export type ApiCall =
     view?: ViewId | null;
   }
   | { "call": "view_list" }
+  | {
+    "call": "view_set_device";
+    /**
+     * Defaults to the terminal being served.
+     */
+    view?: ViewId | null;
+    device?: ViewDevice | null;
+  }
   | { "call": "session_close"; session: SessionId }
   | { "call": "session_rename"; session: SessionId; title?: string | null }
   | { "call": "session_archive"; session: SessionId; archived: boolean }

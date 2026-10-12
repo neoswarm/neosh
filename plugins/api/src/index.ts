@@ -139,6 +139,7 @@ import type { SwarmNode } from "./generated/SwarmNode";
 import type { SwarmStranger } from "./generated/SwarmStranger";
 import type { VarScope } from "./generated/VarScope";
 import type { ViewId } from "./generated/ViewId";
+import type { ViewDevice } from "./generated/ViewDevice";
 import type { ViewInfo } from "./generated/ViewInfo";
 import type { Viewport } from "./generated/Viewport";
 import type { WindowId } from "./generated/WindowId";
@@ -168,7 +169,7 @@ export type {
   SurfaceCell, SurfaceId, TextEdit, ToolCall, ToolDef, ToolResult, TurnRequest, Usage, ImageFile,
   NodeCapabilities, NodeId, NodeInfo, ProjectKey, RemoteProject, StreamEvent, LiveSaid, LiveTurn, ImageData,
   LinkState, SwarmAgent, SwarmNode, SwarmStranger,
-  VarScope, ViewId, ViewInfo, Viewport,
+  VarScope, ViewDevice, ViewId, ViewInfo, Viewport,
   WindowId, WindowInfo, WindowLayout,
   ChecksState,
   PullRequest,
@@ -1388,6 +1389,19 @@ export const CLONE_EVENT = "neosh.git.clone";
  */
 export const UPDATE_EVENT = "neosh.update.progress";
 
+/**
+ * A newer model catalogue is in use — fetched from neosh's repository between releases, so a model
+ * a vendor shipped today is listable today. Anything showing a list of models redraws on it. The
+ * payload is {@link ModelsChanged}.
+ */
+export const MODELS_EVENT = "neosh.models.changed";
+
+/** One {@link MODELS_EVENT} payload: the model ids it added and dropped, as `instance/model`. */
+export interface ModelsChanged {
+  added: string[];
+  removed: string[];
+}
+
 /** One {@link CLONE_EVENT} payload. */
 export interface CloneProgress {
   /** Which clone this is about. The key, since two may be running. */
@@ -1489,6 +1503,20 @@ export interface ViewApi {
   onOpen(cb: (view: ViewId) => void): Disposable;
   /** A terminal went away. Its windows are already closed; let go of what you were keeping. */
   onClose(cb: (view: ViewId) => void): Disposable;
+  /**
+   * Which computer a terminal is for — `neosh connect <name>`, or the answer to the question asked
+   * when it arrived. `null` is *nobody has said*, which draws as every computer.
+   *
+   * The terminal being served when `view` is omitted.
+   */
+  device(view?: ViewId): Promise<ViewDevice | null>;
+  /**
+   * Point a terminal at a computer. Announced to every plugin through `onDevice`, so a panel drawn
+   * per terminal redraws for the one that changed.
+   */
+  setDevice(device: ViewDevice | null, view?: ViewId): Promise<void>;
+  /** A terminal was pointed at a different computer. Not fired for the one it arrived with. */
+  onDevice(cb: (e: { view: ViewId; device: ViewDevice | null }) => void): Disposable;
 }
 
 export interface SessionApi {
@@ -2205,6 +2233,7 @@ interface Registered {
   sessionListeners: Array<(e: { session: SessionId; view: ViewId }) => void>;
   viewOpenListeners: Array<(view: ViewId) => void>;
   viewCloseListeners: Array<(view: ViewId) => void>;
+  viewDeviceListeners: Array<(e: { view: ViewId; device: ViewDevice | null }) => void>;
   selectionListeners: Array<(e: { selection: ModelSelection }) => void>;
   composerListeners: Array<(e: { text: string }) => void>;
   activityListeners: Array<(e: { session: SessionId; turn: string; activity: Activity }) => void>;
@@ -2252,6 +2281,7 @@ function reg(plugin: string): Registered {
       sessionListeners: [],
       viewOpenListeners: [],
       viewCloseListeners: [],
+      viewDeviceListeners: [],
       selectionListeners: [],
       composerListeners: [],
       activityListeners: [],
@@ -3316,6 +3346,20 @@ function build(
         return d;
       },
       onClose: (cb) => listener(r.viewCloseListeners, cb),
+      async device(of) {
+        const views = expect(await c({ call: "view_list" }), "views").views;
+        // The terminal asked about, or — with none named — the one this namespace is bound to,
+        // and failing that the one being served.
+        const want = of ?? view;
+        const info = want !== null
+          ? views.find((v) => v.view === want)
+          : views.find((v) => v.current);
+        return info?.device ?? null;
+      },
+      async setDevice(device, of) {
+        await c({ call: "view_set_device", view: of ?? view ?? null, device });
+      },
+      onDevice: (cb) => listener(r.viewDeviceListeners, cb),
     },
     session: {
       async list(opts) {
@@ -3584,6 +3628,9 @@ async function dispatchEvent(
         break;
       case "view_closed":
         for (const cb of r.viewCloseListeners) cb(ev.view);
+        break;
+      case "view_device":
+        for (const cb of r.viewDeviceListeners) cb({ view: ev.view, device: ev.device ?? null });
         break;
       case "selection_changed":
         for (const cb of r.selectionListeners) cb({ selection: ev.selection });

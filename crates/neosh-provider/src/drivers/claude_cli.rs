@@ -104,32 +104,23 @@ pub fn control_mode(mode: PermissionMode) -> &'static str {
     }
 }
 
-/// The oldest `claude` that will accept a given model.
+/// The oldest `claude` that will accept a given model: `min_version` on its row in `models.json`.
 ///
 /// A CLI that has not heard of a model does not degrade — it exits with "unknown model" after you
 /// have typed your question. So the model is marked rather than the failure explained afterwards,
-/// and anything not listed here has been around long enough that no installed version lacks it.
+/// and a row with no floor has been around long enough that no installed version lacks it.
 ///
 /// Sourced from the release each model shipped in — and where the CLI itself will say, from the CLI:
 /// the 400 it answers with reads *"Claude Code 2.1.222 does not support this model; version 2.1.251
 /// or newer is required"*, which is the number, the fix and the sentence to put on the row, all
-/// from the one place that cannot be wrong about it.
+/// from the one place that cannot be wrong about it. In the manifest rather than here so a model
+/// can be announced the day it ships, with the update that unlocks it on its row.
 ///
 /// Wrong in the safe direction if it drifts: a too-high floor tells somebody to update a CLI that
-/// would have run the model, a too-low one is a failed turn. `claude-fable-5-1` was written down as
-/// 2.1.255 and is 2.1.251 — four releases in which the picker's answer was "update" and the CLI's
-/// was "yes".
-const MIN_VERSION: &[(&str, (u32, u32, u32))] = &[
-    ("claude-opus-5", (2, 1, 219)),
-    ("claude-fable-5-1", (2, 1, 251)),
-    ("claude-fable-5", (2, 1, 170)),
-    // 197, not 219. Read off the vendor's own table rather than assumed equal to Opus 5's, which
-    // is what it was — and a floor twenty-two releases too high is a model missing from the picker
-    // on every CLI in that range, with nothing on screen to say it was ever there.
-    ("claude-sonnet-5", (2, 1, 197)),
-    ("claude-opus-4-8", (2, 1, 154)),
-    ("claude-opus-4-7", (2, 1, 111)),
-];
+/// would have run the model, a too-low one is a failed turn.
+fn min_version(model: &str) -> Option<(u32, u32, u32)> {
+    crate::manifest::min_version("claude-cli", model)
+}
 
 /// The parts of a turn the CLI will only hear on its command line.
 ///
@@ -518,7 +509,7 @@ fn parse_version(out: &str) -> Option<(u32, u32, u32)> {
 /// cut off mid-number, which is worse than not having said it. The version installed is not in
 /// here for the same reason and loses nothing: you are reading this *because* yours is older.
 fn too_old_for(model: &str, installed: Option<(u32, u32, u32)>) -> Option<String> {
-    let need = MIN_VERSION.iter().find(|(id, _)| *id == model).map(|(_, v)| *v)?;
+    let need = min_version(model)?;
     let have = installed?;
     (have < need).then(|| {
         let (a, b, c) = need;

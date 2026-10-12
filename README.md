@@ -63,8 +63,12 @@ the [installation guide](https://neoswarm.dev/docs/installation).
 Start a conversation with the question already in it:
 
 ```bash
-neosh "why is the composer eating my paste"
+neosh prompt why is the composer eating my paste
 ```
+
+With other computers paired, `neosh ls` lists them and `neosh connect <name>` opens a terminal on
+one — its projects, its conversations, `^N` starting there. Plain `neosh` asks which, unless
+`swarm.device` already says.
 
 ## From a script, or from another agent
 

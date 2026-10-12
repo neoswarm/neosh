@@ -194,6 +194,10 @@ What it moves:
   version, the ten internal pins in `[workspace.dependencies]` (both halves — see below),
   `npm/neosh/package.json` and the four `@neosh/cli-*` versions it pins, and `Cargo.lock` through
   `cargo update -w`.
+- **The model snapshot**, `crates/neosh-provider/t3code-models.json`, refreshed from t3code's
+  `main` by `scripts/sync-models.sh` and checked by the parser that reads it, so a release starts
+  with the model list as of the day it was cut. Offline, it says so and the old snapshot ships —
+  every running copy fetches the news itself anyway.
 - **Each npm package, only if its directory changed** since the last `v*` tag — committed,
   uncommitted, or a file git has not seen yet — by a patch (or `--packages minor`; the level you
   asked for when you asked for a level). The rest keep their number and `publish-npm.yml` skips

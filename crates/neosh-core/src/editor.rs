@@ -1020,6 +1020,7 @@ impl Editor {
                 | ApiCall::GenComplete { .. }
                 | ApiCall::SessionList { .. }
                 | ApiCall::ViewList
+                | ApiCall::ViewSetDevice { .. }
                 | ApiCall::SessionCurrent
                 | ApiCall::SessionNew { .. }
                 | ApiCall::SessionSwitch { .. }
@@ -2986,6 +2987,7 @@ fn call_name(call: &ApiCall) -> &'static str {
         ApiCall::StatusClear { .. } => "status.clear",
         ApiCall::SessionList { .. } => "session.list",
         ApiCall::ViewList => "view.list",
+        ApiCall::ViewSetDevice { .. } => "view.setDevice",
         ApiCall::SessionCurrent => "session.current",
         ApiCall::SessionNew { .. } => "session.new",
         ApiCall::SessionSwitch { .. } => "session.switch",

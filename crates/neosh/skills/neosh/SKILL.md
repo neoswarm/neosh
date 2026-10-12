@@ -21,6 +21,9 @@ neosh status            # is a workspace running, and what is in it
 neosh agent ls          # every conversation, with its state
 ```
 
+`neosh ls` (no `agent`) lists the *computers* a workspace can reach, not conversations, and
+`neosh connect` opens an interactive terminal — neither is for scripting conversations.
+
 `neosh status` exiting with "no workspace running" is normal — the first `neosh agent start`
 starts one. Verbs that only *ask* (`ls`, `read`, `watch`, `wait`, `models`, `commands`) will not
 start a workspace; they say there is none and exit 1.

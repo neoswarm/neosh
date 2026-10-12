@@ -17,6 +17,7 @@ import type { ToolResult } from "./ToolResult";
 import type { TurnId } from "./TurnId";
 import type { Usage } from "./Usage";
 import type { VarScope } from "./VarScope";
+import type { ViewDevice } from "./ViewDevice";
 import type { ViewId } from "./ViewId";
 import type { WindowId } from "./WindowId";
 
@@ -29,6 +30,7 @@ export type PluginEvent =
   }
   | { "type": "view_attached"; view: ViewId }
   | { "type": "view_closed"; view: ViewId }
+  | { "type": "view_device"; view: ViewId; device?: ViewDevice | null }
   | {
     "type": "buffer_changed";
     buf: BufferId;

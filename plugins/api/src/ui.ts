@@ -2656,6 +2656,11 @@ export interface RailPickerOptions<G, T> {
     key: KeyContext,
     ctx: { rail: G | undefined; item: T | undefined },
   ): Promise<"handled" | "reload" | "close" | undefined> | "handled" | "reload" | "close" | undefined;
+  /**
+   * Watch something outside the picker, and reload the pane when it moves — the same promise
+   * {@link PickerOptions.subscribe} makes, for a list that can change while you are reading it.
+   */
+  subscribe?(reload: () => void): Disposable;
 }
 
 const RAIL_NS = "neosh.ui.rail";
@@ -3099,6 +3104,18 @@ export async function railPicker<G, T>(
     const row = rows[cursor];
     return row?.kind === "item" ? row.item : undefined;
   };
+
+  if (opts.subscribe) {
+    disposers.push(
+      opts.subscribe(() => {
+        if (closed) return;
+        void (async () => {
+          await load();
+          if (!closed) await render();
+        })().catch(() => {});
+      }),
+    );
+  }
 
   disposers.push(
     await neosh.cmd.register(command, async (_args, key) => {

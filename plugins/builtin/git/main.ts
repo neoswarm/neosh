@@ -261,10 +261,18 @@ two-word scratch name it was created with.",
   // you do rather than a thing you ask.
   await neosh.cmd.register(
     "git.clone",
-    // `?? ""` rather than a non-null assertion: no URL at all is a real call somebody will make —
-    // `git.clone` from the palette with nothing typed after it — and it is answered with the usage
-    // line rather than a crash.
-    (args: string[]) => cloneRepository(neosh, arg(args, 0) ?? "", arg(args, 1)),
+    // No URL at all is a real call somebody will make — `git.clone` from the palette with nothing
+    // typed after it. A person at a key is asked for one; a script, which has nobody to answer a
+    // field, gets the usage line.
+    async (args: string[], key?: unknown) => {
+      let url = arg(args, 0) ?? "";
+      if (url.trim() === "" && key) {
+        url = (await prompt(neosh, "Clone a repository — URL or owner/repo")) ?? "";
+        if (url.trim() === "") return null;
+        url = expandShorthand(url.trim());
+      }
+      return await cloneRepository(neosh, url, arg(args, 1));
+    },
     {
       desc:
         "Clone a repository and open it — `git.clone <url> [destination]`. Asks where without one",
@@ -1732,6 +1740,18 @@ function readAddress(url: string): { owner: string; repo: string; host: string }
   if (host && parts[0] === host) parts.shift();
   const repo = parts.pop() ?? "repo";
   return { owner: parts.pop() ?? "", repo, host };
+}
+
+/**
+ * `owner/repo` as GitHub's address for it, and anything else as it was typed.
+ *
+ * The sidebar's field reads the same shorthand; this is the half for a field of git's own, so
+ * `^K git.clone` and `^O` take the same spellings.
+ */
+function expandShorthand(text: string): string {
+  return /^[\w.-]+\/[\w.-]+$/.test(text) && !text.startsWith(".")
+    ? `https://github.com/${text.replace(/\.git$/, "")}`
+    : text;
 }
 
 /**

@@ -26,6 +26,8 @@ Plugins declare their own options through the same call the built-ins use, and a
 | `agent.model` | `""` | `instance/model`. Empty picks the first that works |
 | `agent.system_prompt` | `""` | Replaces the built-in prompt when set |
 | `agent.append_prompt` | `""` | Said at the end of every message you send — *run the tests before you say you are done*. Added to the copy that is sent, never to the transcript, so what you typed is what stays on screen |
+| `models.update` | `true` | Ask t3code's model manifest what the vendor CLIs serve every six hours and on `^R` in the picker, so new models appear without a release. See [Models](/docs/models) |
+| `models.url` | t3code's `model-manifest.json` on `main` | Where that news is fetched from |
 | `gen.model` | `""` | Model for branch names, commit messages and titles. Empty uses the conversation's model. Separate on purpose: naming a branch does not need a frontier model |
 
 ## Chat

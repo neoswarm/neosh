@@ -1947,7 +1947,7 @@ async function registerCommands(w: Wiring): Promise<void> {
   w.subscriptions.push(
     await neosh.cmd.register(
       "session.new",
-      (args) => newConversation(neosh, arrangement, args[0]),
+      (args, key) => newConversation(neosh, arrangement, args[0], key?.view),
       { desc: "Start a new conversation — here, or in a worktree of its own" },
     ),
   );
@@ -1999,10 +1999,11 @@ async function registerCommands(w: Wiring): Promise<void> {
     }, { desc: "Bring an archived conversation back" }),
   );
   w.subscriptions.push(
-    await neosh.cmd.register("project.open", async (args) => {
+    await neosh.cmd.register("project.open", async (args, _key, here) => {
       // Without this, a second project only ever appears by way of a worktree — which makes the
-      // whole panel a thread list with extra steps.
-      const path = args[0] ?? (await chooseDirectory(neosh));
+      // whole panel a thread list with extra steps. Asked in the terminal the key was pressed in,
+      // because which computer a project is added on is that terminal's answer.
+      const path = args[0] ?? (await chooseDirectory(here ?? neosh));
       if (path === null || path.trim() === "") return;
       try {
         await neosh.session.create({ cwd: path.trim() });
@@ -2141,6 +2142,8 @@ async function registerCommands(w: Wiring): Promise<void> {
   // Any change over there is a redraw here. Without it the panel is right only as often as its
   // four-second refresh, which is a long time to watch a spinner that has already stopped.
   w.subscriptions.push(neosh.swarm.onChange(() => w.each((p) => p.draw())));
+  // A terminal pointed at another computer is a different panel in that terminal and no other.
+  w.subscriptions.push(neosh.view.onDevice(({ view }) => void w.panel(view)?.draw()));
 
   await neosh.hint.set("sessions", { keys: "^T", label: "conversations", priority: 20 });
   await neosh.hint.set("new", { keys: "^N", label: "new", priority: 21 });
@@ -2512,8 +2515,12 @@ async function newConversation(
   neosh: Neosh,
   arrangement: Arrangement,
   base?: string,
+  view?: ViewId,
 ): Promise<void> {
   const current = await neosh.session.current().catch(() => null);
+  // A terminal that is for one computer starts there: the question of which was answered when it
+  // was opened, and asking it again on every `^N` would be asking something already said.
+  const device = base ? null : await neosh.view.device(view).catch(() => null);
   // In another machine's conversation, *here* is a directory on that machine — so the question is
   // the one `^N` asks after choosing it, the path field pointed over there, and it starts on the
   // directory you are in: `^N ↵` is a new conversation beside this one, as it is on your own.
@@ -2531,6 +2538,20 @@ async function newConversation(
     if (chosen?.kind === "host") await startThere(neosh, chosen);
     return;
   }
+  if (device?.kind === "node") {
+    const there = (await neosh.swarm.nodes().catch(() => [] as SwarmNode[]))
+      .find((n) => n.info.id === device.node);
+    if (!there?.up) {
+      neosh.notify(`${there?.info.name ?? "That computer"} is not connected — c on its heading in ^T reconnects`, "warn");
+      return;
+    }
+    const chosen = await whereTo(neosh, [], {
+      title: `New conversation on ${there.info.name}`,
+      seed: `${hostPrefix(there)}:`,
+    });
+    if (chosen?.kind === "host") await startThere(neosh, chosen);
+    return;
+  }
   const here = base ?? current?.cwd;
   // Which computer, first — and only when there is one to ask about *and* it could answer. A
   // repository none of the connected machines has a checkout of has one possible answer, and
@@ -2543,9 +2564,11 @@ async function newConversation(
   // that window compared a guess against the real keys other machines advertise, matched nothing,
   // and silently skipped a question it should have asked. The var is still the fallback, because it
   // is the only answer for a project with nothing open in it.
-  const machine = await chooseMachine(neosh, "New conversation \u2014 where?", {
-    key: here ? await projectKey(neosh, arrangement, here) : null,
-  });
+  const machine = device?.kind === "here"
+    ? { kind: "here" as const }
+    : await chooseMachine(neosh, "New conversation \u2014 where?", {
+      key: here ? await projectKey(neosh, arrangement, here) : null,
+    });
   if (machine === null) return;
   if (machine.kind === "node") {
     // The path field, pointed at that machine: the same picker, seeded exactly as somebody typing
@@ -2732,6 +2755,8 @@ type Where =
   | { kind: "tree"; path: string; label: string }
   /** A repository to fetch first and open second. */
   | { kind: "clone"; url: GitUrl }
+  /** Clone something, and ask for its address. The row for somebody who has not pasted one yet. */
+  | { kind: "clone-ask" }
   /** On another computer, in one of its directories. */
   | { kind: "host"; node: string; cwd: string; label: string }
   /** Look at one machine's directories rather than every machine's projects. */
@@ -2751,6 +2776,36 @@ function elsewhereRow(label: string): PickerItem<Where> {
     hl: "Sidebar.Dim",
     value: { kind: "elsewhere" },
   };
+}
+
+/**
+ * The row that says a repository you do not have yet is a way a project arrives.
+ *
+ * The field already took an address — paste one and it offers to clone it — but a capability that
+ * only exists once you have guessed it does is one nobody finds. So it is also a row, and `↵` on it
+ * asks for the address.
+ */
+function cloneRow(ascii: boolean): PickerItem<Where> {
+  return {
+    label: "Clone a repository…",
+    detail: "a URL, git@host:owner/repo, or just owner/repo",
+    keywords: "clone git repository url github fetch download",
+    icon: ascii ? "v" : "⤓",
+    hl: "Sidebar.Dim",
+    value: { kind: "clone-ask" },
+  };
+}
+
+/** Ask for an address, and clone it. Says so when what was typed is not one. */
+async function askAndClone(neosh: Neosh): Promise<void> {
+  const typed = await prompt(neosh, "Clone a repository — URL or owner/repo");
+  if (typed === null || typed.trim() === "") return;
+  const url = readGitUrl(typed);
+  if (!url) {
+    neosh.notify(`${typed.trim()} is not a repository address — try https://…, git@… or owner/repo`, "warn");
+    return;
+  }
+  await neosh.cmd.call(CLONE_COMMAND, [url.url]).catch((e: unknown) => neosh.notify(String(e), "warn"));
 }
 
 /**
@@ -3216,7 +3271,10 @@ async function activateTarget(
   }
   if (target.kind === "add") {
     await p.leave();
-    await neosh.cmd.exec("project.open").catch(() => {});
+    const path = await chooseDirectory(p.here);
+    if (path !== null && path.trim() !== "") {
+      await p.here.session.create({ cwd: path.trim() }).catch((e: unknown) => neosh.notify(String(e), "warn"));
+    }
     return;
   }
   // A project that is only on other computers. There is nothing here to switch to, so `↵` does
@@ -3313,17 +3371,41 @@ function owningProject(target: Target | undefined): string | null {
  * project opens exactly as a typed one does.
  */
 async function chooseDirectory(neosh: Neosh): Promise<string | null> {
+  // A terminal for another computer adds projects *there*: the field opens already pointed at it,
+  // which is the state typing `<machine>:` would have reached.
+  const device = await neosh.view.device().catch(() => null);
+  if (device?.kind === "node") {
+    const there = (await neosh.swarm.nodes().catch(() => [] as SwarmNode[]))
+      .find((n) => n.info.id === device.node);
+    if (!there?.up) {
+      neosh.notify(`${there?.info.name ?? "That computer"} is not connected — c on its heading in ^T reconnects`, "warn");
+      return null;
+    }
+    const chosen = await whereTo(neosh, [], {
+      title: `Add project on ${there.info.name}`,
+      seed: `${hostPrefix(there)}:`,
+    });
+    if (chosen?.kind === "host") await startThere(neosh, chosen);
+    return null;
+  }
+
   const rows: PickerItem<Where>[] = [elsewhereRow("Type a path…")];
   // Whether an address is worth recognising at all. The git plugin is what clones — and it can be
   // switched off — so without it a pasted URL is not a row this could act on. Offering a verb that
   // cannot happen is worse than not offering it, which is the rule `^N`'s worktree rows follow one
   // function up.
   const clone = (await neosh.cmd.list().catch(() => [])).some((c) => c.name === CLONE_COMMAND);
+  const ascii = (await neosh.opt.get<boolean>("ui.ascii_only").catch(() => false)) ?? false;
+  if (clone) rows.push(cloneRow(ascii));
 
   const chosen = await whereTo(neosh, rows, { title: "Add project", clone });
   if (chosen === null) return null;
   if (chosen.kind === "host") {
     await startThere(neosh, chosen);
+    return null;
+  }
+  if (chosen.kind === "clone-ask") {
+    await askAndClone(neosh);
     return null;
   }
   if (chosen.kind === "clone") {
@@ -3980,10 +4062,16 @@ function group(
   sessions: SessionInfo[],
   arrangement: Arrangement,
   peers: SwarmNode[],
+  /**
+   * Whether this computer's own projects are drawn at all. Not in a terminal that is for another
+   * computer, where every repository is that machine's — including the ones also cloned here,
+   * which are then its rows rather than yours with its block hung under them.
+   */
+  local = true,
 ): Project[][] {
   // ---- what is here -------------------------------------------------------
   const here = new Map<string, SessionInfo[]>();
-  for (const cwd of arrangement.all()) here.set(cwd, []);
+  if (local) for (const cwd of arrangement.all()) here.set(cwd, []);
   for (const s of sessions) {
     const list = here.get(s.cwd);
     if (list) list.push(s);
@@ -4459,6 +4547,12 @@ interface DrawOptions {
   colors: Map<string, string>;
   /** The conversation on another machine this terminal is in, when it is in one. */
   mirrored?: { node: string; session: string };
+  /**
+   * Which computer this terminal is for, when it is for one — `here`, or a node id. `undefined`
+   * is every computer. See `ViewDevice`: a terminal opened with `neosh connect lb` draws `lb` and
+   * nothing else, and one for this computer draws no other machine's section.
+   */
+  scope?: string;
 }
 
 /** How a project's fold is remembered: its directory here, or its identity when it is only there. */
@@ -4505,7 +4599,7 @@ async function collect(
   // Failures absorbed: a panel that renders an exception instead of your conversations is worse
   // than one showing less. All at once rather than one after another: none of them depends on
   // another, and in sequence they were the whole of a keypress's wait.
-  const [all, self, nodes, rawDecorations, codeVar, current, sections] = await Promise.all([
+  const [all, self, nodes, rawDecorations, codeVar, current, sections, device] = await Promise.all([
     ask("sessions", () =>
       neosh.session.list({ includeArchived: true }).catch(() => [] as SessionInfo[])),
     ask("self", () => neosh.swarm.self().catch(() => null)),
@@ -4515,8 +4609,14 @@ async function collect(
     ask("codes", () => neosh.vars.get({ scope: "global" }, VAR_CODES).catch(() => null)),
     ask("current", () => neosh.session.current().catch(() => null)),
     ask("sections", () => neosh.ext.list<SectionItem>(POINT_SECTION).catch(() => [])),
+    // This panel's terminal's, which is what `neosh` here is bound to.
+    ask("device", () => neosh.view.device().catch(() => null)),
   ]);
-  const sessions = all.filter((s) => !s.archived);
+  const scope = device?.kind === "here" ? "here" : device?.kind === "node" ? device.node : undefined;
+  // A terminal for another computer shows that computer's conversations and none of yours: they are
+  // still here, still running, and one `/device` away.
+  const onlyThere = scope !== undefined && scope !== "here";
+  const sessions = onlyThere ? [] : all.filter((s) => !s.archived);
   let running = sessions.some((s) => s.active_turn);
   const now = Date.now();
 
@@ -4531,7 +4631,10 @@ async function collect(
   //
   // One call; empty and harmless on a single machine.
   const me = self?.id ?? null;
-  const peers = nodes.filter((n) => n.info.id !== me);
+  const paired = nodes.filter((n) => n.info.id !== me);
+  const peers = scope === undefined
+    ? paired
+    : paired.filter((n) => n.info.id === scope);
   // A turn over there has a clock on its row too, and a clock that moves every few seconds is one
   // that looks stuck.
   running ||= peers.some((n) => n.link.state === "up" && n.agents.some(turning));
@@ -4554,9 +4657,10 @@ async function collect(
     codes,
     colors,
     mirrored,
+    scope,
     folded: (key) => arrangement.isFolded(key),
   };
-  const projects = group(sessions, arrangement, peers).flat();
+  const projects = group(sessions, arrangement, peers, !onlyThere).flat();
   // Which version of each repository this machine has, for the ones another machine also has a
   // main checkout of — one call for all of them, answered off the disk with no `git` process, and
   // nothing at all on a workspace with no peers.
@@ -4613,10 +4717,24 @@ async function collect(
     }
   };
 
+  const addRow = () => {
+    rows.push(blank());
+    rows.push({
+      text: " + Add project",
+      hl: "Accent",
+      // The key for this row, on this row. `^O` from the composer; `o` from anywhere in the
+      // panel, which is the same question asked from nearer by.
+      right: { text: `${opts.focused ? "o" : "^O"} `, hl: "Sidebar.Key" },
+      value: { kind: "add" },
+    });
+  };
+
   // The blocks this panel draws, each the same shape: so that a section can sit before or after
   // any of them by name, and the foot is whatever lands after the last one.
   const blocks: Record<Slot, () => void> = {
     projects: () => {
+      // Another computer's terminal has no section of yours: its own heading is the top.
+      if (onlyThere) return;
       // How to make the column wider, on the heading of the column it makes wider — the idiom the
       // plan block already uses for `^L`, and it costs no row of a panel whose rows are its whole
       // job. It has to be *somewhere*: a project name clipped to `neosh-websit…` is a row asking
@@ -4652,15 +4770,9 @@ async function collect(
       }
     },
     add: () => {
-      rows.push(blank());
-      rows.push({
-        text: " + Add project",
-        hl: "Accent",
-        // The key for this row, on this row. `^O` from the composer; `o` from anywhere in the
-        // panel, which is the same question asked from nearer by.
-        right: { text: `${opts.focused ? "o" : "^O"} `, hl: "Sidebar.Key" },
-        value: { kind: "add" },
-      });
+      // A terminal for another computer has its own, under that computer's list — see `machines`.
+      if (onlyThere) return;
+      addRow();
     },
     // Every other computer, one section each, in its own colour: a heading that says which machine
     // and whether it can be reached, and under it the repositories that are only over there.
@@ -4671,6 +4783,19 @@ async function collect(
     // glance which rows were yours. So yours are yours, up top, and a machine is a place: its name,
     // its colour, and what is there.
     machines: () => {
+      // A terminal for a computer this workspace does not know — unpaired while the window was
+      // pointed at it, or never paired at all. An empty column would read as a machine with nothing
+      // on it; it is a machine that is not there, and `/device` is the way out.
+      if (onlyThere && peers.length === 0) {
+        rows.push(...heading("PROJECTS", opts.width, opts.focused ? "esc" : "^T"));
+        rows.push({
+          text: "     not a paired computer",
+          hl: "Sidebar.Dim",
+          right: { text: "/device ", hl: "Sidebar.Key" },
+          value: { kind: "custom", command: "device", args: [], section: "device" },
+        });
+        return;
+      }
       const elsewhere = projects.filter((p) => p.cwd === null);
       for (const node of [...peers].sort((a, b) => a.info.name.localeCompare(b.info.name))) {
         const id = node.info.id;
@@ -4678,9 +4803,14 @@ async function collect(
           .filter((p) => bestMachine(p, opts)?.node.id === id)
           .sort((a, b) => lastMoved(b) - lastMoved(a) || a.name.localeCompare(b.name));
         const fold = `host:${id}`;
-        rows.push(blank());
-        rows.push(...machineHeading(node, mine.length, opts));
+        if (!onlyThere) rows.push(blank());
+        // A terminal for this computer is drawn as though it were the one you are sitting at: the
+        // heading is `PROJECTS`, with which computer said once, quietly, beside it.
+        rows.push(...(onlyThere ? hostedHeading(node, opts) : machineHeading(node, mine.length, opts)));
         if (arrangement.isFolded(fold)) continue;
+        if (onlyThere && mine.length === 0) {
+          rows.push({ text: "     nothing here yet", hl: "Sidebar.Dim", inert: true });
+        }
         for (const p of mine) {
           rows.push(projectRow(p, opts, now, id));
           if (arrangement.isFolded(foldOf(p))) continue;
@@ -4688,7 +4818,9 @@ async function collect(
             // One machine: the project row *is* the machine's checkout, so its conversations and
             // worktrees hang straight off it, on a rail under its arrow.
             const b = p.machines[0]!;
-            const rail = { hl: railOf(b.node.id, opts), at: 1 };
+            // No machine colour on the marks in a terminal that is *for* this machine: there every
+            // row is on it, and a colour that is on every row says nothing.
+            const rail = { hl: onlyThere ? "" : railOf(b.node.id, opts), at: 1 };
             for (const r of b.main?.agents ?? []) rows.push(remoteRow(r, opts, now, 0, rail));
             for (const t of b.trees) {
               rows.push(treeRow(t, opts, now, 0, rail));
@@ -4701,6 +4833,9 @@ async function collect(
           }
         }
       }
+      // That computer's list is the whole panel here, so it ends the way yours does: with
+      // somewhere to add one, which adds it there.
+      if (onlyThere && peers.length > 0) addRow();
     },
     // No `archived` block any more: what you have put away is the archive plugin's panel, and its
     // row in this column arrives as a `sidebar.section` contribution like any third party's.
@@ -4719,7 +4854,6 @@ async function collect(
       section(entry);
     }
   }
-
   if (opts.hints) rows.push(...hints(opts));
 
   return { rows, running, pinned: rows.length - body };
@@ -5151,6 +5285,54 @@ function machineHeading(node: SwarmNode, projects: number, opts: DrawOptions): L
 }
 
 /**
+ * The heading of a terminal that is for another computer: `PROJECTS`, like yours, and the machine.
+ *
+ * That terminal is that computer's, so it is drawn as one: the heading every panel has, the rule in
+ * the separator's colour rather than the machine's, and which computer it is said once, beside the
+ * heading, in a lowercase dim that reads as a note rather than as a section. The code keeps the
+ * machine's colour, because that colour is the machine in every other panel. While the link is down
+ * the right-hand column says so, where the key would be; up, it is the key, as on yours. The row is
+ * the machine's heading underneath — `c`, `C`, `t` and `n` act on the machine from it.
+ */
+function hostedHeading(node: SwarmNode, opts: DrawOptions): ListRow<Target>[] {
+  const [machine] = machineHeading(node, 0, opts);
+  const id = node.info.id;
+  const link = opts.links.get(id) ?? node.link;
+  const code = marker(link, opts.codes.get(id), 0, opts.colors.get(id));
+  const up = link?.state === "up";
+  const state = up
+    ? ""
+    : link?.state === "waiting"
+    ? "not allowed yet"
+    : link?.state === "connecting" || link?.state === "retrying"
+    ? "connecting"
+    : "offline";
+  const right = state === ""
+    ? { text: `${opts.focused ? "esc" : "^T"} `, hl: "Sidebar.Key" }
+    : { text: `${state} `, hl: code.hl };
+  const lead = " PROJECTS  ";
+  const room = Math.max(0, opts.width - width(lead) - width(code.text) - 1 - width(right.text) - 1);
+  const name = room >= 4 ? ` ${clip(node.info.name.toLowerCase(), room)}` : "";
+  const text = `${lead}${code.text}${name}`;
+  const at = byteLength(lead);
+  return [
+    {
+      text,
+      full: `${lead}${code.text} ${node.info.name.toLowerCase()}`,
+      indent: 1,
+      hl: "Sidebar.Heading",
+      spans: [
+        { from: at, to: at + byteLength(code.text), hl: code.hl },
+        { from: at + byteLength(code.text), to: byteLength(text), hl: "Sidebar.Dim" },
+      ],
+      right,
+      value: machine?.value,
+    },
+    { text: "─".repeat(Math.max(1, opts.width)), hl: "Separator", inert: true },
+  ];
+}
+
+/**
  * The row a machine's block hangs from: `@ms ⎇ main`, in that machine's colour.
  *
  * Named like a worktree — by its branch — with the machine's code in front, because *which
@@ -5430,7 +5612,7 @@ function remoteRow(
   // Under something that already named the machine, the conversation's own mark wears its colour —
   // the one column every conversation row has, so a block reads as one machine's without a line
   // drawn down beside it. Not while it is working: then the mark is the working colour's.
-  if (rail && !stated && !here) {
+  if (rail?.hl && !stated && !here) {
     const from = byteLength(pad);
     spans.push({ from, to: from + byteLength(glyph), hl: rail.hl });
   }

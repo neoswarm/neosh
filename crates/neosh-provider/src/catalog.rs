@@ -1,83 +1,44 @@
-//! Built-in instance presets and the Anthropic model catalog.
+//! Built-in provider instances, and the models each of them offers.
 //!
-//! # Why presets rather than a hardcoded model list
+//! # Endpoints here, models in a file
 //!
-//! Model lineups change faster than releases do, so a baked-in list is wrong within weeks. Every
-//! OpenAI-compatible endpoint answers `GET /v1/models`, so most of this file is *endpoints* —
-//! base URL, credential variable, display name — and the models are discovered at runtime.
+//! An instance — a base URL, a credential, a brand — changes when somebody writes a driver, so it
+//! is code. A *model* changes when a vendor ships one, which is weekly, so the models are
+//! `models.json` and [`crate::manifest`]: compiled in, with t3code's news about the vendor CLIs laid
+//! over it by a running workspace, and read through the functions below. Adding a rung on a ladder,
+//! a price or a CLI floor is a line in that file; a model the CLIs started serving is usually no
+//! edit at all.
 //!
-//! The Anthropic catalog below is the exception: it is written out because the per-model option
-//! descriptors (which effort levels exist, whether fast mode is available, whether thinking can be
-//! disabled) are not discoverable from any endpoint, and getting them wrong produces a 400 rather
-//! than a graceful degradation.
+//! Every OpenAI-compatible endpoint also answers `GET /v1/models`, so for most providers the file
+//! is only the *seed*: [`merge`] lets the endpoint decide what exists and the file decide how it
+//! reads.
 
 use neosh_proto::{
-    AuthRef, Brand, InstanceConfig, ModelCapabilities, ModelId, ModelInfo, ModelTier, OptionChoice,
-    OptionSelection, Pricing, ProviderOptionDescriptor, ProviderOptionValue,
+    AuthRef, Brand, InstanceConfig, ModelCapabilities, ModelInfo, OptionChoice, OptionSelection,
+    ProviderOptionDescriptor, ProviderOptionValue,
 };
 
-/// Reasoning-effort levels available on a given model generation.
+use crate::manifest;
+
+/// A reasoning ladder, for a driver that *discovered* one.
 ///
-/// `pub` under a longer name because a driver that *discovered* a ladder needs to build the same
-/// descriptor: the picker keys off `"effort"` being the same knob everywhere, and a second spelling
-/// of it invented in a driver is a knob that does not carry over when you switch models.
+/// The picker keys off `"effort"` being the same knob everywhere, and a second spelling of it
+/// invented in a driver is a knob that does not carry over when you switch models.
 pub fn effort_levels(levels: &[&str], default: &str) -> ProviderOptionDescriptor {
-    effort_with(levels, default, &[])
+    select_of(
+        "effort",
+        "Effort",
+        "How much reasoning the model spends before answering.",
+        levels.iter().map(|l| ((*l).to_string(), level_label(l), None)).collect(),
+        default,
+    )
 }
 
-fn effort(levels: &[&str], default: &str) -> ProviderOptionDescriptor {
-    effort_levels(levels, default)
-}
-
-/// A level bought with a word in the prompt rather than with a request parameter.
-///
-/// The id **is** the word. That is what makes injection generic: nothing between here and the
-/// driver has to hold a table of magic strings — the value the picker stored is the thing that gets
-/// written into the message, and a provider plugin that invents its own gets the same treatment
-/// with no host change. See [`crate::prompt_injections`].
-struct Magic {
-    /// Also the word. `"ultrathink"`.
-    id: &'static str,
-    label: &'static str,
-    description: &'static str,
-}
-
-/// A ladder, plus any levels that are spelled rather than sent.
-///
-/// The spelled ones sort last because they are past the top of the scale: `max` is the most a
-/// parameter can ask for, and these are what you say when that was not enough.
-fn effort_with(levels: &[&str], default: &str, magic: &[Magic]) -> ProviderOptionDescriptor {
-    let mut options: Vec<OptionChoice> = levels
-        .iter()
-        .map(|l| OptionChoice {
-            id: (*l).into(),
-            label: level_label(l),
-            description: None,
-            is_default: *l == default,
-        })
-        .collect();
-    options.extend(magic.iter().map(|m| OptionChoice {
-        id: m.id.into(),
-        label: m.label.into(),
-        description: Some(m.description.into()),
-        is_default: false,
-    }));
-    ProviderOptionDescriptor::Select {
-        id: "effort".into(),
-        label: "Effort".into(),
-        description: Some("How much reasoning the model spends before answering.".into()),
-        options,
-        current_value: Some(default.into()),
-        prompt_injected_values: magic.iter().map(|m| m.id.to_string()).collect(),
-    }
-}
-
-/// A select over anything, for the knobs that are not the reasoning ladder.
-fn select(
+fn select_of(
     id: &str,
     label: &str,
     description: &str,
-    choices: &[(&str, &str, Option<&str>)],
+    choices: Vec<(String, String, Option<String>)>,
     default: &str,
 ) -> ProviderOptionDescriptor {
     ProviderOptionDescriptor::Select {
@@ -85,12 +46,12 @@ fn select(
         label: label.into(),
         description: Some(description.into()),
         options: choices
-            .iter()
-            .map(|(id, label, desc)| OptionChoice {
-                id: (*id).into(),
-                label: (*label).into(),
-                description: desc.map(str::to_string),
-                is_default: *id == default,
+            .into_iter()
+            .map(|(id, label, description)| OptionChoice {
+                is_default: id == default,
+                id,
+                label,
+                description,
             })
             .collect(),
         current_value: Some(default.into()),
@@ -98,22 +59,12 @@ fn select(
     }
 }
 
-fn boolean(id: &str, label: &str, desc: &str) -> ProviderOptionDescriptor {
-    ProviderOptionDescriptor::Boolean {
-        id: id.into(),
-        label: label.into(),
-        description: Some(desc.into()),
-        current_value: false,
-        prompt_injected_word: None,
-    }
-}
-
 /// How a reasoning level reads in a list.
 ///
 /// Title case for almost all of them, and a lookup for the ones where it is wrong: `xhigh` is a
 /// contraction, and "Xhigh" reads as a typo in a column of English words. Shared with the drivers
-/// that *discover* their ladders, so a level `codex` reported and one written down here are spelled
-/// the same way on screen.
+/// that *discover* their ladders, so a level `codex` reported and one written down are spelled the
+/// same way on screen.
 pub fn level_label(id: &str) -> String {
     match id {
         "xhigh" => "X-high".into(),
@@ -149,476 +100,59 @@ pub fn default_options(caps: &ModelCapabilities) -> Vec<OptionSelection> {
         .collect()
 }
 
-const EFFORT_5: &[&str] = &["low", "medium", "high", "xhigh", "max"];
-const EFFORT_46: &[&str] = &["low", "medium", "high", "max"];
-
-/// What `claude` reads out of a message rather than off its command line.
-///
-/// **The harness's words, not the model's**, which is why they are on the CLI's catalogue and not
-/// on Anthropic's. `api.anthropic.com` serves a model: it has `output_config.effort` and no opinion
-/// about English, so a message beginning "ultrathink" is a message beginning with a word. The CLI
-/// is a program wrapped around that model, and these are two of the things it looks for.
-///
-/// Advertising them where they do not work would be worse than not having them: the picker would
-/// offer a level that silently does nothing, on the one provider where the same word does something
-/// real — and "it worked yesterday" would be a difference of instance nobody can see.
-///
-/// # Why both of them are rungs
-///
-/// `ultracode` used to be a switch of its own, on the reasoning that orchestration is not depth and
-/// a control that does two things says one. Which is true of the *mechanism* and wrong about the
-/// choice: nobody sets a reasoning level and then separately decides how hard the harness should
-/// work, they pick one thing off one scale and get on with it — and a switch sitting under the
-/// ladder, drawn `off / on`, is a second question about the same decision. Every reference
-/// implementation that has shipped this puts it on the ladder for that reason.
-///
-/// The cost is real and is the point: these are mutually exclusive now, because one message
-/// carries one of these words. "Ultracode at max effort" is no longer expressible — it was, and
-/// almost nobody meant it.
-const CLAUDE_WORDS: &[Magic] = &[
-    Magic {
-        id: "ultracode",
-        label: "Ultracode",
-        description: "Let it orchestrate sub-agents by default. Slower, and thorough.",
-    },
-    Magic {
-        id: "ultrathink",
-        label: "Ultrathink",
-        description: "Past the top of the ladder — said in the message, not sent as a level.",
-    },
-];
-
-/// One entry in the Anthropic catalogue.
-///
-/// `family` and `tier` are what make "the best Opus" and "one rung down" answerable. They are
-/// written here rather than parsed out of the id, because the moment a vendor changes its naming
-/// scheme a parser puts a model on the wrong rung — and the failure is a turn billed at the wrong
-/// price, not an error.
-#[allow(clippy::too_many_arguments)]
-fn claude(
-    id: &str,
-    name: &str,
-    family: &str,
-    tier: ModelTier,
-    tagline: &str,
-    ctx: u64,
-    max_out: u64,
-    price: (f64, f64),
-    efforts: Option<&[&str]>,
-    fast_mode: bool,
-    legacy: bool,
-) -> ModelInfo {
-    let mut descriptors = Vec::new();
-    if let Some(levels) = efforts {
-        descriptors.push(effort(levels, "high"));
-    }
-    if fast_mode {
-        descriptors.push(boolean(
-            "fast_mode",
-            "Fast mode",
-            "Same model, higher output rate, premium pricing.",
-        ));
-    }
-    ModelInfo {
-        id: ModelId::from(id),
-        display_name: name.into(),
-        context_window: Some(ctx),
-        max_output_tokens: Some(max_out),
-        capabilities: ModelCapabilities {
-            tools: true,
-            vision: true,
-            streaming: true,
-            thinking: efforts.is_some(),
-            prompt_caching: true,
-            option_descriptors: descriptors,
-        },
-        pricing: Some(Pricing {
-            input_per_mtok: price.0,
-            output_per_mtok: price.1,
-            cache_read_per_mtok: price.0 * cache_read_multiple(id),
-            cache_write_per_mtok: price.0 * 1.25,
-        }),
-        family: Some(family.into()),
-        tier: Some(tier),
-        legacy,
-        tagline: Some(tagline.into()),
-        // Nothing in a catalogue is unavailable: a catalogue says what exists. Whether *this*
-        // machine can run it is the driver's answer, and `claude-cli` is the one that has one.
-        unavailable: None,
-    }
-}
-
-/// What a cache hit costs, as a multiple of the base input price.
-///
-/// A rule with two exceptions, and the exceptions are the vendor's rather than ours: the pricing
-/// table's own footnote reads *"cache hits and refreshes on Claude Fable 5.1 and Claude Mythos 5.1
-/// are priced at 0.025x the base input price. All other models use the standard 0.1x multiplier."*
-///
-/// Written as an exception list rather than folded into every call site, because that is the shape
-/// of the fact — and because a flat `0.1` was wrong by **four times** on the most expensive model
-/// in the catalogue. This number is not decoration: `neosh::usage` and the sidebar both multiply a
-/// real `cache_read_tokens` count by it, so a stale multiplier is money reported wrongly on the one
-/// screen people check to find out what they are spending.
-fn cache_read_multiple(id: &str) -> f64 {
-    match id {
-        "claude-fable-5-1" | "claude-mythos-5-1" => 0.025,
-        _ => 0.1,
-    }
-}
-
-/// Anthropic models, with the option descriptors each generation actually accepts.
-///
-/// The effort/thinking split is load-bearing: `budget_tokens` is rejected outright on the 5 and
-/// 4.7+ generations, and `effort` gained `xhigh` there, so a single flattened option set would
-/// produce 400s on half the catalog.
-///
-/// # Newest first
-///
-/// One rule, and it decides two things at once: what a picker draws at the top, and — through
-/// [`crate::ProviderRegistry::default_selection`], which takes the first live entry — what a fresh
-/// install with nothing configured lands on. Read as capability order instead, this list put Opus
-/// above the 5.1 that supersedes it, and the newest model in the catalogue was the second row of a
-/// list whose whole job is saying what is current.
-pub fn anthropic_models() -> Vec<ModelInfo> {
-    use ModelTier::{Balanced, Fast, Frontier};
-    const OPUS: &str = "Most capable for complex work";
-    const SONNET: &str = "Best for everyday tasks";
-    // What the vendor says Fable is for. It read "Long-form writing and voice" here, which is a
-    // guess from the name — the line is the top of the ladder for reasoning and long-horizon
-    // agentic work, and it is the one row whose price says so.
-    const FABLE: &str = "Deepest reasoning and long-running work";
-    vec![
-        claude("claude-fable-5-1", "Claude Fable 5.1", "fable", Frontier, FABLE, 1_000_000, 128_000, (10.0, 50.0), Some(EFFORT_5), false, false),
-        claude("claude-opus-5-5", "Claude Opus 5.5", "opus", Frontier, OPUS, 1_000_000, 128_000, (5.0, 25.0), Some(EFFORT_5), true, false),
-        claude("claude-opus-5", "Claude Opus 5", "opus", Frontier, OPUS, 1_000_000, 128_000, (5.0, 25.0), Some(EFFORT_5), true, true),
-        claude("claude-sonnet-5", "Claude Sonnet 5", "sonnet", Balanced, SONNET, 1_000_000, 128_000, (2.0, 10.0), Some(EFFORT_5), false, false),
-        claude("claude-fable-5", "Claude Fable 5", "fable", Frontier, FABLE, 1_000_000, 128_000, (10.0, 50.0), Some(EFFORT_5), false, true),
-        claude("claude-opus-4-8", "Claude Opus 4.8", "opus", Frontier, OPUS, 1_000_000, 128_000, (5.0, 25.0), Some(EFFORT_5), true, true),
-        claude("claude-opus-4-7", "Claude Opus 4.7", "opus", Frontier, OPUS, 1_000_000, 128_000, (5.0, 25.0), Some(EFFORT_5), false, true),
-        claude("claude-opus-4-6", "Claude Opus 4.6", "opus", Frontier, OPUS, 1_000_000, 128_000, (5.0, 25.0), Some(EFFORT_46), false, true),
-        claude("claude-sonnet-4-6", "Claude Sonnet 4.6", "sonnet", Balanced, SONNET, 1_000_000, 128_000, (3.0, 15.0), Some(EFFORT_46), false, true),
-        claude("claude-haiku-4-5", "Claude Haiku 4.5", "haiku", Fast, "Fastest, for quick answers", 200_000, 64_000, (1.0, 5.0), None, false, false),
-    ]
-}
-
-/// A select over how much context to buy: the 1M window is opt-in and billed differently.
-///
-/// Written as an option rather than as two catalogue rows, because it is the same model — a row
-/// each would double the list and put the decision in the wrong place, which is beside the
-/// reasoning effort, not among the products.
-fn context_window(long_by_default: bool) -> ProviderOptionDescriptor {
-    ProviderOptionDescriptor::Select {
-        id: "context".into(),
-        label: "Context".into(),
-        description: Some("How much of the conversation the model can see at once.".into()),
-        options: vec![
-            OptionChoice {
-                id: "200k".into(),
-                label: "200k".into(),
-                description: None,
-                is_default: !long_by_default,
-            },
-            OptionChoice {
-                id: "1m".into(),
-                label: "1M".into(),
-                description: Some("Premium pricing past 200k.".into()),
-                is_default: long_by_default,
-            },
-        ],
-        current_value: Some(if long_by_default { "1m".into() } else { "200k".into() }),
-        prompt_injected_values: Vec::new(),
-    }
-}
-
-/// What each `claude` model needs from the CLI, beyond its name.
-///
-/// `(id, name, family, tier, tagline, context, efforts, fast_mode, long_context, legacy)`.
-type ClaudeCliEntry = (
-    &'static str,
-    &'static str,
-    &'static str,
-    ModelTier,
-    &'static str,
-    u64,
-    Option<&'static [&'static str]>,
-    bool,
-    Option<bool>,
-    bool,
-);
-
-/// Models reachable through the `claude` CLI.
-///
-/// # Why this is written down rather than discovered
-///
-/// The CLI has no "list models" call — `--model` takes a slug or an alias and resolves it itself,
-/// and there is no way to ask what it would accept. So this is the catalogue, and
-/// [`crate::drivers::claude_cli`] filters it against the version that is actually installed: an
-/// older CLI rejects a model it has never heard of, and offering it anyway turns a switch into a
-/// failed turn.
-///
-/// # Slugs, not aliases
-///
-/// This used to be three aliases — `opus`, `sonnet`, `haiku` — on the reasoning that an alias
-/// never goes stale. It does not, but it also cannot say what it resolves to, cannot carry a
-/// version's own option set, and hides every model that is not the newest in its line. Pinning
-/// slugs and letting `model.line opus` do the resolving separates the two jobs: the catalogue says
-/// what exists, and the ladder says which one is current.
-///
-/// # Newest first
-///
-/// As in [`anthropic_models`], and for the same two reasons. Note that "too new for the `claude`
-/// on this machine" is not a reason to move one down the list or take it out of it — see
-/// [`crate::drivers::claude_cli`], which answers that by *saying so on the row*.
-pub fn claude_cli_models() -> Vec<ModelInfo> {
-    use ModelTier::{Balanced, Fast, Frontier};
-    const OPUS: &str = "Most capable for complex work";
-    const SONNET: &str = "Best for everyday tasks";
-    const FABLE: &str = "Deepest reasoning and long-running work";
-    const ENTRIES: &[ClaudeCliEntry] = &[
-        ("claude-fable-5-1", "Claude Fable 5.1", "fable", Frontier, FABLE, 1_000_000, Some(EFFORT_5), false, Some(true), false),
-        ("claude-opus-5-5", "Claude Opus 5.5", "opus", Frontier, OPUS, 1_000_000, Some(EFFORT_5), true, Some(true), false),
-        ("claude-opus-5", "Claude Opus 5", "opus", Frontier, OPUS, 1_000_000, Some(EFFORT_5), true, Some(true), true),
-        ("claude-sonnet-5", "Claude Sonnet 5", "sonnet", Balanced, SONNET, 1_000_000, Some(EFFORT_5), false, Some(false), false),
-        ("claude-haiku-4-5", "Claude Haiku 4.5", "haiku", Fast, "Fastest, for quick answers", 200_000, None, false, None, false),
-        ("claude-fable-5", "Claude Fable 5", "fable", Frontier, FABLE, 1_000_000, Some(EFFORT_5), false, Some(true), true),
-        ("claude-opus-4-8", "Claude Opus 4.8", "opus", Frontier, OPUS, 1_000_000, Some(EFFORT_5), true, None, true),
-        ("claude-opus-4-7", "Claude Opus 4.7", "opus", Frontier, OPUS, 1_000_000, Some(EFFORT_5), false, None, true),
-        ("claude-opus-4-6", "Claude Opus 4.6", "opus", Frontier, OPUS, 1_000_000, Some(EFFORT_46), false, None, true),
-        ("claude-opus-4-5", "Claude Opus 4.5", "opus", Frontier, OPUS, 200_000, Some(EFFORT_46), false, None, true),
-        ("claude-sonnet-4-6", "Claude Sonnet 4.6", "sonnet", Balanced, SONNET, 1_000_000, Some(EFFORT_46), false, Some(false), true),
-    ];
-
-    ENTRIES
-        .iter()
-        .map(|(id, name, family, tier, tagline, ctx, efforts, fast, long, legacy)| {
-            let mut descriptors = Vec::new();
-            if let Some(levels) = efforts {
-                descriptors.push(effort_with(levels, "high", CLAUDE_WORDS));
-            } else {
-                descriptors.push(boolean(
-                    "thinking",
-                    "Thinking",
-                    "Let it reason before answering.",
-                ));
-            }
-            if *fast {
-                descriptors.push(boolean(
-                    "fast_mode",
-                    "Fast mode",
-                    "Same model, higher output rate, premium pricing.",
-                ));
-            }
-            if let Some(long_by_default) = *long {
-                descriptors.push(context_window(long_by_default));
-            }
-            let mut m = ModelInfo::undescribed(*id, *name);
-            m.context_window = Some(*ctx);
-            m.capabilities = ModelCapabilities {
-                tools: true,
-                vision: true,
-                streaming: true,
-                thinking: efforts.is_some(),
-                prompt_caching: true,
-                option_descriptors: descriptors,
-            };
-            m.family = Some((*family).to_string());
-            m.tier = Some(*tier);
-            m.tagline = Some((*tagline).to_string());
-            m.legacy = *legacy;
-            m
-        })
-        .collect()
-}
-
-/// A model in a seed list: enough to pick one, not enough to pretend it is a full description.
-///
-/// `(id, display name, family, tier, tagline, superseded)`.
-type Seed = (&'static str, &'static str, &'static str, ModelTier, &'static str, bool);
-
-/// Turn a seed list into models, asking `knobs` what each one accepts.
-///
-/// Per model rather than per provider, because that is how the ladders actually differ: one
-/// generation gained a level the one before it rejects, and a small model in the same lineup has no
-/// reasoning knob at all.
-fn seeded(seeds: &[Seed], knobs: fn(&str) -> Vec<ProviderOptionDescriptor>) -> Vec<ModelInfo> {
-    seeds
-        .iter()
-        .map(|(id, name, family, tier, tagline, legacy)| {
-            let descriptors = knobs(id);
-            let mut m = ModelInfo::undescribed(*id, *name);
-            m.capabilities = ModelCapabilities {
-                tools: true,
-                vision: true,
-                streaming: true,
-                thinking: descriptors.iter().any(|d| is_reasoning(d.id())),
-                prompt_caching: false,
-                option_descriptors: descriptors,
-            };
-            m.family = Some((*family).to_string());
-            m.tier = Some(*tier);
-            m.tagline = Some((*tagline).to_string());
-            m.legacy = *legacy;
-            m
-        })
-        .collect()
-}
-
-/// Whether a knob is about *reasoning* rather than about the shape of the answer.
-///
-/// One list, because three vendors spell the same idea three ways and `ModelCapabilities::thinking`
-/// is a single bit that a picker uses to decide whether a model reasons at all.
-fn is_reasoning(id: &str) -> bool {
-    matches!(id, "effort" | "thinking" | "thinking_level" | "thinking_budget")
-}
-
-/// A model with no seeded knobs. Most endpoints, most of the time — see [`seed_models`].
-fn no_knobs(_: &str) -> Vec<ProviderOptionDescriptor> {
-    Vec::new()
-}
-
 /// Answer length, which every GPT-5-shaped endpoint takes and nothing else does.
 pub fn verbosity_levels() -> ProviderOptionDescriptor {
-    select(
+    select_of(
         "verbosity",
         "Verbosity",
         "How much answer to write, independently of how hard it thought.",
-        &[("low", "Low", Some("Terse.")), ("medium", "Medium", None), ("high", "High", Some("Explains itself."))],
+        vec![
+            ("low".into(), "Low".into(), Some("Terse.".into())),
+            ("medium".into(), "Medium".into(), None),
+            ("high".into(), "High".into(), Some("Explains itself.".into())),
+        ],
         "medium",
     )
 }
 
-/// What OpenAI's own endpoint accepts beside the messages.
+/// What Gemini accepts for a model id nobody wrote down, from the `google` catalogue's rules.
 ///
-/// The ladder is `reasoning_effort`, and it is *not* Anthropic's: it starts at `minimal`, which has
-/// no equivalent there, and the top rung differs by generation. Written down rather than guessed
-/// from the id, because the failure mode of guessing is a 400 on send rather than a knob that reads
-/// slightly wrong — the same reason the Anthropic catalogue is written down at all.
-fn openai_knobs(id: &str) -> Vec<ProviderOptionDescriptor> {
-    // GPT-6 is the generation that *dropped* a rung as well as gaining one: the docs say
-    // `reasoning.effort supports low, medium, high, xhigh, and max`, and `minimal` — which every
-    // GPT-5 takes — is not among them. It also documents no `verbosity`, so it is not offered:
-    // this file exists to keep a knob nobody advertised off the wire, and inheriting the GPT-5 set
-    // by prefix is exactly how a model gains two parameters it will 400 on.
-    if id.starts_with("gpt-6") {
-        return vec![effort(&["low", "medium", "high", "xhigh", "max"], "medium")];
-    }
-    let levels: &[&str] = if id.starts_with("gpt-5.6") {
-        &["minimal", "low", "medium", "high", "xhigh"]
-    } else if id.starts_with("gpt-5") {
-        &["minimal", "low", "medium", "high"]
-    } else {
-        return Vec::new();
-    };
-    vec![effort(levels, "medium"), verbosity_levels()]
-}
-
-/// What Gemini accepts, which changed shape between generations.
-///
-/// The 3 line takes `thinkingLevel`, a named rung. The 2.5 line takes `thinkingBudget`, a token
-/// count — and the only value of it worth putting in a picker is "none", because every other number
-/// is a guess about a turn that has not happened yet. So the 2.5 models get a switch and the 3 line
-/// gets a ladder, which is what each of them actually has.
-///
-/// 2.5 Pro is deliberately blank: its budget cannot be set to zero, and offering a switch that the
-/// endpoint rejects is worse than offering nothing.
+/// The 3 line takes `thinkingLevel`, a named rung, and the 2.5 line `thinkingBudget`, of which the
+/// only value worth a picker is "none" — so a switch, except on 2.5 Pro, whose budget cannot be
+/// zero. Rules rather than code, so a generation released this morning gets its ladder from a
+/// manifest edit.
 pub fn gemini_knobs(id: &str) -> Vec<ProviderOptionDescriptor> {
-    if id.starts_with("gemini-3") {
-        return vec![select(
-            "thinking_level",
-            "Thinking",
-            "How much reasoning the model spends before answering.",
-            &[("low", "Low", None), ("high", "High", None)],
-            "high",
-        )];
-    }
-    if id.starts_with("gemini-2.5") && !id.contains("pro") {
-        let mut on = boolean("thinking", "Thinking", "Let it reason before answering.");
-        if let ProviderOptionDescriptor::Boolean { current_value, .. } = &mut on {
-            *current_value = true;
-        }
-        return vec![on];
-    }
-    Vec::new()
+    manifest::knobs_for("google", id)
 }
 
-/// What a provider offers, written down, so its models are visible before you have a key.
+/// Anthropic's API models, with the option descriptors each generation actually accepts.
 ///
-/// # Why this exists at all
+/// Newest first, which decides two things at once: what a picker draws at the top, and — through
+/// [`crate::ProviderRegistry::default_selection`], which takes the first live entry — what a fresh
+/// install with nothing configured lands on.
+pub fn anthropic_models() -> Vec<ModelInfo> {
+    manifest::models("anthropic")
+}
+
+/// Models reachable through the `claude` CLI.
 ///
-/// Every OpenAI-shaped endpoint answers `GET /v1/models`, and discovery is still how the real list
-/// is found. But discovery needs a key — so the picker used to show an empty pane for every
-/// provider you had not signed into yet, which is exactly backwards: the list is *how you decide
-/// whether to sign in*. A provider whose models you cannot see is a provider you cannot evaluate.
-///
-/// These are seeds, not truth. The moment a key is present, [`merge`] lets the endpoint's own
-/// answer decide what exists, and keeps only the description from here — because names, rungs and
-/// taglines are not in any `/v1/models` response and are what make the list readable.
-///
-/// Where the exact id is not certain, the vendor's stable alias is used in preference to a pinned
-/// version, for the same reason `claude-cli` lists `opus` rather than a dated id: an alias that
-/// resolves to something is better than an id that resolves to a 404.
-fn seed_models(instance: &str) -> Vec<ModelInfo> {
-    use ModelTier::{Balanced, Fast, Frontier};
-    // Which knobs a seeded model has is a fact about the *vendor*, so it is chosen here rather than
-    // written on every row: an endpoint either takes `reasoning_effort` or it does not, and the
-    // twelve rows below would otherwise repeat the same answer twelve times and disagree on the
-    // thirteenth.
-    let knobs: fn(&str) -> Vec<ProviderOptionDescriptor> = match instance {
-        "openai" => openai_knobs,
-        "google" => gemini_knobs,
-        // Nothing for xAI, DeepSeek or Mistral, and it is not an omission. None of the three
-        // documents a reasoning knob on the models seeded here — Grok's is on the `mini` line only,
-        // DeepSeek's reasoner has no dial at all, and Mistral's models do not reason. A knob
-        // invented for them would be a 400 on the first turn, which is the failure this whole file
-        // is written out longhand to avoid. Where an endpoint *does* say, the driver reads it back:
-        // see `openai_compat`'s discovery.
-        _ => no_knobs,
-    };
-    seeded(match instance {
-        "openai" => &[
-            // Newest first, as everywhere. Its own family rather than a version of `sol`: Astra is
-            // a generation up and both are current, so `model.line sol` has to keep meaning Sol.
-            ("gpt-6-astra", "GPT-6 Astra", "astra", Frontier, "Frontier reasoning and computer use", false),
-            ("gpt-5.6-sol", "GPT-5.6 Sol", "sol", Frontier, "Frontier agentic coding", false),
-            ("gpt-5.6-terra", "GPT-5.6 Terra", "terra", Balanced, "Balanced, for everyday work", false),
-            ("gpt-5.6-luna", "GPT-5.6 Luna", "luna", Fast, "Fast and affordable", false),
-            ("gpt-5.5", "GPT-5.5", "gpt", Frontier, "Complex coding and long-running work", true),
-            ("gpt-5.4", "GPT-5.4", "gpt", Balanced, "Strong for everyday coding", true),
-            ("gpt-5.4-mini", "GPT-5.4 Mini", "gpt", Fast, "Small, quick, cheap", true),
-        ],
-        // The Flash line moves fastest of anything seeded here — three releases in three months —
-        // which is the argument for seeds being a floor rather than the list: the moment a key is
-        // present, `/v1/models` decides, and a row here only has to be reachable and readable.
-        "google" => &[
-            ("gemini-3.1-pro-preview", "Gemini 3.1 Pro", "gemini-pro", Frontier, "Most capable Gemini", false),
-            ("gemini-3.8-flash", "Gemini 3.8 Flash", "gemini-flash", Balanced, "Quick, for everyday work", false),
-            ("gemini-3.1-flash-lite", "Gemini 3.1 Flash Lite", "gemini-flash-lite", Fast, "Cheapest and fastest", false),
-            ("gemini-3.7-flash", "Gemini 3.7 Flash", "gemini-flash", Balanced, "Previous generation", true),
-            ("gemini-2.5-pro", "Gemini 2.5 Pro", "gemini-pro", Frontier, "Previous generation", true),
-            ("gemini-2.5-flash", "Gemini 2.5 Flash", "gemini-flash", Balanced, "Previous generation", true),
-        ],
-        "xai" => &[
-            ("grok-4.6", "Grok 4.6", "grok", Frontier, "Latest Grok", false),
-            ("grok-4.5", "Grok 4.5", "grok", Balanced, "Previous generation", true),
-            ("grok-4.3", "Grok 4.3", "grok", Fast, "Older and cheaper", true),
-        ],
-        // Stable aliases: DeepSeek points these at whatever is current, so they do not go stale.
-        "deepseek" => &[
-            ("deepseek-reasoner", "DeepSeek Reasoner", "deepseek", Frontier, "Thinks before it answers", false),
-            ("deepseek-chat", "DeepSeek Chat", "deepseek", Balanced, "General purpose", false),
-        ],
-        "mistral" => &[
-            ("mistral-large-latest", "Mistral Large", "mistral", Frontier, "Most capable", false),
-            ("mistral-medium-latest", "Mistral Medium", "mistral", Balanced, "General purpose", false),
-            ("mistral-small-latest", "Mistral Small", "mistral", Fast, "Quick and cheap", false),
-            ("codestral-latest", "Codestral", "codestral", Balanced, "Tuned for code", false),
-        ],
-        // Deliberately nothing for Groq, Cerebras, Together, Fireworks and the local endpoints:
-        // they serve other people's models and the lineup changes weekly, so a written-down list
-        // would be wrong faster than it was useful. Discovery is the honest answer there, and the
-        // picker says so rather than showing an empty pane with no explanation.
-        _ => &[],
-    }, knobs)
+/// The CLI has no "list models" call — `--model` takes a slug and resolves it itself — so this is
+/// the catalogue, and [`crate::drivers::claude_cli`] marks what the installed version is too old
+/// for (`min_version`) rather than hiding it. The words `ultrathink` and `ultracode` are rungs here
+/// and nowhere on `anthropic`: they are read by the harness, not the model.
+pub fn claude_cli_models() -> Vec<ModelInfo> {
+    manifest::models("claude-cli")
+}
+
+/// Models reachable through the `codex` CLI, for when `model/list` cannot answer.
+pub fn codex_cli_models() -> Vec<ModelInfo> {
+    manifest::models("codex-cli")
+}
+
+/// Seeds for the `agy` CLI, replaced by `agy models` when it answers. Reasoning effort is part of
+/// the id there rather than a knob beside it, because that is how Antigravity publishes them.
+pub fn antigravity_models() -> Vec<ModelInfo> {
+    manifest::models("antigravity")
 }
 
 /// Let a discovered list decide what exists, and a seed list decide how it reads.
@@ -644,7 +178,7 @@ pub fn merge(discovered: Vec<ModelInfo>, seeds: &[ModelInfo]) -> Vec<ModelInfo> 
                 let mut out = seed.clone();
                 out.context_window = m.context_window.or(seed.context_window);
                 out.max_output_tokens = m.max_output_tokens.or(seed.max_output_tokens);
-                out.pricing = m.pricing.clone().or_else(|| seed.pricing.clone());
+                out.pricing = m.pricing.or(seed.pricing);
                 // An endpoint that listed its own parameters has said something the catalogue can
                 // only have guessed, so it wins. One that said nothing leaves the seeds standing —
                 // silence is not a claim that the model has no knobs.
@@ -669,143 +203,26 @@ pub fn merge(discovered: Vec<ModelInfo>, seeds: &[ModelInfo]) -> Vec<ModelInfo> 
     described
 }
 
-
-/// Reasoning-effort levels `codex` accepts.
+/// Give a discovered model nobody described the knobs its catalogue's rules say it has.
 ///
-/// Its own ladder, not the API's: the CLI passes this straight through to `model_reasoning_effort`,
-/// and a level it does not recognise is a config error rather than a graceful downgrade.
-const EFFORT_CODEX: &[&str] = &["minimal", "low", "medium", "high", "xhigh"];
-
-/// Models reachable through the `codex` CLI.
-///
-/// Ids rather than aliases, because unlike `claude`, `codex` has no alias to pin: `-m` takes a
-/// slug. Written out with rungs so the ladder works here too — this is the same catalogue the CLI
-/// ships, reduced to the part a picker needs.
-pub fn codex_cli_models() -> Vec<ModelInfo> {
-    use ModelTier::{Balanced, Fast, Frontier};
-    [
-        ("gpt-5.6-sol", "GPT-5.6 Sol", "gpt-5.6", Frontier, "Frontier agentic coding", false),
-        ("gpt-5.6-terra", "GPT-5.6 Terra", "gpt-5.6", Balanced, "Balanced, for everyday work", false),
-        ("gpt-5.6-luna", "GPT-5.6 Luna", "gpt-5.6", Fast, "Fast and affordable", false),
-        ("gpt-5.5", "GPT-5.5", "gpt-5", Frontier, "Complex coding and long-running work", true),
-        ("gpt-5.4", "GPT-5.4", "gpt-5", Balanced, "Strong for everyday coding", true),
-        ("gpt-5.4-mini", "GPT-5.4 Mini", "gpt-5", Fast, "Small, quick, cheap", true),
-    ]
-    .into_iter()
-    .map(|(id, name, family, tier, tagline, legacy)| {
-        let mut m = ModelInfo::undescribed(id, name);
-        m.capabilities = ModelCapabilities {
-            tools: true,
-            vision: true,
-            streaming: true,
-            thinking: true,
-            prompt_caching: true,
-            option_descriptors: vec![effort(EFFORT_CODEX, "medium")],
-        };
-        m.family = Some(family.to_string());
-        m.tier = Some(tier);
-        m.tagline = Some(tagline.to_string());
-        m.legacy = legacy;
-        m
-    })
-    .collect()
-}
-
-
-/// Models reachable through an ACP agent.
-///
-/// Written down rather than discovered, because ACP has no "list models" call: the agent tells you
-/// what it has in `session/new`, which is a poor place to be finding out. `session/set_model` is
-/// how one is chosen, and an agent that only has one simply refuses the call and carries on — so a
-/// wrong entry here degrades to "the agent used its default", not to an error.
-fn acp_models(entries: &[(&str, &str, ModelTier, &str)]) -> Vec<ModelInfo> {
-    entries
-        .iter()
-        .map(|(id, name, tier, tagline)| {
-            let mut m = ModelInfo::undescribed(*id, *name);
-            m.capabilities = ModelCapabilities {
-                tools: true,
-                vision: true,
-                streaming: true,
-                thinking: false,
-                prompt_caching: false,
-                option_descriptors: Vec::new(),
-            };
-            m.family = Some("agent".to_string());
-            m.tier = Some(*tier);
-            m.tagline = Some((*tagline).to_string());
-            m
-        })
-        .collect()
-}
-
-/// The `mode` knob every Antigravity model carries.
-///
-/// `--mode plan` is Antigravity's own plan mode: work the change out and say what it would be,
-/// rather than making it. It is a knob rather than a fifth [`neosh_proto::PermissionMode`] because
-/// it is not a statement about what may happen — the agent still reads and still runs what it
-/// needs to in order to answer — and `^E` is where everything a model can be told already lives.
-fn antigravity_mode() -> ProviderOptionDescriptor {
-    ProviderOptionDescriptor::Select {
-        id: "mode".into(),
-        label: "Mode".into(),
-        description: Some("Plan mode works the change out instead of making it".into()),
-        options: vec![
-            OptionChoice {
-                id: "default".into(),
-                label: "Build".into(),
-                description: Some("Make the change".into()),
-                is_default: true,
-            },
-            OptionChoice {
-                id: "plan".into(),
-                label: "Plan".into(),
-                description: Some("Say what it would do, and stop".into()),
-                is_default: false,
-            },
-        ],
-        current_value: None,
-        prompt_injected_values: Vec::new(),
+/// `/v1/models` names a model and says nothing about what it accepts, so a generation that shipped
+/// this morning arrived with no `^E` at all until somebody wrote it down. A rule — `gpt-6` takes
+/// this ladder — is written once per generation in `models.json`, and every model of it that an
+/// endpoint returns gets the ladder from the first day. Only where nothing else has spoken: a seed
+/// or an endpoint that listed its own parameters has said more than a prefix can.
+pub fn with_rules(instance: &str, mut models: Vec<ModelInfo>) -> Vec<ModelInfo> {
+    for m in &mut models {
+        if !m.capabilities.option_descriptors.is_empty() {
+            continue;
+        }
+        let knobs = manifest::knobs_for(instance, m.id.as_ref());
+        if knobs.is_empty() {
+            continue;
+        }
+        m.capabilities.thinking = knobs.iter().any(|d| manifest::is_reasoning(d.id()));
+        m.capabilities.option_descriptors = knobs;
     }
-}
-
-/// Models reachable through the `agy` CLI.
-///
-/// Seeds only: [`crate::drivers::AntigravityProvider::list_models`] asks `agy models` what this
-/// account is actually offered and replaces these. They are written down anyway because the list
-/// of models is how you decide whether to sign in, and a provider that shows an empty pane until
-/// you have is a provider nobody signs into.
-///
-/// Reasoning effort is part of the id rather than a knob beside it, because that is how
-/// Antigravity publishes them: `gemini-3.8-flash-high` and `gemini-3.8-flash-low` are two entries
-/// in `agy models`, not one entry with a ladder.
-pub fn antigravity_models() -> Vec<ModelInfo> {
-    use ModelTier::{Balanced, Fast, Frontier};
-    [
-        ("gemini-3.8-flash-high", "Gemini 3.8 Flash (High)", Frontier, "Thinks hardest"),
-        ("gemini-3.8-flash-medium", "Gemini 3.8 Flash (Medium)", Balanced, "The default"),
-        ("gemini-3.8-flash-low", "Gemini 3.8 Flash (Low)", Fast, "Quick answers"),
-        ("gemini-3.1-pro-high", "Gemini 3.1 Pro (High)", Frontier, "Most capable Gemini"),
-        ("claude-opus-4-6-thinking", "Claude Opus 4.6 (Thinking)", Frontier, "Anthropic, on your Antigravity plan"),
-        ("claude-sonnet-4-6", "Claude Sonnet 4.6 (Thinking)", Balanced, "Anthropic, for everyday work"),
-    ]
-    .into_iter()
-    .map(|(id, name, tier, tagline)| {
-        let mut m = ModelInfo::undescribed(id, name);
-        m.capabilities = ModelCapabilities {
-            tools: true,
-            vision: true,
-            streaming: true,
-            thinking: true,
-            prompt_caching: true,
-            option_descriptors: vec![antigravity_mode()],
-        };
-        m.family = Some("agent".to_string());
-        m.tier = Some(tier);
-        m.tagline = Some(tagline.to_string());
-        m
-    })
-    .collect()
+    models
 }
 
 fn instance(
@@ -814,7 +231,6 @@ fn instance(
     name: &str,
     base_url: Option<&str>,
     auth: AuthRef,
-    models: Vec<ModelInfo>,
 ) -> InstanceConfig {
     InstanceConfig {
         id: id.into(),
@@ -823,7 +239,8 @@ fn instance(
         base_url: base_url.map(str::to_string),
         brand: brand_for(id),
         auth,
-        models,
+        // By id, so a provider gains seeds — or a catalogue of its own — from a manifest edit.
+        models: manifest::models(id),
         extra_headers: Vec::new(),
     }
 }
@@ -896,23 +313,15 @@ fn brand_for(id: &str) -> Option<Brand> {
 pub fn builtin_instances() -> Vec<InstanceConfig> {
     vec![
         // --- plans: a subscription you already pay for -----------------
-        instance("claude-cli", "claude-cli", "Claude", None, cli("claude", "claude login"), claude_cli_models()),
-        instance("codex-cli", "codex-cli", "Codex", None, cli("codex", "codex login"), codex_cli_models()),
+        instance("claude-cli", "claude-cli", "Claude", None, cli("claude", "claude login")),
+        instance("codex-cli", "codex-cli", "Codex", None, cli("codex", "codex login")),
         // Antigravity carries its own Google login, including the access a Google AI
         // subscription comes with — so it belongs with the plans, not with the API keys.
-        instance("antigravity", "antigravity", "Antigravity", None, cli("agy", "agy"), antigravity_models()),
+        instance("antigravity", "antigravity", "Antigravity", None, cli("agy", "agy")),
         // Everything below speaks the Agent Client Protocol, so they are one driver pointed at
         // three programs. A fourth is a line here, not a file.
-        instance("cursor-cli", "cursor-cli", "Cursor", None, cli("cursor-agent", "cursor-agent login"), acp_models(&[
-            ("gpt-5.6-sol", "GPT-5.6 Sol", ModelTier::Frontier, "Frontier agentic coding"),
-            ("claude-opus-5", "Claude Opus 5", ModelTier::Frontier, "Most capable for complex work"),
-            ("claude-sonnet-5", "Claude Sonnet 5", ModelTier::Balanced, "Best for everyday tasks"),
-            ("composer-1", "Composer", ModelTier::Fast, "Cursor's own, tuned for speed"),
-        ])),
-        instance("grok-cli", "grok-cli", "Grok", None, cli("grok", "grok login"), acp_models(&[
-            ("grok-4.6", "Grok 4.6", ModelTier::Frontier, "Latest Grok"),
-            ("grok-4.5", "Grok 4.5", ModelTier::Balanced, "Previous generation"),
-        ])),
+        instance("cursor-cli", "cursor-cli", "Cursor", None, cli("cursor-agent", "cursor-agent login")),
+        instance("grok-cli", "grok-cli", "Grok", None, cli("grok", "grok login")),
         // Google stopped serving Gemini CLI for individual accounts on 18 June 2026 — Code Assist
         // for individuals, AI Pro and AI Ultra all at once — and withdrew "Login with Google"
         // along with them; Code Assist Standard and Enterprise are unchanged, and everyone else is
@@ -929,35 +338,32 @@ pub fn builtin_instances() -> Vec<InstanceConfig> {
             // `^S` on the provider is where the rest of it is said.
             "Individual accounts ended 18 June 2026 — Code Assist Standard and Enterprise still \
              work. Use a Gemini API key instead.",
-        ), acp_models(&[
-            ("gemini-3.1-pro-preview", "Gemini 3.1 Pro", ModelTier::Frontier, "Most capable Gemini"),
-            ("gemini-3.8-flash", "Gemini 3.8 Flash", ModelTier::Balanced, "Quick, for everyday work"),
-            ("gemini-3.1-flash-lite", "Gemini 3.1 Flash Lite", ModelTier::Fast, "Cheapest and fastest"),
-        ])),
+        )),
         // --- API keys: billed per token --------------------------------
-        instance("anthropic", "anthropic", "Anthropic", Some("https://api.anthropic.com"), env("ANTHROPIC_API_KEY"), anthropic_models()),
-        instance("google", "google", "Google Gemini", Some("https://generativelanguage.googleapis.com/v1beta"), env("GEMINI_API_KEY"), seed_models("google")),
+        instance("anthropic", "anthropic", "Anthropic", Some("https://api.anthropic.com"), env("ANTHROPIC_API_KEY")),
+        instance("google", "google", "Google Gemini", Some("https://generativelanguage.googleapis.com/v1beta"), env("GEMINI_API_KEY")),
         // --- OpenAI-compatible endpoints -------------------------------
-        instance("openai", "openai-compat", "OpenAI", Some("https://api.openai.com/v1"), env("OPENAI_API_KEY"), seed_models("openai")),
-        instance("openrouter", "openai-compat", "OpenRouter", Some("https://openrouter.ai/api/v1"), env("OPENROUTER_API_KEY"), vec![]),
-        instance("groq", "openai-compat", "Groq", Some("https://api.groq.com/openai/v1"), env("GROQ_API_KEY"), vec![]),
-        instance("deepseek", "openai-compat", "DeepSeek", Some("https://api.deepseek.com/v1"), env("DEEPSEEK_API_KEY"), seed_models("deepseek")),
-        instance("xai", "openai-compat", "xAI", Some("https://api.x.ai/v1"), env("XAI_API_KEY"), seed_models("xai")),
-        instance("mistral", "openai-compat", "Mistral", Some("https://api.mistral.ai/v1"), env("MISTRAL_API_KEY"), seed_models("mistral")),
-        instance("together", "openai-compat", "Together", Some("https://api.together.xyz/v1"), env("TOGETHER_API_KEY"), vec![]),
-        instance("fireworks", "openai-compat", "Fireworks", Some("https://api.fireworks.ai/inference/v1"), env("FIREWORKS_API_KEY"), vec![]),
-        instance("cerebras", "openai-compat", "Cerebras", Some("https://api.cerebras.ai/v1"), env("CEREBRAS_API_KEY"), vec![]),
+        instance("openai", "openai-compat", "OpenAI", Some("https://api.openai.com/v1"), env("OPENAI_API_KEY")),
+        instance("openrouter", "openai-compat", "OpenRouter", Some("https://openrouter.ai/api/v1"), env("OPENROUTER_API_KEY")),
+        instance("groq", "openai-compat", "Groq", Some("https://api.groq.com/openai/v1"), env("GROQ_API_KEY")),
+        instance("deepseek", "openai-compat", "DeepSeek", Some("https://api.deepseek.com/v1"), env("DEEPSEEK_API_KEY")),
+        instance("xai", "openai-compat", "xAI", Some("https://api.x.ai/v1"), env("XAI_API_KEY")),
+        instance("mistral", "openai-compat", "Mistral", Some("https://api.mistral.ai/v1"), env("MISTRAL_API_KEY")),
+        instance("together", "openai-compat", "Together", Some("https://api.together.xyz/v1"), env("TOGETHER_API_KEY")),
+        instance("fireworks", "openai-compat", "Fireworks", Some("https://api.fireworks.ai/inference/v1"), env("FIREWORKS_API_KEY")),
+        instance("cerebras", "openai-compat", "Cerebras", Some("https://api.cerebras.ai/v1"), env("CEREBRAS_API_KEY")),
         // --- local endpoints, no credentials ---------------------------
-        instance("ollama", "openai-compat", "Ollama (local)", Some("http://localhost:11434/v1"), AuthRef::None, vec![]),
-        instance("llamacpp", "openai-compat", "llama.cpp (local)", Some("http://localhost:8080/v1"), AuthRef::None, vec![]),
-        instance("lmstudio", "openai-compat", "LM Studio (local)", Some("http://localhost:1234/v1"), AuthRef::None, vec![]),
-        instance("vllm", "openai-compat", "vLLM (local)", Some("http://localhost:8000/v1"), AuthRef::None, vec![]),
+        instance("ollama", "openai-compat", "Ollama (local)", Some("http://localhost:11434/v1"), AuthRef::None),
+        instance("llamacpp", "openai-compat", "llama.cpp (local)", Some("http://localhost:8080/v1"), AuthRef::None),
+        instance("lmstudio", "openai-compat", "LM Studio (local)", Some("http://localhost:1234/v1"), AuthRef::None),
+        instance("vllm", "openai-compat", "vLLM (local)", Some("http://localhost:8000/v1"), AuthRef::None),
     ]
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use neosh_proto::ModelTier;
 
     #[test]
     fn a_provider_you_have_not_signed_into_still_lists_what_it_offers() {
@@ -975,7 +381,7 @@ mod tests {
 
     #[test]
     fn discovery_says_what_exists_and_the_catalogue_says_how_it_reads() {
-        let seeds = seed_models("openai");
+        let seeds = manifest::models("openai");
         let known = seeds[0].id.clone();
         let discovered = vec![
             ModelInfo::undescribed(known.0.as_str(), known.0.as_str()),
@@ -996,7 +402,7 @@ mod tests {
     /// installed — so the driver's answer is taken whole, including its absence.
     #[test]
     fn why_a_model_cannot_be_run_survives_the_merge() {
-        let seeds = seed_models("openai");
+        let seeds = manifest::models("openai");
         let known = seeds[0].id.clone();
         let mut said = ModelInfo::undescribed(known.0.as_str(), known.0.as_str());
         said.unavailable = Some("needs a newer CLI".into());
@@ -1014,7 +420,7 @@ mod tests {
     fn a_seeded_model_the_endpoint_does_not_serve_is_not_offered() {
         // The endpoint is the authority on what your account can reach. Keeping a seed it did not
         // return would offer a model whose first turn is a 404.
-        let seeds = seed_models("openai");
+        let seeds = manifest::models("openai");
         let discovered = vec![ModelInfo::undescribed("only-this", "only-this")];
         let merged = merge(discovered, &seeds);
         assert_eq!(merged.len(), 1);
@@ -1025,7 +431,7 @@ mod tests {
     fn nothing_from_the_endpoint_leaves_the_seeds_standing() {
         // Offline, or no key. Falling through to an empty list would make the provider look broken
         // rather than unauthenticated.
-        let seeds = seed_models("mistral");
+        let seeds = manifest::models("mistral");
         assert_eq!(merge(vec![], &seeds).len(), seeds.len());
     }
 
@@ -1221,6 +627,23 @@ mod tests {
         );
     }
 
+    /// A generation nobody has written a row for yet still arrives with its ladder, because the
+    /// rule for its prefix is in the catalogue — and a model somebody *did* describe keeps what
+    /// they said.
+    #[test]
+    fn a_discovered_model_gets_its_generations_knobs_from_the_rules() {
+        let found = with_rules("openai", vec![ModelInfo::undescribed("gpt-6-nova", "GPT-6 Nova")]);
+        let ids: Vec<&str> = found[0].capabilities.option_descriptors.iter().map(|d| d.id()).collect();
+        assert_eq!(ids, vec!["effort"], "the gpt-6 rule, not the gpt-5 one");
+        assert!(found[0].capabilities.thinking);
+
+        let unknown = with_rules("openai", vec![ModelInfo::undescribed("o-something", "?")]);
+        assert!(unknown[0].capabilities.option_descriptors.is_empty(), "no rule, no invented knob");
+
+        let pro = with_rules("google", vec![ModelInfo::undescribed("gemini-2.5-pro-002", "?")]);
+        assert!(pro[0].capabilities.option_descriptors.is_empty(), "2.5 Pro rejects the switch");
+    }
+
     #[test]
     fn local_instances_require_no_credentials() {
         for id in ["ollama", "llamacpp", "lmstudio", "vllm"] {
@@ -1258,7 +681,7 @@ mod tests {
     /// max`, and nothing on the page mentions `verbosity`.
     #[test]
     fn gpt_6_takes_max_and_neither_minimal_nor_verbosity() {
-        let astra = seed_models("openai")
+        let astra = manifest::models("openai")
             .into_iter()
             .find(|m| m.id.0 == "gpt-6-astra")
             .expect("Astra is seeded so it is visible before a key is present");
@@ -1277,7 +700,7 @@ mod tests {
         assert!(astra.capabilities.thinking, "an effort ladder is a model that reasons");
 
         // The generation below it keeps both, so this is a difference and not a rewrite.
-        let sol = seed_models("openai")
+        let sol = manifest::models("openai")
             .into_iter()
             .find(|m| m.id.0 == "gpt-5.6-sol")
             .expect("Sol is still current");
@@ -1327,7 +750,7 @@ mod tests {
         // The knob existed and only one vendor's models carried it, so `^E` on anything else said
         // "no options to set" — about models that document a reasoning parameter in their first
         // paragraph. Each of these is spelled the way its own endpoint spells it.
-        let openai = find(&seed_models("openai"), "gpt-5.6-sol");
+        let openai = find(&manifest::models("openai"), "gpt-5.6-sol");
         let effort = knobs(&openai).into_iter().find(|(id, _)| id == "effort").expect("a ladder");
         assert!(effort.1.contains(&"minimal".to_string()), "OpenAI's starts below low");
         assert!(!effort.1.contains(&"max".to_string()), "and does not borrow Anthropic's top rung");
@@ -1336,9 +759,9 @@ mod tests {
 
         // Gemini changed the shape of the question between generations, so the two are different
         // knobs rather than one knob with a translation layer nobody can see.
-        let three = find(&seed_models("google"), "gemini-3.1-pro-preview");
+        let three = find(&manifest::models("google"), "gemini-3.1-pro-preview");
         assert_eq!(knobs(&three)[0].0, "thinking_level");
-        let flash = find(&seed_models("google"), "gemini-2.5-flash");
+        let flash = find(&manifest::models("google"), "gemini-2.5-flash");
         assert_eq!(knobs(&flash)[0].0, "thinking");
     }
 

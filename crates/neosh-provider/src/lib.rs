@@ -26,9 +26,11 @@ pub mod credentials;
 pub mod drivers;
 pub mod image;
 pub mod injection;
+pub mod manifest;
 pub mod quota;
 pub mod registry;
 pub mod sse;
+pub mod t3code;
 
 use std::pin::Pin;
 

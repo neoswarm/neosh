@@ -9924,6 +9924,48 @@ fn an_address_in_the_add_project_field_offers_to_clone_it() {
     );
 }
 
+/// Cloning is a row of its own, not only something the field does once you have pasted an address.
+///
+/// A capability that exists only after you have guessed it does is one nobody finds: the field took
+/// a URL all along, and nothing on it said so. `Clone a repository…` asks for the address and hands
+/// it to the same clone the pasted one goes through — here, as far as its asking where.
+#[test]
+fn adding_a_project_offers_to_clone_one() {
+    if !have_git() {
+        return;
+    }
+    let sb = Sandbox::new("clonerow");
+    sb.git_init();
+    let src = clone_source(&sb, "acme", "thing");
+    let mut s = sb.start();
+    s.wait_for("PROJECTS");
+
+    s.send(&command("project.open"));
+    assert!(
+        s.pump(|s| s.float_named("[Add project").iter().any(|l| l.contains("Clone a repository"))),
+        "the row is there before anything is typed\n{:?}",
+        s.float_named("[Add project")
+    );
+    s.type_text("clone");
+    assert!(
+        s.pump(|s| s.float_named("[Add project").iter().any(|l| l.contains("Clone a repository"))),
+        "and found by its name\n{:?}",
+        s.float_named("[Add project")
+    );
+    s.enter();
+    assert!(
+        s.pump(|s| s.float_named("[prompt]").iter().any(|l| l.contains("Clone a repository"))),
+        "it asks for the address\n{:?}",
+        s.float_named("[prompt]")
+    );
+    s.type_text(&format!("file://{}", src.display()));
+    s.enter();
+    assert!(
+        s.pump(|s| !s.float_named("[Clone acme/thing").is_empty()),
+        "and the clone takes it from there: where to put it"
+    );
+}
+
 /// A path is still a path. The shorthand must not eat the thing this field is mainly for.
 #[test]
 fn a_path_in_the_add_project_field_is_not_read_as_a_repository() {
@@ -9936,8 +9978,13 @@ fn a_path_in_the_add_project_field_is_not_read_as_a_repository() {
     // Two segments, exactly the shape the shorthand takes — and a path, because of the `~`.
     s.type_text("~/");
 
+    // Waited on as *completions*: the menu's own rows say `/` in their description, so a row with
+    // a slash in it is no evidence that what was typed has been read.
     assert!(
-        s.pump(|s| s.float_named("[Add project").iter().any(|l| l.contains('/'))),
+        s.pump(|s| {
+            let rows = s.float_named("[Add project");
+            rows.iter().any(|l| l.starts_with("> ~/")) && !rows.iter().any(|l| l.contains("Type a path"))
+        }),
         "it completed directories\n{:?}",
         s.float_named("[Add project")
     );
@@ -10144,7 +10191,7 @@ impl Peer {
         sb.write_config(&format!(
             "[swarm]\nenabled = true\nlisten = \"\"\nheartbeat_secs = 1\n\
              accepts_shells = {}\n\n\
-             [[swarm.peers]]\naddr = \"{addr}\"\nid = \"{}\"\nname = \"{name}\"\n",
+             [[swarm.peers]]\naddr = \"{addr}\"\nid = \"{}\"\nname = \"{name}\"\n{EVERY_COMPUTER}",
             shells.ours,
             theirs.id()
         ));
@@ -10964,6 +11011,114 @@ fn asking_which_computer_happens_when_one_of_them_has_the_project() {
     assert!(
         rows.iter().any(|l| l.contains("linux-box")),
         "with the machine that has it beside it:\n{rows:?}"
+    );
+}
+
+/// What every swarm test's terminal has already answered. These are tests of the panel a terminal
+/// for *every* computer draws, and with a machine paired and nothing chosen the first thing a
+/// terminal does is ask which one it is for — a modal, which would take the keys the test sends.
+const EVERY_COMPUTER: &str = "\n[options]\n\"swarm.device\" = \"all\"\n";
+
+/// With another computer up and nothing chosen, a terminal asks which computer it is for — and
+/// `esc` is every one of them, the answer that hides nothing.
+#[test]
+fn a_terminal_asks_which_computer_it_is_for_when_there_is_a_choice() {
+    let sb = Sandbox::new("swarm-which-device");
+    let peer = Peer::beside(&sb, "linux-box");
+    peer.publish(
+        vec![theirs("git:github.com/neoswarm/faraway", "faraway", "/srv/faraway", "/srv/faraway", None)],
+        Vec::new(),
+    );
+    let path = sb.root.join("config/config.toml");
+    let cfg = std::fs::read_to_string(&path).expect("read config");
+    std::fs::write(&path, cfg.replace(EVERY_COMPUTER, "")).expect("unpin the device");
+
+    let mut s = sb.start();
+    assert!(
+        s.pump(|s| !s.picker_named("[Which computer?]").is_empty()),
+        "the question is asked:\n{}",
+        s.transcript()
+    );
+    assert!(
+        s.pump(|s| {
+            let rows = s.picker_named("[Which computer?]");
+            rows.iter().any(|l| l.contains("linux-box")) && rows.iter().any(|l| l.contains("All computers"))
+        }),
+        "with the machine on it, and every computer once it is up:\n{:?}",
+        s.picker_named("[Which computer?]")
+    );
+
+    s.special("esc");
+    assert!(
+        s.pump(|s| s.buffer_named("[Which computer?]").is_none_or(|b| s.windows_for(b).is_empty())),
+        "esc answers it"
+    );
+    assert!(
+        s.pump(|s| {
+            let rows = s.sidebar_now();
+            rows.iter().any(|l| l.contains("PROJECTS")) && rows.iter().any(|l| l.contains("LINUX-BOX"))
+        }),
+        "with every computer:\n{:?}",
+        s.sidebar_now()
+    );
+}
+
+/// A terminal for one computer shows that computer as though it were yours, and `/device all` gives
+/// it every one back.
+///
+/// What narrows is the panel, not the workspace: this machine's project is off the column while the
+/// terminal is for `linux-box`, and saying `all` puts it back without anything having stopped.
+#[test]
+fn a_terminal_for_another_computer_shows_only_that_computer() {
+    let sb = Sandbox::new("swarm-one-device");
+    let peer = Peer::beside(&sb, "linux-box");
+    peer.publish(
+        vec![theirs("git:github.com/neoswarm/faraway", "faraway", "/srv/faraway", "/srv/faraway", None)],
+        Vec::new(),
+    );
+    let mut s = sb.start();
+    let ours = |rows: &[String]| rows.iter().any(|l| l.contains(" work"));
+    assert!(
+        s.pump(|s| {
+            let rows = s.sidebar_now();
+            ours(&rows) && rows.iter().any(|l| l.contains("faraway"))
+        }),
+        "every computer to begin with:\n{:?}",
+        s.sidebar_now()
+    );
+
+    s.send(&command_with("device", "linux-box"));
+    assert!(
+        s.pump(|s| {
+            let rows = s.sidebar_now();
+            !ours(&rows) && rows.iter().any(|l| l.contains("faraway"))
+        }),
+        "only linux-box's projects:\n{:?}",
+        s.sidebar_now()
+    );
+    // Drawn as though it were this computer: the heading every panel has, with which machine said
+    // once beside it, somewhere to add a project, and nothing about the computers it is not for.
+    let rows = s.sidebar_now();
+    assert!(
+        rows.iter().any(|l| l.contains("PROJECTS") && l.contains("@lb") && l.contains("linux-box")),
+        "PROJECTS, and which computer, quietly:\n{rows:?}"
+    );
+    assert!(!rows.iter().any(|l| l.contains("LINUX-BOX")), "not a section heading:\n{rows:?}");
+    let at = |needle: &str| rows.iter().position(|l| l.contains(needle));
+    assert!(
+        matches!((at("PROJECTS"), at("faraway"), at("+ Add project")), (Some(h), Some(p), Some(a)) if h < p && p < a),
+        "the heading, its projects, then somewhere to add one:\n{rows:?}"
+    );
+    assert!(!rows.iter().any(|l| l.contains("other computer")), "and no count of the rest:\n{rows:?}");
+
+    s.send(&command_with("device", "all"));
+    assert!(
+        s.pump(|s| {
+            let rows = s.sidebar_now();
+            ours(&rows) && rows.iter().any(|l| l.contains("faraway"))
+        }),
+        "every computer again:\n{:?}",
+        s.sidebar_now()
     );
 }
 

@@ -1276,6 +1276,10 @@ pub enum InputEvent {
         /// arrival gets the ordinary placement rather than an error nobody can act on.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         session: Option<SessionId>,
+        /// Which computer this terminal is for — `neosh connect <name>`. See
+        /// [`crate::ViewDevice`]; `None` leaves it to the `swarm.device` setting.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        device: Option<crate::ViewDevice>,
     },
     /// The last terminal looking at a view has gone.
     ///
@@ -1389,6 +1393,9 @@ pub enum ClientMessage {
         /// Open in this conversation. See [`InputEvent::Attached::session`].
         #[serde(default, skip_serializing_if = "Option::is_none")]
         session: Option<SessionId>,
+        /// For this computer. See [`InputEvent::Attached::device`].
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        device: Option<crate::ViewDevice>,
     },
     Input {
         #[serde(flatten)]

@@ -4,7 +4,9 @@ title: Scripting
 description: neosh agent is the workspace without a screen. Start conversations, watch them, steer them, read what they produced — from a shell loop, from CI, or from another coding agent.
 ---
 
-`neosh "why is the composer eating my paste"` starts a conversation in this directory, sends that, and draws the answer arriving. It is the terminal, with the first question already asked. Quote it when the first word is also a subcommand name: `neosh status of the build` runs `neosh status`.
+`neosh prompt why is the composer eating my paste` starts a conversation in this directory, sends that, and draws the answer arriving. It is the terminal, with the first question already asked. It is a word of its own — `neosh why is this slow` is refused, with the `neosh prompt` line it meant — because a typo'd subcommand used to become a question sent to a model.
+
+`neosh ls` lists the computers this workspace can reach (`--json` for a script), and `neosh connect <name>` opens a terminal on one of them. See [Machines](/docs/machines).
 
 `neosh agent` is the headless half. It sends the **same `ApiCall` a plugin sends**, over the **same socket a terminal attaches to** — so what a script can do is exactly what a plugin can do, and a conversation started this way is an ordinary one that `^T` lists and you can take over.
 

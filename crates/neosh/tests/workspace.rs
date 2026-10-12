@@ -180,6 +180,17 @@ impl Client {
     }
 
     fn attach_sized(socket: &Path, protocol: u32, width: u16, height: u16) -> Self {
+        Self::attach_for(socket, protocol, width, height, None)
+    }
+
+    /// Attach as `neosh connect` does: saying which computer this terminal is for.
+    fn attach_for(
+        socket: &Path,
+        protocol: u32,
+        width: u16,
+        height: u16,
+        device: Option<neosh_proto::ViewDevice>,
+    ) -> Self {
         let stream = UnixStream::connect(socket).expect("connect");
         let read = stream.try_clone().expect("clone");
         let (tx, rx) = std::sync::mpsc::channel();
@@ -209,8 +220,9 @@ impl Client {
             // here has to care: an unknown stamp is not a difference. See `BuildId::same_as`.
             build: Default::default(),
             // Wherever the workspace would have put us. Asking for a conversation by name is what
-            // `neosh "a prompt"` does, and no test here is that.
+            // `neosh prompt` does, and no test here is that.
             session: None,
+            device,
         });
         c
     }
@@ -1260,6 +1272,61 @@ impl Script {
     }
 }
 
+fn views(s: &mut Script) -> Vec<neosh_proto::ViewInfo> {
+    match s.call(neosh_proto::ApiCall::ViewList) {
+        neosh_proto::ApiOk::Views { views } => views,
+        other => panic!("expected the terminals, got {other:?}"),
+    }
+}
+
+/// A terminal says which computer it is for, and the workspace keeps the answer where a plugin
+/// arriving late can read it — `neosh connect` is that, said as the terminal attaches.
+///
+/// And the answer belongs to the *terminal*: one that leaves takes it with it, so the next to be
+/// handed the kept screen without naming a computer is asked again rather than inheriting a choice
+/// somebody else made.
+#[test]
+fn a_terminal_says_which_computer_it_is_for() {
+    use neosh_proto::{ApiCall, NodeId, ViewDevice};
+    let sb = Sandbox::new("device");
+    let ws = sb.serve("hello_turn.jsonl");
+    let mut s = Script::open(&ws.socket);
+
+    let there = ViewDevice::Node { node: NodeId("0123abcd".into()) };
+    let mut t = Client::attach_for(
+        &ws.socket,
+        neosh_proto::PROTOCOL_VERSION,
+        100,
+        34,
+        Some(there.clone()),
+    );
+    // Narrowed to a computer this workspace has never paired: none of this one's projects, and a
+    // line saying why the list is empty rather than an empty list.
+    t.until("the panel, narrowed to that computer", |c| c.shows("not a paired computer"));
+    let seen = views(&mut s);
+    assert_eq!(seen.len(), 1, "one terminal: {seen:?}");
+    assert_eq!(seen[0].device, Some(there), "it arrived saying which computer");
+
+    // Pointed somewhere else through the API, which is what `/device` does.
+    s.subscribe();
+    s.call(ApiCall::ViewSetDevice { view: Some(seen[0].view), device: Some(ViewDevice::Here) });
+    s.until_event("the change announced", |e| {
+        matches!(e, neosh_proto::PluginEvent::ViewDevice { device: Some(ViewDevice::Here), .. })
+    });
+    assert_eq!(views(&mut s)[0].device, Some(ViewDevice::Here));
+
+    t.leave();
+    t.until("the terminal to go", |c| c.ended.is_some());
+    drop(t);
+    let mut u = Client::attach(&ws.socket, neosh_proto::PROTOCOL_VERSION);
+    u.ready();
+    assert_eq!(
+        views(&mut s)[0].device,
+        None,
+        "a terminal handed the kept screen without naming a computer is asked again"
+    );
+}
+
 fn sessions(s: &mut Script) -> Vec<neosh_proto::SessionInfo> {
     match s.call(neosh_proto::ApiCall::SessionList { include_archived: true }) {
         neosh_proto::ApiOk::Sessions { sessions } => sessions,
@@ -1467,6 +1534,7 @@ fn attaching_into_a_named_conversation_beats_the_screen_that_was_left_behind() {
         height: 34,
         build: Default::default(),
         session: Some(made.id.clone()),
+        device: None,
     });
     asked.ready();
 
