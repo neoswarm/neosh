@@ -1,6 +1,6 @@
 {
   "name": "@neosh/settings",
-  "version": "0.4.11",
+  "version": "0.5.0",
   "description": "Every setting in the workspace on one screen, saved to config.toml as you change it.",
   "license": "MIT",
   "type": "module",
