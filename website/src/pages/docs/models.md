@@ -43,6 +43,16 @@ Typing filters. `⇧⇥` and `←` reach the provider rail, `⇥` and `→` come
 
 Every provider lists models whether or not you have a key, because the list is how you decide whether signing in is worth it. Once a key is present, the endpoint's own `/v1/models` decides what exists; a model the endpoint does not return is dropped even if the catalogue lists it.
 
+## Where the list comes from
+
+The model list has two halves. neosh's own, `models.json` in its repository, describes every model it knows: the rung it sits on, its knobs, its price, the CLI release it needs. The news comes from [t3code](https://github.com/pingdotgg/t3code)'s model manifest, which tracks the same `claude`, `codex` and `agy` CLIs and is updated the day a vendor ships. Each binary has a snapshot of it built in, and a running workspace fetches the newest from t3code's `main` every six hours (and when you press `^R` in the picker), so a model released today is in `^P` today — no new neosh needed. The file is small, and the request carries the last answer's `ETag`, so most checks get back "unchanged" with no body.
+
+What the news can change is narrow. A model t3code calls superseded is marked legacy here. A current model neosh doesn't list yet is added, just above the one it succeeds, and takes its rung, tagline and knobs from that model. It never takes a price, because a new model is often a new price. A copy that can't be read is ignored, and if the network is down the list you already have stays in use.
+
+A model that needs a newer vendor CLI shows up as soon as it is announced, greyed out with the update that unlocks it — `run claude update (2.1.290)` — rather than missing until you happen to update.
+
+`models.update = false` turns the fetching off. `models.url` points it somewhere else: a mirror behind a firewall, or a file of your own in the shape of t3code's `model-manifest.json`. The last fetched copy is kept in the cache directory, so a restart doesn't need the network.
+
 ## Plans
 
 `claude-cli`, `codex-cli` and `antigravity` drive the vendor's own CLI as a provider. None needs an API key, none stores a token, and none is offered unless the program is actually on your `$PATH`. Three things worth knowing:

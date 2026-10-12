@@ -21,6 +21,7 @@ import type {
   PluginContext,
   ProviderOptionDescriptor,
 } from "@neosh/api";
+import { MODELS_EVENT } from "@neosh/api";
 import type { PaneItem, RailItem } from "@neosh/api/ui";
 import { confirmDestructive, defineHighlights, picker, prompt, railPicker } from "@neosh/api/ui";
 import { installOptions, openOptions } from "./options.ts";
@@ -336,6 +337,9 @@ async function pickModel(neosh: Neosh): Promise<void> {
     // "sonnet" into the filter: the `s` signed you in instead. Anything the picker takes for
     // itself is a letter the filter can never contain.
     ownKeys: ["<C-s>", "<C-r>", "<C-a>", "<C-d>"],
+    // A newer catalogue landing while the list is open — usually the one `^R` just asked for — is
+    // a pane that should change under you rather than on the next keypress.
+    subscribe: (reload) => neosh.event.on(MODELS_EVENT, () => reload()),
     hints: "↵ use   ^S sign in   ^R refresh   ^A add   ^D remove   esc close",
     placeholder: "nothing here yet — `s` to sign in, or `n` to name a model yourself",
     async items(c) {

@@ -127,6 +127,17 @@ if want crates; then
     echo "error: the packaged neosh-plugins crate contains node_modules or macOS ._ sidecars." >&2
     exit 1
   fi
+
+  # Both catalogues are `include_str!`ed from beside the crate's Cargo.toml, so the same trap: a
+  # file that is not in the package is a crate that does not build from crates.io.
+  step "the model catalogues are in the packaged neosh-provider crate"
+  provider_files=$(cargo package --list --allow-dirty -p neosh-provider)
+  for required in models.json t3code-models.json; do
+    if ! grep -qx "$required" <<<"$provider_files"; then
+      echo "error: $required is missing from the packaged neosh-provider crate." >&2
+      exit 1
+    fi
+  done
 fi
 
 if want binary; then

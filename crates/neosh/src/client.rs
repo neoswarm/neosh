@@ -222,14 +222,16 @@ fn line(msg: &ClientMessage) -> anyhow::Result<Vec<u8>> {
 /// Attach this terminal to `stream` and draw until something ends it.
 ///
 /// `session` is the conversation to open in, which is `None` for every attach but the one
-/// `neosh "a prompt"` makes: it has just started a conversation and this terminal is the reason
-/// it did. See [`neosh_proto::InputEvent::Attached`].
+/// `neosh prompt` makes: it has just started a conversation and this terminal is the reason it
+/// did. `device` is the computer this terminal is for — `neosh connect <name>` — and `None` leaves
+/// it to the `swarm.device` setting. See [`neosh_proto::InputEvent::Attached`].
 pub async fn attach(
     stream: UnixStream,
     session: Option<neosh_proto::SessionId>,
+    device: Option<neosh_proto::ViewDevice>,
 ) -> anyhow::Result<Ended> {
     let (mut ui, mut input_rx) = TerminalUi::enter()?;
-    let result = run(stream, session, &mut ui, &mut input_rx).await;
+    let result = run(stream, session, device, &mut ui, &mut input_rx).await;
     // The terminal comes back whatever happened, including a failure: leaving somebody in the
     // alternate screen with no program running is worse than any error message.
     let _ = ui.shutdown().await;
@@ -239,6 +241,7 @@ pub async fn attach(
 async fn run(
     stream: UnixStream,
     session: Option<neosh_proto::SessionId>,
+    device: Option<neosh_proto::ViewDevice>,
     ui: &mut TerminalUi,
     input_rx: &mut tokio::sync::mpsc::UnboundedReceiver<InputEvent>,
 ) -> anyhow::Result<Ended> {
@@ -263,6 +266,7 @@ async fn run(
             height,
             build: crate::build::capture().clone(),
             session,
+            device,
         })?)
         .await?;
     write.flush().await?;
@@ -389,7 +393,7 @@ fn stale(workspace: &BuildId, terminal: &BuildId) -> Option<String> {
 /// The arguments a *terminal* we replace ourselves with should be given.
 ///
 /// The workspace's arguments plus nothing, which is the point: not `args_os()`, because the one
-/// thing on that command line that must not be repeated is the prompt. `neosh "why is this slow"`
+/// thing on that command line that must not be repeated is the prompt. `neosh prompt why is this slow`
 /// starts a conversation and says that in it, and a relaunch carrying it forward would ask the
 /// question a second time, in a second conversation, on the far side of an update nobody connected
 /// it to.

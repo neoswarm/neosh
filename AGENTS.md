@@ -568,6 +568,34 @@ is `docs/releasing.md`.
   the seconds it took. Worktrees are somebody's branch and are left alone. A tree git refuses to
   move is filed, not announced; a pull that brought something is one line, because it is news you
   did not ask for.
+- **A model list is ours, and the news about it is t3code's.** Vendors ship weekly and a
+  catalogue bound to a release said nothing about a new model until a release reached every
+  machine. So the models — names, rungs, taglines, knobs, prices, CLI floors — are data,
+  `crates/neosh-provider/models.json` (`neosh_provider::manifest`), and what has shipped *since* is
+  read from somebody whose job is keeping up anyway: t3code's `model-manifest.json`, which
+  describes the same three CLIs we drive and is updated the day a model lands. A snapshot of it is
+  compiled in (`t3code-models.json`, refreshed by `scripts/sync-models.sh`, which `bump.sh` runs),
+  a running workspace fetches theirs from their `main` (`crate::models`, every six hours and on `^R`
+  in the picker, with an `ETag`), and the catalogue in use is always **ours with theirs laid over
+  it** (`neosh_provider::t3code::apply`) — never theirs instead of ours, because their knobs are
+  translated by their adapters and ours are read by our drivers. What it may change is narrow:
+  `legacy` follows their `status`; a *current* model we do not list is added — directly above the
+  model of ours it succeeds, and never above a first row that is still current, since that row is
+  what a fresh install lands on — and borrows family, rung, tagline and knobs from the model they
+  file under the same profile, or the line its alias names, or the same id in another catalogue of
+  ours; a price is never borrowed. A CLI floor of ours stands over theirs, because ours were read
+  off the CLI's own refusals. A model nobody here has a sibling for gets its knobs *translated*
+  from their descriptors and only the ones a driver can send survive. Their `updatedAt` decides
+  between two copies of *theirs* — at least as new and different replaces — and ours is never in
+  that comparison, so editing `models.json` takes effect on the next build whatever GitHub says.
+  Their file owes us no stability: it is read field by field, refused whole when it describes none
+  of our CLIs, and the copy in use stays. **Endpoints stay code** — a base URL, a credential and a
+  brand change when somebody writes a driver — and `instance()` reads its models by id. `rules`
+  give a model an endpoint discovered and nobody described the knobs of its generation, by prefix.
+  A swap renews only built-in instances whose models are still the ones we built, so a
+  `[[providers]]` entry that took over an id keeps its own list, and is announced as
+  `neosh.models.changed`, which an open picker reloads on. A mock never fetches: a test that asked
+  GitHub is a flaky test.
 - **A driver's account of its own loop is not a content block.** Sub-agents, plans, compaction and
   the commands a driver accepts go in `ProviderEvent::Activity`; `TurnAssembler` never reads it. If
   something new has to be squeezed into `TextDelta` to be seen, the family is what to extend.
@@ -606,7 +634,7 @@ is `docs/releasing.md`.
   (`SwarmProbe`, `SwarmCommand`), by name and with the fix, because a call that returns `ok` having
   done nothing is the worst answer available. Fanning out is `SessionNew { activate: false }` —
   creating a conversation from a script must not move the transcript out from under somebody
-  reading one — and `neosh "a prompt"` therefore asks to attach *into* a named conversation
+  reading one — and `neosh prompt` therefore asks to attach *into* a named conversation
   (`Attach { session }`) rather than trusting that the newest one is where an arriving terminal
   lands: a workspace that has been sitting detached keeps a screen for whoever comes back, and that
   screen is somebody else's.
@@ -659,6 +687,30 @@ is `docs/releasing.md`.
   `here.win.open(...)` lands where the person pressing the key is looking. `SessionChanged` names
   the terminal that moved, because "the active conversation" has as many answers as there are
   screens; a question waits until some terminal is reading its conversation and opens there.
+- **A window is for a computer, and the terminal says which.** A swarm draws every machine to
+  everyone, which is right for a list and wrong for the window you opened to work on the build box.
+  So a view carries a `ViewDevice` — `All`, `Here`, `Node`, or `Ask` — said on `Attach` by `neosh
+  connect`, kept on `ViewState` and reported on `ViewInfo` (a plugin loading after the terminal
+  arrived reads it there), changed by `ViewSetDevice` and announced as `PluginEvent::ViewDevice`.
+  The host does nothing else with it: the *question* is a picker and the *landing* is a mirror, so
+  both are the `devices` plugin's, and the project panel and `^N` read the same answer through
+  `view.device()` — which is how a third party's panel narrows with them. `None` is *nobody said*
+  and the `swarm.device` setting decides; a terminal handed a kept screen without naming one gets
+  `None`, because the last terminal's answer was about the last terminal. The question is asked
+  only when another computer is up or being dialled — a list whose only live row is this machine
+  is a keypress confirming it — and `esc` answers *every computer*, recorded as an answer so a
+  reload does not ask again. **It narrows what is shown and where things start, never what
+  exists**: a turn on a machine the window is not for keeps running. **And a window for another
+  computer is drawn as though it were the one you are sitting at** — `PROJECTS` and a rule in the
+  separator's colour, which machine said once beside the heading in a lowercase dim (`@lb
+  linux-box`, the code still in its colour), the marks in the colours your own rows wear rather
+  than the machine's, and `+ Add project` at the foot, which adds *there*: the path field opened
+  already pointed at it. A count of the computers it is not for used to end the panel, on the
+  argument that a narrowed column should not read as a workspace with nothing else in it; what it
+  read as in practice was a reminder on every frame that this was not your own computer, which is
+  the one thing a window opened *for* that computer must not say. `/device` is the way back.
+  An option whose choices are only known at run time gets a list in settings through
+  `settings.choose`, not an `enum` frozen at load.
 - **Every view gets every event.** `Agent` fans its stream out to one queue per view. Never a
   `broadcast` channel: lagging consumers drop the oldest, silently, under load — and a view that
   missed one `ToolFinished` has a card that spins forever with nothing to put it right.
@@ -1330,10 +1382,18 @@ embedded with `include_dir!` and cargo will not notice otherwise.
 
 # The command line
 
-`neosh` is the terminal; `neosh "a prompt"` is the terminal with the first question already asked,
-in a new conversation in this directory. Quote it when the first word is also a subcommand name —
-`neosh status of the build` runs `neosh status` and then complains about `of`, which is an error
-rather than a surprise, but an error all the same.
+`neosh` is the terminal; `neosh prompt …` is the terminal with the first question already asked,
+in a new conversation in this directory. It is a word of its own: whatever followed `neosh` used to
+be the question, which made every mistyped subcommand a message to a model — so `neosh why is this
+slow` is now refused with the `neosh prompt` line it meant, and a single word clap recognises as a
+typo of a command gets clap's suggestion and nothing else.
+
+`neosh ls` lists the computers the workspace can reach — code, name, link, conversations, and which
+one `neosh` opens on (`--json` too) — and `neosh connect [name]` is a terminal for one of them:
+`lb`, `linux-box`, `linux`, an id prefix, `here`, `all`, or no name to be asked. Both settle
+everything over the control socket before the screen is taken — the name, and for another machine
+the link, dialling one nobody is dialling — so a failure is a sentence in the shell. `neosh ls` is
+computers; `neosh agent ls` is conversations.
 
 Everything else the workspace can be asked for a person is under `neosh agent`, which takes no
 screen and answers `--json` for every verb: `start`, `ls`, `send`, `read`, `watch`, `wait`,
@@ -1379,7 +1439,7 @@ only way to do anything.
 | `^J` | The computers in this workspace. Add one by its address, allow one that is asking, rename one (`^E`), or open what it is running. A machine this one has reached that has not allowed it back says so, and says which key to press over there |
 | `^F` | What you have archived — see below. Filter it, put some back, or finally empty it |
 | `^N` | New conversation. With another computer paired it asks **which** first — this one, or any of them, each marked with whether it can be reached; with none paired that question is not asked at all. Then, in a repository, where: here, a worktree you need not name, one kept inside the project, one you do name, an existing one, elsewhere. A worktree you did not name is named by your first message — `fix/composer-paste-truncation`, not `wily-nimbus-7hq2` |
-| `^O` | Add a project. The filter line **is** the path field: `/`, `~` and `./` complete directories from the first keystroke, `⇥` walks into the highlighted one, `↵` takes what you typed. `linux-box:` completes on that computer instead. Paste a repository address — `https://…`, `git@…`, `file://…`, or just `owner/repo` — and it offers to **clone** it: it asks where, remembers the folders you pick, draws git's own progress while it fetches, and leaves you in the new project |
+| `^O` | Add a project. The filter line **is** the path field: `/`, `~` and `./` complete directories from the first keystroke, `⇥` walks into the highlighted one, `↵` takes what you typed. `linux-box:` completes on that computer instead. **Clone a repository…** is a row of its own, and asks for the address; pasting one — `https://…`, `git@…`, `file://…`, or just `owner/repo` — straight into the field offers to clone it too. Either way it asks where, remembers the folders you pick, draws git's own progress while it fetches, and leaves you in the new project |
 | `^B` | Toggle the sidebar |
 | `^K` | Command palette |
 | `/` | Completes a command by name — neosh's, and whatever the agent says it accepts. Keep typing; the composer is still the field, and `↵` sends what you typed when nothing matches |

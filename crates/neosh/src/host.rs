@@ -336,7 +336,7 @@ pub struct Bootstrap {
     pub config_file: Option<std::path::PathBuf>,
     /// Say this as soon as there is something that can answer it.
     ///
-    /// `neosh "a prompt"` in a process that *is* its own workspace — `--no-daemon`, the stdio
+    /// `neosh prompt` in a process that *is* its own workspace — `--no-daemon`, the stdio
     /// protocol, the tests. The attaching client cannot do it there, because there is nothing to
     /// attach to: this process is both ends. It waits for the end of startup rather than firing at
     /// launch, because until plugins have loaded there may be no provider that can serve the model
@@ -739,6 +739,12 @@ struct ViewState {
     /// Per terminal, not per pane: the second press is about this keyboard, and having to press it
     /// twice *in the same pane* would make a key that already needs explaining need it twice.
     quit_armed: Option<std::time::Instant>,
+    /// Which computer this terminal is for. See [`neosh_proto::ViewDevice`].
+    ///
+    /// Kept rather than forwarded, like everything a terminal arriving has to be told: a plugin
+    /// loaded after the terminal reads it off `view.list`, and an event it was not there for is an
+    /// answer it never hears.
+    device: Option<neosh_proto::ViewDevice>,
 }
 
 impl ViewState {
@@ -785,6 +791,7 @@ impl ViewState {
             tabline_win,
             entered: Some(session_id),
             quit_armed: None,
+            device: None,
         }
     }
 }
@@ -1179,6 +1186,9 @@ pub struct Host {
     /// lands.
     image_tx: tokio::sync::mpsc::UnboundedSender<Fetched>,
     image_rx: Option<tokio::sync::mpsc::UnboundedReceiver<Fetched>>,
+    /// The model catalogue: where an ask comes back to, and what it was asked against. See
+    /// [`crate::models`].
+    catalogue: Catalogue,
     /// Repositories by directory, discovered on demand.
     ///
     /// Keyed rather than singular because the *conversation* decides which repository is in play:
@@ -1691,6 +1701,29 @@ struct Fetched {
     result: Result<crate::images::Attachment, String>,
 }
 
+/// The model catalogue a workspace keeps current. See [`crate::models`].
+struct Catalogue {
+    tx: tokio::sync::mpsc::UnboundedSender<Result<crate::models::Fetched, String>>,
+    rx: Option<tokio::sync::mpsc::UnboundedReceiver<Result<crate::models::Fetched, String>>>,
+    /// Off until [`Host::watch_models`]: a workspace with no real providers — a mock, a test — has
+    /// no catalogue worth fetching, and a test suite that asked GitHub would be a flaky one.
+    watching: bool,
+    /// Where the last answer is kept, or nowhere under `--clean`.
+    cache: Option<std::path::PathBuf>,
+    /// One ask at a time: `^R` pressed twice is one request.
+    asking: bool,
+    /// The built-in instances as they were last built. What tells an instance still ours, whose
+    /// models a newer catalogue should replace, from one a config file replaced with its own.
+    built: Vec<neosh_proto::InstanceConfig>,
+}
+
+impl Catalogue {
+    fn new() -> Self {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        Self { tx, rx: Some(rx), watching: false, cache: None, asking: false, built: Vec::new() }
+    }
+}
+
 impl Host {
     pub fn new(
         agent: Arc<Agent>,
@@ -1820,6 +1853,7 @@ impl Host {
             subscribers: Default::default(),
             image_tx,
             image_rx: Some(image_rx),
+            catalogue: Catalogue::new(),
             repos: Default::default(),
             cwd: std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
             projects: Default::default(),
@@ -2910,9 +2944,22 @@ impl Host {
                                 .map(|p| p.session.clone())
                                 .unwrap_or_default(),
                             current: *id == here,
+                            device: v.device.clone(),
                         })
                         .collect(),
                 })
+            }
+            ApiCall::ViewSetDevice { view, device } => {
+                let view = view.unwrap_or_else(|| self.serving());
+                let Some(state) = self.views.get_mut(&view) else {
+                    return Err(ApiError::NotFound { what: format!("terminal {}", view.0) });
+                };
+                // Said only when it moved, so a plugin answering its own event cannot loop.
+                if state.device != device {
+                    state.device = device.clone();
+                    self.broadcast(neosh_proto::PluginEvent::ViewDevice { view, device });
+                }
+                Ok(ApiOk::Unit)
             }
             // Deleting is that machine's to do, at that machine: a conversation there is its files,
             // its history and very possibly somebody's afternoon, and nothing over the swarm is
@@ -3497,7 +3544,7 @@ impl Host {
     /// somebody's screen — or there is only one — it lands in the most recent, and two views of
     /// one conversation is a perfectly good thing to be: same transcript, own scroll, own draft.
     ///
-    /// `want` overrides all of that, and is how `neosh "a prompt"` lands you in the conversation
+    /// `want` overrides all of that, and is how `neosh prompt` lands you in the conversation
     /// it just started rather than wherever the rule above would have put you.
     fn open_view(&mut self, view: neosh_proto::ViewId, want: Option<neosh_proto::SessionId>) {
         // Only one this workspace actually has. A conversation deleted between the client asking
@@ -3513,7 +3560,7 @@ impl Host {
                 self.views.insert(view, state);
             }
             // The kept screen is somebody else's conversation, and this terminal asked for one of
-            // its own. Moved rather than left, or `neosh "a prompt"` against a workspace that has
+            // its own. Moved rather than left, or `neosh prompt` against a workspace that has
             // been sitting detached shows you last week's transcript with a turn running out of
             // sight.
             if let Some(want) = want
@@ -8703,6 +8750,9 @@ impl Host {
             let _ = reply.send(Err(ApiError::Internal { message: why.into() }).into());
             return;
         }
+        if let ApiCall::AgentListModels { refresh: true, .. } = &call {
+            self.ask_for_models();
+        }
         // Answered when the command's owner answers, which for a handler that opens a picker is
         // when somebody closes it. Never on this loop: waiting here would freeze every terminal
         // attached to this workspace for the length of somebody else's function.
@@ -8798,6 +8848,82 @@ impl Host {
         let conversations = store.iter().filter(|s| !s.archived).count();
         drop(store);
         live.report(conversations, running);
+    }
+
+    /// Keep the model catalogue current from now on, keeping what is fetched in `cache`.
+    pub fn watch_models(&mut self, cache: Option<std::path::PathBuf>) {
+        self.catalogue.watching = true;
+        self.catalogue.cache = cache;
+        self.catalogue.built = catalog::builtin_instances();
+    }
+
+    /// Ask for the newest catalogue, unless that is switched off or already being asked.
+    fn ask_for_models(&mut self) {
+        if !self.catalogue.watching || self.catalogue.asking || !self.option_bool("models.update") {
+            return;
+        }
+        let url = self.editor.options().str("models.url").unwrap_or(crate::models::URL).trim().to_string();
+        if url.is_empty() {
+            return;
+        }
+        self.catalogue.asking = true;
+        let tx = self.catalogue.tx.clone();
+        let cache = self.catalogue.cache.clone();
+        tokio::spawn(async move {
+            let _ = tx.send(crate::models::fetch(&url, cache.as_deref()).await);
+        });
+    }
+
+    /// An ask came back. A failure is filed, never said: nothing is wrong with the copy in use, and
+    /// a machine offline for an afternoon would otherwise hear about it every six hours.
+    fn models_fetched(&mut self, fetched: Result<crate::models::Fetched, String>) {
+        self.catalogue.asking = false;
+        match fetched {
+            Ok(crate::models::Fetched::Installed { added, removed }) => {
+                tracing::info!(?added, ?removed, "a newer model catalogue is in use");
+                self.catalogue_changed();
+                self.broadcast(PluginEvent::Event {
+                    name: "neosh.models.changed".to_string(),
+                    data: Some(serde_json::json!({ "added": added, "removed": removed })),
+                    from: BUILTIN.to_string(),
+                });
+            }
+            Ok(crate::models::Fetched::Unchanged) => {}
+            Err(e) => tracing::debug!("could not fetch the model catalogue: {e}"),
+        }
+    }
+
+    /// Give every built-in instance the models the catalogue now in use describes.
+    ///
+    /// Only an instance whose models are still the ones we built it with: a `[[providers]]` entry
+    /// that took over a built-in id with a list of its own is somebody's decision, and a catalogue
+    /// arriving from GitHub is not a reason to undo it. Both copies are renewed — the base a `^R`
+    /// rebuilds from as well as the live registry — or the next reload would put the old list back.
+    fn catalogue_changed(&mut self) {
+        let fresh = catalog::builtin_instances();
+        let was = std::mem::replace(&mut self.catalogue.built, fresh.clone());
+        let renew = |inst: &mut neosh_proto::InstanceConfig| {
+            let old = was.iter().find(|o| o.id == inst.id);
+            let new = fresh.iter().find(|f| f.id == inst.id);
+            if let (Some(old), Some(new)) = (old, new)
+                && inst.models == old.models
+            {
+                inst.models = new.models.clone();
+            }
+        };
+        for inst in &mut self.startup.base_instances {
+            renew(inst);
+        }
+        {
+            let mut reg = self.agent.providers_mut();
+            let mut live: Vec<_> = reg.instances().cloned().collect();
+            for inst in &mut live {
+                renew(inst);
+                reg.add_instance(inst.clone());
+            }
+        }
+        // What was discovered was merged against the old seeds, so it is an answer about them.
+        self.model_cache.lock().expect("model cache poisoned").clear();
     }
 
     /// Take ownership of the agent drivers, so the mode can be mirrored into them later and a
@@ -12941,6 +13067,10 @@ impl Host {
         if self.answer_from_catalogue(&plugin, &id, &call) {
             return;
         }
+        // `^R` in the model picker asks every endpoint again, and the catalogue is one of them.
+        if let ApiCall::AgentListModels { refresh: true, .. } = &call {
+            self.ask_for_models();
+        }
         // Answered when the prompt closes rather than now: the host has to read the
         // keyboard before it knows whether a key was entered, and the plugin is
         // waiting to hear exactly that.
@@ -13297,7 +13427,7 @@ impl Host {
                     });
                 }
             }
-            InputEvent::Attached { session, .. } => {
+            InputEvent::Attached { session, device, .. } => {
                 let arriving = self.from.view;
                 // A terminal we have never met gets a screen of its own, in a conversation nobody
                 // else is reading. That is the whole of what a second window is for: you opened it
@@ -13305,6 +13435,13 @@ impl Host {
                 // would be the one thing guaranteed not to help.
                 if !self.views.contains_key(&arriving) {
                     self.open_view(arriving, session);
+                }
+                // Which computer it is for, before anybody is told it arrived: a plugin reads it
+                // off `view.list` in answer to `ViewAttached`. Set even when it is `None`, because
+                // a kept screen being handed to a new terminal is a new terminal — the last one's
+                // answer was about the last one, and `neosh` with no name asks again.
+                if let Some(v) = self.views.get_mut(&arriving) {
+                    v.device = device;
                 }
                 // A client that has never seen any of this. Whatever was queued for *this view*
                 // was queued for whoever was looking before — and nobody may have been — so it is
@@ -13761,6 +13898,14 @@ impl Host {
         let mut unasked_rx = self.unasked_rx.take();
         let mut relay_rx = self.relay_rx.take();
         let mut image_rx = self.image_rx.take();
+        let mut catalogue_rx = self.catalogue.rx.take();
+        // When the model catalogue is next asked for. A day away when nothing asks — a sandbox, a
+        // mock — which is the shape of every optional timer here.
+        let catalogue_due = tokio::time::sleep(match self.catalogue.watching {
+            true => crate::models::due_in(self.catalogue.cache.as_deref()),
+            false => Duration::from_secs(86_400),
+        });
+        tokio::pin!(catalogue_due);
         // `None` unless something is serving, in which case a `recv` on it is never ready — the
         // same shape as the swarm channel above, and for the same reason.
         let mut control_rx = self.control_rx.take();
@@ -13961,6 +14106,22 @@ impl Host {
                 () = &mut save, if saving => {
                     saving = false;
                     self.flush_sessions();
+                }
+                () = &mut catalogue_due => {
+                    self.ask_for_models();
+                    let next = match self.catalogue.watching {
+                        true => crate::models::EVERY,
+                        false => Duration::from_secs(86_400),
+                    };
+                    catalogue_due.as_mut().reset(Instant::now() + next);
+                }
+                Some(fetched) = async {
+                    match catalogue_rx.as_mut() {
+                        Some(rx) => rx.recv().await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    self.models_fetched(fetched);
                 }
                 () = &mut roster, if self.swarm_node.is_some() => {
                     self.publish_inventory_if_changed();
@@ -16545,6 +16706,28 @@ impl Host {
                 description: Some(
                     "Seconds without a keystroke that count as away, on a terminal that cannot \
                      report whether it has focus. Ignored by one that can."
+                        .into(),
+                ),
+            },
+            OptionSpec {
+                name: "models.update".into(),
+                ty: OptionType::Bool,
+                default: OptionValue::Bool(true),
+                description: Some(
+                    "Keep the model list current between releases: ask t3code's model manifest \
+                     what the claude, codex and agy CLIs serve every six hours (and on ^R in the \
+                     model picker), so a model shipped today is in ^P today. One small file, \
+                     usually answered \"unchanged\"."
+                        .into(),
+                ),
+            },
+            OptionSpec {
+                name: "models.url".into(),
+                ty: OptionType::Str,
+                default: OptionValue::Str(crate::models::URL.into()),
+                description: Some(
+                    "Where the model news is asked for — a mirror, or a file of your own in the \
+                     shape of t3code's model-manifest.json."
                         .into(),
                 ),
             },

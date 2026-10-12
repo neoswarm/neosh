@@ -270,6 +270,10 @@ fi
 
 set_json_version npm/neosh/package.json "$next" pins
 
+# The model list a release starts with, as of the day it was cut. Not fatal: offline, the release
+# carries the last snapshot and every running copy fetches the news anyway.
+scripts/sync-models.sh || echo "bump: could not refresh the t3code model snapshot — releasing the old one" >&2
+
 for move in "${moves[@]+"${moves[@]}"}"; do
   dir="${move%%=*}"
   to="${move#*=}"
@@ -281,7 +285,7 @@ done
 # all this touches, and a release should not wait on the index for a number it already knows.
 cargo update -w --offline >/dev/null 2>&1 || cargo update -w >/dev/null
 
-echo "written: Cargo.toml ($pins pins), Cargo.lock, npm/neosh/package.json, ${#moves[@]} npm package(s)"
+echo "written: Cargo.toml ($pins pins), Cargo.lock, npm/neosh/package.json, ${#moves[@]} npm package(s), the model snapshot"
 if [ "${#firsts[@]}" -gt 0 ]; then
   echo "first publish by hand, before or right after the tag: ${firsts[*]}"
   echo "  (cd plugins/builtin/<name> && npm publish --access public)"
@@ -296,7 +300,7 @@ if ! $tag; then
   exit 0
 fi
 
-git add Cargo.toml Cargo.lock npm/neosh/package.json
+git add Cargo.toml Cargo.lock npm/neosh/package.json crates/neosh-provider/t3code-models.json
 for move in "${moves[@]+"${moves[@]}"}"; do
   dir="${move%%=*}"
   git add "$dir/package.json"

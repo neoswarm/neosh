@@ -349,7 +349,7 @@ impl Handle {
                     self.to_host.closed().await;
                     break;
                 }
-                ClientMessage::Attach { protocol_version, width, height, build, session } => {
+                ClientMessage::Attach { protocol_version, width, height, build, session, device } => {
                     if protocol_version != neosh_proto::PROTOCOL_VERSION {
                         let _ = out.send(ServerMessage::Refused {
                             reason: format!(
@@ -385,8 +385,9 @@ impl Handle {
                     // Its own size. It used to be the smallest attached terminal's, because every
                     // view shared one transcript; a view has its own now, so a wide window is
                     // furnished wide and nobody else's screen is involved.
-                    let _ =
-                        self.to_host.send((from, InputEvent::Attached { width, height, session }));
+                    let _ = self
+                        .to_host
+                        .send((from, InputEvent::Attached { width, height, session, device }));
                 }
                 ClientMessage::Input { event } => {
                     let Some(from) = source else {

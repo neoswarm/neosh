@@ -507,7 +507,10 @@ impl Services {
                     // alone is enough — a discovered id with no name or rung is unpickable, and a
                     // written-down list is out of date the week after it is written.
                     Some(d) => match d.list_models(&inst).await {
-                        Ok(m) => neosh_provider::catalog::merge(m, &inst.models),
+                        Ok(m) => neosh_provider::catalog::with_rules(
+                            inst.id.as_ref(),
+                            neosh_provider::catalog::merge(m, &inst.models),
+                        ),
                         Err(e) => {
                             // Falling back to what was configured keeps an offline machine usable —
                             // and, more often, keeps a provider you have not signed into yet

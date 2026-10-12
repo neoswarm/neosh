@@ -6,5 +6,5 @@ description = "Every setting in the workspace on one screen — yours, neosh's a
 # What other plugins build on. A page is a curated list of options under a title; the panel's
 # buffer kind is where a third party binds a key of its own inside it.
 [provides]
-points = ["settings.page"]
+points = ["settings.page", "settings.choose"]
 kinds = ["neosh.settings", "neosh.settings.text"]

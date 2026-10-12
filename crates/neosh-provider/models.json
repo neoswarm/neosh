@@ -1,0 +1,529 @@
+{
+  "version": 1,
+  "knobs": {
+    "antigravity-mode": {
+      "type": "select",
+      "id": "mode",
+      "label": "Mode",
+      "description": "Plan mode works the change out instead of making it",
+      "options": [
+        {
+          "id": "default",
+          "label": "Build",
+          "description": "Make the change",
+          "is_default": true
+        },
+        {
+          "id": "plan",
+          "label": "Plan",
+          "description": "Say what it would do, and stop",
+          "is_default": false
+        }
+      ]
+    },
+    "claude-cli-effort-4.6": {
+      "type": "select",
+      "id": "effort",
+      "label": "Effort",
+      "description": "How much reasoning the model spends before answering.",
+      "options": [
+        {
+          "id": "low",
+          "label": "Low",
+          "is_default": false
+        },
+        {
+          "id": "medium",
+          "label": "Medium",
+          "is_default": false
+        },
+        {
+          "id": "high",
+          "label": "High",
+          "is_default": true
+        },
+        {
+          "id": "max",
+          "label": "Max",
+          "is_default": false
+        },
+        {
+          "id": "ultracode",
+          "label": "Ultracode",
+          "description": "Let it orchestrate sub-agents by default. Slower, and thorough.",
+          "is_default": false
+        },
+        {
+          "id": "ultrathink",
+          "label": "Ultrathink",
+          "description": "Past the top of the ladder — said in the message, not sent as a level.",
+          "is_default": false
+        }
+      ],
+      "current_value": "high",
+      "prompt_injected_values": [
+        "ultracode",
+        "ultrathink"
+      ]
+    },
+    "claude-cli-effort-5": {
+      "type": "select",
+      "id": "effort",
+      "label": "Effort",
+      "description": "How much reasoning the model spends before answering.",
+      "options": [
+        {
+          "id": "low",
+          "label": "Low",
+          "is_default": false
+        },
+        {
+          "id": "medium",
+          "label": "Medium",
+          "is_default": false
+        },
+        {
+          "id": "high",
+          "label": "High",
+          "is_default": true
+        },
+        {
+          "id": "xhigh",
+          "label": "X-high",
+          "is_default": false
+        },
+        {
+          "id": "max",
+          "label": "Max",
+          "is_default": false
+        },
+        {
+          "id": "ultracode",
+          "label": "Ultracode",
+          "description": "Let it orchestrate sub-agents by default. Slower, and thorough.",
+          "is_default": false
+        },
+        {
+          "id": "ultrathink",
+          "label": "Ultrathink",
+          "description": "Past the top of the ladder — said in the message, not sent as a level.",
+          "is_default": false
+        }
+      ],
+      "current_value": "high",
+      "prompt_injected_values": [
+        "ultracode",
+        "ultrathink"
+      ]
+    },
+    "claude-effort-4.6": {
+      "type": "select",
+      "id": "effort",
+      "label": "Effort",
+      "description": "How much reasoning the model spends before answering.",
+      "options": [
+        {
+          "id": "low",
+          "label": "Low",
+          "is_default": false
+        },
+        {
+          "id": "medium",
+          "label": "Medium",
+          "is_default": false
+        },
+        {
+          "id": "high",
+          "label": "High",
+          "is_default": true
+        },
+        {
+          "id": "max",
+          "label": "Max",
+          "is_default": false
+        }
+      ],
+      "current_value": "high"
+    },
+    "claude-effort-5": {
+      "type": "select",
+      "id": "effort",
+      "label": "Effort",
+      "description": "How much reasoning the model spends before answering.",
+      "options": [
+        {
+          "id": "low",
+          "label": "Low",
+          "is_default": false
+        },
+        {
+          "id": "medium",
+          "label": "Medium",
+          "is_default": false
+        },
+        {
+          "id": "high",
+          "label": "High",
+          "is_default": true
+        },
+        {
+          "id": "xhigh",
+          "label": "X-high",
+          "is_default": false
+        },
+        {
+          "id": "max",
+          "label": "Max",
+          "is_default": false
+        }
+      ],
+      "current_value": "high"
+    },
+    "context-1m-default": {
+      "type": "select",
+      "id": "context",
+      "label": "Context",
+      "description": "How much of the conversation the model can see at once.",
+      "options": [
+        {
+          "id": "200k",
+          "label": "200k",
+          "is_default": false
+        },
+        {
+          "id": "1m",
+          "label": "1M",
+          "description": "Premium pricing past 200k.",
+          "is_default": true
+        }
+      ],
+      "current_value": "1m"
+    },
+    "context-200k-default": {
+      "type": "select",
+      "id": "context",
+      "label": "Context",
+      "description": "How much of the conversation the model can see at once.",
+      "options": [
+        {
+          "id": "200k",
+          "label": "200k",
+          "is_default": true
+        },
+        {
+          "id": "1m",
+          "label": "1M",
+          "description": "Premium pricing past 200k.",
+          "is_default": false
+        }
+      ],
+      "current_value": "200k"
+    },
+    "effort-minimal-to-xhigh": {
+      "type": "select",
+      "id": "effort",
+      "label": "Effort",
+      "description": "How much reasoning the model spends before answering.",
+      "options": [
+        {
+          "id": "minimal",
+          "label": "Minimal",
+          "is_default": false
+        },
+        {
+          "id": "low",
+          "label": "Low",
+          "is_default": false
+        },
+        {
+          "id": "medium",
+          "label": "Medium",
+          "is_default": true
+        },
+        {
+          "id": "high",
+          "label": "High",
+          "is_default": false
+        },
+        {
+          "id": "xhigh",
+          "label": "X-high",
+          "is_default": false
+        }
+      ],
+      "current_value": "medium"
+    },
+    "fast-mode": {
+      "type": "boolean",
+      "id": "fast_mode",
+      "label": "Fast mode",
+      "description": "Same model, higher output rate, premium pricing.",
+      "current_value": false
+    },
+    "gemini-thinking-level": {
+      "type": "select",
+      "id": "thinking_level",
+      "label": "Thinking",
+      "description": "How much reasoning the model spends before answering.",
+      "options": [
+        {
+          "id": "low",
+          "label": "Low",
+          "is_default": false
+        },
+        {
+          "id": "high",
+          "label": "High",
+          "is_default": true
+        }
+      ],
+      "current_value": "high"
+    },
+    "gpt-5-effort": {
+      "type": "select",
+      "id": "effort",
+      "label": "Effort",
+      "description": "How much reasoning the model spends before answering.",
+      "options": [
+        {
+          "id": "minimal",
+          "label": "Minimal",
+          "is_default": false
+        },
+        {
+          "id": "low",
+          "label": "Low",
+          "is_default": false
+        },
+        {
+          "id": "medium",
+          "label": "Medium",
+          "is_default": true
+        },
+        {
+          "id": "high",
+          "label": "High",
+          "is_default": false
+        }
+      ],
+      "current_value": "medium"
+    },
+    "gpt-6-effort": {
+      "type": "select",
+      "id": "effort",
+      "label": "Effort",
+      "description": "How much reasoning the model spends before answering.",
+      "options": [
+        {
+          "id": "low",
+          "label": "Low",
+          "is_default": false
+        },
+        {
+          "id": "medium",
+          "label": "Medium",
+          "is_default": true
+        },
+        {
+          "id": "high",
+          "label": "High",
+          "is_default": false
+        },
+        {
+          "id": "xhigh",
+          "label": "X-high",
+          "is_default": false
+        },
+        {
+          "id": "max",
+          "label": "Max",
+          "is_default": false
+        }
+      ],
+      "current_value": "medium"
+    },
+    "thinking": {
+      "type": "boolean",
+      "id": "thinking",
+      "label": "Thinking",
+      "description": "Let it reason before answering.",
+      "current_value": false
+    },
+    "thinking-on": {
+      "type": "boolean",
+      "id": "thinking",
+      "label": "Thinking",
+      "description": "Let it reason before answering.",
+      "current_value": true
+    },
+    "verbosity": {
+      "type": "select",
+      "id": "verbosity",
+      "label": "Verbosity",
+      "description": "How much answer to write, independently of how hard it thought.",
+      "options": [
+        {
+          "id": "low",
+          "label": "Low",
+          "description": "Terse.",
+          "is_default": false
+        },
+        {
+          "id": "medium",
+          "label": "Medium",
+          "is_default": true
+        },
+        {
+          "id": "high",
+          "label": "High",
+          "description": "Explains itself.",
+          "is_default": false
+        }
+      ],
+      "current_value": "medium"
+    }
+  },
+  "catalogues": {
+    "anthropic": {
+      "prompt_caching": true,
+      "models": [
+        {"id": "claude-fable-5-1", "name": "Claude Fable 5.1", "family": "fable", "tier": "frontier", "tagline": "Deepest reasoning and long-running work", "context": 1000000, "max_output": 128000, "pricing": {"input_per_mtok": 10.0, "output_per_mtok": 50.0, "cache_read_per_mtok": 0.25, "cache_write_per_mtok": 12.5}, "options": ["claude-effort-5"]},
+        {"id": "claude-opus-5-5", "name": "Claude Opus 5.5", "family": "opus", "tier": "frontier", "tagline": "Most capable for complex work", "context": 1000000, "max_output": 128000, "pricing": {"input_per_mtok": 5.0, "output_per_mtok": 25.0, "cache_read_per_mtok": 0.5, "cache_write_per_mtok": 6.25}, "options": ["claude-effort-5", "fast-mode"]},
+        {"id": "claude-opus-5", "name": "Claude Opus 5", "family": "opus", "tier": "frontier", "tagline": "Most capable for complex work", "legacy": true, "context": 1000000, "max_output": 128000, "pricing": {"input_per_mtok": 5.0, "output_per_mtok": 25.0, "cache_read_per_mtok": 0.5, "cache_write_per_mtok": 6.25}, "options": ["claude-effort-5", "fast-mode"]},
+        {"id": "claude-sonnet-5", "name": "Claude Sonnet 5", "family": "sonnet", "tier": "balanced", "tagline": "Best for everyday tasks", "context": 1000000, "max_output": 128000, "pricing": {"input_per_mtok": 2.0, "output_per_mtok": 10.0, "cache_read_per_mtok": 0.2, "cache_write_per_mtok": 2.5}, "options": ["claude-effort-5"]},
+        {"id": "claude-fable-5", "name": "Claude Fable 5", "family": "fable", "tier": "frontier", "tagline": "Deepest reasoning and long-running work", "legacy": true, "context": 1000000, "max_output": 128000, "pricing": {"input_per_mtok": 10.0, "output_per_mtok": 50.0, "cache_read_per_mtok": 1.0, "cache_write_per_mtok": 12.5}, "options": ["claude-effort-5"]},
+        {"id": "claude-opus-4-8", "name": "Claude Opus 4.8", "family": "opus", "tier": "frontier", "tagline": "Most capable for complex work", "legacy": true, "context": 1000000, "max_output": 128000, "pricing": {"input_per_mtok": 5.0, "output_per_mtok": 25.0, "cache_read_per_mtok": 0.5, "cache_write_per_mtok": 6.25}, "options": ["claude-effort-5", "fast-mode"]},
+        {"id": "claude-opus-4-7", "name": "Claude Opus 4.7", "family": "opus", "tier": "frontier", "tagline": "Most capable for complex work", "legacy": true, "context": 1000000, "max_output": 128000, "pricing": {"input_per_mtok": 5.0, "output_per_mtok": 25.0, "cache_read_per_mtok": 0.5, "cache_write_per_mtok": 6.25}, "options": ["claude-effort-5"]},
+        {"id": "claude-opus-4-6", "name": "Claude Opus 4.6", "family": "opus", "tier": "frontier", "tagline": "Most capable for complex work", "legacy": true, "context": 1000000, "max_output": 128000, "pricing": {"input_per_mtok": 5.0, "output_per_mtok": 25.0, "cache_read_per_mtok": 0.5, "cache_write_per_mtok": 6.25}, "options": ["claude-effort-4.6"]},
+        {"id": "claude-sonnet-4-6", "name": "Claude Sonnet 4.6", "family": "sonnet", "tier": "balanced", "tagline": "Best for everyday tasks", "legacy": true, "context": 1000000, "max_output": 128000, "pricing": {"input_per_mtok": 3.0, "output_per_mtok": 15.0, "cache_read_per_mtok": 0.3, "cache_write_per_mtok": 3.75}, "options": ["claude-effort-4.6"]},
+        {"id": "claude-haiku-4-5", "name": "Claude Haiku 4.5", "family": "haiku", "tier": "fast", "tagline": "Fastest, for quick answers", "context": 200000, "max_output": 64000, "pricing": {"input_per_mtok": 1.0, "output_per_mtok": 5.0, "cache_read_per_mtok": 0.1, "cache_write_per_mtok": 1.25}}
+      ]
+    },
+    "antigravity": {
+      "prompt_caching": true,
+      "models": [
+        {"id": "gemini-3.8-flash-high", "name": "Gemini 3.8 Flash (High)", "family": "agent", "tier": "frontier", "tagline": "Thinks hardest", "options": ["antigravity-mode"], "thinking": true},
+        {"id": "gemini-3.8-flash-medium", "name": "Gemini 3.8 Flash (Medium)", "family": "agent", "tier": "balanced", "tagline": "The default", "options": ["antigravity-mode"], "thinking": true},
+        {"id": "gemini-3.8-flash-low", "name": "Gemini 3.8 Flash (Low)", "family": "agent", "tier": "fast", "tagline": "Quick answers", "options": ["antigravity-mode"], "thinking": true},
+        {"id": "gemini-3.1-pro-high", "name": "Gemini 3.1 Pro (High)", "family": "agent", "tier": "frontier", "tagline": "Most capable Gemini", "options": ["antigravity-mode"], "thinking": true},
+        {"id": "claude-opus-4-6-thinking", "name": "Claude Opus 4.6 (Thinking)", "family": "agent", "tier": "frontier", "tagline": "Anthropic, on your Antigravity plan", "options": ["antigravity-mode"], "thinking": true},
+        {"id": "claude-sonnet-4-6", "name": "Claude Sonnet 4.6 (Thinking)", "family": "agent", "tier": "balanced", "tagline": "Anthropic, for everyday work", "options": ["antigravity-mode"], "thinking": true}
+      ],
+      "rules": [
+        {"prefix": "", "options": ["antigravity-mode"]}
+      ]
+    },
+    "claude-cli": {
+      "prompt_caching": true,
+      "models": [
+        {"id": "claude-fable-5-1", "name": "Claude Fable 5.1", "family": "fable", "tier": "frontier", "tagline": "Deepest reasoning and long-running work", "context": 1000000, "options": ["claude-cli-effort-5", "context-1m-default"], "min_version": "2.1.251"},
+        {"id": "claude-opus-5-5", "name": "Claude Opus 5.5", "family": "opus", "tier": "frontier", "tagline": "Most capable for complex work", "context": 1000000, "options": ["claude-cli-effort-5", "fast-mode", "context-1m-default"]},
+        {"id": "claude-opus-5", "name": "Claude Opus 5", "family": "opus", "tier": "frontier", "tagline": "Most capable for complex work", "legacy": true, "context": 1000000, "options": ["claude-cli-effort-5", "fast-mode", "context-1m-default"], "min_version": "2.1.219"},
+        {"id": "claude-sonnet-5", "name": "Claude Sonnet 5", "family": "sonnet", "tier": "balanced", "tagline": "Best for everyday tasks", "context": 1000000, "options": ["claude-cli-effort-5", "context-200k-default"], "min_version": "2.1.197"},
+        {"id": "claude-haiku-4-5", "name": "Claude Haiku 4.5", "family": "haiku", "tier": "fast", "tagline": "Fastest, for quick answers", "context": 200000, "options": ["thinking"], "thinking": false},
+        {"id": "claude-fable-5", "name": "Claude Fable 5", "family": "fable", "tier": "frontier", "tagline": "Deepest reasoning and long-running work", "legacy": true, "context": 1000000, "options": ["claude-cli-effort-5", "context-1m-default"], "min_version": "2.1.170"},
+        {"id": "claude-opus-4-8", "name": "Claude Opus 4.8", "family": "opus", "tier": "frontier", "tagline": "Most capable for complex work", "legacy": true, "context": 1000000, "options": ["claude-cli-effort-5", "fast-mode"], "min_version": "2.1.154"},
+        {"id": "claude-opus-4-7", "name": "Claude Opus 4.7", "family": "opus", "tier": "frontier", "tagline": "Most capable for complex work", "legacy": true, "context": 1000000, "options": ["claude-cli-effort-5"], "min_version": "2.1.111"},
+        {"id": "claude-opus-4-6", "name": "Claude Opus 4.6", "family": "opus", "tier": "frontier", "tagline": "Most capable for complex work", "legacy": true, "context": 1000000, "options": ["claude-cli-effort-4.6"]},
+        {"id": "claude-opus-4-5", "name": "Claude Opus 4.5", "family": "opus", "tier": "frontier", "tagline": "Most capable for complex work", "legacy": true, "context": 200000, "options": ["claude-cli-effort-4.6"]},
+        {"id": "claude-sonnet-4-6", "name": "Claude Sonnet 4.6", "family": "sonnet", "tier": "balanced", "tagline": "Best for everyday tasks", "legacy": true, "context": 1000000, "options": ["claude-cli-effort-4.6", "context-200k-default"]}
+      ]
+    },
+    "codex-cli": {
+      "prompt_caching": true,
+      "models": [
+        {"id": "gpt-5.6-sol", "name": "GPT-5.6 Sol", "family": "gpt-5.6", "tier": "frontier", "tagline": "Frontier agentic coding", "options": ["effort-minimal-to-xhigh"]},
+        {"id": "gpt-5.6-terra", "name": "GPT-5.6 Terra", "family": "gpt-5.6", "tier": "balanced", "tagline": "Balanced, for everyday work", "options": ["effort-minimal-to-xhigh"]},
+        {"id": "gpt-5.6-luna", "name": "GPT-5.6 Luna", "family": "gpt-5.6", "tier": "fast", "tagline": "Fast and affordable", "options": ["effort-minimal-to-xhigh"]},
+        {"id": "gpt-5.5", "name": "GPT-5.5", "family": "gpt-5", "tier": "frontier", "tagline": "Complex coding and long-running work", "legacy": true, "options": ["effort-minimal-to-xhigh"]},
+        {"id": "gpt-5.4", "name": "GPT-5.4", "family": "gpt-5", "tier": "balanced", "tagline": "Strong for everyday coding", "legacy": true, "options": ["effort-minimal-to-xhigh"]},
+        {"id": "gpt-5.4-mini", "name": "GPT-5.4 Mini", "family": "gpt-5", "tier": "fast", "tagline": "Small, quick, cheap", "legacy": true, "options": ["effort-minimal-to-xhigh"]}
+      ],
+      "rules": [
+        {"prefix": "gpt-6", "options": ["gpt-6-effort"]},
+        {"prefix": "", "options": ["effort-minimal-to-xhigh"]}
+      ]
+    },
+    "cursor-cli": {
+      "prompt_caching": false,
+      "models": [
+        {"id": "gpt-5.6-sol", "name": "GPT-5.6 Sol", "family": "agent", "tier": "frontier", "tagline": "Frontier agentic coding"},
+        {"id": "claude-opus-5", "name": "Claude Opus 5", "family": "agent", "tier": "frontier", "tagline": "Most capable for complex work"},
+        {"id": "claude-sonnet-5", "name": "Claude Sonnet 5", "family": "agent", "tier": "balanced", "tagline": "Best for everyday tasks"},
+        {"id": "composer-1", "name": "Composer", "family": "agent", "tier": "fast", "tagline": "Cursor's own, tuned for speed"}
+      ]
+    },
+    "deepseek": {
+      "prompt_caching": false,
+      "models": [
+        {"id": "deepseek-reasoner", "name": "DeepSeek Reasoner", "family": "deepseek", "tier": "frontier", "tagline": "Thinks before it answers"},
+        {"id": "deepseek-chat", "name": "DeepSeek Chat", "family": "deepseek", "tier": "balanced", "tagline": "General purpose"}
+      ]
+    },
+    "gemini-cli": {
+      "prompt_caching": false,
+      "models": [
+        {"id": "gemini-3.1-pro-preview", "name": "Gemini 3.1 Pro", "family": "agent", "tier": "frontier", "tagline": "Most capable Gemini"},
+        {"id": "gemini-3.8-flash", "name": "Gemini 3.8 Flash", "family": "agent", "tier": "balanced", "tagline": "Quick, for everyday work"},
+        {"id": "gemini-3.1-flash-lite", "name": "Gemini 3.1 Flash Lite", "family": "agent", "tier": "fast", "tagline": "Cheapest and fastest"}
+      ]
+    },
+    "google": {
+      "prompt_caching": false,
+      "models": [
+        {"id": "gemini-3.1-pro-preview", "name": "Gemini 3.1 Pro", "family": "gemini-pro", "tier": "frontier", "tagline": "Most capable Gemini", "options": ["gemini-thinking-level"]},
+        {"id": "gemini-3.8-flash", "name": "Gemini 3.8 Flash", "family": "gemini-flash", "tier": "balanced", "tagline": "Quick, for everyday work", "options": ["gemini-thinking-level"]},
+        {"id": "gemini-3.1-flash-lite", "name": "Gemini 3.1 Flash Lite", "family": "gemini-flash-lite", "tier": "fast", "tagline": "Cheapest and fastest", "options": ["gemini-thinking-level"]},
+        {"id": "gemini-3.7-flash", "name": "Gemini 3.7 Flash", "family": "gemini-flash", "tier": "balanced", "tagline": "Previous generation", "legacy": true, "options": ["gemini-thinking-level"]},
+        {"id": "gemini-2.5-pro", "name": "Gemini 2.5 Pro", "family": "gemini-pro", "tier": "frontier", "tagline": "Previous generation", "legacy": true},
+        {"id": "gemini-2.5-flash", "name": "Gemini 2.5 Flash", "family": "gemini-flash", "tier": "balanced", "tagline": "Previous generation", "legacy": true, "options": ["thinking-on"]}
+      ],
+      "rules": [
+        {"prefix": "gemini-3", "options": ["gemini-thinking-level"]},
+        {"prefix": "gemini-2.5-pro", "options": []},
+        {"prefix": "gemini-2.5", "options": ["thinking-on"]}
+      ]
+    },
+    "grok-cli": {
+      "prompt_caching": false,
+      "models": [
+        {"id": "grok-4.6", "name": "Grok 4.6", "family": "agent", "tier": "frontier", "tagline": "Latest Grok"},
+        {"id": "grok-4.5", "name": "Grok 4.5", "family": "agent", "tier": "balanced", "tagline": "Previous generation"}
+      ]
+    },
+    "mistral": {
+      "prompt_caching": false,
+      "models": [
+        {"id": "mistral-large-latest", "name": "Mistral Large", "family": "mistral", "tier": "frontier", "tagline": "Most capable"},
+        {"id": "mistral-medium-latest", "name": "Mistral Medium", "family": "mistral", "tier": "balanced", "tagline": "General purpose"},
+        {"id": "mistral-small-latest", "name": "Mistral Small", "family": "mistral", "tier": "fast", "tagline": "Quick and cheap"},
+        {"id": "codestral-latest", "name": "Codestral", "family": "codestral", "tier": "balanced", "tagline": "Tuned for code"}
+      ]
+    },
+    "openai": {
+      "prompt_caching": false,
+      "models": [
+        {"id": "gpt-6-astra", "name": "GPT-6 Astra", "family": "astra", "tier": "frontier", "tagline": "Frontier reasoning and computer use", "options": ["gpt-6-effort"]},
+        {"id": "gpt-5.6-sol", "name": "GPT-5.6 Sol", "family": "sol", "tier": "frontier", "tagline": "Frontier agentic coding", "options": ["effort-minimal-to-xhigh", "verbosity"]},
+        {"id": "gpt-5.6-terra", "name": "GPT-5.6 Terra", "family": "terra", "tier": "balanced", "tagline": "Balanced, for everyday work", "options": ["effort-minimal-to-xhigh", "verbosity"]},
+        {"id": "gpt-5.6-luna", "name": "GPT-5.6 Luna", "family": "luna", "tier": "fast", "tagline": "Fast and affordable", "options": ["effort-minimal-to-xhigh", "verbosity"]},
+        {"id": "gpt-5.5", "name": "GPT-5.5", "family": "gpt", "tier": "frontier", "tagline": "Complex coding and long-running work", "legacy": true, "options": ["gpt-5-effort", "verbosity"]},
+        {"id": "gpt-5.4", "name": "GPT-5.4", "family": "gpt", "tier": "balanced", "tagline": "Strong for everyday coding", "legacy": true, "options": ["gpt-5-effort", "verbosity"]},
+        {"id": "gpt-5.4-mini", "name": "GPT-5.4 Mini", "family": "gpt", "tier": "fast", "tagline": "Small, quick, cheap", "legacy": true, "options": ["gpt-5-effort", "verbosity"]}
+      ],
+      "rules": [
+        {"prefix": "gpt-6", "options": ["gpt-6-effort"]},
+        {"prefix": "gpt-5.6", "options": ["effort-minimal-to-xhigh", "verbosity"]},
+        {"prefix": "gpt-5", "options": ["gpt-5-effort", "verbosity"]}
+      ]
+    },
+    "xai": {
+      "prompt_caching": false,
+      "models": [
+        {"id": "grok-4.6", "name": "Grok 4.6", "family": "grok", "tier": "frontier", "tagline": "Latest Grok"},
+        {"id": "grok-4.5", "name": "Grok 4.5", "family": "grok", "tier": "balanced", "tagline": "Previous generation", "legacy": true},
+        {"id": "grok-4.3", "name": "Grok 4.3", "family": "grok", "tier": "fast", "tagline": "Older and cheaper", "legacy": true}
+      ]
+    }
+  }
+}

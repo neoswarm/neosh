@@ -1,0 +1,4 @@
+name = "devices"
+version = "0.2.0"
+entry = "main.ts"
+description = "Which computer a terminal is for: asks when another one is connected, lands where you chose, and `/device` changes it."

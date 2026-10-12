@@ -43,7 +43,8 @@ const LIMIT: usize = 200;
 
 /// The fields, named once. `statusCheckRollup` is the expensive one and the reason this is not
 /// asked more often than it is.
-const FIELDS: &str = "number,state,isDraft,headRefName,title,url,statusCheckRollup";
+const FIELDS: &str =
+    "number,state,isDraft,headRefName,isCrossRepository,title,url,statusCheckRollup";
 
 /// Every pull request for the repository containing `dir`, open and closed.
 ///
@@ -128,6 +129,14 @@ fn parse_pulls(json: &str) -> Result<Vec<PullRequest>, VcsError> {
         if branch.is_empty() {
             // The join key. A pull request nothing can be matched against is one no row would ever
             // draw, so it is dropped here rather than carried to every caller to be skipped again.
+            continue;
+        }
+        // A fork's branch is named in somebody else's namespace, so its name says nothing about any
+        // checkout here — and the name it most often has is `main`. A contributor's pull request
+        // from their fork's `main`, closed a year ago, was `#843 closed` on your main checkout for
+        // ever: the join is by name because that is all a row has, so what cannot be joined by
+        // name is left out here rather than matched wrongly there.
+        if item.get("isCrossRepository").and_then(serde_json::Value::as_bool) == Some(true) {
             continue;
         }
         let draft = item.get("isDraft").and_then(serde_json::Value::as_bool).unwrap_or(false);
@@ -223,6 +232,21 @@ mod tests {
         assert_eq!(pulls[0].state, PullState::Draft, "a draft reads as OPEN with a flag");
         assert_eq!(pulls[1].state, PullState::Open);
         assert_eq!(pulls[2].state, PullState::Merged);
+    }
+
+    #[test]
+    fn a_pull_request_from_a_fork_is_not_about_a_branch_here() {
+        let pulls = parse_pulls(
+            r#"[{"number":843,"state":"CLOSED","isDraft":false,"headRefName":"main",
+                 "isCrossRepository":true,"title":"t","url":"u","statusCheckRollup":[]},
+                {"number":2,"state":"OPEN","isDraft":false,"headRefName":"fix/thing",
+                 "isCrossRepository":false,"title":"t","url":"u","statusCheckRollup":[]},
+                {"number":3,"state":"OPEN","isDraft":false,"headRefName":"older-gh",
+                 "title":"t","url":"u","statusCheckRollup":[]}]"#,
+        )
+        .expect("parses");
+        let numbers: Vec<u64> = pulls.iter().map(|p| p.number).collect();
+        assert_eq!(numbers, vec![2, 3], "a fork's `main` is not your `main`");
     }
 
     #[test]

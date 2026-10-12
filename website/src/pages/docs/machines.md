@@ -182,6 +182,33 @@ With no machine paired the question is not asked at all, and `^N` is the single 
 
 `n` on a project that is only on other computers skips straight to it: the row already knows which machines have it and where on each, so with one there is nothing to ask.
 
+## One window per computer
+
+A window is usually *for* one machine — a terminal on the build box beside one on your laptop — so each terminal can say which computer it is for. Its project panel shows only that machine, it opens in that machine's newest conversation, and `^N` starts there without asking.
+
+```bash
+neosh ls                  # every computer, its code, whether it is up, and which one `neosh` opens on
+neosh connect lb          # a terminal on linux-box — by its code, name, the start of its name, or id
+neosh connect here        # this computer only
+neosh connect all         # every computer at once, as one workspace
+neosh connect             # ask, whatever the setting says
+```
+
+`neosh connect` settles the name and waits for the link *before* taking the screen, so a name that matches nothing, or a machine that has not allowed this one, is a sentence in your shell rather than an empty window. A machine nobody is dialling is dialled.
+
+Plain `neosh` asks **which computer?** whenever another one is connected or on its way: this computer first, then each paired machine in its colour (the ones still connecting redraw as they arrive), and **All computers** once there is more than one to be all of. `↵` opens, `d` opens *and* makes it the default so the question is not asked again, and `esc` is every computer — the workspace as it always was. With no other computer up there is nothing to ask, and nothing is.
+
+The default is `swarm.device` — `ask`, `all`, `here`, or a computer's name or code — and lives on the **Computers** page of `/settings`, where `↵` offers the list:
+
+```toml
+[options]
+"swarm.device" = "linux-box"
+```
+
+Inside, `/device` asks again for this terminal, and `/device lb`, `/device all`, `/device here` answer without asking. A window for another computer looks like your own: the heading is `PROJECTS`, with `@lb linux-box` dim beside it, its projects are drawn the way yours are, and `+ Add project` adds one on that machine. Nothing stops when a window is pointed elsewhere: a turn on a machine this window is not for keeps running, and its notifications still arrive.
+
+For a plugin it is `neosh.view.device()`, `neosh.view.setDevice()` and `neosh.view.onDevice()` — the same answer the project panel and `^N` read.
+
 ## What moves, and what does not
 
 An agent belongs to the machine it was started on. Its files, shell and credentials are there, so what travels is descriptions of agents and requests to their owners, never the agent itself. The owner may refuse anything, whatever it advertised.

@@ -62,6 +62,24 @@ interface PageItem {
   options: Array<string | { name: string; label?: string }>;
 }
 
+/**
+ * A list to choose an option's value from, in place of the control its type would get.
+ *
+ * For a value whose choices are only known at run time — `swarm.device` is `ask`, `all`, `here` or
+ * the name of a computer you paired last week, which no `enum` declared at load could list. `↵` on
+ * the row runs `command` with `cmd.call`, and the handler opens whatever it likes, saves the value
+ * itself, and answers whether it changed. A string field is still what a type of `str` gets
+ * anywhere nobody contributed one.
+ */
+const POINT_CHOOSE = "settings.choose";
+interface ChooseItem {
+  option: string;
+  command: string;
+}
+
+/** The options somebody offered a list for, as of the last time the sections were worked out. */
+let choosable = new Set<string>();
+
 /** What a namespace is called as a section, where the prefix alone would not say it. */
 const TITLES: Record<string, string> = {
   agent: "Agent",
@@ -77,6 +95,7 @@ const TITLES: Record<string, string> = {
   usage: "Usage",
   plugins: "Plugins",
   update: "Updates",
+  swarm: "Computers",
   session: "Conversations",
   model: "Models",
   approvals: "Approvals",
@@ -86,6 +105,11 @@ const TITLES: Record<string, string> = {
 
 /** The namespaces in the order a person would look through them; anything else follows by name. */
 const ORDER = ["agent", "chat", "ui", "sidebar", "git", "worktree", "clone", "notify", "gen"];
+
+/** What a row says instead of its option's name, where the name would not say what it does. */
+const LABELS: Record<string, string> = {
+  "swarm.device": "New terminals open on",
+};
 
 /** Options whose value is prose, edited in a field that takes more than one line. */
 const PROSE = new Set(["agent.append_prompt", "agent.system_prompt"]);
@@ -230,6 +254,11 @@ async function sections(neosh: Neosh, entries: Map<string, OptionEntry>): Promis
   const out: Section[] = [];
 
   const pages = await neosh.ext.list<PageItem>(POINT_PAGE).catch(() => []);
+  choosable = new Set(
+    (await neosh.ext.list<ChooseItem>(POINT_CHOOSE).catch(() => []))
+      .map((c) => c.item?.option)
+      .filter((o): o is string => typeof o === "string"),
+  );
   for (const page of pages) {
     const item = page.item;
     if (!item || typeof item.title !== "string" || !Array.isArray(item.options)) continue;
@@ -249,13 +278,19 @@ async function sections(neosh: Neosh, entries: Map<string, OptionEntry>): Promis
   const nodes = await neosh.swarm.nodes().catch(() => []);
   const me = (await neosh.swarm.self().catch(() => null))?.id;
   const peers = nodes.filter((n) => n.info.id !== me);
+  // The settings about computers in general — which one a new terminal opens on — head the page
+  // about each computer, rather than being a section of their own that says the same word.
+  const swarmOptions: Row[] = [...entries.keys()]
+    .filter((name) => name.startsWith("swarm."))
+    .sort()
+    .map((name) => ({ kind: "option", name, label: LABELS[name] ?? humanize(name, false) }));
   if (peers.length > 0) {
     const codes = await neosh.cmd.call<Record<string, string> | null>("swarm.codes").catch(() => null);
     const colors = await neosh.cmd.call<Record<string, string> | null>("swarm.colors").catch(() => null);
     out.push({
       id: "computers",
       title: "Computers",
-      rows: peers.map((n) => ({
+      rows: [...swarmOptions, ...peers.map((n): Row => ({
         kind: "machine",
         id: n.info.id,
         name: n.info.name,
@@ -269,7 +304,7 @@ async function sections(neosh: Neosh, entries: Map<string, OptionEntry>): Promis
           : n.link.state === "down"
           ? "not connected"
           : "connecting",
-      })),
+      }))],
       note: "↵ changes the code a computer is drawn with — the @ms on its rows. ^J adds, renames and removes computers.",
     });
   }
@@ -278,6 +313,8 @@ async function sections(neosh: Neosh, entries: Map<string, OptionEntry>): Promis
   // page also lists it: a page is a shortcut, and the section is where the option *lives*.
   const byPrefix = new Map<string, string[]>();
   for (const name of [...entries.keys()].sort()) {
+    // Already on the Computers page, which is where somebody looking for them goes.
+    if (peers.length > 0 && name.startsWith("swarm.")) continue;
     // A name with no namespace — Vim's own `mapleader`, `timeoutlen` — is the editor's, and a
     // section each would be a rail of one-row pages.
     const prefix = name.includes(".") ? name.split(".")[0] ?? name : "editor";
@@ -298,7 +335,7 @@ async function sections(neosh: Neosh, entries: Map<string, OptionEntry>): Promis
       rows: (byPrefix.get(prefix) ?? []).map((name) => ({
         kind: "option",
         name,
-        label: humanize(name, !name.includes(".")),
+        label: LABELS[name] ?? humanize(name, !name.includes(".")),
       })),
     });
   }
@@ -514,7 +551,7 @@ async function draw(neosh: Neosh, s: Sheet): Promise<void> {
       // On the row the keys are on, what `↵` would do to a value you type rather than slide.
       if (focused && typed(entry) && width(painted.text) + 8 <= room) {
         const from = byteLength(line);
-        line += "  ↵ edit";
+        line += choosable.has(entry.name) ? "  ↵ choose" : "  ↵ edit";
         marks.push([i, from, byteLength(line), "Comment"]);
       }
     } else if (row.kind === "key") {
@@ -779,6 +816,17 @@ async function activateRow(neosh: Neosh, s: Sheet): Promise<void> {
     return;
   }
   if (!entry) return;
+  // Somebody offered a list for this one. Theirs to open and theirs to save; this redraws.
+  const chooser = (await neosh.ext.list<ChooseItem>(POINT_CHOOSE).catch(() => []))
+    .find((c) => c.item?.option === entry.name && typeof c.item.command === "string");
+  if (chooser) {
+    await neosh.cmd.call(chooser.item.command).catch((e: unknown) => neosh.notify(String(e), "warn"));
+    if (sheet !== s) return;
+    const fresh = await neosh.opt.entry(entry.name).catch(() => null);
+    if (fresh) s.entries.set(entry.name, fresh);
+    await draw(neosh, s);
+    return;
+  }
   const t = entry.type;
   if (t.type === "bool" || t.type === "enum") {
     await shift(neosh, s, 1, true);
