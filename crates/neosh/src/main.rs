@@ -23,6 +23,7 @@ mod devices;
 mod models;
 mod cards;
 mod clock;
+mod colour;
 mod diff;
 mod logo;
 mod config;

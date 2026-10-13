@@ -1113,6 +1113,13 @@ pub struct Host {
     /// [`neosh_provider::drivers::Unasked`].
     unasked_rx: Option<tokio::sync::mpsc::UnboundedReceiver<Unheard>>,
     unasked_tx: tokio::sync::mpsc::UnboundedSender<Unheard>,
+    /// Syntax colour a rebuilt transcript drew plain rather than wait for, being worked out beside
+    /// the loop, and the conversations it has finished some of. See [`crate::colour`].
+    colourist: crate::colour::Colourist,
+    coloured_rx: Option<tokio::sync::mpsc::UnboundedReceiver<neosh_proto::SessionId>>,
+    /// Whether the conversations likely to be opened next have been handed to the colourist yet.
+    /// Once a process: `neosh.ready` is said again after every reload.
+    coloured_ahead: bool,
     /// Questions and permission prompts on their way to or from another machine. See
     /// [`crate::relay`].
     relay_rx: Option<tokio::sync::mpsc::UnboundedReceiver<crate::relay::Relay>>,
@@ -1145,6 +1152,14 @@ pub struct Host {
     /// Held here instead and spent by the ending that was in the way, so the report survives the
     /// gap rather than falling into it.
     unheard: std::collections::HashSet<neosh_proto::SessionId>,
+    /// The set of background tasks a driver said between turns while this loop still had a turn
+    /// running there — the same gap as [`Self::unheard`], for [`Host::heard_background`].
+    ///
+    /// Dropped rather than held, the set a turn left behind it — a sub-agent let go of at its
+    /// `result` — was told to nobody, and the row said nothing was running until the next message
+    /// drained it out of the pipe. Held here, it is spent by the ending in the way; replaced by
+    /// anything newer the turn forwards itself, because that one is later on the same pipe.
+    unheard_background: std::collections::HashMap<neosh_proto::SessionId, Vec<neosh_proto::BackgroundTask>>,
     /// Set by a turn ending, cleared by the poll that follows it. See [`crate::quota::AFTER_TURN`].
     quota_due: bool,
     /// Conversations that were blocked on an answer as of the last `question.asking`.
@@ -1738,6 +1753,7 @@ impl Host {
         let (unasked_tx, unasked_rx) = tokio::sync::mpsc::unbounded_channel();
         let (relay_tx, relay_rx) = tokio::sync::mpsc::unbounded_channel();
         let (image_tx, image_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (coloured_tx, coloured_rx) = tokio::sync::mpsc::unbounded_channel();
 
         let screen = ViewState::furnish(&mut editor, neosh_proto::ViewId::LOCAL, here);
 
@@ -1838,6 +1854,9 @@ impl Host {
             quota_rx: Some(quota_rx),
             unasked_rx: Some(unasked_rx),
             unasked_tx,
+            colourist: crate::colour::Colourist::spawn(coloured_tx),
+            coloured_rx: Some(coloured_rx),
+            coloured_ahead: false,
             relay_rx: Some(relay_rx),
             relay_tx,
             offered: Default::default(),
@@ -1845,6 +1864,7 @@ impl Host {
             catalogues: Default::default(),
             catalogue_waiting: Default::default(),
             unheard: std::collections::HashSet::new(),
+            unheard_background: std::collections::HashMap::new(),
             quota_due: false,
             asking: Vec::new(),
             permitting: Vec::new(),
@@ -1965,6 +1985,9 @@ impl Host {
                 // request to somebody else's server.
                 | ApiCall::UpdateCheck { .. }
                 | ApiCall::UpdateApply
+                // A process launch per provider the first time: the keychain is asked whether it
+                // holds a key, and the model picker asks about every provider at once.
+                | ApiCall::ProviderCredentials
         )
     }
 
@@ -3014,6 +3037,7 @@ impl Host {
                 // Nothing left to hear out: the transcript this would have been drawn into is about
                 // to be deleted, and the CLI holding it is closed a few lines below.
                 self.unheard.remove(&session);
+                self.unheard_background.remove(&session);
                 self.driver_commands.remove(&session);
                 // A vendor CLI held open for this conversation has nothing left to answer. Left
                 // alone it would sit there for the rest of the program, holding a conversation
@@ -10659,12 +10683,10 @@ impl Host {
         let here = self.active_session();
         let running = self.turns.contains_key(&here);
         let offset = self.chat_clock().map(|(offset, _)| offset);
-        let (lines, marks, cards, times) = {
+        let ((lines, marks, cards, times), pending) = {
             let store = self.agent.sessions();
             let Some(s) = store.get(&here) else { return };
-            let (lines, marks, cards, times) =
-                transcript(s, ascii, limits, width, show_tools, running, offset);
-            (lines, marks, cards, times)
+            neosh_syntax::deferring(|| transcript(s, ascii, limits, width, show_tools, running, offset))
         };
         let plugin = PluginId::from(BUILTIN);
         // Marks first, and all of them: a mark clamps rather than dies when the line under it is
@@ -10687,6 +10709,7 @@ impl Host {
         // The rows the cards are on now. The ones recorded before addressed a buffer that has just
         // been replaced, and `⇥` or the next call joining a run would find a card by them.
         self.vm().cards = cards;
+        self.colourist.colour(here, pending);
     }
 
     fn enter_session(&mut self) {
@@ -10731,12 +10754,15 @@ impl Host {
         let here = self.active_session();
         let running = self.turns.contains_key(&here);
         let offset = self.chat_clock().map(|(offset, _)| offset);
-        let Some((lines, marks, cards, times, label)) = ({
+        let Some((lines, marks, cards, times, label, pending)) = ({
             let store = self.agent.sessions();
             store.get(&here).map(|s| {
-                let (lines, marks, cards, times) =
-                    transcript(s, ascii, limits, width, show_tools, running, offset);
-                (lines, marks, cards, times, s.label())
+                // Drawn now with whatever colour is already known, and coloured in a moment with
+                // the rest: see `crate::colour`.
+                let ((lines, marks, cards, times), pending) = neosh_syntax::deferring(|| {
+                    transcript(s, ascii, limits, width, show_tools, running, offset)
+                });
+                (lines, marks, cards, times, s.label(), pending)
             })
         }) else {
             return;
@@ -10784,6 +10810,7 @@ impl Host {
         // The rows the redraw just put the cards on. Everything recorded before the switch
         // addressed a buffer that no longer exists.
         self.vm().cards = cards;
+        self.colourist.colour(here.clone(), pending);
         self.ensure_usable_selection();
         // The mode belongs to the conversation, and a driver holds one mode for its whole process
         // rather than one per conversation — so arriving somewhere has to say which. Without it, a
@@ -11091,6 +11118,87 @@ impl Host {
             if let Some(u) = self.v().unanswered.filter(|u| *u > row) {
                 self.vm().unanswered = Some((i64::from(u) + delta).max(0) as u32);
             }
+        }
+    }
+
+    /// Some of the colour a rebuild of this conversation drew plain has been worked out: put it on
+    /// the cards, in every pane reading it.
+    fn coloured(&mut self, session: &neosh_proto::SessionId) {
+        for (view, pane) in self.panes_showing(session) {
+            self.in_pane(view, pane, Self::recolour_cards);
+        }
+    }
+
+    /// Re-mark every diff in this transcript from the memo, leaving its text alone.
+    ///
+    /// Marks only, and only on a card whose rows still say exactly what its body would: colour
+    /// never changes what a row says, so a card that differs has been redrawn since — opened,
+    /// folded, joined — and was coloured then. Nothing else is touched: not the scroll, the cursor,
+    /// a selection, an open answer or the working line, because this lands whenever the thread
+    /// finishes, which is in the middle of whatever you are doing.
+    fn recolour_cards(&mut self) {
+        if self.v().term {
+            return;
+        }
+        let g = self.glyphs();
+        let width = self.chat_width();
+        let limits = self.limits();
+        let buf = self.v().chat;
+        let mut redo: Vec<(u32, Vec<cards::Row>)> = Vec::new();
+        {
+            let Some(b) = self.editor.buffer(buf) else { return };
+            let lines = b.lines();
+            for card in &self.v().cards {
+                let [leg] = card.legs.as_slice() else { continue };
+                let Some(result) = leg.result.as_ref().filter(|r| !r.is_error) else { continue };
+                if cards::edits_of(&leg.input).is_empty() {
+                    continue;
+                }
+                let body = cards::body(&g, &leg.input, result, limits, card.open, width);
+                let at = card.row as usize + 1;
+                let same = !body.is_empty()
+                    && body.len() == card.body as usize
+                    && body
+                        .iter()
+                        .enumerate()
+                        .all(|(k, r)| lines.get(at + k).is_some_and(|l| l.text == r.text));
+                if same {
+                    redo.push((card.row + 1, body));
+                }
+            }
+        }
+        let plugin = PluginId::from(BUILTIN);
+        for (at, body) in redo {
+            let _ = self.editor.apply(&plugin, ApiCall::MarkClear {
+                ns: self.chat_ns,
+                buf,
+                start: Some(at),
+                end: Some(at + body.len() as u32),
+            });
+            for (k, r) in body.iter().enumerate() {
+                self.chat_row(at + k as u32, r);
+            }
+        }
+    }
+
+    /// Fill the colour memo for the conversations most likely to be opened next, off the loop.
+    ///
+    /// Read from their files by the colouring thread rather than copied out of the store, so the
+    /// loop spends nothing on it: a stale file is still the right diffs for every turn but the one
+    /// in flight, and that one is coloured as it arrives.
+    fn colour_ahead(&self, ids: Vec<neosh_proto::SessionId>) {
+        let Some(dir) = self.state_dir.clone() else { return };
+        let ascii = self.option_bool("ui.ascii_only");
+        let limits = self.limits();
+        let width = self.chat_width();
+        let show_tools = self.option_bool("chat.show_tools");
+        for id in ids {
+            let dir = dir.clone();
+            self.colourist.build(move || {
+                let Some(s) = crate::sessions::read(&dir, &id) else { return Default::default() };
+                neosh_syntax::deferring(|| transcript(&s, ascii, limits, width, show_tools, false, None))
+                    .1
+            });
         }
     }
 
@@ -12586,6 +12694,11 @@ impl Host {
                 // typed in the meantime is steered into that listening turn and asked at the end of
                 // it. The other way round, your turn would drain what the agent said and drop it —
                 // your message written over the thing it was answering.
+                // The same gap, for what is still running: said while this turn was winding down,
+                // so held until now. Before `hear_out`, which opens a turn and would park it again.
+                if let Some(tasks) = self.unheard_background.remove(&session) {
+                    self.heard_background(session.clone(), tasks);
+                }
                 if self.unheard.remove(&session) {
                     self.hear_out(session.clone());
                 }
@@ -12766,6 +12879,8 @@ impl Host {
             // away when the turn ends, and a shell that was put in the background is still running
             // after that.
             Activity::Background { tasks } => {
+                // Later on the same pipe than anything heard between turns and parked.
+                self.unheard_background.remove(&session);
                 if self.take_background(&session, tasks) {
                     // Nothing else is broadcast here: the activity itself already went out to every
                     // plugin above, and that is the signal that means what it means.
@@ -13566,17 +13681,20 @@ impl Host {
     /// changes: a detached shell finishes long after the turn that started it was read to its end.
     /// See [`neosh_provider::drivers::Unasked::background`].
     ///
-    /// Declined while a turn is running, and that is not belt-and-braces. The driver only speaks
-    /// here when nothing is reading, but a turn can attach in the gap between it deciding that and
-    /// this being handled — and then the level queued a moment ago would land on top of the one the
-    /// turn has already forwarded. A running turn is reading that pipe and reports the set itself,
-    /// in order, so there is nothing to lose by leaving it to.
+    /// Parked while a turn is running, never applied over it. The driver only speaks here when
+    /// nothing is reading, but a turn can attach in the gap between it deciding that and this being
+    /// handled — and then the level queued a moment ago would land on top of the one the turn has
+    /// already forwarded. Nor dropped: the turn in the way is usually the one that has just *ended*
+    /// and let go of the pipe a moment before its `TurnEnded` gets here, and a set dropped then is
+    /// one nothing says again. So it waits in [`Self::unheard_background`] for that ending, and
+    /// anything the turn forwards itself replaces it.
     fn heard_background(
         &mut self,
         session: neosh_proto::SessionId,
         tasks: Vec<neosh_proto::BackgroundTask>,
     ) {
         if self.turns.contains_key(&session) {
+            self.unheard_background.insert(session, tasks);
             return;
         }
         if !self.take_background(&session, tasks.clone()) {
@@ -13848,6 +13966,11 @@ impl Host {
         // The grammars, loaded beside this loop rather than on it the first time something wants
         // colouring. See `neosh_syntax::warm`.
         neosh_syntax::warm();
+        // And the keychain, for the same reason: the model picker's first question is about every
+        // provider at once. See `Credentials::look_ahead`.
+        let instances: Vec<neosh_proto::InstanceConfig> =
+            self.agent.providers().instances().cloned().collect();
+        neosh_provider::credentials::credentials().look_ahead(instances);
 
         // A single long sleep, reset on demand. Creating a new one per iteration would restart the
         // window on every mutation and a fast stream would never reach its deadline.
@@ -13896,6 +14019,7 @@ impl Host {
         // sitting there is one nobody knows exists.
         let mut quota_rx = self.quota_rx.take();
         let mut unasked_rx = self.unasked_rx.take();
+        let mut coloured_rx = self.coloured_rx.take();
         let mut relay_rx = self.relay_rx.take();
         let mut image_rx = self.image_rx.take();
         let mut catalogue_rx = self.catalogue.rx.take();
@@ -14043,6 +14167,13 @@ impl Host {
                     Unheard::Began(session) => self.hear_out(session),
                     Unheard::Background(session, tasks) => self.heard_background(session, tasks),
                 },
+                Some(session) = async {
+                    match coloured_rx.as_mut() {
+                        Some(rx) => rx.recv().await,
+                        // Never ready, rather than ready-with-nothing: the latter would spin.
+                        None => std::future::pending().await,
+                    }
+                } => self.coloured(&session),
                 Some(relay) = async {
                     match relay_rx.as_mut() {
                         Some(rx) => rx.recv().await,
@@ -14293,11 +14424,24 @@ impl Host {
         // finds out it has a state directory at all — under `--clean` it never does, and the
         // history is then in memory for as long as the process lives and nowhere afterwards.
         self.quota = crate::quota::QuotaStore::new(Some(&dir));
+        // The drivers were handed somewhere to keep a tool's pictures before there was a state
+        // directory to put it in, which is the `--clean` answer: a temporary directory the system
+        // empties on its own schedule. This is the first moment the real one is known.
+        let images = self.image_store();
+        for d in &self.agent_drivers {
+            d.set_image_store(images.clone());
+        }
 
-        let (saved, active) = crate::sessions::load(&dir);
+        let (mut saved, active) = crate::sessions::load(&dir);
         if saved.is_empty() {
             return;
         }
+        // And what they already put there is fetched back before it goes. See
+        // `sessions::adopt_stray_images`.
+        let adopted: Vec<neosh_proto::SessionId> = saved
+            .iter_mut()
+            .filter_map(|s| crate::sessions::adopt_stray_images(&images, s).then(|| s.id.clone()))
+            .collect();
         let restored = saved.len();
         // The session the store was constructed with is empty and unsaved; replacing the ordering
         // below drops it from the list, but it must not linger as a phantom "New conversation"
@@ -14345,9 +14489,7 @@ impl Host {
             let store = self.agent.sessions();
             store.iter().map(|s| s.cwd.clone()).collect()
         };
-        for dir in dirs {
-            self.remember_repo(dir).await;
-        }
+        self.remember_repos(dirs).await;
         // And the one that is active decides where "here" is, which is not necessarily where neosh
         // was started: reopening the last conversation you were in should put you back in *its*
         // project, not in whichever directory the shell happened to be sitting in.
@@ -14356,6 +14498,9 @@ impl Host {
             self.work_in(here).await;
         }
         self.enter_session();
+        for id in &adopted {
+            self.persist_soon(id);
+        }
         tracing::info!("restored {restored} conversation(s)");
     }
 
@@ -14542,33 +14687,52 @@ impl Host {
     }
 
     async fn remember_repo(&mut self, dir: std::path::PathBuf) {
-        if self.repos.contains_key(&dir) {
-            return;
-        }
-        let found = neosh_vcs::Git::discover(&dir).await;
-        if let Some(g) = &found {
-            tracing::info!(dir = %dir.display(), root = %g.root().display(), "git repository");
-            // Asked once, when the directory is first seen, and remembered. A label is read on
-            // every redraw of the panel and is not worth a `rev-parse` each time.
-            //
-            // Both asked at once: they are independent subprocesses, and this is awaited on the
-            // host loop the first time a directory is seen — the switch into a new project.
-            let ((branch, main), origin) = tokio::join!(g.identity(), g.origin_url());
-            self.projects.insert(
-                dir.clone(),
-                ProjectFacts {
-                    name: project_name(&dir, branch.clone(), main.clone()),
-                    repo_root: main.map(|p| p.display().to_string()),
-                    branch,
-                },
-            );
-            // Asked here for the same reason and at the same time as the name: once per directory,
-            // and the answer does not change while a checkout is open.
-            if let Some(key) = origin.and_then(|u| neosh_proto::ProjectKey::from_remote(&u)) {
-                self.project_keys.insert(dir.clone(), key);
+        self.remember_repos(vec![dir]).await;
+    }
+
+    /// [`Self::remember_repo`] for several directories at once.
+    ///
+    /// All of them asked together: each is a few independent subprocesses, and a workspace
+    /// restoring twenty conversations in a dozen checkouts asked them one directory after
+    /// another, on the host loop, before the first frame.
+    async fn remember_repos(&mut self, dirs: Vec<std::path::PathBuf>) {
+        let mut fresh: Vec<std::path::PathBuf> = Vec::new();
+        for dir in dirs {
+            if !self.repos.contains_key(&dir) && !fresh.contains(&dir) {
+                fresh.push(dir);
             }
         }
-        self.repos.insert(dir, found);
+        let found = futures::future::join_all(fresh.into_iter().map(|dir| async move {
+            let found = neosh_vcs::Git::discover(&dir).await;
+            let facts = match &found {
+                // Asked once, when the directory is first seen, and remembered. A label is read on
+                // every redraw of the panel and is not worth a `rev-parse` each time. Both at once:
+                // they are independent subprocesses.
+                Some(g) => Some(tokio::join!(g.identity(), g.origin_url())),
+                None => None,
+            };
+            (dir, found, facts)
+        }))
+        .await;
+        for (dir, found, facts) in found {
+            if let (Some(g), Some(((branch, main), origin))) = (&found, facts) {
+                tracing::info!(dir = %dir.display(), root = %g.root().display(), "git repository");
+                self.projects.insert(
+                    dir.clone(),
+                    ProjectFacts {
+                        name: project_name(&dir, branch.clone(), main.clone()),
+                        repo_root: main.map(|p| p.display().to_string()),
+                        branch,
+                    },
+                );
+                // Asked here for the same reason and at the same time as the name: once per
+                // directory, and the answer does not change while a checkout is open.
+                if let Some(key) = origin.and_then(|u| neosh_proto::ProjectKey::from_remote(&u)) {
+                    self.project_keys.insert(dir.clone(), key);
+                }
+            }
+            self.repos.insert(dir, found);
+        }
     }
 
     /// A branch was renamed: put right everything the host had written down about it.
@@ -14692,14 +14856,14 @@ impl Host {
         self.projects.remove(from);
         self.repos.remove(from);
         self.project_keys.remove(from);
-        self.remember_repo(to.to_path_buf()).await;
         // Every directory the move carried, not only the tree's root: a conversation in a
         // subdirectory has facts of its own under a key that has just changed.
-        for id in &moved {
-            let dir = { self.agent.sessions().get(id).map(|s| s.cwd.clone()) };
-            let Some(dir) = dir else { continue };
-            self.remember_repo(dir).await;
+        let mut dirs = vec![to.to_path_buf()];
+        {
+            let store = self.agent.sessions();
+            dirs.extend(moved.iter().filter_map(|id| store.get(id).map(|s| s.cwd.clone())));
         }
+        self.remember_repos(dirs).await;
 
         let old = from.display().to_string();
         let new = to.display().to_string();
@@ -16912,6 +17076,22 @@ impl Host {
     /// host is what said it. It is announced again after a reload, which is the same fact about the
     /// same workspace being true a second time.
     fn announce_ready(&mut self) {
+        // Here rather than at restore, because the length of a diff preview is a setting and the
+        // memo is keyed by what a card shows: coloured before the config had loaded, a
+        // workspace with `chat.diff_lines` set would fill the memo with previews nothing asks for.
+        if !std::mem::replace(&mut self.coloured_ahead, true) {
+            let ahead: Vec<neosh_proto::SessionId> = {
+                let store = self.agent.sessions();
+                store
+                    .order()
+                    .iter()
+                    .filter(|id| store.get(id).is_some_and(|s| !s.hidden() && !s.archived))
+                    .take(COLOUR_AHEAD)
+                    .cloned()
+                    .collect()
+            };
+            self.colour_ahead(ahead);
+        }
         self.report_unread_points();
         self.broadcast(PluginEvent::Event {
             name: READY_EVENT.to_string(),
@@ -17488,6 +17668,13 @@ async fn run_slow(svc: Services, call: ApiCall) -> ApiResult {
         // Off the loop for the same reason git is, and for a reason of its own: the number of
         // files it reads is exactly the number of conversations somebody has never thrown away.
         ApiCall::SessionsStored => svc.sessions_stored().await,
+        ApiCall::ProviderCredentials => {
+            let agent = svc.agent.clone();
+            tokio::task::spawn_blocking(move || agent.providers().credentials())
+                .await
+                .map(|credentials| ApiOk::Credentials { credentials })
+                .map_err(|e| ApiError::Internal { message: e.to_string() })
+        }
         other => Err(ApiError::Internal {
             message: format!("{other:?} is not a background call"),
         }),
@@ -17544,6 +17731,12 @@ fn machine_name() -> String {
         .filter(|h| !h.is_empty())
         .unwrap_or_else(|| "neosh".to_string())
 }
+
+/// How many of the most recently used conversations are coloured before anybody opens them.
+///
+/// Each is a few hundred milliseconds of one background thread, and the order is most recent first,
+/// so this is where `^T` usually goes next. Past it, a conversation is coloured when opened.
+const COLOUR_AHEAD: usize = 12;
 
 pub fn now_secs() -> i64 {
     std::time::SystemTime::now()

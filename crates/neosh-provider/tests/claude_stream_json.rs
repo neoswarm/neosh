@@ -507,6 +507,54 @@ async fn a_cli_that_dies_is_no_longer_running_anything() {
     );
 }
 
+/// A `claude` that lets a sub-agent go at the end of its answer.
+///
+/// A foreground agent still running when the turn's `result` is written is moved into the
+/// background there and then, so the set changes *after* the result — inside the window where the
+/// driver has asked how full the context is and is waiting for the answer. Here the change lands
+/// exactly in it, ahead of that answer.
+const LETS_GO: &str = r#"#!/bin/sh
+say() { printf '%s\n' "$1"; }
+while IFS= read -r line; do
+  case "$line" in
+    *'"subtype":"get_context_usage"'*)
+      say '{"type":"system","subtype":"background_tasks_changed","tasks":[{"task_id":"a1","task_type":"local_agent","description":"Audit the parser"}]}'
+      say '{"type":"control_response","response":{"subtype":"success","request_id":"x","response":{"totalTokens":10,"maxTokens":100}}}' ;;
+    *'"type":"user"'*)
+      say '{"type":"stream_event","session_id":"s","event":{"type":"message_start","message":{"model":"m","usage":{}}}}'
+      say '{"type":"stream_event","session_id":"s","event":{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}}'
+      say '{"type":"stream_event","session_id":"s","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"DELEGATED"}}}'
+      say '{"type":"stream_event","session_id":"s","event":{"type":"content_block_stop","index":0}}'
+      say '{"type":"stream_event","session_id":"s","event":{"type":"message_stop"}}'
+      say '{"type":"result","subtype":"success","is_error":false,"result":"DELEGATED","session_id":"s"}'
+      ;;
+  esac
+done
+"#;
+
+/// What a turn let go of on its way out is said by that turn, not by the next one.
+///
+/// Every other line read in that window belongs to whatever comes next and is held for it — and
+/// this one was too, so the row said nothing was running until another message was sent, and then
+/// said it the instant that message was. A turn is still attached, so the reader cannot say it
+/// either: if the turn does not, nobody does.
+#[tokio::test]
+async fn an_agent_let_go_of_at_the_end_of_a_turn_is_reported_by_that_turn() {
+    let fake = Fake::running("lets-go", LETS_GO);
+    let p = ClaudeCliProvider::new(fake.program());
+    let heard = heard_by(&p);
+
+    let first: Vec<ProviderEvent> =
+        p.stream(&inst(), req(&fake.dir, "one"), CancellationToken::new()).collect().await;
+    assert!(text_of(&first).contains("DELEGATED"));
+    let said = sets_of(&first).last().cloned().unwrap_or_default();
+    let heard = heard.0.lock().expect("heard lock poisoned").last().cloned().unwrap_or_default();
+    assert!(
+        said.iter().chain(&heard).any(|t| t.kind.as_deref() == Some("local_agent")),
+        "the sub-agent went into the background and nothing said so: turn {said:?}, between {heard:?}"
+    );
+}
+
 /// A `claude` that reports a limit in the middle of an answer, the way the real one does.
 ///
 /// The line is copied from a live run — `utilization` is the fraction the CLI carries, not the
