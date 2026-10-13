@@ -337,6 +337,25 @@ impl Credentials {
         }
     }
 
+    /// Ask the keychain about every one of these now, on a thread of its own, so the answers are
+    /// remembered before anything draws a list of them.
+    ///
+    /// A keychain answer is a process launch — `security` on a Mac, `secret-tool` elsewhere — and
+    /// the first [`survey`](Self::survey) asked for every instance in a row on the loop that also
+    /// draws the screen: a sixth of a second of a workspace starting up with nothing on it moving.
+    /// [`stored`](Self::stored) remembers hits and misses alike, so whichever of the two asks
+    /// second is a lookup. Nothing secret leaves the store: only whether there is one, and where.
+    pub fn look_ahead(self: Arc<Self>, instances: Vec<InstanceConfig>) {
+        if self.keychain.is_none() {
+            return;
+        }
+        let _ = std::thread::Builder::new().name("neosh-keychain".into()).spawn(move || {
+            for cfg in &instances {
+                let _ = self.source(cfg);
+            }
+        });
+    }
+
     /// One row per instance, in the order given.
     pub fn survey<'a>(
         &self,

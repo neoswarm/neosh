@@ -30,11 +30,20 @@
 //!
 //! # Cost, and what stops it
 //!
-//! Parsing is per call and nothing is cached: a card is highlighted once, when it is written, and
-//! a transcript rebuild highlights what it rebuilds. That is fine for a diff and ruinous for a
-//! minified bundle somebody pasted, so [`LIMITS`] refuses anything past them and the caller draws
-//! plain text — which is what it drew before this crate existed, and is never worse than nothing.
+//! A card is highlighted once, when it is written, and a transcript rebuild highlights what it
+//! rebuilds — through [`spans`]'s memo, so the same diff is never parsed twice while it is
+//! remembered. That is fine for a diff and ruinous for a minified bundle somebody pasted, so
+//! [`LIMITS`] refuses anything past them and the caller draws plain text — which is what it drew
+//! before this crate existed, and is never worse than nothing.
+//!
+//! What it costs is mostly the regex engine: `fancy-regex` backtracks through grammars written for
+//! Oniguruma, at roughly a hundred and fifty microseconds a line of TypeScript, and the first line
+//! of a language also compiles that language's patterns. A long conversation is a few thousand
+//! lines of diff, which is most of a second spent on the loop that answers keys — so a rebuild
+//! asks under [`deferring`], draws what is not remembered plain, and hands the rest to a thread
+//! ([`Pending::run`]) that fills the memo for the redraw that follows.
 
+use std::cell::RefCell;
 use std::sync::OnceLock;
 
 use syntect::parsing::{ParseState, Scope, ScopeStack, ScopeStackOp, SyntaxReference, SyntaxSet};
@@ -108,17 +117,51 @@ fn syntaxes() -> &'static SyntaxSet {
     SET.get_or_init(two_face::syntax::extra_newlines)
 }
 
-/// Load the grammars now, on a thread of their own.
+/// Load the grammars now, on a thread of their own, and compile the ones people write in.
 ///
-/// They are loaded the first time anything asks, which left the cost — a large deserialisation —
-/// on whatever happened to ask first: the first code block of an answer, or the first switch into
-/// a conversation with a diff in it, on the loop that answers keys. A caller asking while this is
-/// still loading waits for it rather than loading a second copy.
+/// They are loaded the first time anything asks, which left the cost on whatever happened to ask
+/// first: the first code block of an answer, or the first switch into a conversation with a diff
+/// in it, on the loop that answers keys. Loading the set is only half of it, too — syntect
+/// deserialises a grammar's contexts and compiles its patterns the first time a line in that
+/// language is parsed, which is a tenth of a second for TypeScript and was paid by the first
+/// card of every workspace. So a few lines that reach the common constructs are parsed here, in
+/// each language a diff is likely to be in. A caller asking while this is still going waits for
+/// nothing: the compiled patterns are shared, and whichever thread gets to one first compiles it.
 pub fn warm() {
     let _ = std::thread::Builder::new().name("neosh-syntax".into()).spawn(|| {
         let _ = syntaxes();
+        for token in WARM {
+            let Some(lang) = of_token(token) else { continue };
+            let mut h = Incremental::new(lang);
+            for line in SAMPLE.lines() {
+                h.line(line);
+            }
+        }
     });
 }
+
+/// The languages [`warm`] compiles, most likely first.
+const WARM: &[&str] = &[
+    "tsx", "ts", "rs", "js", "jsx", "md", "json", "sh", "py", "go", "swift", "css", "html", "toml",
+    "yaml", "kt", "java", "c", "cpp", "rb", "sql",
+];
+
+/// Something like code in most of them: enough to walk a grammar through imports, declarations,
+/// strings, templates, comments, calls and markup, which is where its patterns live.
+const SAMPLE: &str = r#"import { a, type B } from "./b";
+// a comment, and /* another */
+export async function f<T>(x: number, y = 'y'): Promise<string> {
+  const s = `${x} and ${y}`; let n = 0x1F + 2.5e3;
+  if (x > 1 && !y) { return s.trim(); } else { throw new Error("no"); }
+}
+const C = () => <div className="x" onClick={() => f(1)}>{n}</div>;
+fn main() -> Result<(), Box<dyn Error>> { let v: Vec<u8> = vec![1]; println!("{v:?}"); Ok(()) }
+def g(self, *args, **kw): return [i for i in args if i]  # py
+func h(s string) (int, error) { return len(s), nil }
+# Heading
+- [x] item with `code` and **bold**
+{"key": [1, true, null], "o": {"p": "q"}}
+"#;
 
 /// The language a file of this name is written in.
 ///
@@ -170,6 +213,9 @@ pub fn spans(lang: Language, text: &str) -> Option<Vec<Spans>> {
     if let Some(hit) = MEMO.lock().ok().and_then(|m| m.get(key)) {
         return Some(hit);
     }
+    if defer(lang, text, key) {
+        return None;
+    }
     let mut h = Incremental::new(lang);
     let out: Vec<Spans> = lines.iter().map(|line| h.line(line)).collect();
     if let Ok(mut m) = MEMO.lock() {
@@ -182,37 +228,142 @@ pub fn spans(lang: Language, text: &str) -> Option<Vec<Spans>> {
 ///
 /// A transcript is rebuilt from its messages whenever a conversation is arrived in or the window
 /// changes width, and every diff in it is highlighted again each time — the same text, the same
-/// answer. Bounded by count, oldest out first: a few hundred diffs is a long session's worth, and
-/// the spans for one are a few small tuples a line.
+/// answer. Bounded by the *lines* it holds, oldest out first, because that is what its memory is:
+/// it was 512 entries, and one long conversation is a hundred and fifty of them, so switching
+/// between three of them evicted each one before it was come back to and every switch was a cold
+/// one. Sixty thousand lines is a few dozen long conversations and a few megabytes.
 static MEMO: std::sync::Mutex<Memo> = std::sync::Mutex::new(Memo::new());
 
-const MEMO_ENTRIES: usize = 512;
+const MEMO_LINES: usize = 60_000;
 
 struct Memo {
     map: Option<std::collections::HashMap<u64, Vec<Spans>>>,
     order: std::collections::VecDeque<u64>,
+    lines: usize,
 }
 
 impl Memo {
     const fn new() -> Self {
-        Self { map: None, order: std::collections::VecDeque::new() }
+        Self { map: None, order: std::collections::VecDeque::new(), lines: 0 }
     }
 
     fn get(&self, key: u64) -> Option<Vec<Spans>> {
         self.map.as_ref()?.get(&key).cloned()
     }
 
+    fn has(&self, key: u64) -> bool {
+        self.map.as_ref().is_some_and(|m| m.contains_key(&key))
+    }
+
     fn put(&mut self, key: u64, value: Vec<Spans>) {
         let map = self.map.get_or_insert_with(Default::default);
-        if map.insert(key, value).is_none() {
-            self.order.push_back(key);
+        let n = value.len().max(1);
+        match map.insert(key, value) {
+            Some(old) => self.lines = self.lines - old.len().max(1) + n,
+            None => {
+                self.order.push_back(key);
+                self.lines += n;
+            }
         }
-        while self.order.len() > MEMO_ENTRIES {
-            if let Some(old) = self.order.pop_front() {
-                map.remove(&old);
+        while self.lines > MEMO_LINES && self.order.len() > 1 {
+            if let Some(old) = self.order.pop_front()
+                && let Some(gone) = map.remove(&old)
+            {
+                self.lines -= gone.len().max(1);
             }
         }
     }
+}
+
+// Highlighting asked for while [`deferring`], waiting to be done somewhere else.
+//
+// Thread-local because it is a property of the call in progress on *this* thread — a rebuild on
+// the host loop — and not of the memo, which every thread shares: a thread filling the memo in
+// the background must parse what it is asked rather than defer it to itself.
+thread_local! {
+    static DEFERRED: RefCell<Option<Vec<Job>>> = const { RefCell::new(None) };
+}
+
+/// One piece of text waiting to be highlighted.
+struct Job {
+    lang: Language,
+    text: String,
+    key: u64,
+}
+
+/// What a [`deferring`] call left unhighlighted, in the order it was asked for.
+#[derive(Default)]
+pub struct Pending {
+    jobs: Vec<Job>,
+}
+
+impl Pending {
+    pub fn is_empty(&self) -> bool {
+        self.jobs.is_empty()
+    }
+
+    pub fn len(&self) -> usize {
+        self.jobs.len()
+    }
+
+    /// The last `n` asked for, taken off this one. A transcript is built top to bottom and read at
+    /// the bottom, so these are the ones on screen.
+    pub fn split_newest(&mut self, n: usize) -> Pending {
+        let at = self.jobs.len().saturating_sub(n);
+        Pending { jobs: self.jobs.split_off(at) }
+    }
+
+    /// Highlight all of it into the memo, newest first, so the next [`spans`] for any of it is a
+    /// lookup. Slow — this is the work deferring moved — so it belongs on a thread of its own.
+    pub fn run(self) {
+        for job in self.jobs.into_iter().rev() {
+            if MEMO.lock().is_ok_and(|m| m.has(job.key)) {
+                continue;
+            }
+            let mut h = Incremental::new(job.lang);
+            let out: Vec<Spans> = split(&job.text).iter().map(|line| h.line(line)).collect();
+            if let Ok(mut m) = MEMO.lock() {
+                m.put(job.key, out);
+            }
+        }
+    }
+}
+
+/// Run `f` with every highlight the memo does not already hold drawn plain, and say which.
+///
+/// For a caller that would rather draw *now* and colour in a moment than make somebody wait for
+/// the colour: [`spans`] answers `None` for anything it would have had to parse — exactly the
+/// "draw it plain" answer it gives past [`LIMITS`], so no caller needs a second path — and the
+/// texts come back as a [`Pending`] to [`run`](Pending::run) elsewhere. Nests: an inner call
+/// collects its own, and the outer one's carry on afterwards.
+pub fn deferring<R>(f: impl FnOnce() -> R) -> (R, Pending) {
+    struct Restore(Option<Vec<Job>>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            let outer = self.0.take();
+            DEFERRED.with(|d| *d.borrow_mut() = outer);
+        }
+    }
+    let outer = DEFERRED.with(|d| d.borrow_mut().replace(Vec::new()));
+    let restore = Restore(outer);
+    let out = f();
+    let jobs = DEFERRED.with(|d| d.borrow_mut().take()).unwrap_or_default();
+    drop(restore);
+    (out, Pending { jobs })
+}
+
+/// Note a miss for the [`deferring`] call in progress, if there is one. `true` when there was,
+/// which means the caller should answer "plain" rather than parse.
+fn defer(lang: Language, text: &str, key: u64) -> bool {
+    DEFERRED.with(|d| match d.borrow_mut().as_mut() {
+        Some(jobs) => {
+            if !jobs.iter().any(|j| j.key == key) {
+                jobs.push(Job { lang, text: text.to_string(), key });
+            }
+            true
+        }
+        None => false,
+    })
 }
 
 fn memo_key(lang: Language, text: &str) -> u64 {
@@ -375,10 +526,20 @@ const SCOPES: &[(&str, &str)] = &[
 ];
 
 fn group_of_scope(scope: Scope) -> Option<&'static str> {
-    let name = scope.build_string();
-    SCOPES
+    // Asked for every scope on the stack at every token of every line, so it is a comparison of
+    // two packed integers rather than of two strings: `is_prefix_of` is atom-wise, which is
+    // exactly "equal, or this followed by a dot". Spelled as strings it was an allocation for the
+    // scope's name and another for each prefix tried — most of the time a diff took to colour.
+    static TABLE: OnceLock<Vec<(Scope, &'static str)>> = OnceLock::new();
+    TABLE
+        .get_or_init(|| {
+            SCOPES
+                .iter()
+                .filter_map(|(prefix, group)| Scope::new(prefix).ok().map(|s| (s, *group)))
+                .collect()
+        })
         .iter()
-        .find(|(prefix, _)| name == *prefix || name.starts_with(&format!("{prefix}.")))
+        .find(|(prefix, _)| prefix.is_prefix_of(scope))
         .map(|(_, group)| *group)
 }
 
@@ -512,6 +673,52 @@ mod tests {
     }
 
     #[test]
+    fn deferring_draws_plain_now_and_the_same_colours_once_run() {
+        let l = of_token("rust").expect("rust");
+        // Text nothing else in this test binary asks for, so the memo cannot already hold it.
+        let code = "fn deferred_only_here(n: u8) -> u8 { n + 1 } // once\n";
+        let (now, pending) = deferring(|| spans(l, code));
+        assert!(now.is_none(), "a miss under deferring is drawn plain");
+        assert_eq!(pending.len(), 1);
+        // Asked twice in one rebuild, it is still one job.
+        let (_, twice) = deferring(|| (spans(l, "let twice = 1;\n"), spans(l, "let twice = 1;\n")));
+        assert_eq!(twice.len(), 1);
+        pending.run();
+        let (later, none) = deferring(|| spans(l, code));
+        assert!(none.is_empty(), "what was run is remembered");
+        let mut h = Incremental::new(l);
+        let direct: Vec<Spans> = code.lines().map(|line| h.line(line)).collect();
+        assert_eq!(later, Some(direct));
+        // And outside a deferring call nothing is deferred at all.
+        assert!(spans(l, "let outside = 2;\n").is_some());
+    }
+
+    #[test]
+    fn the_newest_jobs_split_off_the_end() {
+        let l = of_token("rust").expect("rust");
+        let (_, mut pending) = deferring(|| {
+            for i in 0..5 {
+                let _ = spans(l, &format!("let split_{i} = {i};\n"));
+            }
+        });
+        let newest = pending.split_newest(2);
+        assert_eq!((pending.len(), newest.len()), (3, 2));
+    }
+
+    #[test]
+    fn the_memo_is_bounded_by_the_lines_it_holds() {
+        let mut m = Memo::new();
+        let row = |n: usize| vec![Vec::new(); n];
+        m.put(1, row(MEMO_LINES - 10));
+        m.put(2, row(5));
+        assert!(m.has(1) && m.has(2));
+        m.put(3, row(20));
+        assert!(!m.has(1), "the oldest goes first");
+        assert!(m.has(2) && m.has(3));
+        assert_eq!(m.lines, 25);
+    }
+
+    #[test]
     fn spans_are_byte_ranges_that_land_on_character_boundaries() {
         // Columns on the wire are UTF-8 byte offsets, and a span that cuts a multi-byte character
         // in half panics the moment somebody slices a line with it.
@@ -522,3 +729,4 @@ mod tests {
         }
     }
 }
+

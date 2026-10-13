@@ -480,6 +480,60 @@ pub fn forget(state: &Path, id: &SessionId) {
     let _ = std::fs::remove_file(path);
 }
 
+/// Take into the image store the pictures a conversation keeps in the system's temporary directory.
+///
+/// A tool's picture — a screenshot an agent took, an image it read — is written by the driver
+/// into the directory it was handed, and the drivers were handed theirs before the workspace knew
+/// it had a state directory, so they got the `--clean` answer: `$TMPDIR/neosh-images-<pid>`. Every
+/// such conversation then named files the operating system deletes on its own schedule — macOS
+/// sweeps `$TMPDIR` of anything unread for three days — and a transcript whose pictures had gone
+/// showed their names and nothing else, with nothing anywhere to say why.
+///
+/// Each one found is *linked* into `images` under the same name and the message is pointed at it,
+/// falling back to a copy across filesystems: the temporary name is left for its own process to
+/// clean up, so a workspace still running from before this has nothing pulled out from under it.
+/// A file that has already gone is left named as it was; there is nothing to keep. Returns whether
+/// the conversation changed, which is whether it needs writing.
+pub fn adopt_stray_images(images: &Path, session: &mut Session) -> bool {
+    let tmp = std::env::temp_dir();
+    let stray = |path: &str| {
+        let p = Path::new(path);
+        let parent = p.parent()?;
+        let named = parent.file_name()?.to_str()?.starts_with("neosh-images-");
+        (named && parent.parent() == Some(tmp.as_path())).then(|| p.file_name().map(PathBuf::from))?
+    };
+    let adopt = |path: &mut String| -> bool {
+        let Some(name) = stray(path) else { return false };
+        let from = Path::new(path.as_str());
+        let to = images.join(&name);
+        if !to.is_file() {
+            if !from.is_file() || std::fs::create_dir_all(images).is_err() {
+                return false;
+            }
+            if std::fs::hard_link(from, &to).is_err() && std::fs::copy(from, &to).is_err() {
+                return false;
+            }
+        }
+        *path = to.to_string_lossy().into_owned();
+        true
+    };
+    let mut changed = false;
+    for message in &mut session.messages {
+        for block in &mut message.content {
+            match block {
+                neosh_proto::ContentBlock::Image { path, .. } => changed |= adopt(path),
+                neosh_proto::ContentBlock::ToolResult { images, .. } => {
+                    for image in images {
+                        changed |= adopt(&mut image.path);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    changed
+}
+
 /// Everything restorable, most recently used first, and which one was active.
 ///
 /// A file that does not parse is skipped with a warning rather than being fatal: one corrupt
@@ -871,5 +925,53 @@ mod tests {
         save(&t.0, &s).expect("save");
         let leftover = session_path(&t.0, &s.id).with_extension("json.tmp");
         assert!(!leftover.exists(), "the temporary file is renamed, not left behind");
+    }
+
+    #[test]
+    fn pictures_left_in_the_temporary_directory_are_taken_into_the_store() {
+        let state = std::env::temp_dir().join(format!("neosh-adopt-state-{}", std::process::id()));
+        let stray_dir = std::env::temp_dir().join(format!("neosh-images-adopt-{}", std::process::id()));
+        std::fs::create_dir_all(&stray_dir).expect("mkdir");
+        let shot = stray_dir.join("shot.png");
+        std::fs::write(&shot, b"png bytes").expect("write");
+        let gone = stray_dir.join("gone.png");
+        let elsewhere = state.join("mine.png");
+        let image = |p: &Path| neosh_proto::ImageFile {
+            path: p.to_string_lossy().into_owned(),
+            media_type: "image/png".into(),
+        };
+        let mut s = Session::new("/tmp");
+        s.messages.push(Message {
+            role: neosh_proto::Role::User,
+            content: vec![
+                neosh_proto::ContentBlock::Image {
+                    path: shot.to_string_lossy().into_owned(),
+                    media_type: "image/png".into(),
+                },
+                neosh_proto::ContentBlock::ToolResult {
+                    tool_use_id: neosh_proto::ToolCallId("t".into()),
+                    content: String::new(),
+                    is_error: false,
+                    images: vec![image(&gone), image(&elsewhere)],
+                },
+            ],
+            at: None,
+        });
+        let store = state.join("images");
+        assert!(adopt_stray_images(&store, &mut s));
+        let neosh_proto::ContentBlock::Image { path, .. } = &s.messages[0].content[0] else {
+            panic!("an image block")
+        };
+        assert_eq!(Path::new(path), store.join("shot.png"));
+        assert_eq!(std::fs::read(path).expect("adopted"), b"png bytes");
+        assert!(shot.is_file(), "the temporary name is left for its own process");
+        let neosh_proto::ContentBlock::ToolResult { images, .. } = &s.messages[0].content[1] else {
+            panic!("a tool result")
+        };
+        assert_eq!(Path::new(&images[0].path), gone, "a file already gone is left as it was");
+        assert_eq!(Path::new(&images[1].path), elsewhere, "only the temporary directory is adopted from");
+        assert!(!adopt_stray_images(&store, &mut s), "a second pass has nothing to do");
+        let _ = std::fs::remove_dir_all(&state);
+        let _ = std::fs::remove_dir_all(&stray_dir);
     }
 }

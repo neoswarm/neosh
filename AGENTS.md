@@ -59,6 +59,16 @@ is `docs/releasing.md`.
   one construct that looks ahead is a table, so a line with a pipe in it holds the boundary until
   a blank line. Settling per *block* re-highlighted an open fence from its first line on every
   token: a few hundred lines of code in an answer pinned a core for minutes.
+- **A rebuilt transcript is drawn now and coloured afterwards.** `fancy-regex` through a TypeScript
+  grammar is ~150 µs a line, and a long conversation is thousands of lines of diff — on the host
+  loop that was a second, and three on a busy machine, between `↵` on a conversation and seeing it.
+  So `transcript()` runs under `neosh_syntax::deferring`: what the memo holds is drawn in colour,
+  the rest plain, and the misses go to `crate::colour` — one thread, newest first because that is
+  what is on screen, which says which conversation it finished so `recolour_cards` re-marks only
+  the rows whose text still matches. Colour never changes a row's text, so nothing moves when it
+  lands. The same thread pre-fills the memo for the most recent conversations at startup, and
+  always yields to the one somebody is looking at. A new caller that highlights on the loop
+  outside `deferring` is the bug this replaced.
 - **Which way a diff line went is a background; what the code says is the foreground.**
   `ExtmarkOpts::line_hl_group` bands the whole row and every ranged group is patched over it. A
   `Diff.*Line` group that sets a foreground silently un-highlights the code on it. Colours for code

@@ -959,6 +959,19 @@ async fn run_turn(
                 // This turn is over and this is the wait for one last number. Anything the CLI
                 // says that is not that number belongs to what comes next.
                 if ending && v.get("type").and_then(Value::as_str) != Some("control_response") {
+                    // Except the live set of background tasks, which is about the conversation
+                    // rather than about any turn — and this window is exactly when it moves: a
+                    // sub-agent still running at `result` is put in the background there and then.
+                    // Held, it waited for the next message to be sent, so the row said nothing was
+                    // running until you asked something and then said it at once. Nor can the
+                    // reader say it instead, because a turn is still attached. Forwarded now, in
+                    // order; a level said once is not stale by the time the next turn drains.
+                    if let Some(tasks) = sse::background_tasks(&v) {
+                        let _ = tx
+                            .send(ProviderEvent::Activity { activity: Activity::Background { tasks } })
+                            .await;
+                        continue;
+                    }
                     held.push(line);
                     continue;
                 }
@@ -1090,6 +1103,14 @@ async fn run_turn(
                     && v.get("subtype").and_then(Value::as_str) == Some("compact_boundary")
                 {
                     stale = asked;
+                }
+                // A turn nobody is listening to any more still reads the pipe, and the reader stays
+                // quiet because a turn is attached — so the set of background tasks it reads goes
+                // the way the workspace hears it between turns, or it waits for the next message.
+                if abandoned
+                    && let (Some(tasks), Some(sink)) = (sse::background_tasks(&v), &unasked)
+                {
+                    sink.background(&request.conversation, tasks);
                 }
                 for ev in control_failure(&v).into_iter().chain(sse::claude_cli_line(&v, &mut live.state)) {
                     if abandoned {
