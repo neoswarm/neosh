@@ -1,6 +1,6 @@
 {
   "name": "@neosh/devices",
-  "version": "0.5.1",
+  "version": "0.6.0",
   "description": "Which computer a terminal is for: asks when another one is connected, lands where you chose, and /device changes it.",
   "license": "MIT",
   "type": "module",
