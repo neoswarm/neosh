@@ -650,28 +650,30 @@ async fn two_strangers_can_be_introduced_while_they_are_running() {
     // A dialled an address it knows nothing about, and is told what is there — by name, with an id
     // that was *proven* rather than claimed. That is what a confirmation dialog can show.
     let found = wait_for(&mut a_rx, |e| match e {
-        SwarmEvent::Stranger { node, dialled: true } => Some(node.clone()),
+        SwarmEvent::Stranger { node, dialled: true, .. } => Some(node.clone()),
         _ => None,
     })
     .await;
     assert_eq!(found.name, "linux-box");
     assert_eq!(found.id, b_key, "and it is the machine that is actually there");
 
-    // B, meanwhile, is told somebody is asking.
-    let asking = wait_for(&mut b_rx, |e| match e {
-        SwarmEvent::Stranger { node, dialled: false } => Some(node.clone()),
-        _ => None,
-    })
-    .await;
-    assert_eq!(asking.id, a_key);
-    assert_eq!(asking.name, "mac-studio");
-
-    // Both people say yes. No restart, no config file.
+    // A looking is not A asking: B hears nothing until A says yes, and then hears it as a knock —
+    // an id that was proven, from somebody who pressed *Add* on purpose.
     a.send(SwarmRequest::Pair {
         id: b_key.clone(),
         name: "linux-box".into(),
         addr: Some(addr.to_string()),
     });
+    let (asking, knock) = wait_for(&mut b_rx, |e| match e {
+        SwarmEvent::Stranger { node, dialled: false, knock } => Some((node.clone(), *knock)),
+        _ => None,
+    })
+    .await;
+    assert_eq!(asking.id, a_key);
+    assert_eq!(asking.name, "mac-studio");
+    assert!(knock, "the first dial after Add knocks");
+
+    // And B says yes. No restart, no config file.
     b.send(SwarmRequest::Pair { id: a_key, name: "mac-studio".into(), addr: None });
 
     let up = wait_for(&mut a_rx, |e| match e {
@@ -755,7 +757,7 @@ async fn a_machine_that_has_not_allowed_us_back_says_so_rather_than_dialling_in_
 
     // Over there, the other half of the same moment: somebody is asking.
     let asking = wait_for(&mut b_rx, |e| match e {
-        SwarmEvent::Stranger { node, dialled: false } => Some(node.id.clone()),
+        SwarmEvent::Stranger { node, dialled: false, .. } => Some(node.id.clone()),
         _ => None,
     })
     .await;
@@ -844,7 +846,7 @@ async fn a_disconnect_holds_until_a_redial_lifts_it() {
     assert!(returned.is_err(), "disconnected means disconnected, not ten seconds of quiet");
 
     // The pairing survived, so reconnecting is one request, not a ceremony.
-    p.a.send(SwarmRequest::Redial { id: b_id.clone() });
+    p.a.send(SwarmRequest::Redial { id: b_id.clone(), knock: false });
     let name = wait_for(&mut p.a_rx, |e| match e {
         SwarmEvent::PeerUp { node, .. } if node.id == b_id => Some(node.name.clone()),
         _ => None,
@@ -1050,4 +1052,98 @@ async fn wait_for_peer(rx: &mut UnboundedReceiver<SwarmEvent>) -> neosh_proto::N
         _ => None,
     })
     .await
+}
+
+/// Looking is not asking, and asking again is heard again.
+///
+/// "Add a computer" probes the address first, to show a name and a fingerprint before anybody says
+/// yes. That probe used to arrive on the far side as the request itself — before *Add* had been
+/// pressed — and the redials that followed were deduplicated as the same request, so the person at
+/// the other machine was told once, at the wrong moment, and never again. Now the probe says
+/// nothing, the first dial after `Pair` knocks, the heartbeat redials do not, and `Redial` with a
+/// knock is a resend that the far side hears as one.
+#[tokio::test]
+async fn a_probe_is_silent_and_a_resend_knocks_again() {
+    let probe = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("probe");
+    let addr: SocketAddr = probe.local_addr().expect("addr");
+    drop(probe);
+
+    let a_id = Identity::ephemeral();
+    let b_id = Identity::ephemeral();
+    let b_key = b_id.id().clone();
+    let (b, mut b_rx) = neosh_swarm::node::spawn(
+        Arc::new(b_id),
+        Allowed::load(None),
+        SwarmConfig {
+            name: "linux-box".into(),
+            listen: Some(addr),
+            heartbeat: Duration::from_millis(150),
+            ..Default::default()
+        },
+        "0.1.0".into(),
+    );
+    let _b = b;
+    let a_info = neosh_proto::NodeInfo {
+        id: a_id.id().clone(),
+        name: "mac-studio".into(),
+        os: "macos".into(),
+        version: "0.1.0".into(),
+    };
+    let caps = neosh_proto::NodeCapabilities {
+        accepts_commands: false,
+        accepts_approvals: false,
+        shells: false,
+        streams: true,
+        browse: false,
+        rich_stream: false,
+        catalogue: false,
+        live: false,
+        calls: false,
+        projects: Vec::new(),
+    };
+    // The listener may not be up for the first moment.
+    let found = tokio::time::timeout(PATIENCE, async {
+        loop {
+            match neosh_swarm::probe(&addr.to_string(), &a_id, &a_info, &caps).await {
+                Ok(n) => return n,
+                Err(_) => tokio::time::sleep(Duration::from_millis(50)).await,
+            }
+        }
+    })
+    .await
+    .expect("the listener came up");
+    assert_eq!(found.id, b_key, "the probe learnt who is there");
+
+    let heard = tokio::time::timeout(Duration::from_millis(500), async {
+        loop {
+            if let Some(SwarmEvent::Stranger { .. }) = b_rx.recv().await {
+                return;
+            }
+        }
+    })
+    .await;
+    assert!(heard.is_err(), "a look is not a request, and nothing is announced for one");
+
+    let (a, _a_rx) = neosh_swarm::node::spawn(
+        Arc::new(a_id),
+        Allowed::load(None),
+        SwarmConfig { name: "mac-studio".into(), heartbeat: Duration::from_millis(150), ..Default::default() },
+        "0.1.0".into(),
+    );
+    a.send(SwarmRequest::Pair { id: b_key.clone(), name: "linux-box".into(), addr: Some(addr.to_string()) });
+    fn knocked(e: &SwarmEvent) -> Option<bool> {
+        match e {
+            SwarmEvent::Stranger { dialled: false, knock, .. } => Some(*knock),
+            _ => None,
+        }
+    }
+    assert!(wait_for(&mut b_rx, knocked).await, "Add knocks");
+    assert!(!wait_for(&mut b_rx, knocked).await, "the heartbeat's redial does not");
+
+    a.send(SwarmRequest::Redial { id: b_key, knock: true });
+    let again = wait_for(&mut b_rx, |e| match e {
+        SwarmEvent::Stranger { dialled: false, knock: true, .. } => Some(()),
+        _ => None,
+    });
+    again.await;
 }

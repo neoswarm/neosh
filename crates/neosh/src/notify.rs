@@ -48,6 +48,10 @@ pub enum AlertReason {
     Quota,
     /// A plugin raised one itself, through `ApiCall::Alert`.
     Plugin,
+    /// Another computer asked to pair with this one. Nothing happens until somebody here answers,
+    /// and the person asking is usually at the *other* keyboard, so a corner of this one is the
+    /// wrong place for it to be said only once.
+    Pairing,
 }
 
 impl AlertReason {
@@ -60,11 +64,20 @@ impl AlertReason {
             Self::Failure => "failure",
             Self::Quota => "quota",
             Self::Plugin => "plugin",
+            Self::Pairing => "pairing",
         }
     }
 
-    pub fn all() -> [Self; 6] {
-        [Self::TurnDone, Self::Question, Self::Permission, Self::Failure, Self::Quota, Self::Plugin]
+    pub fn all() -> [Self; 7] {
+        [
+            Self::TurnDone,
+            Self::Question,
+            Self::Permission,
+            Self::Failure,
+            Self::Quota,
+            Self::Plugin,
+            Self::Pairing,
+        ]
     }
 }
 

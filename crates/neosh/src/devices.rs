@@ -231,8 +231,7 @@ pub async fn run_ls(
         return Ok(());
     }
     let opens = match resolve_quiet(&s, &s.default) {
-        Some(ViewDevice::All) => "every computer at once".to_string(),
-        Some(ViewDevice::Here) => "this computer".to_string(),
+        Some(ViewDevice::Here | ViewDevice::All) => "this computer".to_string(),
         Some(ViewDevice::Node { node }) => s
             .peers
             .iter()
@@ -242,7 +241,7 @@ pub async fn run_ls(
         Some(ViewDevice::Ask) | None => "a question: which computer".to_string(),
     };
     say!("`neosh` opens on {opens} ({OPTION} = \"{}\").", s.default);
-    say!("`neosh connect <name|code>` opens a terminal on one; `all` and `here` work too.");
+    say!("`neosh connect <name|code>` opens a terminal on one; `here` is this one.");
     if s.peers.iter().any(|n| matches!(n.link, LinkState::Waiting)) {
         say!("A computer that has not allowed this one yet: press ^J there and allow it.");
     }
@@ -260,7 +259,10 @@ fn resolve(s: &Survey, query: &str) -> Result<ViewDevice, String> {
     let lower = q.to_lowercase();
     match lower.as_str() {
         "" | "ask" => return Ok(ViewDevice::Ask),
-        "all" | "*" | "every" | "everything" | "everywhere" => return Ok(ViewDevice::All),
+        // A terminal is for one computer. `all` was every machine at once, and a setting or a
+        // habit that still says it gets the question rather than an error: it is the nearest thing
+        // to "I had not picked one".
+        "all" | "*" | "every" | "everything" | "everywhere" => return Ok(ViewDevice::Ask),
         "here" | "local" | "this" | "localhost" | "." => return Ok(ViewDevice::Here),
         _ => {}
     }
@@ -324,7 +326,7 @@ fn resolve(s: &Survey, query: &str) -> Result<ViewDevice, String> {
         })
         .collect();
     Err(format!(
-        "no computer called \"{q}\". Paired: {}, and `all` and `here`. `neosh ls` lists them.",
+        "no computer called \"{q}\". Paired: {}, and `here`. `neosh ls` lists them.",
         known.join(", ")
     ))
 }
@@ -387,15 +389,15 @@ async fn wait_up(c: &mut Control, node: &NodeId) -> anyhow::Result<()> {
                 c.call(ApiCall::SwarmReconnect { node: node.clone() }).await?;
             }
             LinkState::Down => anyhow::bail!(
-                "could not reach {name}{why}. Is neosh running there? `neosh connect all` opens \
-                 everything else."
+                "could not reach {name}{why}. Is neosh running there? `neosh connect here` opens \
+                 this computer."
             ),
             LinkState::Connecting { .. } | LinkState::Retrying { .. } => {}
         }
         if started.elapsed() > REACH {
             anyhow::bail!(
                 "could not reach {name}{why} in {}s. Is neosh running there, and is it on this \
-                 network? `neosh connect all` opens everything else.",
+                 network? `neosh connect here` opens this computer.",
                 REACH.as_secs()
             );
         }
@@ -429,6 +431,7 @@ mod tests {
                 rich_stream: true,
                 catalogue: true,
                 live: true,
+                calls: true,
                 projects: Vec::new(),
             },
             up: true,
@@ -473,7 +476,8 @@ mod tests {
     #[test]
     fn all_here_and_this_machines_own_name_are_not_other_computers() {
         let s = survey(vec![peer("aaaa1111", "linux-box")], &[]);
-        assert_eq!(resolve(&s, "all"), Ok(ViewDevice::All));
+        // One computer per terminal: `all` is read as not having picked one, and asks.
+        assert_eq!(resolve(&s, "all"), Ok(ViewDevice::Ask));
         assert_eq!(resolve(&s, "here"), Ok(ViewDevice::Here));
         assert_eq!(resolve(&s, "laptop"), Ok(ViewDevice::Here));
         assert_eq!(resolve(&s, ""), Ok(ViewDevice::Ask));

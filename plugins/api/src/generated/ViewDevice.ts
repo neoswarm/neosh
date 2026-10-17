@@ -14,7 +14,11 @@ import type { NodeId } from "./NodeId";
  *
  * Per **view**, because that is what a window is: two terminals on one workspace are two answers.
  * It narrows what is *shown* and where things *start*, and never what exists — a turn on a machine
- * this window is not for keeps running, and `All` is one `/device` away.
+ * this window is not for keeps running, and is one `/device` away.
+ *
+ * A terminal is for **one** computer. `All` — every machine in one panel — was the original
+ * default and is kept only so an older client's `Attach` still decodes; everything reads it as
+ * `Here`, and the devices plugin asks a terminal that arrives with it.
  */
 export type ViewDevice = { "kind": "all" } | { "kind": "here" } | {
   "kind": "node";

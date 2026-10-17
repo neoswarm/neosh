@@ -79,6 +79,12 @@ pub struct Swarm {
 }
 
 impl Swarm {
+    /// Take a machine off the board — it was unpaired. What it was running goes with it: a
+    /// machine you removed is not a machine whose conversations you can reach.
+    pub fn forget(&mut self, id: &NodeId) {
+        self.peers.remove(id);
+    }
+
     /// A machine we know about before it has said anything: paired, and about to be dialled — or
     /// waited for. Gives the board a row from the first frame, so "connecting…" is a state a
     /// person can watch rather than a silence they have to explain.
@@ -98,6 +104,7 @@ impl Swarm {
                 rich_stream: false,
                 catalogue: false,
                 live: false,
+                calls: false,
                 projects: Vec::new(),
             },
             agents: Vec::new(),
@@ -493,6 +500,7 @@ mod tests {
             rich_stream: true,
             catalogue: true,
             live: true,
+            calls: true,
             projects: Vec::new(),
         }
     }

@@ -81,6 +81,7 @@ fn caps() -> NodeCapabilities {
         rich_stream: false,
         catalogue: false,
         live: false,
+        calls: false,
         projects: vec![RemoteProject {
             key: ProjectKey("git:github.com/neoswarm/neosh".into()),
             name: "neosh".into(),
@@ -136,6 +137,7 @@ fn every_message_has_a_canonical_encoding() {
             node: node(a, "mac-studio"),
             capabilities: caps(),
             nonce: "aa".repeat(32),
+            knock: false,
         }),
     );
     check(
@@ -214,6 +216,22 @@ fn every_message_has_a_canonical_encoding() {
             // part an implementation in another language gets wrong, because a `read_dir` gives you
             // bare names and a field needs a path.
             paths: vec!["/home/me/src/neosh/".into(), "/home/me/src/dotfiles/".into()],
+        }),
+    );
+    check(
+        "15-call.json",
+        // The call is JSON *text*, so a newer call is a string an older owner refuses rather than a
+        // tag that fails the frame.
+        canonical(&AscpMessage::Call {
+            id: "a1".into(),
+            call: r#"{"call":"git_worktrees","cwd":"/home/me/src/neosh"}"#.into(),
+        }),
+    );
+    check(
+        "16-called.json",
+        canonical(&AscpMessage::Called {
+            id: "a1".into(),
+            ok: r#"{"ok":"worktrees","worktrees":[{"path":"/home/me/src/neosh","branch":"main","is_main":true,"locked":false,"is_current":false}]}"#.into(),
         }),
     );
 }

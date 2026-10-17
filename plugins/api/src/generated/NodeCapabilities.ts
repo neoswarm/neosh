@@ -86,6 +86,19 @@ export type NodeCapabilities = {
    */
   live: boolean;
   /**
+   * Whether [`AscpMessage::Call`] will be answered — the workspace API run here on another
+   * machine's behalf, for the handful of calls that are about *this disk* rather than about the
+   * screen asking: its worktrees and branches, a clone, a directory listing, an option, a var, a
+   * new conversation. Which is what lets `n`, `^N` and a clone on a project over there be the
+   * same code they are here, instead of a path field and nothing else.
+   *
+   * A compatibility flag in `browse`'s sense — an unknown tag fails the frame and takes the
+   * connection with it, and `false` is what an older handshake decodes to — and gated the way
+   * `Browse` is, on `accepts_commands`: a node that already takes `NewSession` with any `cwd` on
+   * its disk gives nothing further away by making a worktree for it to start in.
+   */
+  calls: boolean;
+  /**
    * The checkouts this node has, for starting something on it.
    */
   projects: Array<RemoteProject>;

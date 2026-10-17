@@ -438,7 +438,16 @@ export type ApiCall =
   | { "call": "swarm_reconnect"; node: NodeId }
   | { "call": "swarm_disconnect"; node: NodeId }
   | { "call": "swarm_strangers" }
+  | { "call": "swarm_dismiss"; node: NodeId }
   | { "call": "swarm_browse"; node: NodeId; prefix: string }
+  | {
+    "call": "swarm_call";
+    node: NodeId;
+    /**
+     * Not `call`, which is this enum's own tag.
+     */
+    inner: ApiCall;
+  }
   | { "call": "swarm_shell"; node: NodeId; cwd?: string | null }
   | { "call": "quota_list" }
   | { "call": "quota_refresh"; instance?: InstanceId | null }

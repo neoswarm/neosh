@@ -1,0 +1,5 @@
+{
+  "call": "{\"call\":\"git_worktrees\",\"cwd\":\"/home/me/src/neosh\"}",
+  "id": "a1",
+  "type": "call"
+}

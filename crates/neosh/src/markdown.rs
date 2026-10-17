@@ -31,8 +31,9 @@
 //! them. It is what `yc` finds when it goes looking for the block to copy, and it is the colour
 //! plain code is drawn in between the tokens that have one.
 //!
-//! Tables are not rendered as tables. Column widths depend on the terminal, the content and the
-//! wrap policy, and a table that reflows badly is harder to read than the pipes it came from.
+//! Tables are laid out in columns, and a cell too long for its column wraps inside it rather than
+//! being clipped. A table that cannot be made narrow enough without breaking its words becomes one
+//! block of `label  value` lines per row instead, which the transcript wraps like any prose.
 
 /// One styled span of one rendered row: `(row, byte from, byte to, highlight group)`.
 ///
@@ -257,9 +258,11 @@ fn render_into(
     }
 }
 
-/// The widest a single column is allowed to be before it is clipped.
+/// The narrowest a column is squeezed to while there is a word in it wider than this. Below it a
+/// column stops wrapping at spaces and starts breaking words, which reads worse than records.
 const MAX_CELL: usize = 40;
-/// The widest a whole table is allowed to be before it becomes a list of records instead.
+/// The widest a whole table is allowed to be before its cells wrap, and — when even wrapped at
+/// word boundaries it cannot get this narrow — before it becomes a list of records instead.
 const MAX_TABLE: usize = 100;
 
 /// Render a pipe table starting at `at`, if there is one. Returns how many source lines it ate.
@@ -267,6 +270,10 @@ const MAX_TABLE: usize = 100;
 /// A table is only a table once its delimiter row has arrived. Before that it is a row of text with
 /// pipes in it, and rendering it as a one-column table that becomes a three-column one a moment
 /// later is a flicker on the most visually complicated thing in an answer.
+///
+/// A cell longer than its column **wraps inside it** rather than being clipped: a table is very
+/// often where the answer *is*, and a row ending in `…` is the one sentence you asked for with its
+/// end cut off and no key that brings it back.
 fn table(raw: &[&str], at: usize, lines: &mut Vec<String>, marks: &mut Vec<Mark>) -> Option<usize> {
     let header = cells(raw.get(at)?)?;
     let aligns = delimiter(raw.get(at + 1)?, header.len())?;
@@ -285,52 +292,81 @@ fn table(raw: &[&str], at: usize, lines: &mut Vec<String>, marks: &mut Vec<Mark>
     }
 
     let columns = header.len();
-    let mut widths: Vec<usize> = header.iter().map(|c| display_width(c).min(MAX_CELL)).collect();
-    for row in &rows {
+    let all = || std::iter::once(&header).chain(rows.iter());
+    let mut widths = vec![0; columns];
+    // The narrowest each column can go without breaking a word, capped so one long URL does not
+    // decide that a table must be records.
+    let mut floors = vec![1; columns];
+    for row in all() {
         for (i, c) in row.iter().take(columns).enumerate() {
-            widths[i] = widths[i].max(display_width(c).min(MAX_CELL));
+            widths[i] = widths[i].max(display_width(c));
+            let word = c.split_whitespace().map(display_width).max().unwrap_or(0);
+            floors[i] = floors[i].max(word.min(MAX_CELL));
         }
     }
+    for (f, w) in floors.iter_mut().zip(&widths) {
+        *f = (*f).min(*w).max(1);
+    }
 
-    // Too wide to line up, so stop pretending. Columns that do not fit are not a table — they are a
-    // table with the right-hand ones off the edge, and reading a row means guessing which is which.
-    let total = widths.iter().sum::<usize>() + 2 * (columns.saturating_sub(1)) + 2;
-    if total > MAX_TABLE {
+    // Squeeze the widest column a column at a time until the table fits: the column with the most
+    // to give is the one whose text wraps least badly for it.
+    let chrome = 2 * columns.saturating_sub(1) + 2;
+    while widths.iter().sum::<usize>() + chrome > MAX_TABLE {
+        let Some(i) = (0..columns).filter(|&i| widths[i] > floors[i]).max_by_key(|&i| widths[i]) else {
+            break;
+        };
+        widths[i] -= 1;
+    }
+
+    // Too wide to line up even wrapped, so stop pretending. Columns that do not fit are not a table
+    // — they are a table with the right-hand ones off the edge, and reading a row means guessing
+    // which is which.
+    if widths.iter().sum::<usize>() + chrome > MAX_TABLE {
         records(&header, &rows, lines, marks);
         return Some(taken);
     }
 
-    let line = |cs: &[String], widths: &[usize], aligns: &[Align]| -> String {
-        let mut out = String::from("  ");
-        for (i, w) in widths.iter().enumerate() {
-            let cell = cs.get(i).map(String::as_str).unwrap_or("");
-            let cell = clip(cell, *w);
-            let pad = w.saturating_sub(display_width(&cell));
-            match aligns.get(i).copied().unwrap_or(Align::Left) {
-                Align::Right => {
-                    out.push_str(&" ".repeat(pad));
-                    out.push_str(&cell);
+    let row_lines = |cs: &[String]| -> Vec<String> {
+        let wrapped: Vec<Vec<String>> = widths
+            .iter()
+            .enumerate()
+            .map(|(i, w)| wrap(cs.get(i).map(String::as_str).unwrap_or(""), *w))
+            .collect();
+        let height = wrapped.iter().map(Vec::len).max().unwrap_or(1).max(1);
+        (0..height)
+            .map(|n| {
+                let mut out = String::from("  ");
+                for (i, w) in widths.iter().enumerate() {
+                    let cell = wrapped[i].get(n).map(String::as_str).unwrap_or("");
+                    let pad = w.saturating_sub(display_width(cell));
+                    match aligns.get(i).copied().unwrap_or(Align::Left) {
+                        Align::Right => {
+                            out.push_str(&" ".repeat(pad));
+                            out.push_str(cell);
+                        }
+                        Align::Centre => {
+                            out.push_str(&" ".repeat(pad / 2));
+                            out.push_str(cell);
+                            out.push_str(&" ".repeat(pad - pad / 2));
+                        }
+                        Align::Left => {
+                            out.push_str(cell);
+                            out.push_str(&" ".repeat(pad));
+                        }
+                    }
+                    if i + 1 < widths.len() {
+                        out.push_str("  ");
+                    }
                 }
-                Align::Centre => {
-                    out.push_str(&" ".repeat(pad / 2));
-                    out.push_str(&cell);
-                    out.push_str(&" ".repeat(pad - pad / 2));
-                }
-                Align::Left => {
-                    out.push_str(&cell);
-                    out.push_str(&" ".repeat(pad));
-                }
-            }
-            if i + 1 < widths.len() {
-                out.push_str("  ");
-            }
-        }
-        out.trim_end().to_string()
+                out.trim_end().to_string()
+            })
+            .collect()
     };
 
-    let head = line(&header, &widths, &aligns);
-    marks.push((lines.len(), 0, head.len(), "Markdown.Heading"));
-    lines.push(head);
+    for head in row_lines(&header) {
+        marks.push((lines.len(), 0, head.len(), "Markdown.Heading"));
+        lines.push(head);
+    }
 
     // A rule under the header rather than a box around everything. The job is to separate the
     // labels from the data; a full grid spends four times the ink saying the same thing.
@@ -345,10 +381,58 @@ fn table(raw: &[&str], at: usize, lines: &mut Vec<String>, marks: &mut Vec<Mark>
     marks.push((lines.len(), 0, rule.len(), "Markdown.Rule"));
     lines.push(rule);
 
-    for row in &rows {
-        lines.push(line(row, &widths, &aligns));
+    // Once any row takes more than one line, a blank between rows is what says where one ends:
+    // without it two wrapped rows read as one row with a longer cell.
+    let body: Vec<Vec<String>> = rows.iter().map(|r| row_lines(r)).collect();
+    let spaced = body.iter().any(|r| r.len() > 1);
+    for (n, row) in body.into_iter().enumerate() {
+        if spaced && n > 0 {
+            lines.push(String::new());
+        }
+        lines.extend(row);
     }
     Some(taken)
+}
+
+/// Break text into lines no wider than `width` columns: at spaces where it can, and inside a word
+/// — on a grapheme boundary — only where the word alone is wider than the column.
+fn wrap(text: &str, width: usize) -> Vec<String> {
+    use unicode_segmentation::UnicodeSegmentation;
+    let width = width.max(1);
+    let mut out: Vec<String> = Vec::new();
+    let mut line = String::new();
+    let mut used = 0;
+    for word in text.split_whitespace() {
+        let w = display_width(word);
+        if used > 0 && used + 1 + w <= width {
+            line.push(' ');
+            line.push_str(word);
+            used += 1 + w;
+            continue;
+        }
+        if used > 0 {
+            out.push(std::mem::take(&mut line));
+            used = 0;
+        }
+        if w <= width {
+            line.push_str(word);
+            used = w;
+            continue;
+        }
+        for g in word.graphemes(true) {
+            let gw = display_width(g);
+            if used > 0 && used + gw > width {
+                out.push(std::mem::take(&mut line));
+                used = 0;
+            }
+            line.push_str(g);
+            used += gw;
+        }
+    }
+    if used > 0 || out.is_empty() {
+        out.push(line);
+    }
+    out
 }
 
 /// A table too wide to line up, as one block per row.
@@ -363,8 +447,7 @@ fn records(header: &[String], rows: &[Vec<String>], lines: &mut Vec<String>, mar
         }
         for (i, cell) in row.iter().enumerate() {
             let name = header.get(i).map(String::as_str).unwrap_or("");
-            let name = clip(name, label);
-            let pad = label.saturating_sub(display_width(&name));
+            let pad = label.saturating_sub(display_width(name));
             let text = format!("  {name}{}  {cell}", " ".repeat(pad));
             marks.push((lines.len(), 2, 2 + name.len(), "Markdown.Heading"));
             lines.push(text);
@@ -418,28 +501,6 @@ fn display_width(s: &str) -> usize {
     use unicode_width::UnicodeWidthStr;
     s.width()
 }
-
-/// Clip to a column budget without splitting a grapheme.
-fn clip(s: &str, max: usize) -> String {
-    use unicode_segmentation::UnicodeSegmentation;
-    use unicode_width::UnicodeWidthStr;
-    if s.width() <= max {
-        return s.to_string();
-    }
-    let mut out = String::new();
-    let mut used = 0;
-    for g in s.graphemes(true) {
-        let w = g.width();
-        if used + w > max.saturating_sub(1) {
-            break;
-        }
-        out.push_str(g);
-        used += w;
-    }
-    out.push('\u{2026}');
-    out
-}
-
 
 /// One non-fenced line: its block shape, then its inline runs.
 fn render_block_line(line: &str, row: usize, marks: &mut Vec<Mark>) -> String {
@@ -807,11 +868,35 @@ mod tests {
     }
 
     #[test]
-    fn a_cell_that_will_not_fit_is_clipped_not_wrapped() {
-        let long = "y".repeat(80);
-        let got = lines(&format!("| a | b |\n|---|---|\n| {long} | ok |\n"));
-        assert!(got[2].contains('\u{2026}'), "clipped: {:?}", got[2]);
-        assert!(display_width(&got[2]) <= MAX_TABLE, "and inside the budget: {:?}", got[2]);
+    fn a_cell_that_will_not_fit_wraps_inside_its_column_and_loses_nothing() {
+        // A row ending in `…` is the sentence you asked for with its end cut off.
+        let long = "the quick brown fox jumps over the lazy dog ".repeat(4);
+        let long = long.trim();
+        let got = lines(&format!(
+            "| Key | What it does |\n|---|---|\n| ^P | {long} |\n| ^E | short |\n"
+        ));
+        assert!(got.iter().all(|l| !l.contains('\u{2026}')), "nothing clipped: {got:#?}");
+        assert!(got.iter().all(|l| display_width(l) <= MAX_TABLE), "inside the budget: {got:#?}");
+        let words: Vec<&str> = got
+            .iter()
+            .skip(2)
+            .take_while(|l| !l.is_empty())
+            .flat_map(|l| l.split_whitespace())
+            .filter(|w| *w != "^P")
+            .collect();
+        assert_eq!(words.join(" "), long, "every word, in order: {got:#?}");
+        assert!(got[2].starts_with("  ^P   the"), "the key beside the first line: {:?}", got[2]);
+        let column = got[2].find("the").unwrap();
+        assert_eq!(&got[3][..column], " ".repeat(column), "continuations stay in the column: {got:#?}");
+        assert!(got.contains(&String::new()), "a wrapped row is set apart from the next: {got:#?}");
+        assert_eq!(got.last().unwrap(), "  ^E   short");
+    }
+
+    #[test]
+    fn a_word_wider_than_its_column_breaks_on_a_grapheme() {
+        assert_eq!(wrap("abcdef", 4), vec!["abcd", "ef"]);
+        assert_eq!(wrap("日本語です", 4), vec!["日本", "語で", "す"]);
+        assert_eq!(wrap("", 4), vec![""]);
     }
 
     #[test]

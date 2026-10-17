@@ -25,6 +25,13 @@ export type AscpMessage =
      * Hex, 32 bytes.
      */
     nonce: string;
+    /**
+     * "I am asking again, on purpose" — a person pressed *resend* on a computer that has not
+     * allowed this one yet. A machine that has not paired with us hears from our dialler every
+     * heartbeat, and says so once; this is how the second, deliberate time gets said too.
+     * Absent unless set, so the hello an older node reads is byte for byte the one it knew.
+     */
+    knock?: boolean;
   }
   | {
     "type": "welcome";
@@ -75,6 +82,8 @@ export type AscpMessage =
   | { "type": "browsed"; id: string; paths: Array<string> }
   | { "type": "catalogue"; id: string; refresh: boolean }
   | { "type": "catalogued"; id: string; catalogue: ModelCatalogue }
+  | { "type": "call"; id: string; call: string }
+  | { "type": "called"; id: string; ok: string }
   | {
     "type": "pty_open";
     id: string;

@@ -88,9 +88,11 @@ mod tests {
                 rich_stream: true,
                 catalogue: true,
                 live: true,
+                calls: true,
                 projects: Vec::new(),
             },
             nonce: "00".into(),
+            knock: false,
         }
     }
 

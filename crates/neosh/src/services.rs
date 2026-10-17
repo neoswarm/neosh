@@ -121,7 +121,7 @@ impl Services {
     /// the model may do; the model does not arrive here — it calls a registered tool, which is
     /// gated like every tool. A user pressing Enter in a branch picker is not the agent acting, and
     /// asking the agent's policy about it would refuse the thing the user just asked for.
-    fn permit_write(&self, verb: &str) -> Result<(), ApiError> {
+    pub(crate) fn permit_write(&self, verb: &str) -> Result<(), ApiError> {
         if self.may_write_vcs {
             return Ok(());
         }

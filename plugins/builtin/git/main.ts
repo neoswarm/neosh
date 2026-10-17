@@ -182,18 +182,24 @@ two-word scratch name it was created with.",
       // Empty is absent. A caller filling a later slot has to pass something for the earlier ones,
       // and `""` meaning "a branch called nothing" turns "ask me" into a silent no-op.
       (args: string[]) =>
-        newWorktree(neosh, { branch: arg(args, 0), path: arg(args, 1), cwd: arg(args, 2) }),
-      "Create a worktree and start working in it — `git.worktree.new <branch> [path] [cwd]`",
+        newWorktree(neosh, {
+          branch: arg(args, 0),
+          path: arg(args, 1),
+          cwd: arg(args, 2),
+          node: arg(args, 3),
+        }),
+      "Create a worktree and start working in it — `git.worktree.new <branch> [path] [cwd] [computer]`",
     ],
     [
       "git.worktree.new.auto",
-      (args: string[]) => newWorktree(neosh, { cwd: arg(args, 0), auto: true }),
-      "A worktree on a branch named for you, with nothing to answer — `git.worktree.new.auto [cwd]`",
+      (args: string[]) => newWorktree(neosh, { cwd: arg(args, 0), auto: true, node: arg(args, 1) }),
+      "A worktree on a branch named for you, with nothing to answer — `git.worktree.new.auto [cwd] [computer]`",
     ],
     [
       "git.worktree.new.inside",
-      (args: string[]) => newWorktree(neosh, { cwd: arg(args, 0), auto: true, inside: true }),
-      "A worktree kept inside the repository, on a branch named for you — `git.worktree.new.inside [cwd]`",
+      (args: string[]) =>
+        newWorktree(neosh, { cwd: arg(args, 0), auto: true, inside: true, node: arg(args, 1) }),
+      "A worktree kept inside the repository, on a branch named for you — `git.worktree.new.inside [cwd] [computer]`",
     ],
     [
       "git.pull",
@@ -237,7 +243,25 @@ two-word scratch name it was created with.",
       // Read as one, `p` on the git block tried to pull a repository called `git` and reported that
       // it could not find one — which is a true sentence about a question nobody asked. A row of
       // ours means the conversation's own checkout, which is what no `cwd` at all already says.
-      (args: string[]) => pull(neosh, arg(args, 0) === "custom" ? undefined : arg(args, 1)),
+      //
+      // A row about another machine also names it, third: the checkout is on that disk, so the
+      // status, the fetch and the pull are that machine's (`swarm.at`), and the question about a
+      // diverged branch is still asked here.
+      async (args: string[]) => {
+        const kind = arg(args, 0);
+        if (kind === "remote" || kind === "elsewhere") {
+          const cwd = arg(args, 1);
+          const node = arg(args, 2);
+          if (!cwd || !node) {
+            neosh.notify("that project is on several computers — open one of its rows to pull it", "info");
+            return;
+          }
+          const on = await onMachine(neosh, node);
+          if (on) await pullRepository(on, cwd);
+          return;
+        }
+        await pull(neosh, kind === "custom" ? undefined : arg(args, 1));
+      },
       "Pull the repository of the sidebar row under the cursor",
     ],
     [
@@ -271,11 +295,11 @@ two-word scratch name it was created with.",
         if (url.trim() === "") return null;
         url = expandShorthand(url.trim());
       }
-      return await cloneRepository(neosh, url, arg(args, 1));
+      return await cloneRepository(neosh, url, arg(args, 1), arg(args, 2));
     },
     {
       desc:
-        "Clone a repository and open it — `git.clone <url> [destination]`. Asks where without one",
+        "Clone a repository and open it — `git.clone <url> [destination] [computer]`. Asks where without one",
     },
   );
 
@@ -980,6 +1004,13 @@ interface WorktreeSpec {
   /** Name it rather than ask. See {@link scratchName}. */
   auto?: boolean;
   /**
+   * The computer the repository is on, when it is not this one. Every question about the disk —
+   * the trees, the branch names, `worktree.root`, what is already in the directory — is asked of
+   * that machine, the tree is made there, and the conversation in it is that machine's, opened
+   * here. See `swarm.at`.
+   */
+  node?: string;
+  /**
    * Inside the repository, whatever `worktree.root` says.
    *
    * The per-call form of a relative root: the picker offers "in this project" as a *choice*, and a
@@ -1015,20 +1046,24 @@ interface WorktreeSpec {
  * it is a chore with extra steps.
  */
 async function newWorktree(neosh: Neosh, spec: WorktreeSpec = {}): Promise<void> {
-  const root = await repoRoot(neosh, spec.cwd);
+  // The machine the repository is on. Everything about the disk is asked through `on`; a question
+  // for a person and a notice are still this screen's, which `on` keeps here anyway.
+  const on = spec.node ? await onMachine(neosh, spec.node) : neosh;
+  if (on === null) return;
+  const root = await repoRoot(on, spec.cwd);
   if (root === null) return;
 
   // Remote names count. `origin/fix-thing` with no local branch means `git worktree add` should
   // check the existing one out rather than fail trying to create it, and for a generated name it
   // means one that is free here but taken upstream is not offered.
   const taken = new Set(
-    (await neosh.git.branches({ includeRemote: true, cwd: spec.cwd }).catch(() => []))
+    (await on.git.branches({ includeRemote: true, cwd: spec.cwd }).catch(() => []))
       .flatMap((b) => [b.name, b.name.replace(/^[^/]+\//, "")]),
   );
 
   // A worktree occupies two namespaces and the branch list is only one of them. See `occupied`.
-  const parent = await worktreeParent(neosh, root, spec.inside);
-  const here = spec.path ? new Set<string>() : await occupied(neosh, parent);
+  const parent = await worktreeParent(on, root, spec.inside);
+  const here = spec.path ? new Set<string>() : await occupied(on, parent);
 
   const asked = spec.branch ??
     (spec.auto
@@ -1042,21 +1077,52 @@ async function newWorktree(neosh: Neosh, spec: WorktreeSpec = {}): Promise<void>
   const create = !taken.has(name);
 
   try {
-    await neosh.git.addWorktree(where, name, { create, cwd: spec.cwd });
+    await on.git.addWorktree(where, name, { create, cwd: spec.cwd });
   } catch (e) {
     neosh.notify(String(e), "error");
     return;
   }
-  const session = await neosh.session.create({ cwd: where });
+  // On another machine this is that machine's conversation, opened here — and the scratch mark
+  // below goes on *its* id over there, which is where the turn that renames the branch runs.
+  const session = await on.session.create({ cwd: where });
   // Only a name *nobody chose* is one this plugin may replace later. A branch somebody typed is
   // theirs, and `git.worktree.new feat/thing` must not be quietly renamed the moment a message is
   // sent — so the mark goes on here, where the difference is still known, rather than being
   // guessed at afterwards from the shape of the name.
   if (spec.auto && create) {
-    await neosh.vars.set(sessionScope(session.id), VAR_SCRATCH, name)
+    await on.vars.set(sessionScope(session.id), VAR_SCRATCH, name)
       .catch((e: unknown) => neosh.log.info(`could not mark ${name} as scratch: ${e}`));
   }
-  neosh.notify(`${create ? "branched" : "checked out"} ${name} in ${where}`);
+  const machine = spec.node ? await machineName(neosh, spec.node) : null;
+  neosh.notify(
+    `${create ? "branched" : "checked out"} ${name} in ${where}${machine ? ` on ${machine}` : ""}`,
+  );
+}
+
+/**
+ * The namespace for another computer's disk, when it can be asked — and a sentence saying why not
+ * when it cannot, rather than a call that fails three steps down as "not a git repository".
+ */
+async function onMachine(neosh: Neosh, node: string): Promise<Neosh | null> {
+  const there = (await neosh.swarm.nodes().catch(() => [])).find((n) => n.info.id === node);
+  if (!there?.up) {
+    neosh.notify(`${there?.info.name ?? "that computer"} is not connected — c on its row reconnects`, "warn");
+    return null;
+  }
+  if (!there.capabilities.calls) {
+    neosh.notify(
+      `${there.info.name} is running neosh ${there.info.version}, which cannot do that for another machine — update it there`,
+      "warn",
+    );
+    return null;
+  }
+  return neosh.swarm.at(node);
+}
+
+/** What a paired computer is called, for a sentence. Its id when it cannot be found. */
+async function machineName(neosh: Neosh, node: string): Promise<string> {
+  const all = await neosh.swarm.nodes().catch(() => []);
+  return all.find((n) => n.info.id === node)?.info.name ?? node.slice(0, 8);
 }
 
 /**
@@ -1784,7 +1850,15 @@ async function cloneRepository(
   neosh: Neosh,
   address: string,
   into?: string,
+  node?: string,
 ): Promise<string | null> {
+  // On another computer every question about the disk — `clone.root`, the folders remembered there,
+  // what is already in them, the folder browser, the clone itself — is that machine's, and what
+  // opens is its conversation. The picker and the progress row are still this screen's.
+  const on = node ? await onMachine(neosh, node) : neosh;
+  if (on === null) return null;
+  const machine = node ? await machineName(neosh, node) : null;
+  const onto = machine ? ` onto ${machine}` : "";
   const url = (address ?? "").trim();
   if (url === "") {
     neosh.notify("git.clone needs a repository URL — `git.clone <url> [destination]`", "warn");
@@ -1799,18 +1873,18 @@ async function cloneRepository(
   // caller with no screen.
   if (into && into.trim() !== "") {
     const at = into.trim().replace(/\/+$/, "");
-    if (await directoryExists(neosh, at)) {
+    if (await directoryExists(on, at)) {
       neosh.notify(`${at} is already there — nothing was cloned`, "warn");
       return null;
     }
-    if (!await runClone(neosh, url, at, name, ascii)) return null;
-    await neosh.session.create({ cwd: at }).catch((e: unknown) => neosh.notify(String(e), "warn"));
+    if (!await runClone(on, url, at, name, ascii, machine)) return null;
+    await on.session.create({ cwd: at }).catch((e: unknown) => neosh.notify(String(e), "warn"));
     return at;
   }
 
-  const root = ((await neosh.opt.get<string>("clone.root").catch(() => "")) ?? "").trim();
+  const root = ((await on.opt.get<string>("clone.root").catch(() => "")) ?? "").trim();
   const remembered =
-    (await neosh.vars.get<string[]>({ scope: "global" }, VAR_CLONE_LOCATIONS).catch(() => null)) ??
+    (await on.vars.get<string[]>({ scope: "global" }, VAR_CLONE_LOCATIONS).catch(() => null)) ??
       [];
 
   // `clone.root` nests by owner, because it is the one directory that collects repositories from
@@ -1825,7 +1899,7 @@ async function cloneRepository(
       owned: false,
     })),
   ];
-  const taken = await Promise.all(destinations.map((d) => directoryExists(neosh, d.at)));
+  const taken = await Promise.all(destinations.map((d) => directoryExists(on, d.at)));
 
   type Dest = { kind: "at"; path: string } | { kind: "ask" };
   const rows: PickerItem<Dest>[] = destinations.map((d, i) => ({
@@ -1850,7 +1924,7 @@ async function cloneRepository(
   });
 
   const picked = await picker<Dest>(neosh, rows, {
-    title: `Clone ${name}`,
+    title: `Clone ${name}${onto}`,
     width: 84,
     height: Math.min(12, rows.length + 3),
     hints: `${host ? `from ${host}   ` : ""}↵ clone here   Esc cancel`,
@@ -1865,7 +1939,7 @@ async function cloneRepository(
     // The *folder it goes in*, not the destination itself: `<folder>/<repo>` is what gets made, so
     // the question has one answer rather than two — and that answer is exactly the thing worth
     // remembering for next time.
-    const folder = await pathPicker(neosh, `Clone ${repo} into which folder?`, {
+    const folder = await pathPicker(on, `Clone ${repo}${onto} into which folder?`, {
       initial: root ? `${root}/` : "~/",
     });
     if (folder === null || folder.trim() === "") return null;
@@ -1873,7 +1947,7 @@ async function cloneRepository(
     at = join(learn, "", repo);
   }
 
-  if (await directoryExists(neosh, at)) {
+  if (await directoryExists(on, at)) {
     // Said here rather than left to git, which reports it as a `fatal:` about a destination path —
     // accurate, and reads to somebody who just pressed `↵` on a menu row as though the clone went
     // wrong rather than as though that row was already taken.
@@ -1881,16 +1955,16 @@ async function cloneRepository(
     return null;
   }
 
-  const ok = await runClone(neosh, url, at, name, ascii);
+  const ok = await runClone(on, url, at, name, ascii, machine);
   if (!ok) return null;
-  if (learn) await rememberLocation(neosh, remembered, learn, root);
+  if (learn) await rememberLocation(on, remembered, learn, root);
 
   // Landing in it is the point, exactly as it is for a worktree. A verb that fetches a repository
   // and then leaves you where you were has done the work and withheld the reason for it — you
   // would go and find the thing you just asked for, which is the complaint `swarm.command` fixed
   // one panel along. Done here rather than by the caller so that `^K git.clone` and `^O` behave
   // the same; the sidebar therefore takes the path as *already opened* and does not open it again.
-  await neosh.session.create({ cwd: at }).catch((e: unknown) => neosh.notify(String(e), "warn"));
+  await on.session.create({ cwd: at }).catch((e: unknown) => neosh.notify(String(e), "warn"));
   return at;
 }
 
@@ -1921,9 +1995,11 @@ async function runClone(
   at: string,
   name: string,
   ascii: boolean,
+  machine: string | null = null,
 ): Promise<boolean> {
   const key = `git.clone.${at}`;
-  let phase = "Connecting";
+  // git's phases are told on the machine running it, so a clone over there has one: where.
+  let phase = machine ? `Cloning on ${machine}` : "Connecting";
   let percent: number | null = null;
 
   const draw = () => {
@@ -1952,7 +2028,7 @@ async function runClone(
 
   try {
     await neosh.git.clone(url, at);
-    neosh.notify(`cloned ${name} into ${at}`);
+    neosh.notify(`cloned ${name} into ${at}${machine ? ` on ${machine}` : ""}`);
     return true;
   } catch (e) {
     // git's own last line — `Repository not found`, `Permission denied (publickey)`, `could not

@@ -10191,9 +10191,10 @@ impl Peer {
         sb.write_config(&format!(
             "[swarm]\nenabled = true\nlisten = \"\"\nheartbeat_secs = 1\n\
              accepts_shells = {}\n\n\
-             [[swarm.peers]]\naddr = \"{addr}\"\nid = \"{}\"\nname = \"{name}\"\n{EVERY_COMPUTER}",
+             [[swarm.peers]]\naddr = \"{addr}\"\nid = \"{}\"\nname = \"{name}\"\n{}",
             shells.ours,
-            theirs.id()
+            theirs.id(),
+            on_the_peer(name),
         ));
 
         let rt = tokio::runtime::Builder::new_multi_thread()
@@ -10310,73 +10311,6 @@ fn theirs(key: &str, name: &str, cwd: &str, root: &str, branch: Option<&str>) ->
     }
 }
 
-/// A repository you both have is **one row**, and the other machine's work is inside it.
-///
-/// The bug this pins down drew it as two: local conversations were grouped by directory and matched
-/// against remote ones on a key the local side never had — inferred from the remote agent's `cwd`,
-/// so the two only met when both machines happened to have the repository at the same absolute
-/// path. They never do. The repository you were sitting in appeared once as yours and once again
-/// below as a project you had never heard of, named after whichever remote conversation sorted
-/// first — which for a worktree is `work · fix/thing`, a display string being used as a key.
-#[test]
-fn a_repository_on_two_computers_is_one_row_with_both_lots_of_work_in_it() {
-    const KEY: &str = "git:github.com/neoswarm/work";
-    let sb = Sandbox::new("swarm-one-tree");
-    sb.git_init();
-    sb.git_remote("https://github.com/neoswarm/work.git");
-    let peer = Peer::beside(&sb, "linux-box");
-    // Deliberately nothing like the local path: that difference is the whole point.
-    peer.publish(
-        vec![theirs(KEY, "work", "/srv/checkouts/work", "/srv/checkouts/work", None)],
-        vec![
-            there("r1", "reading the parser", KEY, "/srv/checkouts/work", "/srv/checkouts/work", None),
-            there("r2", "chasing the flake", KEY, "/srv/checkouts/work/.wt/fix", "/srv/checkouts/work", Some("fix/the-thing")),
-        ],
-    );
-
-    let mut s = sb.start();
-    s.wait_for("PROJECTS");
-    assert!(
-        s.pump(|s| s.sidebar_now().iter().any(|l| l.contains("reading the parser"))),
-        "the other machine's conversation arrives at all:\n{:?}",
-        s.sidebar_now()
-    );
-
-    let rows = s.sidebar_now();
-    let named = |needle: &str| rows.iter().position(|l| l.contains(needle));
-
-    // One project row, not two. `work · fix/thing` was the second one, and it is the display string
-    // the old grouping mistook for an identity.
-    assert!(
-        !rows.iter().any(|l| l.contains("work · ") || l.contains("work \u{b7} ")),
-        "a worktree is never a project named after a branch:\n{rows:?}"
-    );
-    let heads = rows.iter().filter(|l| l.contains("work") && !l.contains("\u{2387}")).count();
-    assert_eq!(heads, 1, "one row for one repository:\n{rows:?}");
-
-    // The other machine is a block of its own under the repository: its row, then its main
-    // checkout's conversation, then its worktree and the conversation in that — never folded in
-    // with ours, whatever it is on.
-    let repo = named("work").expect("the repository row");
-    let block = named("@lb").expect("the machine's block row");
-    let mine = named("reading the").expect("their main-checkout conversation");
-    let tree = named("fix/the-thing").expect("their worktree, as a checkout row");
-    let inside = named("chasing the").expect("the conversation in their worktree");
-    assert!(
-        repo < block && block < mine && mine < tree && tree < inside,
-        "nested, in order:\n{rows:?}"
-    );
-
-    // The block row says which machine, once; everything under it is indented under it, with no
-    // line drawn down the side.
-    let indent = |row: usize| rows[row].len() - rows[row].trim_start().len();
-    for row in [mine, tree, inside] {
-        assert!(!rows[row].contains('@'), "said once, on the block:\n{rows:?}");
-        assert!(!rows[row].contains('\u{2502}'), "no rail down the side:\n{rows:?}");
-        assert!(indent(row) > indent(block), "row {row} hangs off the block:\n{rows:?}");
-    }
-}
-
 /// A checkout on a machine that has not allowed this one is not a row.
 ///
 /// Its project list arrived in the handshake — the half of pairing that did happen — so this is not
@@ -10440,6 +10374,166 @@ fn a_machine_that_has_not_allowed_this_one_contributes_no_rows() {
     );
     drop(handle);
     drop(rt);
+}
+
+/// `^R` on a machine that has not allowed this one asks it again — and the far end hears a knock.
+///
+/// The invite that never arrived: the far end was told once, at the wrong moment, and every redial
+/// after it was deduplicated as the same request. A heartbeat's redial still does not knock, so a
+/// machine is not told about the same computer every ten seconds; pressing the key does.
+#[test]
+fn asking_a_machine_again_knocks_on_its_door() {
+    let sb = Sandbox::new("swarm-knock");
+    let probe = std::net::TcpListener::bind("127.0.0.1:0").expect("probe");
+    let addr = probe.local_addr().expect("addr");
+    drop(probe);
+    let state = sb.root.join("state");
+    std::fs::create_dir_all(&state).expect("state dir");
+    let _mine = neosh_swarm::Identity::load_or_create(&neosh_swarm::identity::key_path(&state))
+        .expect("this workspace's key");
+    let theirs_id = neosh_swarm::Identity::ephemeral();
+    sb.write_config(&format!(
+        "[swarm]\nenabled = true\nlisten = \"\"\nheartbeat_secs = 1\n\n\
+         [[swarm.peers]]\naddr = \"{addr}\"\nid = \"{}\"\nname = \"stranger\"\n\n\
+         [options]\n\"swarm.device\" = \"here\"\n",
+        theirs_id.id()
+    ));
+    let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build().expect("runtime");
+    let guard = rt.enter();
+    let (handle, mut events) = neosh_swarm::node::spawn(
+        std::sync::Arc::new(theirs_id),
+        neosh_swarm::Allowed::load(None),
+        neosh_swarm::SwarmConfig {
+            name: "stranger".into(),
+            listen: Some(addr),
+            heartbeat: Duration::from_millis(200),
+            ..Default::default()
+        },
+        "0.4.6".into(),
+    );
+    drop(guard);
+    // Whether the far end has heard a knock yet, reading everything it has been told.
+    let mut knocked = move || {
+        let mut any = false;
+        while let Ok(e) = events.try_recv() {
+            if let neosh_swarm::SwarmEvent::Stranger { dialled: false, knock: true, .. } = e {
+                any = true;
+            }
+        }
+        any
+    };
+
+    let mut s = sb.start();
+    s.send(&command("swarm.nodes"));
+    assert!(
+        s.pump(|s| s.picker_named("[Computers]").iter().any(|l| l.contains("ask again"))),
+        "the waiting machine says how to ask again:\n{:?}",
+        s.picker_named("[Computers]")
+    );
+    s.drain_for(Duration::from_millis(1500));
+    assert!(!knocked(), "being dialled on the heartbeat is not being asked");
+
+    s.ctrl("r");
+    s.wait_for("asked stranger again");
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let mut heard = false;
+    while !heard && std::time::Instant::now() < deadline {
+        heard = knocked();
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert!(heard, "the far end heard it asked again");
+    drop(handle);
+    drop(rt);
+}
+
+/// A computer asking to join is a row in the panel until somebody answers it, and `^X` in `^J`
+/// turns it away.
+///
+/// What the asking used to be was one toast, raised before the person over there had even pressed
+/// *Add* — so a request that arrived while you were looking elsewhere was gone, and there was no way
+/// to say no to one either.
+#[test]
+fn a_computer_asking_to_join_stays_on_screen_until_it_is_answered() {
+    let sb = Sandbox::new("swarm-asking");
+    let probe = std::net::TcpListener::bind("127.0.0.1:0").expect("probe");
+    let ours = probe.local_addr().expect("addr");
+    drop(probe);
+    let state = sb.root.join("state");
+    std::fs::create_dir_all(&state).expect("state dir");
+    let mine = neosh_swarm::Identity::load_or_create(&neosh_swarm::identity::key_path(&state))
+        .expect("this workspace's key");
+    sb.write_config(&format!(
+        "[swarm]\nenabled = true\nlisten = \"{ours}\"\nheartbeat_secs = 1\n"
+    ));
+
+    let mut s = sb.start();
+    s.wait_for("PROJECTS");
+
+    let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build().expect("runtime");
+    let guard = rt.enter();
+    let (handle, _events) = neosh_swarm::node::spawn(
+        std::sync::Arc::new(neosh_swarm::Identity::ephemeral()),
+        neosh_swarm::Allowed::load(None),
+        neosh_swarm::SwarmConfig {
+            name: "laptop".into(),
+            heartbeat: Duration::from_millis(500),
+            ..Default::default()
+        },
+        "0.4.6".into(),
+    );
+    drop(guard);
+    // Somebody over there pressed *Add* with this machine's address.
+    handle.send(neosh_swarm::SwarmRequest::Pair {
+        id: mine.id().clone(),
+        name: "the workspace under test".into(),
+        addr: Some(ours.to_string()),
+    });
+
+    assert!(
+        s.pump(|s| s.sidebar_now().iter().any(|l| l.contains("laptop wants to join"))),
+        "the request is a row:\n{:?}",
+        s.sidebar_now()
+    );
+
+    s.send(&command("swarm.nodes"));
+    assert!(
+        s.pump(|s| s.picker_named("[Computers]").iter().any(|l| l.contains("turn away"))),
+        "and in ^J, with how to say no:\n{:?}",
+        s.picker_named("[Computers]")
+    );
+    s.ctrl("x");
+    s.wait_for("turned laptop away");
+    s.special("esc");
+    assert!(
+        s.pump(|s| !s.sidebar_now().iter().any(|l| l.contains("wants to join"))),
+        "and the row goes:\n{:?}",
+        s.sidebar_now()
+    );
+    // It keeps dialling, and a heartbeat's redial does not bring it back.
+    s.drain_for(Duration::from_millis(2000));
+    assert!(
+        !s.sidebar_now().iter().any(|l| l.contains("wants to join")),
+        "turned away stays turned away:\n{:?}",
+        s.sidebar_now()
+    );
+    drop(handle);
+    drop(rt);
+}
+
+/// Where another computer is added has a key, and the panel says which.
+///
+/// Pairing had no mark anywhere on screen: the first thing somebody did with it was ask which key
+/// it was.
+#[test]
+fn the_panel_says_which_key_reaches_the_computers() {
+    let sb = Sandbox::new("computers-key");
+    let mut s = sb.start();
+    s.wait_for("PROJECTS");
+    assert!(
+        s.pump(|s| s.sidebar_now().iter().any(|l| l.contains("^J") && l.contains("computers"))),
+        "the foot of the panel names ^J:\n{:?}",
+        s.sidebar_now()
+    );
 }
 
 impl Session {
@@ -10782,6 +10876,7 @@ fn a_workspace_refuses_a_shell_from_a_peer_that_asks_anyway() {
                 rich_stream: false,
                 catalogue: false,
                 live: false,
+                calls: false,
                 projects: Vec::new(),
             };
             neosh_swarm::accept(&mut stream, &theirs, &allowed, &info, &caps).await.expect("paired");
@@ -10913,42 +11008,37 @@ fn alive(pid: i32) -> bool {
         .unwrap_or(false)
 }
 
-/// `^N` does not ask which computer when none of them has this repository.
+/// `^N` never asks which computer — not even when another one has this very repository.
 ///
-/// The question is worth asking when it is a decision, and a repository nobody else has a checkout
-/// of has one possible answer. Asking anyway is a panel and a keypress spent confirming something
-/// the workspace already knew — the same rule as not asking at all with no machine paired, one step
-/// finer. The first cut asked the moment a second computer existed, which on a swarm of two made
-/// every `^N` two keys instead of one for the whole time the other machine had nothing to do with
-/// what you were working on.
+/// A terminal is for one computer, decided when it was opened, so a new conversation in it is on
+/// that computer. The question used to come first on every `^N` the moment a second machine had a
+/// checkout of what you were in, which made the key two decisions in a project that had already
+/// said where it was. The path field does not list the other machines either: `linux-box:` still
+/// reaches one, and `^J` is where a window moves.
 #[test]
-fn asking_which_computer_is_skipped_when_none_of_them_has_the_project() {
+fn a_new_conversation_never_asks_which_computer() {
+    const KEY: &str = "git:github.com/neoswarm/work";
     let sb = Sandbox::new("swarm-no-question");
     sb.git_init();
     sb.git_remote("https://github.com/neoswarm/work.git");
     let mut peer = Peer::beside(&sb, "linux-box");
-    // A machine that is up and useful, and has nothing to do with the repository you are in.
-    peer.publish(
-        vec![theirs("git:github.com/neoswarm/faraway", "faraway", "/srv/faraway", "/srv/faraway", None)],
-        Vec::new(),
-    );
+    // This terminal is for this computer, and the machine beside it has a checkout of the very
+    // repository it is in — the case that used to ask.
+    let path = sb.root.join("config/config.toml");
+    let cfg = std::fs::read_to_string(&path).expect("read config");
+    std::fs::write(
+        &path,
+        cfg.replace(&on_the_peer("linux-box"), "\n[options]\n\"swarm.device\" = \"here\"\n"),
+    )
+    .expect("this computer");
+    peer.publish(vec![theirs(KEY, "work", "/srv/work", "/srv/work", Some("main"))], Vec::new());
 
     let mut s = sb.start();
     s.wait_for("PROJECTS");
-    // Wait for the machine itself, not for something it brought: a question that has not been
-    // asked yet looks exactly like one that will not be, so a test that presses the key before the
-    // peer has connected passes for the wrong reason. Its arrival is the one unambiguous signal.
+    // Wait for the machine itself: a question that has not been asked yet looks exactly like one
+    // that will not be, so a key pressed before the peer has connected passes for the wrong reason.
     assert!(s.pump(|s| s.texts().iter().any(|t| t.contains("linux-box joined"))), "the peer joined");
-    assert!(
-        s.pump(|s| s.sidebar_now().iter().any(|l| l.contains("faraway"))),
-        "and its project is on the panel:\n{:?}",
-        s.sidebar_now()
-    );
-    // And that this workspace has settled on its *own* project key — the origin remote rather than
-    // the `dir:` guess it answers with until it has read the repository. Until then the key is
-    // deliberately not used to withhold the question, so a `^N` pressed in that window would be
-    // testing the fallback rather than the rule.
-    peer.wait_for_key("git:github.com/neoswarm/work");
+    peer.wait_for_key(KEY);
 
     s.ctrl("n");
     // On the picker's own buffer rather than on the words in it: "New conversation" is also what an
@@ -10962,65 +11052,21 @@ fn asking_which_computer_is_skipped_when_none_of_them_has_the_project() {
     assert!(rows.iter().any(|l| l.contains("Here")), "and it is the one about directories:\n{rows:?}");
     // `This computer` is the machine picker's first row, and is what must not appear.
     assert!(
-        !rows.iter().any(|l| l.contains("This computer")),
-        "the which-computer question is not asked:\n{rows:?}"
+        !rows.iter().any(|l| l.contains("This computer") || l.contains("linux-box")),
+        "the which-computer question is not asked, and no machine is a row:\n{rows:?}"
     );
 }
 
-/// And it does ask when one of them has it, because then it is a decision.
-#[test]
-fn asking_which_computer_happens_when_one_of_them_has_the_project() {
-    const KEY: &str = "git:github.com/neoswarm/work";
-    let sb = Sandbox::new("swarm-yes-question");
-    sb.git_init();
-    sb.git_remote("https://github.com/neoswarm/work.git");
-    let mut peer = Peer::beside(&sb, "linux-box");
-    // The same repository, at a path of its own — which is the ordinary case and the one the
-    // matching had to be made to see. With a conversation in it, purely so there is something on
-    // screen to wait for: the repository merges into the `work` row that is already there and a
-    // repository that is here as well deliberately wears no marker, so the machine connecting
-    // changes nothing visible about the project itself.
-    peer.publish(
-        vec![theirs(KEY, "work", "/srv/checkouts/work", "/srv/checkouts/work", None)],
-        vec![there("r1", "over there", KEY, "/srv/checkouts/work", "/srv/checkouts/work", None)],
-    );
-
-    let mut s = sb.start();
-    s.wait_for("PROJECTS");
-    // The key first, for the reason the other test waits for it: until this workspace has read its
-    // own origin it answers `dir:work`, and a `^N` pressed then is testing the fallback.
-    peer.wait_for_key(KEY);
-    // And then the merge, which is what makes this the same repository as the peer's.
-    assert!(
-        s.pump(|s| s.sidebar_now().iter().any(|l| l.contains("over there"))),
-        "the peer's work is in our tree:\n{:?}",
-        s.sidebar_now()
-    );
-
-    s.ctrl("n");
-    assert!(
-        s.pump(|s| !s.picker_named("[New conversation — where?]").is_empty()),
-        "which computer is asked first — instead the where-picker opened: {:?}",
-        s.picker_named("[New conversation]")
-    );
-    let rows = s.picker_named("[New conversation — where?]");
-    assert!(
-        rows.iter().any(|l| l.contains("This computer")),
-        "and this one is the row the cursor starts on, so `^N ⏎` is unchanged:\n{rows:?}"
-    );
-    assert!(
-        rows.iter().any(|l| l.contains("linux-box")),
-        "with the machine that has it beside it:\n{rows:?}"
-    );
+/// What every swarm test's terminal has already answered: it is for the peer. With a machine paired
+/// and nothing chosen the first thing a terminal does is ask which one it is for — a modal, which
+/// would take the keys the test sends — and a terminal is for one computer, so these are tests of
+/// the panel a terminal for *that* computer draws.
+fn on_the_peer(name: &str) -> String {
+    format!("\n[options]\n\"swarm.device\" = \"{name}\"\n")
 }
 
-/// What every swarm test's terminal has already answered. These are tests of the panel a terminal
-/// for *every* computer draws, and with a machine paired and nothing chosen the first thing a
-/// terminal does is ask which one it is for — a modal, which would take the keys the test sends.
-const EVERY_COMPUTER: &str = "\n[options]\n\"swarm.device\" = \"all\"\n";
-
-/// With another computer up and nothing chosen, a terminal asks which computer it is for — and
-/// `esc` is every one of them, the answer that hides nothing.
+/// With another computer paired and nothing chosen, a terminal asks which computer it is for, and
+/// there is no "all of them": a terminal is for one, and `esc` is this one.
 #[test]
 fn a_terminal_asks_which_computer_it_is_for_when_there_is_a_choice() {
     let sb = Sandbox::new("swarm-which-device");
@@ -11031,7 +11077,7 @@ fn a_terminal_asks_which_computer_it_is_for_when_there_is_a_choice() {
     );
     let path = sb.root.join("config/config.toml");
     let cfg = std::fs::read_to_string(&path).expect("read config");
-    std::fs::write(&path, cfg.replace(EVERY_COMPUTER, "")).expect("unpin the device");
+    std::fs::write(&path, cfg.replace(&on_the_peer("linux-box"), "")).expect("unpin the device");
 
     let mut s = sb.start();
     assert!(
@@ -11040,11 +11086,14 @@ fn a_terminal_asks_which_computer_it_is_for_when_there_is_a_choice() {
         s.transcript()
     );
     assert!(
-        s.pump(|s| {
-            let rows = s.picker_named("[Which computer?]");
-            rows.iter().any(|l| l.contains("linux-box")) && rows.iter().any(|l| l.contains("All computers"))
-        }),
-        "with the machine on it, and every computer once it is up:\n{:?}",
+        s.pump(|s| s.picker_named("[Which computer?]").iter().any(|l| l.contains("linux-box"))),
+        "with the machine on it:\n{:?}",
+        s.picker_named("[Which computer?]")
+    );
+    s.drain_for(Duration::from_millis(1500));
+    assert!(
+        !s.picker_named("[Which computer?]").iter().any(|l| l.contains("All computers")),
+        "and no row for all of them, even once it is up:\n{:?}",
         s.picker_named("[Which computer?]")
     );
 
@@ -11053,21 +11102,20 @@ fn a_terminal_asks_which_computer_it_is_for_when_there_is_a_choice() {
         s.pump(|s| s.buffer_named("[Which computer?]").is_none_or(|b| s.windows_for(b).is_empty())),
         "esc answers it"
     );
+    s.drain_for(Duration::from_millis(1000));
+    let rows = s.sidebar_now();
+    assert!(rows.iter().any(|l| l.contains("PROJECTS")), "this computer's panel:\n{rows:?}");
     assert!(
-        s.pump(|s| {
-            let rows = s.sidebar_now();
-            rows.iter().any(|l| l.contains("PROJECTS")) && rows.iter().any(|l| l.contains("LINUX-BOX"))
-        }),
-        "with every computer:\n{:?}",
-        s.sidebar_now()
+        !rows.iter().any(|l| l.contains("faraway") || l.contains("LINUX-BOX")),
+        "and nothing of the other one's:\n{rows:?}"
     );
 }
 
-/// A terminal for one computer shows that computer as though it were yours, and `/device all` gives
-/// it every one back.
+/// A terminal for one computer shows that computer as though it were yours, and `/device here`
+/// brings it back to this one.
 ///
 /// What narrows is the panel, not the workspace: this machine's project is off the column while the
-/// terminal is for `linux-box`, and saying `all` puts it back without anything having stopped.
+/// terminal is for `linux-box`, and saying `here` puts it back without anything having stopped.
 #[test]
 fn a_terminal_for_another_computer_shows_only_that_computer() {
     let sb = Sandbox::new("swarm-one-device");
@@ -11078,16 +11126,6 @@ fn a_terminal_for_another_computer_shows_only_that_computer() {
     );
     let mut s = sb.start();
     let ours = |rows: &[String]| rows.iter().any(|l| l.contains(" work"));
-    assert!(
-        s.pump(|s| {
-            let rows = s.sidebar_now();
-            ours(&rows) && rows.iter().any(|l| l.contains("faraway"))
-        }),
-        "every computer to begin with:\n{:?}",
-        s.sidebar_now()
-    );
-
-    s.send(&command_with("device", "linux-box"));
     assert!(
         s.pump(|s| {
             let rows = s.sidebar_now();
@@ -11111,13 +11149,13 @@ fn a_terminal_for_another_computer_shows_only_that_computer() {
     );
     assert!(!rows.iter().any(|l| l.contains("other computer")), "and no count of the rest:\n{rows:?}");
 
-    s.send(&command_with("device", "all"));
+    s.send(&command_with("device", "here"));
     assert!(
         s.pump(|s| {
             let rows = s.sidebar_now();
-            ours(&rows) && rows.iter().any(|l| l.contains("faraway"))
+            ours(&rows) && !rows.iter().any(|l| l.contains("faraway"))
         }),
-        "every computer again:\n{:?}",
+        "this computer's again, and only this computer's:\n{:?}",
         s.sidebar_now()
     );
 }
@@ -11259,123 +11297,6 @@ fn a_paste_goes_to_the_panel_with_the_keyboard_rather_than_behind_it() {
     );
 }
 
-/// Another machine's checkout is always a block of its own, in its colour, with its worktrees
-/// inside it — and when its commit is not ours, the block row says so.
-#[test]
-fn another_machine_is_a_block_of_its_own_and_says_when_it_is_on_another_commit() {
-    const KEY: &str = "git:github.com/neoswarm/work";
-    let sb = Sandbox::new("swarm-versions");
-    sb.git_init();
-    sb.git_remote("https://github.com/neoswarm/work.git");
-    let peer = Peer::beside(&sb, "linux-box");
-    // Same branch as ours, a commit we do not have.
-    let mut main = theirs(KEY, "work", "/srv/checkouts/work", "/srv/checkouts/work", Some("trunk"));
-    main.head = Some("deadbeef00000000000000000000000000000000".into());
-    peer.publish(
-        vec![
-            main,
-            theirs(KEY, "work", "/srv/checkouts/work/.wt/fix", "/srv/checkouts/work", Some("fix/the-thing")),
-        ],
-        vec![
-            there("r1", "reading the parser", KEY, "/srv/checkouts/work", "/srv/checkouts/work", Some("trunk")),
-            there("r2", "chasing the flake", KEY, "/srv/checkouts/work/.wt/fix", "/srv/checkouts/work", Some("fix/the-thing")),
-        ],
-    );
-
-    let mut s = sb.start();
-    s.wait_for("PROJECTS");
-    // Titles are clipped to the panel, so the needles are short. The commit travels with the
-    // project list, which arrives on the peer's heartbeat rather than with its conversations — so
-    // the wait is on the `≠` itself, not on the rows that happen to come first.
-    assert!(
-        s.pump(|s| {
-            let rows = s.sidebar_now();
-            ["@lb", "reading", "chasing", "fix/the-thing", "\u{2260} deadbee"]
-                .iter()
-                .all(|n| rows.iter().any(|l| l.contains(n)))
-        }),
-        "the machine's block arrives:\n{:?}",
-        s.sidebar_now()
-    );
-    let rows = s.sidebar_now();
-    let named = |needle: &str| rows.iter().position(|l| l.contains(needle));
-    let block = named("@lb").expect("the block row");
-    assert!(rows[block].contains("\u{2387} trunk"), "named by its branch:\n{rows:?}");
-    assert!(rows[block].contains("\u{2260} deadbee"), "and its commit, which is not ours:\n{rows:?}");
-    let conv = named("reading").expect("their conversation");
-    let tree = named("fix/the-thing").expect("their worktree");
-    let inside = named("chasing").expect("the conversation in it");
-    assert!(block < conv && conv < tree && tree < inside, "nested, in order:\n{rows:?}");
-    let indent = |row: usize| rows[row].chars().take_while(|c| *c == ' ' || *c == '\u{2502}').count();
-    assert!(indent(inside) > indent(tree), "their worktree's conversation is inside it:\n{rows:?}");
-    // And it is drawn in the machine's colour — the block row, and the rail down every row in it.
-    // One machine is the blue, `Swarm.Host1`, and nothing about it is a local worktree's colour.
-    let sidebar = s.buffer_named("[sidebar]").expect("the sidebar buffer");
-    let groups = s.groups_of(sidebar);
-    for row in [block, conv, tree, inside] {
-        assert!(
-            groups.get(row).is_some_and(|g| g.iter().any(|g| g == "Swarm.Host1")),
-            "row {row} wears the machine's colour: {:?}",
-            groups.get(row)
-        );
-    }
-    assert!(
-        groups.get(block).is_some_and(|g| g.iter().any(|g| g == "Swarm.Version")),
-        "the commit that is not ours is marked: {:?}",
-        groups.get(block)
-    );
-}
-
-/// Yours first, then a section per other computer: a repository only over there is under that
-/// machine's heading and nowhere else, and a checkout whose key is only a guess joins yours.
-#[test]
-fn another_computers_projects_are_in_its_own_section_under_yours() {
-    let sb = Sandbox::new("swarm-sections");
-    sb.git_init();
-    sb.git_remote("https://github.com/neoswarm/work.git");
-    let peer = Peer::beside(&sb, "linux-box");
-    peer.publish(
-        vec![
-            // Theirs of *this* repository, before that machine has read its origin: a guess.
-            theirs("dir:work", "work", "/srv/work", "/srv/work", Some("trunk")),
-            // And one this machine has no clone of.
-            theirs("git:github.com/neoswarm/faraway", "faraway", "/srv/faraway", "/srv/faraway", Some("main")),
-        ],
-        vec![there("r1", "over there", "git:github.com/neoswarm/faraway", "/srv/faraway", "/srv/faraway", Some("main"))],
-    );
-
-    let mut s = sb.start();
-    s.wait_for("PROJECTS");
-    assert!(
-        s.pump(|s| {
-            let rows = s.sidebar_now();
-            ["LINUX-BOX", "faraway", "over there", "\u{2387} trunk"]
-                .iter()
-                .all(|n| rows.iter().any(|l| l.contains(n)))
-        }),
-        "the machine's section arrives:\n{:?}",
-        s.sidebar_now()
-    );
-    let rows = s.sidebar_now();
-    let named = |needle: &str| rows.iter().position(|l| l.contains(needle));
-    let work = named(" \u{25be} work").or_else(|| named(" \u{25b8} work")).expect("our project");
-    let block = named("\u{2387} trunk").expect("their checkout of it, as a block inside ours");
-    let add = named("+ Add project").expect("the add row");
-    let heading = named("LINUX-BOX").expect("the machine's heading");
-    let faraway = named("faraway").expect("their project");
-    let conv = named("over there").expect("the conversation in it");
-    assert!(work < block && block < add, "the guessed key joined ours:\n{rows:?}");
-    assert!(add < heading && heading < faraway && faraway < conv, "theirs is under its heading:\n{rows:?}");
-    assert_eq!(
-        rows.iter().filter(|l| l.contains("faraway")).count(),
-        1,
-        "one row for their project — no block row repeating it:\n{rows:?}"
-    );
-    assert!(!rows[faraway].contains('@'), "the heading already says which machine:\n{rows:?}");
-    assert!(rows[faraway].contains("\u{2387} main"), "and which branch it is on:\n{rows:?}");
-    assert!(!rows[conv].contains('\u{2502}'), "no rail down the side:\n{rows:?}");
-}
-
 /// Folding a row about another machine folds it — it does not turn it into a project of yours.
 ///
 /// The bug: the fold was written as a *project* var keyed by the row's name (`git:github.com/…`),
@@ -11401,6 +11322,7 @@ fn folding_a_row_about_another_machine_folds_it_and_moves_nothing() {
     );
     s.enter_panel();
     assert!(s.sidebar_seek("faraway"), "the cursor reaches it:\n{:?}", s.sidebar_now());
+    let before = s.sidebar_now().iter().position(|l| l.contains("faraway")).expect("the row");
     s.special("enter");
     assert!(
         s.pump(|s| !s.sidebar_now().iter().any(|l| l.contains("over there"))),
@@ -11409,9 +11331,8 @@ fn folding_a_row_about_another_machine_folds_it_and_moves_nothing() {
     );
     s.drain_for(Duration::from_millis(1500));
     let rows = s.sidebar_now();
-    let add = rows.iter().position(|l| l.contains("+ Add project")).expect("the add row");
     let faraway = rows.iter().position(|l| l.contains("faraway")).expect("still there");
-    assert!(add < faraway, "still in the machine's section, not among ours:\n{rows:?}");
+    assert_eq!(faraway, before, "where it was, not moved among anything else:\n{rows:?}");
     assert_eq!(rows.iter().filter(|l| l.contains("faraway")).count(), 1, "and only once:\n{rows:?}");
 
     // And back, with the same key.
@@ -11807,12 +11728,16 @@ fn another_computers_rows_say_what_its_panel_says() {
     done.unread = true;
     let mut asks = there("r2", "asks one", KEY, "/srv/faraway", "/srv/faraway", Some("main"));
     asks.state = neosh_proto::AgentState::Blocked;
+    // The newest, so it is where a terminal for this machine lands — opening the other two would
+    // read them, and reading is what clears the marks this is about.
+    let mut landing = there("r3", "landing", KEY, "/srv/faraway", "/srv/faraway", Some("main"));
+    landing.updated_at += 60;
     let mut project = theirs(KEY, "faraway", "/srv/faraway", "/srv/faraway", Some("main"));
     project.decorations = vec![serde_json::json!({
         "target": { "project": "/srv/faraway" },
         "badge": { "parts": [{ "text": "\u{2193}3", "hl": "Git.Behind" }, { "text": " " }, { "text": "#86", "hl": "Forge.Open" }] },
     })];
-    peer.publish(vec![project], vec![done, asks]);
+    peer.publish(vec![project], vec![done, asks, landing]);
 
     let mut s = sb.start();
     s.wait_for("PROJECTS");
@@ -12053,7 +11978,10 @@ fn another_computers_turn_ending_unwatched_is_a_notification_here() {
     busy.state = neosh_proto::AgentState::Running;
     busy.turn_started_at = Some(started);
     let project = || theirs(KEY, "faraway", "/srv/faraway", "/srv/faraway", Some("main"));
-    peer.publish(vec![project()], vec![busy.clone()]);
+    // The newest, so a terminal for this machine lands there and the long job is watched by nobody.
+    let mut landing = there("r2", "landing", KEY, "/srv/faraway", "/srv/faraway", Some("main"));
+    landing.updated_at += 60;
+    peer.publish(vec![project()], vec![busy.clone(), landing.clone()]);
     let mut s = sb.start();
     s.wait_for("PROJECTS");
     assert!(
@@ -12064,7 +11992,7 @@ fn another_computers_turn_ending_unwatched_is_a_notification_here() {
     let mut done = busy.clone();
     done.state = neosh_proto::AgentState::Idle;
     done.unread = true;
-    peer.publish(vec![project()], vec![done]);
+    peer.publish(vec![project()], vec![done, landing]);
     s.wait_for("finished on linux-box");
 }
 
@@ -12209,4 +12137,337 @@ fn another_computers_conversation_shows_its_own_models() {
         panic!("a model, not {command:?}")
     };
     assert_eq!((instance.as_str(), model.as_str()), ("far-cli", "far-haiku"));
+}
+
+impl Peer {
+    /// Ask the workspace under test to run an API call, as another machine's `swarm.at` does.
+    fn call(&mut self, call: neosh_proto::ApiCall) -> Result<neosh_proto::ApiOk, String> {
+        let node = self.wait_up();
+        let id = format!("call-{}", now_secs_nanos());
+        self.handle.send(neosh_swarm::SwarmRequest::Call {
+            node,
+            id: id.clone(),
+            call: serde_json::to_string(&call).expect("a call is JSON"),
+        });
+        let want = id.clone();
+        match self.wait_event("the answer to a call", move |e| match e {
+            neosh_swarm::SwarmEvent::Called { id, .. } => *id == want,
+            neosh_swarm::SwarmEvent::Answer { id, .. } => *id == want,
+            _ => false,
+        }) {
+            neosh_swarm::SwarmEvent::Called { ok, .. } => {
+                Ok(serde_json::from_str(&ok).expect("the answer is an ApiOk"))
+            }
+            neosh_swarm::SwarmEvent::Answer { result: Err(r), .. } => Err(format!("{r:?}")),
+            other => panic!("not an answer: {other:?}"),
+        }
+    }
+
+    /// Wait for the workspace under test to ask this machine for a call, and answer it.
+    fn answer_call(
+        &mut self,
+        answer: impl FnOnce(&neosh_proto::ApiCall) -> Result<neosh_proto::ApiOk, neosh_proto::Refusal>,
+    ) -> neosh_proto::ApiCall {
+        let neosh_swarm::SwarmEvent::Call { node, id, call } =
+            self.wait_event("a call", |e| matches!(e, neosh_swarm::SwarmEvent::Call { .. }))
+        else {
+            unreachable!()
+        };
+        let call: neosh_proto::ApiCall = serde_json::from_str(&call).expect("a call is JSON");
+        let result = answer(&call).map(|ok| serde_json::to_string(&ok).expect("JSON"));
+        self.handle.send(neosh_swarm::SwarmRequest::Called { node, id, result });
+        call
+    }
+}
+
+/// `worktree.root` on the machine in these tests, as `opt.get` answers it.
+fn tree_root() -> neosh_proto::ApiOk {
+    neosh_proto::ApiOk::Option {
+        entry: Some(neosh_proto::OptionEntry {
+            name: "worktree.root".into(),
+            ty: neosh_proto::OptionType::Str,
+            value: neosh_proto::OptionValue::Str("/srv/trees".into()),
+            default: neosh_proto::OptionValue::Str("/srv/trees".into()),
+            description: None,
+            owner: "neosh".into(),
+            modified: false,
+        }),
+    }
+}
+
+fn now_secs_nanos() -> u128 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0)
+}
+
+/// Another computer can ask this one about its disk — and only about its disk.
+///
+/// What `n` on a project over there is built on: its worktrees, a new tree, a conversation in it.
+/// The owner keeps its own list of which calls a peer may make and checks it on every one, so a
+/// call about a *screen* is refused whatever the asker believed, and a git call that does not say
+/// which directory is refused rather than answered about whatever somebody here is reading.
+#[test]
+fn another_computer_can_make_a_worktree_here_and_start_in_it_without_moving_this_screen() {
+    use neosh_proto::{ApiCall, ApiOk};
+    let sb = Sandbox::new("swarm-call-owner");
+    sb.git_init();
+    let mut peer = Peer::beside(&sb, "linux-box");
+    let mut s = sb.start();
+    s.wait_for("PROJECTS");
+    let work = sb.work().display().to_string();
+
+    let trees = peer.call(ApiCall::GitWorktrees { cwd: Some(work.clone()) }).expect("answered");
+    let ApiOk::Worktrees { worktrees } = trees else { panic!("not worktrees: {trees:?}") };
+    assert!(worktrees.iter().any(|t| t.is_main), "the main checkout is listed: {worktrees:?}");
+
+    let refused = peer.call(ApiCall::GitWorktrees { cwd: None }).expect_err("no directory");
+    assert!(refused.contains("which directory"), "and says why: {refused}");
+    let refused = peer.call(ApiCall::SessionCurrent).expect_err("a screen is not a disk");
+    assert!(refused.contains("NotPermitted"), "refused on principle: {refused}");
+
+    let tree = sb.root.join("trees/feat-x");
+    let made = peer.call(ApiCall::GitAddWorktree {
+        path: tree.display().to_string(),
+        branch: "feat/x".into(),
+        create: true,
+        cwd: Some(work.clone()),
+    });
+    assert!(made.is_ok(), "the tree is made: {made:?}");
+    assert!(tree.join("README.md").exists(), "on this disk");
+    assert!(
+        s.pump(|s| s.texts().iter().any(|t| t.contains("linux-box made a worktree at"))),
+        "and said out loud on the machine it happened on:\n{}",
+        s.transcript()
+    );
+
+    // Sent by hand rather than through `call`, because the inventory naming it is published
+    // *before* the answer goes back, and `call` would read past it.
+    let node = peer.wait_up();
+    peer.handle.send(neosh_swarm::SwarmRequest::Call {
+        node,
+        id: "start".into(),
+        call: serde_json::to_string(&ApiCall::SessionNew {
+            cwd: Some(tree.display().to_string()),
+            title: None,
+            activate: true,
+        })
+        .expect("JSON"),
+    });
+    peer.wait_event("the new conversation in the inventory", |e| {
+        matches!(e, neosh_swarm::SwarmEvent::Inventory { agents, .. }
+            if agents.iter().any(|a| a.cwd.ends_with("trees/feat-x")))
+    });
+    let neosh_swarm::SwarmEvent::Called { ok, .. } = peer.wait_event("the answer", |e| {
+        matches!(e, neosh_swarm::SwarmEvent::Called { id, .. } if id == "start")
+    }) else {
+        unreachable!()
+    };
+    let started: ApiOk = serde_json::from_str(&ok).expect("an ApiOk");
+    let ApiOk::Session { session } = started else { panic!("not a session: {started:?}") };
+    assert!(session.cwd.ends_with("trees/feat-x"), "in the tree: {}", session.cwd);
+    // Asked to activate, and it did not: the person at this machine is reading what they were.
+    assert!(!session.is_active, "this screen did not move");
+}
+
+/// `n` on a project that is on another computer asks the question it asks here.
+///
+/// It used to start a conversation in that directory and nothing else — no worktree, no choice —
+/// which is the difference between a project over there and a project here that this exists to
+/// remove. The question's rows are that machine's answers, and choosing a new worktree makes it
+/// *there*, through the same verb that makes one here.
+#[test]
+fn n_on_a_project_over_there_offers_a_worktree_and_makes_it_there() {
+    use neosh_proto::{ApiCall, ApiOk, WorktreeInfo};
+    const KEY: &str = "git:github.com/neoswarm/faraway";
+    let sb = Sandbox::new("swarm-call-n");
+    sb.git_init();
+    sb.git_remote("https://github.com/neoswarm/work.git");
+    let mut peer = Peer::beside(&sb, "linux-box");
+    peer.publish(
+        vec![theirs(KEY, "faraway", "/srv/faraway", "/srv/faraway", Some("main"))],
+        vec![there("r1", "over there", KEY, "/srv/faraway", "/srv/faraway", Some("main"))],
+    );
+
+    let mut s = sb.start();
+    s.wait_for("PROJECTS");
+    assert!(
+        s.pump(|s| s.sidebar_now().iter().any(|l| l.contains("over there"))),
+        "their project arrives:\n{:?}",
+        s.sidebar_now()
+    );
+    s.enter_panel();
+    assert!(s.sidebar_seek("faraway"), "the cursor reaches it:\n{:?}", s.sidebar_now());
+    s.key("n");
+
+    // Its worktrees, asked of it.
+    let asked = peer.answer_call(|_| {
+        Ok(ApiOk::Worktrees {
+            worktrees: vec![WorktreeInfo {
+                path: "/srv/faraway".into(),
+                branch: Some("main".into()),
+                head: None,
+                is_main: true,
+                locked: false,
+                is_current: false,
+            }],
+        })
+    });
+    assert!(
+        matches!(&asked, ApiCall::GitWorktrees { cwd: Some(c) } if c == "/srv/faraway"),
+        "about the directory on the row: {asked:?}"
+    );
+    // Where it keeps them, for the row that says so.
+    peer.answer_call(|_| Ok(tree_root()));
+
+    assert!(
+        s.pump(|s| !s.picker_named("[New conversation on linux-box]").is_empty()),
+        "the question is asked:\n{}",
+        s.transcript()
+    );
+    let rows = s.picker_named("[New conversation on linux-box]");
+    assert!(rows.iter().any(|l| l.contains("Here")), "here first:\n{rows:?}");
+    assert!(rows.iter().any(|l| l.contains("In a new worktree")), "and a worktree:\n{rows:?}");
+
+    // The second row: a worktree named for you.
+    s.ctrl("n");
+    s.special("enter");
+
+    // The git plugin's own verb, asking that machine: the repository, its branches, where trees go
+    // and what is already there — then the tree itself.
+    let mut made = None;
+    for _ in 0..8 {
+        let call = peer.answer_call(|c| match c {
+            ApiCall::GitWorktrees { .. } => Ok(ApiOk::Worktrees {
+                worktrees: vec![WorktreeInfo {
+                    path: "/srv/faraway".into(),
+                    branch: Some("main".into()),
+                    head: None,
+                    is_main: true,
+                    locked: false,
+                    is_current: false,
+                }],
+            }),
+            ApiCall::GitBranches { .. } => Ok(ApiOk::Branches { branches: Vec::new() }),
+            ApiCall::OptGet { .. } => Ok(tree_root()),
+            ApiCall::PathComplete { .. } => Ok(ApiOk::Paths { paths: Vec::new(), denied: None }),
+            ApiCall::GitAddWorktree { .. } => Ok(ApiOk::Unit),
+            // Refused, so the test stops at what it is about: opening a mirror is its own tests'.
+            _ => Err(neosh_proto::Refusal::Failed { message: "not in this test".into() }),
+        });
+        if let ApiCall::SessionNew { cwd, .. } = &call {
+            made = Some(cwd.clone());
+            break;
+        }
+        if let ApiCall::GitAddWorktree { path, branch, create, cwd } = &call {
+            assert!(path.starts_with("/srv/trees/faraway/"), "under that machine's root: {path}");
+            assert!(*create, "a new branch");
+            assert!(!branch.is_empty(), "named for you");
+            assert_eq!(cwd.as_deref(), Some("/srv/faraway"), "in that repository");
+        }
+    }
+    let made = made.expect("a conversation was asked for over there");
+    assert!(
+        made.as_deref().is_some_and(|c| c.starts_with("/srv/trees/faraway/")),
+        "in the new tree: {made:?}"
+    );
+}
+
+/// `p` on a project over there pulls *that* checkout.
+///
+/// It used to be handed the row's kind and nothing else, and pulled whatever this terminal's own
+/// conversation was in — a key aimed at one machine's repository acting on another's. The row now
+/// says which directory on which machine, and the verb asks that machine.
+#[test]
+fn pull_on_a_project_over_there_asks_that_machine() {
+    use neosh_proto::ApiCall;
+    const KEY: &str = "git:github.com/neoswarm/faraway";
+    let sb = Sandbox::new("swarm-call-pull");
+    sb.git_init();
+    let mut peer = Peer::beside(&sb, "linux-box");
+    peer.publish(
+        vec![theirs(KEY, "faraway", "/srv/faraway", "/srv/faraway", Some("main"))],
+        vec![there("r1", "over there", KEY, "/srv/faraway", "/srv/faraway", Some("main"))],
+    );
+    let mut s = sb.start();
+    s.wait_for("PROJECTS");
+    assert!(
+        s.pump(|s| s.sidebar_now().iter().any(|l| l.contains("over there"))),
+        "their project arrives:\n{:?}",
+        s.sidebar_now()
+    );
+    s.enter_panel();
+    assert!(s.sidebar_seek("faraway"), "the cursor reaches it:\n{:?}", s.sidebar_now());
+    s.key("p");
+    let asked = peer.answer_call(|_| Err(neosh_proto::Refusal::Failed { message: "no".into() }));
+    assert!(
+        matches!(&asked, ApiCall::GitStatus { cwd: Some(c) } if c == "/srv/faraway"),
+        "its status, over there: {asked:?}"
+    );
+}
+
+/// An address typed after a machine's name is cloned onto that machine.
+///
+/// `linux-box:` already pointed the path field at it; `linux-box:https://…` points a clone at it,
+/// and where it lands is asked of that machine — its `clone.root`, its disk.
+#[test]
+fn an_address_after_a_machines_name_clones_onto_that_machine() {
+    use neosh_proto::{ApiCall, ApiOk};
+    let sb = Sandbox::new("swarm-call-clone");
+    sb.git_init();
+    let mut peer = Peer::beside(&sb, "linux-box");
+    let mut s = sb.start();
+    s.wait_for("PROJECTS");
+    peer.wait_up();
+
+    s.send(&command("project.open"));
+    assert!(s.pump(|s| !s.float_named("[Add project").is_empty()), "the field opened");
+    // The terminal is for linux-box, so the field opens already pointed at it: `linux-box:` is
+    // typed for you, and the address goes after it.
+    assert!(
+        s.pump(|s| s.float_named("[Add project").iter().any(|l| l.contains("linux-box:"))),
+        "pointed at that machine\n{:?}",
+        s.float_named("[Add project")
+    );
+    s.type_text("https://github.com/neoswarm/faraway");
+    assert!(
+        s.pump(|s| s.float_named("[Add project")
+            .iter()
+            .any(|l| l.contains("Clone neoswarm/faraway onto linux-box"))),
+        "the address is a row, and says where\n{:?}",
+        s.float_named("[Add project")
+    );
+    s.special("enter");
+
+    // Where it would go is that machine's to say, and so is the clone.
+    let mut cloned = None;
+    for _ in 0..8 {
+        let call = peer.answer_call(|c| match c {
+            ApiCall::OptGet { .. } => Ok(ApiOk::Option {
+                entry: Some(neosh_proto::OptionEntry {
+                    name: "clone.root".into(),
+                    ty: neosh_proto::OptionType::Str,
+                    value: neosh_proto::OptionValue::Str("/srv/repos".into()),
+                    default: neosh_proto::OptionValue::Str("/srv/repos".into()),
+                    description: None,
+                    owner: "neosh".into(),
+                    modified: false,
+                }),
+            }),
+            ApiCall::VarGet { .. } => Ok(ApiOk::Json { value: serde_json::Value::Null }),
+            ApiCall::PathComplete { .. } => Ok(ApiOk::Paths { paths: Vec::new(), denied: None }),
+            _ => Err(neosh_proto::Refusal::Failed { message: "not in this test".into() }),
+        });
+        if let ApiCall::GitClone { url, path } = &call {
+            cloned = Some((url.clone(), path.clone()));
+            break;
+        }
+        // The destination picker opens once the machine has said where; take its first row.
+        if matches!(call, ApiCall::PathComplete { .. })
+            && s.pump(|s| !s.float_named("[Clone neoswarm/faraway onto linux-box").is_empty())
+        {
+            s.special("enter");
+        }
+    }
+    let (url, path) = cloned.expect("the clone was asked of that machine");
+    assert_eq!(url, "https://github.com/neoswarm/faraway");
+    assert_eq!(path, "/srv/repos/neoswarm/faraway", "under its clone.root");
 }
