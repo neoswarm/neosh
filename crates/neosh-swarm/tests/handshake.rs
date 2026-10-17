@@ -24,6 +24,7 @@ fn caps() -> NodeCapabilities {
         rich_stream: true,
         catalogue: true,
         live: true,
+        calls: true,
         projects: Vec::new(),
     }
 }
@@ -159,6 +160,7 @@ async fn claiming_a_trusted_id_without_the_key_is_refused_and_says_so() {
             node: info(real.id(), "not really"),
             capabilities: caps(),
             nonce: "aa".repeat(32),
+            knock: false,
         },
     )
     .await
@@ -205,6 +207,7 @@ async fn a_version_mismatch_is_refused_with_both_numbers() {
         node: info(&NodeId("ff".into()), "future"),
         capabilities: caps(),
         nonce: "00".into(),
+        knock: false,
     };
     neosh_swarm::wire::write_message(&mut stream, &from_the_future).await.expect("writes");
     drop(stream);

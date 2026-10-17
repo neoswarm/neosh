@@ -3,20 +3,23 @@
  *
  * # A window is for a computer
  *
- * A swarm puts several machines in one workspace, and the workspace draws all of them to everyone.
- * That is right for a list and wrong for a window you opened to work on the build box: its project
- * panel, the conversation it lands in and where `^N` starts were about every machine at once. So
- * each terminal carries an answer — `view.device` — and this plugin is what gives it one:
+ * A swarm puts several machines in one workspace, and a terminal is for **one** of them. There used
+ * to be a third answer, every computer at once, and it was the one nobody could read: a project
+ * panel in which nothing said which rows were yours, and a `^N` that had to ask which machine
+ * before it could ask where. So each terminal carries an answer — `view.device` — and this plugin
+ * is what gives it one:
  *
  * * `neosh connect lb` arrives with the answer already given, and this lands it there: the newest
  *   conversation on that machine, opened as a conversation.
  * * `neosh` arrives with none, and `swarm.device` decides. `ask`, the default, is a question —
- *   *which computer?* — asked only when there is a second computer to answer it with, because a
- *   question with one possible answer is a keypress spent confirming it.
- * * `/device` asks again from inside, and `/device lb` answers without asking.
+ *   *which computer?* — asked whenever another computer is paired, connected or not, because
+ *   which one you sat down to work on is the first thing you decide. With none paired there is
+ *   nothing to ask and the terminal is this computer's.
+ * * `/device` asks again from inside, `/device lb` answers without asking, and `^J` → `↵` on a
+ *   machine moves the window there.
  *
  * What it narrows is what a terminal *shows* and where it *starts*, never what exists: a turn on a
- * machine this window is not for keeps running, and every computer is one `/device all` away.
+ * machine this window is not for keeps running, and is one `/device` away.
  *
  * # Not the sidebar's
  *
@@ -51,7 +54,7 @@ export async function activate({ neosh, subscriptions }: PluginContext) {
     type: { type: "str" },
     default: "ask",
     description:
-      "Which computer a new terminal opens on: `ask` asks whenever another computer is connected, `all` shows every computer at once, `here` is this one, and a computer's name or code (`lb`) is that one. `neosh connect <name>` and `/device` choose for one terminal whatever this says.",
+      "Which computer a new terminal opens on: `ask` asks whenever another computer is paired, `here` is this one, and a computer's name or code (`lb`) is that one. A terminal is always for one computer. `neosh connect <name>` and `/device` choose for one terminal whatever this says.",
   });
 
   // Which landing each terminal is on, so a second answer cancels the first: a terminal pointed at
@@ -67,6 +70,9 @@ export async function activate({ neosh, subscriptions }: PluginContext) {
     const current = await here.session.current().catch(() => null);
     if (!live()) return;
     switch (device?.kind) {
+      // `all` is what an older terminal or workspace may still say, and a terminal is for one
+      // computer now — this one, unless somebody says otherwise.
+      case "all":
       case "here": {
         // Only when it is somewhere else. A terminal already in a conversation of yours stays in
         // it: which one is a choice somebody may already have made.
@@ -79,7 +85,7 @@ export async function activate({ neosh, subscriptions }: PluginContext) {
         await toNode(neosh, view, device.node, current?.mirror?.node ?? null, live);
         return;
       default:
-        // Every computer, or not decided yet: wherever it is is somewhere it may be.
+        // Not decided yet: wherever it is is somewhere it may be.
         return;
     }
   };
@@ -87,7 +93,8 @@ export async function activate({ neosh, subscriptions }: PluginContext) {
   /** What to do with a terminal that has just arrived, or was here before this plugin loaded. */
   const arrive = async (view: ViewId) => {
     const device = await neosh.view.device(view).catch(() => null);
-    if (device?.kind === "ask") {
+    // `all` is an answer that no longer exists, so a terminal that arrives with it is asked.
+    if (device?.kind === "ask" || device?.kind === "all") {
       await ask(neosh, view, { force: true });
       return;
     }
@@ -105,6 +112,11 @@ export async function activate({ neosh, subscriptions }: PluginContext) {
     const chosen = resolve(world, setting);
     if (typeof chosen === "string") {
       neosh.notify(`${OPTION}: ${chosen}`, "warn");
+      await ask(neosh, view, { force: false });
+      return;
+    }
+    if (chosen.kind === "ask") {
+      await ask(neosh, view, { force: false });
       return;
     }
     await neosh.view.setDevice(chosen, view).catch(() => {});
@@ -128,8 +140,13 @@ export async function activate({ neosh, subscriptions }: PluginContext) {
         neosh.notify(chosen, "warn");
         return;
       }
+      // `/device ask` is a request for the question, not an answer to it.
+      if (chosen.kind === "ask") {
+        await ask(neosh, view, { force: true });
+        return;
+      }
       await neosh.view.setDevice(chosen, view);
-    }, { desc: "Which computer this terminal is for — /device lb, /device all, or ask" }),
+    }, { desc: "Which computer this terminal is for — /device lb, /device here, or ask" }),
   );
   subscriptions.push(
     await neosh.cmd.register("device.default", async () => {
@@ -187,8 +204,9 @@ async function survey(neosh: Neosh): Promise<World> {
 function resolve(w: World, query: string): ViewDevice | string {
   const q = query.trim().replace(/^@/, "");
   const lower = q.toLowerCase();
-  if (lower === "" || lower === "ask") return { kind: "ask" };
-  if (["all", "*", "every", "everything", "everywhere"].includes(lower)) return { kind: "all" };
+  // `all` was every computer at once, and a terminal is for one computer now: a setting that still
+  // says it is read as the question, which is the nearest thing to "I had not picked one".
+  if (["", "ask", "all", "*", "every", "everything", "everywhere"].includes(lower)) return { kind: "ask" };
   if (["here", "local", "this", "localhost", "."].includes(lower)) return { kind: "here" };
   if (w.me && (w.me.name.toLowerCase() === lower || w.me.id === q)) return { kind: "here" };
   const pick = (hits: SwarmNode[], how: string): ViewDevice | string | null => {
@@ -207,11 +225,12 @@ function resolve(w: World, query: string): ViewDevice | string {
       : `no computer called "${q}" — there is ${
         w.peers.map((n) => w.codes[n.info.id] ? `${n.info.name} (@${w.codes[n.info.id]})` : n.info.name)
           .join(", ")
-      }, and all and here`);
+      }, and here`);
 }
 
 /** How the setting spells a choice: words a person can read in `config.toml`. */
 function spell(w: World, d: ViewDevice): string {
+  if (d.kind === "all") return "here";
   if (d.kind !== "node") return d.kind;
   const n = w.peers.find((p) => p.info.id === d.node);
   if (!n) return d.node;
@@ -257,24 +276,21 @@ async function viewOf(neosh: Neosh, key: KeyContext | undefined): Promise<ViewId
 /**
  * Ask which computer a terminal is for.
  *
- * `force` is somebody asking for the question — `neosh connect`, `/device` — and is asked whatever
- * there is. Without it this is a terminal arriving, and it is asked only when there is a second
- * computer that is up or on its way up: a list of one is a keypress spent confirming it, and a
- * list of machines that are all off is a question whose only answer is this one.
+ * `force` is somebody asking for the question — `neosh connect`, `/device`. Without it this is a
+ * terminal arriving, and it is asked whenever another computer is *paired*, whatever its link is
+ * doing: the first cut asked only while one was up, so a workspace that started a moment before
+ * its peers connected never asked at all, and the window drew every machine anyway. With nothing
+ * paired there is one answer and it is given without a question.
  *
  * Every paired machine is a row, including the ones that are not there yet — the picker's rule
  * everywhere in this workspace, because a computer missing from the list reads as the feature not
- * existing. They redraw as they connect. **All computers** is offered only once there is more than
- * one to be all of.
+ * existing. They redraw as they connect, and choosing one that is still dialling waits for it.
  */
 async function ask(neosh: Neosh, view: ViewId, opts: { force: boolean }): Promise<void> {
   let world = await survey(neosh);
-  const coming = (n: SwarmNode) =>
-    n.link.state === "up" || n.link.state === "connecting" || n.link.state === "retrying";
-  if (!opts.force && !world.peers.some(coming)) return;
   if (world.peers.length === 0) {
-    neosh.notify("This is the only computer in the workspace — ^J adds another", "info");
-    await neosh.view.setDevice({ kind: "all" }, view).catch(() => {});
+    if (opts.force) neosh.notify("This is the only computer in the workspace — ^J adds another", "info");
+    await neosh.view.setDevice({ kind: "here" }, view).catch(() => {});
     return;
   }
   const here = neosh.view.at(view);
@@ -288,7 +304,6 @@ async function ask(neosh: Neosh, view: ViewId, opts: { force: boolean }): Promis
 
   const items: PickerItem<ViewDevice>[] = [];
   const fill = () => {
-    const up = world.peers.filter((n) => n.link.state === "up");
     const rows: PickerItem<ViewDevice>[] = [{
       label: world.me?.name ?? "This computer",
       detail: `this computer  ·  ${count(world.local)}`,
@@ -315,15 +330,6 @@ async function ask(neosh: Neosh, view: ViewId, opts: { force: boolean }): Promis
         value: { kind: "node", node: n.info.id },
       });
     }
-    if (up.length > 0) {
-      rows.push({
-        label: "All computers",
-        detail: `this one and ${up.length === 1 ? up[0]!.info.name : `${up.length} others`}, together`,
-        icon: ascii ? "+" : "◆",
-        hl: "Accent",
-        value: { kind: "all" },
-      });
-    }
     // In place, because `reload` re-reads the very array the picker was handed.
     items.splice(0, items.length, ...rows);
   };
@@ -338,10 +344,9 @@ async function ask(neosh: Neosh, view: ViewId, opts: { force: boolean }): Promis
     title: "Which computer?",
     filter: false,
     width: 68,
-    // Room for every row it can grow to: `All computers` arrives with the first machine to connect.
-    height: Math.min(12, world.peers.length + 2),
+    height: Math.min(12, world.peers.length + 1),
     selected,
-    hints: "↵ open   d always this one   esc all of them",
+    hints: "↵ open   d always this one   esc this computer   ^J later moves it",
     ownKeys: ["d", ...digits],
     onKey(key, ctx) {
       if (key.key.code.kind !== "char" || key.key.mods.ctrl || key.key.mods.alt) return;
@@ -367,9 +372,9 @@ async function ask(neosh: Neosh, view: ViewId, opts: { force: boolean }): Promis
         });
       }),
   });
-  const answer: ViewDevice = chosen ?? taken ?? { kind: "all" };
-  // Escape is an answer too — every computer, which is the workspace as it always was — and it is
-  // recorded as one, so the question is not asked again of this terminal by a reload.
+  const answer: ViewDevice = chosen ?? taken ?? { kind: "here" };
+  // Escape is an answer too — this computer, which is where the terminal is — and it is recorded
+  // as one, so the question is not asked again of this terminal by a reload.
   await neosh.view.setDevice(answer, view).catch((e: unknown) => neosh.notify(String(e), "warn"));
   if (chosen !== null || taken !== null) {
     await neosh.vars.set({ scope: "global" }, VAR_LAST, answer).catch(() => {});
@@ -390,7 +395,6 @@ async function ask(neosh: Neosh, view: ViewId, opts: { force: boolean }): Promis
 function describe(w: World, d: ViewDevice): string {
   switch (d.kind) {
     case "all":
-      return "every computer";
     case "here":
       return "this computer";
     case "ask":
@@ -412,17 +416,10 @@ async function chooseDefault(neosh: Neosh): Promise<boolean> {
   const rows: PickerItem<Choice>[] = [
     {
       label: "Ask every time",
-      detail: "whenever another computer is connected",
+      detail: "whenever another computer is paired",
       icon: "?",
       hl: "Accent",
       value: { value: "ask" },
-    },
-    {
-      label: "Every computer",
-      detail: "one workspace, every machine in it",
-      icon: "◆",
-      hl: "Accent",
-      value: { value: "all" },
     },
     {
       label: world.me?.name ?? "This computer",

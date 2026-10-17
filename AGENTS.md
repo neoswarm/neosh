@@ -273,7 +273,26 @@ is `docs/releasing.md`.
   `connecting…` — the one row with something actionable in it drawn as the one row with nothing to
   say — so adding a computer looked like a wrong address for as long as anybody watched. It does
   not spin, either: a spinner means *this* machine is working on it, and what this is waiting for
-  is a person at the other end. **What a machine is called is a decision too.** A hostname is
+  is a person at the other end. **And the other end is told for as long as the asking lasts, not
+  once.** It used to be told by a six-second toast, at the wrong moment — on the *probe*, the look
+  `^J` takes at an address before *Add* is pressed, carrying an id nothing had proven — and every
+  later dial from the same machine was deduplicated, so a request that arrived while you were in
+  another window, or at the other keyboard doing the asking, was simply gone: "I sent the invite and
+  nothing arrived" was the whole of the bug report, and it was exact. So a dialler that hangs up
+  before its `Proof` is a look and not a request — the handshake ends in a protocol error, never a
+  `Stranger` — and `Hello` carries `knock`, true on the first dial after *Add* and on `^R` over a
+  machine that is waiting (`Redial { knock: true }`), false on the heartbeat's redials and on a
+  `[[swarm.peers]]` entry, because *somebody asked again on purpose* and *it is still dialling* are
+  different news. A request is an **alert** on first sight or on a knock (`AlertReason::Pairing`,
+  `pairing` in `notify.when`), since the person it is about is at another keyboard and the one here
+  could be anywhere; and it is a **state** until somebody answers it — `swarm.asking`, a workspace
+  var of `{ id, name }`, which the project panel draws as a pulsing `? linux-box wants to join` at
+  the very top with `^J` on its right. It ends by being allowed, by `^X` turning it away
+  (`swarm.dismiss`: off the list, and not announced again until it knocks), or by ninety seconds of
+  quiet, because a machine that has us paired dials every heartbeat and one that has stopped has
+  given up. Unpairing takes a machine off the board at once rather than leaving it saying it was
+  waiting, and an address that answers with this machine's own key is refused as *this computer*
+  rather than paired with itself. **What a machine is called is a decision too.** A hostname is
   chosen by whoever set the box up and is `Mac` on both of them; `swarm.rename` is an SSH `Host`
   alias, kept beside the pairing in `$STATE`, substituted once where `SwarmNode` is built so every
   panel agrees, and never overwritten by the handshake that refreshes everything else. And the
@@ -300,14 +319,15 @@ is `docs/releasing.md`.
   paired every remote row looked alike and which computer a conversation was on was a pause on the
   row and a read of the key card. So it is `@` and the machine's **short code** — `@ms` for
   `mac-studio` — three columns, worked out from the name (`machineCodes`: initials, the next
-  candidate on a clash, assigned in a fixed order so a redraw never shuffles them) and yours to
+  candidate on a clash, assigned in a fixed order so a redraw never shuffles them, and over every
+  paired machine rather than the ones a window shows, so `@lb` is `@lb` in every window) and yours to
   change: `@` on the row, `^T` in `^J`, the *Computers* page in settings, all writing the
   `swarm.codes` workspace var, because what you call a machine is a fact every panel should agree
   on. The code is said **once per block**, on the block's own row, and every row under it carries
   the block's colour instead. **And each machine has a colour of its own** — `Swarm.Host1`…`6`,
   `machineColors`, a hash of the node id so pairing a third machine does not repaint the first two,
   and the blue for the first — worn by its code, its `⎇` and the `·` of every conversation in its block, and by its
-  rows in `^J`, in `^N`'s "which computer" and on the settings page, so the colour you learn in one
+  rows in `^J`, in the *which computer?* a terminal asks and on the settings page, so the colour you learn in one
   panel is the machine in every other. The first cut had one blue for every machine, which said
   *not here* and never *where*. While a link is not up the code is `Swarm.Linking` pulsing amber
   while it is being dialled, `Swarm.Waiting` while it is a person at the far end being waited on,
@@ -340,30 +360,33 @@ is `docs/releasing.md`.
   diverged branch, because a build box one release behind is ordinary — and nothing when it matches
   or either side cannot say. Both commits come off the **files**, not out of `git`:
   `neosh_vcs::read_head` reads `HEAD`, the ref and `packed-refs`, cheap enough for
-  `RemoteProject::head` on the inventory timer and for `git.heads` on every redraw.
-- **Yours first, and then each other machine is a place.** `PROJECTS` is the repositories with a
-  checkout on this disk and nothing else; after `+ Add project` comes one section per paired
-  machine (the `machines` slot) — `@st STARFIGHTER` and a rule under it in its colour, the right
-  column saying `offline`, `connecting` or `not allowed yet` when it cannot be reached — and under
-  it the repositories that are **only** over there. They used to be mixed in with yours and ranked
-  *above* them, because a project with no directory here sorted as rank `0`; each also said `@st`
-  on its row and then again on a block row beneath it. In a machine's own section the machine goes
-  without saying: the row is the name and the branch its checkout is on (`faraway ⎇ main`), and
-  its conversations and worktrees hang straight off it, indented. A repository only
-  elsewhere but on several machines sits under the best-connected one, with a block per machine
-  inside. The heading is a row you can stand on — `↵` folds the section (`host:<node>`), `c`/`C`
-  connect and disconnect, `t` is a shell in that machine's home, `n` is the path field pointed at
-  it. And **a key that is only a guess joins the one project it names**: a machine that has not
-  read its origin yet answers `dir:<name>`, which never matched your real key, so the repository
-  you were sitting in appeared again as somebody else's — now `dir:neosh` meets the single local
-  project called `neosh`, and only a single one, because a wrong merge is worse than two rows.
-  **No line down the side**: a `│` rail beside every block read as a border and boxed the panel in;
-  the indent says what hangs off what and the machine's colour rides on marks the rows already
-  have. And **a fold of a row that is not a directory is not a project var** — `host:…`,
-  `machine:…`, `git:…` go in the `sidebar.folded.elsewhere` workspace var, because a project var
-  keyed by a name that is not a path was read back as a directory arriving, and the row you had just
-  folded jumped into your own section as a project of yours. `sidebar.projects` holds absolute
-  paths and nothing else, and anything else found there is dropped on load.
+  `RemoteProject::head` on the inventory timer and for `git.heads` on every redraw. Since a
+  terminal became one computer's (below), the bundled panel never puts two machines in one list,
+  so neither the block nor the `≠` is drawn by it today; the reasoning stands for any panel that
+  does.
+- **A window lists one computer's projects, and a window for this one lists only yours.**
+  `PROJECTS` is the repositories with a checkout on this disk and nothing else — no section per
+  paired machine after it, and no machine's block hung under a repository of yours. Both were
+  drawn once, in a window that showed every computer at once: a section per machine after `+ Add
+  project`, ranked *above* yours at first because a project with no directory here sorted as rank
+  `0`, and a block under each repository another machine also had. What that added up to was a
+  column in which nothing said which rows were yours, so another computer's work is now a window
+  *for* that computer (see below), and `^J` → `↵` is how a window becomes one. There the list is
+  that machine's, drawn in the `machines` slot as yours are drawn: the heading is `PROJECTS`, the
+  right column says `offline`, `connecting` or `not allowed yet` when it cannot be reached and the
+  heading is a row you can stand on (`c`/`C`, `t`, `n` all mean *that machine*); each row is the
+  name and the branch its checkout is on (`faraway ⎇ main`); its conversations and worktrees hang
+  straight off it, indented; the marks wear the colours your own rows wear; and a repository also
+  cloned here is *its* row rather than yours with its block under it (`group(…, local = false)`).
+  A window pointed at a computer this workspace no longer knows says `not a paired computer`, with
+  `/device` on the row, rather than drawing an empty column that reads as a machine with nothing
+  on it. **No line down the side**: a `│` rail beside every block read as a border and boxed the
+  panel in; the indent says what hangs off what. And **a fold of a row that is not a directory is
+  not a project var** — `host:…`, `machine:…`, `git:…` go in the `sidebar.folded.elsewhere`
+  workspace var, because a project var keyed by a name that is not a path was read back as a
+  directory arriving, and the row you had just folded jumped into your own section as a project of
+  yours. `sidebar.projects` holds absolute paths and nothing else, and anything else found there is
+  dropped on load.
 - **Another machine's conversation opens as a conversation, not as a window onto one.** It was a
   float of plain text with a one-line prompt behind `i` — no cards, no markdown, no working line —
   on the argument that the chat pane is *yours* and somebody else's conversation there would give
@@ -501,20 +524,36 @@ is `docs/releasing.md`.
   on the machine it happens on, and **closed when the link closes**: a shell has no timeout and no
   idea the connection it was opened over has gone, so without that a laptop shutting its lid leaves
   a login shell running on somebody else's computer with nothing on any screen pointing at it.
-- **Which computer is asked before where on it, and only when there is one to ask about.** With no
-  machine paired — which is most workspaces — `^N` draws nothing extra and is the single key it has
-  always been, and nor is it asked when the machines you *do* have are up and none of them has a
-  checkout of the repository you are in: that question has one possible answer, and a panel that
-  appears to confirm it is a keypress and a redraw spent on nothing. The moment a second computer
-  that could take the work exists, which one is the first thing you would have to
-  decide anyway, and asking it *first* is what makes it a decision rather than a path field you
-  have to know scp's spelling to use. This computer is the first row and the cursor starts on it,
-  so `^N ⏎` is unchanged. Every paired machine is a row including the ones that cannot be used,
-  greyed with the reason — the path field's rule, for the path field's argument: skipping them is
-  right about what can be *done* and wrong about what should be *said*. Choosing one hands you the
-  path field seeded `<machine>:`, which is the state typing it would have reached, so the two
-  routes cannot diverge. `n` on a project that is only elsewhere skips the question when one
-  machine has it: the row already knows which machines and where on each.
+- **`^N` asks where, never which computer, because a terminal already said.** It used to: with a
+  machine paired that had this repository, `^N` opened on *which computer?* — this one, then each
+  machine, greyed with its reason — and then on the path field pointed at whichever you took. That
+  was a question a terminal for one computer had already answered, asked again on the commonest key
+  in the workspace, and in a terminal for every computer it was the panel's own confusion handed to
+  you as a choice. So `^N` starts where the window is: here in a window for this computer, there in
+  a window for another (`view.device()`), and on the machine a conversation is on when you are in a
+  mirror or `n` is pressed on its row. The path field lists no machines either — every row in it is
+  a place on the window's computer — but `linux-box:` still completes over there, and the hint strip
+  says so, because the scp spelling is the one route to another disk that costs no question. Moving
+  the window is `^J` and `/device`, which is where a decision about which computer belongs.
+- **A project over there asks what a project here asks, because the code asking is the same code.**
+  `n` on another machine's row used to start a conversation in that directory and nothing else —
+  no worktree, no named branch, no clone — because every one of those verbs is a question about a
+  *disk* and each had a local call and no remote one. So there is one remote call rather than one
+  per verb: `ApiCall::SwarmCall` / `AscpMessage::Call` carries an `ApiCall` as **JSON text** (typed,
+  a call added next release is a tag that drops the link) and `swarm.at(node)` in `@neosh/api` is
+  the whole namespace with every call wrapped in it. The host decides which leave — `remote_call`,
+  one list read by both ends: git's reads, `git worktree add`, `git clone`, fetch, pull, the forge,
+  `path.complete`, `opt.get`, vars and `session.create`; everything else (pickers, floats, notices,
+  listeners) is run here as it always was, which is why `newWorktree`, `cloneRepository`,
+  `pullRepository` and the *where?* rows run unchanged handed `swarm.at(node)` instead of `neosh`.
+  The owner enforces the list on every call, refuses a git call that does not name its `cwd` (its
+  "current" checkout is whoever is at that keyboard), never moves a screen for `session.create`, and
+  says a new tree or clone out loud; the asker checks its plugin's `vcs_write` first, because the
+  owner sees a machine and not a plugin; and a conversation it made is opened **here**, as a mirror,
+  in the terminal that asked — answering with the owner's id, since every id a bound namespace
+  hands out should be one that machine knows. Removing a worktree is not on the list. Gated on
+  `accepts_commands`, and `NodeCapabilities::calls` is a compatibility flag in `browse`'s sense; a
+  machine without it gets the old behaviour, or a sentence saying to update it.
 - **What another machine knows about this one is a roster, not a snapshot.** `publish_inventory` was
   called when a peer connected and when a peer drove something here, and never once because somebody
   *sitting at this machine* started, renamed, archived or deleted a conversation — so every other
@@ -697,22 +736,31 @@ is `docs/releasing.md`.
   `here.win.open(...)` lands where the person pressing the key is looking. `SessionChanged` names
   the terminal that moved, because "the active conversation" has as many answers as there are
   screens; a question waits until some terminal is reading its conversation and opens there.
-- **A window is for a computer, and the terminal says which.** A swarm draws every machine to
-  everyone, which is right for a list and wrong for the window you opened to work on the build box.
-  So a view carries a `ViewDevice` — `All`, `Here`, `Node`, or `Ask` — said on `Attach` by `neosh
-  connect`, kept on `ViewState` and reported on `ViewInfo` (a plugin loading after the terminal
-  arrived reads it there), changed by `ViewSetDevice` and announced as `PluginEvent::ViewDevice`.
-  The host does nothing else with it: the *question* is a picker and the *landing* is a mirror, so
-  both are the `devices` plugin's, and the project panel and `^N` read the same answer through
-  `view.device()` — which is how a third party's panel narrows with them. `None` is *nobody said*
-  and the `swarm.device` setting decides; a terminal handed a kept screen without naming one gets
-  `None`, because the last terminal's answer was about the last terminal. The question is asked
-  only when another computer is up or being dialled — a list whose only live row is this machine
-  is a keypress confirming it — and `esc` answers *every computer*, recorded as an answer so a
-  reload does not ask again. **It narrows what is shown and where things start, never what
-  exists**: a turn on a machine the window is not for keeps running. **And a window for another
-  computer is drawn as though it were the one you are sitting at** — `PROJECTS` and a rule in the
-  separator's colour, which machine said once beside the heading in a lowercase dim (`@lb
+- **A window is for a computer, and the terminal says which.** A swarm puts several machines in
+  one workspace, and a terminal is for **one** of them. There was a third answer, every computer at
+  once, and it was the default: a project panel in which nothing said which rows were yours, and a
+  `^N` that had to ask which machine before it could ask where. So a view carries a `ViewDevice` —
+  `Here`, `Node` or `Ask` — said on `Attach` by `neosh connect`, kept on `ViewState` and reported on
+  `ViewInfo` (a plugin loading after the terminal arrived reads it there), changed by
+  `ViewSetDevice` and announced as `PluginEvent::ViewDevice`. **`All` is still a variant and is
+  never an answer**: it survives so an older client's `Attach` decodes, everything reads it as
+  `Here`, and a terminal that arrives with it is asked. The host does nothing else with it: the
+  *question* is a picker and the *landing* is a mirror, so both are the `devices` plugin's, and the
+  project panel and `^N` read the same answer through `view.device()` — which is how a third
+  party's panel narrows with them. `None` is *nobody said* and the `swarm.device` setting decides; a
+  terminal handed a kept screen without naming one gets `None`, because the last terminal's answer
+  was about the last terminal. The question is asked whenever another computer is **paired**,
+  whatever its link is doing — asked only while one was up, a workspace that started a moment
+  before its peers connected never asked at all — and with nothing paired there is one answer and
+  it is given without a question. `esc` answers *this computer*, recorded as an answer so a reload
+  does not ask again. `all`, wherever a person can still type it — `swarm.device`, `neosh connect
+  all`, `/device all` — is read as `ask`, the nearest thing to "I had not picked one", and `/device
+  ask` asks. `^J` is the other way to move one: `↵` on a machine points this window at it, dialling
+  it if it is down and landing in its newest conversation, `↵` on *This computer* brings it back, and
+  the row the window is for says `this window`. **It narrows what is shown and where things start,
+  never what exists**: a turn on a machine the window is not for keeps running. **And a window for
+  another computer is drawn as though it were the one you are sitting at** — `PROJECTS` and a rule
+  in the separator's colour, which machine said once beside the heading in a lowercase dim (`@lb
   linux-box`, the code still in its colour), the marks in the colours your own rows wear rather
   than the machine's, and `+ Add project` at the foot, which adds *there*: the path field opened
   already pointed at it. A count of the computers it is not for used to end the panel, on the
@@ -736,6 +784,15 @@ is `docs/releasing.md`.
   above every driver, on the copy of the message this turn sends — never on the transcript, never on a tool
   round, and always with a sendable value put back in the selection's place. `^E` shows *all* of
   them at once and applies as you move, because a knob you cannot see is a knob you do not have.
+- **A context window is two settings for `claude`, and choosing 1M has to say both.** `[1m]` on the
+  model id is how much the model can *see*; when the CLI *compacts* is decided separately, and with
+  nothing local naming it the CLI takes a per-model window from its own server configuration —
+  which was seen compacting under 400k. So a conversation with 1M chosen, its meter reading out of a
+  million, was summarised away at less than half of it, and nothing on screen disagreed with the
+  meter. The `claude-cli` driver therefore passes `autoCompactWindow: 1000000` in `--settings`
+  whenever context 1M is selected — it outranks the server's value, and only
+  `CLAUDE_CODE_AUTO_COMPACT_WINDOW` in the environment outranks it — and says nothing for 200k,
+  which is the CLI's own default already.
 - **`ENOENT` from a spawn is two different sentences, and the wrong one sends people hunting.**
   `Command::spawn` reports a working directory it cannot `chdir` into exactly as it reports a
   program it cannot find — "no such file or directory", os error 2 — and every driver wrote that up
@@ -1005,7 +1062,7 @@ is `docs/releasing.md`.
   into the highlighted one and `↵` takes it — `pathPicker`'s bargain, which is why a completion row's
   label has to be the whole path and why a remote one is prefixed rather than bare. The scp spelling
   is not decoration: `host:path` means there what it means here, it is what makes one field able to
-  point at two machines, and it is learned by reading a machine's row rather than by being told. What
+  point at two machines, and the hint strip says it whenever a machine is paired. What
   this replaced was a path sitting at the bottom of a list of every worktree the program had ever
   heard of — a verb whose distance from the cursor grew with how long you had used it — so
   `Another directory…` is above that list now, and under `^O` **there is no list at all**: moving
@@ -1016,14 +1073,12 @@ is `docs/releasing.md`.
   each row its own full path with the basename and branch repeated after it and truncated
   mid-branch. No filter fixes that, which is the point: `^O` means *somewhere I do not work yet*,
   and a list of the repository you are in cannot answer it. What `^N` offers is the panel's own
-  list, which is the same rule and not an exception to it. Choosing a
-  machine reopens the picker seeded with `<machine>:` rather than descending in place, because a
-  second level whose rows lie about what is in the field is a `<Tab>` that jumps somewhere nobody
-  asked for. **Every paired machine is a row, including the ones that cannot be used**, greyed with
-  the reason on them: skipping them is right about what can be *done* and wrong about what should be
-  *said*, and somebody who has just paired a computer and finds an empty list reads it as the feature
-  not existing. A machine with no projects yet falls through to its home directory rather than
-  showing none. And starting one over there **opens it** — `swarm.command` answers with the
+  list, which is the same rule and not an exception to it. **No machine is a row in it**: they
+  were, every paired one, greyed with the reason when it could not be used, and choosing one
+  reopened the field seeded `<machine>:` — but a terminal is for one computer, every other row in
+  the field is a place on that one, and a menu offering every machine beside every directory was
+  asking *which computer?* again on a key that had been told. Typing the name is still the way
+  there; moving the window is `^J`. And starting one over there **opens it** — `swarm.command` answers with the
   conversation `NewSession` made, which until it did meant the same key did visibly less for the same
   intention: you had to go and find, in `^J`, the thing you had just made.
 - **Nothing there and not allowed to look are different answers.** They are the same empty list, and
@@ -1227,7 +1282,14 @@ is `docs/releasing.md`.
   per conversation. A turn that is walked away from — `<Esc>`, a switch — leaves the CLI mid-answer
   with the rest of it in the pipe, and the next turn reads it as its own: someone else's reply, and
   then nothing. Stop forwarding, interrupt, read to the `result` that ends it, and leave the process
-  at a turn boundary.
+  at a turn boundary. **What `<Esc>` left running is the one line that must survive the drain.** The
+  first thing the CLI says after an interrupt is the set of tasks it moved into the background, and
+  that was the very line whose failed send told the driver the turn had been abandoned — so it was
+  dropped, the reader kept quiet because a turn still held the pipe, and the conversation looked
+  idle until the next message drained it and the mark appeared at once. `Unread::level` keeps the
+  newest set the reader saw while a turn was attached, and the turn says it on its way out, or the
+  between-turns path does when nothing is listening any more. A level, so saying a set already
+  forwarded says nothing.
 - **Everything queued into one gap is one message.** A delegating driver is handed the *newest* user
   message and nothing else, so N queued messages meant N-1 questions drawn as asked and never put to
   anybody — which reads exactly like being ignored. `take_steering_into` joins them, in the order
@@ -1400,7 +1462,8 @@ typo of a command gets clap's suggestion and nothing else.
 
 `neosh ls` lists the computers the workspace can reach — code, name, link, conversations, and which
 one `neosh` opens on (`--json` too) — and `neosh connect [name]` is a terminal for one of them:
-`lb`, `linux-box`, `linux`, an id prefix, `here`, `all`, or no name to be asked. Both settle
+`lb`, `linux-box`, `linux`, an id prefix, `here`, or no name to be asked — and `all`, which was
+every computer at once, is read as asking, since a terminal is for one. Both settle
 everything over the control socket before the screen is taken — the name, and for another machine
 the link, dialling one nobody is dialling — so a failure is a sentence in the shell. `neosh ls` is
 computers; `neosh agent ls` is conversations.
@@ -1446,9 +1509,9 @@ only way to do anything.
 | `^E` | Everything this model can be told, on one panel: effort, thinking, fast mode, context, and whatever a driver invented. `h`/`l` along a row, `j`/`k` between them, arrows too, and it applies as you move. Nothing else reaches the keyboard while it is open; `^E` again closes it |
 | `⇧⇥` | Permission mode — full access to start with, then ask, allow-listed, deny. Belongs to this conversation, saved with it, and takes effect on the turn that is running |
 | `^T` | Projects and conversations. Switching is never refused — turns keep running where they are |
-| `^J` | The computers in this workspace. Add one by its address, allow one that is asking, rename one (`^E`), or open what it is running. A machine this one has reached that has not allowed it back says so, and says which key to press over there |
+| `^J` | The computers in this workspace. Add one by its address, allow one that is asking, rename one (`^E`), and `↵` on one moves this window to it — dialling it if it is down, landing in its newest conversation — while `↵` on *This computer* brings it back; the row this window is for says `this window`. A machine this one has reached that has not allowed it back says so, says which key to press over there, and `^R` on it asks again. `^X` on a computer asking to join turns it away until it asks again. A request to join is also an alert and a pulsing `? name wants to join` at the top of the project panel |
 | `^F` | What you have archived — see below. Filter it, put some back, or finally empty it |
-| `^N` | New conversation. With another computer paired it asks **which** first — this one, or any of them, each marked with whether it can be reached; with none paired that question is not asked at all. Then, in a repository, where: here, a worktree you need not name, one kept inside the project, one you do name, an existing one, elsewhere. A worktree you did not name is named by your first message — `fix/composer-paste-truncation`, not `wily-nimbus-7hq2` |
+| `^N` | New conversation, on the computer this window is for — it never asks which; `^J` moves the window. In a repository it asks where: here, a worktree you need not name, one kept inside the project, one you do name, an existing one, elsewhere. A worktree you did not name is named by your first message — `fix/composer-paste-truncation`, not `wily-nimbus-7hq2` |
 | `^O` | Add a project. The filter line **is** the path field: `/`, `~` and `./` complete directories from the first keystroke, `⇥` walks into the highlighted one, `↵` takes what you typed. `linux-box:` completes on that computer instead. **Clone a repository…** is a row of its own, and asks for the address; pasting one — `https://…`, `git@…`, `file://…`, or just `owner/repo` — straight into the field offers to clone it too. Either way it asks where, remembers the folders you pick, draws git's own progress while it fetches, and leaves you in the new project |
 | `^B` | Toggle the sidebar |
 | `^K` | Command palette |
@@ -1675,7 +1738,7 @@ says how many are asking, `^T` is where you go, and it opens when you get there.
 **The keys are beside what they act on, and the row's own keys are on a card next to it.** `^T` sits
 on the `PROJECTS` heading and becomes `esc` while you are in the panel; `^O` sits on the `+ Add
 project` row and becomes `o`. The strip at the foot keeps only the keys that have no row to sit on —
-`^N`, `^F`, `^K`, `^B`, `^Z` outside the panel; `↵`, `?`, `esc` inside — laid out in columns with
+`^N`, `^J`, `^F`, `^K`, `^B`, `/settings`, `^Z` outside the panel; `↵`, `?`, `esc` inside — laid out in columns with
 the keys in `Sidebar.Key`, because a strip that said every verb for every row in one dim colour was
 a paragraph nobody read twice. What a row can do is the **key card**: pause on a row and a float
 appears just past the panel's rule, level with the row, one key per line — `↵ space fold or

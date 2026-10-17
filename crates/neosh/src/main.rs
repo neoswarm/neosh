@@ -141,7 +141,7 @@ enum Cmd {
     /// `neosh connect lb` — by its code, its name, the start of its name, or its id — opens a
     /// terminal whose project panel, landing conversation and `^N` are about that machine, and
     /// waits for the link first, so a computer that cannot be reached is a sentence here rather
-    /// than an empty window. `all` is every computer at once, `here` is this one, and no name at all
+    /// than an empty window. A terminal is for one computer: `here` is this one, and no name at all
     /// asks, whatever `swarm.device` says. `neosh ls` lists what there is.
     Connect(ConnectArgs),
     /// List the computers this workspace can reach, and which one `neosh` opens on.
@@ -228,7 +228,7 @@ struct PromptArgs {
 
 #[derive(Args, Debug)]
 struct ConnectArgs {
-    /// A computer's code (`lb`), name, the start of its name, or id — or `all`, or `here`. Omit to
+    /// A computer's code (`lb`), name, the start of its name, or id — or `here`. Omit to
     /// be asked.
     device: Option<String>,
 }
@@ -749,18 +749,8 @@ async fn run_client(
         Opening::Prompt(text) => {
             let mut control = control::Control::connect(&socket, &args).await?;
             // A question asked here is about this computer, and a picker asking which one over
-            // the answer arriving would be asking something already answered — unless the
-            // setting says every terminal shows every computer, which is still true of this one.
-            let everything = matches!(
-                control.call(neosh_proto::ApiCall::OptGet { name: devices::OPTION.into() }).await,
-                Ok(neosh_proto::ApiOk::Option { entry: Some(neosh_proto::OptionEntry {
-                    value: neosh_proto::OptionValue::Str(ref v), ..
-                }) }) if v.trim().eq_ignore_ascii_case("all")
-            );
-            device = Some(match everything {
-                true => neosh_proto::ViewDevice::All,
-                false => neosh_proto::ViewDevice::Here,
-            });
+            // the answer arriving would be asking something already answered.
+            device = Some(neosh_proto::ViewDevice::Here);
             let info = match control
                 .call(neosh_proto::ApiCall::SessionNew {
                     cwd: Some(cwd.display().to_string()),
@@ -786,8 +776,7 @@ async fn run_client(
     // Kept for the restart below: a terminal that was for one computer comes back for it.
     let again_on = match &device {
         Some(neosh_proto::ViewDevice::Node { node }) => Some(node.0.clone()),
-        Some(neosh_proto::ViewDevice::All) => Some("all".to_string()),
-        Some(neosh_proto::ViewDevice::Here) => Some("here".to_string()),
+        Some(neosh_proto::ViewDevice::Here | neosh_proto::ViewDevice::All) => Some("here".to_string()),
         _ => None,
     };
     match client::attach(stream, into, device).await? {

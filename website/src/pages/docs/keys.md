@@ -22,10 +22,10 @@ Every default is a key your terminal already sends: Ctrl with a letter, `⇧⇥`
 | `^E` | Every option this model has, on one panel, applied as you move |
 | `⇧⇥` | Permission mode. Belongs to this conversation and is saved with it |
 | `^T` | Projects and conversations |
-| `^J` | The computers in this workspace |
+| `^J` | The computers in this workspace. `↵` on one moves this window to it |
 | `^F` | The archive |
-| `^N` | New conversation. With another computer paired it asks which one first; in a repository it then asks where |
-| `^O` | Add a project — a path, another computer, or **Clone a repository…** (or paste an address straight in) |
+| `^N` | New conversation, on the computer this window is for. In a repository it asks where |
+| `^O` | Add a project — a path, `linux-box:` for one on another computer, or **Clone a repository…** (or paste an address straight in) |
 | `^B` | Toggle the sidebar |
 | `^K` | Command palette |
 | `^W` | Windows, panes and tabs — hold it to see what follows. See below |

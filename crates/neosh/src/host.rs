@@ -76,6 +76,9 @@ struct Saving {
 /// is a recompute-and-compare, and doing it on the host loop's every iteration would put it on the
 /// token path.
 const ROSTER_INTERVAL: Duration = Duration::from_secs(2);
+/// How long a machine asking to join may go without dialling before the request is let go. Its
+/// dialler retries every heartbeat (ten seconds by default) for as long as it means it.
+const STRANGER_QUIET: Duration = Duration::from_secs(90);
 
 /// The plugin id the host registers its own things under.
 ///
@@ -1039,6 +1042,10 @@ pub struct Host {
     /// what it is refusing, so the id is the only thing that tells a directory listing from a
     /// started conversation from a shell that was not allowed.
     swarm_asking: std::collections::HashMap<String, SwarmAsk>,
+    /// For a [`SwarmAsk::Call`] that made a conversation over there, the terminal to open it in
+    /// when the answer arrives — the one that asked, since `session.create` lands where it was
+    /// pressed. Absent for every other call.
+    swarm_call_lands: std::collections::HashMap<String, neosh_proto::ViewId>,
     swarm_next_command: u64,
     /// Shells this machine is running for other machines, by the handle it minted for each.
     ///
@@ -1088,6 +1095,13 @@ pub struct Host {
     /// waiting in the list when you look. Reset on restart, because a request that old is one to
     /// make again.
     swarm_strangers: std::collections::HashMap<neosh_proto::NodeId, neosh_proto::SwarmStranger>,
+    /// When each machine asking to join last dialled. A machine that has us paired dials every
+    /// heartbeat, so one that has gone quiet for a while has given up — unpaired us, or gone — and
+    /// a request it is no longer making is not one to go on showing.
+    swarm_stranger_seen: std::collections::HashMap<neosh_proto::NodeId, Instant>,
+    /// Machines somebody here turned down. Kept for this workspace's life so the next heartbeat
+    /// does not ask again; a knock — a resend over there — takes one off.
+    swarm_dismissed: std::collections::HashSet<neosh_proto::NodeId>,
     /// The authorisation list, shared with the running node so pairing needs no restart.
     swarm_allowed: neosh_swarm::Allowed,
     /// The node's events, held here between construction and the loop taking them.
@@ -1559,6 +1573,8 @@ enum SwarmAsk {
     Command,
     /// A directory listing.
     Browse,
+    /// An API call run over there. See [`ApiCall::SwarmCall`].
+    Call,
     /// A shell.
     Shell,
     /// Something typed into another machine's conversation opened here, or `Esc` in it. Nobody is
@@ -1837,6 +1853,7 @@ impl Host {
             swarm_pending: Default::default(),
             published: None,
             swarm_asking: Default::default(),
+            swarm_call_lands: Default::default(),
             swarm_serving: Default::default(),
             swarm_next_pty: 0,
             swarm_opening: Default::default(),
@@ -1846,6 +1863,8 @@ impl Host {
             mirror_drawn: Default::default(),
             mirror_pictures: Default::default(),
             swarm_strangers: Default::default(),
+            swarm_stranger_seen: Default::default(),
+            swarm_dismissed: Default::default(),
             swarm_allowed: neosh_swarm::Allowed::load(None),
             swarm_events: None,
             swarm_listen_configured: false,
@@ -2614,27 +2633,7 @@ impl Host {
             ApiCall::SwarmHostsOf { project } => Ok(ApiOk::Names {
                 names: self.swarm.hosts_of(&project).into_iter().map(str::to_string).collect(),
             }),
-            ApiCall::SwarmMirror { node, session, view } => {
-                let local = self.open_mirror(&node, &session)?;
-                let view = view.unwrap_or_else(|| self.serving());
-                let moved = self.in_view(view, |me| {
-                    me.arrive_in(&local).map_err(|e| ApiError::NotFound { what: e.to_string() })
-                });
-                moved?;
-                // No `work_in`: the directory is on the other machine, and there is nothing here
-                // to read a repository out of.
-                self.in_view(view, |me| me.enter_session());
-                // Asked every time, found or made: subscribing is what sends the history, and a
-                // conversation opened again after a while should be what it is now.
-                if let Some(h) = &self.swarm_node {
-                    h.send(neosh_swarm::SwarmRequest::Subscribe { node, session });
-                }
-                let info = self.agent.sessions().get(&local).map(|s| s.info());
-                match info {
-                    Some(info) => Ok(ApiOk::Session { session: self.named(info) }),
-                    None => Err(ApiError::NotFound { what: "that conversation went away".into() }),
-                }
-            }
+            ApiCall::SwarmMirror { node, session, view } => self.mirror_into(node, session, view),
             ApiCall::SwarmSubscribe { node, session } => {
                 match &self.swarm_node {
                     Some(h) => {
@@ -2703,6 +2702,14 @@ impl Host {
                     .map(|s| s.info.name.clone())
                     .filter(|n| !n.is_empty())
                     .unwrap_or(name);
+                // An address that resolves to this machine — two Macs both called `Mac`, and the
+                // one you typed is the one you are sitting at — would pair a machine with itself and
+                // then hide the row, since a list of the others never shows yourself.
+                if self.swarm_self().is_some_and(|me| me.id == node) {
+                    return Err(ApiError::InvalidArgument {
+                        message: "that address is this computer — use the other one's address".into(),
+                    });
+                }
                 let addr = addr.or_else(|| {
                     self.swarm_strangers.get(&node).and_then(|s| s.addr.clone())
                 });
@@ -2715,6 +2722,8 @@ impl Host {
                 // moment after pairing is exactly when somebody is watching for it to appear.
                 self.swarm.seed(node.clone(), name.clone(), addr.is_some());
                 self.swarm_strangers.remove(&node);
+                self.swarm_dismissed.remove(&node);
+                self.publish_asking();
                 self.editor_message(MessageLevel::Info, format!("paired with {name}"));
                 self.broadcast(PluginEvent::SwarmChanged);
                 Ok(ApiOk::Unit)
@@ -2736,8 +2745,26 @@ impl Host {
                             .into(),
                     });
                 }
-                h.send(neosh_swarm::SwarmRequest::Unpair { id: node });
+                h.send(neosh_swarm::SwarmRequest::Unpair { id: node.clone() });
+                // Off the board as well as off the list. The node forgets a machine that never
+                // connected without a word — there is no link to report going down — so the row
+                // of one that had not allowed this computer yet stayed on screen saying it was
+                // waiting, after the notice said it was removed, until the workspace restarted.
+                self.swarm.forget(&node);
+                self.swarm_strangers.remove(&node);
+                self.publish_asking();
                 self.broadcast(PluginEvent::SwarmChanged);
+                Ok(ApiOk::Unit)
+            }
+            ApiCall::SwarmDismiss { node } => {
+                let known = self.swarm_strangers.remove(&node).is_some();
+                self.swarm_stranger_seen.remove(&node);
+                self.swarm_dismissed.insert(node);
+                self.publish_asking();
+                self.broadcast(PluginEvent::SwarmChanged);
+                if !known {
+                    return Err(ApiError::NotFound { what: "that machine is not asking".into() });
+                }
                 Ok(ApiOk::Unit)
             }
             ApiCall::SwarmRename { node, name } => {
@@ -2763,7 +2790,10 @@ impl Host {
                 let Some(h) = &self.swarm_node else {
                     return Err(ApiError::NotFound { what: "the swarm is not running".into() });
                 };
-                h.send(neosh_swarm::SwarmRequest::Redial { id: node.clone() });
+                // Knocking: a person pressed this, and for a machine that has not allowed this one
+                // yet it is *resend* — the far end says so again rather than taking it for one more
+                // heartbeat from somebody it has already mentioned.
+                h.send(neosh_swarm::SwarmRequest::Redial { id: node.clone(), knock: true });
                 // The board says "connecting" from the keystroke, not from the first failure:
                 // the state changed the moment somebody asked, and the events catch up.
                 if let Some(name) = self.swarm.peer(&node).map(|p| p.info.name.clone()) {
@@ -2828,6 +2858,9 @@ impl Host {
             }),
             ApiCall::SwarmBrowse { .. } => Err(ApiError::Internal {
                 message: "swarm.browse is answered asynchronously".into(),
+            }),
+            ApiCall::SwarmCall { .. } => Err(ApiError::Internal {
+                message: "swarm.call is answered asynchronously".into(),
             }),
             // ---- events -------------------------------------------------
             // `from` is stamped here rather than taken from the call, so "who said this" is one of
@@ -6556,6 +6589,195 @@ impl Host {
         handle.send(neosh_swarm::SwarmRequest::Browse { node, id, prefix });
     }
 
+    /// Open another machine's conversation here and move a terminal into it. What
+    /// [`ApiCall::SwarmMirror`] does, and what a conversation started over there through
+    /// [`ApiCall::SwarmCall`] does once it exists.
+    fn mirror_into(
+        &mut self,
+        node: neosh_proto::NodeId,
+        session: neosh_proto::SessionId,
+        view: Option<neosh_proto::ViewId>,
+    ) -> ApiResult {
+        let local = self.open_mirror(&node, &session)?;
+        let view = view.unwrap_or_else(|| self.serving());
+        let moved = self.in_view(view, |me| {
+            me.arrive_in(&local).map_err(|e| ApiError::NotFound { what: e.to_string() })
+        });
+        moved?;
+        // No `work_in`: the directory is on the other machine, and there is nothing here
+        // to read a repository out of.
+        self.in_view(view, |me| me.enter_session());
+        // Asked every time, found or made: subscribing is what sends the history, and a
+        // conversation opened again after a while should be what it is now.
+        if let Some(h) = &self.swarm_node {
+            h.send(neosh_swarm::SwarmRequest::Subscribe { node, session });
+        }
+        let info = self.agent.sessions().get(&local).map(|s| s.info());
+        match info {
+            Some(info) => Ok(ApiOk::Session { session: self.named(info) }),
+            None => Err(ApiError::NotFound { what: "that conversation went away".into() }),
+        }
+    }
+
+    /// Send an API call to a peer and remember who is waiting. See [`ApiCall::SwarmCall`].
+    ///
+    /// Only for a call [`remote_call`] admits and a node that is not this one; the caller has
+    /// already run anything else here.
+    fn begin_swarm_call(
+        &mut self,
+        node: neosh_proto::NodeId,
+        call: ApiCall,
+        waiting: (PluginId, RequestId),
+    ) {
+        // What a plugin may not do to this disk it may not do to that one either. Checked here
+        // because the owner cannot: it sees a machine asking, not which plugin on it.
+        if let Some(verb) = remote_write(&call)
+            && let Err(e) = self.services(&waiting.0).permit_write(verb)
+        {
+            self.answer_swarm(waiting, Err(e));
+            return;
+        }
+        let Some(handle) = &self.swarm_node else {
+            self.answer_swarm(waiting, Err(ApiError::NotFound {
+                what: "the swarm is not running".into(),
+            }));
+            return;
+        };
+        let text = match serde_json::to_string(&call) {
+            Ok(t) => t,
+            Err(e) => {
+                self.answer_swarm(waiting, Err(ApiError::Internal { message: e.to_string() }));
+                return;
+            }
+        };
+        self.swarm_next_command += 1;
+        let id = format!("a{}", self.swarm_next_command);
+        if let ApiCall::SessionNew { activate: true, .. } = &call {
+            self.swarm_call_lands.insert(id.clone(), self.serving());
+        }
+        self.swarm_pending.insert(id.clone(), waiting);
+        self.swarm_asking.insert(id.clone(), SwarmAsk::Call);
+        handle.send(neosh_swarm::SwarmRequest::Call { node, id, call: text });
+    }
+
+    /// A call we sent to a peer was answered.
+    ///
+    /// A conversation made over there for a caller that wanted to *be* in it is opened here as a
+    /// mirror, in the terminal that asked — which is what `session.create` does here, and is the
+    /// difference between starting work on that machine and having to go and find it in `^J`. The
+    /// answer is still the owner's conversation: the namespace that asked is bound to that
+    /// machine, and every id it is handed should be one that machine knows.
+    fn on_swarm_called(&mut self, node: neosh_proto::NodeId, id: &str, ok: String) {
+        let Some(waiting) = self.swarm_pending.remove(id) else { return };
+        self.swarm_asking.remove(id);
+        let lands = self.swarm_call_lands.remove(id);
+        let answer = match serde_json::from_str::<ApiOk>(&ok) {
+            Ok(answer) => answer,
+            Err(_) => {
+                let name = self.swarm.peer(&node).map(|p| p.info.name.clone()).unwrap_or_default();
+                self.answer_swarm(waiting, Err(ApiError::Internal {
+                    message: format!(
+                        "{name} answered in a shape this neosh cannot read — update one of them"
+                    ),
+                }));
+                return;
+            }
+        };
+        if let (Some(view), ApiOk::Session { session }) = (lands, &answer)
+            && let Err(e) = self.mirror_into(node, session.id.clone(), Some(view))
+        {
+            self.editor_message(MessageLevel::Warn, format!("could not open it here: {e}"));
+        }
+        self.answer_swarm(waiting, Ok(answer));
+    }
+
+    /// A peer asked for an API call to be run here. Answer exactly once, whatever happens.
+    ///
+    /// `accepts_commands` was checked by the node before this was raised; what is checked here is
+    /// *which* call, every time, whatever the other end believes it may ask.
+    async fn run_swarm_call(&mut self, node: neosh_proto::NodeId, id: String, text: String) {
+        let Some(handle) = self.swarm_node.clone() else { return };
+        let refuse = |handle: &neosh_swarm::SwarmHandle, id: String, refusal| {
+            handle.send(neosh_swarm::SwarmRequest::Called { node: node.clone(), id, result: Err(refusal) });
+        };
+        let Ok(mut call) = serde_json::from_str::<ApiCall>(&text) else {
+            refuse(&handle, id, neosh_proto::Refusal::NotPermitted {
+                what: format!(
+                    "this computer's neosh ({}) does not know that call — update it",
+                    env!("CARGO_PKG_VERSION")
+                ),
+            });
+            return;
+        };
+        if !remote_call(&call) {
+            refuse(&handle, id, neosh_proto::Refusal::NotPermitted {
+                what: "that is not something another computer can ask this one for".into(),
+            });
+            return;
+        }
+        // "The current checkout" over here is whatever somebody at this machine is reading,
+        // which is not a thing the asker can know or mean.
+        if remote_needs_cwd(&call) {
+            refuse(&handle, id, neosh_proto::Refusal::Failed {
+                message: "say which directory — this computer's current one is not yours".into(),
+            });
+            return;
+        }
+        // `~` means this home, and a conversation started from over there never moves a screen
+        // here: the person at this machine is reading what they were reading.
+        match &mut call {
+            ApiCall::SessionNew { cwd, activate, .. } => {
+                *activate = false;
+                if let Some(c) = cwd.as_mut() {
+                    *c = expand_tilde(c).unwrap_or_else(|| c.clone());
+                }
+            }
+            ApiCall::GitClone { path, .. } | ApiCall::GitAddWorktree { path, .. } => {
+                *path = expand_tilde(path).unwrap_or_else(|| path.clone());
+            }
+            _ => {}
+        }
+        // Said on the machine it happens on, as a shell is: a directory appearing on this disk
+        // that nobody here asked for should come with who did.
+        let who = self.swarm.peer(&node).map(|p| p.info.name.clone()).unwrap_or_default();
+        match &call {
+            ApiCall::GitClone { url, path } => {
+                self.editor_message(MessageLevel::Info, format!("{who} is cloning {url} into {path}"));
+            }
+            ApiCall::GitAddWorktree { path, .. } => {
+                self.editor_message(MessageLevel::Info, format!("{who} made a worktree at {path}"));
+            }
+            _ => {}
+        }
+        let settle = move |handle: &neosh_swarm::SwarmHandle, result: ApiResult| {
+            let result = match result {
+                Ok(ok) => serde_json::to_string(&ok).map_err(|e| neosh_proto::Refusal::Failed {
+                    message: e.to_string(),
+                }),
+                Err(e) => Err(neosh_proto::Refusal::Failed { message: api_error_words(e) }),
+            };
+            handle.send(neosh_swarm::SwarmRequest::Called { node, id, result });
+        };
+        if Self::is_slow(&call) {
+            let mut svc = self.services(&PluginId::from(BUILTIN));
+            // The owner's decision, made once in `accepts_commands`; the asking plugin's own
+            // `vcs_write` was checked on the machine it runs on.
+            svc.may_write_vcs = true;
+            svc.caller = format!("{who} (another computer)");
+            tokio::spawn(async move {
+                let result = run_slow(svc, call).await;
+                settle(&handle, result);
+            });
+            return;
+        }
+        let made = matches!(call, ApiCall::SessionNew { .. });
+        let result = self.dispatch(&PluginId::from(BUILTIN), call).await;
+        if made && result.is_ok() {
+            self.publish_inventory();
+        }
+        settle(&handle, result);
+    }
+
     /// A peer asked which of our directories start with `prefix`. Answer exactly once, whatever
     /// happens.
     ///
@@ -6611,6 +6833,7 @@ impl Host {
             rich_stream: false,
             catalogue: false,
             live: false,
+            calls: false,
             projects: Vec::new(),
         };
         let bridge = self.bridge.clone();
@@ -6868,6 +7091,41 @@ impl Host {
     }
 
     /// Tell every peer what changed here. Cheap enough to call on any session event.
+    /// Say which machines are asking to join, as the `swarm.asking` workspace var — read by the
+    /// project panel, which draws a row for each until somebody answers. A var rather than a
+    /// notice because it has to be true for a terminal that attaches an hour later, and a notice
+    /// is said to whoever was attached at the time.
+    fn publish_asking(&mut self) {
+        let mut asking: Vec<serde_json::Value> = self
+            .swarm_strangers
+            .values()
+            .filter(|s| !s.dialled)
+            .map(|s| serde_json::json!({ "id": s.info.id.0, "name": s.info.name }))
+            .collect();
+        asking.sort_by(|a, b| a["name"].as_str().cmp(&b["name"].as_str()));
+        self.set_global_var("swarm.asking", serde_json::Value::Array(asking));
+    }
+
+    /// Stop showing a request the machine has stopped making — unpaired over there, or gone. It
+    /// dials every heartbeat while it means it, so a minute of silence is an answer.
+    fn forget_quiet_strangers(&mut self) {
+        let quiet: Vec<neosh_proto::NodeId> = self
+            .swarm_stranger_seen
+            .iter()
+            .filter(|(_, at)| at.elapsed() > STRANGER_QUIET)
+            .map(|(id, _)| id.clone())
+            .collect();
+        if quiet.is_empty() {
+            return;
+        }
+        for id in &quiet {
+            self.swarm_stranger_seen.remove(id);
+            self.swarm_strangers.remove(id);
+        }
+        self.publish_asking();
+        self.broadcast(PluginEvent::SwarmChanged);
+    }
+
     pub fn publish_inventory(&mut self) {
         if self.swarm_node.is_none() {
             return;
@@ -6994,6 +7252,7 @@ impl Host {
                 let orphaned: Vec<String> = self.swarm_pending.keys().cloned().collect();
                 for id in orphaned {
                     self.swarm_asking.remove(&id);
+                    self.swarm_call_lands.remove(&id);
                     if let Some(waiting) = self.swarm_pending.remove(&id) {
                         self.answer_swarm(waiting, Err(ApiError::NotFound {
                             what: format!("{name} went away before answering"),
@@ -7056,8 +7315,18 @@ impl Host {
                 self.on_mirror_stream(&node, &session, &event);
                 self.broadcast(PluginEvent::SwarmStream { node, session, event });
             }
-            E::Stranger { node, dialled } => {
+            E::Stranger { node, dialled, knock } => {
+                // Turned down here, and this is its heartbeat rather than somebody asking again.
+                if !dialled && !knock && self.swarm_dismissed.contains(&node.id) {
+                    return;
+                }
+                if knock {
+                    self.swarm_dismissed.remove(&node.id);
+                }
                 let first = !self.swarm_strangers.contains_key(&node.id);
+                if !dialled {
+                    self.swarm_stranger_seen.insert(node.id.clone(), Instant::now());
+                }
                 // The address only means anything when we were the one dialling. For a machine
                 // that dialled us, where it happened to arrive from is not somewhere we could
                 // usefully dial back.
@@ -7069,13 +7338,23 @@ impl Host {
                     node.id.clone(),
                     neosh_proto::SwarmStranger { info: node, dialled, addr },
                 );
-                // Said once. A machine that is dialling us every ten seconds must not produce a
-                // notification every ten seconds.
-                if first && !dialled {
-                    self.editor_message(
+                // Said when it is new and when it is asked again on purpose — never per heartbeat,
+                // since a machine with this one paired dials every ten seconds. Said as an *alert*:
+                // the person asking is at the other keyboard, so this one is very often a terminal
+                // nobody is looking at or none at all, and a six-second note in its corner was the
+                // whole of what used to be said. What stays is `swarm.asking`, drawn by the panel
+                // until somebody answers.
+                if (first || knock) && !dialled {
+                    self.alert(
+                        crate::notify::AlertReason::Pairing,
+                        None,
                         MessageLevel::Info,
+                        "A computer wants to join",
                         format!("{name} wants to join this workspace — ^J to allow it"),
                     );
+                }
+                if !dialled {
+                    self.publish_asking();
                 }
                 self.broadcast(PluginEvent::SwarmChanged);
             }
@@ -7185,6 +7464,17 @@ impl Host {
                 }
             }
             E::Browse { node, id, prefix } => self.run_swarm_browse(node, id, prefix),
+            // Taken by the loop before it reaches here; see `run_swarm_call`.
+            E::Call { node, id, .. } => {
+                if let Some(h) = &self.swarm_node {
+                    h.send(neosh_swarm::SwarmRequest::Called {
+                        node,
+                        id,
+                        result: Err(neosh_proto::Refusal::Busy { message: "try again".into() }),
+                    });
+                }
+            }
+            E::Called { node, id, ok } => self.on_swarm_called(node, &id, ok),
             E::Catalogue { node, id, refresh } => self.serve_catalogue(node, id, refresh),
             E::Catalogued { node, id, catalogue } => {
                 self.swarm_asking.remove(&id);
@@ -7290,8 +7580,10 @@ impl Host {
         let known = self.agent.sessions().list_with(true).iter().any(|s| s.id == session);
         match command {
             C::NewSession { cwd, title } => {
+                // `~` as typed into a path field on the other machine means *this* home, which
+                // only this side can say.
                 let dir = cwd
-                    .map(std::path::PathBuf::from)
+                    .map(|c| std::path::PathBuf::from(expand_tilde(&c).unwrap_or(c)))
                     .unwrap_or_else(|| self.cwd.clone());
                 if dir.is_dir() {
                     // The one just made, not whatever is on screen here: `new_session_titled`
@@ -7477,6 +7769,7 @@ impl Host {
     ) {
         let Some(waiting) = self.swarm_pending.remove(id) else { return };
         let asked = self.swarm_asking.remove(id);
+        self.swarm_call_lands.remove(id);
         let result = if !ok {
             Err(ApiError::Denied { reason: message })
         } else if asked == Some(SwarmAsk::Browse) {
@@ -8606,7 +8899,9 @@ impl Host {
                 (if ascii { "Enter" } else { "\u{23ce}" }, "start"),
                 ("^O", "add project"),
                 ("^T", "projects"),
-                ("^F", "archived"),
+                // Before the archive, which is empty on a first run: another computer is the
+                // thing somebody arriving here is most likely to go looking for a key to.
+                ("^J", "computers"),
                 ("^Z", "every key"),
             ]
         } else {
@@ -8761,6 +9056,7 @@ impl Host {
             ApiCall::SwarmProbe { .. }
             | ApiCall::SwarmCommand { .. }
             | ApiCall::SwarmBrowse { .. }
+            | ApiCall::SwarmCall { .. }
             // And this one for a second reason on top of the first: it opens a *pane*, which is a
             // rectangle on a screen, and a control connection is deliberately not a view.
             | ApiCall::SwarmShell { .. } => Some(
@@ -13178,6 +13474,19 @@ impl Host {
     /// One plugin call, answered. Split out so the terminal it is about can be set for the whole
     /// of it and put back afterwards, however many ways out of it there are.
     async fn plugin_call(&mut self, plugin: PluginId, id: RequestId, call: ApiCall) {
+        // A namespace bound to another machine sends *every* call this way, and only the ones
+        // about that machine's disk go there: a picker it opens is still a picker on this screen.
+        // Anything else — and anything aimed at this machine — is simply the call.
+        let call = match call {
+            ApiCall::SwarmCall { node, inner } => {
+                if self.swarm_self().is_some_and(|me| me.id == node) || !remote_call(&inner) {
+                    return Box::pin(self.plugin_call(plugin, id, *inner)).await;
+                }
+                self.begin_swarm_call(node, *inner, (plugin, id));
+                return;
+            }
+            other => other,
+        };
         // In another machine's conversation, what can answer it is that machine's list.
         if self.answer_from_catalogue(&plugin, &id, &call) {
             return;
@@ -13261,6 +13570,13 @@ impl Host {
 
     /// The same, for a call that wants no answer.
     async fn plugin_notify(&mut self, plugin: PluginId, call: ApiCall) {
+        // `notify`, `progress` and `done` arrive here from a namespace bound to another machine,
+        // and are about this screen. A notify that is about that disk has nobody to answer, so it
+        // is the call made here — which is never what such a namespace sends.
+        let call = match call {
+            ApiCall::SwarmCall { inner, .. } => *inner,
+            other => other,
+        };
         if let ApiCall::ChatAttach { path: None } = &call {
             self.begin_paste(None);
             return;
@@ -14080,7 +14396,13 @@ impl Host {
                         // Never ready, rather than ready-with-nothing: the latter would spin.
                         None => std::future::pending().await,
                     }
-                } => self.on_swarm_event(ev),
+                } => match ev {
+                    // Answered by `dispatch`, which awaits, so not from inside `on_swarm_event`.
+                    neosh_swarm::SwarmEvent::Call { node, id, call } => {
+                        self.run_swarm_call(node, id, call).await
+                    }
+                    ev => self.on_swarm_event(ev),
+                },
                 Some(ev) = agent_rx.recv() => self.handle_agent_event(ev),
                 Some(c) = async {
                     match control_rx.as_mut() {
@@ -14256,6 +14578,7 @@ impl Host {
                 }
                 () = &mut roster, if self.swarm_node.is_some() => {
                     self.publish_inventory_if_changed();
+                    self.forget_quiet_strangers();
                     self.prune_mirrors();
                     roster.as_mut().reset(Instant::now() + ROSTER_INTERVAL);
                 }
@@ -16831,8 +17154,8 @@ impl Host {
                 ),
                 description: Some(
                     "What is worth interrupting you for: turn.done, question, permission, \
-                     failure, quota, plugin. A list rather than six switches, because it is one \
-                     decision asked six times."
+                     failure, quota, plugin, pairing. A list rather than seven switches, because \
+                     it is one decision asked seven times."
                         .into(),
                 ),
             },
@@ -17694,6 +18017,69 @@ async fn run_slow(svc: Services, call: ApiCall) -> ApiResult {
 fn lines_in(content: &str) -> usize {
     let body = content.trim_end();
     if body.is_empty() { 0 } else { body.lines().count() }
+}
+
+/// Whether another machine may ask this one for `call`. See [`ApiCall::SwarmCall`].
+///
+/// Calls about this disk, and nothing about a screen. One list, read on both ends: by the asker to
+/// decide which calls of a bound namespace leave the machine, and by the owner to refuse whatever
+/// the asker believed.
+fn remote_call(call: &ApiCall) -> bool {
+    matches!(
+        call,
+        ApiCall::GitStatus { .. }
+            | ApiCall::GitBranches { .. }
+            | ApiCall::GitWorktrees { .. }
+            | ApiCall::GitFetch { .. }
+            | ApiCall::GitPull { .. }
+            | ApiCall::ForgePulls { .. }
+            | ApiCall::GitAddWorktree { .. }
+            | ApiCall::GitClone { .. }
+            | ApiCall::PathComplete { .. }
+            | ApiCall::OptGet { .. }
+            | ApiCall::VarGet { .. }
+            | ApiCall::VarSet { .. }
+            | ApiCall::SessionNew { .. }
+    )
+}
+
+/// The `git` verb a remote call writes with, for the asking plugin's `vcs_write`.
+fn remote_write(call: &ApiCall) -> Option<&'static str> {
+    match call {
+        ApiCall::GitFetch { .. } => Some("fetch"),
+        ApiCall::GitPull { .. } => Some("pull"),
+        ApiCall::GitAddWorktree { .. } => Some("worktree add"),
+        ApiCall::GitClone { .. } => Some("clone"),
+        _ => None,
+    }
+}
+
+/// A git call that left out which directory, which on the owner would mean whatever somebody at
+/// that machine happens to be reading.
+fn remote_needs_cwd(call: &ApiCall) -> bool {
+    match call {
+        ApiCall::GitStatus { cwd }
+        | ApiCall::GitBranches { cwd, .. }
+        | ApiCall::GitWorktrees { cwd }
+        | ApiCall::GitFetch { cwd }
+        | ApiCall::GitPull { cwd, .. }
+        | ApiCall::ForgePulls { cwd }
+        | ApiCall::GitAddWorktree { cwd, .. } => cwd.as_deref().is_none_or(str::is_empty),
+        _ => false,
+    }
+}
+
+/// What went wrong, without the category prefix `Display` puts on it — the asker says which
+/// machine, and `denied: not found: …` after that is three labels on one sentence.
+fn api_error_words(e: ApiError) -> String {
+    match e {
+        ApiError::NotFound { what } => format!("{what} is not there"),
+        ApiError::InvalidArgument { message }
+        | ApiError::Busy { message }
+        | ApiError::Internal { message } => message,
+        ApiError::Denied { reason } => reason,
+        ApiError::NotPermitted { capability } => capability,
+    }
 }
 
 /// A refusal, in words a person can act on.

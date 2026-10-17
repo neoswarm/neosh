@@ -1305,7 +1305,7 @@ fn a_terminal_says_which_computer_it_is_for() {
     t.until("the panel, narrowed to that computer", |c| c.shows("not a paired computer"));
     let seen = views(&mut s);
     assert_eq!(seen.len(), 1, "one terminal: {seen:?}");
-    assert_eq!(seen[0].device, Some(there), "it arrived saying which computer");
+    assert_eq!(seen[0].device, Some(there.clone()), "it arrived saying which computer");
 
     // Pointed somewhere else through the API, which is what `/device` does.
     s.subscribe();
@@ -1314,16 +1314,25 @@ fn a_terminal_says_which_computer_it_is_for() {
         matches!(e, neosh_proto::PluginEvent::ViewDevice { device: Some(ViewDevice::Here), .. })
     });
     assert_eq!(views(&mut s)[0].device, Some(ViewDevice::Here));
+    // And back to the other computer, so what the next terminal must not inherit is a choice that
+    // differs from what it would be given anyway.
+    s.call(ApiCall::ViewSetDevice { view: Some(seen[0].view), device: Some(there.clone()) });
+    s.until_event("the change announced", |e| {
+        matches!(e, neosh_proto::PluginEvent::ViewDevice { device: Some(ViewDevice::Node { .. }), .. })
+    });
 
     t.leave();
     t.until("the terminal to go", |c| c.ended.is_some());
     drop(t);
     let mut u = Client::attach(&ws.socket, neosh_proto::PROTOCOL_VERSION);
     u.ready();
-    assert_eq!(
-        views(&mut s)[0].device,
-        None,
-        "a terminal handed the kept screen without naming a computer is asked again"
+    // Nobody named one, so it is the setting's to decide — and with nothing paired there is nothing
+    // to ask, so the devices plugin may already have answered `here`. What it must never be is the
+    // last terminal's answer, which was about the last terminal.
+    let device = views(&mut s)[0].device.clone();
+    assert!(
+        matches!(device, None | Some(ViewDevice::Here)),
+        "a terminal handed the kept screen without naming a computer does not inherit one: {device:?}"
     );
 }
 

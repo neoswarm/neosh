@@ -41,6 +41,8 @@ pub struct Peer {
 pub struct Stranger {
     pub node: NodeInfo,
     pub capabilities: NodeCapabilities,
+    /// It asked on purpose — see `AscpMessage::Hello::knock`. Only ever true on the listening side.
+    pub knock: bool,
 }
 
 /// Dial: we opened the connection, so we challenge first.
@@ -54,6 +56,22 @@ pub async fn dial<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
+    dial_knocking(stream, me, allowed, my_info, my_caps, false).await
+}
+
+/// [`dial`], saying whether this is somebody asking again on purpose. See
+/// `AscpMessage::Hello::knock`.
+pub async fn dial_knocking<S>(
+    stream: &mut S,
+    me: &Identity,
+    allowed: &Allowed,
+    my_info: &NodeInfo,
+    my_caps: &NodeCapabilities,
+    knock: bool,
+) -> Result<Peer, SwarmError>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
     let my_nonce = nonce();
     write_message(
         stream,
@@ -62,6 +80,7 @@ where
             node: announce(me, my_info),
             capabilities: my_caps.clone(),
             nonce: my_nonce.clone(),
+            knock,
         },
     )
     .await?;
@@ -87,7 +106,7 @@ where
         return Err(SwarmError::BadSignature(node.id));
     }
     if !allowed.accepts(&node.id) {
-        return Err(SwarmError::Stranger(Box::new(Stranger { node, capabilities })));
+        return Err(SwarmError::Stranger(Box::new(Stranger { node, capabilities, knock: false })));
     }
 
     let proof = me.sign(&challenge(ASCP_VERSION, &their_nonce, &node.id, me.id()));
@@ -109,7 +128,7 @@ where
     let Some(first) = read_message(stream).await? else {
         return Err(SwarmError::Protocol("peer closed before saying hello".into()));
     };
-    let AscpMessage::Hello { version, node, capabilities, nonce: their_nonce } = first else {
+    let AscpMessage::Hello { version, node, capabilities, nonce: their_nonce, knock } = first else {
         return Err(SwarmError::Protocol("expected a hello".into()));
     };
     check_version(version)?;
@@ -142,9 +161,16 @@ where
     .await?;
 
     let Some(reply) = read_message(stream).await? else {
-        // A stranger that dialled us to find out who we are and then hung up. That is the first
-        // half of pairing seen from this side, and it is not a failure.
-        return Err(unauthorised_or_gone(allowed, node, capabilities));
+        // Somebody who dialled to find out who we are and hung up — "add a computer" looking before
+        // it asks. Not a request: nobody has pressed *Add* yet, the id was never proven, and this
+        // used to be announced as one, which spent the only announcement a real request got on
+        // the moment before it was made. The request is the dial that follows, with a proof.
+        let _ = capabilities;
+        return Err(SwarmError::Protocol(if allowed.accepts(&node.id) {
+            "peer closed before proving itself".into()
+        } else {
+            "a machine looked and hung up".into()
+        }));
     };
     let AscpMessage::Proof { signature } = reply else {
         return Err(SwarmError::Protocol("expected a proof".into()));
@@ -155,22 +181,9 @@ where
     }
     // Now, and only now, is the claimed id a proven one worth checking against the list.
     if !allowed.accepts(&node.id) {
-        return Err(SwarmError::Stranger(Box::new(Stranger { node, capabilities })));
+        return Err(SwarmError::Stranger(Box::new(Stranger { node, capabilities, knock })));
     }
     Ok(Peer { node, capabilities })
-}
-
-/// A peer that went away mid-handshake: a stranger if it was one, an ordinary disconnect otherwise.
-fn unauthorised_or_gone(
-    allowed: &Allowed,
-    node: NodeInfo,
-    capabilities: NodeCapabilities,
-) -> SwarmError {
-    if allowed.accepts(&node.id) {
-        SwarmError::Protocol("peer closed before proving itself".into())
-    } else {
-        SwarmError::Stranger(Box::new(Stranger { node, capabilities }))
-    }
 }
 
 /// The node info to put on the wire: the caller's, with the id replaced by the one we can sign for.

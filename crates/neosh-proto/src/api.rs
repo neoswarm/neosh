@@ -300,19 +300,23 @@ pub struct ViewInfo {
 ///
 /// Per **view**, because that is what a window is: two terminals on one workspace are two answers.
 /// It narrows what is *shown* and where things *start*, and never what exists — a turn on a machine
-/// this window is not for keeps running, and `All` is one `/device` away.
+/// this window is not for keeps running, and is one `/device` away.
+///
+/// A terminal is for **one** computer. `All` — every machine in one panel — was the original
+/// default and is kept only so an older client's `Attach` still decodes; everything reads it as
+/// `Here`, and the devices plugin asks a terminal that arrives with it.
 #[derive(TS, Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 #[ts(export)]
 pub enum ViewDevice {
-    /// Every computer, as the workspace always drew it.
+    /// Every computer at once. Retired: read as [`ViewDevice::Here`], kept so it still decodes.
     All,
     /// This computer, and nothing paired with it.
     Here,
     /// One other computer, by its id.
     Node { node: NodeId },
     /// Not decided, and to be *asked* whatever `swarm.device` says — what `neosh connect` with no
-    /// name means. Drawn as `All` until somebody answers.
+    /// name means. Drawn as `Here` until somebody answers.
     Ask,
 }
 
@@ -1453,6 +1457,15 @@ pub enum ApiCall {
     },
     /// Machines that have asked to join, or that we found and have not added.
     SwarmStrangers,
+    /// Turn down a machine that asked to join, without pairing with it.
+    ///
+    /// It goes off every list, and the same machine dialling again on its heartbeat — which it
+    /// will, for as long as it has this one paired — does not bring it back. Asking again *on
+    /// purpose*, which is its resend, does: a person over there pressed a key, and a person here
+    /// should hear about it.
+    SwarmDismiss {
+        node: NodeId,
+    },
     /// Which directories on another machine start with `prefix` — [`ApiCall::PathComplete`], asked
     /// over there.
     ///
@@ -1470,6 +1483,29 @@ pub enum ApiCall {
         node: NodeId,
         #[serde(default)]
         prefix: String,
+    },
+    /// Run one call **on another machine** and answer with what it answered there.
+    ///
+    /// The difference between a project over there and a project here was every verb that is
+    /// about a disk: which worktrees a repository has, which branches are taken, making a new tree
+    /// to start in, cloning, where the owner keeps them. Each had a local call and no remote one,
+    /// so `n` on a row over there could only start a conversation in the directory it named. This
+    /// is the one remote call instead of one per verb — `swarm.at(node)` in `@neosh/api` is the
+    /// whole namespace with these routed there, so the code that asks *where?* here asks it there.
+    ///
+    /// The owner answers only calls about its disk — git reads, `git worktree add`, `git clone`,
+    /// fetch and pull, a directory listing, an option, a var, and a new conversation (which never
+    /// moves a screen over there, and which this side then opens as a mirror where the caller is
+    /// looking, exactly as `session.create` arrives in one here). Everything else is refused by
+    /// name, as is a git call that does not say which directory: the owner's "current" checkout is
+    /// whatever somebody over there happens to be reading. Removing a worktree is not on the list
+    /// — nothing over the swarm destroys what it cannot put back. A write needs `vcs_write` on the
+    /// *calling* plugin, checked here, and `accepts_commands` on the owner, checked there. Aimed at
+    /// this machine, it is simply the call.
+    SwarmCall {
+        node: NodeId,
+        /// Not `call`, which is this enum's own tag.
+        inner: Box<ApiCall>,
     },
     /// Open a **shell** on another machine, in a tab of its own.
     ///

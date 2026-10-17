@@ -24,7 +24,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
 
 use crate::allow::Allowed;
-use crate::handshake::{accept, dial};
+use crate::handshake::{accept, dial_knocking};
 use crate::identity::Identity;
 use crate::wire::{read_message, write_message};
 
@@ -107,6 +107,10 @@ pub enum SwarmRequest {
     Browse { node: NodeId, id: String, prefix: String },
     /// Answer a [`SwarmEvent::Browse`] that came in.
     Browsed { node: NodeId, id: String, result: Result<Vec<String>, Refusal> },
+    /// Run an API call on a peer. `call` is JSON text; see [`AscpMessage::Call`].
+    Call { node: NodeId, id: String, call: String },
+    /// Answer a [`SwarmEvent::Call`] that came in, with the answer as JSON text.
+    Called { node: NodeId, id: String, result: Result<String, Refusal> },
     /// Ask a peer which models it can run a conversation with.
     Catalogue { node: NodeId, id: String, refresh: bool },
     /// Answer a [`SwarmEvent::Catalogue`] that came in.
@@ -137,7 +141,11 @@ pub enum SwarmRequest {
     /// The shell exited here. Only ever travels from the owner.
     PtyExit { node: NodeId, pty: String, status: Option<i32> },
     /// Dial a down peer again now, resetting its backoff, rather than waiting the delay out.
-    Redial { id: NodeId },
+    ///
+    /// `knock` says a person asked for it — *resend* on a machine that has not allowed this one —
+    /// and the next hello says so, so the far end announces the request again rather than treating
+    /// it as one more heartbeat from somebody it has already mentioned.
+    Redial { id: NodeId, knock: bool },
     /// Close the connection to a peer and stop dialling it, keeping the pairing.
     ///
     /// [`SwarmRequest::Redial`] is the way back. The peer may still dial in — it is still on the
@@ -187,6 +195,11 @@ pub enum SwarmEvent {
     Browse { node: NodeId, id: String, prefix: String },
     /// A browse we sent has been answered. Exactly one of these per browse, ever.
     Browsed { node: NodeId, id: String, result: Result<Vec<String>, Refusal> },
+    /// A peer wants an API call run here. The host must answer with [`SwarmRequest::Called`].
+    Call { node: NodeId, id: String, call: String },
+    /// A call we sent has been answered. A refusal arrives as [`Self::Answer`], as every refusal
+    /// does.
+    Called { node: NodeId, id: String, ok: String },
     /// A peer wants our model catalogue. The host must answer with [`SwarmRequest::Catalogued`].
     Catalogue { node: NodeId, id: String, refresh: bool },
     /// A catalogue we asked for. A refusal arrives as [`Self::Answer`], as every refusal does.
@@ -207,8 +220,9 @@ pub enum SwarmEvent {
     ///
     /// The beginning of pairing rather than the end of a connection. Reported for both directions:
     /// a machine we dialled and did not recognise, and one that dialled us. Either way the id here
-    /// has been *proven*, which is what makes it safe to show somebody and ask.
-    Stranger { node: NodeInfo, dialled: bool },
+    /// has been *proven*, which is what makes it safe to show somebody and ask. `knock` is a person
+    /// over there asking again on purpose (see `SwarmRequest::Redial`), which deserves saying again.
+    Stranger { node: NodeInfo, dialled: bool, knock: bool },
     /// A peer wants to watch one of our sessions, so the host should start sending its events.
     Subscribed { node: NodeId, session: SessionId },
     Unsubscribed { node: NodeId, session: SessionId },
@@ -269,7 +283,7 @@ enum Wire {
     },
     Message { node: NodeId, message: AscpMessage },
     Down { node: Option<NodeId>, reason: String },
-    Stranger { node: NodeInfo, dialled: bool },
+    Stranger { node: NodeInfo, dialled: bool, knock: bool },
 }
 
 /// Start a node. Returns the handle the host keeps and the events it should read.
@@ -323,6 +337,8 @@ async fn run(
         rich_stream: true,
         catalogue: true,
         live: true,
+        // A build fact, like `browse`: answering is `accepts_commands`, checked on arrival.
+        calls: true,
         projects: Vec::new(),
     };
 
@@ -361,12 +377,13 @@ async fn run(
     // also assigns to when the host reports its projects, and the borrow checker is right to
     // object. Everything here is cloned at spawn time anyway.
     macro_rules! start_dialling {
-        ($peer:expr) => {{
+        ($peer:expr, $knock:expr) => {{
             let peer: PeerAddress = $peer;
             if !diallers.contains_key(&peer.addr) {
                 let addr = peer.addr.clone();
                 let handle = tokio::spawn(keep_dialled(
                     peer,
+                    $knock,
                     identity.clone(),
                     allowed.clone(),
                     info.clone(),
@@ -380,7 +397,7 @@ async fn run(
         }};
     }
     for peer in config.peers.clone() {
-        start_dialling!(peer);
+        start_dialling!(peer, false);
     }
 
     let mut peers: HashMap<NodeId, Connected> = HashMap::new();
@@ -439,8 +456,14 @@ async fn run(
                         // Only dial if we were told where. A machine that dialled us will dial
                         // again on its own schedule, and inventing an address for it would mean
                         // connecting to whatever else is on that host and port.
+                        // Afresh, and knocking: pairing is asking, and adding a machine again that is
+                        // already being dialled used to change nothing at all — the dialler already
+                        // running carried on as one more heartbeat the far end had stopped mentioning.
                         if let Some(addr) = addr {
-                            start_dialling!(PeerAddress { addr, expect: Some(id) });
+                            if let Some(task) = diallers.remove(&addr) {
+                                task.abort();
+                            }
+                            start_dialling!(PeerAddress { addr, expect: Some(id) }, true);
                         }
                     }
                     SwarmRequest::Unpair { id } => {
@@ -465,7 +488,7 @@ async fn run(
                             });
                         }
                     }
-                    SwarmRequest::Redial { id } => {
+                    SwarmRequest::Redial { id, knock } => {
                         // Whatever a disconnect held back is welcome again — for a peer that
                         // dials us, this is the whole of what "reconnect" can do.
                         paused.remove(&id);
@@ -481,7 +504,7 @@ async fn run(
                             if let Some(task) = diallers.remove(&addr) {
                                 task.abort();
                             }
-                            start_dialling!(PeerAddress { addr, expect: Some(id) });
+                            start_dialling!(PeerAddress { addr, expect: Some(id) }, knock);
                         }
                     }
                     SwarmRequest::Disconnect { id } => {
@@ -571,6 +594,40 @@ async fn run(
                                     }),
                                 });
                             }
+                        }
+                    }
+                    SwarmRequest::Call { node, id, call } => match peers.get(&node) {
+                        // `browse`'s rule: never a message the far end cannot parse.
+                        Some(p) if p.capabilities.calls => {
+                            let _ = p.out.send(AscpMessage::Call { id, call });
+                        }
+                        Some(p) => {
+                            let _ = events.send(SwarmEvent::Answer {
+                                node,
+                                id,
+                                result: Err(Refusal::NotPermitted {
+                                    what: format!(
+                                        "{} is running neosh {}, which cannot do that for another \
+                                         machine — update it there",
+                                        p.info.name, p.info.version
+                                    ),
+                                }),
+                            });
+                        }
+                        None => {
+                            let _ = events.send(SwarmEvent::Answer {
+                                node,
+                                id,
+                                result: Err(Refusal::Busy { message: "not connected".into() }),
+                            });
+                        }
+                    },
+                    SwarmRequest::Called { node, id, result } => {
+                        if let Some(p) = peers.get(&node) {
+                            let _ = p.out.send(match result {
+                                Ok(ok) => AscpMessage::Called { id, ok },
+                                Err(refusal) => AscpMessage::Refused { id, refusal },
+                            });
                         }
                     }
                     SwarmRequest::Catalogue { node, id, refresh } => match peers.get(&node) {
@@ -765,8 +822,8 @@ async fn run(
                     });
                     let _ = events.send(SwarmEvent::PeerUp { node: peer_info, capabilities });
                 }
-                Wire::Stranger { node, dialled } => {
-                    let _ = events.send(SwarmEvent::Stranger { node, dialled });
+                Wire::Stranger { node, dialled, knock } => {
+                    let _ = events.send(SwarmEvent::Stranger { node, dialled, knock });
                 }
                 Wire::Down { node, reason } => {
                     // Only if this *is* the connection we are using. The losing half of a
@@ -868,6 +925,23 @@ async fn run(
                     }
                     AscpMessage::Catalogued { id, catalogue } => {
                         let _ = events.send(SwarmEvent::Catalogued { node, id, catalogue });
+                    }
+                    AscpMessage::Call { id, call } => {
+                        // Browse's gate, for Browse's reason. Which calls are answered is the
+                        // host's list, enforced there on every one whatever was sent.
+                        if caps.accepts_commands {
+                            let _ = events.send(SwarmEvent::Call { node, id, call });
+                        } else if let Some(p) = peers.get(&node) {
+                            let _ = p.out.send(AscpMessage::Refused {
+                                id,
+                                refusal: Refusal::NotPermitted {
+                                    what: "this node does not accept commands".into(),
+                                },
+                            });
+                        }
+                    }
+                    AscpMessage::Called { id, ok } => {
+                        let _ = events.send(SwarmEvent::Called { node, id, ok });
                     }
                     AscpMessage::Browsed { id, paths } => {
                         let _ = events.send(SwarmEvent::Browsed { node, id, result: Ok(paths) });
@@ -991,7 +1065,7 @@ async fn listen(
                 // A machine that proved itself and is not on the list is somebody asking to pair,
                 // not an error. It reaches the host, which can offer to add it.
                 Err(crate::SwarmError::Stranger(s)) => {
-                    let _ = wire.send(Wire::Stranger { node: s.node, dialled: false });
+                    let _ = wire.send(Wire::Stranger { node: s.node, dialled: false, knock: s.knock });
                 }
                 // At `debug`, not `warn`: on a network anybody can reach, a refused handshake is
                 // the system working. A `warn` per port scan is a log nobody reads.
@@ -1010,6 +1084,9 @@ async fn listen(
 /// a spinner that never resolves.
 async fn keep_dialled(
     peer: PeerAddress,
+    // Said on the first hello only: the knock is the person pressing the key, and every redial
+    // after it is the heartbeat again.
+    mut knock: bool,
     identity: Arc<Identity>,
     allowed: Allowed,
     info: NodeInfo,
@@ -1034,7 +1111,16 @@ async fn keep_dialled(
     let mut attempt: u32 = 0;
     loop {
         let outcome = match TcpStream::connect(&peer.addr).await {
-            Ok(mut stream) => match dial(&mut stream, &identity, &allowed, &info, &caps).await {
+            Ok(mut stream) => match dial_knocking(
+                &mut stream,
+                &identity,
+                &allowed,
+                &info,
+                &caps,
+                std::mem::take(&mut knock),
+            )
+            .await
+            {
                 Ok(found) => {
                     // The address said one machine and another answered. Worth refusing rather
                     // than accepting quietly: the allow-list would let it through, and "my laptop
@@ -1066,7 +1152,7 @@ async fn keep_dialled(
                     }
                 }
                 Err(crate::SwarmError::Stranger(s)) => {
-                    let _ = wire.send(Wire::Stranger { node: s.node, dialled: true });
+                    let _ = wire.send(Wire::Stranger { node: s.node, dialled: true, knock: false });
                     Outcome::Stranger
                 }
                 Err(e) => {

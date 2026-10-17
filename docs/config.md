@@ -420,9 +420,10 @@ The verbs on a row, and the list updates live while it is open:
 | Key | Does |
 |---|---|
 | `^E` | Call it something else. An SSH `Host` alias: it wins over the name the machine announces, everywhere, and clearing the field gives the hostname back. Refused for a machine your `config.toml` declared, whose `name` is one line away |
-| `^R` | Dial it again now, rather than waiting out the retry delay |
+| `↵` | Move this window to that computer, dialling it if nothing is. On **This computer**, move it back |
+| `^R` | Dial it again now, rather than waiting out the retry delay. On a machine that has not allowed this one yet, **ask again**: it is told afresh |
 | `^D` | Disconnect: close the link and stop dialling, keeping the pairing. `^R` takes it back |
-| `^X` | Unpair: forget it altogether |
+| `^X` | Unpair: forget it altogether. On a computer asking to join, turn it away until it asks again |
 | `^Y` | Copy this computer's own id |
 
 Renaming earns its key because a hostname is chosen by whoever set the machine up: two Macs out of
@@ -451,8 +452,11 @@ The name and the fingerprint are read off the far machine rather than typed by y
 point: a public key typed from memory is a public key typed wrong, and a fingerprint is only worth
 showing if it came from the other end.
 
-Then the other machine says `mac-studio wants to join this workspace — ^J to allow it`, and somebody
-there says yes. Two confirmations, one per machine, because authorising a computer to steer your
+Then the other machine is told, and keeps being told until somebody answers: a notification —
+`mac-studio wants to join this workspace — ^J to allow it` — and a pulsing `? mac-studio wants to
+join` at the top of its project panel for as long as the request stands. Somebody there says yes.
+Looking at an address before pressing *Add* is not a request and is not announced; a request
+nobody repeats for a minute and a half drops off. Two confirmations, one per machine, because authorising a computer to steer your
 agents is a decision each side gets to make.
 
 Between the two, you are put back in `^J` with the new machine sitting on `allow this computer on
@@ -545,8 +549,9 @@ rather than a character, and `<CR>` accepts either the highlighted row or exactl
 because the directory you want may not be one it offered. `~` expands, and a path with no `/`
 completes against the conversation's own directory.
 
-Underneath: `Type a path…`, which is the row that says the field takes one, and every computer you
-have paired. Nothing else. It used to list the worktrees of the repository you are standing in,
+Underneath: `Type a path…`, which is the row that says the field takes one. Nothing else — not the
+computers you have paired either, because a terminal is for one computer and `linux-box:` reaches
+another. It used to list the worktrees of the repository you are standing in,
 which was wrong twice over — the ones already on the panel were an offer to add what was added, and
 the ones not on it were the scratch branches you had removed, handed back. `^O` means *somewhere I
 do not work yet*, and a list of the repository you are already in cannot answer that. `^N` is where
@@ -599,10 +604,9 @@ at a time, `<Tab>` and all.
 `<CR>` starts the conversation **there** — the agent runs on that machine, against that machine's
 files — and opens a window onto it here.
 
-Every paired machine is a row whether or not it can be used. One that has not allowed this computer
-yet, or that is disconnected, or that is read-only, says which; `<CR>` on it repeats the reason
-rather than opening an empty list. `^N` asks the same question with the same field, alongside
-`Here` and the worktree options.
+No machine is a row in the field: a terminal is for one computer, every row here is a place on it,
+and moving the window is `^J`. The hint strip says `name: another computer` whenever one is paired.
+`^N` asks the same question with the same field, alongside `Here` and the worktree options.
 
 Listing a machine's directories follows `accepts_commands`: a machine that will start an agent
 anywhere you name has already given away more than the names of its directories, so there is no

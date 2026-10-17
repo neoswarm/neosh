@@ -76,7 +76,7 @@ Mutual challenge–response, the shape SSH uses. The dialler goes first.
 
 ```
 dialler                                   listener
-   |  Hello    { version, node, caps, nonce_d }   ->  |
+   |  Hello    { version, node, caps, nonce_d, knock? } -> |
    |  <-  Welcome { version, node, caps, sig_l, nonce_l }   (unconditional)
    |  verify sig_l over challenge(nonce_d)            |
    |  → not authorised?  it is a *stranger*, not an error
@@ -118,6 +118,24 @@ Three properties, each of which is a thing that goes wrong when it is missing:
   to be shown before somebody decides whether to add it. Reporting an id that had not been verified
   would be reporting whatever the peer felt like claiming.
 
+- **A dialler that hangs up before `Proof` is looking, not asking.** Adding a computer starts with a
+  *probe*: dial, read the `Welcome` for the name and fingerprint to show, and close — before anybody
+  has decided to add anything. The listener has seen a `Hello` and nothing proven, so it is not a
+  stranger and must not be announced as a request; the reference implementation ends that handshake
+  with an ordinary protocol error. It used to be announced, and since that was the first sight of
+  the machine it spent the request's only announcement on the moment before the request was made.
+
+**`knock` says a person is asking.** `Hello` carries an optional `knock: bool`, default `false` and
+omitted when false, so a hello without it is byte for byte what an older node sends and expects. A
+dialler sets it on the first dial after a person adds the machine, and on an explicit *ask again*
+for a peer that has not allowed it yet; never on the redials a heartbeat makes, and never for a
+peer configured by hand. A dialler that is not yet allowed redials every heartbeat, so a listener
+cannot announce every dial — and one that announces only the first loses every request that arrived
+while nobody was looking. So a listener announces a stranger **on first sight or on a knock**, and
+otherwise lets repeated dials keep the request alive without saying so again. A request the
+listener has turned away stays quiet until the next knock. A listener that does not know the field
+ignores it, which costs only the second announcement.
+
 **Version mismatch is refused, not negotiated.** A protocol that silently degrades is one where a
 feature the other machine lacks looks like a bug in the other machine.
 
@@ -145,6 +163,7 @@ is an accident of who booted first.
 | `Inventory` | one per change | always |
 | `Command` / `Ack` / `Refused` | one per meaningful keystroke | on demand |
 | `Browse` / `Browsed` / `Refused` | one per keystroke in a directory field | on demand |
+| `Call` / `Called` / `Refused` | a handful per new conversation, worktree or clone | on demand |
 | `Subscribe` / `Stream` | **one per token** | only while subscribed |
 | `Pty*` | **one per burst of terminal output** | only while a shell is open |
 
@@ -217,6 +236,33 @@ this could be added without a version bump. An unknown message tag fails the fra
 connection with it, so a node built before `Browse` existed cannot simply ignore one — a caller must
 therefore check the flag before sending. It defaults to `false`, which is exactly what an older
 node's handshake decodes to, so "does not say" and "cannot" are the same answer.
+
+### Call
+
+`Call { id, call }` asks the node to run one call of its workspace API and `Called { id, ok }`
+answers with what it returned, or `Refused` does. Exactly once. `call` is an `ApiCall` and `ok` an
+`ApiOk`, each as **JSON text** inside the string rather than as nested objects: typed, a call added
+in a newer release would be a tag the far end cannot parse, which fails the frame and the connection
+with it. As text the owner parses it, and one it does not know is refused by name.
+
+It exists so that the questions asked before starting work on a machine are asked *of* that
+machine: which worktrees a repository has, which branch names are taken, where its trees and clones
+go, what is already in a directory — and then making the tree, or the clone, and the conversation in
+it. A verb per question would have been seven messages and seven compatibility flags.
+
+**The owner keeps the list** of calls a peer may make and checks it on every one, whatever the
+handshake said and whatever the asker believed: git's reads, `git worktree add`, `git clone`, fetch,
+pull, the forge's pull requests, a directory listing, an option, a var, and a new conversation —
+calls about the owner's **disk**, and nothing about a screen. Removing a worktree is not on it:
+nothing over the swarm destroys what it cannot put back. A git call that does not name its
+directory is refused rather than answered about whatever somebody at the owner happens to be
+reading. A new conversation is created without moving any screen on the owner; it is the asker's to
+open, as a mirror. The asker checks its own plugin's permission to write a repository before sending
+— the owner sees a machine, not which plugin on it asked.
+
+Gated on `accepts_commands`, for `Browse`'s reason one step further: a node that starts an agent in
+any directory you name gives nothing further away by making a worktree for it to start in.
+`NodeCapabilities::calls` is a compatibility flag in exactly `browse`'s sense.
 
 ### Pty
 
@@ -321,10 +367,16 @@ An implementation is ASCP-0 conformant if it:
     handshake it sent.
 12. Sends `PtyOpen` only to a peer whose handshake said `shells: true`.
 13. Closes every pty it owns for a peer when that peer's connection ends.
+14. Answers every `Call` exactly once with `Called` or `Refused`, answers none at all unless it
+    accepts commands, and refuses every call not on its own list — checked on every call.
+15. Sends `Call` only to a peer whose handshake said `calls: true`.
+16. Never announces a peer that closed before sending `Proof` as a request to pair: its id was
+    never proven.
 
-Points 1, 2, 6, 9, 11 and 13 are the security-relevant ones. An implementation failing any of them
-is not a degraded ASCP node; it is an open door. Points 10 and 12 are the compatibility ones: a peer
-that has never heard of the message will drop the connection rather than skip the frame.
+Points 1, 2, 6, 9, 11, 13 and 14 are the security-relevant ones. An implementation failing any of
+them is not a degraded ASCP node; it is an open door. Points 10, 12 and 15 are the compatibility
+ones: a peer that has never heard of the message will drop the connection rather than skip the
+frame.
 
 ---
 

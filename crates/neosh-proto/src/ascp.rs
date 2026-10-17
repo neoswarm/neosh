@@ -293,6 +293,10 @@ pub struct AgentSummary {
     pub decorations: Vec<serde_json::Value>,
 }
 
+fn is_false(b: &bool) -> bool {
+    !*b
+}
+
 fn is_zero(n: &u32) -> bool {
     *n == 0
 }
@@ -524,6 +528,18 @@ pub struct NodeCapabilities {
     /// cannot parse, and `false` is what an older handshake decodes to.
     #[serde(default)]
     pub live: bool,
+    /// Whether [`AscpMessage::Call`] will be answered — the workspace API run here on another
+    /// machine's behalf, for the handful of calls that are about *this disk* rather than about the
+    /// screen asking: its worktrees and branches, a clone, a directory listing, an option, a var, a
+    /// new conversation. Which is what lets `n`, `^N` and a clone on a project over there be the
+    /// same code they are here, instead of a path field and nothing else.
+    ///
+    /// A compatibility flag in `browse`'s sense — an unknown tag fails the frame and takes the
+    /// connection with it, and `false` is what an older handshake decodes to — and gated the way
+    /// `Browse` is, on `accepts_commands`: a node that already takes `NewSession` with any `cwd` on
+    /// its disk gives nothing further away by making a worktree for it to start in.
+    #[serde(default)]
+    pub calls: bool,
     /// The checkouts this node has, for starting something on it.
     #[serde(default)]
     pub projects: Vec<RemoteProject>,
@@ -719,6 +735,12 @@ pub enum AscpMessage {
         capabilities: NodeCapabilities,
         /// Hex, 32 bytes.
         nonce: String,
+        /// "I am asking again, on purpose" — a person pressed *resend* on a computer that has not
+        /// allowed this one yet. A machine that has not paired with us hears from our dialler every
+        /// heartbeat, and says so once; this is how the second, deliberate time gets said too.
+        /// Absent unless set, so the hello an older node reads is byte for byte the one it knew.
+        #[serde(default, skip_serializing_if = "is_false")]
+        knock: bool,
     },
     /// The answer: who I am, proof I hold my key, and a challenge of my own.
     Welcome {
@@ -804,6 +826,20 @@ pub enum AscpMessage {
     },
     /// The answer to [`Self::Catalogue`].
     Catalogued { id: String, catalogue: ModelCatalogue },
+    /// Run one workspace API call on that machine and say what it answered. See
+    /// [`NodeCapabilities::calls`].
+    ///
+    /// `call` is an `ApiCall` as **JSON text** rather than the type itself, and the answer is an
+    /// `ApiOk` the same way. Typed, a call added in a newer release would be a tag the far end
+    /// cannot parse, which fails the frame and drops the link — the whole connection lost to one
+    /// question. As text, the owner parses it, and one it does not know is refused by name.
+    ///
+    /// The owner keeps its own list of which calls a peer may make, and enforces it whatever was
+    /// sent: everything else in the API is about a screen, and the screen asking is not this one.
+    /// Answered with [`Self::Called`] or [`Self::Refused`], exactly once.
+    Call { id: String, call: String },
+    /// The answer to [`Self::Call`]: what the owner's API returned, as JSON text.
+    Called { id: String, ok: String },
     /// Open a shell on that machine.
     ///
     /// The one thing here that is not about an agent, and it is what "it feels like it is on this

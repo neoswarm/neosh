@@ -3,6 +3,7 @@
     "accepts_approvals": false,
     "accepts_commands": true,
     "browse": true,
+    "calls": false,
     "catalogue": false,
     "live": false,
     "projects": [

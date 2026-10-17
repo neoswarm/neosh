@@ -66,9 +66,10 @@ Start a conversation with the question already in it:
 neosh prompt why is the composer eating my paste
 ```
 
-With other computers paired, `neosh ls` lists them and `neosh connect <name>` opens a terminal on
-one — its projects, its conversations, `^N` starting there. Plain `neosh` asks which, unless
-`swarm.device` already says.
+A terminal is for one computer. With others paired, `neosh ls` lists them and `neosh connect
+<name>` opens a terminal on one — its projects, its conversations, `^N` starting there. Plain
+`neosh` asks which whenever another computer is paired, unless `swarm.device` already says, and
+`^J` moves a terminal from one to another.
 
 ## From a script, or from another agent
 

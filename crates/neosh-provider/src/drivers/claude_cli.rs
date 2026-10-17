@@ -227,6 +227,15 @@ struct Unread {
     attached: std::sync::atomic::AtomicUsize,
     /// An `init` seen while somebody was reading, and not yet read by them.
     pending: std::sync::atomic::AtomicBool,
+    /// The newest set of background tasks the reader saw while a turn was attached.
+    ///
+    /// The turn usually reads that line too and forwards it, but not always: an interrupted turn
+    /// stops at its `result`, and the CLI says what it moved into the background *just after* it —
+    /// into a pipe a turn is still holding, so the reader kept quiet, and a turn that has stopped
+    /// reading. What `<Esc>` left running was then said by nobody until the next message drained
+    /// it. Kept here, the turn says it on its own stream on the way out. A level, so saying the
+    /// set a turn has already forwarded is saying nothing.
+    level: Mutex<Option<Vec<neosh_proto::BackgroundTask>>>,
 }
 
 /// A change asked for while a turn is running.
@@ -530,13 +539,27 @@ fn model_arg(selection: &neosh_proto::ModelSelection) -> String {
     }
 }
 
+/// The long context window, in tokens — what `[1m]` buys, and where compaction should then wait for.
+const LONG_CONTEXT: u64 = 1_000_000;
+
 /// The `--settings` payload for the switches that are settings rather than flags.
 ///
 /// Fast mode and always-on thinking have no command-line flag; the CLI reads them from its
 /// settings, which `--settings` will take as a JSON string. Returns nothing when neither is on, so
 /// the usual case adds no argument at all.
+///
+/// And the long context window, which is two settings and not one. `[1m]` on the model id is how
+/// much the model can *see*; when the CLI *compacts* is decided separately, and when nothing local
+/// names it the CLI takes a per-model window from its own server configuration — which can sit
+/// far below the million. So a conversation with 1M chosen, and a meter reading out of a million,
+/// was summarised away somewhere under 400k. `autoCompactWindow` in settings outranks that server
+/// value (only `CLAUDE_CODE_AUTO_COMPACT_WINDOW` in the environment outranks it), so choosing 1M
+/// now means compacting near 1M. 200k says nothing: that is the CLI's own default already.
 fn settings_arg(selection: &neosh_proto::ModelSelection) -> Option<String> {
     let mut map = serde_json::Map::new();
+    if selection.option_str("context") == Some("1m") {
+        map.insert("autoCompactWindow".into(), LONG_CONTEXT.into());
+    }
     if selection.option_flag("fast_mode") == Some(true) {
         map.insert("fastMode".into(), true.into());
     }
@@ -649,6 +672,17 @@ impl Provider for ClaudeCliProvider {
             if one_shot && let Some(live) = guard.take() {
                 live.close().await;
             }
+            // What is running now, said last on this turn's own stream so it lands after anything
+            // older the turn forwarded — see [`Unread::level`]. When nobody is listening any more
+            // (an abandoned turn), the way out below says it instead.
+            if let Some(tasks) = watch.take_level()
+                && tx
+                    .send(ProviderEvent::Activity { activity: Activity::Background { tasks: tasks.clone() } })
+                    .await
+                    .is_err()
+            {
+                *watch.unread.level.lock().expect("level lock poisoned") = Some(tasks);
+            }
             drop(attached);
         });
 
@@ -693,6 +727,15 @@ impl Drop for Attached {
             && self.0.unread.pending.swap(false, std::sync::atomic::Ordering::SeqCst)
         {
             self.0.report();
+        }
+        // And a set of background tasks nothing has said yet — one that arrived after the turn's
+        // stream had already closed, or whose stream had no listener. Said the way a set is said
+        // between turns, because it now is between turns.
+        if !self.0.reading()
+            && let Some(tasks) = self.0.take_level()
+            && let Some(sink) = &self.0.sink
+        {
+            sink.background(&self.0.conversation, tasks);
         }
     }
 }
@@ -1421,11 +1464,17 @@ impl Watch {
     /// is wrong until the next change — which, for a conversation nobody goes back to, is forever.
     fn background(&self, tasks: Vec<neosh_proto::BackgroundTask>) {
         if self.reading() {
+            *self.unread.level.lock().expect("level lock poisoned") = Some(tasks);
             return;
         }
         if let Some(sink) = &self.sink {
             sink.background(&self.conversation, tasks);
         }
+    }
+
+    /// The newest set said while a turn was reading, once. See [`Unread::level`].
+    fn take_level(&self) -> Option<Vec<neosh_proto::BackgroundTask>> {
+        self.unread.level.lock().expect("level lock poisoned").take()
     }
 
     /// The process is gone, so nothing it was holding is running any more.
@@ -1975,6 +2024,22 @@ mod tests {
         );
     }
 
+    /// Choosing 1M has to move where compaction happens, not only how much the model can see: left
+    /// to itself the CLI compacts at a window its server picks, which was under 400k.
+    #[test]
+    fn a_million_tokens_of_context_compacts_near_a_million() {
+        use neosh_proto::ProviderOptionValue::Text;
+        assert_eq!(
+            settings_arg(&sel("claude-opus-5", &[("context", Text("1m".into()))])).as_deref(),
+            Some(r#"{"autoCompactWindow":1000000}"#)
+        );
+        assert_eq!(
+            settings_arg(&sel("claude-opus-5", &[("context", Text("200k".into()))])),
+            None,
+            "200k is the CLI's own default, and saying it again would be a setting for nothing"
+        );
+    }
+
     /// The child is spawned in the conversation's directory.
     ///
     /// Worth a real process rather than a mock: the whole failure this fixes was a `Command` that
@@ -2313,6 +2378,82 @@ done
     /// is ahead of the ending the host is waiting for. Asserted with no polling loop on purpose:
     /// `collect` cannot return until the stream is closed, so a count that is already 1 here is the
     /// ordering itself, and a host that reads "is a turn running" at that moment always reads yes.
+    /// `<Esc>` on a turn that had something running puts it in the background, and the first thing
+    /// the CLI says after the interrupt is exactly that. The agent loop has already let go of the
+    /// stream by then, and the turn finds out it was abandoned by failing to send *that line* — so
+    /// the one fact worth keeping was the one dropped, the reader kept quiet because a turn still
+    /// held the pipe, and the conversation looked idle until the next message drained it and the
+    /// mark appeared at once. Whichever way it arrives now, the last set heard has the task in it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn what_an_interrupt_left_running_is_said_without_another_message() {
+        use futures::StreamExt;
+        use std::os::unix::fs::PermissionsExt;
+
+        #[derive(Debug, Default)]
+        struct Heard(Mutex<Vec<Vec<neosh_proto::BackgroundTask>>>);
+        impl super::super::Unasked for Heard {
+            fn began(&self, _conversation: &SessionId) {}
+            fn background(&self, _conversation: &SessionId, tasks: Vec<neosh_proto::BackgroundTask>) {
+                self.0.lock().expect("heard").push(tasks);
+            }
+        }
+
+        let dir = std::env::temp_dir().join(format!("neosh-left-running-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("dirs");
+        let script = dir.join("fake-claude");
+        std::fs::write(
+            &script,
+            r#"#!/bin/sh
+while IFS= read -r line; do
+  case "$line" in
+    *'"subtype":"interrupt"'*)
+      id=`printf '%s' "$line" | sed 's/.*"request_id":"\([^"]*\)".*/\1/'`
+      printf '{"type":"control_response","response":{"subtype":"success","request_id":"%s","response":{}}}\n' "$id"
+      printf '{"type":"system","subtype":"background_tasks_changed","tasks":[{"task_id":"t1","description":"cargo build","task_type":"local_bash"}]}\n'
+      printf '{"type":"result","subtype":"error_during_execution","is_error":false,"session_id":"s","result":""}\n'
+      continue
+      ;;
+    *control_request*)
+      id=`printf '%s' "$line" | sed 's/.*"request_id":"\([^"]*\)".*/\1/'`
+      printf '{"type":"control_response","response":{"subtype":"success","request_id":"%s","response":{}}}\n' "$id"
+      continue
+      ;;
+  esac
+  printf '{"type":"system","subtype":"init","session_id":"s","slash_commands":[]}\n'
+  printf '{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"building"}}}\n'
+done
+"#,
+        )
+        .expect("script");
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+
+        let p = ClaudeCliProvider::new(script.display().to_string());
+        let heard = Arc::new(Heard::default());
+        crate::drivers::AgentDriver::set_unasked(&p, heard.clone());
+
+        // Interrupted the way the agent loop does it: the token is cancelled and the stream is let
+        // go of at once.
+        let cancel = CancellationToken::new();
+        let mut turn = p.stream(&inst(), req("claude-opus-5"), cancel.clone());
+        while let Some(ev) = turn.next().await {
+            if matches!(&ev, ProviderEvent::TextDelta { .. }) {
+                break;
+            }
+        }
+        cancel.cancel();
+        drop(turn);
+        // Long enough for the abandoned turn to have been drained to its `result`.
+        tokio::time::sleep(Duration::from_millis(800)).await;
+        let sets: Vec<_> = heard.0.lock().expect("heard").drain(..).collect();
+
+        let last = sets.last().expect("the background set was said without another message");
+        assert_eq!(last.iter().map(|t| t.id.0.as_str()).collect::<Vec<_>>(), ["t1"], "{sets:?}");
+
+        p.shutdown(&SessionId::from("test"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn a_turn_begun_while_the_last_one_was_winding_down_is_still_reported() {

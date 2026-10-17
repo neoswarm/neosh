@@ -1,0 +1,5 @@
+{
+  "id": "a1",
+  "ok": "{\"ok\":\"worktrees\",\"worktrees\":[{\"path\":\"/home/me/src/neosh\",\"branch\":\"main\",\"is_main\":true,\"locked\":false,\"is_current\":false}]}",
+  "type": "called"
+}

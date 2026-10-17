@@ -441,6 +441,13 @@ export interface FloatOptions {
 
 export interface Neosh {
   readonly version: number;
+  /**
+   * Which computer this namespace's calls about a **disk** go to — `null` for this one.
+   *
+   * See {@link SwarmApi.at}: git, `path.complete`, `opt.get`, `vars` and `session.create` are
+   * answered by that machine, and everything about a screen is still this one's.
+   */
+  readonly machine: NodeId | null;
   readonly buf: BufferApi;
   readonly win: WindowApi;
   /** The panes of the main region. See {@link PaneApi}. */
@@ -2063,6 +2070,26 @@ export interface SwarmApi {
    */
   browse(node: NodeId, prefix?: string): Promise<string[]>;
   /**
+   * The whole namespace, with every call about a **disk** answered by another computer.
+   *
+   * What makes a project over there the same project as one here: the code that asks *where?* —
+   * which worktrees a repository has, which branch names are taken, making a new tree, cloning,
+   * where the owner keeps them — runs unchanged, handed this instead of `neosh`. Over there go
+   * git's reads, `git.addWorktree`, `git.clone`, `git.fetch`, `git.pull`, `forge.pulls`,
+   * `path.complete`, `opt.get`, `vars.get`/`vars.set`, and `session.create` — which starts the
+   * conversation on that machine without moving any screen there, and opens it **here**, in the
+   * terminal this namespace is bound to, exactly as a local one arrives. Its answer is that
+   * machine's conversation, so a var set on its id is set where the conversation lives.
+   *
+   * Everything else — pickers, floats, notices, keymaps, listeners — is this screen's as it always
+   * was, which is why a dialog written for local work needs nothing to work over there. A git
+   * call must name its `cwd` (the owner's "current" checkout is whatever somebody at that
+   * machine is reading), writes need `vcs_write` here and `accepts_commands` there, and removing a
+   * worktree is refused: nothing over the swarm destroys what it cannot put back. A machine too
+   * old for this rejects with a sentence saying so. Passing this machine's own id is `neosh`.
+   */
+  at(node: NodeId): Neosh;
+  /**
    * Open a **shell** on another machine, in a tab of its own.
    *
    * The same terminal `<C-w>T` opens here, with the pty on the other end of a link: the emulator
@@ -2149,6 +2176,12 @@ export interface SwarmApi {
    * `false` is "this machine wants to join — allow it?". Same button, different question.
    */
   strangers(): Promise<SwarmStranger[]>;
+  /**
+   * Turn down a machine that asked to join. It leaves {@link strangers} and stays gone while it
+   * goes on dialling; only its resend — somebody over there asking again on purpose — brings it
+   * back.
+   */
+  dismiss(node: NodeId): Promise<void>;
   /** A node joined, left, changed what it is running, or asked to join. Redraw. */
   onChange(cb: () => void): Disposable;
   onStream(
@@ -2397,16 +2430,22 @@ function build(
   version: number,
   r: ReturnType<typeof reg>,
   view: ViewId | null,
+  machine: NodeId | null = null,
 ): Neosh {
   // On the envelope rather than in each call: a call comes *from* a terminal, exactly as a key
   // press does, and it is the same fact for all of them. It matters for far more than opening a
   // window — which conversation is on screen, what is in the composer, what `session.list` marks
   // as the one you are in are all questions with an answer per terminal.
-  const c = (x: ApiCall) => call(plugin, x, view ?? undefined);
-  const n = (x: ApiCall) => notify(plugin, x, view ?? undefined);
+  // Bound to another machine, every call is wrapped and the host decides which leave: one list,
+  // kept beside the code that enforces it, rather than a second copy here to drift from it.
+  const route = (x: ApiCall): ApiCall =>
+    machine === null ? x : { call: "swarm_call", node: machine, inner: x };
+  const c = (x: ApiCall) => call(plugin, route(x), view ?? undefined);
+  const n = (x: ApiCall) => notify(plugin, route(x), view ?? undefined);
 
   const api: Neosh = {
     version,
+    machine,
     notify(message, level) {
       n({ call: "notify", level: level ?? "info", message, kind: "reply" });
     },
@@ -2598,6 +2637,9 @@ function build(
       async strangers() {
         return expect(await c({ call: "swarm_strangers" }), "swarm_strangers").strangers;
       },
+      async dismiss(node) {
+        await c({ call: "swarm_dismiss", node });
+      },
       async hostsOf(project) {
         return expect(await c({ call: "swarm_hosts_of", project }), "names").names;
       },
@@ -2607,6 +2649,7 @@ function build(
         // answering a command that had nothing to report — which is a success, not a mismatch.
         return done.ok === "swarm_commanded" ? done.session ?? null : null;
       },
+      at: (node) => build(plugin, version, r, view, node),
       async browse(node, prefix) {
         return expect(await c({ call: "swarm_browse", node, prefix: prefix ?? "" }), "paths").paths;
       },
@@ -3323,7 +3366,7 @@ function build(
         const views = expect(await c({ call: "view_list" }), "views").views;
         return views.find((v) => v.current) ?? null;
       },
-      at: (id) => build(plugin, version, r, id),
+      at: (id) => build(plugin, version, r, id, machine),
       onOpen(cb) {
         // The terminals that were already here, as well as the ones still to come. A plugin loaded
         // after them missed their arrival, and "open a panel in every view" would otherwise mean

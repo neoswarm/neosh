@@ -26,9 +26,23 @@ listen  = ""       # or just dial-only: joins machines without being joinable
    ```
 
 3. Check the fingerprint against what that computer shows under **This computer**, then confirm.
-4. The other machine announces that somebody is asking, and somebody there presses `^J` and allows it.
+4. The other machine is told that somebody is asking — see [below](#when-a-computer-asks) — and somebody there presses `^J` and allows it.
 
-Two confirmations, one per machine, because authorising a computer to steer your agents is a decision each side gets to make. Nothing restarts, and nothing is written to your `config.toml`: paired machines live in the state directory, and `^X` in the list removes one.
+Two confirmations, one per machine, because authorising a computer to steer your agents is a decision each side gets to make. Nothing restarts, and nothing is written to your `config.toml`: paired machines live in the state directory, and `^X` in the list removes one — from the list at once, rather than leaving it there saying it is waiting. An address that turns out to be this computer is refused rather than paired with itself.
+
+### When a computer asks
+
+A request to join is said on the machine being asked twice, and the second one lasts. It is a **notification** — *A computer wants to join: linux-box wants to join this workspace — ^J to allow it* — which reaches you the way a finished turn does, in whichever window you are in or on the desktop when none is attached (`notify.when` calls it `pairing`). And it is a **row** at the very top of the project panel, `? linux-box wants to join`, pulsing, with `^J` on its right, for as long as the request stands. `^J` is the key either way, and it sits at the foot of the project panel as `^J computers` for anyone who has never pressed it.
+
+Only a real request is announced. Looking at an address before pressing *Add* — which is how the name and fingerprint above are read — asks nothing of the far end, and nothing is shown there. That look used to be the one announcement a request got, a toast for six seconds before anybody had pressed anything, and every dial after it was kept quiet; a request that arrived while you were elsewhere was simply gone.
+
+| Where | Key | Does |
+| --- | --- | --- |
+| the machine asked | `↵` | Allow it |
+| the machine asked | `^X` | Turn it away: it leaves the list and is not announced again until somebody over there asks again |
+| the machine asking | `^R` | Ask again. The other machine is told afresh, notification and all, and this one says `asked linux-box again — ^J over there allows mac-studio` |
+
+A request nobody repeats drops off by itself after a minute and a half: a machine that has this one paired dials every few seconds, so one that has gone quiet has given up.
 
 ## Or by hand
 
@@ -53,11 +67,12 @@ A peer entry you wrote by hand cannot be removed with `^X`, because that line wo
 
 Every paired machine is a row in `^J` from the first frame, and the row says where the link stands: `connecting…` for one being dialled that has never answered, with a `try 4` once it has failed a few times, `reconnecting` for one that was here and dropped, `disconnected` for one nothing is dialling, and the conversation count for one that is up. Reconnects back off from a second up to half a minute and reset the moment a dial lands, so a machine that reboots is back in seconds. The list updates live while it is open, and the `This computer` row says whether this machine is `listening`, `not listening`, or `dial-only`.
 
-Two verbs on any row:
+Three keys on any row:
 
 | Key | Does |
 | --- | --- |
-| `^R` | Dial it again now, rather than waiting out the retry delay |
+| `↵` | Move this window to that computer — see [one window per computer](#one-window-per-computer) |
+| `^R` | Dial it again now, rather than waiting out the retry delay. On a machine that has not allowed this one yet, ask again |
 | `^D` | Disconnect: close the link and stop dialling, keeping the pairing. `^R` takes it back |
 
 Disconnect holds in both directions, so a peer that dials in is turned away until you say otherwise, and it lasts until a reconnect or a restart. Unpairing with `^X` is the stronger verb, for a machine you are done with rather than done with for now.
@@ -76,23 +91,12 @@ Whatever a machine advertises, it checks again every time: a capability list is 
 
 ## What you see
 
-**A project is one row, wherever its checkouts are**, and every other computer that has it is a **block** inside it. Projects are matched by their normalised git remote rather than by path, so `/Users/me/dev/neosh` here and `/home/me/src/neosh` there are one repository:
+**A terminal is for one computer, and its project panel is that computer's list.** In a window for this one, `PROJECTS` is what has a checkout on this disk and nothing else: another machine's work is not mixed into it, not hung under it, and not in a section below it. There was once a window for every computer at once, and it was a column in which nothing said which rows were yours.
+
+A window for another computer is drawn as though it were the one you are sitting at:
 
 ```
- PROJECTS                       ^T
-──────────────────────────────────
- ▾ neosh                         6
-   ▸ Chasing the flake         12m
-   ▾ ⎇ fix/composer-paste        2
-     · Try the grapheme path
-   ▾ @lb ⎇ main ≠ 4f3a1c2        2
-     · Rework the tab bar       3m
-     ▾ ⎇ fix/tab-strip           1
-       · Nearly there           1h
-
- + Add project                  ^O
-
- @lb LINUX-BOX
+ PROJECTS  @lb linux-box        ^T
 ──────────────────────────────────
  ▾ api ⎇ main                    2
    · Rate limiting              2h
@@ -100,18 +104,12 @@ Whatever a machine advertises, it checks again every time: a capability list is 
      · Try a token bucket      now
  ▸ infra                         4
 
- @ms MAC-STUDIO            offline
-──────────────────────────────────
- ▸ design-site                   1
+ + Add project                  ^O
 ```
 
-**Yours first, then one section per computer.** `PROJECTS` is what has a checkout on this disk. After it, every paired machine has a section of its own — its code and name, and a rule under them in its colour — holding the repositories that are **only** over there: `api` and `infra` are on `linux-box` and nowhere here. In a machine's section the machine goes without saying, so those rows are just the name and the branch its checkout is on, with its conversations and worktrees indented beneath it. The heading is a row you can stand on: `↵` folds the whole machine away, `c` and `C` connect and disconnect, `t` opens a shell in its home, and `n` starts a conversation somewhere on it. When a machine cannot be reached its heading says so — `offline`, `connecting`, `not allowed yet` — and its colour goes dim.
+Which computer is said once, beside the heading — its code in its colour, its name dim — and when it cannot be reached the right-hand side says so instead: `offline`, `connecting`, `not allowed yet`. The heading is a row you can stand on: `c` and `C` connect and disconnect, `t` opens a shell in its home, and `n` starts a conversation somewhere on it. Each row below is a repository and the branch its checkout is on, with its conversations and worktrees indented beneath it, in the colours your own rows wear. `+ Add project` adds one **on that machine**. `^J` and `/device` are how a window moves from one computer to another — [below](#one-window-per-computer).
 
-Inside one of your own projects, your own conversations and worktrees come first. Then each other machine that also has it is a row like a worktree — its **code**, its branch, and its name when there is room — with its conversations and its worktrees indented under it, the `·` of each conversation and the `⎇` of each worktree **in that machine's colour**, so wherever the cursor is, which computer the row is on is the colour of its mark. Another machine's work is never mixed into your own list: what it is working on was written against the code *it* has, and a row beside yours would say otherwise. `api` is a repository this machine has no clone of at all, which is still somewhere you can see and start work.
-
-**When its checkout is on a different commit from yours**, its row says so: `≠ 4f3a1c2`, in amber. When they match, or the other machine runs a neosh too old to say, nothing is added. Both sides read their commit straight off the repository's files, with no `git` process behind it.
-
-**Every machine has a colour of its own** — blue for the first, then violet, teal, orange, pink and lime — and it is the same colour in `^J`, in `^N`'s "which computer" and on the settings page. The colour follows the machine, not the order you paired them in, so adding a third computer never repaints the first two.
+**Every machine has a colour of its own** — blue for the first, then violet, teal, orange, pink and lime — and it is the same colour in `^J`, in the *which computer?* a new terminal asks, on the status line and on the settings page. The colour follows the machine, not the order you paired them in, so adding a third computer never repaints the first two.
 
 The code in front of it says the rest, and **its colour says whether you can reach it**:
 
@@ -121,7 +119,7 @@ The code in front of it says the rest, and **its colour says whether you can rea
 | amber, pulsing | being dialled, or waiting for somebody to allow this computer over there |
 | dim | nothing is dialling it — everything of that machine's dims with it |
 
-The code is worked out from the machine's name — `ms` for `mac-studio`, `lb` for `linux-box`, the next candidate when two would clash — and `@` on a row about that machine, `^T` in `^J`, or the *Computers* page in settings changes it to one of your own (up to four letters or digits, kept in the `swarm.codes` workspace var). `@` because in a terminal that is already the word for *over there, on that host*: anyone who has typed `ssh you@box` reads it that way.
+The code is worked out from the machine's name — `ms` for `mac-studio`, `lb` for `linux-box`, the next candidate when two would clash, the same in every window — and `@` on a row about that machine, `^T` in `^J`, or the *Computers* page in settings changes it to one of your own (up to four letters or digits, kept in the `swarm.codes` workspace var). `@` because in a terminal that is already the word for *over there, on that host*: anyone who has typed `ssh you@box` reads it that way.
 
 **A row on a machine you can reach is drawn like one of yours.** Only a machine that is not connected greys its rows, because that is the one case where the row is something you can read about and not act on.
 
@@ -131,7 +129,7 @@ Rows for a machine that has gone quiet stay where they are. They were real a mom
 
 **`↵` on a conversation over there opens it as a conversation** — in the pane, drawn exactly as one of yours is: its history as a transcript with the same cards, then its turns live, tool calls and all. **The composer is the ordinary composer**: what you type is sent to that machine and answered by the agent running there, `Esc` asks its turn to stop, and a message typed at that machine's own keyboard appears here as it is asked. The row stays lit in the project panel while you are in it, and the status line says `@lb linux-box` in that machine's colour, because the composer looks the same either way and something on screen has to say which computer your message goes to.
 
-It is still that machine's conversation. It runs there, with that machine's files, model and permissions; nothing about it is saved here, and it does not appear among your own conversations — its row is in the machine's section, where it always was. Pictures you attach stay on this computer (the words are sent). If the machine is not connected, sending says so and leaves what you wrote in the field. An older neosh on the other end streams the words but not the tool calls; those appear when its turn ends, when the whole conversation is fetched again.
+It is still that machine's conversation. It runs there, with that machine's files, model and permissions; nothing about it is saved here, and it does not appear among your own conversations — its row is in that machine's list, in a window for that machine. Pictures you attach stay on this computer (the words are sent). If the machine is not connected, sending says so and leaves what you wrote in the field. An older neosh on the other end streams the words but not the tool calls; those appear when its turn ends, when the whole conversation is fetched again.
 
 **And the rest of the keyboard works on it too**, each key doing to that conversation what it does to one of yours — over there:
 
@@ -176,36 +174,39 @@ Starting an agent over there is a thing with a permission layer over it, a trans
 
 ## Starting something over there
 
-With a machine paired that has this project, `^N` asks **which computer** first — this one, or any of them, each with its marker and the reason it cannot be used when it cannot. `This computer` is the first row and the cursor starts on it, so `^N ⏎` is what it always was. Pick another and you get the path field pointed at that machine, which is the same thing typing `linux-box:` into it would have got you.
+`^N` starts where the window is, and never asks *which computer*: the terminal already said. In a window for linux-box it is a conversation on linux-box, and in a conversation over there `^N ⏎` is a new one beside it.
 
-With no machine paired the question is not asked at all, and `^N` is the single key it has always been. Nor is it asked when the machines you have are connected but none of them has a checkout of the repository you are in: there is one possible answer, and a panel that appears to confirm it is a keypress spent on nothing.
+**A project over there asks what a project here asks.** `n` on one of its rows, or `^N` in one of its conversations, offers the same rows in the same order — here, a new worktree named for you, one kept inside the project, one you name, a tree it already has, somewhere else — and every one of them is answered by that machine: its worktrees, its branch names, its `worktree.root`, the tree made on its disk. `p` pulls over there. What lands is that machine's conversation, opened here.
 
-`n` on a project that is only on other computers skips straight to it: the row already knows which machines have it and where on each, so with one there is nothing to ask.
+The path field — `^N`'s *Another directory…*, and `^O` — completes on the window's computer. Typing a machine's name and a colon, `linux-box:`, completes on that one instead (the hint strip says so when a machine is paired), and an address after it, `linux-box:https://github.com/owner/repo`, clones onto it. In a window for that machine, `^O` is already pointed there and a pasted address clones there.
+
+All of this needs a current neosh at both ends. An older one on the other machine still takes a conversation in a directory you name, and says nothing about worktrees.
 
 ## One window per computer
 
-A window is usually *for* one machine — a terminal on the build box beside one on your laptop — so each terminal can say which computer it is for. Its project panel shows only that machine, it opens in that machine's newest conversation, and `^N` starts there without asking.
+A terminal is *for* one machine — a terminal on the build box beside one on your laptop. Its project panel shows only that machine, it opens in that machine's newest conversation, and `^N` starts there.
 
 ```bash
 neosh ls                  # every computer, its code, whether it is up, and which one `neosh` opens on
 neosh connect lb          # a terminal on linux-box — by its code, name, the start of its name, or id
-neosh connect here        # this computer only
-neosh connect all         # every computer at once, as one workspace
+neosh connect here        # this computer
 neosh connect             # ask, whatever the setting says
 ```
 
 `neosh connect` settles the name and waits for the link *before* taking the screen, so a name that matches nothing, or a machine that has not allowed this one, is a sentence in your shell rather than an empty window. A machine nobody is dialling is dialled.
 
-Plain `neosh` asks **which computer?** whenever another one is connected or on its way: this computer first, then each paired machine in its colour (the ones still connecting redraw as they arrive), and **All computers** once there is more than one to be all of. `↵` opens, `d` opens *and* makes it the default so the question is not asked again, and `esc` is every computer — the workspace as it always was. With no other computer up there is nothing to ask, and nothing is.
+Plain `neosh` asks **which computer?** whenever another one is paired, whether or not it is connected yet: this computer first, then each paired machine in its colour, redrawing as they connect — choosing one still being dialled waits for it. `↵` opens, `d` opens *and* makes it the default so the question is not asked again, and `esc` is this computer. With nothing paired there is nothing to ask, and the terminal is this computer's.
 
-The default is `swarm.device` — `ask`, `all`, `here`, or a computer's name or code — and lives on the **Computers** page of `/settings`, where `↵` offers the list:
+There is no answer for every computer at once any more. `all` — in `swarm.device`, `neosh connect all` or `/device all` — is read as asking, the nearest thing to not having picked one.
+
+The default is `swarm.device` — `ask`, `here`, or a computer's name or code — and lives on the **Computers** page of `/settings`, where `↵` offers the list:
 
 ```toml
 [options]
 "swarm.device" = "linux-box"
 ```
 
-Inside, `/device` asks again for this terminal, and `/device lb`, `/device all`, `/device here` answer without asking. A window for another computer looks like your own: the heading is `PROJECTS`, with `@lb linux-box` dim beside it, its projects are drawn the way yours are, and `+ Add project` adds one on that machine. Nothing stops when a window is pointed elsewhere: a turn on a machine this window is not for keeps running, and its notifications still arrive.
+Inside, `/device` asks again for this terminal, and `/device lb` and `/device here` answer without asking. So does `^J`: `↵` on a machine moves this window to it — dialling it if nothing is, and landing in its newest conversation — and `↵` on **This computer** brings it back. The row for the computer this window is for says `this window`. A window for another computer looks like your own: the heading is `PROJECTS`, with `@lb linux-box` dim beside it, its projects are drawn the way yours are, and `+ Add project` adds one on that machine. Nothing stops when a window is pointed elsewhere: a turn on a machine this window is not for keeps running, and its notifications still arrive.
 
 For a plugin it is `neosh.view.device()`, `neosh.view.setDevice()` and `neosh.view.onDevice()` — the same answer the project panel and `^N` read.
 
